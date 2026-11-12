@@ -307,14 +307,16 @@ class TrialProcessTests(unittest.TestCase):
             request_record(28, "later", 900, []),
             transcript_record("system", 100, subtype="compact_boundary"),
         ]
-        for storage in ("plain", "compressed", "both"):
+        for storage in ("plain", "compressed", "both", "alias"):
             with self.subTest(storage=storage), tempfile.TemporaryDirectory() as folder:
                 home = Path(folder)
                 path = home / ".claude/projects/project/director.jsonl"
                 path.parent.mkdir(parents=True)
                 _ = path.write_text("\n".join(json.dumps(record) for record in records))
                 before = path.read_bytes()
-                if storage != "plain":
+                if storage == "alias":
+                    (path.parent.parent / "alias").symlink_to(path.parent, target_is_directory=True)
+                if storage in ("compressed", "both"):
                     compressed = compressed_copy(path)
                     if storage == "both":
                         _ = path.write_bytes(before)

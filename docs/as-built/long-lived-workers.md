@@ -91,7 +91,7 @@ Every other foreground process prevents the pane report from proving a sole Code
 
 `worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
-A pending run reply or friend reply keeps the pass active without another prompt.
+A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A worker puts its question in its reply and ends the turn.
@@ -254,7 +254,7 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Claude coordinator and friends
+### Claude coordinator
 
 `assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
@@ -361,6 +361,11 @@ Pane observations supply native worker resume state.
 A busy recipient gets only its `own_pass` continuation.
 An idle worker row receives no prompt.
 A director can receive the list of busy and idle worker children.
+Restore reaps detached orphans before it resumes workers.
+A full restore reaps once per held run folder.
+A limited restore reaps once per selected worker in each held run folder.
+It preserves excluded workers and workers with unknown pane evidence.
+It prints each reaped run id.
 Restore reopens only workers with active dispatches.
 It reads each worker's dispatch record and transcript once to select the resume step.
 An accepted dispatch gets a continuation prompt only when the worker is idle.
@@ -615,6 +620,13 @@ They store no separate backend record.
 
 Native dispatch identity comes from the recorder's pass and history records.
 The held Claude launcher stores the fixed staff reference and slot in `impl_worker_<slot>.json`.
+It stores no worker name or backend family.
+Mesh roster entries use fixed staff IDs as keys and retain dispatch telemetry.
+Pass selection uses the fixed worker ID and checks the current staff parent.
+Run selection searches the current parent's runs.
+A supplied run folder must name that parent's fixed staff ID.
+A dispatch link supplies dispatch detail only.
+Current membership comes from the staff parent, rather than the presence of a record.
 `worker_state.worker_record_path` resolves the staff member before it selects the slot file.
 `worker_admission.parent` reads the run owner from the state file.
 
@@ -666,10 +678,19 @@ An account move resumes an open or stopped worker in its same pane and closes no
 Restore reopens only workers with active dispatches.
 Idle workers stay closed until their next assign.
 Account moves preserve closed idle workers.
+After restore, the command lists completed passes in open phases, newest first.
+Each line gives the current worker name, phase, dispatch id, and reply path.
+The reader uses recorder passes and history events without adding a record.
+Each finished event retains the saved reply path before another dispatch replaces its pass.
+A missing saved reply path prints `unavailable`.
+Repeated restore calls list the same results while their phases remain open.
+The director applies `<RestartTakeover/>` from `docs/direct/restart_takeover.md` before repeating work.
 
 ## Worker account display
 
 `worker.py list all --json` gives each retained worker its name, fixed id, current session, state, role and activity.
+JSON rows also give `dispatch_id`, `run_path`, `completion_state`, and `reply_path` from the newest recorder pass.
+Missing dispatch evidence uses empty strings and `completion_state: "unknown"`.
 It computes `work`, `account` and `home` when it reads each worker.
 It stores none of these three fields.
 `worker_panes.worker_state` supplies `work` as `idle`, `busy` or `unknown`.

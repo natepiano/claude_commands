@@ -239,7 +239,7 @@ Run files keep staff references instead of copied native identities.
   An empty registry effort prevents the caller's environment from supplying another effort.
   A continued worker keeps its effort.
   The module records the dispatch role before delivery.
-- The [Claude coordinator](long-lived-workers.md#claude-coordinator-and-friends) proves the running session before publication and delivery.
+- The [Claude coordinator](long-lived-workers.md#claude-coordinator) proves the running session before publication and delivery.
 
 - When a worker leaves its summary file empty, `scripts/direct/claude_worker.py` writes a summary from the pane log in the assign process.
   It decodes UTF-8 with replacement.

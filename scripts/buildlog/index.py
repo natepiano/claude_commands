@@ -1165,7 +1165,7 @@ def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead)
         except FileNotFoundError:
             remove_index(path)
         else:
-            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+            if path.name == LEGACY_INDEX_NAME or changed.st_mtime < cutoff:
                 remove_index(path)
 
 

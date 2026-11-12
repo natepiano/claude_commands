@@ -148,31 +148,27 @@ def _save_producer_reservation(request: ProducerFirstStart, pending: PendingProd
 
 
 def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
-    """Find live named conversations and unresolved agents in labeled producer panes."""
+    """Find producer conversations through their current native identities."""
     from scripts.message import codex_daemon
 
     panes = client.panes()
-    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
-    spaces = {row.get("workspace_id") for row in client.listed("workspace") if row.get("label") == workspace}
-    tabs = {row.get("tab_id") for row in client.listed("tab") if row.get("label") == name}
-    conflicts: list[tuple[str, str]] = []
-    for pane in panes:
-        if pane["workspace_id"] not in spaces or not (pane.get("label") == name or pane.get("tab_id") in tabs):
-            continue
-        identity = pane["session_id"] or "unidentified"
-        try:
-            info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
-                                     "named producer process info")
-            kinds = producer_pane_kinds(info)
-            if not kinds:
-                continue
-            if len(kinds) == 1:
-                identity = client.producer_admission_launch(pane["pane_id"], kinds[0])["session_id"]
-        except (OSError, ValueError, herdr_types.HerdrFailure):
-            pass
-        conflicts.append((identity, pane["pane_id"]))
     membership = staff.initial_snapshot()
     member = next((row for row in membership.find(kind="producer") if row.name == name), None)
+    entries = pane_record.read(client.session)
+    references = pane_launch.named_references(name, membership, entries)
+    evidence = pane_launch.NativePaneEvidence(panes, client.scan_row_panes(membership, [dict(pane) for pane in panes]))
+    conflicts: list[tuple[str, str]] = []
+    for reference in references:
+        if isinstance(reference, pane_launch.StaffLaunchReference):
+            owner = membership.by_id(reference.id)
+            if owner is None or owner.kind != "producer":
+                continue
+            identity = str(owner.current_session)
+        else:
+            identity = reference.session
+        for pane in pane_launch.reference_panes(reference, membership, client, entries, evidence=evidence):
+            if pane_launch.native_sessions(client, pane):
+                conflicts.append((identity, str(pane["pane_id"])))
     named: list[tuple[str, tuple[int, ...]]] = [
         (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions()
         if member is not None and row["sessionId"] == member.current_session]
@@ -457,48 +453,25 @@ def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_N
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
     membership = (LaunchNames.read() if isinstance(names, LaunchNamesNotRead) else names).tab_record
-    owner = membership.by_member_reference(session)
-    if owner is None:
-        owners = [row for row in membership.rows if row.name == session]
-        owner = owners[0] if len(owners) == 1 else None
-    if owner is not None:
-        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id), membership, client, entries)
-        if len(matches) > 1:
-            raise ValueError(f"{session}: several tabs match")
-        if not matches:
-            return SessionNotFound(session)
-        pane = matches[0]
-        return herdr.TabSession(str(pane["pane_id"]), str(pane.get("label") or ""),
-                               str(pane.get("workspace_id", "")), str(owner.current_session))
-    tabs: list[herdr.TabSession] = []
-    for pane in client.panes():
-        identity = pane["session_id"]
-        entry = entries.get(pane["pane_id"])
-        reference = pane_launch.launch_reference(entry, membership) if entry is not None else pane_launch.NativeLaunchReference("")
-        owner = membership.by_id(reference.id) if isinstance(reference, pane_launch.StaffLaunchReference) else None
-        if isinstance(reference, pane_launch.StaffLaunchReference) and owner is None:
-            continue
-        saved_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry) if entry is not None else ""
-        label = pane.get("label") or ""
-        if entry is not None and saved_identity != identity and (
-                session in (pane_launch.reference_id(entry), saved_identity) or session == label):
-            if identity:
-                live = herdr.read_conversation(identity)
-                if isinstance(live, herdr.UnknownConversation):
-                    herdr.conversation_note(live)
-                if isinstance(live, herdr.LiveConversation):
-                    continue  # A saved entry cannot displace another running conversation.
-            identity = saved_identity
-        tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
-    matches = [tab for tab in tabs if tab.session_id == session]
-    if not matches:
+    references = pane_launch.named_references(session, membership, entries)
+    if not references:
         try:
             _ = staff.native_id(session)
         except staff.StaffRefused:
-            matches = [tab for tab in tabs if tab.label == session]
-    if len(matches) > 1:
+            return SessionNotFound(session)
+        references.add(pane_launch.NativeLaunchReference(session))
+    tabs: dict[str, herdr.TabSession] = {}
+    for reference in references:
+        owner = membership.by_id(reference.id) if isinstance(reference, pane_launch.StaffLaunchReference) else None
+        identity = str(owner.current_session) if owner is not None else (
+            reference.session if isinstance(reference, pane_launch.NativeLaunchReference) else "")
+        for pane in pane_launch.reference_panes(reference, membership, client, entries):
+            pane_id = str(pane["pane_id"])
+            tabs[pane_id] = herdr.TabSession(pane_id, str(pane.get("label") or ""),
+                str(pane.get("workspace_id", "")), identity)
+    if len(tabs) > 1:
         raise ValueError(f"{session}: several tabs match")
-    return matches[0] if matches and matches[0].session_id else SessionNotFound(session)
+    return next(iter(tabs.values())) if tabs else SessionNotFound(session)
 
 
 def _same_process(pid: int, started: str) -> bool:
@@ -550,10 +523,23 @@ def _record_launches(selected: list[str]) -> None:
     try:
         client = herdr.Herdr(herdr.shared_session())
         entries = pane_record.read(client.session)
+        record = staff.initial_snapshot()
+        references = {reference for name in selected for reference in pane_launch.named_references(name, record, entries)}
+        identities = set(selected)
+        for reference in references:
+            if isinstance(reference, pane_launch.StaffLaunchReference):
+                owner = record.by_id(reference.id)
+                if owner is not None:
+                    identities.add(str(owner.current_session))
+            else:
+                identities.add(reference.session)
+        locations = {pane for pane, entry in entries.items()
+                     if pane_launch.launch_reference(entry, record) in references}
+        retained_references = {pane_launch.launch_reference(entry, record) for entry in entries.values()}
+        locations.update(str(pane["pane_id"]) for reference in references - retained_references
+            for pane in pane_launch.reference_panes(reference, record, client, entries))
         def selected_pane(pane: herdr.PaneIdentity) -> bool:
-            entry = entries.get(pane["pane_id"])
-            return (pane["session_id"] in selected or pane.get("label") in selected
-                    or entry is not None and pane_launch.reference_id(entry) in selected)
+            return pane["pane_id"] in locations or pane["session_id"] in identities
         with _launch_note_output, redirect_stdout(StringIO()):
             _ = pane_record.seed(client.session, select=selected_pane)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
@@ -681,19 +667,37 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
             record = staff.StaffSnapshot(())
         member = record.by_member_reference(session)
         if member is None:
-            producers = [row for row in record.rows if row.kind == "producer" and row.name == session]
-            if len(producers) == 1:
-                member = producers[0]
+            members = [row for row in record.rows if row.name == session]
+            if len(members) == 1:
+                member = members[0]
         if member is not None:
             return member.current_session
         registered = {row["sessionId"] for row in sessions.running_sessions()
-                      if session in (row["sessionId"], row["name"])}
+                      if session == row["sessionId"]}
         if len(registered) > 1:
             return StopFailed(session, f"{session}: several live sessions match")
         if registered:
             return registered.pop()
-        tab = _tab_of(session)
-        return tab.session_id if isinstance(tab, herdr.TabSession) and tab.session_id else SessionNotFound(session)
+        entries = pane_record.read(herdr.shared_session())
+        references = pane_launch.named_references(session, record, entries)
+        identities: set[str] = set()
+        panes = herdr.Herdr(herdr.shared_session()).panes() if references else []
+        for reference in references:
+            if isinstance(reference, pane_launch.StaffLaunchReference):
+                owner = record.by_id(reference.id)
+                if owner is not None:
+                    identities.add(str(owner.current_session))
+                continue
+            locations = {pane for pane, entry in entries.items()
+                         if pane_launch.launch_reference(entry, record) == reference}
+            if any(pane["pane_id"] in locations and pane["session_id"]
+                   and pane["session_id"] != reference.session
+                   and isinstance(herdr.read_conversation(pane["session_id"]), herdr.LiveConversation) for pane in panes):
+                continue
+            identities.add(reference.session)
+        if len(identities) > 1:
+            return StopFailed(session, f"{session}: several tabs match")
+        return identities.pop() if identities else SessionNotFound(session)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return StopFailed(session, str(error))
 
@@ -1047,22 +1051,13 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
 
 
 def _codex_name_ids(name: str) -> list[str]:
-    """Keep a UUID or read exact names from the shared Codex index."""
+    """Accept an explicit native ID without reading Codex display names."""
     from scripts.production import staff
 
     try:
         _ = staff.native_id(name)
         return [name]
     except staff.StaffRefused:
-        pass
-    try:
-        entries = [cast(dict[str, str], json.loads(line))
-                   for line in (agent_accounts.codex_home() / "session_index.jsonl").read_text().splitlines() if line.strip()]
-        return sorted({entry["id"] for entry in entries if entry.get("thread_name") == name})
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as error:
-        print(f"{name}: index anomaly: {error}", file=sys.stderr)
         return []
 
 
@@ -1299,7 +1294,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 message += "\n" + detached
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own, detached=detached) if (kind != "codex" or row is not None) and (
+                                     workers=workers, own_pass=own, unit=row, detached=detached) if (kind != "codex" or row is not None) and (
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
@@ -1482,12 +1477,6 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         or row is not None and record.by_member_reference(pane_launch.reference_id(entry)) == row) else None
     environment = entry["environment"] if entry else {}
     name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
-    try:
-        tab = _tab_of(identity)
-        if isinstance(tab, herdr.TabSession):
-            name = tab.label or name
-    except (OSError, ValueError, herdr_types.HerdrFailure):
-        pass  # The saved launch name still identifies a session whose pane is gone.
     name = name or identity
     unit = row.name if row is not None and row.kind == "unit" else ""
     if unit:

@@ -1,15 +1,19 @@
 """Terminal-cell layout shared by text output and the queue pane."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import re
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
+from types import MappingProxyType
 from scripts.lib.terminal_cells import terminal_width
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import RunningStep, WaitingStep
     from scripts.lib.build_steps import StepNames
+    from scripts.message.unit_labels import UnitLabels
+
+NO_UNIT_LABELS: Mapping[str, UnitLabels] = MappingProxyType({})
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -42,14 +46,25 @@ def field(text: str) -> str:
     return " ".join(text.split())
 
 
-def step_text(step: WaitingStep | RunningStep, names: StepNames) -> str:
-    """Show the project with the step's shown name when the project is known."""
-    return field(f"{step.project} {names.shown(step.step)}")
+def step_owner_name(step: WaitingStep | RunningStep, labels: Mapping[str, UnitLabels]) -> str:
+    """Use the recorded unit before the repository name."""
+    identity = labels.get(step.session_id)
+    unit = step.unit or (identity.unit if identity is not None else "")
+    if identity is not None:
+        unit = unit.removeprefix(identity.showrunner + "-")
+    return unit if unit not in ("", "—", "owner not recorded") else step.project
 
 
-def step_prose(step: WaitingStep | RunningStep, names: StepNames) -> str:
-    """Show the project with the step's sentence name when the project is known."""
-    return field(f"{step.project} {names.prose(step.step)}")
+def step_text(step: WaitingStep | RunningStep, names: StepNames, *,
+              labels: Mapping[str, UnitLabels] = NO_UNIT_LABELS) -> str:
+    """Show the owner unit with the step's shown name."""
+    return field(f"{step_owner_name(step, labels)} {names.shown(step.step)}")
+
+
+def step_prose(step: WaitingStep | RunningStep, names: StepNames, *,
+               labels: Mapping[str, UnitLabels] = NO_UNIT_LABELS) -> str:
+    """Show the owner unit with the step's sentence name."""
+    return field(f"{step_owner_name(step, labels)} {names.prose(step.step)}")
 
 
 def age(since: float, now: float) -> int:

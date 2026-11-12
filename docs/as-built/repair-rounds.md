@@ -117,7 +117,9 @@ Work moved to another phase is not saved work.
 `progress_history.py check-launch` and `start-pass` check the named open phase and the prompt's first `Phase <id> — <title>` line.
 A recorded launch needs `--phase-id`.
 A fix needs a ledger batch in flight, a landed batch awaiting review, or an explicit `--fix-cause`.
-The launcher records `worker_name` for recovery.
+The launcher records `worker_id` for recovery.
+Current names come from staff when the run has a fixed owner.
+Historical events retain the event-time worker name.
 The director records phase boundaries before the next phase's first dispatch.
 Historical boundaries that are missing remain uncertain.
 

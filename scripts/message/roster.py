@@ -71,6 +71,21 @@ KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
 MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
 
 
+@dataclass(frozen=True)
+class AllRosterSessions:
+    """Read every session for discovery."""
+
+
+@dataclass(frozen=True)
+class MessageParticipants:
+    """Read worker details for a proved recipient and its sender."""
+
+    native_ids: frozenset[str]
+
+
+ALL_ROSTER_SESSIONS = AllRosterSessions()
+
+
 from scripts.message.unit_labels import (
     staff_relationships,
     UnderShowrunner as UnderShowrunner,
@@ -982,14 +997,17 @@ def _ledger_workers(
     workers: dict[str, _WorkerPlace] = {}
     records_list = list(records)
     owner_runs: dict[staff.StaffId, list[str]] = {}
+    scanned: dict[str, list[str]] = {}
     for run in sorted(runs, key=lambda run: (isinstance(run.director, _NoRunningDirector),
                                              not (run.path / unit_runs.STATE_FILE).exists())):
         for member in _worker_ledger(run, problems, membership):
             owner = membership.parent_of(member)
             if owner is not None:
                 if owner.id not in owner_runs:
+                    if not owner_runs:
+                        scanned = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=membership)
                     owner_runs[owner.id] = unit_runs.held(owner.current_session, os.environ.get("ROSTER_RUN_ROOT"),
-                                                        record=membership)
+                                                        record=membership, scanned=scanned)
                 preferred = owner_runs[owner.id]
                 if preferred and run.path.resolve() != Path(preferred[0]).resolve():
                     continue
@@ -1185,23 +1203,34 @@ def _unit_workers(
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
     membership: staff.StaffSnapshot,
     records: list[SessionRecord],
+    participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS,
 ) -> tuple[list[RosterEntry], set[str]]:
-    try:
-        table = process_table.snapshot()
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        _problem(problems, "process table", error)
-        table = {}
+    table: dict[int, process_table.Process] = {}
+    if isinstance(participants, AllRosterSessions):
+        try:
+            table = process_table.snapshot()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _problem(problems, "process table", error)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
     role_log = _role_log()
     try:
         parents = session_staff.pane_parents(membership)
+        selected_workers = membership.find(kind="worker")
+        if isinstance(participants, MessageParticipants):
+            selected_workers = [row for row in selected_workers if row.current_session in participants.native_ids]
+            parent_ids = {row.parent.id for row in selected_workers if isinstance(row.parent, staff.ReportsTo)}
+            parents = [parent for parent in parents if parent.id in parent_ids]
         if parents:
             from scripts.herdr import worker_panes
 
-            observations = worker_panes.observe_parents(parents, membership)
+            observations = (worker_panes.observe_parents(parents, membership,
+                                selection=worker_panes.SelectedWorkerRows(frozenset(row.id for row in selected_workers)))
+                            if isinstance(participants, MessageParticipants)
+                            else worker_panes.observe_parents(parents, membership))
+            scanned = worker_panes.parent_run_index(membership)
             for parent in parents:
-                run = worker_panes.worker_run(parent, record=membership)
+                run = worker_panes.worker_run(parent, record=membership, scanned=scanned)
                 for state in observations[parent.id]:
                     row = state.row
                     backend = membership.backends.get(row.id)
@@ -1235,6 +1264,9 @@ def _unit_workers(
                         else AccountUnread("worker account not read")))
     except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
         _problem(problems, "pane workers", error)
+    # Blind review rows have no native address and cannot identify either participant.
+    if isinstance(participants, MessageParticipants):
+        return entries, worker_threads
     names_by_pid = {record["pid"]: member.name for record in records
                     if (member := membership.by_current_session(record["sessionId"])) is not None}
     for run in runs:
@@ -1284,7 +1316,8 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 
 
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
-                       worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None) -> Roster:
+                       worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None,
+                       participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     """Use the reported session or the pane process to address Codex."""
     membership = staff.initial_snapshot() if membership is None else membership
     entries: list[RosterEntry] = []
@@ -1326,6 +1359,9 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                         pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                     pass
+            if isinstance(participants, MessageParticipants) and (
+                    not isinstance(thread, CodexThread) or thread.thread_id not in participants.native_ids):
+                continue
             process = codex_processes.get(HerdrPlace(name, pane))
             if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
                 continue
@@ -1351,7 +1387,8 @@ def machine_name() -> str:
 @herdr.observation_snapshot()
 @herdr.pane_snapshot()
 def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
-                  registry: RegistryRead) -> Roster:
+                  registry: RegistryRead,
+                  participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
@@ -1373,7 +1410,12 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems, record=membership)
-    workers = _ledger_workers(runs, records, problems, membership)
+    ledger_records = ([record for record in records if record["sessionId"] in participants.native_ids]
+                      if isinstance(participants, MessageParticipants) else records)
+    ledger_workers = {row.current_session for row in membership.find(kind="worker")}
+    workers = (_ledger_workers(runs, ledger_records, problems, membership)
+               if isinstance(participants, AllRosterSessions)
+               or any(record["sessionId"] in ledger_workers for record in ledger_records) else {})
     production_places: dict[str, _ProductionPlace] = {}
     try:
         production_places = _production_places(
@@ -1388,7 +1430,7 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
     )
     unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems,
-        home_state=home_state, membership=membership, records=records
+        home_state=home_state, membership=membership, records=records, participants=participants
     )
     durable_roles, durable_threads = _durable_roles(machine, claude, warnings, membership=membership)
     unit_workers = [entry for entry in unit_workers
@@ -1419,8 +1461,10 @@ def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnap
             )
             for session in daemon
             if session.thread_id not in worker_threads
+            and (isinstance(participants, AllRosterSessions) or session.thread_id in participants.native_ids)
         )
-    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered), worker_threads=worker_threads, membership=membership)
+    interactive = _herdr_codex_panes(machine, (runner["name"] for runner in registered),
+                                    worker_threads=worker_threads, membership=membership, participants=participants)
     problems.extend(interactive.problems)
     excluded = diagnostics.excluded_sessions
     claude = {key: entry for key, entry in claude.items() if key not in worker_threads}
@@ -1470,7 +1514,8 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 @role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope, *,
-           membership: staff.StaffSnapshot | None = None, registry: RegistryRead | None = None) -> Roster:
+           membership: staff.StaffSnapshot | None = None, registry: RegistryRead | None = None,
+           participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
     problems: list[str] = []
     try:
         membership = staff.initial_snapshot() if membership is None else membership
@@ -1481,13 +1526,13 @@ def roster(environment: Mapping[str, str], scope: RosterScope, *,
     registry = sessions.read_registry() if registry is None else registry
     match scope:
         case ThisMachine():
-            local = _local_roster(environment, membership=membership, registry=registry)
+            local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
             local.problems[:0] = problems
             return local
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment, membership=membership, registry=registry)
+                local = _local_roster(environment, membership=membership, registry=registry, participants=participants)
                 local.problems[:0] = problems
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],

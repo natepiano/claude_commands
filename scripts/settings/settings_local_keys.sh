@@ -37,21 +37,34 @@ def local_hooks: with_entries(.value |= map(select(local_hook))) | with_entries(
 def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));
 def local_plugin: .key as \$k | ${SETTINGS_LOCAL_MARKETPLACES_JSON} | any(. as \$m | \$k | endswith(\"@\" + \$m));"
 
-# Remove local values and sort shared hook events.
+# Remove local values and retain HEAD's object order.
 # The clean filter uses this program.
 # shellcheck disable=SC2034
 SETTINGS_LOCAL_KEYS_STRIP='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
+def committed_order($reference):
+  if type == "object" then
+    . as $live
+    | (if ($reference | type) == "object" then $reference else {} end) as $head
+    | reduce (($head | keys_unsorted[]),
+              ($live | keys_unsorted[] | select(. as $key | $head | has($key) | not))) as $key
+        ({}; if $live | has($key) then .[$key] = ($live[$key] | committed_order($head[$key])) else . end)
+  elif type == "array" then
+    if ($reference | type) == "array" then
+      to_entries | map(. as $entry | $entry.value | committed_order($reference[$entry.key]))
+    else map(committed_order(null)) end
+  else . end;
 with_entries(select(.key | local_key | not))
 | if has("hooks") then
     (.hooks | length) as $before
-    | .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries)
+    | .hooks |= shared_hooks
     | if $before > 0 and (.hooks | length) == 0 then del(.hooks) else . end
   else . end
 | if has("enabledPlugins") then
     (.enabledPlugins | length) as $before
     | .enabledPlugins |= with_entries(select(local_plugin | not))
     | if $before > 0 and (.enabledPlugins | length) == 0 then del(.enabledPlugins) else . end
-  else . end'
+  else . end
+| if $ARGS.named.committed == null then . else committed_order($ARGS.named.committed) end'
 
 # jq: keep only the local-only keys of an object, plus its local hook groups.
 SETTINGS_LOCAL_KEYS_PICK='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
@@ -113,7 +126,11 @@ settings_local_keys_snapshot() {
     settings="$1"
     sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
     [[ -f "$settings" ]] || return 0
-    baseline="$(settings_local_keys_baseline)" || return 1
+    if [[ $# -ge 2 ]]; then
+        baseline="$2"
+    else
+        baseline="$(settings_local_keys_baseline)" || return 1
+    fi
     snapshot="$(jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_PICK" "$settings")" || return 1
     if [[ "$snapshot" == "{}" && ! -e "$sidecar" ]]; then
         return 0

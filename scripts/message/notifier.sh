@@ -57,7 +57,7 @@ write_conf() {
     [[ -n ${conf[COMMAND]:-} ]] && print -r -- "COMMAND=${conf[COMMAND]}"
     [[ -n ${conf[PROMPT]:-} ]] && print -r -- "PROMPT=${conf[PROMPT]}"
     [[ -n ${conf[RUN]:-} ]] && print -r -- "RUN=${conf[RUN]}"
-    print -r -- "FROM=${conf[FROM]}"
+    [[ ${conf[PROMPT]:-} != scheduled ]] && print -r -- "FROM=${conf[FROM]}"
     print -r -- "CHECK=${conf[CHECK]:-}"
     print -r -- "HOLD=${conf[HOLD]}"
     print -r -- "ALIGN=${conf[ALIGN]:-0}"
@@ -222,7 +222,7 @@ cmd_state() {
 # Claim before checking or sending. A concurrent tick or manual fire cannot
 # claim the same scheduled slot twice.
 instance_tick() {
-  local name=$1 forced=$2 show_next=$3 dir lock_fd fired result rc socket prompt
+  local name=$1 forced=$2 show_next=$3 dir lock_fd fired result rc socket prompt sender
   local check_pid watchdog_pid timeout_marker
   local -a check_words run_words send_args
   typeset -A conf state
@@ -319,12 +319,20 @@ instance_tick() {
   fi
 
   if [[ ${conf[PROMPT]:-} == scheduled ]]; then
-    prompt=$("$PY" "${SCRIPT:h:h}/production/update_registration.py" prompt --owner "${conf[TARGET]#session:}" 2>&1)
+    prompt=$("$PY" "${SCRIPT:h:h}/production/update_registration.py" delivery --owner "${conf[TARGET]#session:}" 2>&1)
     rc=$?
     if (( rc != 0 )); then
       print -u2 -r -- "notifier.sh: scheduled prompt failed for $name: ${(j: :)${(f)prompt}}"
       return 0
     fi
+    if [[ $prompt != *$'\n'* || -z ${prompt#*$'\n'} ]]; then
+      print -u2 -r -- "notifier.sh: scheduled prompt failed for $name: empty prompt or missing sender separator"
+      return 0
+    fi
+    sender=${prompt%%$'\n'*}
+    prompt=${prompt#*$'\n'}
+  else
+    sender=${conf[FROM]}
   fi
 
   zsystem flock -f lock_fd "$dir/lock" || { log_error "lock failed: $name"; return 1; }
@@ -334,7 +342,7 @@ instance_tick() {
   write_state
   zsystem flock -u "$lock_fd"
 
-  send_args=(--to "uds:$socket" --from "${conf[FROM]}" --key "notifier-$name" --summary 'scheduled update' --timeout "${conf[TIMEOUT]}")
+  send_args=(--to "uds:$socket" --from "$sender" --key "notifier-$name" --summary 'scheduled update' --timeout "${conf[TIMEOUT]}")
   if [[ -n ${conf[COMMAND]:-} ]]; then
     send_args+=(--text "${conf[COMMAND]}")
   else

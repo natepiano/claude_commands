@@ -489,7 +489,8 @@ def remove_stray_producer(name: str, session: str) -> int:
         processes: list[ProvedStrayProcess] = []
         if isinstance(observed, herdr.LiveConversation):
             conflicts = stop_resume.producer_conflicts(name, client)
-            if not any(found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
+            if not admission_matches and not any(
+                    found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
                 raise ValueError(f"{identity}: session has no producer name or pane proof for {name}")
             for pid in observed.pids:
                 native = herdr.native_process(pid, observed.kind)
@@ -2019,8 +2020,16 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 _ = staff.rename(row.id, bare)
                 changed = True
                 continue
-            if not isinstance(observed, worker_panes.ClosedWorker) or any(
-                    pane.get("label") in (row.name, worker_panes.agent_name(owner, row.name)) for pane in client.panes()):
+            if not isinstance(observed, worker_panes.ClosedWorker):
+                print(pair + "the old pane is not closed", file=sys.stderr)
+                continue
+            try:
+                entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+                retained = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client, entries)
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+                print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
+                continue
+            if retained:
                 print(pair + "the old pane is not closed", file=sys.stderr)
                 continue
             runs = [Path(run) for run in unit_runs.held(str(owner.current_session),

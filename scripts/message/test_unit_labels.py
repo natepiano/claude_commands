@@ -20,6 +20,28 @@ if TYPE_CHECKING:
 
 
 class FileOnlyLabelTests(unittest.TestCase):
+    def test_recorded_owner_without_a_parent_shows_its_session_name(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            member = fixture_member("producer", name="solo")
+            with mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
+                labels = unit_labels.unit_labels_for([member.current_session], {})
+            self.assertEqual(labels[member.current_session], unit_labels.UnitLabels("solo"))
+            self.assertEqual(labels[member.current_session].owner_text, "solo")
+
+    def test_recorded_unit_labels_survive_a_missing_session_registry_entry(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="demo", parent=runner.id)
+            with mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
+                labels = unit_labels.unit_labels_for([unit.current_session], {})
+            self.assertEqual(labels[unit.current_session], unit_labels.UnitLabels("demo", "hana", "demo"))
+
     def test_docless_holder_labels_stay_silent_across_repeated_reads(self) -> None:
         from scripts.message import unit_labels
         from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -116,7 +138,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
             def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.TimerRegistration:
@@ -196,7 +218,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
                 timer_path = timers / f"showrunner-{owner_id}"
                 timer_path.mkdir(parents=True)
                 _ = (timer_path / "conf").write_text(
@@ -242,7 +264,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("private fixture")),

@@ -95,6 +95,22 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertEqual(inventory, cache.tip(commit).entries)
         contents = dict(style_ledger.blob_contents(self.repo, {path: inventory[path].object}))
         self.assertEqual(contents[path], (self.repo / path).read_bytes())
+        # These blob contents share a four-digit object prefix.
+        first, second = ("126", "337") if len(tree) == 64 else ("142", "784")
+        self.write("ambiguous-first", first)
+        self.write("ambiguous-second", second)
+        ambiguous = self.git("hash-object", "-w", "ambiguous-first")[:4]
+        _ = self.git("hash-object", "-w", "ambiguous-second")
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        for name, revision in (("missing", "missing-revision"), ("non-commit", tree),
+                               ("ambiguous", ambiguous), ("range", "HEAD..HEAD")):
+            with self.subTest(revision=name):
+                with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                    _ = read_tip(self.repo, revision)
+                if name != "range":
+                    self.assertEqual(refused.exception.status, 128)
+                if name == "ambiguous":
+                    self.assertIn("is ambiguous", refused.exception.stderr)
 
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")

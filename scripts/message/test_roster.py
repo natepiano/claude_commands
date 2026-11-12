@@ -28,7 +28,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import staff, session_staff
 from scripts.whoami import agent_accounts
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.herdr import worker_panes
@@ -592,7 +592,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         row = staff.StaffRow(
             staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Staff owner", staff.StaffRoot(),
-            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
         )
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
             result, _, errors = self._run_main("--json")
@@ -612,7 +612,7 @@ class RosterTests(unittest.TestCase):
             with self.subTest(parent=parent):
                 row = staff.StaffRow(
                     staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.ReportsTo(parent),
-                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
                 )
                 with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
                     result, lines, errors = self._run_main("--json")
@@ -1216,6 +1216,41 @@ class RosterTests(unittest.TestCase):
 
         self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
         self.assertEqual(read.call_count, 1)
+
+    def test_each_roster_shares_run_scans_across_worker_parents(self) -> None:
+        self.assertGreater(len(session_staff.pane_parents(staff.snapshot())), 1)
+        with mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scan:
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    entries = self._entries()
+                    self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
+                    self.assertEqual(scan.call_count, 2 * (attempt + 1))
+
+    def test_message_participants_keep_the_full_roster_rows_and_select_one_worker(self) -> None:
+        full = self._entries()
+        sender, recipient = full["alpha-impl"], full["unit-one"]
+        assert isinstance(sender.thread, roster.CodexThread)
+        assert isinstance(recipient.session, roster.ClaudeSession)
+        identities = frozenset((sender.thread.thread_id, recipient.session.session_id))
+        record = staff.snapshot()
+        worker = record.by_current_session(sender.thread.thread_id)
+        assert worker is not None
+        expected_parent = record.parent_of(worker)
+        assert expected_parent is not None
+        with (mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
+              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("unrelated reviewer process scan")),
+              mock.patch.object(worker_panes, "observe_parents", wraps=worker_panes.observe_parents) as observe):
+            focused = roster.roster(os.environ, roster.ThisMachine(), membership=record,
+                                    participants=roster.MessageParticipants(identities))
+        def selected(entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+            return [entry for entry in entries
+                    if isinstance(entry.thread, roster.CodexThread) and entry.thread.thread_id in identities
+                    or isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id in identities]
+        self.assertEqual(selected(focused.entries), selected(list(full.values())))
+        observe.assert_called_once()
+        parents = cast(list[staff.StaffRow], observe.call_args.args[0])
+        self.assertEqual([parent.id for parent in parents], [expected_parent.id])
+        self.assertEqual(observe.call_args.kwargs["selection"], worker_panes.SelectedWorkerRows(frozenset((worker.id,))))
 
 
     def test_display_rename_keeps_record_keys_and_adds_a_structured_job(self) -> None:

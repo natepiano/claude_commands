@@ -50,7 +50,7 @@ class FailedLookupTests(unittest.TestCase):
         runner = staff.StaffRow(staff.StaffId(fixture_runtime_id("builds-id")), "showrunner", "builds", staff.ReportsTo(top.id),
                                current_session=staff.StaffId(fixture_runtime_id("builds-current")))
         unit = staff.StaffRow(staff.StaffId(fixture_runtime_id("queue-id")), "unit", "queue", staff.ReportsTo(runner.id),
-                             current_session=staff.StaffId(fixture_runtime_id("queue-current")))
+                             current_session=staff.StaffId(fixture_runtime_id("queue-current")), unit_type=staff.UnitDetails("direct"))
         worker = staff.StaffRow(staff.StaffId(fixture_runtime_id("test-id")), "worker", "test", staff.ReportsTo(unit.id),
                                current_session=staff.StaffId(fixture_runtime_id("test-current")))
         agent = staff.StaffRow(staff.StaffId(fixture_runtime_id("agent-id")), "producer", "analyst", staff.StaffRoot(),
@@ -58,7 +58,7 @@ class FailedLookupTests(unittest.TestCase):
         other = staff.StaffRow(staff.StaffId(fixture_runtime_id("other-id")), "showrunner", "other", staff.StaffRoot(),
                               current_session=staff.StaffId(fixture_runtime_id("other-current")))
         other_unit = staff.StaffRow(staff.StaffId(fixture_runtime_id("other-queue-id")), "unit", "queue",
-                                   staff.ReportsTo(other.id), current_session=staff.StaffId(fixture_runtime_id("other-queue-current")))
+                                   staff.ReportsTo(other.id), current_session=staff.StaffId(fixture_runtime_id("other-queue-current")), unit_type=staff.UnitDetails("direct"))
         other_worker = staff.StaffRow(staff.StaffId(fixture_runtime_id("other-test-id")), "worker", "other-test",
                                      staff.ReportsTo(other_unit.id), current_session=staff.StaffId(fixture_runtime_id("other-test-current")))
         _ = staff_file.write_text(json.dumps({

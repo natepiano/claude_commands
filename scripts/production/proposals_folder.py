@@ -27,12 +27,13 @@ def ledger(doc: Path) -> Path | None:
         return None
 
 
-def issues_folder(doc: Path) -> Path | None:
+def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
     """Return the configured folder, or None when the document has no proposals field."""
-    try:
-        lines = doc.read_text(encoding="utf-8").splitlines()
-    except UnicodeError as error:
-        raise OSError(f"{doc}: {error}") from error
+    if lines is None:
+        try:
+            lines = doc.read_text(encoding="utf-8").splitlines()
+        except UnicodeError as error:
+            raise OSError(f"{doc}: {error}") from error
     try:
         folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
     except Refusal:
@@ -72,16 +73,16 @@ def proposer(issue: Issue) -> str:
     return issue.value("proposed_by")
 
 
-def proposal_issues(doc: Path) -> list[Issue]:
+def proposal_issues(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
-    if folder is None or not folder.is_dir():
+    if folder is None or (sources is None and not folder.is_dir()):
         return []
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if issue.value("record_type") != "question"]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG, sources=sources) if issue.value("record_type") != "question"]
 
 
-def open_proposals(doc: Path) -> list[Issue]:
+def open_proposals(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues in the production's folder that are its own. Staff is read only when issues exist."""
-    found = proposal_issues(doc)
+    found = proposal_issues(doc, sources=sources)
     names = owners(doc) if found else frozenset[str]()
     return [issue for issue in found if proposer(issue) in names]

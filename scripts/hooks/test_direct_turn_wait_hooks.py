@@ -117,14 +117,18 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         owner = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         owner = staff.update_current_session(owner.id, staff.native_id(SESSION))
         _ = staff.set_run(owner.id, staff.OpenRun(run))
+        state["owner_staff_id"] = owner.id
+        _ = (run / "progress_history_state.json").write_text(json.dumps(state))
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
+            if index:
+                _ = fixture_member("producer", name=name, runtime_id=fixture_runtime_id(f"peer-{index}"))
             connection = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
             address = str(root / f"socket-{index}")
             connection.bind(address)
             _ = (sessions / (f"{os.getpid()}.json" if index == 0 else f"peer-{index}.json")).write_text(json.dumps(
-                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else f"peer-{index}",
+                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else fixture_runtime_id(f"peer-{index}"),
                  "name": name, "messagingSocketPath": address, "updatedAt": 1, "tmux": "", "formerNames": []}))
         _ = (root / "current_socket").write_text("/fixture/showrunner/socket")
         session_lookup = root / "session_lookup.py"
@@ -163,7 +167,7 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
 
 
 class DirectorTurnWaitHookTests(unittest.TestCase):
-    def test_historical_worker_address_alias_matches_its_thread_and_not_its_name(self) -> None:
+    def test_fixed_worker_address_matches_its_current_session(self) -> None:
         with director_wait_fixture() as fixture:
             runs = fixture.root / "unit-runs"
             worker_run = runs / "supplier-run"
@@ -172,8 +176,9 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             worker = fixture_worker("supplier-fix", parent.id,
                                     backend=staff.CodexBackend(fixture.root / "codex"))
             write_text_atomic(worker_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": parent.id}))
+            _ = staff.rename(worker.id, "renamed-supplier")
             fixture.environment["UNIT_RUN_ROOT"] = str(runs)
-            supplier = "worker:supplier-run/supplier-fix"
+            supplier = f"worker:supplier-run/{worker.id}"
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on " + supplier}, 1010)
             fixture.call(PROMPT, {"prompt": fixture.message("Ready", address="codex:another-thread", name=supplier)}, 1020)
             self.assertEqual(len(fixture.wait_events()), 1)
@@ -200,7 +205,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
         for final_line, sender, address in (
             ("blocked: waiting on the showrunner to merge", "showrunner:expected-showrunner", "/fixture/showrunner/socket"),
             ("blocked: waiting on claude-build-followups-other", "claude-build-followups-other", "socket-1"),
-            ("blocked: waiting on session:peer-1", "session:peer-1", "socket-1"),
+            ("blocked: waiting on session:" + fixture_runtime_id("peer-1"), "session:" + fixture_runtime_id("peer-1"), "socket-1"),
         ):
             with self.subTest(final_line=final_line), director_wait_fixture() as fixture:
                 fixture.call(STOP, {"last_assistant_message": final_line}, 1010)

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import unittest
 from scripts.accounts import accounts
+from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.direct import assign_claude_test_support as support
 from scripts.direct.assign_claude_test_support import DIRECT_DIR as DIRECT_DIR
 from scripts.lib.test_models_registry import claude_catalog_environment
-from typing import cast
+from typing import cast, override
 import json
 import os
 import subprocess
@@ -16,6 +17,13 @@ from unittest.mock import patch
 
 
 class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_TIER_ONLY": "1"})))
+        # Keep the fixture entry unchanged for startup hooks and child observations.
+        _ = self.enterContext(patch.object(self, "direct_cli_calls", not process_boundary_for_case(self)))
+
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)
@@ -139,6 +147,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    @process_boundary
     def test_failed_landed_record_leaves_error_status(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -157,6 +166,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         )
         self.assertIn("blocked:", (session_dir / "board.log").read_text(encoding="utf-8"))
 
+    @process_boundary
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
         session_dir, first = self.first_worker_launch()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -195,7 +205,9 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)[name]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)[name]["status"], "completed")
-        self.assertEqual(self.open_passes(session_dir)[name]["worker_name"], name)
+        passed = self.open_passes(session_dir)[name]
+        self.assertEqual(passed["worker_id"], self.recorded_worker(session_dir).id)
+        self.assertNotIn("worker_name", passed)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
         self.assertEqual((self.root / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (self.root / "delivered_message.txt").read_text(encoding="utf-8")
@@ -216,6 +228,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         check = cast(dict[str, object], started["launch_check"])
         self.assertEqual(check["fix_cause"], "retry tests fail after integration")
 
+    @process_boundary
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -234,6 +247,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
             "implemented\n",
         )
 
+    @process_boundary
     def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)

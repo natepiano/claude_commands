@@ -10,22 +10,40 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import cast
 
 from scripts.lib import conf
 from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
 
 PREFIX = "change-review - "
 PRODUCER = "Producer"
 
 
-def configured_lists_directory() -> Path:
-    return Path(conf.read("change_review").text("lists_directory")).expanduser()
+def routing_setting(file: str, key: str, *, sources: list[Path] | None = None) -> str:
+    """Read a routing setting. A collector rejects recovery from an unreadable or invalid source."""
+    settings = conf.read(file)
+    if sources is None:
+        return settings.text(key)
+    sources.append(settings.source)
+    result = settings.origin(key, str)
+    if isinstance(result, conf.UsableLiveValue):
+        return result.value
+    if isinstance(result, conf.RecoveredValue) and not settings.source.exists():
+        return result.value
+    raise ValueError(result.reason)
 
 
-def lists_directory() -> Path:
+def configured_lists_directory(*, sources: list[Path] | None = None) -> Path:
+    return Path(routing_setting("change_review", "lists_directory", sources=sources)).expanduser()
+
+
+def lists_directory(*, sources: list[Path] | None = None) -> Path:
     override = os.environ.get("CHANGE_REVIEW_DIR")
-    return Path(override) if override else configured_lists_directory()
+    if override:
+        return Path(override)
+    return configured_lists_directory() if sources is None else configured_lists_directory(sources=sources)
 
 
 def _is_real_list(review_list: Path, configured_folder: Path) -> bool:
@@ -114,7 +132,9 @@ def production_documents(initial: dict[str, Path], lists: Iterable[tuple[str, st
 class StaffRouting:
     """Read fixed producer identities and staff parent edges."""
 
-    def __init__(self, record: staff.StaffSnapshot, documents: dict[str, Path]) -> None:
+    def __init__(self, record: staff.StaffSnapshot, documents: dict[str, Path], *,
+                 sources: list[Path] | None = None) -> None:
+        self.sources: list[Path] | None = sources
         self.record: staff.StaffSnapshot = record
         self.runners: dict[staff.StaffId, staff.StaffRow] = {
             row.id: row for row in record.rows if row.kind == "showrunner"}
@@ -152,20 +172,41 @@ class StaffRouting:
 
     @cached_property
     def _root(self) -> staff.StaffRow | None:
-        name = conf.read("review_links").text("unrouted_alert_recipient")
+        name = routing_setting("review_links", "unrouted_alert_recipient", sources=self.sources)
         return self.runners_by_name.get(name)
+
+    @cached_property
+    def document_lines(self) -> dict[Path, list[str]]:
+        """Share one document read across list and question routing."""
+        documents: dict[Path, list[str]] = {}
+        for doc in dict.fromkeys(self.documents.values()):
+            if self.sources is not None:
+                self.sources.append(doc)
+            try:
+                documents[doc] = doc.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                if self.sources is not None:
+                    raise
+                continue
+        return documents
 
     @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
+            if self.sources is not None:
+                self.sources.append(doc)
             try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
+                lines = self.document_lines.get(doc, [])
                 listing = Path(production_field(lines, "Change review")).expanduser()
                 for name, known in self.documents.items():
                     if known == doc:
                         paths[name] = listing
-            except (OSError, Refusal):
+            except (OSError, UnicodeError):
+                if self.sources is not None:
+                    raise
+                continue
+            except Refusal:
                 continue
         return paths
 
@@ -232,7 +273,7 @@ class StaffRouting:
     def unrouted(self, review_list: Path, row: dict[str, str], note: str, producer: str) -> UnroutedChange:
         list_owner = self.list_owner(review_list)
         print(f"staff: {note[0].lower() + note[1:]} (change {list_owner}/{row['#']})", file=sys.stderr)
-        if not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
+        if self.sources is None and not row.get("Verdict") and _is_real_list(review_list, self._configured_folder) and self.record.production:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")
@@ -252,25 +293,40 @@ def delivery_path(root: Path, review_list: Path, row: str) -> Path:
     return root / delivery_name(review_list.resolve(), row)
 
 
-def review_root() -> Path:
-    return Path(os.environ.get("REVIEW_LINKS_ROOT") or conf.read("change_review").text("review_links_directory")).expanduser()
+def review_root(*, sources: list[Path] | None = None) -> Path:
+    return Path(os.environ.get("REVIEW_LINKS_ROOT") or routing_setting(
+        "change_review", "review_links_directory", sources=sources)).expanduser()
 
 
-def waits_for_user(review_list: Path, row: dict[str, str], root: Path) -> bool:
-    """Use the shared typed waiting rule."""
+def delivery_slots(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
+    """Read one delivery record. A collector requires valid JSON and complete reads."""
+    if sources is not None:
+        sources.append(path)
     try:
-        slots = delivery_state.decode(delivery_path(root, review_list, row["#"]).read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     except OSError:
-        slots = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+        if sources is not None:
+            raise
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    return (delivery_state.decode_value(cast(object, json.loads(text))) if sources is not None
+            else delivery_state.decode(text))
+
+
+def waits_for_user(review_list: Path, row: dict[str, str], root: Path, *,
+                   sources: list[Path] | None = None) -> bool:
+    """Use the shared typed waiting rule."""
+    slots = delivery_slots(delivery_path(root, review_list, row["#"]), sources=sources)
     return slots.waits_for_user(bool(row.get("Verdict")))
 
 
 def waiting_rows(review_list: Path, rows: list[dict[str, str]],
-                 names: set[str] | None = None) -> list[dict[str, str]]:
+                 names: set[str] | None = None, *, sources: list[Path] | None = None) -> list[dict[str, str]]:
     """Scan delivery names once and open only records that exist."""
-    root = review_root()
+    root = review_root(sources=sources)
     if names is None:
-        names = {path.name for path in root.glob(".review-link-delivery-*")}
+        names = {path.name for path in source_paths(root, ".review-link-delivery-*", sources=sources)}
     resolved = review_list.resolve()
     empty = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     found: list[dict[str, str]] = []
@@ -280,10 +336,7 @@ def waiting_rows(review_list: Path, rows: list[dict[str, str]],
         name = delivery_name(resolved, row["#"])
         slots = empty
         if name in names:
-            try:
-                slots = delivery_state.decode((root / name).read_text(encoding="utf-8"))
-            except OSError:
-                pass
+            slots = delivery_slots(root / name, sources=sources)
         if slots.waits_for_user(False):
             found.append(row)
     return found

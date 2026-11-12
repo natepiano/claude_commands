@@ -241,7 +241,7 @@ class FolderMoveFixture(StaffTestCase):
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
         staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
-        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"), unit_type=staff.UnitDetails("direct"))
 
     @override
     def setUp(self) -> None:
@@ -289,7 +289,7 @@ class FolderMoveFixture(StaffTestCase):
         sibling = pane_record.launch("w1:p2", fixture_runtime_id("folder-move-neighbour"),
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
-        fields: dict[str, object] = {
+        fields: dict[str, object] = {"owner_staff_id": self.owner.id,
             "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
             "branch": "unit-branch", "plan_doc": "plan.md",
             "history_file": str(self.history), "production": "production", "unit": "kept-name",

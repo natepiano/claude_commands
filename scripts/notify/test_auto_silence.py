@@ -62,10 +62,11 @@ class AutoSilenceTests(unittest.TestCase):
                               move: resume_message.NoAccountMove | resume_message.AccountMove = resume_message.NO_ACCOUNT_MOVE,
                               workers: resume_message.ResumeWorkers = resume_message.NO_WORKERS,
                               context: str = "",
-                              own_pass: resume_message.BusyPass | resume_message.NoOwnPass = resume_message.NO_OWN_PASS) -> str:
+                              own_pass: resume_message.BusyPass | resume_message.NoOwnPass = resume_message.NO_OWN_PASS,
+                              unit: staff.StaffRow | None = None) -> str:
             self.assertEqual(cause, "you were stopped and resumed")
             return resume_message.resume_message("the herdr server restarted", move=move,
-                                                  workers=workers, context=context, own_pass=own_pass)
+                                                  workers=workers, context=context, own_pass=own_pass, unit=unit)
 
         for name, identity in (("devtools", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
                                ("models", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):

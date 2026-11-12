@@ -1246,12 +1246,18 @@ def process_start_time(pid: int) -> str | None:
         return None
 
 
+def format_percent(value: float, *, complete: bool = True) -> str:
+    """Round down to one decimal place without showing an early completion."""
+    tenths = math.floor(value * 10)
+    return f"{(tenths if complete else min(tenths, 999)) / 10:.1f}%"
+
+
 def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
-                f"some avg10 {pressure.some_avg10:.1f}; swap {pressure.swap_used_percent:.1f}% used")
+                f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
     if pressure.condition == "swap":
-        return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
+        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 

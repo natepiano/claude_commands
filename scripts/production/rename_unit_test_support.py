@@ -287,7 +287,7 @@ class FolderRenameFixture(StaffTestCase):
         identity = staff.native_id(fixture_runtime_id(f"unit:{parent}:{self.old_name}"))
         return staff.StaffRow(identity, "unit", self.old_name, staff.ReportsTo(parent),
             current_session=staff.native_id(fixture_runtime_id("folder-current-after-clear")),
-            worktree=staff.PresentWorktree(remote.local_machine(), self.source))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.source), unit_type=staff.UnitDetails("direct"))
 
     @override
     def setUp(self) -> None:

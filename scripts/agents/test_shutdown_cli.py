@@ -316,7 +316,8 @@ class RetireUnitTests(unittest.TestCase):
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
+                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
+                            + "# whole: 40..\nunits_table_columns=170\n")
         return path
 
 
@@ -1975,6 +1976,7 @@ class WorkerRenameTests(StaffTestCase):
             TERMINAL_UNKNOWN = "the shell terminal evidence is temporarily incomplete"
             RETIRE_REFUSED = "a live native process prevents retirement"
             CLOSED_CLASH = "the old row has no pane or active dispatch"
+            MISLEADING_LABEL = "another native owner has the old worker display name"
             ACTIVE_CLASH = "the old row has an active dispatch"
             OPEN_CLASH = "the old row has an open pane"
             SHELL_CLASH = "the old row retains its shell pane"
@@ -1999,7 +2001,7 @@ class WorkerRenameTests(StaffTestCase):
                                       QualifiedWorkerCase.UNDECIDED_DASHED_ROLE) else
                                   "cargo-liner-TEST-handler")
                         qualified = fixture.worker(prefix + "-" + bare)
-                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.ACTIVE_CLASH,
+                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL, QualifiedWorkerCase.ACTIVE_CLASH,
                                  QualifiedWorkerCase.OPEN_CLASH, QualifiedWorkerCase.SHELL_CLASH,
                                  QualifiedWorkerCase.RETIRE_REFUSED)
                         bare_twins = [fixture.worker("review")] if scenario in twins else []
@@ -2026,6 +2028,9 @@ class WorkerRenameTests(StaffTestCase):
                             fixture.world.unknown["w1:p9"] = "TEST process evidence unavailable"
                         if scenario is QualifiedWorkerCase.TERMINAL_UNKNOWN:
                             fixture.world.locations["w1:p9"]["terminal_id"] = ""
+                        if scenario is QualifiedWorkerCase.MISLEADING_LABEL:
+                            foreign = fixture_member("showrunner", name="foreign-native-owner")
+                            fixture.world.add(foreign, "w1:foreign", label=qualified.name)
                         before = fixture.staff_file.read_bytes()
                         arguments = ["rename", str(owner.id), owner.name]
                         interruptions = (["before label", "after label"]
@@ -2094,7 +2099,7 @@ class WorkerRenameTests(StaffTestCase):
                                     f"{qualified.name} ({qualified.id}) and {bare_twins[0].name} ({bare_twins[0].id}): kept; "
                                     + f"{qualified.id}: native session is live (pid {os.getpid()}); stop it before removing its row"])
                                 end.assert_called_once()
-                            elif scenario is QualifiedWorkerCase.CLOSED_CLASH:
+                            elif scenario in (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL):
                                 self.assertEqual(staff.snapshot().find(kind="worker", parent=owner.id), bare_twins)
                                 end.assert_called_once()
                                 self.assertEqual(result.stderr, "")
@@ -2621,6 +2626,65 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("../escape", result.stdout + result.stderr)
         self.assertEqual(self.snapshot(), before)
+
+
+    def test_document_move_ignores_an_incomplete_legacy_staged_blob(self) -> None:
+        row = self.production_row()
+        failed = self.run_command(OLD, NEW, "--to-doc", str(self.new_doc),
+                                  "--to-branch", NEW, wrapper=FAIL_GIT_MOVE_INDEX)
+        self.assertIn("simulated git mv index failure", failed.stderr)
+        journal = self.state / row.id / "rename.json"
+        with saved_fixture(self.root) as restore:
+            for blob in ({}, {"mode": 100644, "object_id": "blob"},
+                         {"mode": "100644", "object_id": 7},
+                         {"mode": "", "object_id": ""}, None):
+                with self.subTest(blob=blob):
+                    restore()
+                    self.write(journal, json.dumps({"staged_blob": blob}))
+                    legacy = journal.read_bytes()
+                    self.assert_success(self.run_command(OLD, NEW,
+                        "--to-doc", str(self.new_doc), "--to-branch", NEW))
+                    self.assertEqual(journal.read_bytes(), legacy)
+                    self.assertEqual(staff.by_id(row.id), replace(row, name=NEW,
+                        doc=staff.LiveDoc("natedev", self.new_doc)))
+                    before = self.file_versions()
+                    self.assert_success(self.run_command(OLD, NEW,
+                        "--to-doc", str(self.new_doc), "--to-branch", NEW))
+                    self.assertEqual(self.file_versions(), before)
+
+    def test_document_move_plan_is_proved_before_the_row_changes(self) -> None:
+        row = self.production_row()
+        rename = staff.rename
+        plan = shutdown.rename_plan
+        document = self.doc.read_bytes()
+        requests: list[shutdown.RenamePlan] = []
+
+        def read_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -> shutdown.RenamePlan:
+            request = plan(old, new, to_doc=to_doc, to_branch=to_branch)
+            requests.append(request)
+            return request
+
+        def rename_row(identity: staff.StaffId, name: str) -> staff.StaffRow:
+            self.assertEqual(len(requests), 1)
+            request = requests[0]
+            self.assertEqual(request.member.id, row.id)
+            self.assertIsInstance(request.move, shutdown.DocBranchMove)
+            assert isinstance(request.move, shutdown.DocBranchMove)
+            self.assertEqual(request.move.source, self.doc)
+            self.assertEqual(request.move.destination, self.new_doc)
+            self.assertEqual(request.move.branch, NEW)
+            self.assertFalse((self.state / row.id / "rename.json").exists())
+            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual(self.doc.read_bytes(), document)
+            self.assertFalse(self.new_doc.exists())
+            self.assertEqual(self.git("branch", "--show-current"), OLD)
+            return rename(identity, name)
+
+        with (mock.patch.object(shutdown, "rename_plan", side_effect=read_plan),
+              mock.patch.object(staff, "rename", side_effect=rename_row) as renamed):
+            self.assert_success(self.run_command(OLD, NEW,
+                "--to-doc", str(self.new_doc), "--to-branch", NEW))
+        renamed.assert_called_once_with(row.id, NEW)
 
 
 @final
@@ -3169,7 +3233,7 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertEqual(len(messages), 2)
                     self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(
                         row.id, "unit", "gamma", row.parent, current_session=row.id,
-                        worktree=staff.PresentWorktree("natedev", destination), doc=row.doc))
+                        worktree=staff.PresentWorktree("natedev", destination), doc=row.doc, unit_type=staff.UnitDetails("direct")))
                     self.assertEqual(staff.snapshot().by_id(worker.id), worker)
                     self.assertEqual(self.git("branch", "--show-current", cwd=destination), final_branch)
                     if followup == "rename again with pending notice":
@@ -3232,6 +3296,45 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual((destination / "work.md").read_text(), "phase work\nmore, not committed\n")
         self.assertEqual((destination / "draft.md").read_text(), "a new file\n")
         self.assertEqual((destination / "docs/plans/alpha.md").read_bytes(), plan)
+
+
+    def test_review_refuses_a_branch_that_differs_from_the_pending_move(self) -> None:
+        from scripts.production import unit_move
+
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        with saved_fixture(self.root) as restore:
+            for pending_name in ("", "alpha"):
+                with self.subTest(pending_name=pending_name):
+                    restore()
+                    _ = unit_move.prepare_rename(row, folder, "pending-branch", pending_name or row.name)
+                    if not pending_name:
+                        path = unit_move.rename_move_path(row.id)
+                        fields = unit_move.json_object(unit_move.read_json(path))
+                        fields["name"] = ""
+                        unit_move.write_json(path, fields)
+                    before = file_versions(self.root)
+                    result = self.invoke(["rename", "alpha", "alpha", "--to-branch", "cargo-liner-handler"])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("finish the pending rename to alpha" if pending_name else
+                                  "the pending rename record is invalid", result.stderr)
+                    self.assertEqual(file_versions(self.root), before)
+
+    def test_to_branch_keeps_the_unit_name_and_folder_and_resumes_its_session(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        folder = self.rust / "claude-demo-alpha"
+        tip = self.git("rev-parse", "HEAD", cwd=folder)
+        self.write(self.home / f".claude/projects/fixture/{row.current_session}.jsonl", "{}\n")
+        session = FolderSessionFixture(row, live=True)
+        with session.installed(), RenameDisplays(row).installed():
+            self.assert_ok(self.invoke(["rename", "alpha", "alpha", "--to-branch", "cargo-liner-handler"]))
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=folder), "cargo-liner-handler")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=folder), tip)
+        self.assertEqual(self.git("--git-dir", str(self.origin), "rev-parse", "cargo-liner-handler"), tip)
+        self.assertEqual(session.stops, [])
+        self.assertEqual([resumed.id for resumed in session.starts], [])
 
 
 @final

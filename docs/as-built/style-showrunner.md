@@ -4,6 +4,8 @@
 
 A repository's production document configures one to four style units in its `Style units` table.
 Each family has exactly one owner. One unit can own all four families.
+Staff records `unit_type=style` for these units and selects `/unit:style`.
+The command applies `docs/direct/style_unit.md` after <RestartTakeover/>.
 Units sweep `~/rust/nate_style` and the repository's local rules.
 A shared SQLite ledger records coverage at the synced branch-point tip.
 Units apply mechanical fixes and hold other changes for style decisions.
@@ -44,7 +46,7 @@ For `**Kind:** style`, that procedure takes precedence over `commands/showrunner
 | `scripts/production/proposal_issue.py` | Issue writer: `create`, `approve`, `unapprove`, `start`, `close`, `reopen`, `move-approved`, `area-style`, `rules`, more |
 | `scripts/production/proposals_table.py`, `footer_counts.py` | Proposal states and the footer count |
 | `scripts/production/production_lifecycle.py` | Wrap detaches style children |
-| `docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
+| `commands/unit/style.md`, `docs/direct/style_unit.md` | Style director entry, refill, gate, publication, and standing lifetime |
 | `commands/showrunner/add_style.md`, `style_report.md`, `proposal.md` | Showrunner commands |
 | `docs/style_production.md` | Runtime procedure (Tiers, Families, Ticket queue, Ledger, Sync, Merging back, Yielding, Big changes, Lifetime, Report) |
 
@@ -348,7 +350,10 @@ The module name is the file stem, or the folder name for `mod.rs`.
 Moving a test file into its owner removes the owner's declaration.
 Unreadable declarations and module files outside a known crate count as edited.
 Uncertain `path` attributes also count.
-These include attributes in inline modules, attributes carried by `cfg_attr`, and attributes that mount inline module folders.
+These include attributes carried by `cfg_attr` and attributes that mount inline module folders.
+A plain file-module path string that ends in another file's name does not declare the requested module file.
+This exclusion also applies inside inline modules.
+A string that ends in the requested file's name remains uncertain inside an inline module.
 `declares_module` reads raw identifiers as plain words through `plain_words`.
 Other findings include only their own file before recorded needs are appended.
 
@@ -367,9 +372,14 @@ A file outside the crate root is scanned only when it names the library, the old
 The ledger keeps that result for its lifetime.
 `EditedFiles.naming` uses one `git ls-tree` per commit.
 One `git cat-file --batch` through `style_ledger.blob_contents` reads named blobs not yet read.
-`renamed_text` or `declares_module` scans each kept path once per distinct blob.
+Restructure findings share one declaration scan per distinct blob during a refill.
+The scan keeps the token check, plain words, item starts, inline modules, and module declarations with their scopes and path attributes.
+`declares_module` reads this syntax for each requested module file.
+`EditedFiles.of` keeps each finding's computed paths and recorded needs for the selection pass.
+A second call for the same finding reads no file text.
+`SplitEditedFiles` shares these scans while its `GitReadCache` supplies the blobs.
 `EditedFiles.module_readings` keeps file rename readings.
-Thus `of` and `uncertain` share one scan.
+For file renames, `of` and `uncertain` share the same readings.
 On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files.
 Under load 20, `of` takes about 1.2 seconds.
 The read takes 0.02 seconds.
@@ -537,13 +547,14 @@ Findings left counts filed findings whose decision is approved. When all filed f
 
 Schema 25 also adds `held_findings.built_at`. For old built findings it uses the merged build ticket's `updated_at`, or the finding's `updated_at` when there is no merged build ticket. `style_ledger.legacy_built_at_sql(finding)` returns this rule as SQL, for migration 25 and for the Units report on a ledger before schema 25. The report opens the ledger read-only and does not migrate it. It reads `built_at` when the column exists, also when later writes changed `updated_at`. Without the column it uses `legacy_built_at_sql("h")`, but a ledger without the `tickets` table or the `build_ticket` column uses the finding's `updated_at`, because that SQL fails there. Its last-24-hours count also supplies the totals line's ETA. Each build transition sets an empty `built_at` once: proposal ticket merge, declaration follow, `held built` and `mark_built_at_merge`. Later writes keep that time. Returning a built finding to filed, waiving it or withdrawing it as a duplicate clears the time.
 
-**Unit side** (`docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md`): refill uses this command:
+**Unit side** (`commands/unit/style.md`, `docs/direct/style_unit.md`): refill uses this command:
 
 `style_plan.py next-phase --unit <unit> --plan <unit worktree>/<configured plan> --repo <unit worktree> --session-dir <run folder>`
 
-It runs at startup, after compaction or restart, and at each `<NextPhase/>`.
+It runs at startup, after compaction or restart, and at each ticket boundary.
 With N above 1, it restores each ticket's phase and worker before filling available slots.
-It first resumes checkpoint step 7 for any reservation record in `checkpoint_committed_awaiting_release_confirmation`.
+It first recovers pending publication and release under <StyleCheckpoint/>.
+An unsuccessful recovery blocks refill.
 Exits 3, 4 and 5 report once and end the turn blocked.
 The message is `waiting on the showrunner: sync | board | ticket <id> merge`.
 A sync message or `ticket <id> merged; refill.` resumes a sync wait.
@@ -1027,3 +1038,18 @@ Rust-analyzer startup passes its active exception through the shared queue bound
 `LINT_CONFIG_FILE` selects the config file.
 The shared test helper replaces the queue boundary for direct calls and CLI child processes.
 Tests retain their private Cargo and rust-analyzer programs without a real queue place.
+
+### Crate copy lifetime
+
+Each identified crate run removes a crate's editable copy when the crate becomes `INTEGRATED` or `ABANDONED`.
+Other crates in the run can remain open.
+This rule covers native copies and adopted copies linked to the run.
+The removal uses `copies.workspace_removal_guard` after the worker locks close.
+The run keeps its lock through removal.
+`HeldCrateRunLock` passes that ownership to the guard without acquiring the lock again.
+Other callers use `AcquireCrateRunLock` to acquire the lock before removal.
+The guard reads the state of the crate that owns the copy.
+`complete_run` also removes remaining terminal copies after a crash and ends their task records.
+A terminal resume returns without creating a copy.
+Integrated result validation reads the canonical Git objects, which already hold the imported commit.
+Later crate integration, resume, import, and refusal publication do not need a terminal crate's copy.

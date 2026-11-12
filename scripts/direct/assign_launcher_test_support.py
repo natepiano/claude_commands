@@ -156,7 +156,7 @@ class AssignLauncherFixture(unittest.TestCase):
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
             "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
         })))
-        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE", "AGENTS_CALLER_FAMILY", "AGENTS_CALLER_ASSIGNMENT"):
+        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
             _ = os.environ.pop(key, None)
         original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:

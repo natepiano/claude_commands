@@ -44,8 +44,18 @@ Telemetry does not stop the launch.
 
 `owner_staff_id` is the run's owner field.
 Owner lookup uses a fixed staff id and reads the current unit or showrunner row.
-Older records can resolve their director's session identity at the history boundary.
+Fixed owner references resolve current staff facts.
+Historical session identities remain event-time data.
 Saved event names remain historical text.
+Run state stores no current folder, branch, production name, or unit name for a staffed owner.
+State reads resolve the folder through staff and read the branch through Git.
+Closed states use the same rule.
+History keeps the event-time folder and branch.
+History reads preserve those recorded values.
+Staffed run state stores no director session, director family, or dispatch participant name.
+Current reads resolve those facts through the fixed staff references.
+Native transcript evidence supplies the director family.
+Shared account-home discovery includes numbered Codex accounts when staff has no session home.
 Active readers obtain the current folder through `plan_history.staff_directory`.
 They do not route through saved folder copies or an absolute plan path.
 `start-run` with a plan calls `unit_config.set_plan` on the unit's existing `.unit.toml`.
@@ -55,9 +65,12 @@ Staff stores neither the plan nor the port.
 
 `progress_history.last_dispatch(worker_id)` returns `RecordedDispatch` or `NoDispatchRecorded`.
 It finds the newest open or finished dispatch across the worker parent's runs.
-A recorded worker id takes precedence over a legacy pass name.
+A recorded worker id selects the dispatch.
+The dispatch history lookup selects workers through fixed staff IDs.
+Current readers validate the worker's parent through staff.
 `DispatchDetailNotRecorded.UNRECORDED` represents an absent dispatch field.
 The result includes the phase instance and status.
+It uses no current-role fallback from the role history.
 Resume messages use these settings to construct `assign.sh` commands.
 `write_review_turn` owns review-turn records.
 
@@ -96,12 +109,15 @@ stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
-`start-run` resolves the project clock without an agent-supplied timestamp. For
-a supplied plan, the recorder uses its timezone-qualified `Project started`
-field. If absent, it persists the oldest Git commit time for that plan, or the
-run start when the plan has no history. For ad hoc work without a plan, it
-reuses the most recent plan-backed clock for the exact working directory and
-branch. With no such history, the project clock starts with the run.
+`start-run` resolves the project clock without an agent-supplied timestamp.
+For a supplied plan, the recorder uses its timezone-qualified `Project started` field.
+If the field is absent, the recorder saves the oldest Git commit time for that plan.
+If the plan has no Git history, the recorder saves the run start time.
+For ad hoc work without a plan, the recorder reuses the most recent plan-backed clock for the exact working directory and branch.
+For older events without a folder, this lookup resolves the folder through the fixed staff owner ID.
+The lookup preserves a recorded folder and branch.
+It does not change the event file.
+With no matching history, the project clock starts with the run.
 
 The live state and every event record `project_start_source` and
 `project_plan_doc`. `progress` resolves these fields for legacy active runs that
@@ -549,20 +565,13 @@ review with no unclaimed pass behind it, the closure review after verification,
 keeps the ordinal `Review 3`. An
 activity's name is its `--label`, and its `Worker` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
-than per run, and `start-pass` and `start-activity` re-detect the unit director
-as they open, so a unit director that changes model or effort part way through
-shows the change on the rows after it. Windows are also opened from inside
-workers: a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but
-detects as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
-of its own. So `_refresh_main_identity` replaces `main_agent` only when the
-detected session is the run's director (`unit_runs.director`, the run folder's
-`director` file, else the `run_started` event's session), else the stored
-identity's session; with neither known it takes any detection. The director is
-read from the run folder rather than from `main_agent` because until 2026-10-17
-every window rewrote it, and three live runs then carried a worker's thread there;
-the director's next window repairs such a run. Detection that comes back unknown
-leaves the stored identity alone, because a window that cannot answer must not
-erase the answer already recorded.
+than per run.
+`start-pass` and `start-activity` detect the director's model and effort when they open a window.
+The fixed run owner reference selects the director through staff.
+A worker's detection cannot replace that director's settings.
+State stores model and effort as turn telemetry.
+Staff supplies the current session and backend family when a state read has a fixed owner.
+Events keep their event-time identities for attribution.
 
 A round's result is every finding the ledger stamped with that round: verdicts
 make it `N fixed` plus `M open` where those apply, findings opened make it
