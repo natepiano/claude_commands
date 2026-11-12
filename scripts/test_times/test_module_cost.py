@@ -28,6 +28,19 @@ def install_runner(tree: Path) -> None:
 
 
 class ModuleCostTests(unittest.TestCase):
+    def test_reads_task_ids_without_decoding_the_task_name(self) -> None:
+        samples = [
+            (b"Name:\tworker\nTgid:\t401\nPid:\t402\nPPid:\t202\n", (401, 202)),
+            (b"Name:\tworker\xff\nTgid:\t503\nPid:\t504\nPPid:\t303\n", (503, 303)),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status"
+            for contents, expected in samples:
+                with self.subTest(contents=contents):
+                    _ = status.write_bytes(contents)
+                    with mock.patch.object(task_cpu, "Path", return_value=status):
+                        self.assertEqual(task_cpu.task_ids(402), expected)
+
     def test_groups_interpreter_commands_by_the_script_or_module(self) -> None:
         samples = [
             (["python3", "-m", "unittest", "discover", "-s", "a"], "python3 -m unittest"),

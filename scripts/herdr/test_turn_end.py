@@ -154,6 +154,8 @@ class TurnEndTests(unittest.TestCase):
                 if close == "working":
                     self.case.fixture.world.locations[pane]["agent_status"] = "working"
                 if close == "setup":
+                    if family == "claude":
+                        self.case.fixture.world.record(row, pane)
                     self.case.fixture.world.foreground[pane] = (998598, "direnv", ["direnv", "export", "zsh"])
                 elif close == "outside":
                     self.case.fixture.world.remove_leaf(pane)

@@ -605,6 +605,33 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
         return f"{delivery.outcome}: {delivery.detail}"
 
 
+def command_deliver(args: argparse.Namespace) -> int:
+    record_path = Path(str(getattr(args, "record", "")))
+    record = _read_record(record_path)
+    try:
+        delivery = deliver(record, command_result(record))
+    except RunDeliveryFailed as error:
+        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+        return 1
+    record = _read_record(record_path)
+    record["delivery"] = delivery
+    _ = _write_record(record_path, record)
+    return 0
+
+
+def deliver_in_fresh_process(record_path: Path) -> int:
+    """Import delivery code after the recorded command ends."""
+    script = Path(__file__).resolve()
+    try:
+        return subprocess.run(
+            [str(script.parents[1] / "lib/py"), str(script), "deliver", str(record_path)],
+            stdin=subprocess.DEVNULL, check=False,
+        ).returncode
+    except OSError as error:
+        print(f"detached_runs: delivery process did not start: {error}", file=sys.stderr)
+        return 1
+
+
 def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
     """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
@@ -663,15 +690,12 @@ def command_supervise(args: argparse.Namespace) -> int:
     # unless the result is already held.
     record["exit_code"] = exit_code
     record = _write_record(record_path, record)
-    try:
-        delivery = deliver(record, CompletedCommand(exit_code))
-    except RunDeliveryFailed as error:
-        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+    if deliver_in_fresh_process(record_path) != 0:
         return 1
     record = _read_record(record_path)
     record.update({
         "status": "finished", "exit_code": exit_code,
-        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "delivery": delivery,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     _finish_record(record_path, record)
     return 0
@@ -697,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
+    _ = delivery.add_argument("record")
+    delivery.set_defaults(handler=command_deliver)
     reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
     _ = reap.add_argument("--session-dir", required=True)
     _ = reap.add_argument("--worker", default="")

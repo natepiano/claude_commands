@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from scripts.agents import remote
-from scripts.herdr import herdr_types
+from scripts.herdr import pane_launch, herdr_types
 
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -74,6 +75,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
         with (mock.patch.object(pane_record, "RECORD_DIR", records),
               mock.patch("scripts.agents.pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
+            write_text_atomic(config / "projects/fixture" / f"{owner.current_session}.jsonl", "")
             pane_record.write("agents", original)
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
                   mock.patch.object(add_unit, "launch_session", side_effect=launch),
@@ -92,7 +94,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
                 moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, self.env, self.checkout)
             self.assertEqual(moved.returncode, 0, moved.stderr)
             publications = [entry for entry in pane_record.read("agents").values()
-                            if entry["session_id"] in (owner.id, owner.current_session)]
+                            if pane_launch.reference_id(entry) in (owner.id, owner.current_session)]
             self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in publications],
                              [("w7:p3", str(destination))])
 
@@ -273,8 +275,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                            environment: herdr.PreparedAgentEnvironment, family: str, arguments: list[str],
                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str,
                            reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            kind: Literal["claude", "codex"] = kind) -> herdr.AgentLaunched:
-                    _ = (session, opening, timeout, agent, codex)
+                    _ = (session, opening, timeout, agent, codex, client)
                     self.assertEqual(reported_unknown, "")
                     self.assertFalse(backend.live)
                     self.assertEqual(target, herdr.ExistingPane("w1:p1", "kept-terminal"))
@@ -286,6 +289,13 @@ class UnitFolderMoveTests(FolderRenameFixture):
                     backend.live = True
                     self.publish_session_process(kind, live=True)
                     return herdr.AgentLaunched("w1:p1", herdr.PromptSubmissionNotRequired())
+                def process_info(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    del deadline
+                    self.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
+                    pid = 998041 if backend.live else 998040
+                    argv = [kind, "--resume" if kind == "claude" else "resume", self.owner.current_session] if backend.live else ["zsh"]
+                    return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": pid,
+                        "foreground_processes": [{"pid": pid, "name": kind if backend.live else "zsh", "argv": argv}]}}
                 with (backend.installed(), mock.patch.object(restart, "start_row", side_effect=real_start),
                       mock.patch.object(restart, "stop_row", side_effect=stop),
                       mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude1", self.home / ".claude")),
@@ -295,7 +305,8 @@ class UnitFolderMoveTests(FolderRenameFixture):
                       mock.patch.object(herdr, "prepare_session_environment", side_effect=prepare),
                       mock.patch.object(herdr, "launch_prepared_agent", side_effect=launch),
                       mock.patch.object(herdr, "running_codex_threads", return_value=set()),
-                      mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("w1", self.owner.name)),
+                      mock.patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.ExistingPane("w1:p1", "kept-terminal")),
+                      mock.patch.object(herdr.Herdr, "result", side_effect=process_info),
                       mock.patch.object(herdr.Herdr, "panes", return_value=panes),
                       mock.patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell()),
                       mock.patch.object(herdr.Herdr, "remember_row_tab")):
@@ -448,7 +459,10 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(client, "pane_activity", return_value=herdr.PaneRunning(("editor",))),
               mock.patch.object(herdr, "PROGRAM_TIMEOUT_SECONDS", 0),
               mock.patch.object(herdr, "check_target", wraps=herdr.check_target) as target,
-              mock.patch.object(client, "result", return_value={"process_info": {"shell_pid": 998040, "foreground_process_group_id": 998041}}),
+              mock.patch.object(client, "result", return_value={"process_info": {"shell_pid": 998040, "foreground_process_group_id": 998099,
+                  "foreground_processes": [{"pid": 998099, "name": "claude", "argv": ["claude"]}]}}),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.EnvironmentThread(self.owner.current_session), "fixture-start", {})),
               mock.patch.object(herdr, "start_agent") as agent_start,
               mock.patch.object(client, "run") as typed,
               mock.patch.object(herdr, "Herdr", return_value=client),
@@ -620,6 +634,11 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(client, "saved_row_tab", return_value=herdr.ExistingPane("w1:p1", "")),
               mock.patch.object(client, "panes", return_value=panes),
               mock.patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(self.source, {})),
+              mock.patch.object(client, "result", return_value={"process_info": {"shell_pid": 998040,
+                  "foreground_process_group_id": 998041, "foreground_processes": [{"pid": 998041,
+                      "name": "codex", "argv": ["codex", "resume", self.owner.current_session]}]}}),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(self.owner.current_session), "fixture-start", {})),
               mock.patch.object(client, "run") as typed,
               mock.patch.object(client, "remember_row_tab"),
               mock.patch.object(herdr, "Herdr", return_value=client),

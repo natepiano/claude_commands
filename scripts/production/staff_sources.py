@@ -140,7 +140,7 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     for launch in sources.launches:
         if launch.get("pane_id") != pane or launch.get("ended"):
             continue
-        if record.by_member_reference(launch["session_id"]) is not None:
+        if record.by_member_reference(pane_launch.reference_id(launch)) is not None:
             return True
     return False
 

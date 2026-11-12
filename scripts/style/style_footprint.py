@@ -3655,6 +3655,20 @@ class ModulePathConditions(Enum):
     ALLOW_CFG = "allow_cfg"
 
 
+def module_path_attribute(words: tuple[str, ...], allowed: frozenset[str],
+                          conditions: ModulePathConditions) -> str | None:
+    """Return the first unsupported attribute, including attributes carried by cfg_attr."""
+    start = 3 if words[1] == "!" else 2
+    if (conditions is ModulePathConditions.ALLOW_CFG
+            and words[start:start + 2] == ("cfg_attr", "(")):
+        for argument in attribute_arguments(words)[1:]:
+            name = module_path_attribute(("#", "[", *argument, "]"), allowed, conditions)
+            if name is not None:
+                return name
+        return None
+    return macro_attribute(words, allowed)
+
+
 def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
                  texts: Mapping[str, MoveText],
                  conditions: ModulePathConditions = ModulePathConditions.UNCONDITIONAL) -> str | None:
@@ -3663,7 +3677,8 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
     Each parent must declare its child with a `mod <name>;` line.
     Declaration attributes must be inert and contain no comments.
     By default, declarations and files below the crate root must contain no `cfg` or `cfg_attr` attributes.
-    ALLOW_CFG permits outer and inner `cfg` attributes on the path.
+    ALLOW_CFG permits outer and inner `cfg` attributes.
+    It also permits `cfg_attr` when each carried attribute passes the same rules.
     """
     allowed_cfg = frozenset({"cfg"}) if conditions is ModulePathConditions.ALLOW_CFG else frozenset[str]()
     files = crate_files(sources, crate, tuple())
@@ -3680,7 +3695,8 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
                 return f"{path}: a cfg attribute on the path to {module_path(module)}"
             # Inner attributes reach child modules. Crate root attributes reach both source and destination modules.
             for begin, end in attribute_spans(words) if size else ():
-                name = macro_attribute(words[begin:end], INNER_ATTRIBUTES | allowed_cfg) if words[begin + 1] == "!" else None
+                name = (module_path_attribute(words[begin:end], INNER_ATTRIBUTES | allowed_cfg, conditions)
+                        if words[begin + 1] == "!" else None)
                 if name is not None:
                     return f"{path}: the inner attribute {name} on the path to {module_path(module)}"
             if size == len(module):
@@ -3694,7 +3710,8 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
                             and configured(words, item.start, item.keyword, inner=False)):
                         return f"{path}: a cfg attribute on the path to {module_path(module)}"
                     for begin, end in attribute_spans(words[item.start:item.keyword]):
-                        name = macro_attribute(words[item.start + begin:item.start + end], INERT_ATTRIBUTES | allowed_cfg)
+                        name = module_path_attribute(
+                            words[item.start + begin:item.start + end], INERT_ATTRIBUTES | allowed_cfg, conditions)
                         if name is not None:
                             return f"{path}: the attribute {name} on the path to {module_path(module)}"
                         if attribute_comment(text, spans, item.start + begin, item.start + end):
@@ -3936,8 +3953,8 @@ def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
             whole_file = test_file(before, change.path) if whole_file is None else whole_file
             if not whole_file:
                 return False
-        if following is not None and lint_arguments(new[following.start:following.end]) != [
-                group for group in lint_arguments(old[previous.start:previous.end])
+        if following is not None and attribute_arguments(new[following.start:following.end]) != [
+                group for group in attribute_arguments(old[previous.start:previous.end])
                 if tuple(token.value for token in group) not in removed]:
             return False
         if following is not None and (old[previous.start:previous.start + 4] != new[following.start:following.start + 4]
@@ -4032,16 +4049,20 @@ def test_file(sources: RevisionTree, path: str) -> bool:
     return test_module(path, frozenset({path}))
 
 
-def lint_arguments(attribute: tuple[Token, ...]) -> list[tuple[Token, ...]]:
-    """The comma-separated arguments of an outer `#[level(...)]` attribute, with no empty group for a trailing comma."""
-    groups: list[tuple[Token, ...]] = []
-    current: list[Token] = []
-    for token in attribute[4:-2]:
-        if token.value == ",":
+def attribute_arguments[T: (Token, str)](attribute: tuple[T, ...]) -> list[tuple[T, ...]]:
+    """Read comma-separated attribute arguments and preserve nested groups. Omit an empty group after a trailing comma."""
+    words = tuple(token.value if isinstance(token, Token) else token for token in attribute)
+    groups: list[tuple[T, ...]] = []
+    current: list[T] = []
+    depth = 0
+    start = 5 if words[1] == "!" else 4
+    for token, word in zip(attribute[start:-2], words[start:-2]):
+        if word == "," and depth == 0:
             groups.append(tuple(current))
             current = []
         else:
             current.append(token)
+            depth += (word in {"(", "[", "{"}) - (word in {")", "]", "}"})
     if current:
         groups.append(tuple(current))
     return groups

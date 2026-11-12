@@ -314,7 +314,7 @@ def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: s
     if not session_id:
         return NoUnitConversation()
     entry = pane_record.read(found.place.session).get(found.place.pane) if found is not None else None
-    if entry is None or entry["session_id"] != session_id:
+    if entry is None or pane_launch.reference_id(entry) != session_id:
         try:
             entry = pane_record.launch_for_session(session_id)
         except ValueError as error:

@@ -5298,9 +5298,9 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         except (OSError, ValueError):
             continue
         for launch in entries.values():
-            previous = launches.get(launch["session_id"])
+            previous = launches.get(pane_launch.reference_id(launch))
             if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
+                launches[pane_launch.reference_id(launch)] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 
@@ -5327,7 +5327,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                                              session_staff.LiveSession(identity))
             if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.StoredReference(launch["session_id"]))
+                                                 session_staff.StoredReference(pane_launch.reference_id(launch)))
         except (staff.StaffUnreadable, ValueError) as error:
             print(f"accounts: unit {identity}: {error}", file=sys.stderr)
             continue

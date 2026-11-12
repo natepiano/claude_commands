@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import shutil
@@ -22,7 +23,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
@@ -41,6 +42,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
+NATIVE_PANE_CLIENT = herdr.Herdr
+NATIVE_PROCESS_ENVIRONMENT = herdr.process_environment
 
 
 class RenameDisplays:
@@ -133,6 +136,12 @@ class FolderMoveBackend:
         fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
                                self.environment(self.pid), cwd=self.cwd)
 
+    def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
+        """Use the shared scan with this fixture's process replies."""
+        client = NATIVE_PANE_CLIENT(self.session)
+        with mock.patch.object(client, "result", side_effect=self.result):
+            return client.scan_row_panes(record, panes)
+
     def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
 
@@ -157,10 +166,15 @@ class FolderMoveBackend:
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         entry = pane_record.read(self.session)[pane]
-        self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
+        self.fixture.assertIn(pane_launch.reference_id(entry), (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
+        if arguments == ("pane", "process-info", "--pane", "w1:p2"):
+            return {"process_info": {"shell_pid": self.shell_pid,
+                "foreground_process_group_id": self.shell_pid,
+                "foreground_processes": [{"pid": self.shell_pid, "argv": ["zsh"]}]}}
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
         argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
         foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
@@ -209,6 +223,8 @@ class FolderMoveBackend:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
 
     def environment(self, pid: int) -> dict[str, str]:
+        if pid != self.pid:
+            return NATIVE_PROCESS_ENVIRONMENT(pid)
         self.fixture.assertEqual(pid, self.pid)
         return ({"CLAUDE_CONFIG_DIR": str(self.config)} if self.kind == "claude" else
                 {"CODEX_HOME": str(self.config), "CODEX_THREAD_ID": self.fixture.owner.current_session})
