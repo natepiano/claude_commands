@@ -208,6 +208,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot, local_snapshot, OpenRun |
+| `scripts/nightly_review/candidates.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
 | `scripts/nix_env/heal.py` | read | initial_snapshot |
 | `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session |
@@ -292,7 +293,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, slot_operation, ensure, native_id, set_home, resume, set_hold, child_environment |
 | `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
-| `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
+| `scripts/statusline/counts_row.py` | read | record_path, by_id, parent_of, StaffId (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
@@ -301,7 +302,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/style/style_ledger.py` | read | snapshot |
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
-| `scripts/style/style_proposals.py` | read | snapshot |
+| `scripts/style/style_proposals.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, OpenRun |
