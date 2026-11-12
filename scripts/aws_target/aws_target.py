@@ -22,9 +22,9 @@ import time
 from typing import Literal, Protocol, cast, final, get_args
 
 from scripts.aws_target import ledger, measurement, remote
-from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings, service_loop
+from scripts.aws_target.config import ControlSettings, gate_deployment, money, offload_enabled, read_control_settings, read_settings, service_loop
 from scripts.build_queue import queue_snapshot
-from scripts.build_targets.target_config import SshTarget, is_aws_target
+from scripts.build_targets.target_config import SshTarget, is_aws_target, ssh_target_state_directory
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
@@ -270,6 +270,65 @@ class Controller:
                                             money(str(row['SpotPrice'])), 'DescribeSpotPriceHistory') for row in rows)
         _ = ledger.CostLedger(self.directory).refresh_prices(self.settings_path, now, fetch)
 
+    def _gate_prices(self, configuration: conf.ConfigRead, now: int) -> None:
+        """Refresh gate prices even when the former builder route is disabled."""
+        manifest = self.directory / 'gate-deployment.json'
+        if not manifest.exists():
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with (self.directory / 'spot-prices.lock').open('a+') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            _ = lock.seek(0)
+            try:
+                last = int(lock.read().strip() or '0')
+            except ValueError:
+                last = 0
+            if last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
+                return
+            _ = lock.seek(0)
+            _ = lock.truncate()
+            _ = lock.write(str(now))
+            lock.flush()
+            try:
+                values = conf.read_or_repository('cloud_gate')
+                home = configuration.text('region')
+                deployed = ledger.rows(gate_deployment(manifest, home), 'regions')
+                regions = tuple(dict.fromkeys([*values.words('spot_candidate_regions'),
+                    *[ledger.text(row, 'region') for row in deployed]]))
+                sizes = values.words('instance_types')
+                api = AwsCli(configuration.text('credentials_profile'), home, configuration.number('aws_timeout_s'), self.execute)
+                prices: list[ledger.RegionalSpotPrice] = []
+                for region in regions:
+                    raw = api.in_region(region).call('describe-spot-price-history', '--instance-types', *sizes,
+                        '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(now, UTC).isoformat(),
+                        '--no-paginate', '--max-results', '1000')
+                    if raw.get('NextToken'):
+                        raise ValueError('The regional Spot price reply is incomplete')
+                    latest: dict[tuple[str, str], tuple[float, ledger.RegionalSpotPrice]] = {}
+                    for row in ledger.rows(raw, 'SpotPriceHistory'):
+                        size, zone = ledger.text(row, 'InstanceType'), ledger.text(row, 'AvailabilityZone')
+                        if size not in sizes:
+                            continue
+                        at = datetime.fromisoformat(ledger.text(row, 'Timestamp').replace('Z', '+00:00')).timestamp()
+                        price = money(ledger.text(row, 'SpotPrice'))
+                        if not zone or price < 0:
+                            raise ValueError('The regional Spot price reply has invalid rows')
+                        key = (zone, size)
+                        if key not in latest or at > latest[key][0]:
+                            latest[key] = (at, ledger.RegionalSpotPrice(region, zone, size, price, now))
+                    zones = {ledger.text(subnet, 'zone') for row in deployed if row['region'] == region
+                             for subnet in ledger.rows(row, 'subnets')}
+                    if (not latest or set(sizes) - {size for _, size in latest}
+                            or any((zone, size) not in latest for zone in zones for size in sizes)):
+                        raise ValueError('The regional Spot price reply omits a type or deployed zone')
+                    prices.extend(price for _, price in latest.values())
+                ledger.write_spot_prices(self.directory, prices)
+            except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
+                print('aws_target: gate price read unavailable: ' + type(error).__name__, file=sys.stderr)
+
     def refresh_charges(self, api: AwsCli, now: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
 
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
@@ -299,7 +358,12 @@ class Controller:
             _ = state.pop(key, None)
 
     def tick(self) -> ControlResult:
-        return self._action('tick')
+        result = self._action('tick')
+        try:
+            self._gate_prices(conf.read(self.settings_path), int(self.clock()))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print('aws_target: gate price read unavailable: ' + type(error).__name__, file=sys.stderr)
+        return result
 
     def start(self) -> ControlResult:
         return self._action('start')
@@ -342,7 +406,7 @@ class Controller:
                 ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(now, evidence.state, 'DescribeInstances'))
                 try:
                     self._prices(api, settings, now)
-                except (AwsUnavailable, OSError, ValueError, KeyError, TypeError) as error:
+                except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     state['price_error'] = str(error)
                 try:
                     reading = self.refresh_charges(api, now)
@@ -441,8 +505,8 @@ def main() -> int:
     _ = parser.add_argument('--queue-directory', type=Path)
     args = parser.parse_args(namespace=ControlArguments())
     directory = args.directory
-    if directory == Path() and offload_enabled(conf.read(args.settings)):
-        directory = offload.state_directory('aws')
+    if directory == Path():
+        directory = ssh_target_state_directory('aws')
     if args.command == 'serve':
         serve(args.settings, directory)
         return 0
