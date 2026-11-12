@@ -154,7 +154,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
-                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
+                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh", "file_lock.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
 

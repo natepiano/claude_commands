@@ -129,6 +129,8 @@ export UNIT_TEAM_ROLE="${TEAM_SLOT}"
 export UNIT_RUN_DIR="${SESSION_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/file_lock.sh"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -302,7 +304,7 @@ PY
     FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
     # One atomic snapshot for every lens and retry of this phase's broad pass.
     (
-      flock -x 9
+      lock_file_descriptor 9
       if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
         SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
         trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
