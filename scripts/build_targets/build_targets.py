@@ -24,6 +24,7 @@ from contextlib import ExitStack, nullcontext, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
     from scripts.mac_test import mac_test, offload
     from scripts.message import roster
     from scripts.build_targets.targets import (
-        Held, RunningJob, TargetState,
+        AwsStatusRow, Held, RunningJob, TargetState,
     )
 
 
@@ -201,10 +202,12 @@ def running_job_text(job: RunningJob,
 def format_state(name: str, state: TargetState,
                  labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.build_targets.targets import (
-        ExpiresAt, Free, ReleaseEstimated, Running, StateUnreadable, Unreachable,
+        AwsStatusRow, ExpiresAt, Free, ReleaseEstimated, Running, StateUnreadable, Unreachable,
     )
 
     name = display_field(name)
+    if isinstance(state, AwsStatusRow):
+        return format_aws_status(state)
     if isinstance(state, Free):
         return f"{name}: free"
     if isinstance(state, Running):
@@ -224,14 +227,53 @@ def format_state(name: str, state: TargetState,
 
 
 def probe_target(target: SshTarget) -> TargetState:
+    from scripts.build_targets import target_config
     from scripts.build_targets.targets import Unreachable
     from scripts.mac_test import offload
 
+    if target_config.is_aws_target(target):
+        return target_state(target)
     config = offload.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
         return Unreachable(result.reason)
     return target_state(target)
+
+
+def format_aws_status(row: AwsStatusRow) -> str:
+    from scripts.aws_target import ledger as cost_ledger, measurement
+    from scripts.build_targets.targets import RemovalPending
+
+    def at(value: float) -> str:
+        return local_time(datetime.fromtimestamp(value, timezone.utc)) if value else 'unavailable'
+    monthly = f'${row.monthly_usd:.2f}' if isinstance(row.monthly_usd, Decimal) else 'unavailable'
+    cap = f'${row.monthly_limit_usd:.2f}' if isinstance(row.monthly_limit_usd, Decimal) else 'unavailable'
+    state = f'starting since {at(row.starting_at)}' if row.state == 'starting' else row.state
+    lines = [f'{row.target}: {state}; evidence {at(row.evidence_at)}; month {monthly} / {cap}',
+             f'  spending {row.spending}; decision {at(row.decision_at)}; {display_field(row.reason)}']
+    if isinstance(row.removal, RemovalPending):
+        lines.append('  down incomplete: ' + ', '.join(row.removal.resources)
+                     + f'; storage ${row.removal.storage_usd_per_day:.2f}/day; run deploy.py down --approve-destroy')
+    for slots in row.slots:
+        lines.append(f'  {slots.repository}: {slots.occupied}/{slots.capacity} slots; '
+                     + f'{slots.active} active, {slots.retained} retained pending cleanup')
+    for result in row.results:
+        count = str(result.unresolved_count) if isinstance(result.unresolved_count, int) else 'unavailable'
+        lines.append(f'  result {result.repo_identity} slot {result.slot}: {result.outcome}; '
+                     + f'completion {result.completion}; cleanup {result.cleanup}; unresolved {count}; evidence {at(result.evidence_at)}')
+    for notice in row.notices:
+        text = f'  notice {notice.period}: {notice.delivery.value}'
+        if notice.delivery == cost_ledger.DeliveryState.PENDING:
+            text += f'; retry after {at(notice.retry_after)}'
+        lines.append(text)
+    if any(slots.retained for slots in row.slots):
+        recovery = {
+            measurement.ControllerRecovery.CONTROLLER_TICK: 'controller evidence is unavailable',
+            measurement.ControllerRecovery.CONFIRM_STOP: 'controller tick confirms stop or remote cleanup',
+            measurement.ControllerRecovery.STATE_EVIDENCE_RELEASE: 'state-evidence release',
+        }[row.recovery]
+        lines.append(f'  recovery: {recovery}; run aws_target.py tick')
+    return '\n'.join(lines)
 
 
 def command_status(probe: bool = False) -> int:
@@ -461,6 +503,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
+        if isinstance(probe, offload.InterruptedTargetStatus):
+            return ExcludedTarget(target, "busy")
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
         with handlers:
@@ -482,6 +526,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
 
+    from scripts.build_targets import target_config
     from scripts.mac_test import mac_test, offload
 
     session = claim_state.submitting_session(session)
@@ -501,6 +546,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if isinstance(policy, offload.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
+    if isinstance(selection, Pinned) and target_config.is_aws_target(target):
+        control = mac_test.read_json_object(paths.directory / "controller.json") or {}
+        if control.get("state") in ("stopped", "starting", "pending", "stopping"):
+            return ExcludedTarget(target, "starting")
+        if control.get("state") == "refused":
+            return ExcludedTarget(target, str(control.get("reason", "controller refused")))
     answer = mac_test.free_now(paths, target.settings, repo_root, session=session)
     if new_step and not isinstance(selection, Pinned) and answer == "bad":
         start_probe_recovery(target, repo_root, package, kind)
@@ -513,11 +564,50 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     return EligibleTarget(target)
 
 
+def aws_spending_exclusion(target: SshTarget) -> str:
+    """Check AWS spending before reading the execution settings."""
+    from scripts.build_targets import target_config
+
+    if not target_config.is_aws_target(target):
+        return ""
+    return aws_target_spending_exclusion(target)
+
+
+def aws_target_spending_exclusion(target: SshTarget) -> str:
+    """Read spending permission for a configured AWS target."""
+
+    from scripts.aws_target import config as aws_config
+    from scripts.lib import conf
+
+    if not aws_config.offload_enabled(conf.read(target.settings)):
+        return "off"
+    from scripts.aws_target import ledger as cost_ledger
+    from scripts.mac_test import mac_test
+
+    decision = cost_ledger.spending_guard(target.settings, mac_test.state_paths(target.name).directory)
+    if isinstance(decision, cost_ledger.SpendingAllowed):
+        return ""
+    print(f"build targets: {target.name}: spending refused: {decision.reason}", file=sys.stderr)
+    return "spending_limit" if isinstance(decision, cost_ledger.SpendingRefused) else "spending_unavailable"
+
+
 def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarget:
-    """Read execution settings for a registered SSH target."""
+    """Exclude unusable AWS settings without stopping selection for other targets."""
+
+    from scripts.build_targets import target_config
+    from scripts.lib import conf
     from scripts.mac_test import offload
 
-    return offload.read_config(target.settings)
+    try:
+        reason = aws_spending_exclusion(target)
+        if reason:
+            return ExcludedTarget(target, reason)
+        return offload.read_config(target.settings)
+    except conf.Unusable as error:
+        if not target_config.is_aws_target(target):
+            raise
+        print(f"build targets: {target.name}: spending refused: {error}", file=sys.stderr)
+        return ExcludedTarget(target, "spending_unavailable")
 
 
 def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:

@@ -125,9 +125,9 @@ class AdminSecretTests(unittest.TestCase):
         output, errors = StringIO(), StringIO()
         with mock.patch.object(admin_secrets, 'read_hidden', return_value='test-passphrase') as prompt, \
              redirect_stdout(output), redirect_stderr(errors):
-            _ = subject.admin.executor(execute)(['aws', 'ec2', 'describe-spot-price-history'], capture_output=True, text=True, timeout=1, check=False)
+            _ = subject.price()
             _ = box.Tailnet(self.settings, subject.admin, transport).call('GET', 'acl')
-            _ = subject.admin.executor(execute)(['aws', 'ec2', 'describe-spot-price-history'], capture_output=True, text=True, timeout=1, check=False)
+            _ = subject.price()
             prompt.assert_called_once()
         self.assertEqual(len(calls), 2)
         self.assertEqual(requests, ['oauth/token', 'tailnet/-/acl'])
@@ -148,7 +148,7 @@ class AdminSecretTests(unittest.TestCase):
                     _ = (self.path.parent / 'tailscale-oauth').write_text('{}')
                 with mock.patch.object(admin_secrets, 'read_hidden') as prompt:
                     with self.assertRaisesRegex(admin_secrets.SecretsRefused, 'deploy.py secrets'):
-                        _ = deploy.Deployment(self.settings, self.root / 'state', self.root / 'bundle').gate_up(approve_resources=True)
+                        _ = deploy.Deployment(self.settings, self.root / 'state', self.root / 'bundle').up(approve_resources=True)
                     prompt.assert_not_called()
 
     def test_secrets_import_removes_only_admin_and_keeps_scaler_after_encryption(self) -> None:

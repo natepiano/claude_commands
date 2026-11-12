@@ -60,7 +60,7 @@ def text_setting(path: Path, key: str, value: str) -> None:
 
 def install_cost_settings(path: Path, overrides: str = "") -> None:
     """Install complete settings with exact, private test prices."""
-    _ = write_config_fixture(path, "region=us-east-1\n" + overrides)
+    _ = write_config_fixture(path, "offload=on\nregion=us-east-1\ninstance_id=i-fixture\n" + overrides)
     numeric_settings(path, {
         "daily_limit_usd": "20", "monthly_limit_usd": "400", "limit_reserve_usd": "3",
         "fallback_usd_per_hour": "1", "fixed_usd_per_month": "0",
