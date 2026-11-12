@@ -64,13 +64,7 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
 
    Defer copy-guard scope traversal (`copy_guard.py:900,1122`, 0–1.8 s), full bulk-run attribution and crate ownership attribution (`crate_run.py:303`) until measured evidence changes this order (architect after Phase 201).
 
-   Content-call backlog after these three (reuse `scripts/production/cli_fixture.py`; keep command-specific isolation in each fixture; keep stdin isolation and the recorder `detach` patch where needed; keep real CLI entries, cold imports, signals, timeouts, publication races and writer-lifetime proofs). Census costs bound the investigation only:
-
-   | Candidate | Location and owner | Census measurement and bound |
-   | --- | --- | --- |
-   | Phase-table content and refresh cases | `scripts/direct/test_phase_table.py:279,453`; natest, sdlc go | 67 starts, 9.240 local CPU s; 0–9.240 CPU s |
-   | Shot argument and validation cases | `scripts/hana_shot/test_hana_shot.py:418,585`; natest, hana-shot go | 142 starts, 21.735 local CPU s; 0–21.735 CPU s |
-   | Hold-event record contents | `scripts/build_hold/build_hold.py:934` through `build_hold_test_support.py`; natest, build-hold and report goes | 247 recorder starts, 19.409 local CPU s; 0–19.409 CPU s; needs its own behavior map: the recorder runs asynchronously |
+   Content-call backlog: done. Phases 202, 203 and 204 converted the three candidates; aws pairs saved 21.38 (hold-event), 9.85 (phase-table) and 18.07 (screenshot tool) CPU s per gate. Reuse `scripts/production/cli_fixture.py` for a later candidate; keep command-specific isolation in each fixture; keep real CLI entries, cold imports, signals, timeouts, publication races and writer-lifetime proofs. A recorder that runs in a thread calls its main directly, not through `invoke_cli`: the restore would change module bindings while the thread runs (Phase 202 F001).
 
    Do not convert `direct/test_progress_history.py:408` or `direct/recorder_fixture.py:201`: they already call real handlers in process.
 
