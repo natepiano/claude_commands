@@ -3480,3 +3480,63 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - All merge-gate, targeted-test, test_times and aws_target modules pass; basedpyright clean on each changed file.
 - A fake-clock test shows a gate past its limit stops, names its running modules, and reports red.
+
+### Phase 220 — Pane summary tests call the summary function directly  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the pane summary cases in `scripts/direct/test_assign_claude_panes.py` call `claude_worker._summary` (`scripts/direct/claude_worker.py:389`) directly in place of a whole Claude launcher run, and aws pairs show a CPU gain.
+
+**Decision:** architect reviews 25 and 26, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+
+**Spec:**
+1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on `direct/test_assign_claude_panes.py`.
+2. For the cases at `test_assign_claude_panes.py:12,30,63` (and any other case whose assertions read only the summary output), build the pane bytes and the summary inputs in the test and call `claude_worker._summary` directly. Assert the same summary text, length and log bytes.
+3. Keep the case at `:44` (control cleanup before the character cut) as a whole launcher test, so one test still proves the launcher writes the summary and the agent log.
+4. Keep every assertion. Keep the test count. Add no new general adapter.
+5. Run the module, every module that imports `claude_worker`, and basedpyright on each changed file.
+
+**Files:**
+- `scripts/direct/test_assign_claude_panes.py`
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phase 214: a test row must call the function directly, not run a whole launcher.
+
+**Acceptance gate:**
+- Launcher runs fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 221 — Follow and records tests make content calls in process  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content calls in `scripts/direct/test_assign_claude_follow.py` and `scripts/direct/test_assign_claude_records.py` run the assignment in process through the existing adapter (`assign_claude_test_support.py:445`, `run_assignment`), and aws pairs show a CPU gain.
+
+**Decision:** architect reviews 25 and 26, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+
+**Spec:**
+1. Refresh the profiles first: `module_cost.py --tests 10 --commands 15` on both modules.
+2. Turn on `direct_cli_calls` for the content cases (`test_assign_claude_follow.py:23,118,175,201`; `test_assign_claude_records.py:35,72,185`). Use `process_boundary_for_case` to keep a real process where a case proves it.
+3. Keep real processes for injected startup hooks, child observations, recorder failures and status-order observations.
+4. Keep every test and assertion. Change no shared support file unless the adapter cannot serve a case; then report the case and stop.
+5. Run both modules, every module that imports `assign_claude_test_support.py`, and basedpyright on each changed file.
+
+**Files:**
+- `scripts/direct/test_assign_claude_follow.py`
+- `scripts/direct/test_assign_claude_records.py`
+
+**Workers:** 1 writer; both modules use the same adapter.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 214: `resolve_model` reads the launch table in process; test environments carry the tier-only guard.
+- Census: follow 0–6.539 s (12 assignment tasks), records 0–6.299 s (16 tasks); ceilings, not savings.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain per module; sdlc sees the diff before land.
