@@ -3237,7 +3237,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Dropped; nothing landed. A trial traced each Bash launch with Linux `strace` to prove every descendant (+364 lines, an `strace` dependency). Sample of the 10 modules that hold the 59 tests with only `unverified launch bash`: 2 recovered. With real system binaries (`date`, `mkdir`, `dirname`, `cat`, `rm`, `mv` and others) added as leaves, the projection is 46 of 59, and the folder goes from 617 to 663 known of 1,558. The other 13 stay unknown (the `py` wrapper, fixture executables). The folder records cannot project more. Simple ranks above a 3% coverage gain, and no removal work is approved to use it. Patch: `phases/188/bash_descendant_evidence.patch` in the session folder.
 
-### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: todo
+### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: done
 **Depends on:** Phase 176
 
 #### Work Order
@@ -3335,3 +3335,103 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - No gain; nothing landed. Two queue-approved `_union` versions (`copy_guard.py:786`) were measured in aws pairs against `96e8e395f`: a dict used as an ordered set made `copies/test_copy_guard_sources.py` 3.69 CPU s slower (19.21 to 22.90, 3/3 rounds), because frozen dataclass hashes are not cached and walk every nested tuple on each insert; an identity fast path in front of the old list scan made it 0.61 s slower (19.17 to 19.78, 3/3 rounds). `copy_guard.py` is unchanged. Do not retry hashed membership for these value types without a cached hash.
+
+### Phase 199 — Measure repeated target metadata reads within one build-target request  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A report names the pure metadata reads that `build_targets.py` repeats within one request, with measured CPU per caller and a bound, file, line and owner for each combinable read.
+
+**Decision:** builds, 2026-11-12: the top job is the most gate CPU s per work hour; rank from the Phase 177 census. This is census rank 2 (target eligibility metadata, gross ceiling 0–149.5 CPU s per gate, about 18.7 per work hour). Research only; no code change. resources owns `build_targets.py`; verify owns its `verify.sh` callers. Code needs both goes.
+
+**Spec:**
+1. Read `phases/177/body_command_census.md` (the `build_targets.py` rows and caller table) in the session folder.
+2. Trace each `build_targets.py` command that `verify.sh:783,2395,2678` and `verify_mac_offload_test_support.py:1022` start. For each, list the files, Git calls and config reads it makes, and which are pure reads of immutable input within one request.
+3. Measure CPU per command and per read step on `direct/test_verify_mac_only.py`, `test_verify_ssh_targets_routing.py` and `test_verify_wait_holder.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> <module> --tests 10 --commands 15`, two runs each, plus in-process timing of the read steps.
+4. Name each repeated pure read that one request could do once, with its bound (kept apart from measurements), file, line and owner. Keep target choice, reservation, release, live probes, ownership and lock checks as behavior.
+5. Change no repository file. Write the report to `phases/199/target_reads_report.md` in the session folder.
+
+**Files:**
+- `phases/199/target_reads_report.md` — in the session folder.
+
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 177: `build_targets.py` 90.9 local CPU s in 541 starts across 31 observed modules; the pure-read share is unknown.
+- Phase 185 moved recorder imports; target calls run through `verify.sh` and stay with verify-unit.
+- No speed phase is selected from a local estimate; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives measured CPU per command and per read step, and each combinable read with bound, file, line and owner.
+- No repository file changes.
+
+### Phase 200 — Measure repeated Git metadata queries within one caller  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A report names the Git metadata queries that copies and style callers repeat on immutable state within one operation, with measured CPU per caller and a bound, file, line and owner for each combinable query.
+
+**Decision:** builds, 2026-11-12: rank from the Phase 177 census. This is census rank 3 (Git metadata, gross ceiling 0–93.5 CPU s per gate, about 15.6 per work hour). Research only; no code change. queue owns `scripts/copies/`; style owns `scripts/style/git_process.py`; natest owns `ledger_test_support.py`.
+
+**Spec:**
+1. Read `phases/177/body_command_census.md` (the `git rev-parse` rows and caller table) in the session folder.
+2. Trace the `git rev-parse` calls from `copies.py:433,449,474,486`, `style/git_process.py:157` and `style/ledger_test_support.py:283` in the top modules: `style/test_crate_run.py`, `style/test_style_ledger_tickets.py`, `agents/test_models_conf_publish.py`, `style/test_style_ledger_findings.py`, `style/test_bulk_run.py`.
+3. Count calls per operation and mark which read immutable values (common dir, top level, object ids of fixed commits) before refs, index or working tree can change. Measure their CPU with `module_cost.py --tests 10 --commands 15`, two runs per module.
+4. Name each combinable or reusable query with its bound (kept apart from measurements), file, line and owner. Fresh refs and working-tree checks keep fresh reads. Mark the fixture-only part (natest) apart from production (queue, style).
+5. Change no repository file. Write the report to `phases/200/git_metadata_report.md` in the session folder.
+
+**Files:**
+- `phases/200/git_metadata_report.md` — in the session folder.
+
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 177: `git rev-parse` 56.8 local CPU s in 56,622 calls across 94 observed modules.
+- Architect after Phase 197: `style_ledger.py:7787` already makes one `rev-parse` call for the ledger location.
+- No speed phase is selected from a local estimate; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives measured CPU per caller and each combinable query with bound, file, line and owner.
+- No repository file changes.
+
+### Phase 201 — Record-content tests call the recorder in process  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/buildlog/test_record.py` runs its record-content cases through `record.main(argv)` in process, keeps a small set of real CLI starts, and saves measured aws CPU.
+
+**Decision:** report, 2026-11-12: go on the test file with three conditions. (1) Each in-process case calls `record.main(argv)` with its environment set as the CLI case set it (patch `os.environ` per case, restore after) and the same working folder; check the return code and the captured stdout and stderr, as the CLI case did. (2) Keep real CLI starts for the entry path (the script through `scripts/lib/py`), an argument error exit code, and one record write that reads stdin, if a case reads stdin now. (3) No production code change in `record.py` for the tests; send report the hash before it lands. Census rank 7 (bound 0-17.7 CPU s per gate).
+
+**Spec:**
+1. Change the `record` helper at `test_record.py:167` so it runs `record.main(argv)` in process for record-content cases. Set `os.environ` from `self.environment(**extra)` and the working folder from `cwd` for the call; restore both after it. Feed `input` through `sys.stdin`. Capture stdout and stderr. Return the same `subprocess.CompletedProcess[str]` shape, so callers stay unchanged.
+2. `record.main` with `step` calls `detach()` (`record.py:450`), which calls `os.setsid()` and closes every descriptor above 2. In process, patch `record.detach` in the test only; never call it in the runner. Patch any other process-wide side effect the same way, and name each one in the reply.
+3. `step-context` runs `step_context.py` (`CONTEXT_SCRIPT`). Run it in process through its own `main` only when it has one with the same contract; otherwise keep it a CLI start.
+4. Keep real CLI starts per condition (2). Name each kept CLI case in the reply.
+5. Keep every assertion. Add no new test method. Keep module-level state between cases from leaking: reload or reset what `record.py` caches from the environment.
+6. Change no production file.
+
+**Files:**
+- `scripts/buildlog/test_record.py` — the `record` helper and the kept CLI cases.
+
+**Workers:** 1 writer; one test file holds the whole change.
+- impl: `scripts/buildlog/test_record.py`.
+
+**Constraints from prior phases:**
+- Phase 177: `buildlog/test_record.py` makes 130 record calls, about 10.8 local CPU s; the module is about 20 CPU s.
+- No speed phase lands on a local estimate; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `buildlog/test_record.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
+- An aws paired trial shows a CPU saving for `buildlog/test_record.py`.
+- report receives the file hash before it lands.
