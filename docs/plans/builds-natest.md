@@ -3107,43 +3107,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 170 — The four unheld lock-contention tests use forked children  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** four tests that start fresh Python children for lock contention start forked children instead. Every test, assertion, real handler and contention boundary stays.
-
-**Decision:** Architect review after Phase 168, finding 1 (next item 6b, phase 1). Phase 168 ceiling: 2.18 CPU s. sdlc go, 2026-11-11: the three files are free.
-
-**Spec:**
-1. Convert these tests to forked children that call the real handler or `main` (the Phase 163 pattern, `scripts/production/test_waiting.py` `eta_request_processes`):
-   - `scripts/production/test_ci_points.py:1009`, `test_simultaneous_watch_calls_claim_only_one_first_alert`: 2 children; both reach the held review lock; one alert and one log record.
-   - `scripts/agents/test_detached_runs.py:381`, `test_parallel_starts_cannot_exceed_one_configured_place`: 4 children; real admission lock; statuses `[0, 4, 4, 4]`; one saved run.
-   - `scripts/usage/test_agents_log.py:343`, `test_concurrent_default_registration_writes_one_assignment_and_returns_one_true`: 6 children; one returns true; one saved assignment.
-   - `scripts/usage/test_agents_log.py:530`, `test_concurrent_processes_append_complete_json_lines`: 4 children; 80 complete records.
-2. In each child: call `os.setpgid(0, 0)`, close inherited parent lock descriptors before the contention starts, and keep the intended child patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor). Do not let a child depend on an unrelated parent patch.
-3. Give each child its own output capture. In cleanup, kill each group through `send_process_group` (`scripts/lib/process_group.py`), join the child and close every descriptor. Never call `os.killpg` directly.
-4. Keep every existing assertion. Use no threads.
-5. If a child cannot keep its boundary in a fork, leave that test as it is and say why.
-
-**Files:**
-- `scripts/production/test_ci_points.py` — item 1, CI watch.
-- `scripts/agents/test_detached_runs.py` — item 1, admission.
-- `scripts/usage/test_agents_log.py` — item 1, registration and append.
-
-**Workers:** 1 writer; one pattern across three files.
-- impl4: all three files.
-
-**Constraints from prior phases:**
-- Phase 163: the fork pattern and its process-group cleanup; `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`.
-- Phase 168: lock waits cost almost no CPU; the saving is interpreter start and entry imports.
-- Phase 166: local CPU numbers are a guide only; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.production.test_ci_points scripts.agents.test_detached_runs scripts.usage.test_agents_log scripts.lib.test_process_group_sources` passes three times with 126 tests in the three modules.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- No process or folder stays behind.
-- Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
+- Checkpoint `195ea9cda`. Four lock-contention tests start their contenders as forked children: the simultaneous watch alerts test (`test_ci_points.py`), the parallel admission starts test (`test_detached_runs.py`), and the concurrent registration and JSON append tests (`test_agents_log.py`). `scripts/lib/fork_test_support.py` (`ForkChildren`: `pipe`, `start`; `ForkChild`: `pid`, `is_alive`, `result`) owns start, pipes, output capture and cleanup; cleanup signals the child directly when its process group does not exist yet. Its tests use pipes, not multiprocessing events: a first check run hung 2h10m in an event `set()` after a killed waiter. aws pairs: 2.06 CPU s saved per gate (1.00, 0.65, 0.40); the helper tests cost 0.13 CPU s locally.
 
 ### Phase 171 — The crate run tests share one default frozen state  · status: done
 **Depends on:** none
@@ -3221,73 +3187,16 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a measured report names the child commands and shared fixtures that cost the most CPU inside test bodies across the whole gate, with their callers and owners. No code changes.
-
-**Decision:** builds item 80 (the user, 2026-11-11): aim at the largest gate-time saving per work hour. Phase 174: fixed module costs are about 133 of 4,664 CPU s per gate; test bodies use the rest. Read-only.
-
-**Spec:**
-1. Pick a module sample that covers at least 60% of median cloud gate CPU, from the 209 recent passed cloud full gates in the newest `~/.local/state/buildlog/index-*.sqlite` (read-only). Add 30 random small modules. Record the revision, the sample and its CPU share.
-2. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --commands 25 --tests 5` on the sample. Run at most four modules at once.
-3. Add up child CPU by program across the sample: `git` by subcommand, `python3` by script or module, shells by script, and others. Give the count and the CPU of each.
-4. For each of the top 15 program rows, find the callers: the fixture or helper, with file and line, and the number of gate modules that use it. Scale each row to the full gate by module CPU share, labelled as an estimate.
-5. For each top caller, say if the child is part of the tested behavior or only setup. For setup, name the cheaper form (a class seed, an in-process call, one combined Git command) and its estimated saving per gate.
-6. Rank the candidates by estimated gate CPU s saved per work hour. Name the owner. Keep measured numbers apart from estimates.
-7. Write the report to `phases/177/body_command_census.md` in the session folder. Change no repository file. Delete saved run output after you read it.
-
-**Files:**
-- `phases/177/body_command_census.md` — the report, in the session folder; no repository file changes.
-
-**Workers:** 1 researcher; read-only.
-- impl3: the report.
-
-**Constraints from prior phases:**
-- Phase 174: gate wall time follows CPU over 32 slots (r = 0.994). Admission fixture imports cost up to 36 CPU s across 200 modules. Do not count import costs again.
-- Phase 164 and 169: in the style modules, Git children inside `copies.py` dominate; copies-unit owns them.
-- Phase 166: local CPU numbers overstate; only aws pairs decide a saving.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives the sample and its CPU share, the program table, the top callers with file, line, module count and owner, and the ranked candidates with measured and estimated labels.
-- `git status` shows no change from the researcher.
+- Checkpoint `3360d8b15`. Read-only census of the commands that test bodies start, in 137 high-cost and 30 random small modules (60.78% of median gate CPU); report at `phases/177/body_command_census.md`. Measured leaders: module_run task family 598.5 CPU s, `python3 -c` 166.8 (2,081 starts), `progress_history.py` 98.9 (390), `build_targets.py` 90.9 (541), `admission_client.py` 79.9 (467), `git rev-parse` 56.8 (56,622 calls). Ranked gross ceilings per work hour: recorder reuse 19.17 (Phase 182), target metadata reads 18.69, Git metadata 15.58, model resolution 13.86, admission client reuse 10.95. The census replaced `task_cpu.task_ids` in memory after a task name with byte `0xff` broke UTF-8 decoding.
 
 ### Phase 178 — The coverage report tests run the report in process, and the ledger fixture drops two unused imports  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_coverage_report.py` starts the report CLI once in place of 30 times, and `ledger_test_support.py` stops importing two modules it does not use. All tests and assertions stay.
-
-**Decision:** Phase 174 ranks these two changes second and third by gate seconds saved per work hour (ceilings 7.9 and 1.9 CPU s per gate). builds, 2026-11-11: current. style-unit go, 2026-11-11: both files are free; keep one real CLI process and every assertion; aws pairs decide; send the hash on land.
-
-**Spec:**
-1. In `scripts/style/ledger_test_support.py`, remove the imports of `style_plan` (line 27) and `declarations` (line 29). Search the repository first: no importer may read `ledger_test_support.style_plan` or `ledger_test_support.declarations`.
-2. In `scripts/style/test_coverage_report.py`, change `report()` (line 151) to call `coverage_report.main` in process through `invoke_cli` (`scripts/production/cli_fixture.py:91`). It must return the same `subprocess.CompletedProcess[str]` shape: exit code, stdout and stderr.
-3. Keep one test that runs the real CLI through `lib/py`, with its exit code and output assertions. Pick the test that covers the main report path.
-4. Check that `coverage_report.main` reads no process-wide state that the in-process call changes: arguments, environment, working folder, signals, globals and caches. Reset any such state for each call.
-5. Keep every assertion and every analysis, parser and Git call. Change no production code.
-6. Measure local CPU before and after with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 style/test_coverage_report.py`. The director runs three aws pairs on `style/test_coverage_report.py` and the ledger fixture importers; only aws pairs decide.
-
-**Files:**
-- `scripts/style/ledger_test_support.py` — imports at lines 27 and 29.
-- `scripts/style/test_coverage_report.py` — `report()` at line 151; 20 tests.
-
-**Workers:** 1 writer; two small style test files.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 174: the 30 report children cost 8.2 CPU s of 10.1 local; the import probe saved 1.87 CPU s across 42 importers.
-- Phase 78: `invoke_cli` is the shared in-process CLI boundary; `StaffCommandTestCase` runs 72 staff CLI calls through it.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.style.test_coverage_report` passes three times with 20 tests.
-- The ledger fixture importers pass.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+- Checkpoint `35eaebdf1`. `test_coverage_report.py` `report()` calls `coverage_report.main` in process through `invoke_cli`; one test keeps the real CLI through `lib/py`. `ledger_test_support.py` imports `style_plan` and `declarations` inside the two fixture methods that use them. aws pairs: `test_coverage_report.py` 13.56 to 3.10 CPU s; four ledger importers saved 0.23–0.35 s, `test_crate_run.py` -0.03 (noise).
 
 ### Phase 179 — Answer three questions on slow verify tests, coverage overlap and a fast-only gate  · status: done
 **Depends on:** none
@@ -3296,7 +3205,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.
 
-### Phase 180 — Collect line coverage overlap across scripts/direct  · status: todo
+### Phase 180 — Collect line coverage overlap across scripts/direct  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3328,7 +3237,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report and JSON exist, with candidates and unknown coverage in separate tables.
 - `git status` shows no change from the collection.
 
-### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: todo
+### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3417,7 +3326,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Spec:**
 1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_mac_only.py`. Name where the CPU goes: full `verify.sh` entries, `build_targets.py` children, stubs, fixture setup and the leak check.
 2. Map each test's assertions to the code they prove. Policy, eligibility and forwarding-name checks may move to calls of the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) when the decision is in one function. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
-3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit):
+3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit). "Keep" means no move away from the boundary at the phase base: a check that uses a direct result call at the base keeps that call and gets no new full entry.
    1. Signals: `test_int_during_long_busy_poll_stops_every_child` and `test_term_during_busy_wait_stops_every_child`; each still proves that no child outlives `verify.sh`.
    2. The Mac-only guarantee: `test_busy_then_pass_never_runs_on_natedev`, `test_runner_refusals_never_fall_back_or_retry` and `test_missing_runner_refuses_instead_of_running_locally`; each proves that no local cargo run starts.
    3. Environment wiring: `test_readonly_exports_reach_runner_without_shell_assignment` and `test_forwarded_environment_uses_callers_values_despite_shell_bindings`.
@@ -3447,3 +3356,38 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - After a fixture change, every importer of `verify_mac_offload_test_support.py` passes.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: todo
+**Depends on:** Phase 180
+
+#### Work Order
+
+**Goal:** A repeat of the Phase 180 folder collection over `scripts/direct` gives known coverage for the tests whose only unknown cause is a child from another test, and reports the overlap candidates.
+
+**Decision:** user via builds, 2026-11-11 (item 80, approval 2): the folder collection is approved. Phase 180 ran it and got 0 known of 1,558 tests, from a collector defect. The repair and one repeat run finish that approval. Candidates are not removal approvals. No test removal or coverage reduction is approved.
+
+**Spec:**
+1. Find the cause. In the Phase 180 run, every test has the cause `child outlived its test`. 618 tests have only that cause. `child_causes` in `scripts/test_times/coverage_overlap.py` uses `math.inf` as the end of a launch with no recorded end. Then that launch is "alive" at the start of every later test in the run. `LineCollector.poll_children` in `scripts/test_times/line_collector.py` records an end only when a held `Popen` returns from `poll()`. Name the launches that have no end in a folder run, and say why (still running, not held, mocked, or other).
+2. Repair the cause in the collector. Do not hide it in the report. A child that still runs at a later test start stays a valid cause for that test. A child with no evidence that it ran at that time is not a cause. Keep each other cause rule as it is.
+3. Add rows to `scripts/test_times/test_coverage_overlap.py` for the defect: one launch with no seen exit, followed by later tests in other modules. Prove the rows fail on the old code.
+4. Run the folder collection again, as in Phase 180 Spec items 1-3, at the new commit, with `COVERAGE_OUT` in `phases/184/`. Report as in Phase 180 Spec items 4-5, plus the count of tests that changed from unknown to known.
+
+**Files:**
+- `scripts/test_times/coverage_overlap.py` — launch end rules in `child_causes`.
+- `scripts/test_times/line_collector.py` — child end records, if the cause is there.
+- `scripts/test_times/test_coverage_overlap.py` — new rows for the defect.
+- `phases/184/coverage_overlap_report.md`, `phases/184/coverage_overlap.json` — in the session folder.
+
+**Workers:** 1 writer; the collector and its tests share one cause and cannot split.
+- impl: the cause, the repair, the new rows and the repeat run.
+
+**Constraints from prior phases:**
+- Phase 180: 207 modules, 1,558 tests, all passed; collector CPU 1,711 s, wall 43.5 min; 0 known, 0 candidates; cause counts Bash 729, Cargo 68, Git 361, ps 167, forks 146; every test has `child outlived its test`.
+- Phase 179: three sampled modules gave 5 of 21 tests unknown. The defect shows only in a long run.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
+- The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
