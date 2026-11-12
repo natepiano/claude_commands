@@ -238,7 +238,7 @@ def registered_showrunners(
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
             name=row.name,
-            session=live["name"] if live is not None else "",
+            session=row.name if live is not None else "",
             socket=live["messagingSocketPath"] if live is not None else "",
             doc=str(doc.path),
             zone=timer.zone if isinstance(timer, showrunners.TimerRegistration) else user_zone_name()))
@@ -312,7 +312,7 @@ def production_places(
         name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(name, owner["name"], f"session:{parent.current_session}")
+            UnderShowrunner(name, parent.name, f"session:{parent.current_session}")
             if owner is not None else ProductionWithoutRunningShowrunner(name))
         places[identity] = ProductionPlace(relationship, DirectsUnit(row.name))
     return places

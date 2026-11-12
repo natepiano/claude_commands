@@ -249,7 +249,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
 | `scripts/production/showrunner_tree.py` | read | active, snapshot |
-| `scripts/production/showrunners.py` | read | initial_snapshot, runtime_id |
+| `scripts/production/showrunners.py` | read | initial_snapshot, runtime_id, snapshot |
 | `scripts/production/staff.py` | owner | staff.json (owner) |
 | `scripts/production/staff_move.py` | write | cli_result, main, move, operation, snapshot |
 | `scripts/production/staff_sources.py` | write | active, apply_seed, cli_result, ensure, initial_snapshot, native_id, operation, set_doc, snapshot |
@@ -308,10 +308,12 @@ The shared pane launch builder uses `set_home`.
 | `scripts/usage/transcript_retention.py` | read | local_snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
+| `scripts/whoami/five_hour.py` | read | snapshot |
+| `scripts/whoami/quota_alert.py` | read | snapshot; send.staff_named |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-183 accessor rows: 39 write, 143 read, 1 owner.
+185 accessor rows: 39 write, 145 read, 1 owner.
 
 ## Approved copies
 

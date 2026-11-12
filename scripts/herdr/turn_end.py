@@ -71,10 +71,13 @@ def _friend_pending(client: herdr.Herdr, state: worker_panes.WorkerPane | worker
     kind = "codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"
     address = ("codex:" if kind == "codex" else "session:") + str(row.current_session)
     for pane in panes:
-        if not (pane.get("tab_id") == tab and str(pane.get("label", "")).startswith("friend-")
+        if not (pane.get("tab_id") == tab and pane["pane_id"] != state.pane
                 and client.readiness(pane["pane_id"])["agent_status"] == herdr.AgentStatus.WORKING):
             continue
-        native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        try:
+            native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        except herdr_types.HerdrFailure:
+            continue
         backend = (staff.CodexBackend(Path(native.environment["CODEX_HOME"])) if kind == "codex"
                    else staff.ClaudeBackend())
         source = worker_admission.transcript_source(replace(row, current_session=staff.native_id(native.current_identity)), backend)
@@ -138,7 +141,11 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     options = options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name))
 
     def send_notice() -> None:
-        result = send.send(options)
+        current = staff.snapshot().by_id(parent.id)
+        if current is None:
+            raise ValueError(f"{parent.id}: notice recipient is not in staff")
+        address = ("codex:" if isinstance(staff.backend(current), staff.CodexBackend) else "session:") + str(current.current_session)
+        result = send.send(options._replace(selection=send.RosterLookup(address)))
         if result.outcome not in ("sent", "skipped"):
             raise ValueError(result.detail)
         progress_history.record_dispatch_notice(run, instance, stamp)

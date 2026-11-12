@@ -7,7 +7,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-import json
 import math
 from time import monotonic
 import os
@@ -46,7 +45,7 @@ RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/prod
 class Showrunner(TypedDict):
     """A staff showrunner with its timer and current session data."""
 
-    # The session's name now, looked up by its Claude session id. Empty while it is not running.
+    # The current staff name. Empty while the session is not running.
     session: str
     # Where a message reaches it now. Empty while it is not running.
     socket: str
@@ -223,26 +222,13 @@ def _fields(path: Path, *, dependencies: Callable[[Path], None] | None = None) -
 
 
 def session_name(session_id: str) -> str:
-    """The live Claude session's name, or empty when it has none or is not running."""
+    """Return the staff name for the current native session."""
     return _session_name(session_id)
 
 
 def _session_name(session_id: str) -> str:
-    for path in sessions_directory().glob("*.json"):
-        try:
-            pid = int(path.stem)
-            try:
-                os.kill(pid, 0)
-            except PermissionError:
-                # Another user's process is still a live one.
-                pass
-            data = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-            name = data.get("name")
-            if data.get("sessionId") == session_id and isinstance(name, str) and name:
-                return name
-        except (OSError, ValueError, TypeError):
-            continue
-    raise ValueError(f"session {session_id} has no live named process")
+    owner = staff.snapshot().by_current_session(session_id)
+    return owner.name if owner is not None else ""
 
 
 def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None,
@@ -315,19 +301,20 @@ def _registered(timer: TimerRegistration, *,
                 membership: staff.StaffSnapshot | None = None) -> Showrunner:
     membership = membership if membership is not None else staff.initial_snapshot()
     owner = membership.by_id(staff.StaffId(timer.target[8:]))
-    current = owner.current_session if owner is not None else timer.target[8:]
+    if owner is None:
+        raise ValueError(f"{timer.target}: no showrunner staff row")
+    current = owner.current_session
     target = "session:" + current
     if isinstance(known_sessions, DiscoverSessions):
         socket = (socket_for(target, deadline=deadline) if math.isfinite(deadline)
                   else socket_for(target)) or ""
-        name = _session_name(current) if socket else ""
+        name = owner.name if socket else ""
     else:
         record = known_sessions.get(current)
         live = record is not None and messaging_socket_exists(record)
         socket = record["messagingSocketPath"] if record is not None and live else ""
-        name = record["name"] if record is not None and live else ""
-    doc = (str(owner.doc.path) if owner is not None
-           and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else "")
+        name = owner.name if live else ""
+    doc = str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""
     return Showrunner(session=name, socket=socket or "", name=timer.name, zone=timer.zone, doc=doc)
 
 
