@@ -169,6 +169,7 @@ from scripts.build_queue.admission_records import (
     WaitingStep,
     WidthNotRecorded,
     WithinSlot,
+    format_percent,
 )
 from scripts.build_queue.step_estimator import (
     Completed,
@@ -376,7 +377,18 @@ def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMe
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
-        labels = roster.unit_labels_for(session_ids, os.environ)
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        recorded: dict[str, UnitMembership] = {}
+        try:
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+        except (OSError, ValueError):
+            pass
+        missing = [session for session in session_ids if session not in recorded]
+        if missing:
+            recorded.update(roster.unit_labels_for(missing, os.environ))
+        labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}
 
@@ -1804,7 +1816,7 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
@@ -1849,9 +1861,9 @@ def progress_text(reading: StepMemory) -> str:
     if not isinstance(reading, ProgressAdjustedMemory):
         return ""
     counter = reading.counter
-    phase = (f"{counter.phase}, {counter.percent:.0f}% done" if isinstance(counter, progress.ProgressCounter)
+    phase = (f"{counter.phase}, {format_percent(counter.percent, complete=counter.done == counter.total)} done" if isinstance(counter, progress.ProgressCounter)
              else counter.reason)
-    reason = (f"highest anonymous use in the next {reading.window.lookahead_percent:g}%"
+    reason = (f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
               if isinstance(reading.window, progress.WindowPeak) else
               f"full need: {reading.window.reason}")
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"

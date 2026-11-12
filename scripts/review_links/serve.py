@@ -350,7 +350,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(length).decode("utf-8")
             delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.browser_failure(400, "Check the answer and submit it again.", error)
+            self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
             return
         except change_page.FeatureLogFailed as error:
             self.browser_failure(503, "The feature log could not be updated.", error)

@@ -2167,9 +2167,13 @@ class RestartTests(RestartTestCase):
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)))
         sibling_identity = str(self.rows[1].current_session)
+        foreign = staff.StaffRow(staff.StaffId("foreign-producer"), "producer", "another-production", staff.STAFF_ROOT,
+                                 current_session=staff.StaffId("foreign-producer-session"))
         read_native = herdr.native_process
 
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            if pid == 990102 and kind == "claude":
+                return herdr.NativeAgentProcess(herdr.EnvironmentThread(str(foreign.current_session)), "fixture-start", {})
             if pid == 990101 and kind == "claude":
                 return herdr.NativeAgentProcess(herdr.EnvironmentThread(sibling_identity), "fixture-start", {})
             return read_native(pid, kind)
@@ -2194,7 +2198,9 @@ class RestartTests(RestartTestCase):
                 return {"panes": [own] if own_only else [sibling, own]}
             if arguments[:2] == ("pane", "process-info"):
                 pid = 990101 if arguments[-1] == "w1:sibling" else 990000
-                argv = ["claude"] if pid == 990101 else ["zsh"]
+                if workspace_label == "morty" and own_only:
+                    pid = 990102
+                argv = ["claude"] if pid in (990101, 990102) else ["zsh"]
                 return {"process_info": {"shell_pid": 990000, "foreground_process_group_id": pid,
                     "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv}]}}
             raise AssertionError(arguments)
@@ -2215,7 +2221,7 @@ class RestartTests(RestartTestCase):
         producer = replace(self.rows[0], kind="producer")
         self.rows = (producer,)
         self.running.clear()
-        record = staff.StaffSnapshot(self.rows)
+        record = staff.StaffSnapshot((*self.rows, foreign))
 
         def resume(row: staff.StaffRow, entry: pane_record.PaneLaunch) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
             del entry

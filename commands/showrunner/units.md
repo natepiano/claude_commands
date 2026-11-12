@@ -21,6 +21,14 @@ The style table uses the same status words as the phase table.
 Both tables add a **Machine** column after **Status** only when a row runs on another machine.
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
+Both tables omit a column when every row has `—` in that column.
+A table without rows keeps its columns.
+Both tables use `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
+They allow four columns for the terminal margin and measure text before Markdown escaping.
+Long text cells end with `…`; a cut never splits a wide character.
+Column headers set the minimum text widths.
+Fixed columns and minimum text widths can exceed a smaller configured width.
+
 For units outside the `Style units` table in a production without `Kind: style`, the table is:
 `| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
 ETA Plan appears only when at least one row has unfinished plan phases.
@@ -30,6 +38,9 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    An open phase takes priority over not started, then done.
    All three characters use the same display width.
    With no recorded phases, Progress gives `—`.
+   When a row shows a Progress bar, one blank line separates the table from this legend:
+   `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+   The style table has no Progress legend.
 2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
    A finished newest run supplies no fallback.
@@ -57,13 +68,18 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Notes, ETA Next, ETA Plan, and Workers use at most 80 characters per cell, with `…` for omitted text.
-The Progress bar has no text cut.
-Queued limits each item or title to 80 characters and keeps its count suffix after the cut.
+Notes and Workers first limit each cell to 80 characters.
+Queued first limits each item or title to 80 characters and adds its count suffix.
+The table then cuts Queued, Non-Phase Work, Workers, and Notes, in that order, until its rows fit the width.
+Notes keeps its text while another cuttable column can shrink.
+The table preserves Unit, Status, Machine, Progress, Phase, and both ETA cells.
 Empty cells show `—`.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
-`| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`:
+`| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
+
+The style table cuts Step before Ticket to fit the width.
+The number columns keep their right alignment when the table omits a column.
 
 - **Ticket**: `#<n> · <rule> · <crate> · <work>`. The number drops the unit
   prefix. The rule is its file stem; an empty rule uses the first stem from
