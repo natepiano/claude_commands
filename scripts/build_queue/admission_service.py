@@ -1203,10 +1203,12 @@ class AdmissionServer:
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+        rows = self._ordered_waiters()
+        sessions = [row.get("session_id", "") for _, row in rows if not row.get("unit")]
         labels: Mapping[str, gate.UnitMembership] = (
-            gate.priority_labels([waiting.row.get("session_id", "") for waiting in self.waiters.values()])
-            if not isinstance(self.priority, records.NoQueuePriority) else {})
-        return gate.apply_queue_priority(self._ordered_waiters(), gate.QueueOrderContext(self.priority, labels))
+            gate.priority_labels(sessions)
+            if sessions and not isinstance(self.priority, records.NoQueuePriority) else {})
+        return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
 
     def _override_pending_reconnect(self) -> bool:
         if isinstance(self.override_reconnect_until, NoReconnectGrace):
@@ -2243,7 +2245,7 @@ class AdmissionServer:
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
-        started, cpu_started = self.clock.monotonic(), time.process_time()
+        started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
             return self._handle_request(request, connection)
         finally:
@@ -2257,7 +2259,7 @@ class AdmissionServer:
             records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
         else:
             records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
-            wall, cpu = self.clock.monotonic() - started, time.process_time() - cpu_started
+            wall, cpu = self.clock.monotonic() - started, time.thread_time() - cpu_started
             if wall > limit:
                 print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
                       file=sys.stderr, flush=True)
