@@ -1281,7 +1281,8 @@ class CostLedger:
     def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
         """Release a reservation only after AWS confirms its final state."""
         with self._locked() as state:
-            state.gate_reservations = [replace(r, state=outcome, instance_type=instance_type or r.instance_type) if r.attempt == attempt else r
+            state.gate_reservations = [replace(r, state=outcome, instance_type=instance_type or r.instance_type) if r.attempt == attempt
+                                       and not (isinstance(r.state, GateTerminated) and isinstance(outcome, GateAbsent)) else r
                                        for r in state.gate_reservations]
             self._price_gates(state, self.read_bills(), int(time.time()) if isinstance(outcome, GateRunning) else outcome.at)
             self._save(state)
