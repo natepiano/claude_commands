@@ -88,15 +88,6 @@ class WorktreeAttributionTests(unittest.TestCase):
                                            "--phase", phase, "--repo", str(root)])
         return code, errors.getvalue()
 
-    def test_missing_unit_row_names_the_owner(self) -> None:
-        _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps({"owner_staff_id": "missing-owner"}))
-        directory = phase_reservation.phase_directory(self.session, "1")
-        errors = io.StringIO()
-        with contextlib.redirect_stderr(errors), self.assertRaisesRegex(phase_reservation.StateRefused,
-                                                                      "run owner is unavailable"):
-            _ = phase_reservation.phase_worktree(directory)
-        self.assertIn("run owner missing-owner: unit staff row is unavailable", errors.getvalue())
-
     def test_claim_records_the_first_commit_and_dirty_status(self) -> None:
         directory = phase_reservation.phase_directory(self.session, "1")
         _ = phase_reservation.enroll(directory, "1", "board_ready")
@@ -732,9 +723,6 @@ class PhaseRepairTests(unittest.TestCase):
         self.assertEqual((self.directory / phase_reservation.REPAIRS_FILE).read_text().splitlines(), lines)
         self.assertEqual((self.root / "posts.log").read_text().splitlines(), posts)
 
-    def test_no_mapping_prints_reopen_commands_without_writing(self) -> None:
-        self.assert_reopen_refusal(self.repair())
-
     def test_a_checkpoint_released_active_record_can_claim_a_new_reservation(self) -> None:
         _ = subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"],
@@ -924,14 +912,6 @@ class PhaseRepairTests(unittest.TestCase):
                 self.assertEqual((self.directory / phase_reservation.STATE_FILE).read_bytes(), original)
                 self.assertFalse((self.directory / phase_reservation.REPAIRS_FILE).exists())
                 self.assertFalse((self.root / "posts.log").exists())
-
-    def test_repair_does_not_accept_caller_supplied_reservation_or_run_ids(self) -> None:
-        self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
-        for option in ("--reservation-id", "--run-id", "--state"):
-            with self.subTest(option=option):
-                self.assertEqual(self.repair(option, "forged").returncode, 2)
-                self.assertFalse((self.directory / phase_reservation.STATE_FILE).exists())
-
 
 HELD_BERTH = r'''#!__PYTHON__
 import json, os, subprocess, sys

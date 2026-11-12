@@ -68,7 +68,9 @@ def versions(command, remote=False):
     else: raise AssertionError(command)
 if name == 'aws':
     op = args[args.index('--region') + 3]
-    if op == 'describe-instances':
+    if op == 'get-service-quota':
+        output({'Quota': {'Value': 128}})
+    elif op == 'describe-instances':
         s['observations'] = s.get('observations', 0) + 1
         if s.get('self_stop') and s['observations'] >= s.get('stop_after', 2): s['ec2'] = 'stopped'
         save()
@@ -430,7 +432,8 @@ class BoxTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 self.assertTrue(subject.up(approve_resources=True))
-            stage_lines = [line for line in output.getvalue().splitlines() if not line.startswith('up: ')]
+            stage_lines = [line for line in output.getvalue().splitlines()
+                           if not line.startswith('up: ') and ': Spot quota ' not in line]
             self.assertEqual(len(stage_lines), 12)
             self.assertTrue(all(line.endswith(': present') for line in stage_lines))
             later = self.commands()[commands:]

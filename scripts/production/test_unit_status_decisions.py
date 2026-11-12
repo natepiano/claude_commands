@@ -56,3 +56,31 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertNotIn("WAITING on you", outputs[1])
         self.assertNotIn("=== DECISION", outputs[1])
         self.assertNotIn("BLOCK in", outputs[1])
+
+    def test_a_unit_with_no_marked_session_reads_gone_while_a_marked_one_lives(self) -> None:
+        outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
+                                          missing_units=("hook",), stopped_units=("hookworm",))
+        # A unit without a marked session prints its staff unit id.
+        gone = self.unit_text(outputs[0], "hook")
+        live = self.unit_text(outputs[0], "hookworm")
+        self.assertIn("SESSION GONE", gone)
+        self.assertIn("CLAUDE NOT RUNNING", live)
+
+    def test_herdr_units_report_activity_and_tick_health(self) -> None:
+        outputs, calls, seen = self.run_statuses(
+            "/tmp/native-run\n", "failing: no instance", 1,
+            units=("hook", "native"),
+            panes=({"hook": "● Check hook progress\nPhase ETA: 12:00 EDT\n— holding: running\n",
+                    "native": "● Check herdr progress\nPhase ETA: 13:00 EDT\n— gate: approve release\n"},),
+        )
+        output = outputs[0]
+        self.assertIn("== hook", output)
+        self.assertIn("● Check hook progress", output)
+        self.assertIn("== native", output)
+        self.assertIn("● Check herdr progress", output)
+        self.assertIn("Phase ETA: 13:00 EDT", output)
+        self.assertIn("=== DECISION for you from native ===", output)
+        self.assertNotIn("CLAUDE NOT RUNNING", output)
+        self.assertNotIn("SESSION GONE", output)
+        self.assertEqual(calls, "health unit-native-run\n" * 2)
+        self.assertEqual(seen, f"{self.unit_ids['native']}|— gate: approve release\n")

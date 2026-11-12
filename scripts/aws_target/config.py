@@ -19,6 +19,27 @@ from scripts.lib import conf
 from scripts.build_targets import target_config
 
 
+def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
+    """Read the ordered regions permitted by the account policy."""
+    values = configuration if configuration is not None else conf.read_or_repository('cloud_gate')
+    regions = tuple(values.words('regions'))
+    if not regions or regions[0] != home or len(set(regions)) != len(regions):
+        raise ValueError('regions must start with the home region and contain no duplicates')
+    return regions
+
+
+def gate_deployment(path: Path, home: str) -> dict[str, object]:
+    """Migrate the single-region record once and read the regional form."""
+    from scripts.lib.atomic_file import write_text_atomic
+    value = cast(dict[str, object], json.loads(path.read_text()))
+    if 'regions' not in value:
+        regional = {key: value.pop(key) for key in ('image', 'subnets', 'template', 'version', 'security_group') if key in value}
+        regional['region'] = value.pop('region', home)
+        value['regions'] = [regional]
+        write_text_atomic(path, json.dumps(value, sort_keys=True) + '\n')
+    return value
+
+
 def account_settings_path() -> Path:
     """Use the installed account settings regardless of the checkout's CONF_DIR."""
     override = os.environ.get('AWS_TARGET_CONFIG')

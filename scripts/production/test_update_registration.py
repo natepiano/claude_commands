@@ -9,8 +9,8 @@ import shutil
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from typing import IO, cast, final, override
 from unittest import mock
 
@@ -102,7 +102,9 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
 
     def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
-        self.without_updates_line()
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
+        _ = self.git("commit", "-qam", "no Updates line")
         first = self.run_command("register")
 
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -243,26 +245,6 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(after.entries[0].key, f"{owner.id}: Choose the layout")
         self.assertEqual(after.entries[0].item,
                          "example [user], since Tue Oct 06 08:00, asked by alpha: Keep the layout?")
-
-    def test_question_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
-        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
-                                        "question": "Keep the layout?", "review_unavailable": "offline",
-                                        "asked_by": str(self.asker_id), "after": "2099-01-02T08:00",
-                                        "urgency": "soon", "due": "2099-01-03", "follows": "Earlier choice"}
-        _ = self.outstanding().write_text(json.dumps([legacy]))
-        self.migrate()
-        with self.forbid_legacy_question_access():
-            after = registration.read_open_items(self.outstanding())
-        self.assertEqual(len(after), 1)
-        item = after[0]
-        self.assertIsInstance(item, registration.ReviewUnavailableOutstandingQuestion)
-        assert isinstance(item, registration.ReviewUnavailableOutstandingQuestion)
-        self.assertEqual((item.text, item.question, item.asked_by),
-                         ("Choose the layout", "Keep the layout?", self.asker_id))
-        self.assertEqual(item.since, datetime(2026, 10, 6, 8))
-        self.assertEqual(item.reason, "offline")
-        self.assertEqual(item.timing, registration.DeferredUntil(datetime(2099, 1, 2, 8)))
-        self.assertEqual(item.rank.follows, "Earlier choice")
 
     def test_footer_counts_read_migrated_records_without_the_legacy_list(self) -> None:
         self.file_question()
@@ -649,6 +631,26 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.question_rows(), [])
         self.assertFalse(timer.exists())
         self.assertFalse((self.state / "showrunner/outstanding/example.json").exists())
+
+    def test_reader_preserves_review_timing_and_rank_after_migration(self) -> None:
+        legacy = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep the layout?", "review_unavailable": "offline",
+                                        "asked_by": str(self.asker_id), "after": "2099-01-02T08:00",
+                                        "urgency": "soon", "due": "2099-01-03", "follows": "Earlier choice"}
+        _ = self.outstanding().write_text(json.dumps([legacy]))
+        self.migrate()
+        with self.forbid_legacy_question_access():
+            after = registration.read_open_items(self.outstanding())
+        self.assertEqual(len(after), 1)
+        item = after[0]
+        self.assertIsInstance(item, registration.ReviewUnavailableOutstandingQuestion)
+        assert isinstance(item, registration.ReviewUnavailableOutstandingQuestion)
+        self.assertEqual((item.text, item.question, item.asked_by),
+                         ("Choose the layout", "Keep the layout?", self.asker_id))
+        self.assertEqual(item.since, datetime(2026, 10, 6, 8))
+        self.assertEqual(item.reason, "offline")
+        self.assertEqual(item.timing, registration.DeferredUntil(datetime(2099, 1, 2, 8)))
+        self.assertEqual(item.rank.follows, "Earlier choice")
 
 
 if __name__ == "__main__":

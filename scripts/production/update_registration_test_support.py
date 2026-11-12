@@ -249,11 +249,6 @@ class RegistrationFixture(unittest.TestCase):
                               cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
                               timeout=TEST_HANG_GUARD_SECS)
 
-    def without_updates_line(self) -> None:
-        doc = self.doc.read_text(encoding="utf-8")
-        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
-        _ = self.git("commit", "-qam", "no Updates line")
-
     def question_state(self, items: list[dict[str, str] | str]) -> Path:
         path = self.root / "questions.json"
         _ = path.write_text(json.dumps({"open_for_user": items}))

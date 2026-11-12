@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from contextvars import ContextVar
-from io import StringIO
+from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
 from time import monotonic
@@ -39,6 +39,7 @@ from scripts.production.staff import STAFF_ROOT
 from scripts.whoami import agent_accounts, note_file
 from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
 from scripts.agents import member_account, pane_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
@@ -1068,7 +1069,7 @@ def _codex_name_ids(name: str) -> list[str]:
 
 def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionNotFound:
     """Read the native resume arguments and the folder from the rollout metadata."""
-    path = next((agent_accounts.codex_home() / "sessions").glob(f"**/rollout-*{identity}.jsonl"), None)
+    path = next(iter(transcript_paths(agent_accounts.codex_home() / "sessions", f"**/rollout-*{identity}.jsonl")), None)
     if path is None:
         return SessionNotFound(identity)
     restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
@@ -1078,8 +1079,8 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
         return SessionNotFound(identity)
     if kind != "codex":
         return SessionNotFound(identity)
-    with path.open(encoding="utf-8") as stream:
-        meta = herdr.json_object(cast(object, json.loads(stream.readline())), "Codex rollout metadata")
+    with open_transcript(path) as stream, TextIOWrapper(stream, encoding="utf-8") as transcript:
+        meta = herdr.json_object(cast(object, json.loads(transcript.readline())), "Codex rollout metadata")
     folder = herdr.json_text(herdr.json_object(meta.get("payload"), "Codex session metadata").get("cwd"), "Codex rollout cwd")
     return pane_record.launch("", identity, folder, environment, [kind, *arguments], kind=kind)
 
@@ -1238,7 +1239,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         else:
             _ = entry.pop("config_dir", None)
-        if row is not None and row.kind == "producer":
+        if row is not None and row.kind == "producer" and not (
+                isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
+                and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
             if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, row.name, space):
                 destination = client.producer_row_tab(str(row.id), row.name, space)
@@ -1328,7 +1331,10 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         selected_home = staff.SessionHome(target_dir.absolute())
         if row is not None and row.home != selected_home:
             try:
-                _ = staff.set_home(row.id, selected_home)
+                # The launch hook can publish the new home before the start returns.
+                current = staff.by_id(row.id)
+                if current is None or current.home != selected_home:
+                    _ = staff.set_home(row.id, selected_home)
             except (staff.StaffUnreadable, staff.StaffNotFound) as error:
                 print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
         if original is not None:

@@ -278,20 +278,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
         finally:
             connection.set_trace_callback(None)
 
-    def test_legacy_candidate_source_blobs_are_read_in_the_site_batch(self) -> None:
-        source = "fn work() {\n    let old = 791;\n}\n"
-        ledger, finding, base, checkpoint = self.legacy_anchor(source, "// shifted\n" + source, "let old = 791;")
-        read_tip = cast(Callable[[str], style_ledger.RepositoryTip], getattr(ledger, "_tip"))
-        before, current = read_tip(base), read_tip(checkpoint)
-        wanted = {before.blobs[PARENT_FILE], current.blobs[PARENT_FILE]}
-        prepare = cast(Callable[[tuple[style_ledger.HeldFinding, ...], style_ledger.RepositoryTip], None],
-                       getattr(ledger, "_prepare_sites"))
-        with mock.patch.object(style_ledger, "blob_contents", wraps=style_ledger.blob_contents) as batches:
-            prepare((finding,), current)
-            self.assertEqual(ledger.finding_anchor(finding), style_ledger.FindingAnchor(base, PARENT_FILE, finding.line))
-        candidate_reads = [set(cast(dict[str, str], call.args[1]).values()) & wanted
-                           for call in batches.call_args_list]
-        self.assertEqual([blobs for blobs in candidate_reads if blobs], [wanted])
 
     def assert_hidden_enclosing_move_refused(self, prefix: str) -> None:
         header = "macro_rules! declarations {\n    () => {\n"
@@ -1164,19 +1150,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
               self.assertRaisesRegex(style_ledger.LedgerError, f"synced tip moved from {planned}")):
             _ = ledger.follow_declarations([finding_id], planned, lambda _: True)
         self.assertEqual(self.held_rows(ledger.database), before)
-
-
-    def test_a_built_rename_reads_its_file_at_each_commit_once_across_the_plan_and_its_recheck(self) -> None:
-        ledger = self.ledger()
-        finding_id = self.renamed_parent(ledger)
-        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
-        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as runs:
-            renamed, = self.follow_approved(ledger, [finding_id])
-        self.assertIsInstance(renamed, style_ledger.DeclarationRenamed)
-        reads = [call for call in runs.call_args_list
-                 if PARENT_FILE in cast(tuple[list[str]], call.args)[0] and "ls-tree" in cast(tuple[list[str]], call.args)[0]]
-        # a.rs at the read commit and at the tip; the applied check and the recheck under the lock read no git.
-        self.assertEqual(len(reads), 2)
 
 
     def test_a_trait_qualified_built_rename_follows_a_filed_impl_method_and_keeps_its_type_owner(self) -> None:
@@ -2149,7 +2122,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
             left, = self.follow_approved(ledger, [finding_id])
         self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Test the readings log and the weighted pace toward 100% usage."""
+"""The readings log and the weighted pace for account usage."""
 
 import json
 import math

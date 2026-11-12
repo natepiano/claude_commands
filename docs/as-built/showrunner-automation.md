@@ -137,6 +137,7 @@ It preserves the line's comments and spacing.
 The commit uses `tune(<file>): <key> <old> -> <new>` and a `User-Approved:` trailer.
 A same-value retry finishes publication without another commit.
 `scripts/lib/main_publish.py` supplies the shared publication path for `/tune` and `/zone`.
+Its preparation and push each take a short [main push lock](repair-rounds.md#shared-main-push-lock).
 It accepts unpublished subjects beginning `tune(`, `zone(`, or `user zone: `.
 It refuses another unpublished commit before changing the setting.
 It fetches main and rebases pending publisher commits when a fast-forward fails.
@@ -179,7 +180,7 @@ The queue survives a unit rename because its key is the fixed staff id.
 
 `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --started <ISO>` accepts these options:
 
-- `--review-trial "<line>"`, `--parallel "<line>"`, and `--delivers "<line>"`.
+- `--review-trial "<line>"` and `--delivers "<line>"`.
 - `--shrink` or `--as-built`.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
@@ -197,8 +198,6 @@ Each local Promote checkout must exist before the command pushes.
 
 - **Input rules.** A code checkpoint needs a `--review-trial` line and a one-line `--delivers`; a shrink refuses `--delivers`.
   [Review regime records](review-regime-trial.md) define the line.
-  The checkpoint also needs `--parallel` matching `Parallel: Phase <N>[, Phase <M>…] could start` or `Parallel: none — <reason>`.
-  `Parallel: unknown` is refused with instructions to add the plan's `**Depends on:**` lines and rerun `check_parallel`.
   `--cancel-prior` is refused with `Push: git`.
   `MergeRequest.delivers` and `excluded` use `str`, with `""` for an absent value.
 - **User bump.** `--bump` accepts only code checkpoints.
@@ -220,7 +219,12 @@ Each local Promote checkout must exist before the command pushes.
   Each successful recipient is saved, and a failed send gets one retry.
   `MERGE_CHECKPOINT_SEND` selects the sender for tests.
 
-- **Publication locks.** The gate-record lock precedes `main_push_lock`.
+- **Publication locks.** `scripts/lib/main_push_lock.py` supplies the shared helper.
+  The gate-record lock precedes `main_push_lock`.
+  Nested calls in one process share the hold for the same repository.
+  Only a child with an explicit `held_environment` shares that hold through `MAIN_PUSH_LOCK_HELD`.
+  `push_validate` passes this environment to the validation shell.
+  Detached gate children receive the plain environment and take their own locks.
   The checkpoint releases the gate-record lock before local promotion.
   It retains `main-push.lock` through the last local push to main.
   Mac pulls and result delivery occur after that lock is released.
@@ -263,8 +267,8 @@ Each local Promote checkout must exist before the command pushes.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
   8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
-     Otherwise, it releases the lock, merges main, retests the new paths, and tries again.
-     Tests never run inside this lock.
+     Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
+     The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
      Preparation failure restores the tip before this run when origin still has its old tip.
@@ -481,6 +485,57 @@ The report renderer, report schedule, child report rows, and report interval com
 `update_registration.py` owns question types, reading, and due filtering.
 Registration retains a stopped timer for discovery and session ownership.
 
+- **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
+  `config/user_zone.conf` supplies the configured zone.
+  `USER_ZONE` overrides that value, and `USER_ZONE_CONF` selects another file.
+  Production documents do not select a zone.
+  Scripts use package imports; shell displays call the helper through `scripts/lib/py`.
+  A stored time retains its original zone when that zone identifies the recorded instant.
+  Tests select a private zone when their expected output requires it.
+- **`/zone`:** `commands/zone.md` runs `scripts/lib/zone.py`.
+  Bare, it prints the configured zone, label, UTC offset, and current time.
+  `set NAME` resolves an IANA name, city, or current seasonal label.
+  Ambiguous or unknown names exit 2 with the candidate offsets.
+  Publication runs on natedev through `main_publish`, shared with `/tune`.
+  It updates `zone=` while preserving comments, commits only that file, and pushes main.
+  A failed commit keeps the new text when the file already matches HEAD.
+  Otherwise, it restores the previous text and refuses publication.
+  The Mac pulls through the shared helper, and the broadcast reaches both machines.
+  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  Pending pulls retain each Mac path and source.
+  A bare call drains the queue before it returns.
+  Promotion runs `zone.py drain --pulled <path>` after a successful pull.
+  The drain skips only that path and pulls every other pending target before sending the notice.
+  Clearing one target preserves other targets and an undelivered notice.
+  A legacy queue without `pulls` represents one default `~/.claude` pull.
+  `ZONE_SSH`, `ZONE_BROADCAST`, and `ZONE_STATE` select private test dependencies.
+  A repeated request commits an uncommitted zone even when its stored value already matches.
+- **Status line assignment.** `statusline.sh` sends the native session ID and staff data to `scripts/statusline/assignment.py`.
+  `StaffSnapshot.by_current_session` selects the row.
+  The row supplies the current name, kind, and parent name.
+  A showrunner displays `<name> showrunner`; a worker displays `worker`.
+  A unit displays `<name> unit`, with `for <parent>` when the parent exists.
+  Its first line displays `<assignment> | <folder> | <branch>` when the branch is available.
+  Branch lookup starts at `workspace.current_dir`, else `cwd`, else the process folder from `--arg pwd`.
+  It resolves symbolic links in that folder before the parent search.
+  It searches parent folders for the first `.git` entry and reads `HEAD` without a `git` process.
+  A `.git` folder contains `HEAD`.
+  A `.git` file supplies an absolute `gitdir` path or a path relative to its containing folder.
+  A `ref: refs/heads/<name>` value supplies the branch name.
+  A detached `HEAD` displays `detached <first 7 characters>`.
+  A missing repository, an unreadable file, or a folder resolution failure omits the branch field.
+  Other roles keep their first line unchanged.
+  Missing or damaged staff data displays `unassigned`.
+  Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
+  Quota and notifier refresh paths keep their own behavior.
+
+- **Configured zones.** The status line reads `USER_ZONE`, else `zone=` from `USER_ZONE_CONF` or `config/user_zone.conf`.
+  `send_later.py --at` reads the user's zone and sends UTC to systemd.
+  `verify.sh` uses the user's zone for recorded results.
+- **Display times.** User displays use `scripts.lib.user_zone`.
+  Stored instants keep their offsets.
+  Tests select a private zone when their assertions need one.
+
 ### CI points and review watch: `ci_points.py`
 
 `ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
@@ -561,26 +616,33 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |`.
+  - **Phase productions:** `| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
+    ETA Plan appears only when at least one row has unfinished plan phases.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
     Both tables add a **Machine** column after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
     `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
     `worker.py list --json` keeps its existing fields.
-    Phase shows `phase <n> of <m> — <task>`.
-    The task uses the newest plan run's open step, then the phase title.
-    Other phase states include `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
-    Cells limit task text to 80 characters and end longer text with `…`.
-    Progress uses `█` for done, `▓` for open, and `░` for todo, followed by `<done>/<total>`.
-    Plans above 20 phases use 20 equal groups, with open before todo before done.
-    Repair rounds append `fix rounds <n>` and `+ 1 running` when applicable.
-    When the plan has no phases, an open run supplies Progress and ETA from its full event history.
-    This fallback changes neither Phase, Non-Phase Work, nor Queued.
+    Both tables sort unit names without case distinctions before they select their rows.
+    Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
+    Plans above 20 phases use 20 equal groups, with open before not started before done.
+    The bar has no text cut, and all three characters use the same display width.
+    Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
+    Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
+    Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+    Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
+    Notes limits text to 80 characters and ends longer text with `…`.
+    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
+    Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
+    The fallback does not change Non-Phase Work or Queued.
     A finished newest run supplies no fallback.
-    ETA uses the latest stated promise from `eta_trail`, never `schedule_end`.
-    Passed promises add `late <elapsed>`; open phases without promises show `no ETA`.
-    A predicted plan finish adds `ends <time>`.
+    ETA Next uses the open plan phase's latest promise from `eta_trail`, never `schedule_end`.
+    Otherwise, it uses the newest open phase outside the plan, then the next not-started plan phase with a promise.
+    Passed promises add `late <elapsed>`; open work without a promise shows `no ETA`.
+    With no open work or promised phase, ETA Next shows `—`.
+    ETA Plan shows the predicted plan finish without `ends`; a row without unfinished plan phases shows `—`.
+    The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
     Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
     Run workers appear first; idle workers append a count, and closed workers add nothing.

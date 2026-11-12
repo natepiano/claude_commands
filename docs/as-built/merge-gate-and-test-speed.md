@@ -615,6 +615,77 @@ Checkpoint integration modules separate inputs, receipts, validation, promotion,
 Ordinary CLI cases use the real parser and handlers in-process.
 Git, executable stand-ins, and selected unit and child-handoff cases retain real subprocesses.
 
+### Queued checkpoint batches
+
+`merge_checkpoint.py --production <name> --batch <file>` lands queued checkpoints in file order.
+Each nonempty line holds the single command's item arguments as shell words.
+The shared parser requires each item's unit, phase, hash, start time, and applicable flags.
+Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge.
+The outer command refuses positional item arguments.
+A batch can contain one item.
+
+1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
+2. Check each item and make its own merge commit.
+3. Test all code paths changed from the published merge branch tip through HEAD once.
+4. Use one `tested_main_push` hold, one push, and one local promotion.
+5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+Shrink and as-built items add no test paths of their own.
+A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
+The published tip is `origin/<merge branch>`.
+An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
+Those paths still select tests when only shrink or as-built items remain.
+Main integration retains the existing retest rule before publication.
+Any item's `--cancel-prior` applies to the shared push.
+Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
+Each merge retains its own review ownership and completion record.
+
+A held or failed item before the push starts drops from the batch.
+Every later item from the same unit drops with it and receives a report that names the stopped item.
+The checkout returns to the starting tip before each retry.
+Retries continue until an attempt passes or no item remains.
+Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
+Subjects without the closing-item format retain the configured plan.
+An ancestry hold names the first unmerged commit by its short hash and subject.
+Reset aborts an unfinished merge only when no merge was unfinished at batch start.
+An earlier unfinished merge and its staged edits remain unchanged.
+A red test identifies its items through the shared checkpoint test selector.
+Candidates are the code items that select a red command, or all code items when none selects it.
+When no code item remains, every remaining item is a candidate.
+One candidate drops directly.
+For multiple candidates, a binary search finds the first merge that makes the red commands fail.
+Each probe resets the checkout to a candidate's unpublished merge commit.
+It merges the same main commit that the red test tip holds, without another fetch.
+A conflict stops the search and drops every candidate.
+The probe selects test steps again from the batch paths at that tip.
+It runs only unresolved red steps that the tip still selects.
+A red step absent from that selection counts as green.
+Full tests and probes use the same runner and flake rules.
+The starting tip is treated as green; the last candidate is known red.
+Seven candidates need at most three probes.
+Each probe reports its item, merge commit, and green or red result.
+Each batch invocation clears its shared test log once before the first attempt.
+Full tests, probes, main retests, and all retries append to that log.
+The search restores the starting tip and drops the causing item and that unit's later items.
+A cancelled probe or another non-red stop drops every candidate with that stop.
+A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
+Already-merged items receive `resume it alone with the single command`.
+The push start is the boundary for drop, reset, and retry.
+Once the push starts, a failure drops no items and starts no batch reset or retry.
+Only `push_rollback` can undo a failed push after it checks the live origin.
+Each item receives the stop report.
+
+`test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
+It also covers unpublished paths after interruption and a wrapper failure after a successful push.
+The interruption rows include a shrink-only retry.
+The held-batch rows preserve an earlier unfinished merge and its staged edits.
+They also land a clean item after two holds and remove a held unit's later item.
+The history rows merge closing items for an older plan after the configured plan changes.
+The shared-red row uses two probes to identify the middle item and land the other two.
+The main-integration row keeps new main content at every probe and drops the first item.
+The package-rename row skips the renamed test at the earlier tip and drops the second item.
+
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 
 Conversation-pause hook behavior tests live in `scripts/hooks/test_conversation_pause.py`; `test_conversation_pause_processes.py` covers alarm budgets, executable exits and concurrent lock/delivery. Both use `conversation_pause_test_support.py` restoring a private fixture seed at the same path for each case. Synchronous behavior cases execute the real hook and CLI entry points and their current Python stand-ins in-process, with isolated input, output, environment, import-time fixture paths and signal handlers. Alarm-budget, concurrent lock/delivery and executable-error cases retain real processes; detached activity calls remain detached. Fixture release and activity waits use file events and a 600-second hang guard in `scripts/lib/test_hang_guard.py`. All original assertions are retained.
@@ -648,6 +719,9 @@ Each class builds a complete Git/worktree fixture once and restores a private co
 Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary.
 Concurrent refill tests release on observed lock contention and check committed tickets and disjoint files.
 
+The gate's main promotion takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) after its hold and release waits.
+It releases the lock after the local main push and before the Mac pull.
+
 ### Small fixes on main
 
 `commands/unit/fast_track.md` defines the fast-track exception for small fixes.
@@ -670,7 +744,9 @@ Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
 The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
 
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
-`main_push_lock` protects its fast-forward push.
+The shared `scripts.lib.main_push_lock` helper protects the final fetch and fast-forward push.
+It also protects local promotion when fast-track calls that step.
+The fast check runs before these holds.
 A moved main causes another application and check within `max_push_attempts`.
 The command then promotes through the production's configured targets and restores the selected source changes.
 A refusal before publication exits 2.

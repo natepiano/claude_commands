@@ -66,7 +66,8 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
             kept = sum(keeps_run_place(model, place) and not has_move_priority(model, place)
                        for place in range(1, position))
             priority = model.reading.explanation.priority
-            unit = priority["unit"] if not isinstance(priority, admission_records.NoQueuePriority) else ""
+            unit = (", ".join(entry["unit"] for entry in priority.entries)
+                    if isinstance(priority, admission_records.QueuePriority) else "")
             causes = f"{moved} of {unit} (queue priority), " if moved else ""
             if kept:
                 causes += f"{kept} keep their run's place, "

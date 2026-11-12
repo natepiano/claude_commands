@@ -246,6 +246,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
+   When several small changes are coming, hold their notices and send them together.
+   The merge gate lands them in one batch run.
+
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
@@ -254,18 +257,13 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
-   Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
    (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
-   checkpoint commit. The `Parallel:` line is
-   `phase_table.py parallel --session-dir <SESSION_DIR>`'s output, verbatim.
-   `merge_checkpoint.py` refuses `Parallel: unknown`: add the plan's missing
-   `**Depends on:**` lines (`/plan:to_phased_plan` → <PhaseNumbering/>) and
-   rerun.
+   checkpoint commit.
 
    The shrink notice has this form:
 

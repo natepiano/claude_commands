@@ -1645,7 +1645,8 @@ phase_wait_start() {
     if [[ -n "$holder" ]]; then
         while IFS= read -r flag; do holder_args+=("$flag"); done <<< "$holder"
     fi
-    if [[ -s "$file" ]]; then
+    if [[ -f "$file" ]]; then
+        [[ -s "$file" ]] || return 0
         previous=$(< "$holder_file")
         if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
         read -r id < "$file"
@@ -1665,9 +1666,14 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})" && [[ -n "$id" ]]; then
-        printf '%s' "$holder" > "$holder_file"
-        printf '%s\n' "$id" > "$file"
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
+        if [[ -n "$id" ]]; then
+            printf '%s' "$holder" > "$holder_file"
+            printf '%s\n' "$id" > "$file"
+        else
+            : > "$file"
+            printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+        fi
     else
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
@@ -1675,7 +1681,10 @@ phase_wait_start() {
 phase_wait_finish() {
     if [[ "$1" == token ]]; then PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""; fi
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
-    [[ -s "$file" ]] || return 0
+    if [[ ! -s "$file" ]]; then
+        rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
+        return 0
+    fi
     read -r id < "$file"
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
