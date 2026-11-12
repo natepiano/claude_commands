@@ -95,10 +95,17 @@ class Row(NamedTuple):
     state: str
 
 
-def read_lines(path: Path) -> list[str]:
+def read_lines(path: Path, *, sources: list[Path] | None = None) -> list[str]:
+    """Read lines. A source collector retains paths and requires readable existing files."""
+    if sources is not None:
+        sources.append(path)
     try:
         return path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
     except (OSError, UnicodeError):
+        if sources is not None:
+            raise
         return []
 
 
@@ -113,11 +120,11 @@ def backlog_rows(backlog: Path) -> list[Row]:
     return ledger_rows(backlog / "ledger.md")
 
 
-def ledger_rows(ledger: Path) -> list[Row]:
+def ledger_rows(ledger: Path, *, sources: list[Path] | None = None) -> list[Row]:
     """The rows of one improvement ledger; a file a line names is beside the ledger."""
     backlog = ledger.parent
     rows: list[Row] = []
-    for line in read_lines(ledger):
+    for line in read_lines(ledger, sources=sources):
         found = BACKLOG_LINE.match(line)
         if found is None:
             continue
@@ -127,7 +134,7 @@ def ledger_rows(ledger: Path) -> list[Row]:
         if named is not None:
             title = title[: named.start()]
             file_name = named["file"] or f"{named['link']}.md"
-            proposer, _ = by_line(read_lines(backlog / file_name)[:12])
+            proposer, _ = by_line(read_lines(backlog / file_name, sources=sources)[:12])
         rows.append(Row(proposer or "plan backlog", title, found["date"], BACKLOG_STATES[found["state"]]))
     return rows
 
@@ -156,7 +163,7 @@ def stars(text: str) -> int:
     return text.count(renumber.STAR)
 
 
-def proposal_score(issue: Issue) -> float:
+def proposal_score(issue: Issue, *, sources: list[Path] | None = None) -> float:
     """The score the vault's ranking gives the issue's stars, from its frontmatter once confirmed, else
     from its `Proposed ranking:` line; UNSCORED when either lacks a value.
 
@@ -166,7 +173,7 @@ def proposal_score(issue: Issue) -> float:
     goal_text = issue.value("backlog_goal")
     values = {name: stars(issue.value(f"backlog_{name}")) for name in STAR_FIELDS}
     if not goal_text or not all(values.values()):
-        line = RANKING_LINE.search(read_body(issue.path))
+        line = RANKING_LINE.search(read_body(issue.path, sources=sources))
         parts = {part.strip().split(" ", 1)[0]: part.strip() for part in (line["values"] if line else "").split("·")}
         goal_text = parts.get("goal", "").removeprefix("goal ")
         values = {name: stars(parts.get(name, "")) for name in STAR_FIELDS}
@@ -177,47 +184,53 @@ def proposal_score(issue: Issue) -> float:
     return renumber.calculate_score(goal, {f"backlog_{name}": count for name, count in values.items()})
 
 
-def read_body(path: Path) -> str:
-    text = "\n".join(read_lines(path))
+def read_body(path: Path, *, sources: list[Path] | None = None) -> str:
+    text = "\n".join(read_lines(path, sources=sources))
     parts = text.split("\n---", 2) if text.startswith("---") else ["", "", text]
     return parts[-1]
 
 
-def day(text: str) -> datetime | None:
+def day(text: str, *, sources: list[Path] | None = None) -> datetime | None:
+    if text in ("", NONE):
+        return None
     try:
         moment = date.fromisoformat(text)
     except ValueError:
+        if sources is not None:
+            raise
         return None
     return datetime(moment.year, moment.month, moment.day)
 
 
-def issue_urgency(issue: Issue) -> urgency.Urgency:
-    """The issue's `review_urgency`, `review_due` and `review_marked`; a value it cannot read is normal."""
+def issue_urgency(issue: Issue, *, sources: list[Path] | None = None) -> urgency.Urgency:
+    """Read review urgency. A collector rejects invalid values; other callers use normal urgency."""
     try:
         return urgency.from_fields({key: issue.value(f"review_{key}") for key in ("urgency", "due", "marked")})
     except urgency.UrgencyError as error:
+        if sources is not None:
+            raise ValueError(f"{issue.path}: {error}") from error
         print(f"proposals_table: {issue.path.name}: {error}; read as normal", file=sys.stderr)
         return urgency.Urgency()
 
 
-def issue_row(issue: Issue) -> IssueRow:
+def issue_row(issue: Issue, *, sources: list[Path] | None = None) -> IssueRow:
     """The issue's row, its title the P number and the file's name, with its progress read once."""
     progress = proposal_progress(issue)
-    level = issue_urgency(issue) if isinstance(progress, AwaitingApproval) else urgency.Urgency()
+    level = issue_urgency(issue, sources=sources) if isinstance(progress, AwaitingApproval) else urgency.Urgency()
     shown = urgency.cell(level)
     row = Row(staff_name(issue.value("proposed_by")) if issue.value("proposed_by") else NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
               issue.value("date_created") or NONE,
               issue_state(issue, progress) + (f" · {shown}" if shown else ""))
     waits = isinstance(progress, AwaitingApproval)
-    entry = urgency.Entry(str(issue.path), row, level, day(row.date),
-                          (proposal_score(issue) if waits else UNSCORED,),
+    entry = urgency.Entry(str(issue.path), row, level, day(row.date, sources=sources),
+                          (proposal_score(issue, sources=sources) if waits else UNSCORED,),
                           next(iter(issue.fields.get("depends_on", [])), ""))
     return IssueRow(progress, entry)
 
 
-def issue_entries(found: list[Issue]) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+def issue_entries(found: list[Issue], *, sources: list[Path] | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
     """The waiting issues, to be ordered, and the rows of the ones in progress, oldest first."""
-    rows = sorted(map(issue_row, found), key=IssueRow.order)
+    rows = sorted((issue_row(issue, sources=sources) for issue in found), key=IssueRow.order)
     folder = {issue.path.stem: str(issue.path) for issue in found}
     # `depends_on` names an issue by its file name; an entry's prerequisite is its key, the path.
     waiting = [replace(row.entry, after=folder.get(row.entry.after, ""))
@@ -323,11 +336,11 @@ def queue(doc: Path, *, record: staff.StaffSnapshot | None = None) -> str:
     return f"proposal-{document_id(doc, record=record)}"
 
 
-def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
+def scope_issues(doc: Path, below: bool = False, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues of the production, and with `below` of each one below it, from each one's folder."""
     found: dict[Path, Issue] = {}
     for each in scope_docs(doc, below):
-        for issue in proposal_issues(each):
+        for issue in proposal_issues(each, sources=sources):
             _ = found.setdefault(issue.path, issue)
     names = owners(doc, below) if found else frozenset[str]()
     return [issue for issue in found.values() if proposer(issue) in names]
@@ -343,18 +356,20 @@ def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
     return list(paths)
 
 
-def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+def waiting_entries(doc: Path, below: bool = False, *,
+                    sources: list[Path] | None = None) -> tuple[list[urgency.Entry[Row]], list[Row]]:
     """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows.
 
     Only the production's own, and with `below` those of each production below it: issues their
     proposer field gives to one of them, and the lines of the Improvement queue ledgers their docs name.
     """
-    waiting, in_progress = issue_entries(scope_issues(doc, below))
+    waiting, in_progress = issue_entries(scope_issues(doc, below, sources=sources), sources=sources)
     rest = list(in_progress)
     for found in improvement_ledgers(doc, below):
-        for row in ledger_rows(found):
+        for row in ledger_rows(found, sources=sources):
             if row.state == REVIEW_STATE:
-                waiting.append(urgency.Entry(f"{BACKLOG_KEY}{found}: {row.proposal}", row, since=day(row.date),
+                waiting.append(urgency.Entry(f"{BACKLOG_KEY}{found}: {row.proposal}", row,
+                                             since=day(row.date, sources=sources),
                                              value=(UNSCORED,)))
             else:
                 rest.append(row)

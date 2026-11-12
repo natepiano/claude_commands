@@ -61,7 +61,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 with mock.patch.object(sys, "platform", "darwin"), \
                         mock.patch.object(subprocess, "run", side_effect=ps), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        redirect_stdout(io.StringIO()):
+                        mock.patch.object(mac_test, "bind_instance_generation"), redirect_stdout(io.StringIO()):
                     if cleanup:
                         held = mac_test.read_claims(paths)[0]
                         assert "remote_host" in held.record

@@ -141,6 +141,7 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
                                               else repository if evidence in ("foreign", "owner-fallback") else root / "removed" / name))
             row = staff.StaffRow(identity, "showrunner" if kind == "showrunner" else "unit", name,
                                  staff.STAFF_ROOT if kind == "showrunner" else staff.ReportsTo(production_id),
+                                 unit_type=staff.NotUnit() if kind == "showrunner" else staff.UnitDetails("direct"),
                                  current_session=identity,
                                  worktree=staff.WorktreeUnfilled() if kind == "showrunner" else tree)
             if evidence != "history":

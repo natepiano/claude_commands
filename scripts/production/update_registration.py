@@ -276,8 +276,11 @@ class QuestionStaff:
     sources: session_staff.MemberSources
 
     @classmethod
-    def read(cls) -> QuestionStaff:
-        return cls.for_record(staff.snapshot())
+    def read(cls, *, sources: list[Path] | None = None) -> QuestionStaff:
+        if sources is None:
+            return cls.for_record(staff.snapshot())
+        record = staff.snapshot()
+        return cls(record, session_staff.member_sources(dependencies=sources.append))
 
     @classmethod
     def for_record(cls, record: staff.StaffSnapshot,
@@ -824,7 +827,8 @@ def question_records(production: Production, identities: QuestionStaff) -> list[
 
 
 def question_records_for_document(doc: Path, identities: QuestionStaff, *, include_unrouted: bool = False,
-                                  lines: list[str] | None = None) -> list[QuestionRecord]:
+                                  lines: list[str] | None = None,
+                                  sources: list[Path] | None = None) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
     folder = question_folder(doc, identities, lines=lines)
     if isinstance(folder, QuestionOwnerUnavailable):
@@ -833,7 +837,10 @@ def question_records_for_document(doc: Path, identities: QuestionStaff, *, inclu
             return []
     else:
         source = folder.path
-    issues = [Issue(path, frontmatter(path)) for path in sorted(source.glob("question-*.md"))]
+    from scripts.production.issues import source_paths
+
+    issues = [Issue(path, frontmatter(path, sources=sources))
+              for path in sorted(source_paths(source, "question-*.md", sources=sources))]
     if isinstance(folder, QuestionFolder):
         issues = [issue for issue in issues if issue.value("production_id") == folder.owner]
     return _question_records(issues)
@@ -1018,21 +1025,26 @@ class QuestionStoreUnreadable(InputError, ValueError):
 
 
 def read_open_fields(path: Path | None, *, production: Production | None = None,
-                     identities: QuestionStaff | None = None, document: Path | None = None) -> list[OutstandingItem]:
-    """Read reminder fields and canonical question fields with one identity context."""
+                     identities: QuestionStaff | None = None, document: Path | None = None,
+                     sources: list[Path] | None = None) -> list[OutstandingItem]:
+    """Read reminders and canonical questions. A source collector requires complete reads."""
     document = production.doc if production is not None else document
     if path is None and document is None:
         return []
     try:
+        if path is not None and sources is not None:
+            sources.append(path)
         entries = stored_entries(path) if path is not None else []
-        identities = identities if identities is not None else QuestionStaff.read()
+        identities = identities if identities is not None else QuestionStaff.read(sources=sources)
         if document is None:
             row = identities.record.by_id(staff.StaffId(cast(Path, path).stem))
             document = (row.doc.path if row is not None and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
                         else None)
             if document is None:
                 return entries
-        entries.extend(record.item.copy() for record in question_records_for_document(document, identities)
+        if sources is not None:
+            sources.append(document)
+        entries.extend(record.item.copy() for record in question_records_for_document(document, identities, sources=sources)
                        if record.status == "open")
         return entries
     except (RegistrationFailure, InputError) as error:
@@ -1040,9 +1052,10 @@ def read_open_fields(path: Path | None, *, production: Production | None = None,
 
 
 def read_open_items(path: Path | None, *, production: Production | None = None,
-                    identities: QuestionStaff | None = None, document: Path | None = None) -> list[Outstanding]:
-    """Read reminders and canonical questions for one production."""
-    entries = read_open_fields(path, production=production, identities=identities, document=document)
+                    identities: QuestionStaff | None = None, document: Path | None = None,
+                    sources: list[Path] | None = None) -> list[Outstanding]:
+    """Parse open reminders and questions with the same source collector."""
+    entries = read_open_fields(path, production=production, identities=identities, document=document, sources=sources)
     location = path or document or (production.doc if production is not None else Path("questions"))
     return parse_outstanding_entries(entries, location)
 

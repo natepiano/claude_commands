@@ -10,7 +10,7 @@ from typing import Literal, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "idle", "paused", "exited"]
+SessionState = Literal["busy", "starting", "waiting", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -95,8 +95,13 @@ def classify(member: staff.StaffRow | UnrecordedStaff,
     hold = staff_state(member)
     if hold != "active":
         return hold
+    if isinstance(activity, LiveActivity):
+        if activity.status == "busy":
+            return "busy"
+        if activity.status == "starting":
+            return "starting"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "busy"
+        return "waiting"
     if isinstance(activity, NoLiveSession):
         return "exited"
-    return "busy" if activity.status == "busy" else "idle"
+    return "idle"

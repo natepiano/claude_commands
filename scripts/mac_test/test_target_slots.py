@@ -65,7 +65,7 @@ class RepositoryKeyTests(unittest.TestCase):
     def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
         log_root = self.root.parent / "buildlog"
         request = offload.OffloadRequest(self.root, "project", "empty-repository", offload.NO_RESULT_FILE, (), owner="verify",
-                                        target="linux", holder_session="fixture-session")
+                                        target="aws", holder_session="fixture-session")
         with mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(log_root), "BUILDLOG_MEM_WAIT_SINCE": "", "BUILDLOG_MEM_WAIT_FIRST_FILE": "",
         }):
@@ -109,14 +109,14 @@ class RepositorySlotTests(unittest.TestCase):
             "unreachable_backoff_s=30\nslots=2\nslots.hana=4\n"
             "build_budget_gib=32\ntarget_budget_gib=24\n"
         )
-        for name in ("mac", "linux"):
+        for name in ("mac", "aws"):
             _ = write_config_fixture(self.root / f"{name}.conf", f"host=fake-{name}\n" + settings,
                                      template="mac_test")
         _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
-            "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
-            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+            "targets=mac,aws,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
+            + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -237,11 +237,11 @@ class RepositorySlotTests(unittest.TestCase):
     def test_linux_clones_with_different_names_share_origin_capacity(self) -> None:
         main = self.repository("project", "git@github.com:nate/project.git")
         clone = self.repository("phase-copy", "https://github.com/nate/project.git")
-        self.assertEqual(self.claim("linux", main, 101)[0], 0)
-        self.assertEqual(self.claim("linux", clone, 102)[0], 0)
+        self.assertEqual(self.claim("aws", main, 101)[0], 0)
+        self.assertEqual(self.claim("aws", clone, 102)[0], 0)
 
-        self.assertEqual(self.claim("linux", main, 103)[0], 11)
-        self.assertEqual(self.claim("linux", clone, 104)[0], 11)
+        self.assertEqual(self.claim("aws", main, 103)[0], 11)
+        self.assertEqual(self.claim("aws", clone, 104)[0], 11)
 
     def test_mac_serializes_different_origins_with_the_same_name(self) -> None:
         first = self.repository("first/project", "https://github.com/first/project.git")
@@ -258,11 +258,11 @@ class RepositorySlotTests(unittest.TestCase):
         first = self.repository("first/project", "https://github.com/first/project.git")
         second = self.repository("second/project", "https://github.com/second/project.git")
         for pid in (101, 102):
-            self.assertEqual(self.claim("linux", first, pid)[0], 0)
-        self.assertEqual(self.claim("linux", first, 103)[0], 11)
+            self.assertEqual(self.claim("aws", first, pid)[0], 0)
+        self.assertEqual(self.claim("aws", first, 103)[0], 11)
 
-        self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertEqual(set(self.claims("linux")), {101, 102, 103})
+        self.assertEqual(self.claim("aws", second, 103)[0], 0)
+        self.assertEqual(set(self.claims("aws")), {101, 102, 103})
 
     def test_local_and_shared_clones_keep_the_original_identity(self) -> None:
         main = self.repository("hana", "https://github.com/nate/hana.git")
@@ -291,96 +291,96 @@ class RepositorySlotTests(unittest.TestCase):
 
         def contend(pid: int) -> int:
             _ = barrier.wait(timeout=5)
-            return mac_test.command_claim(self.arguments("linux", root, pid), mac_test.state_paths("linux"))
+            return mac_test.command_claim(self.arguments("aws", root, pid), mac_test.state_paths("aws"))
 
         with redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=6) as workers:
             statuses = list(workers.map(contend, range(101, 107)))
 
         self.assertEqual(sorted(statuses), [0, 0, 11, 11, 11, 11])
-        records = list(self.claims("linux").values())
+        records = list(self.claims("aws").values())
         self.assertEqual(len(records), 2)
         self.assertEqual(len({record.get("slot") for record in records}), 2)
 
     def test_repository_override_and_config_reload_control_capacity(self) -> None:
         root = self.repository("phase-copy", "https://github.com/nate/hana.git")
-        settings = self.root / "linux.conf"
+        settings = self.root / "aws.conf"
         for pid in range(101, 105):
-            self.assertEqual(self.claim("linux", root, pid)[0], 0)
-        self.assertEqual(self.claim("linux", root, 105)[0], 11)
+            self.assertEqual(self.claim("aws", root, pid)[0], 0)
+        self.assertEqual(self.claim("aws", root, 105)[0], 11)
         _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=5"))
 
-        self.assertEqual(self.claim("linux", root, 105)[0], 0)
-        self.assertEqual(len(self.claims("linux")), 5)
+        self.assertEqual(self.claim("aws", root, 105)[0], 0)
+        self.assertEqual(len(self.claims("aws")), 5)
 
     def test_free_slot_prefers_the_last_worktree(self) -> None:
         first = self.repository("project", "https://github.com/nate/project.git")
         second = self.repository("feature", "https://github.com/nate/project.git", first)
-        self.assertEqual(self.claim("linux", first, 101)[0], 0)
-        self.assertEqual(self.claim("linux", second, 102)[0], 0)
-        preferred = self.claims("linux")[102].get("slot")
-        self.release("linux", 101)
-        self.release("linux", 102)
+        self.assertEqual(self.claim("aws", first, 101)[0], 0)
+        self.assertEqual(self.claim("aws", second, 102)[0], 0)
+        preferred = self.claims("aws")[102].get("slot")
+        self.release("aws", 101)
+        self.release("aws", 102)
 
-        self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertEqual(self.claims("linux")[103].get("slot"), preferred)
+        self.assertEqual(self.claim("aws", second, 103)[0], 0)
+        self.assertEqual(self.claims("aws")[103].get("slot"), preferred)
 
     def test_occupied_affinity_slot_is_never_reused(self) -> None:
         first = self.repository("project", "https://github.com/nate/project.git")
         second = self.repository("feature", "https://github.com/nate/project.git", first)
-        self.assertEqual(self.claim("linux", first, 101)[0], 0)
-        self.assertEqual(self.claim("linux", second, 102)[0], 0)
-        occupied = self.claims("linux")[102].get("slot")
-        self.release("linux", 101)
+        self.assertEqual(self.claim("aws", first, 101)[0], 0)
+        self.assertEqual(self.claim("aws", second, 102)[0], 0)
+        occupied = self.claims("aws")[102].get("slot")
+        self.release("aws", 101)
 
-        self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertNotEqual(self.claims("linux")[103].get("slot"), occupied)
+        self.assertEqual(self.claim("aws", second, 103)[0], 0)
+        self.assertNotEqual(self.claims("aws")[103].get("slot"), occupied)
 
     def test_remote_claims_remain_when_the_local_owner_ends(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         for pid in (101, 102):
-            self.assertEqual(self.claim("linux", root, pid, remote=True)[0], 0)
-        before = self.claims("linux")
+            self.assertEqual(self.claim("aws", root, pid, remote=True)[0], 0)
+        before = self.claims("aws")
         self.dead.update((101, 102))
 
-        self.assertEqual(self.claim("linux", root, 103)[0], 11)
-        self.assertEqual(self.claims("linux"), before)
-        self.release("linux", 101)
-        self.assertEqual(self.claim("linux", root, 103)[0], 0)
-        self.assertIn(102, self.claims("linux"))
+        self.assertEqual(self.claim("aws", root, 103)[0], 11)
+        self.assertEqual(self.claims("aws"), before)
+        self.release("aws", 101)
+        self.assertEqual(self.claim("aws", root, 103)[0], 0)
+        self.assertIn(102, self.claims("aws"))
 
     def test_repeated_claim_preserves_its_occupied_slot(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
-        settings = self.root / "linux.conf"
+        settings = self.root / "aws.conf"
         _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
         requested = claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a")
-        self.assertEqual(self.claim("linux", root, 101, request_identity=requested)[0], 0)
-        before = self.claims("linux")
+        self.assertEqual(self.claim("aws", root, 101, request_identity=requested)[0], 0)
+        before = self.claims("aws")
 
-        self.assertEqual(self.claim("linux", root, 101, request_identity=requested)[0], 0)
+        self.assertEqual(self.claim("aws", root, 101, request_identity=requested)[0], 0)
 
-        self.assertEqual(self.claims("linux"), before)
+        self.assertEqual(self.claims("aws"), before)
         for other in (claim_state.ClaimIdentity("claim-b", "episode-a", "attempt-a"),
                       claim_state.ClaimIdentity("claim-a", "episode-b", "attempt-a"),
                       claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-b")):
             with self.subTest(identity=other):
-                self.assertEqual(self.claim("linux", root, 101, request_identity=other)[0], 11)
-                self.assertEqual(self.claims("linux"), before)
+                self.assertEqual(self.claim("aws", root, 101, request_identity=other)[0], 11)
+                self.assertEqual(self.claims("aws"), before)
 
     def test_takeover_keeps_the_remote_slot_until_cleanup(self) -> None:
-        settings = self.root / "linux.conf"
+        settings = self.root / "aws.conf"
         _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
         root = self.repository("project", "https://github.com/nate/project.git")
-        self.assertEqual(self.claim("linux", root, 101, remote=True)[0], 0)
-        before = self.claims("linux")[101]
+        self.assertEqual(self.claim("aws", root, 101, remote=True)[0], 0)
+        before = self.claims("aws")[101]
         self.dead.add(101)
 
-        status, output = self.claim("linux", root, 102, remote=True, identity=True)
+        status, output = self.claim("aws", root, 102, remote=True, identity=True)
 
         self.assertEqual(status, 13)
         answer = offload.read_claim_answer(offload.CommandOutput(status, output, ""))
         self.assertIsInstance(answer, offload.TakenOverMacClaim)
-        self.assertEqual(set(self.claims("linux")), {102})
-        retained = self.claims("linux")[102]
+        self.assertEqual(set(self.claims("aws")), {102})
+        retained = self.claims("aws")[102]
         self.assertEqual(retained.get("slot"), before.get("slot"))
         self.assertEqual(retained.get("remote_host"), before.get("remote_host"))
         if isinstance(answer, offload.TakenOverMacClaim):
@@ -388,14 +388,14 @@ class RepositorySlotTests(unittest.TestCase):
 
     def test_dead_request_cannot_replace_slot_affinity(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
-        self.assertEqual(self.claim("linux", root, 101)[0], 0)
-        self.release("linux", 101)
-        paths = mac_test.state_paths("linux")
+        self.assertEqual(self.claim("aws", root, 101)[0], 0)
+        self.release("aws", 101)
+        paths = mac_test.state_paths("aws")
         before = {str(path.relative_to(paths.directory)): path.read_bytes()
                   for path in paths.directory.rglob("*.json")}
         self.dead.add(102)
 
-        self.assertEqual(self.claim("linux", root, 102)[0], 1)
+        self.assertEqual(self.claim("aws", root, 102)[0], 1)
         after = {str(path.relative_to(paths.directory)): path.read_bytes()
                  for path in paths.directory.rglob("*.json")}
         self.assertEqual(after, before)
@@ -403,12 +403,12 @@ class RepositorySlotTests(unittest.TestCase):
     def test_claim_answer_preserves_the_allocated_slot(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         for pid in (101, 102):
-            status, output = self.claim("linux", root, pid, identity=True)
+            status, output = self.claim("aws", root, pid, identity=True)
             answer = offload.read_claim_answer(offload.CommandOutput(status, output, ""))
 
             self.assertIsInstance(answer, offload.FreshMacClaim)
             if isinstance(answer, offload.FreshMacClaim):
-                self.assertEqual(answer.slot, self.claims("linux")[pid].get("slot"))
+                self.assertEqual(answer.slot, self.claims("aws")[pid].get("slot"))
 
     def test_linux_mirrors_use_the_build_folder_rule_without_percent_encoding_the_key(self) -> None:
         cases = (
@@ -419,14 +419,14 @@ class RepositorySlotTests(unittest.TestCase):
         mirrors: set[str] = set()
         for repository, name in cases:
             with self.subTest(repository=repository):
-                mirror = offload.remote_mirror(repository, "linux", 2)
-                self.assertEqual(mirror, f".local/state/build-target/mirror/{name}/linux-s2")
+                mirror = offload.remote_mirror(repository, "aws", 2)
+                self.assertEqual(mirror, f".local/state/build-target/mirror/{name}/aws-s2")
                 self.assertNotIn("%", mirror)
                 self.assertIn("%", repository.path_key)
                 mirrors.add(mirror)
         self.assertEqual(len(mirrors), len(cases))
-        self.assertEqual(offload.remote_mirror(offload.KnownRepository("other-copy", cases[0][0].key), "linux", 2),
-                         offload.remote_mirror(cases[0][0], "linux", 2))
+        self.assertEqual(offload.remote_mirror(offload.KnownRepository("other-copy", cases[0][0].key), "aws", 2),
+                         offload.remote_mirror(cases[0][0], "aws", 2))
 
     def test_linux_mirrors_isolate_origins_slots_and_build_folders(self) -> None:
         first = self.repository("one/project", "ssh://git@example.com/a/project.git")
@@ -437,19 +437,19 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIsInstance(second_id, offload.KnownRepository)
         if not isinstance(first_id, offload.KnownRepository) or not isinstance(second_id, offload.KnownRepository):
             self.fail("Repository identity must resolve before selecting a mirror")
-        mirrors = [offload.remote_mirror(first_id, "linux", 1), offload.remote_mirror(first_id, "linux", 2),
-                   offload.remote_mirror(second_id, "linux", 1)]
+        mirrors = [offload.remote_mirror(first_id, "aws", 1), offload.remote_mirror(first_id, "aws", 2),
+                   offload.remote_mirror(second_id, "aws", 1)]
 
         self.assertEqual(len(set(mirrors)), 3)
         for mirror, slot in zip(mirrors, (1, 2, 1), strict=True):
             path = PurePosixPath(mirror)
             self.assertEqual(path.parts[:4], (".local", "state", "build-target", "mirror"))
             self.assertEqual(len(path.parts), 6)
-            self.assertEqual(path.name, f"linux-s{slot}")
+            self.assertEqual(path.name, f"aws-s{slot}")
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
-        config = offload.read_config(self.root / "linux.conf")
-        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", slot=2, holder_session="fixture-session")
+        config = offload.read_config(self.root / "aws.conf")
+        request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", slot=2, holder_session="fixture-session")
 
         command = offload.remote_test_command(config, request, first_id)
 
@@ -488,56 +488,56 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(list(paths.claims.iterdir()), [path])
 
     def test_takeover_retry_requires_cleanup_before_a_fresh_claim(self) -> None:
-        settings = self.root / "linux.conf"
+        settings = self.root / "aws.conf"
         _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
         root = self.repository("project", "https://github.com/nate/project.git")
-        self.assertEqual(self.claim("linux", root, 101, remote=True)[0], 0)
+        self.assertEqual(self.claim("aws", root, 101, remote=True)[0], 0)
         self.dead.add(101)
-        status, output = self.claim("linux", root, 102, remote=True, identity=True)
+        status, output = self.claim("aws", root, 102, remote=True, identity=True)
         self.assertEqual(status, 13)
 
         requested = claim_state.reply_claim_identity(output)
         repeated_status, repeated_output = self.claim(
-            "linux", root, 102, remote=True, identity=True, request_identity=requested)
+            "aws", root, 102, remote=True, identity=True, request_identity=requested)
 
         self.assertEqual(repeated_status, 13)
         self.assertEqual(repeated_output, output)
         self.assertIsInstance(offload.read_claim_answer(
             offload.CommandOutput(repeated_status, repeated_output, "")), offload.TakenOverMacClaim)
-        self.release("linux", 102)
-        self.assertEqual(self.claim("linux", root, 102, remote=True)[0], 0)
+        self.release("aws", 102)
+        self.assertEqual(self.claim("aws", root, 102, remote=True)[0], 0)
 
     def test_another_worktree_can_clean_full_slots_after_the_owners_end(self) -> None:
         source = self.repository("project", "https://github.com/nate/project.git")
         abandoned = [self.repository(name, "https://github.com/nate/project.git", source)
                      for name in ("old-a", "old-b")]
         for pid, root in zip((101, 102), abandoned, strict=True):
-            self.assertEqual(self.claim("linux", root, pid, remote=True)[0], 0)
+            self.assertEqual(self.claim("aws", root, pid, remote=True)[0], 0)
             (root / ".git").unlink()
             root.rmdir()
         self.dead.update((101, 102))
         replacement = self.repository("replacement", "https://github.com/nate/project.git", source)
 
-        status, output = self.claim("linux", replacement, 103, remote=True)
+        status, output = self.claim("aws", replacement, 103, remote=True)
 
         self.assertEqual(status, 13)
-        self.assertIn("leftovers: fake-linux", output)
-        taken = self.claims("linux")[103]
+        self.assertIn("leftovers: fake-aws", output)
+        taken = self.claims("aws")[103]
         self.assertEqual(taken.get("worktree"), str(abandoned[0]))
         self.assertIs(taken.get("cleanup_pending"), True)
-        self.assertEqual(len(self.claims("linux")), 2)
+        self.assertEqual(len(self.claims("aws")), 2)
 
     def test_affinity_writes_remove_deleted_worktrees(self) -> None:
         source = self.repository("project", "https://github.com/nate/project.git")
         removed = self.repository("removed", "https://github.com/nate/project.git", source)
-        self.assertEqual(self.claim("linux", removed, 101)[0], 0)
-        self.release("linux", 101)
+        self.assertEqual(self.claim("aws", removed, 101)[0], 0)
+        self.release("aws", 101)
         (removed / ".git").unlink()
         removed.rmdir()
 
-        self.assertEqual(self.claim("linux", source, 102)[0], 0)
+        self.assertEqual(self.claim("aws", source, 102)[0], 0)
 
-        paths = mac_test.state_paths("linux")
+        paths = mac_test.state_paths("aws")
         affinity = cast(dict[str, object], json.loads(next(paths.affinity.iterdir()).read_text()))
         self.assertNotIn(str(removed), affinity)
         self.assertIn(str(source), affinity)
@@ -545,7 +545,7 @@ class RepositorySlotTests(unittest.TestCase):
     def test_target_platform_selects_the_mirror_and_claim_layout(self) -> None:
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(registry.read_text().replace(
-            "targets=mac,linux,natedev", "targets=mac,linux,darwin,natedev")
+            "targets=mac,aws,natedev", "targets=mac,aws,darwin,natedev")
             + "kind.darwin=ssh\nplatform.darwin=macos\nsettings.darwin=mac.conf\n")
         root = self.repository("project", "https://github.com/nate/project.git")
         identity = offload.repository_identity(root)
@@ -563,8 +563,8 @@ class RepositorySlotTests(unittest.TestCase):
 
     def test_target_state_includes_every_active_slot(self) -> None:
         registry = self.root / "build_targets.conf"
-        _ = registry.write_text(registry.read_text().replace('targets=mac,linux,', 'targets=mac,linux-one,').replace('.linux=', '.linux-one=').replace('=linux.conf', '=linux-one.conf'))
-        _ = (self.root / "linux.conf").rename(self.root / "linux-one.conf")
+        _ = registry.write_text(registry.read_text().replace("aws", "linux-one"))
+        _ = (self.root / "aws.conf").rename(self.root / "linux-one.conf")
         root = self.repository("project", "https://github.com/nate/project.git")
         for pid in (101, 102):
             self.assertEqual(self.claim("linux-one", root, pid)[0], 0)
@@ -580,16 +580,16 @@ class RepositorySlotTests(unittest.TestCase):
         origin = "https://github.com/nate/hana.git"
         main = self.repository("hana", origin)
         clone = self.repository("phase-copy", origin)
-        settings = self.root / "linux.conf"
+        settings = self.root / "aws.conf"
         _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=3")
                                 + "slots.phase-copy=1\n")
 
         for root, pid in ((clone, 101), (clone, 102), (main, 103)):
-            self.assertEqual(self.claim("linux", root, pid)[0], 0)
+            self.assertEqual(self.claim("aws", root, pid)[0], 0)
 
-        self.assertEqual(self.claim("linux", clone, 104)[0], 11)
-        self.assertEqual(self.claim("linux", main, 104)[0], 11)
-        self.assertEqual(len({record.get("slot") for record in self.claims("linux").values()}), 3)
+        self.assertEqual(self.claim("aws", clone, 104)[0], 11)
+        self.assertEqual(self.claim("aws", main, 104)[0], 11)
+        self.assertEqual(len({record.get("slot") for record in self.claims("aws").values()}), 3)
 
     def test_mac_skip_keeps_legacy_filters_when_linux_filter_support_expands(self) -> None:
         identity = offload.KnownRepository("hana", "https://github.com/nate/hana")
@@ -616,15 +616,15 @@ class RepositorySlotTests(unittest.TestCase):
     def test_deleted_worktree_takeover_preserves_the_other_occupied_slot(self) -> None:
         source = self.repository("project", "https://github.com/nate/project.git")
         old = self.repository("deleted", "https://github.com/nate/project.git", source)
-        self.assertEqual(self.claim("linux", old, 101, remote=True)[0], 0)
-        self.assertEqual(self.claim("linux", source, 102, remote=True)[0], 0)
-        before = self.claims("linux")
+        self.assertEqual(self.claim("aws", old, 101, remote=True)[0], 0)
+        self.assertEqual(self.claim("aws", source, 102, remote=True)[0], 0)
+        before = self.claims("aws")
         (old / ".git").unlink()
         old.rmdir()
         self.dead.add(101)
 
-        self.assertEqual(self.claim("linux", source, 103, remote=True)[0], 13)
-        retained = self.claims("linux")[103]
+        self.assertEqual(self.claim("aws", source, 103, remote=True)[0], 13)
+        retained = self.claims("aws")[103]
         self.assertEqual(retained.get("slot"), before[101].get("slot"))
         self.assertEqual(retained.get("repo_key"), before[101].get("repo_key"))
         self.assertEqual(retained.get("repo_name"), before[101].get("repo_name"))
@@ -632,14 +632,14 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIs(retained.get("cleanup_pending"), True)
         requested = claim_state.ClaimIdentity(cast(str, retained["claim_id"]),
                                                cast(str, retained["episode"]), cast(str, retained["attempt"]))
-        self.assertEqual(self.claim("linux", source, 103, remote=True, request_identity=requested)[0], 13)
-        self.assertEqual(self.claim("linux", source, 104, remote=True)[0], 11)
-        self.assertEqual(self.claims("linux")[102], before[102])
+        self.assertEqual(self.claim("aws", source, 103, remote=True, request_identity=requested)[0], 13)
+        self.assertEqual(self.claim("aws", source, 104, remote=True)[0], 11)
+        self.assertEqual(self.claims("aws")[102], before[102])
 
-        self.release("linux", 103)
-        self.assertEqual(self.claim("linux", source, 104, remote=True)[0], 0)
-        self.assertEqual(self.claims("linux")[104].get("slot"), before[101].get("slot"))
-        self.assertEqual(self.claims("linux")[102], before[102])
+        self.release("aws", 103)
+        self.assertEqual(self.claim("aws", source, 104, remote=True)[0], 0)
+        self.assertEqual(self.claims("aws")[104].get("slot"), before[101].get("slot"))
+        self.assertEqual(self.claims("aws")[102], before[102])
 
 
 if __name__ == "__main__":

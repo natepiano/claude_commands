@@ -272,12 +272,7 @@ class TargetRemoval:
                 raise ValueError('a completed removal record cannot authorize another stack deletion')
             return True
         # Refusals must leave up available to record missing deletion identities.
-        foundation_without_volume = (outputs.get('ComputeEnabled') == 'false'
-                                     and not outputs.get('InstanceId') and not outputs.get('DataVolumeId')
-                                     and saved.get('data_volume_id', '') == '')
         for key in ('data_volume_id', 'budget_name'):
-            if key == 'data_volume_id' and foundation_without_volume:
-                continue
             value = saved.get(key)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f'missing saved {key}; run deploy.py up once to record it')
@@ -289,9 +284,6 @@ class TargetRemoval:
         _ = self._device_identity()
         if stack:
             outputs = self._outputs(stack)
-            if foundation_without_volume and (outputs.get('ComputeEnabled') != 'false'
-                    or outputs.get('InstanceId') or outputs.get('DataVolumeId')):
-                raise ValueError('the live foundation has compute resources absent from the deployment record')
             for key, value in (('InstanceId', self.identity.instance), ('DataVolumeId', self.identity.volume),
                                ('BudgetName', self.identity.budget)):
                 if value and outputs.get(key, value) != value:
@@ -374,8 +366,8 @@ class TargetRemoval:
         return changed
 
     def retained(self) -> bool:
-        if not self.identity.budget:
-            raise ValueError('missing saved Budget identity; run deploy.py up once to record it')
+        if not self.identity.volume or not self.identity.budget:
+            raise ValueError('missing saved volume or Budget identity; run deploy.py up once to record it')
         changed = self.data_volume()
         if self.identity.budget:
             account = self.identity.account_id

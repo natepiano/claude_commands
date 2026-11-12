@@ -328,7 +328,7 @@ class GateWorker:
             readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
             record_query(sum((reading.query_usd for reading in readings), Decimal(0)))
             return readings
-        _ = self.book.refresh_charges(self.settings_path, now, fetch)
+        _ = self.book.refresh_charges(self.settings_path, now, fetch, gate_workload=True)
 
     def upload(self, bucket: str, key: str, path: Path) -> None:
         _ = self.api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(path), service='s3api')
@@ -979,6 +979,8 @@ def main() -> int:
         outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
         save(folder / 'outcome.json', outcome)
     return 0
+
+
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wake an active /unit:direct run after its turn ends near compaction.
+"""Wake an active unit run after its turn ends near compaction.
 
 The separate asyncRewake Stop entry runs this hook in the background.
 Exit 2 sends the reason from stderr to the agent in a system-reminder.
@@ -31,12 +31,13 @@ from scripts.hooks.context_usage import (
 from scripts.hooks.direct_run import active_run
 from scripts.hooks.conversation_pause import DirectorTurn, director_turn
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
 
 REASON = """\
-/unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%).
+{command} run active, {tokens:,} / {trigger:,} tokens ({percent}%).
 Compaction runs when the context reaches {trigger:,} tokens. It does not run while the session is idle.
 Take the next workflow action now. Do not wait for compaction.
-After compaction, read ~/.claude/commands/unit/direct.md in full.
+After compaction, read ~/.claude/commands/{command_file}.md in full.
 Then read each stub file whose moment is live.
 If you need a user decision, state it in one line and end the turn."""
 
@@ -45,15 +46,16 @@ class StopPayload(HookInput, total=False):
     last_assistant_message: str
 
 
-def build_reason(tokens: int, trigger: int) -> str:
+def build_reason(tokens: int, trigger: int, command: str) -> str:
     percent = round(100 * tokens / trigger) if trigger else 100
-    return REASON.format(tokens=tokens, trigger=trigger, percent=percent)
+    return REASON.format(tokens=tokens, trigger=trigger, percent=percent, command=command,
+                         command_file=command.removeprefix("/").replace(":", "/"))
 
 
 def main() -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
 
-    # Subagents do not orchestrate /unit:direct runs; their stop is a real result.
+    # Subagents return results instead of directing unit runs.
     if payload.get("agent_id"):
         return
 
@@ -65,6 +67,8 @@ def main() -> None:
     session_dir = active_run(session_id)
     if session_dir is None:
         return
+    row = staff.local_by_current_session(session_id)
+    command = staff.unit_command(row if row is not None and row.kind == "unit" else "direct")
     # A declared wait is a real stop, including a restated decision after a
     # compaction block. Record before the compaction and background-work guards.
     final_message = payload.get("last_assistant_message", "")
@@ -106,7 +110,7 @@ def main() -> None:
         pass
     write_text_atomic(wake_line, status)
 
-    print(build_reason(tokens, trigger_tokens(window)), file=sys.stderr)
+    print(build_reason(tokens, trigger_tokens(window), command), file=sys.stderr)
     raise SystemExit(2)
 
 

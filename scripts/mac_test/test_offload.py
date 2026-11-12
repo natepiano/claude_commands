@@ -231,12 +231,12 @@ class RunnerCompletionTests(unittest.TestCase):
             self.fail("The runner did not send a completion marker")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result"
-            target = target_config.SshTarget("linux", "linux", Path(directory) / "linux.conf")
+            target = target_config.SshTarget("aws", "linux", Path(directory) / "aws.conf")
             with redirect_stdout(output), mock.patch.object(target_config, "read_targets", return_value=(target,)):
-                status = offload.write_result(offload.LostMacRun(1, answer.detail), offload.ResultFile(path), target="linux")
+                status = offload.write_result(offload.LostMacRun(1, answer.detail), offload.ResultFile(path), target="aws")
             self.assertEqual(status, 75)
             self.assertIn("reason=runner exited with status 143 without a final status\n", path.read_text())
-        self.assertIn("the linux runner exited with status 143 without a final status", output.getvalue())
+        self.assertIn("the aws runner exited with status 143 without a final status", output.getvalue())
         self.assertNotIn("link", output.getvalue())
         self.assertNotIn("running on natedev instead", output.getvalue())
 
@@ -256,18 +256,26 @@ class RunnerCompletionTests(unittest.TestCase):
                     "received_bytes": len(wire.encode("utf-8")), "complete": True,
                 }])
 
+    def test_interruption_reports_the_instance_generation_without_claiming_link_loss(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = offload.write_result(offload.InterruptedTargetRun("generation-one", 1),
+                                          offload.NO_RESULT_FILE, target="aws")
+        self.assertEqual(status, 75)
+        self.assertEqual(output.getvalue(), "mac_test: the aws instance was interrupted (generation generation-one)\n")
+
 
 class CompletedRunSyncTests(unittest.TestCase):
     def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
-        for target in ("linux", "mac"):
+        for target in ("aws", "mac"):
             for status in (0, 42):
                 for fails in (False, True):
                     with self.subTest(target=target, status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
                         self.check_finished_run(Path(directory), target, status, fails)
 
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
-        configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
-        config = offload.OffloadConfig(True, offload.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
+        configured = target_config.SshTarget(target, "linux" if target == "aws" else "macos", root / "target.conf")
+        config = offload.OffloadConfig(True, offload.SshConnectionSettings("aws-build", 1, 1), 1, 1, 1, "1", {})
         request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
         output = io.StringIO()
@@ -284,18 +292,19 @@ class CompletedRunSyncTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, copies_environment(root)),
             mock.patch.object(offload, "configured_ssh_target", return_value=configured),
+            mock.patch.object(offload, "expected_instance_generation", return_value=""),
             mock.patch.object(offload, "expected_linux_parity", return_value={}),
             mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
             mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
-            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "linux-build")),
+            mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "aws-build")),
             mock.patch.object(offload, "remote_test_command", return_value="fixture step"),
             mock.patch.object(controller, "stream_mac_run", return_value=offload.ReportedMacStatus(status, offload.CleanupKept())),
             mock.patch.object(offload, "release_claim", side_effect=release) as released,
             mock.patch.object(time, "monotonic", return_value=5),
             mock.patch.object(buildlog_store, "root", return_value=root),
             mock.patch.object(buildlog_store, "host_name", return_value="natedev"),
-            mock.patch.object(buildlog_sync, "configured_peers", return_value=(buildlog_sync.SyncPeer("linux", "linux-build"),)),
-            mock.patch.object(buildlog_record, "target_hosts", return_value=("linux-build",)),
+            mock.patch.object(buildlog_sync, "configured_peers", return_value=(buildlog_sync.SyncPeer("aws", "aws-build"),)),
+            mock.patch.object(buildlog_record, "target_hosts", return_value=("aws-build",)),
             mock.patch.object(buildlog_record, "sync_config", return_value={
                 "sync.connect_timeout_s": "3", "sync.reach_timeout_s": "7", "sync.rsync_timeout_s": "11"}),
             mock.patch.object(buildlog_health, "write_snapshot"),
@@ -308,8 +317,8 @@ class CompletedRunSyncTests(unittest.TestCase):
         expected = offload.PassedOnMac(4) if status == 0 else offload.FailedOnMac(status, 4)
         self.assertEqual(result, expected)
         released.assert_called_once_with(controller, target)
-        if target == "linux":
-            self.assertEqual(exchange.call_args.args[0], buildlog_sync.SyncPeer("linux", "linux-build"))
+        if target == "aws":
+            self.assertEqual(exchange.call_args.args[0], buildlog_sync.SyncPeer("aws", "aws-build"))
             self.assertEqual(exchange.call_args.args[-2:], (7, 11))
             self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
 
@@ -337,10 +346,10 @@ class LocalVersionPreflightTests(unittest.TestCase):
             root = Path(directory)
             if content is not None:
                 _ = (root / "box-tools.json").write_text(content)
-            target = target_config.SshTarget("linux", "linux", root / "linux.conf")
+            target = target_config.SshTarget("aws", "linux", root / "aws.conf")
             config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1),
                                           1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
-            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
+            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="aws", holder_session="fixture-session")
             controller = offload.ProcessController()
             versions = {"rustc": "rustc 1.99.0", "nextest": "nextest fixture", "mend": "mend fixture", "git": "commit"}
 
@@ -366,19 +375,19 @@ class LocalVersionPreflightTests(unittest.TestCase):
                 answer = offload.run_offload(controller, config, request, 1)
                 if declined:
                     self.assertEqual(answer, offload.DeclinedMacRun("state", 4,
-                        "linux version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
+                        "aws version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
                     claim.assert_not_called()
-                    self.assertEqual(offload.linux_version_decline_path("linux", HANA.name), root / "version-decline-hana")
-                    self.assertTrue(offload.linux_version_declined_recently("linux", HANA.name, 60, 159))
-                    self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 160))
+                    self.assertEqual(offload.linux_version_decline_path("aws", HANA.name), root / "version-decline-hana")
+                    self.assertTrue(offload.linux_version_declined_recently("aws", HANA.name, 60, 159))
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 160))
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
                         claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
-                        self.assertFalse(offload.linux_version_decline_path("linux", HANA.name).exists())
+                        self.assertFalse(offload.linux_version_decline_path("aws", HANA.name).exists())
                 else:
                     claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
-                    self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
+                    self.assertFalse(offload.linux_version_declined_recently("aws", HANA.name, 60, 100))
             scripts_copy.assert_not_called()
             tree_copy.assert_not_called()
 
@@ -415,23 +424,23 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_ssh_target_state_path_needs_no_registry(self) -> None:
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
-            self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / ".local/state/build-targets/linux")
+            self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
             self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "build-targets")}):
-                self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / "build-targets/linux")
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "build-targets/aws")
                 self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": "~/private-targets", "HOME": str(self.root)}):
-                self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / "private-targets/linux")
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "private-targets/aws")
 
     def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
-        for target in (".", "..", "../linux", "/tmp/linux", "linux/other"):
+        for target in (".", "..", "../aws", "/tmp/aws", "aws/other"):
             with self.subTest(target=target), self.assertRaises(target_config.ConfigError):
                 _ = offload.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
         _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", template="mac_test")
         for filename, budget_key in (("other-mac.conf", "mac_budget_gib"),
-                                     ("linux.conf", "target_budget_gib")):
+                                     ("aws_target.conf", "target_budget_gib")):
             with self.subTest(settings=filename):
                 settings = self.root / filename
                 _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"

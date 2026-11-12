@@ -17,6 +17,7 @@ from scripts.whoami import worker_usage
 from scripts.usage.test_outcomes import OutcomeFixture
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
@@ -145,7 +146,11 @@ class StoreReadoutTests(OutcomeFixture):
         shim = str(READOUT.parents[1] / "lib/py")
         command = ([shim, "-c", script] if script else [shim, str(READOUT)])
         database = ["--db", str(self.db_path)] if explicit_db else []
-        return subprocess.run([*command, *database, "--before", *before, "--after", *after],
+        arguments = [*database, "--before", *before, "--after", *after]
+        if not script and not process_boundary_for_case(self):
+            return invoke_cli(worker_usage, lambda: worker_usage.main() or 0, arguments,
+                              self.environment(), self.root / "outside-checkout")
+        return subprocess.run([*command, *arguments],
                               env=self.environment(), cwd=self.root / "outside-checkout", capture_output=True,
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -257,6 +262,7 @@ raise SystemExit(worker_usage.run(sys.argv[1:]))
 """
         _ = self.assert_readout("expected-two-cuts.md", after=(AFTER[0], "2026-10-10T21:36Z"), script=script)
 
+    @process_boundary
     def test_readout_uses_only_the_store_from_another_directory_without_pythonpath(self) -> None:
         self.mac_pass()
         before = self.db_path.read_bytes()

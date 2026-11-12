@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
-import re
+import io
+import json
+import runpy
 import unittest
+from collections.abc import Callable
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
+from unittest.mock import patch
+
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.hooks import direct_run
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -24,18 +33,73 @@ class CommandStubTests(unittest.TestCase):
         self.assertEqual(len(usage_lines), 1)
         self.assertTrue(usage_lines[0].startswith("**Usage:** `/unit:direct "))
 
-    def test_hooks_reread_the_direct_command(self) -> None:
-        for name in (
-            "session-start-direct-resume.py",
-            "stop-direct-continue.py",
+        for unit_type in ("merge", "style"):
+            with self.subTest(unit_type=unit_type):
+                selected = REPO / f"commands/unit/{unit_type}.md"
+                self.assertTrue(selected.is_file())
+                self.assertFalse(selected.is_symlink())
+                self.assertIn(f"**Usage:** `/unit:{unit_type}", selected.read_text())
+
+        direct = command.read_text()
+        for removed in ("**Standing:**", "StandingPlanRefill", "standing_plan_refill.md", "Standing plans"):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, direct)
+        self.assertIn("<StyleReview/>", direct)
+        self.assertIn("commands/unit/style_review.md", direct)
+        self.assertIn("<HeldAstraRoles/>", direct)
+        ticket = (REPO / "commands/unit/style.md").read_text().split("<StyleTicketExecution>\n", 1)[1].split("</StyleTicketExecution>", 1)[0]
+        for before, after in (
+            ("<DualReview/>", "<Synthesize/>"),
+            ("<Synthesize/>", "<FixDispatch/>"),
+            ("<FixDispatch/>", "<ClosureReview/>"),
+            ("<ClosureReview/>", "<StyleTicketGate/>"),
+            ("<StyleTicketGate/>", "<StyleCheckpoint/>"),
         ):
-            with self.subTest(name=name):
-                text = (REPO / "scripts/hooks" / name).read_text()
-                command_paths = cast(
-                    list[str],
-                    re.findall(r"~/\.claude/(commands/[\w/]+\.md)", text),
-                )
-                self.assertEqual(set(command_paths), {"commands/unit/direct.md"})
+            with self.subTest(before=before, after=after):
+                self.assertIn(before, ticket)
+                self.assertIn(after, ticket)
+                self.assertLess(ticket.index(before), ticket.index(after))
+        contract = (REPO / "docs/direct/style_unit.md").read_text()
+        for tag in ("StandingPlanRefill", "StyleCheckpoint", "StyleNoChangeTicket", "StyleStandingLifetime"):
+            with self.subTest(tag=tag):
+                self.assertEqual(contract.count(f"<{tag}>"), 1)
+        self.assertFalse((REPO / "docs/direct/standing_plan_refill.md").exists())
+        for source in ("docs/direct/phase_end.md", "docs/direct/run_phase_review.md", "commands/unit/checkpoint.md"):
+            with self.subTest(source=source):
+                self.assertIn("docs/direct/style_unit.md", (REPO / source).read_text())
+
+
+class UnitCompactionTests(StaffTestCase):
+    def test_compaction_loads_the_recorded_unit_command(self) -> None:
+        runner = fixture_member("showrunner", name="demo")
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                row = staff.ensure("unit", name=unit_type, parent=staff.ReportsTo(runner.id),
+                    runtime_id=fixture_runtime_id(unit_type), unit_type=unit_type)
+                payload = {"source": "compact", "session_id": row.current_session}
+                output = io.StringIO()
+                with (patch.object(direct_run, "active_run", return_value=self.root / "run"),
+                      patch("sys.stdin", io.StringIO(json.dumps(payload))), redirect_stdout(output)):
+                    module = runpy.run_path(str(REPO / "scripts/hooks/session-start-direct-resume.py"))
+                    main = cast(Callable[[], None], module["main"])
+                    main()
+                response = cast(dict[str, object], json.loads(output.getvalue()))
+                details = cast(dict[str, object], response["hookSpecificOutput"])
+                context = details["additionalContext"]
+                assert isinstance(context, str)
+                self.assertIn(f"/unit:{unit_type}", context)
+                self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", context)
+                command = REPO / f"commands/unit/{unit_type}.md"
+                self.assertTrue(command.is_file())
+                if unit_type == "style":
+                    text = command.read_text()
+                    self.assertIn("<RestartTakeover/>", text)
+                    self.assertIn("<StandingPlanRefill/>", text)
+                    self.assertLess(text.index("Apply <RestartTakeover/> before new work."),
+                                    text.index("Recover pending publication"))
+                    self.assertLess(text.index("Recover pending publication"), text.index("Apply <StandingPlanRefill/>."))
+                if unit_type != "direct":
+                    self.assertNotIn("commands/unit/direct.md", context)
 
 
 class PhaseStyleReviewTests(unittest.TestCase):

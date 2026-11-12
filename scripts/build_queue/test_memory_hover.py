@@ -47,9 +47,9 @@ class MemoryHoverTests(unittest.TestCase):
                     "name": name, "unit": "fixture", "showrunner": "fixture-production",
                     "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
                     "progress": counter}]}))
-                self.assertEqual(hover[0], "Running step")
+                self.assertEqual(hover[0], f"{name} · fixture-production")
                 for expected in ("suites:1, 80.0% done", "0.5 GiB", "highest anonymous use in the next 20.0%",
-                                 "The queue holds this memory for the run.", "Unit: fixture",
+                                 "The queue holds this memory for the run.", "\nfixture",
                                  f"testing · 8 of 10 {counter['unit']} · 80.0% done"):
                     with self.subTest(expected=expected):
                         self.assertIn(expected, hover[1])
@@ -58,19 +58,16 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
-            ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "58.3% done"),
-            ("setup", progress.NoCounter("no cloud counter"), "No local memory reservation."),
-            ("", progress.NoCounter("no cloud counter"), "No local memory reservation."),
+            ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "testing · 7 of 12 modules · 58.3% done"),
+            ("setup", progress.NoCounter("no cloud counter"), "setup. Machine: aws."),
+            ("", progress.NoCounter("no cloud counter"), "Machine: aws. No local memory reservation."),
         ):
             with self.subTest(status=status):
                 hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
                     "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
                     "status": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn(expected, hover[1])
-                self.assertIn("No local memory reservation.", hover[1])
-                self.assertIn("Machine: aws", hover[1])
-                if status:
-                    self.assertNotIn(status, hover[1])
+                self.assertIn("Machine: aws. No local memory reservation.", hover[1])
                 self.assertFalse(hover[1].startswith("."), hover[1])
 
     def test_progress_percent_rounds_down_until_the_counter_is_complete(self) -> None:
@@ -93,36 +90,71 @@ class MemoryHoverTests(unittest.TestCase):
         for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%", "85.0%"):
             self.assertIn(expected, str(hover))
 
-    def test_chart_rows_show_time_without_a_step_table(self) -> None:
+    def test_step_table_shows_the_stage_and_repeats_headers_only_above_waiting_steps(self) -> None:
         for waiting in (False, True):
             with self.subTest(waiting=waiting):
                 running: list[dict[str, object]] = [{"name": phase, "queued": True, "unit": "fixture", "pid": 10 + index,
-                            "machine": "fixture", "vcpus": 4, "started_at": 80,
+                            "machine": "fixture", "vcpus": 4,
                             "progress": {"kind": "RowProgress", "phase": phase}}
                            for index, phase in enumerate(("building", "testing"))]
-                running.append({"name": "no counter", "queued": True, "started_at": 80,
-                                "progress": {"kind": "NoProgress"}})
-                waiter = {"name": "waiting", "since": 200 - 2 * 86400, "detail": "fixture", "pid": 20,
+                running.append({"name": "no counter", "queued": True, "progress": {"kind": "NoProgress"}})
+                waiter = {"name": "waiting", "since": 100, "detail": "fixture", "pid": 20,
                           "progress": {"kind": "RowProgress", "phase": "building"}}
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
                         "walk": running, "waiters": [waiter] if waiting else []}
                 rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
                 root = ElementTree.fromstring(f"<root>{rendered}</root>")
-                self.assertIsNone(root.find(".//table"))
-                for index in range(3):
-                    row = root.find(f".//div[@data-run='{index}']")
-                    assert row is not None
-                    duration = row.find(".//span[@class='row-time']")
-                    assert duration is not None
-                    self.assertEqual(duration.text, "2 min")
+                table = root.find(".//table")
+                assert table is not None
+                headers = table.findall("./thead/tr/th")
+                self.assertEqual([cell.text for cell in headers],
+                                 ["#", "Step", "Duration", "Stage", "Unit", "Pid", "Machine", "vCPU"])
+                for index, expected in enumerate(("building", "testing", "")):
+                    stage = table.find(f"./tbody/tr[@data-tip='row:{index}']/td[@class='stage']")
+                    assert stage is not None
+                    self.assertEqual(stage.text or "", expected)
+                queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
-                self.assertEqual(spacers, [])
+                self.assertEqual(len(queue_headers), int(waiting))
+                self.assertEqual(len(spacers), int(waiting))
                 if waiting:
-                    row = root.find(".//div[@data-tip='wait:0']")
-                    assert row is not None
-                    duration = row.find(".//span[@class='row-time']")
-                    assert duration is not None
-                    self.assertEqual(duration.text, "waits 2 days")
+                    self.assertEqual([cell.text for cell in queue_headers[0]],
+                                     ["#", "Step", "Waiting", "Stage", "Unit", "Pid", "Machine", "vCPU"])
+                    self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
+                    body = table.find("./tbody")
+                    assert body is not None
+                    self.assertEqual([row.get("data-tip") or row.get("class") for row in body][-3:],
+                                     ["room", "queue-head", "wait:0"])
+                    stage = table.find("./tbody/tr[@data-tip='wait:0']/td[@class='stage']")
+                    assert stage is not None
+                    self.assertEqual(stage.text or "", "")
+
+    def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
+        head = "Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots"
+        priority = "queue priority: port (the user's bump)"
+        data = {"read_at": 200, "waiters": [
+            {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
+             "reason": "free memory", "head_text": head, "priority_text": priority},
+            {"name": "trunk nextest", "unit": "trunk", "need": 2, "since": 100,
+             "reason": "head protection · behind #1"},
+            {"name": "fps nextest", "unit": "fps", "need": 2, "since": 100,
+             "reason": "estimate expired"}]}
+        for index, reason in enumerate(("free memory", "head protection · behind #1", "estimate expired")):
+            with self.subTest(index=index):
+                hover = str(self.page_expression(f"tipText('wait:{index}', data)", data))
+                self.assertEqual(hover.count(reason), 1)
+                self.assertEqual(hover.count(head), int(index == 0))
+                self.assertEqual(hover.count(priority), int(index == 0))
+                if index == 0:
+                    self.assertNotIn("Needs 1.9 GiB", hover)
+        page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
+            self.assertNotIn(removed, page)
+        for unmatched in ("", priority):
+            with self.subTest(unmatched=unmatched):
+                heading = str(self.page_expression("tipText('walkhead', data)", {
+                    **data, "unmatched_priority_text": unmatched}))
+                self.assertEqual(heading.count(priority), int(bool(unmatched)))
 
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
