@@ -205,7 +205,6 @@ def reports_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
     return path.parent.parent / "reports" / path.name
 
 
-
 class InstancePresent(NamedTuple):
     output: str
 
@@ -531,7 +530,7 @@ DEFAULT_MINUTES = 15
 
 
 class UpdatesOnDemand(NamedTuple):
-    """The doc's Updates line reads `on demand`, or there is none: a dailies runs only when the user asks for one."""
+    """The document has no scheduled update interval."""
 
 
 def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
@@ -588,11 +587,6 @@ def register(production: Production) -> None:
     except Exception as exc:
         # Recording must never interrupt registration.
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
-    schedule = update_schedule(lines)
-    # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
-    minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
-                        else (DEFAULT_MINUTES, False))
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -600,25 +594,13 @@ def register(production: Production) -> None:
     # The staff row owns the timer.
     owner = production.owner
     updates = f"showrunner-{owner.id}"
-    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {owner.id}"
-    _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(minutes),
-              "--prompt", "scheduled", "--from", f"showrunner-timer-{production.name}",
-              "--check", check, *(["--aligned"] if aligned else [])])
-    if isinstance(schedule, UpdatesOnDemand):
-        _ = notifier(["stop", updates])
+    _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(DEFAULT_MINUTES),
+                  "--prompt", "scheduled", "--from", f"showrunner-timer-{production.name}"])
+    _ = notifier(["stop", updates])
     if isinstance(instance("stall-watch"), InstanceAbsent):
         run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
         _ = notifier(["new", "stall-watch", "--every", "1", "--run", run])
-    if isinstance(schedule, UpdatesOnDemand):
-        report("register", "ok", f"{updates} on demand: no scheduled dailies")
-        return
-    status = instance(updates)
-    if isinstance(status, InstanceAbsent):
-        raise RegistrationFailure("register", f"{updates} missing after new")
-    next_due = next((line for line in status.output.splitlines() if line.startswith("next_due=")), "")
-    if not next_due:
-        raise RegistrationFailure("register", f"{updates} status lacks next_due")
-    report("register", "ok", f"{updates} {next_due}")
+    report("register", "ok", f"{updates} registered; automatic reports are off")
 
 
 def production_time(production: Production, stamp: str) -> str:
@@ -1021,6 +1003,11 @@ def read_open_items(path: Path | None, *, production: Production | None = None,
     entries = read_open_fields(path, production=production, identities=identities, document=document)
     location = path or document or (production.doc if production is not None else Path("questions"))
     return parse_outstanding_entries(entries, location)
+
+
+def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
+    """Return the items whose deferred time has passed."""
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_all_open_fields() -> list[OutstandingItem]:

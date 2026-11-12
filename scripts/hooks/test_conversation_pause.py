@@ -22,7 +22,7 @@ from scripts.hooks import hook_dispatch
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
-    ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT,
+    ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
     QUESTION, RETURN_SCHEDULE, SESSION, SETTINGS, ConversationPauseFixture,
     asked_not_read, asked_read, conversation_pause, cross_session, scheduled_wakeup,
 )
@@ -66,7 +66,6 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
         permissions = cast(dict[str, object], settings["permissions"])
         allow = cast(list[str], permissions["allow"])
         self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
-
 
 
 class ConversationPauseTests(ConversationPauseFixture):
@@ -414,6 +413,37 @@ class ConversationPauseTests(ConversationPauseFixture):
             f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_typed_showrunner_prompt_pauses_reports_once(self) -> None:
+        instance = self.create_instance(self.showrunner_timer("demo"))
+        first = self.parsed_reply(self.run_prompt("hello", now=100))
+        self.assertEqual(first, {
+            "systemMessage": (
+                f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}"
+            ),
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": PAUSE_CONTEXT,
+            },
+        })
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertFalse((self.showrunner_root / "footers-off").exists())
+        self.assertEqual(self.record(), {
+            "session_id": SESSION,
+            "instances": [self.showrunner_timer("demo")],
+            "phase": {"kind": "replying", "user_wrote_at": 100},
+        })
+        calls_after_first = self.calls(self.notifier_log)
+
+        second = self.run_prompt("another thought", now=120)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(self.calls(self.notifier_log), calls_after_first)
+        phase = cast(dict[str, object], self.record()["phase"])
+        self.assertEqual(
+            phase,
+            {"kind": "replying", "user_wrote_at": 120},
+        )
 
     def test_report_names_for_unit_and_other_instances(self) -> None:
         for name, words in (
@@ -766,28 +796,28 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "automatic updates on: dailies\n")
+        self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertEqual(self.calls(self.notifier_log), [["unpause", self.showrunner_timer("demo")]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(record_path.exists())
 
     def test_a_timer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"))
+        reports = self.create_instance(self.showrunner_timer("demo"))
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
-        # The showrunner stops its dailies on purpose while the user talks.
-        self.set_enabled(dailies, False)
+        # The showrunner stops its reports on purpose while the user talks.
+        self.set_enabled(reports, False)
 
         result = self.run_cli("resume")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_a_timer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc")
         _ = self.run_prompt("hello", now=100)
         self.assertEqual(self.record()["instances"], ["unit-abc"])
@@ -797,10 +827,10 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"), enabled=False)
+        reports = self.create_instance(self.showrunner_timer("demo"), enabled=False)
         unit_report = self.create_instance("unit-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
@@ -812,14 +842,14 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(tick.returncode, 0, tick.stderr)
         self.assertEqual(self.record()["phase"], {"kind": "returned", "returned_at": 400})
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((reports / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
-        dailies = self.create_instance(self.showrunner_timer("demo"))
+        reports = self.create_instance(self.showrunner_timer("demo"))
         _ = self.create_instance("unit-abc")
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.run_prompt("hello", now=100)
-        self.set_enabled(dailies, False)
+        self.set_enabled(reports, False)
 
         tick = self.run_cli("tick", now=150)
 
@@ -877,7 +907,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         )
         self.assertEqual(
             self.run_cli("status").stdout,
-            "paused: dailies, status reports (replying)\n",
+            "paused: status reports (replying)\n",
         )
         kept = self.run_cli("keep")
         self.assertEqual(kept.returncode, 0, kept.stderr)
@@ -1783,90 +1813,6 @@ print("SENT: delivered")
             self.record("kept-session")["phase"], {"kind": "kept_off"}
         )
 
-    def test_open_reviews_leave_all_phases_byte_identical(self) -> None:
-        asked_instance = self.create_instance(
-            self.showrunner_timer("asked"), session_id="asked-session", enabled=False, paused=True
-        )
-        quiet_instance = self.create_instance(
-            self.showrunner_timer("quiet"), session_id="quiet-session", enabled=False, paused=True
-        )
-        returned_instance = self.create_instance(
-            self.showrunner_timer("returned"), session_id="returned-session", enabled=False, paused=True
-        )
-        _ = self.create_instance("conversation-pause", run="tick")
-        paths = {
-            "asked": self.write_record(
-                asked_read(100, 1),
-                instances=(asked_instance.name,),
-                session_id="asked-session",
-            ),
-            "quiet": self.write_record(
-                {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-                instances=(quiet_instance.name,),
-                session_id="quiet-session",
-            ),
-            "returned": self.write_record(
-                {"kind": "returned", "returned_at": 100},
-                instances=(returned_instance.name,),
-                session_id="returned-session",
-            ),
-        }
-        review_root = self.showrunner_root / "review-paused"
-        review_root.mkdir(parents=True)
-        review_paths = [review_root / f"{instance.name.removeprefix('showrunner-')}.json"
-                        for instance in (asked_instance, quiet_instance, returned_instance)]
-        for review_path in review_paths:
-            _ = review_path.write_text("{}\n")
-        for instance in (asked_instance, quiet_instance, returned_instance):
-            owner = staff.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
-            assert owner is not None
-            _ = staff.rename(owner.id, f"renamed-{owner.name}")
-        before = {name: path.read_bytes() for name, path in paths.items()}
-
-        held = self.run_cli("tick", now=1_000)
-        self.assertEqual(held.returncode, 0, held.stderr)
-        self.assertEqual(
-            {name: path.read_bytes() for name, path in paths.items()}, before
-        )
-        self.assertEqual(self.calls(self.send_log), [])
-        self.assertEqual(
-            [call for call in self.calls(self.notifier_log) if call[0] == "unpause"],
-            [],
-        )
-
-        for review_path in review_paths:
-            review_path.unlink()
-        advanced = self.run_cli("tick", now=1_000)
-        self.assertEqual(advanced.returncode, 0, advanced.stderr)
-        self.assertEqual(
-            self.record("asked-session")["phase"],
-            {"kind": "returned", "returned_at": 1_000},
-        )
-        self.assertEqual(
-            self.record("quiet-session")["phase"],
-            asked_not_read(1_000),
-        )
-        self.assertFalse(paths["returned"].exists())
-        self.assertEqual(len(self.calls(self.send_log)), 1)
-
-    def test_review_file_is_ignored_without_a_showrunner_item(self) -> None:
-        instance = self.create_instance("unit-abc", enabled=False, paused=True)
-        _ = self.create_instance("conversation-pause", run="tick")
-        _ = self.write_record(
-            asked_read(100, 1),
-            instances=("unit-abc",),
-        )
-        owner = fixture_member("showrunner", name="demo")
-        review_path = self.showrunner_root / "review-paused" / f"{owner.id}.json"
-        review_path.parent.mkdir(parents=True)
-        _ = review_path.write_text("{}\n")
-
-        result = self.run_cli("tick", now=400)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.record()["phase"], {"kind": "returned", "returned_at": 400}
-        )
-        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_unreadable_record_does_not_block_another_session(self) -> None:
         instance = self.create_instance("unit-abc", enabled=False, paused=True)

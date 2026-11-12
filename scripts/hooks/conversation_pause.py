@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pause scheduled updates while a session has an active conversation."""
+"""Pause configured reports while a session has an active conversation."""
 
 from __future__ import annotations
 try:
@@ -615,9 +615,7 @@ def _record(session_id: str) -> RecordLookup:
 def user_words(instances: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     instance_set = set(instances)
     words: list[str] = []
-    if any(name.startswith("showrunner-") for name in instance_set):
-        words.append("dailies")
-    if any(name.startswith(unit_runs.INSTANCE_PREFIXES) for name in instance_set):
+    if any(name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES)) for name in instance_set):
         words.append("status reports")
     known = {name for name in instance_set
              if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))}
@@ -957,18 +955,6 @@ def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     return words
 
 
-def _review_names(record: PauseRecord) -> frozenset[staff.StaffId]:
-    from scripts.production import showrunners
-
-    names: set[staff.StaffId] = set()
-    for name in record.instances:
-        if name.startswith("showrunner-"):
-            owner = showrunners.owner_for_timer(notifier_root() / name)
-            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-                names.add(owner.id)
-    return frozenset(names)
-
-
 def _timer_paused(instance: Path) -> bool:
     """Whether the timer is stopped by a pause and nobody has stopped or started it since."""
     try:
@@ -994,14 +980,12 @@ def _prune_unscheduled(record: PauseRecord) -> PauseRecord | None:
     return kept
 
 
-def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, review_open: bool,
+def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup,
              questions: list[QuestionDelivery], actions: list[str]) -> None:
     if session is NotRunning.GONE:
         words = _resume_items(record)
         path.unlink(missing_ok=True)
         actions.append(f"session ended: {record.session_id}: {', '.join(words)}")
-        return
-    if review_open:
         return
     if not isinstance(record.phase, Returned):
         kept = _prune_unscheduled(record)
@@ -1042,8 +1026,6 @@ def _advance(path: Path, record: PauseRecord, now: int, session: SessionLookup, 
 
 
 def tick(now: int) -> tuple[str, ...]:
-    from scripts.hooks import showrunner_footer
-
     scheduled_root = state_root() / "scheduled-prompts"
     try:
         scheduled_paths = list(scheduled_root.glob("*.json"))
@@ -1064,11 +1046,7 @@ def tick(now: int) -> tuple[str, ...]:
         for path, session in lookups:
             try:
                 record = read_record(path)
-                review_open = any(
-                    showrunner_footer.review_pause_path(name).exists()
-                    for name in _review_names(record)
-                )
-                _advance(path, record, now, session, review_open, questions, actions)
+                _advance(path, record, now, session, questions, actions)
             except FileNotFoundError:
                 continue
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:

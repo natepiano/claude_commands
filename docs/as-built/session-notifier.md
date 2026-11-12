@@ -2,7 +2,9 @@
 
 ## What it is
 
-The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies gantt` report) to a showrunner, and `/unit:report` ticks to a `/unit:direct` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
+The session notifier sends scheduled messages to sessions.
+Showrunner registration keeps a stopped timer for discovery and sends no automatic report.
+Use `/showrunner:units` for production status.
 
 ### Key files
 
@@ -29,13 +31,11 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `scripts/direct/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
 
-| `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
 
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
 
 | `scripts/agents/restart.py`, `restart_support.py` | Legacy record-driven restart restores the recorded notifier state. The shared session stop leaves notifier state unchanged. |
 
-| `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:report_interval` retimes the showrunner instance. |
 
 
 | `config/direct.conf` | `UNIT_PROGRESS_INTERVAL_SECONDS`, the Codex unit poll timeout. |
@@ -161,55 +161,25 @@ With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that
 
 ### The showrunner instance
 
-`/showrunner:produce` owns `UPDATES` = `showrunner-<staff-id>`.
-The staff id keeps the timer instance stable across a production rename.
-The rename command moves no timer instance.
-At start and resume, `update_registration.py register --production <showrunner name>` registers the timer:
-
-```sh
-notifier.sh new showrunner-<staff-id> --to session:<staff-id> --every <N> \
-  --prompt scheduled --from showrunner-timer-<showrunner-name> \
-  --check "zsh $HOME/.claude/scripts/production/production_check.sh <staff-id>"
-```
-
-Registration writes `PROMPT=scheduled` and creates no prompt file.
-Each tick builds the prompt from the current owner row, production document, and `commands/showrunner/produce.md` template.
-A rename changes the name in the next prompt.
-A document move changes the source read for the next prompt.
+`update_registration.py register` creates or retargets `showrunner-<staff id>` and stops it.
+The timer retains its target session for discovery.
+Its configuration stores `PROMPT=scheduled` and targets `session:<staff id>`.
+Registration creates no prompt file.
+The staff id preserves the instance across production renames and session changes.
+`notifier.sh` builds each prompt through `update_registration.py prompt --owner <staff id>` before it records `LAST_SENT`.
+The builder reads the current owner name and document through staff.
+It reads the interval from the document and the template from `commands/showrunner/produce.md`.
+The template uses `/showrunner:units`.
+A failed build prints one stderr line and skips delivery.
+The stopped timer sends no automatic report.
 `adopt_moved_state` copies missing scratchpad state and writes no prompt file.
-
-N comes from the document's `**Updates:** every N minutes` line.
-The text `on the hour` adds `--aligned`.
-An absent schedule or `on demand` creates a stopped timer with the default interval of 15 minutes.
-There is no `--hold`.
-A repeated `new` retains the clock and enabled setting.
-The instance continues across session restarts.
-A delivered prompt starts with `Scheduled update`.
-
-A user-requested `/showrunner:dailies` restarts the timer through `dailies_input.py --user-run`.
-A scheduled tick does not restart the timer.
-Reports read the next update time from `notifier.sh status`.
-`production_lifecycle.py wrap` removes the instance.
-The check also removes the instance when the document says `wrapped`.
-
-A pending demotion stops the child showrunner's notifier instance.
-Restoration can start that instance again.
-After placement, demotion removes the instance and its counts cache.
-It keeps reminders and history records.
-It marks the old production document ended and commits only that document on the unit branch.
-The final journal step supports repeated execution.
+The document's old Updates interval has no effect.
+Registration creates stall-watch only when absent.
+Production wrap removes the timer and retains reminder history.
 
 ### Unit reports
 
 A unit run has no notifier instance (user, 2026-10-19). `/unit:report` runs only when someone asks. All 12 `worker-*` instances had been `ENABLED=0` since 2026-10-12 22:04 EDT. They were removed. `prepare_session.sh` creates none. `end_session.sh` removes none. A Codex unit's poll timeout composes no report. It lets `<EarlyReviewArm/>` run, as defined in `docs/direct/early_review.md`.
-
-### Changing the interval
-
-`/showrunner:report_interval [minutes]` changes the document's `**Updates:**` line and runs `notifier.sh interval UPDATES <minutes>`.
-It commits the document and records the old interval, new interval, and next tick.
-It reports the next tick in `ZONE` and UTC.
-Without an argument, it reports status only.
-The next prompt uses the interval from the document at delivery.
 
 ### TICKS FAILING
 
@@ -267,22 +237,6 @@ A row without a run produces no health check.
 
 ## Calibration and gotchas
 
-- **Interval cost.** Each report costs the unit director about 40 s of generation. Keep the interval at or above the median review, about 5 minutes.
-- **Showrunner interval.** 15 minutes when the doc has no `**Updates:**` line.
-- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<staff id>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The staff row records the showrunner. The stopped instance preserves the update schedule. A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `UNIT_PROGRESS_UPDATES=on-demand` in `direct.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `unit-<run id>` and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `direct.conf` went back to `scheduled` the same day, hourly.
-- **Quiet by default (user, 2026-10-13).** New productions get no timer unless asked; unit runs get none at all since 2026-10-19. A doc with no `**Updates:**` line is on demand too; only `every N minutes` schedules. Until 2026-10-18 `register` also turned a new production's reply footer off; the footer is gone (user: "i want footers gone for good"). `direct.conf` ships `on-demand`, and `unit_notifier.sh` reads a missing line as `on-demand`. An on-demand start that finds the run's instance runs `new` on it, which retargets it and keeps its clock and `ENABLED` (until 2026-10-13 it stopped the instance), so existing runs keep what they have. Unit directors have no reply footer.
-- **Timing.** `next_due` is a whole minute; the tick that sends it lands within about 15 s after. On natedev a slow tick pushes the next one back (the interval counts from the end of the run); on the Mac an overlapping tick finds `.tick.lock` held and exits at once.
-- **A skip uses its slot.** An idle unit, a missing session or a hold skips the whole interval, not 15 s.
-- **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s; a postmaster delivery about 1 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
-- **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
-- **Inherited identities.** A worker can inherit its director's `CLAUDE_CODE_SESSION_ID`.
-  Run preparation and cleanup select `CODEX_THREAD_ID` first, like `staff.runtime_id()`. Tests use fresh identities and fixture run roots.
-- **Run ownership.** The director's staff row stores the open run path.
-  Tests use `STAFF_FILE` and private run roots.
-  Run folders can remain under the current `unit` root or the former `delegate` root.
-- **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
-- **`fire`** moves the clock and skips the hold, but a failing check or a missing session still skips it.
-
 ## Why
 
 - **The schedule lives outside the session.** An agent that must arm a timer before ending every turn misses one sooner or later. A file-backed instance ticked by a job keeps the schedule through turn ends, compaction and restarts, and the showrunner and the units use one mechanism.
@@ -296,8 +250,6 @@ A row without a run produces no health check.
 - **Hold for units.** A unit in a long turn cannot read ticks; without the hold they would stack and each produce a report. The socket-change release covers a restarted session, which lost its waiting tick; the two-interval release keeps a lost tick from silencing the unit for good.
 
 - **Each report restarts the clock.** The next tick comes one interval after the latest report from any source, the report's clock line names the real next tick, and the restart releases the hold.
-
-- **No hold for the showrunner.** A scheduled showrunner update does not restart its own clock, so a hold would skip every other tick.
 
 - **`new` leaves state alone on an existing instance.** A resume retargets the instance without moving the clock or re-enabling updates the user stopped.
 

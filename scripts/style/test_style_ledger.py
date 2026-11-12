@@ -130,6 +130,10 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))
         lock_path = self.root / "state" / self.repo.name / "refill.lock"
         self.assertEqual(lock_path.parent, style_ledger.ledger_location(self.repo).database.parent)
+        for checkout in (self.repo, worktree):
+            with self.subTest(checkout=checkout):
+                self.assertEqual(style_ledger.ledger_location(checkout / "crates/alpha"),
+                                 style_ledger.LedgerLocation(checkout.resolve(), lock_path.parent / "ledger.sqlite"))
         self.assertFalse(lock_path.parent.exists())
         blocked, acquired = threading.Event(), threading.Event()
         flock = fcntl.flock

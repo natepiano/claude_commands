@@ -216,7 +216,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/change_routing.py` | read | staff.json path |
 | `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
-| `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
 | `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
@@ -244,7 +243,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/prune_phase_notes.py` | read | snapshot |
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
-| `scripts/production/review_pause.py` | read | StaffId; showrunners.owner_for_timer reads the owner by its fixed staff id |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
@@ -312,7 +310,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-184 accessor rows: 39 write, 144 read, 1 owner.
+182 accessor rows: 39 write, 142 read, 1 owner.
 
 ## Approved copies
 

@@ -6,7 +6,9 @@ A set of agent-session tools in `~/.claude`, all Python (standard library) or zs
 
 - A PostToolUse hook that blocks an editing agent the moment an edit leaves a Rust function over clippy's `too_many_lines` limit.
 
-- An adhoc-review pause of the dailies. The showrunner question Stop hook is retired (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"), and the reply footer it once checked is gone (user, 2026-10-18).
+- The showrunner question Stop hook was retired on 2026-10-19.
+  The user retired its reply footer on 2026-10-18.
+  Dailies and their adhoc-review pause were retired on 2026-11-11.
 
 - Cargo-token hygiene: each verify step runs in its own process group that a release or reclaim stops.
 
@@ -100,14 +102,16 @@ An install that removes nothing makes no extra app-server calls for cleanup. A s
 
 ### Showrunner question hook
 
-The reply footer, its `Waiting on:` block, the footers-off switch and `/showrunner:footer` are gone (user, 2026-10-18: "i want footers gone for good"). The user reads the counts in the status line. The question check is retired too (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"): what is left reads productions for the status line's counts row and the review pause.
+The user retired the reply footer, its `Waiting on:` block, and `/showrunner:footer` on 2026-10-18.
+The user retired the question Stop hook on 2026-10-19.
+The user reads counts in the status line.
+The remaining readers supply production questions for that line.
 
 Files: `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.py`, the Open-questions list and The hook bullets of `commands/showrunner/produce.md`. The Stop hook that checked a showrunner's reply is gone (2026-10-19).
 
-- **Production.** `read_production(instance_dir) -> Production | None` reads the document from the timer owner's current staff row.
-  It requires `Status: PRODUCTION — running` and reads the zone through `scripts/lib/user_zone.py`.
-  It builds `ScheduledDailies(next_due)` when `ENABLED=1`; otherwise, it uses `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`.
-  An unreadable document gives `None`.
+- **Production.** Production identity and question paths come from the staff record.
+  The user's zone setting supplies the zone.
+  Dailies schedules no longer supply production status.
 - **Open questions.** `open_questions(productions) -> int | None` counts the items now due in every production's needs-user file: an item with no `after`, or whose `after` is at or before now in the production's zone. It is `None` when a file cannot be read.
 - **Counts line.** `scripts/production/footer_counts.py` reads each count at render time and stores none. `changes` uses the staff routing function in `scripts/production/change_routing.py`, which also supplies the change page tabs.
 The router reads the fixed staff id in each row's Producer cell.
@@ -120,8 +124,19 @@ The page, footer, and `/next` use the same typed waiting rule.
 The status count watches staff, lists, and delivery records.
 The merge writer and `change_review add` store Producer ids.
 
-`proposals` counts `proposals_table.waiting_entries(doc)`, the same own-production rows as `/next proposal`: open proposal issues waiting for approval and proposed lines in the ledger the Improvement queue field names. Accepted and deferred plan-backlog lines do not count. Shared issue folders are filtered by the showrunner staff name and units (`proposals_folder.owners` and `proposer`); showrunners above and below count their own. `sources()` includes the Improvement queue ledger so the status line cache refreshes when it changes. A source that cannot be read counts 0. `counts_line` writes `For you: 1 question, 2 changes, 130 efficiency, 1 proposal`, zero counts left out, None when all are zero. Every kind is available through `/next`. The status line adds the open questions of the production's own list (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
-- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause and review-pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
+`proposals` counts `proposals_table.waiting_entries(doc)`, the same production rows as `/next proposal`.
+These include open proposal issues awaiting approval and proposed lines in the Improvement queue ledger.
+Accepted and deferred plan items do not count.
+`proposals_folder.owners` and `proposer` filter shared issue folders by the showrunner and its units.
+Each showrunner counts its own proposals.
+`sources()` includes the Improvement queue ledger, so a change refreshes the status line cache.
+An unreadable source contributes zero.
+`counts_line` prints `For you: 1 question, 2 changes, 130 efficiency, 1 proposal` and omits zero counts.
+It returns `None` when all counts are zero.
+Every kind is available through `/next`.
+The status line includes open questions from `open_questions` through `showrunner_footer.counts_line`.
+Replies carry no count line.
+- **Old state.** Switch files left in `~/.local/state/showrunner/footers-off/` are not read; `tidy_wrapped.py` deletes a production's file at wrap. Pause records still load. Their footer keys have no effect. Shutdown restart keeps only staff row IDs.
 
 ### Tool-output read guard
 
@@ -132,15 +147,9 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 - **Changes and copies.** `changes_output` refuses a simple command whose program is `rm`, `cp`, `mv` or `tee` with an argument matching the same pattern, and a redirect operator (`>`, `>>`, `&>`, `>|`) whose target matches it. These also prompt, and units waited hours on an `rm` of the saved `cargo-berth board --json` output (2026-10-21). The `deny` says to leave saved output alone and names `cat <file> > /tmp/claude/<name>` to keep a copy. `commands/unit/direct.md` now reads only `.status` from the board through `jq`, so that output is not saved.
 - **Not an allow rule.** A `Bash(sed -n …)` or `Bash(awk …)` allow rule would also allow `sed -n 'w <file>'` and `awk 'BEGIN{system(…)}'`, so the guard sends the session to the forms that already run with no prompt.
 
-### Production status: run-out and pane lookup
+### Account usage rate
 
 - `scripts/whoami/run_out.py`: `Reading(at, used_percent)`, `read_readings`, and `weighted_rate(readings, end) -> float | None`: percent used per second by `end`, each rise between consecutive readings weighted by 0.5^(age / `HALF_LIFE`, 12 h). A drop (a weekly refill or a redeemed reset), time at 100% and a gap over `MAX_GAP` (15 min: the account sat logged out) are skipped, so rises before a refill still count. None until the counted time, weighted, reaches `MIN_SPAN` (1 h).
-
-- `dailies_render.agent_line` extends `weighted_rate` at the latest reading to 100%, rounded to the minute. When it is None, the fallback divides used percent by the time since the later of the weekly refill and now minus `run_out.WINDOW` (24 h).
-
-- Agents line forms (then the unchanged resets part, `N reset(s) available until <Mon D>` / `no resets available` / `resets unknown`): `claude1: 25%; runs out about Tue 22:02 PDT, before its Sun 23:00 refill; …` (`22:02 PDT today` when today); `…; runs out about Mon 04:00 PDT, so it hits its Sun 23:00 refill first; …`; `…: 1%; does not run out at this pace, so it hits its Sun 23:00 refill first; …` (rate at or below 0); `…: 100%; ran out, back at its Sun 23:00 refill; …`. Unknown usage reads `week's usage unknown; refills …`.
-
-- `agent_section(now, zone, *, at=None)`: with `--at`, when a note's `weekly_usage_checked_at` is later than the stamped minute, each line uses the account's latest reading before the end of that minute (computed in absolute time), and only readings up to it feed the pace; with none the note stands. Notes are the accounts in use (`role` or `sessions`) in `~/rust/hanadocs/agents/*.md`, read by their stable account labels; readings live in `~/.local/state/agent-notes/readings.jsonl`.
 
 ### Showrunner settings and stall watcher
 
@@ -202,26 +211,10 @@ After a successful delivery, it saves that recipient's id in `told`.
 It reads current names again for the final parent and children report.
 This per-delivery lookup preserves correct routing when a recipient changes name during an earlier delivery.
 
-### Adhoc review pause
+### Adhoc review
 
-`scripts/production/review_pause.py pause | status | resume dailies|none` acts on productions targeting the staff owner of `$CLAUDE_CODE_SESSION_ID`.
-`pause`, `status` and `resume` resolve each timer's owner through staff and show the current production name in output.
-The record path is `~/.local/state/showrunner/review-paused/<owner staff id>.json`.
-`showrunner_footer.review_pause_path` builds this path.
-`conversation_pause._review_names` resolves timer owners to staff ids before the review check reads these files.
-
-`ReviewPauseRecord{dailies}` stores one `ActionState`: `untouched`, `attempted`, `done` or `skipped`.
-The reader accepts legacy booleans as `done` or `skipped` and ignores a legacy `footers` key.
-The writer saves the record atomically before and after the action.
-`pause` stops enabled dailies through `notifier.sh stop showrunner-<owner staff id>`, with a 10-second timeout.
-`reconcile_attempted(instance, path, record)` changes `attempted` to `done` when it observes the effect.
-All three commands use this function.
-A failed stop retains `attempted`, so a repeated command retries the incomplete action.
-`resume dailies` starts dailies only when the record says `done`.
-`resume none` leaves dailies stopped.
-Both resume choices delete the record.
-`/adhoc_review` runs `pause` at Step 2 and `status` at Step 5.
-If the review stopped dailies, it asks `Turn dailies back on? (yes / leave off)` before the selected resume command.
+Dailies and their pause/resume steps were retired on 2026-11-11.
+`/adhoc_review` no longer manages a dailies schedule.
 
 ### Cargo token and step groups
 
@@ -322,9 +315,6 @@ Run files keep staff references instead of copied native identities.
 
 - **No Stop hook for asked questions** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The reply footer it once checked is gone (user, 2026-10-18).
 
-- **Review records use fixed staff ids.** A production rename, compaction or session change preserves its review record.
-  The record identifies the action that the review completed.
-  `resume` restores only that action, and action states let a repeated pause complete an interrupted action.
 
 - **Run jobs get their own service.** A background child stays in the tick's cgroup or launchd job and dies with it; a separate service keeps the run, its watchdog and its final log write alive.
 

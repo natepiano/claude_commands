@@ -1240,14 +1240,14 @@ class LifecycleTests(LifecycleFixture):
         owner = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         assert owner is not None
         owner_id = owner.id
-        own = (state / "footers-off" / owner_id, state / "review-paused" / f"{owner_id}.json",
+        own = (state / "footers-off" / owner_id,
                state / "outstanding" / f"{owner_id}.json", state / owner_id / "prompt.txt")
         other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
         for path in (*own, *other):
             self.write(path, "[]\n")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, review-paused/{owner_id}\.json, "
+        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, "
                          + rf"outstanding/{owner_id}\.json, {owner_id}/$")
         self.assertFalse(any(path.exists() for path in own))
         self.assertFalse((state / owner_id).exists())

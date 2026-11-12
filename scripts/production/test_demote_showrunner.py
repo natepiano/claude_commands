@@ -237,7 +237,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.git("-C", str(self.child_tree), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "child.md")
         self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), self.child_branch)
 
-    def test_pending_demotion_keeps_its_schedule_and_restore_starts_it(self) -> None:
+    def test_pending_demotion_keeps_its_registration_and_restore_leaves_it_stopped(self) -> None:
         files = self.cleanup_files()
         self.timer.side_effect = self.fixture_notifier
         _ = self.fixture_notifier(["new", f"showrunner-{self.child.id}", "--every", "15",
@@ -256,7 +256,7 @@ class DemoteShowrunnerTests(StaffTestCase):
               mock.patch.object(herdr, "shared_session", return_value="fixture"),
               mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
             self.assertEqual(demote.restore(self.journal()), 0)
-        self.assertIn("ENABLED=1", (instance / "state").read_text())
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
         self.start.side_effect = self.start_unit
         self.assertEqual(self.run_command()[0], 0)
         self.assertFalse(instance.exists())
@@ -285,7 +285,7 @@ class DemoteShowrunnerTests(StaffTestCase):
               mock.patch.object(herdr, "shared_session", return_value="fixture"),
               mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
             self.assertEqual(demote.restore(self.journal()), 0)
-        self.assertIn("ENABLED=1", (instance / "state").read_text())
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
         self.assertEqual(staff.by_id(self.child.id), self.child)
         self.assertTrue(all(path.exists() for path in files))
 

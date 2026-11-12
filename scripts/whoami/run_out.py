@@ -1,6 +1,6 @@
 """How fast an account's week is being used, from the readings agent_notes.py logs.
 
-`weighted_rate` is the pace the dailies footer extends to 100% used. Each rise in
+`weighted_rate` estimates the pace toward 100% usage. Each rise in
 used percent counts half as much per `HALF_LIFE` of age, and a refill only skips
 the drop, so the night before a morning refill still counts toward the next day.
 Time an account sat logged out is skipped too, so it does not read as quiet use.
