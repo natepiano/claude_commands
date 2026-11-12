@@ -822,7 +822,6 @@ class OutsideFailure(StrEnum):
     AMBIGUOUS_ITEMS = "ambiguous destination items"
     BODY_FAILED = "body check failed"
     BODY_UNREADABLE = "body unreadable or empty"
-    WRONG_KEYWORD = "keyword differs"
     WRONG_OWNER = "owner differs"
     TRAIT_UNCERTAIN = "trait identity uncertain"
     NOT_GAINED = "declaration not gained"
@@ -895,13 +894,14 @@ class OutsideRenameUnresolved:
 
 
 def outside_evidence_line(evidence: OutsideRenameNotProven) -> str:
-    """Name every examined target and each failed check in a stable order."""
+    """Count passed candidates first, then failed checks in OutsideFailure order."""
     candidates = "none"
     if isinstance(evidence.candidates, OutsideCandidates):
-        candidates = ", ".join(
-            f"{item.path}:{item.line} {declarations.declaration_line(item.declaration)} "
-            + f"{item.unchanged}/{item.old_nonblank_count} body lines "
-            + ("passed" if not item.checks else "/".join(item.checks)) for item in evidence.candidates.items)
+        counts = Counter(check for item in evidence.candidates.items for check in set(item.checks))
+        passed = sum(not item.checks for item in evidence.candidates.items)
+        checks = [f"passed: {passed}"] if passed else []
+        checks.extend(f"{check}: {counts[check]}" for check in OutsideFailure if counts[check])
+        candidates = f"{len(evidence.candidates.items)} ({', '.join(checks)})"
     return (f"outside rename not proved: {', '.join(evidence.reasons)}; candidates: {candidates}; "
             + mapped_evidence_line(evidence.mapped))
 
@@ -2350,6 +2350,12 @@ MIGRATIONS = {
             finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
         );
     """,
+    39: """
+        CREATE TABLE IF NOT EXISTS finding_needs (
+            finding_id TEXT NOT NULL, path TEXT NOT NULL, recorded_at TEXT NOT NULL,
+            PRIMARY KEY(finding_id, path)
+        );
+    """,
 }
 
 
@@ -3181,6 +3187,23 @@ class Ledger:
                 unjudged.append(UnjudgedTicketCell(rule, path))
         return tuple(unjudged)
 
+    def finding_needs(self, finding_id: str) -> tuple[str, ...]:
+        """Return the recorded edit paths that the finding needs."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT path FROM finding_needs WHERE finding_id=? ORDER BY path", (finding_id,),
+        ).fetchall())
+        return tuple(path for path, in rows)
+
+    def finding_need(self, finding_id: str, path: str) -> None:
+        """Record an edit path for any finding in the ledger."""
+        path = self._path(path)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            _ = self._held(finding_id)
+            _ = self._connection.execute(
+                "INSERT OR IGNORE INTO finding_needs VALUES (?,?,?)", (finding_id, path, _now()),
+            )
+
     @_ticket_operation("yield")
     def ticket_yield(self, id: str, path: str) -> tuple[str, ...]:
         """Give up the assigned ticket's work on path, and return the proposal findings that the yield frees.
@@ -3589,6 +3612,7 @@ class Ledger:
                 raise LedgerError(f"{ticket['id']}: findings cannot be read")
             for finding in self.named_held(ticket["finding_ids"]):
                 files.add(finding.path)
+                files.update(self.finding_needs(finding.finding_id))
                 moved = file_rename(finding.kind, finding.path, finding.after)
                 pair = approved_rename(finding.kind, finding.before, finding.after)
                 if isinstance(moved, FileRename):
@@ -5764,11 +5788,13 @@ class Ledger:
                 continue
             destination = self._declared_file(tip.commit, path)
             for item in destination.declared_items:
+                if item.declaration.keyword != target.keyword:
+                    continue
+                if item.declaration.owner not in (target.owner, old.declaration.owner):
+                    continue
                 if item.declaration.name == old.declaration.name:
                     continue
                 checks: list[OutsideFailure] = []
-                if item.declaration.keyword != target.keyword:
-                    checks.append(OutsideFailure.WRONG_KEYWORD)
                 if item.declaration.owner != target.owner:
                     checks.append(OutsideFailure.WRONG_OWNER)
                 if not checks and target.owner == old.declaration.owner:
@@ -6654,33 +6680,59 @@ class Ledger:
         self._built_rename_evidence[tip.commit] = evidence
         return evidence
 
+    def _release_declaration_commit(self, commit: str) -> None:
+        """Release declaration caches that name this completed group's historical commit."""
+        self._declared_files = {key: value for key, value in self._declared_files.items() if key[0] != commit}
+        self._commit_files = {key: value for key, value in self._commit_files.items() if key[0] != commit}
+        self._item_bodies = {key: value for key, value in self._item_bodies.items() if key[0] != commit}
+        self._outside_bodies = {key: value for key, value in self._outside_bodies.items() if key[0] != commit and key[2] != commit}
+        self._outside_diffs = {key: value for key, value in self._outside_diffs.items() if commit not in key[:2]}
+        self._file_modules = {key: value for key, value in self._file_modules.items() if key[0] != commit}
+        self._extern_names = {key: value for key, value in self._extern_names.items() if key[0] != commit}
+        # Binding proofs use (ticket, path, commit); site maps use (before, after, path).
+        self._binding_proofs = {key: value for key, value in self._binding_proofs.items() if key[2] != commit}
+        self._site_maps = {key: value for key, value in self._site_maps.items() if commit not in key[:2]}
+        _ = self._tips.pop(commit, None)
+
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
                              approved: Callable[[Path], bool]) -> DeclarationReading:
-        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
+        findings = tuple(self._held(finding_id) for finding_id in finding_ids)
+        self._prepare_sites(findings, tip)
         rust_files = frozenset(tip.rust_files)
         built = self._built_renames(tip)
         self._refresh_site_rows()
-        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, built.renames,
-                                                   built.findings) for finding_id in finding_ids)
-        for outcome in outcomes:
-            finding = outcome.finding
-            if isinstance(outcome, FindingSite):
-                evidence = outcome.evidence
-            elif isinstance(outcome, DeclarationMoved):
-                anchor = self.finding_anchor(finding)
-                evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
-                            if isinstance(anchor, FindingAnchor) else anchor)
-            elif isinstance(outcome, DeclarationRemoved):
-                evidence = NeedsJudgment("no source site after proved declaration removal")
-            elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
-                # Existing untracked findings are eligible for filing; this asserts no historical carry.
-                evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
-            elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
-                evidence = self._site_proof(finding, tip.commit)
-            else:
-                evidence = NeedsJudgment("existing declaration proof refused this transition")
-            self._follow_evidence[(finding, tip.commit)] = evidence
-        return DeclarationReading(tip.commit, outcomes)
+        groups: dict[str | int, list[tuple[int, HeldFinding]]] = {}
+        for index, finding in enumerate(findings):
+            anchor = self.finding_anchor(finding)
+            # A finding without an anchor uses its input position as its group key.
+            group_key = anchor.commit if isinstance(anchor, FindingAnchor) else index
+            groups.setdefault(group_key, []).append((index, finding))
+        outcomes: dict[int, DeclarationOutcome] = {}
+        for commit, group in groups.items():
+            for index, finding in group:
+                outcome = self._declaration_outcome(self._held(finding.finding_id), tip, rust_files, approved,
+                                                    built.renames, built.findings)
+                outcomes[index] = outcome
+                finding = outcome.finding
+                if isinstance(outcome, FindingSite):
+                    evidence = outcome.evidence
+                elif isinstance(outcome, DeclarationMoved):
+                    anchor = self.finding_anchor(finding)
+                    evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
+                                if isinstance(anchor, FindingAnchor) else anchor)
+                elif isinstance(outcome, DeclarationRemoved):
+                    evidence = NeedsJudgment("no source site after proved declaration removal")
+                elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                    # Existing untracked findings remain eligible for filing without historical carry.
+                    evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
+                elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
+                    evidence = self._site_proof(finding, tip.commit)
+                else:
+                    evidence = NeedsJudgment("existing declaration proof refused this transition")
+                self._follow_evidence[(finding, tip.commit)] = evidence
+            if isinstance(commit, str) and commit != tip.commit:
+                self._release_declaration_commit(commit)
+        return DeclarationReading(tip.commit, tuple(outcomes[index] for index in range(len(findings))))
 
     def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:
         """What follow_declarations writes for the findings at the synced tip; it writes nothing.
@@ -7949,6 +8001,7 @@ class LedgerArguments(argparse.Namespace):
     proposal: str = ""
     state: HeldStateName | None = None
     finding_ids: str = "[]"
+    finding_id: str = ""
     finding: list[str] = []
     reason: str = ""
     site: str = ""
@@ -8076,7 +8129,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
+        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -8126,6 +8179,9 @@ def main() -> None:
                 _ = command.add_argument("--after", required=True, help=FINDING_REPLACEMENT_GUIDANCE)
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
+            elif action == "need":
+                _ = command.add_argument("--finding", dest="finding_id", required=True)
+                _ = command.add_argument("--path", required=True)
             elif action == "list":
                 _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built", "withdrawn"), default=None)
                 _ = command.add_argument("--json", action="store_true")
@@ -8275,6 +8331,8 @@ def main() -> None:
                             if isinstance(check, RenameNotApplied):
                                 print(f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all "
                                       + f"(issue {finding.state.proposal})", file=sys.stderr)
+                elif args.action == "need":
+                    ledger.finding_need(args.finding_id, args.path)
                 elif args.action == "replace":
                     person: WaiveUndo = WaiveUndoneBy(args.person.strip()) if args.person is not None else NoWaiveUndo()
                     print(ledger.replace_held(args.id, args.after, person).finding_id)

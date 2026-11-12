@@ -106,21 +106,22 @@ class LaunchNames:
             return saved
         return owner.name
 
-    def resume(self, entry: PaneLaunch) -> PaneLaunch:
+    def resume(self, entry: PaneLaunch) -> pane_launch.CurrentLaunch:
         """Project a saved member reference to its current conversation and name."""
         current = pane_record.without_legacy_identity(entry)
+        record = self.tab_record
         if isinstance(self.record, StaffNamesUnavailable):
-            return current
-        if isinstance(pane_launch.launch_reference(current, self.record), pane_launch.NativeLaunchReference):
-            print(f"launch names: {entry['session_id']} ({entry['name']}): no staff row; saved name retained", file=sys.stderr)
-        return pane_launch.current_launch(current, self.record)
+            return pane_launch.current_launch(current, record)
+        if isinstance(pane_launch.launch_reference(current, record), pane_launch.NativeLaunchReference):
+            print(f"launch names: {entry.get('session_id', '')} ({entry.get('name', '')}): no staff row; saved name retained", file=sys.stderr)
+        return pane_launch.current_launch(current, record)
 
-    def resume_proof(self, original: PaneLaunch, current: PaneLaunch) -> pane_launch.VerifiedResume:
+    def resume_proof(self, original: PaneLaunch, current: pane_launch.NativePaneLaunch) -> pane_launch.VerifiedResume:
         """Accept the fixed member reference and the observed native resume identity."""
-        references = {original["session_id"], current["session_id"]}
+        references = {pane_launch.reference_id(original), current["session_id"]}
         if not isinstance(self.record, StaffNamesUnavailable):
             owner = self.record.by_current_session(current["session_id"])
             if owner is not None:
                 references.add(owner.id)
-        return pane_launch.VerifiedResume(current, frozenset(references))
+        return pane_launch.VerifiedResume(current, frozenset(references), self.tab_record)
 

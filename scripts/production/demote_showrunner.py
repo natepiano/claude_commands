@@ -245,7 +245,7 @@ def restore(path: Path) -> int:
         _ = staff.change_director(source.id, staff.ShowrunnerRole(source.name, source.parent.id, source.doc))
         for identity in cast(list[str], fields["directors"]):
             _ = staff.move(staff.StaffId(identity), staff.ReportsTo(source.id))
-        entry = cast(pane_launch.PaneLaunch, fields["launch"])
+        entry = pane_record.resume_launch(cast(pane_launch.PaneLaunch, fields["launch"]))
         environment = entry["environment"].copy()
         if isinstance(source.home, staff.SessionHome):
             environment.update(named_account_environment(source.home.path))

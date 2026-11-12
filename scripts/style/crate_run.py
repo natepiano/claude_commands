@@ -976,15 +976,15 @@ class CrateRun:
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
         with serial(self.folder), self.complete_run():
             manifest = self.read()
+            if package not in manifest["crates"]:
+                raise bulk.BulkRenameError("crate is not in the frozen run")
+            record = manifest["crates"][package]
+            stage = CrateStage(record["stage"])
+            if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
+                return manifest
             with (self.frozen_checkout(manifest) as frozen,
                   self.ledger.rules_from_checkout(frozen), ExitStack() as workers,
                   ExitStack() as validation_checkouts):
-                if package not in manifest["crates"]:
-                    raise bulk.BulkRenameError("crate is not in the frozen run")
-                record = manifest["crates"][package]
-                stage = CrateStage(record["stage"])
-                if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
-                    return manifest
                 checkout = Path(record["checkout"])
                 validation: HeldCrateValidation | SeparateIntegrationCheckout = SeparateIntegrationCheckout()
                 base = manifest["base"]

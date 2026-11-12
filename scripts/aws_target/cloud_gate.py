@@ -7,16 +7,19 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -49,6 +52,22 @@ class LocalFallback:
 @dataclass(frozen=True)
 class CloudCompleted:
     run: gate.GateRun
+
+
+@dataclass(frozen=True)
+class GateLaunchVariant:
+    region: str
+    instance_type: str
+    subnet_id: str
+    zone: str
+
+
+@dataclass(frozen=True)
+class RegionalLiveSpotRead:
+    region: str
+    seconds: float
+    used: bool
+    prices: tuple[ledger.RegionalSpotPrice, ...] = ()
 
 
 def settings() -> conf.ConfigRead:
@@ -101,12 +120,20 @@ def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profi
 
 def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_progress.CloudProgress:
     """Read the current phase and each module's latest result."""
-    state: cloud_progress.CloudState = 'setup'
+    state: cloud_progress.CloudState = 'setup' if text.strip() else 'requesting'
+    stage = '' if text.strip() else 'launch'
+    modules_started = False
     failed: set[str] = set()
     for line in text.splitlines():
+        named_stage = re.fullmatch(r'(?:\S+ )?stage=(.+)', line)
+        if named_stage and not modules_started:
+            stage = named_stage[1]
+            if stage.startswith('round '):
+                state = 'running'
         start = re.fullmatch(r'Runner: \d+ modules, whole machine, (\d+) CPUs', line)
         if start:
             state, size_vcpus = 'running', int(start[1])
+            stage, modules_started = '', True
         result = re.fullmatch(r'(\S+) exit=(-?\d+) seconds=\d+\.\d+(?: stopped)?', line)
         if result:
             if int(result[2]):
@@ -114,8 +141,8 @@ def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_p
             else:
                 failed.discard(result[1])
         if line == 'Cloud gate: uploading':
-            state = 'uploading'
-    return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at)
+            state, stage = 'uploading', 'uploading'
+    return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at, stage=stage)
 
 
 @dataclass(frozen=True)
@@ -271,6 +298,7 @@ class GateWorker:
                  clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep) -> None:
         self.api = api
         self.box_region = api.region
+        self.box_zone: str = ''
         self.apis: dict[str, AwsCli] = {api.region: api}
         self.book = book
         self.settings_path = settings_path
@@ -278,6 +306,7 @@ class GateWorker:
         self.clock = clock
         self.pause = pause
         self.size_vcpus: int = 0
+        self.price_read_evidence: tuple[dict[str, object], ...] = ()
 
     def regional_api(self, region: str) -> AwsCli:
         if region not in self.apis:
@@ -289,7 +318,8 @@ class GateWorker:
         counter = log_progress(text)
         if isinstance(counter, progress_profile.ProgressCounter):
             progress_profile.publish_counter(self.sidecar, counter)
-        cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
+        cloud_progress.publish(self.sidecar, replace(log_cloud_progress(text, self.size_vcpus, self.clock()),
+            region=self.box_region, zone=self.box_zone))
 
     def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
         now = int(self.clock())
@@ -395,6 +425,8 @@ class GateWorker:
         error_code = launch_error_code(reason)
         row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
             'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode'], 'region': self.box_region}
+        if result != 'finished' and self.price_read_evidence:
+            row['spot_price_reads'] = self.price_read_evidence
         if result == 'finished':
             row['gate_s'] = gate_s
         else:
@@ -404,15 +436,131 @@ class GateWorker:
         if result == 'refused':
             print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
 
+    def live_spot_prices(self, variants: Sequence[GateLaunchVariant]) -> tuple[RegionalLiveSpotRead, ...]:
+        """Read deployed regions concurrently under one launch deadline."""
+        if not variants:
+            return ()
+        values = settings()
+        sizes = values.words('instance_types')
+        regions = tuple(dict.fromkeys(row.region for row in variants))
+        deployed = {(row.region, row.instance_type, row.zone) for row in variants}
+        started = time.monotonic()
+        deadline = started + values.number('spot_price_live_read_timeout_s')
+        read_at = int(self.clock())
+        call_started: dict[str, float] = {}
+
+        def fetch(region: str) -> RegionalLiveSpotRead:
+            begin = time.monotonic()
+            call_started[region] = begin
+            try:
+                remaining = deadline - begin
+                if remaining <= 0:
+                    return RegionalLiveSpotRead(region, 0, False)
+                reply = self.api.in_region(region).call('describe-spot-price-history', '--instance-types', *sizes,
+                    '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(read_at, UTC).isoformat(),
+                    '--no-paginate', '--max-results', '1000', timeout_s=min(self.api.timeout_s, remaining))
+                prices = tuple(row for row in ledger.regional_spot_prices(region, reply, sizes, read_at)
+                               if (row.region, row.instance_type, row.zone) in deployed)
+                ended = time.monotonic()
+                used = bool(prices) and ended <= deadline
+                return RegionalLiveSpotRead(region, ended - begin, used, prices if used else ())
+            except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError,
+                    subprocess.SubprocessError):
+                return RegionalLiveSpotRead(region, time.monotonic() - begin, False)
+
+        pool = ThreadPoolExecutor(max_workers=len(regions))
+        try:
+            pending = {region: pool.submit(fetch, region) for region in regions}
+            done, _ = wait(pending.values(), timeout=max(0, deadline - time.monotonic()))
+            ended = time.monotonic()
+            return tuple(future.result() if future in done else
+                         RegionalLiveSpotRead(region, ended - call_started.get(region, started), False)
+                         for region, future in pending.items())
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
+                      live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
+        """Prefer available capacity, larger sizes, and the lowest total gate cost."""
+        values = settings()
+        policy = conf.read(self.settings_path)
+        now = self.clock()
+        max_age = policy.whole('price_max_age_seconds')
+        cooldown = values.whole('capacity_cooldown_seconds')
+        try:
+            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown))
+        except OSError:
+            history = ()
+        recent = [row for row in history if float(str(row['time'])) <= now]
+        zone_codes = {'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'}
+        quota_codes = {'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'}
+        refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
+        zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
+                 for row in refused if row.get('error_code') in zone_codes}
+        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in quota_codes}
+        def cooled(variant: GateLaunchVariant) -> bool:
+            return variant.region in regions or (variant.region, variant.instance_type, variant.zone) in zones
+        try:
+            prices = {(row.region, row.instance_type, row.zone): row.usd_per_hour
+                      for row in sorted(ledger.read_spot_prices(self.book.directory), key=lambda row: row.read_at)
+                      if 0 <= now - row.read_at <= max_age}
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+            prices = {}
+        prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+        if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
+            return sorted(variants, key=cooled)
+        durations: list[float] = []
+        for row in recent:
+            if row.get('result') != 'finished' or row.get('mode') != mode or float(str(row['time'])) < now - max_age:
+                continue
+            try:
+                duration = float(str(row['gate_s']))
+                if math.isfinite(duration) and duration > 0:
+                    durations.append(duration)
+            except (ValueError, KeyError, TypeError):
+                continue
+        hours = (Decimal(str(statistics.median(durations))) / 3600 if durations
+                 else Decimal(values.whole('lifetime_minutes')) / 60)
+        transfer = conf.decimal(values.text('remote_region_transfer_usd'))
+        wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
+        extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
+                         ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
+        if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
+            raise ValueError('The regional gate delay must be nonnegative')
+        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
+            position, variant = item
+            size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', variant.instance_type)
+            vcpus = (2 if size[1] == 'large' else 4 * int(size[2] or '1')) if size else 0
+            key = (variant.region, variant.instance_type, variant.zone)
+            cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
+                    + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
+                    if key in prices else Decimal(0))
+            return cooled(variant), -vcpus, key not in prices, cost, position
+        return [variant for _, variant in sorted(enumerate(variants), key=order)]
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
         if launch.get('instance'):
             self.box_region = str(launch.get('region', self.api.region))
+            self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
-        variants = [(regional, size, row) for regional in ledger.rows(deployment, 'regions')
-                    for size in sizes for row in ledger.rows(regional, 'subnets')]
+        variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
+                    for regional in ledger.rows(deployment, 'regions') for size in sizes for row in ledger.rows(regional, 'subnets')]
+        if not path.exists():
+            readings = self.live_spot_prices(variants)
+            live_prices = [price for reading in readings if reading.used for price in reading.prices]
+            variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
+            launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
+                'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
+            save(path, launch)
+        elif 'variants' in launch:
+            variants = [GateLaunchVariant(ledger.text(row, 'region'), ledger.text(row, 'instance_type'),
+                ledger.text(row, 'subnet_id'), ledger.text(row, 'zone')) for row in ledger.rows(launch, 'variants')]
+        saved_order = {key: launch[key] for key in ('variants', 'spot_price_reads') if key in launch}
+        self.price_read_evidence = ledger.rows(launch, 'spot_price_reads') if 'spot_price_reads' in launch else ()
+        regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         for offset in range(index, stop):
@@ -422,9 +570,12 @@ class GateWorker:
                 size = ledger.text(arguments, 'InstanceType')
                 zone = str(launch.get('zone', ''))
             else:
-                regional, size, subnet = variants[offset]
+                variant = variants[offset]
+                regional = regional_rows[variant.region]
+                size = variant.instance_type
+                subnet = {'id': variant.subnet_id, 'zone': variant.zone}
                 self.box_region = ledger.text(regional, 'region')
-                zone = ledger.text(subnet, 'zone')
+                zone = variant.zone
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
@@ -460,12 +611,12 @@ class GateWorker:
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 if regional.get('image'):
                     arguments['ImageId'] = ledger.text(regional, 'image')
-                launch = {'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
+                launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
                 save(path, launch)
             api = self.regional_api(self.box_region)
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock()))
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
             if self.clock() >= ledger.instant(request, 'expires'):
                 reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
@@ -475,6 +626,7 @@ class GateWorker:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
+                    self.box_zone = zone
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             try:
@@ -496,8 +648,8 @@ class GateWorker:
             except AwsUnavailable as error:
                 # A saved request keeps its token and bytes after an uncertain reply.
                 if capacity_error(str(error)):
-                    launch = {}
-                    save(path, {'variant': offset + 1})
+                    launch = {**saved_order, 'variant': offset + 1}
+                    save(path, launch)
                     continue
                 if not definite_refusal(str(error)):
                     raise
@@ -509,6 +661,7 @@ class GateWorker:
             instance = ledger.text(instances[0], 'InstanceId')
             save(path, {**launch, 'instance': instance})
             self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
+            self.box_zone = zone
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
@@ -518,7 +671,7 @@ class GateWorker:
         row: dict[str, object] = {}
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock(), stage='launch'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -556,7 +709,8 @@ class GateWorker:
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
+                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock(),
+                    stage='launch', region=self.box_region, zone=self.box_zone))
                 while self.clock() < ledger.instant(request, 'expires'):
                     try:
                         bucket = ledger.text(deployment, 'bucket')
@@ -749,7 +903,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                        else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
             save(current, {'attempt': folder.name, **identity})
             save(folder / 'deployment.json', deployment)
-            cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time()))
+            cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time(), stage='launch'))
             outcome = run_service(repo, folder, request, command, service)
             reservation.status = int(not outcome.run.passed) if isinstance(outcome, CloudCompleted) else 0
             return outcome
