@@ -2,7 +2,6 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Record each `~/.claude` test run, test module and slow test in the build log, show their history at once with `/test_times`, and make the slowest test modules faster, from the top of a descending sort down.
 
-
 ## Source
 
 2026-11-03 09:30 EST
@@ -3170,70 +3169,16 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 174 — Rank the test work by gate seconds saved per work hour  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a measured report ranks the candidate test speed work by gate seconds saved per work hour, with shared per-module costs measured. No code changes.
-
-**Decision:** builds showrunner item 80, from the user, 2026-11-11: aim at the largest gate-time saving per work hour. dwight measured a median full gate of 197 s and 4,663 CPU s on 32 vCPUs; the slowest 12 modules use 11% of CPU and about 746 others use 89%. Earlier shared changes saved 38.7, 49, 42 and 127 CPU s per gate; single-module phases save 1–13 CPU s. Read-only.
-
-**Spec:**
-1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only (`file:...?mode=ro`), tables `gate_runs` and `gate_modules`. Use passed cloud full gates (`host != 'natedev'`, `selection = 'full'`, `status = 0`) since 2026-11-08. Record the gate count and the database file.
-2. Gate shape. Use the method of `~/rust/hanadocs/dwight/tools/m.py`: wall, CPU, slots, time to the first module, time after the last module start, and the modules that end last. Say whether gate wall time follows total CPU over the slots or the tail.
-3. Fixed cost per module. Measure about 20 small modules across suites with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 5 --commands 10`. Split the cost into interpreter start, the `module_run.py` supervisor, package bootstrap, shared support imports and test setup. Use `python3 -X importtime` to attribute import CPU to shared modules. Multiply by the gate module count for a gate estimate, labelled as an estimate.
-4. Shared support. Rank shared fixtures and support modules by the number of gate modules that use them times their measured CPU. Name the top 10, with file, line and owner.
-5. Scheduling. Find where the gate orders modules (file and line). Estimate the wall time saved by longest-first order or by splitting the tail modules.
-6. Find the source of the earlier shared savings (38.7, 49, 42 and 127 CPU s) in `git log` where you can, and say what kind of change each was.
-7. For each candidate give: measured cost (gate CPU s and gate wall s), estimated saving, estimated work hours, gate seconds saved per work hour, owner, and a measured or estimated label on each number. Include the open single-module work from next item 6b for comparison.
-8. Write the report to `phases/174/gate_value_ranking.md` in the session folder. Change no repository file. Delete saved run output after you read it.
-
-**Files:**
-- `phases/174/gate_value_ranking.md` — the report, in the session folder; no repository file changes.
-
-**Workers:** 1 researcher; read-only.
-- impl3: the report.
-
-**Constraints from prior phases:**
-- Phase 166: local CPU numbers overstate; only aws pairs decide a saving. Keep measured costs separate from estimated savings.
-- Phase 168: entry imports cost 0.02–0.50 s per child; lock waits cost almost no CPU.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives the gate shape, the fixed cost per module by part, the top 10 shared costs with owners, the scheduling estimate, and the ranked table with measured and estimated labels.
-- `git status` shows no change from the researcher.
+- Checkpoint `f1a98808e`. Read-only ranking; report at `phases/174/gate_value_ranking.md` in the unit session. Gate wall time follows CPU over 32 slots (r 0.994); the fixed cost per module is about 133 of 4,664 CPU s, so test bodies hold 97%. Scheduling is already longest-first. Gate records then had no module start times (report phase 50 adds them). Ranking by estimated gate seconds per work hour: admission fixture imports (36 CPU s, 6 h), coverage CLI in process (7.9 s, 2 h; Phase 178), unused ledger imports (1.87 s, 0.5 h; Phase 178).
 
 ### Phase 175 — Check whether affected-only merge gates would have caught the recorded failures  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a report says, for each failed cloud merge gate since 2026-11-08, whether the affected-test selection for that merge includes each recorded failing module. Analysis only: no aws cost and no gate-policy change.
-
-**Decision:** builds showrunner item 82, from the user, 2026-11-11. dwight found 523 full gates on 489 trees since 11-08; 62 failed on 42 trees; only one failed tree also has an affected run (`~/rust/hanadocs/dwight/tools/n.py`). Read-only.
-
-**Spec:**
-1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only, tables `gate_runs` and `gate_modules`. List cloud `merge-gate` runs since 2026-11-08, the failed runs and their distinct trees. Record the database file and the counts.
-2. Find the affected-test selection that `targeted-test` uses (`scripts/production/merge_gate.py` and its callers). Explain the algorithm and the base it compares the merge result against, with file and line.
-3. For each failed tree, find the merge commit and its base in the local repository objects. Run the selection code in process on the changed files; run no tests. When the selection needs the tree at that commit, use `python3 ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit <C> -- <cmd>`. Do not fetch with a ref write; use `git fetch --no-write-fetch-head` only when an object is absent.
-4. Compare each recorded failing module with the selection. Put each failed tree in one class: all failures selected, partial coverage, no failure selected, no failing module recorded (infrastructure or abort), or missing evidence (commit absent or no module records).
-5. Mark each tree that also passed a full gate as a test that fails only sometimes, apart from trees that never passed. Name the infrastructure cause from the records where you can.
-6. List the missed modules, the failed trees with no selected failure, and the trees with partial coverage.
-7. State the limit: selection coverage does not prove that an affected run would reproduce a failure.
-8. Write the report to `phases/175/affected_gate_report.md` in the session folder. Change no repository file. Start no gate and no aws work.
-
-**Files:**
-- `phases/175/affected_gate_report.md` — the report, in the session folder; no repository file changes.
-
-**Workers:** 1 researcher; read-only.
-- test: the report.
-
-**Constraints from prior phases:** none.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report explains the selection and its base, classifies every failed tree, and lists missed modules, uncovered trees and partial trees.
-- `git status` shows no change from the researcher.
+- Checkpoint `8f30bce69`. Read-only replay of the affected-test selection on 62 failed cloud merge gates (42 trees) since 11-08. Of 35 trees with a commit, the selection includes every failing module on 25, some on 4 and none on 6; 7 trees have no commit object. Most misses are whole-repository audits and fixtures that read a config file (Phase 176).
 
 ### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
 **Depends on:** Phase 175
@@ -3347,29 +3292,6 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 179 — Answer three questions on slow verify tests, coverage overlap and a fast-only gate  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a report answers the user's item 80 questions A, B and C with measured numbers and stated limits. Analysis only: no rule change, no test removal, no new test schedule, no aws work.
-
-**Decision:** the user via morty and builds, 2026-11-11. Source numbers: `~/rust/hanadocs/dwight/measurements-2026-11-11.md`, section "Is the full gate too large?" (read it; do not cd into that folder). Keep this apart from the Phase 177 census.
-
-**Spec:**
-1. A. Of the 414 slow verify tests (`scripts/direct/test_verify_*.py`, 0.5 s or more), count the tests that start a real end-to-end `verify.sh` run, and count those processes. Count the tests that prove a path a direct function call cannot prove (process boundary, signals, locks, real shell). Give test counts and process counts apart. Name the distinct behaviors and the limits of the evidence. Ask verify-unit for facts through `send.py` when needed.
-2. B. Find whether `scripts/test_times/coverage_overlap.py` has run across a full folder such as `direct`. If yes, report the candidate counts and the evidence. If no, estimate the time and the cost of a full run from a small measured sample. Do not start a full run.
-3. C. Estimate the gate duration when only tests below 0.5 s stay in the gate. Use the gate records and `module_cost.py` on a sample. Give test time, CPU time and gate wall time apart. Include the fixed cost per module (Phase 174: about 133 CPU s per gate) and modules that stay because one fast test stays. State the limits of selecting by test time.
-4. Write the report to `phases/179/gate_size_questions.md` in the session folder. Change no repository file.
-
-**Files:**
-- `phases/179/gate_size_questions.md` — the report, in the session folder; no repository file changes.
-
-**Workers:** 1 researcher; read-only.
-- impl4: the report.
-
-**Constraints from prior phases:**
-- Phase 174: gate wall time follows CPU over 32 slots (r = 0.994); module start times are not recorded.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report answers A, B and C with measured and estimated labels and limits.
-- `git status` shows no change from the researcher.
+- Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.
