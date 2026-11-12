@@ -3026,7 +3026,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** a notice runs before the completion writers (`merge_checkpoint.py` `run`), so a test of notice error handling guards saved records. Review returned the notice ValueError test. Check where a tested step sits before state writes, not only what the test asserts.
 
-### Phase 160 — The waiting tests build their Git trees once for each class  · status: todo
+### Phase 160 — The waiting tests build their Git trees once for each class  · status: done
 **Depends on:** none
 
 #### Work Order
