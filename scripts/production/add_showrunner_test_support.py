@@ -368,10 +368,6 @@ class AddShowrunnerFixture(unittest.TestCase):
 
         def advance(seconds: float) -> None:
             nonlocal elapsed
-            # Registry fixtures change on the next read; no asynchronous writer
-            # needs wall time. Keep the requested interval observable.
-            with (self.root / "polls.jsonl").open("a") as output:
-                _ = output.write(json.dumps(seconds) + "\n")
             elapsed += seconds
 
         with (patch.object(subprocess, "run", run),

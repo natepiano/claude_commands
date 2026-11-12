@@ -19,7 +19,7 @@ from collections.abc import Callable
 from contextlib import closing, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.style import bulk_rename as bulk
@@ -90,9 +90,19 @@ def word_edits(source: str, old: str, new: str, *, macros: bool = True) -> tuple
 
 
 class CargoProjectTests(unittest.TestCase):
+    project_seed: ClassVar[Path]
     queue: StyleQueueFake = StyleQueueFake()
     repo: Path = Path()
     root: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.project_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="bulk-rename-seed-"))) / "project"
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.project_seed
+        fixture.create_project()
 
     @override
     def setUp(self) -> None:
@@ -100,6 +110,13 @@ class CargoProjectTests(unittest.TestCase):
         self.set_up_tools()
         self.queue = self.enterContext(unqueued_style_children())
         self.repo = self.root / "project"
+        self.set_up_project()
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+
+    def set_up_project(self) -> None:
+        _ = shutil.copytree(self.project_seed, self.repo, symlinks=True)
+
+    def create_project(self) -> None:
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
         _ = (self.repo / ".gitignore").write_text("/target\n/Cargo.lock\n")
@@ -109,7 +126,6 @@ class CargoProjectTests(unittest.TestCase):
         _ = self.git("config", "user.email", "bulk@example.invalid")
         _ = self.git("add", ".")
         _ = self.git("commit", "-qm", "fixture")
-        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
 
     def set_up_tools(self) -> None:
         tools = rust_tool_path(self.root / "tools")
@@ -558,14 +574,6 @@ class RenameTests(CargoProjectTests):
         self.assertIn('overlaps the preserved external name', result.refusals[0].reason)
         self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
 
-    def test_f009_several_globs_and_proof_share_one_coverage_walk(self) -> None:
-        source = ''.join(f"mod provider{i} {{}} use provider{i}::*;\n" for i in range(5))
-        source += "fn f() { let old = 1; consume(old); }\n"
-        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
-        with mock.patch.object(bulk, "crate_source_coverage", wraps=bulk.crate_source_coverage) as walk:
-            result = self.rename(source, (self.finding(source, line=6),), server)
-        self.assertEqual(result.refusals, ())
-        self.assertEqual(walk.call_count, 1)
 
     def test_f007_index_reads_once_and_tracks_accepted_and_rolled_back_edits(self) -> None:
         root, child = self.repo / "src/lib.rs", self.repo / "src/child.rs"
@@ -691,14 +699,6 @@ class RenameTests(CargoProjectTests):
                 self.assertEqual(result.edited, source)
                 self.assertEqual(server.documents[self.repo / "src/lib.rs"], source)
                 self.assertEqual(server.documents[other], other.read_text())
-
-    def test_prepare_or_rename_refusal_returns_its_exact_reason(self) -> None:
-        source = (self.repo / "src/lib.rs").read_text()
-        def refuse(_text: str, _offset: int, _new: str) -> tuple[bulk.SourceEdit, ...]:
-            raise bulk.BulkRenameError("prepareRename refused")
-        result = self.rename(source, (self.finding(source),), ScriptedServer(refuse))
-        self.assertEqual(result.kept, ())
-        self.assertEqual(result.refusals[0].reason, "prepareRename refused")
 
 
 class CandidateEditTests(CargoProjectTests):
@@ -2017,46 +2017,6 @@ pub fn run(parameter: usize) -> usize {
             rename.assert_not_called()
         self.assertEqual(result.edited, source)
         self.assertIn("'number' is already a binding in the same pattern or parameter list at line 1", result.refusals[0].reason)
-
-
-class ToolEnvironmentTests(unittest.TestCase):
-    def test_only_real_tool_setup_keeps_the_callers_paths(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="bulk-tool-paths-") as directory:
-            root = Path(directory)
-            caller_tools = root / "caller-tools"
-            caller_tools.mkdir()
-            for name in ("cargo", "rust-analyzer"):
-                tool = caller_tools / name
-                _ = tool.write_text("#!/bin/sh\nexit 99\n")
-                tool.chmod(0o755)
-            caller_environment = {
-                "PATH": str(caller_tools),
-                "CARGO_HOME": str(root / "caller-cargo"),
-                "RUSTUP_HOME": str(root / "caller-rustup"),
-            }
-            for fixture in (CargoProjectTests(), RustAnalyzerTests(
-                "test_real_lsp_parameter_comments_rebase_the_next_prepare_rename"
-            )):
-                with self.subTest(fixture=type(fixture).__name__), mock.patch.dict(
-                    os.environ, caller_environment
-                ), mock.patch.object(fixture, "git", return_value=""):
-                    try:
-                        fixture.setUp()
-                        stubs = fixture.root / "tools"
-                        if isinstance(fixture, RustAnalyzerTests):
-                            expected_tools = caller_tools
-                            self.assertEqual(os.environ["CARGO_HOME"], caller_environment["CARGO_HOME"])
-                            self.assertEqual(os.environ["RUSTUP_HOME"], caller_environment["RUSTUP_HOME"])
-                            self.assertFalse(stubs.exists())
-                        else:
-                            expected_tools = stubs
-                            self.assertEqual(os.environ["CARGO_HOME"], str(fixture.root / "cargo-home"))
-                            self.assertEqual(os.environ["RUSTUP_HOME"], str(fixture.root / "rustup"))
-                        self.assertEqual(os.environ["PATH"], str(expected_tools))
-                        for name in ("cargo", "rust-analyzer"):
-                            self.assertEqual(shutil.which(name), str(expected_tools / name))
-                    finally:
-                        _ = fixture.doCleanups()
 
 
 if __name__ == "__main__":

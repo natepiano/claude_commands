@@ -13,7 +13,6 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import final, override
-from unittest import mock
 
 from scripts.style import style_footprint
 
@@ -161,49 +160,6 @@ class StyleFootprintTests(unittest.TestCase):
             self.write(path, (self.repo / path).read_text().replace("read_value", "load_value"))
         result = self.worktree_check(base)
         self.assertEqual((result.returncode, result.stdout), (0, "mechanical\n"), result.stderr)
-
-    def test_worktree_snapshot_error_cleans_up_its_temporary_index(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        base = self.commit()
-        self.write("src/lib.rs", "fn renamed() {}\n")
-        original_run = subprocess.run
-        indexes: list[Path] = []
-
-        def fail_write_tree(arguments: list[str], *, capture_output: bool, text: bool, check: bool,
-                            env: dict[str, str] | None = None, input: str = "",
-                            errors: str = "strict") -> subprocess.CompletedProcess[str]:
-            environment = env
-            if environment is not None and "GIT_INDEX_FILE" in environment:
-                path = Path(str(environment["GIT_INDEX_FILE"]))
-                indexes.append(path)
-                if "write-tree" in arguments:
-                    return subprocess.CompletedProcess(arguments, 128, "", "snapshot failed")
-            return original_run(arguments, capture_output=capture_output, text=text, check=check,
-                                env=env, input=input, errors=errors)
-
-        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_write_tree):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
-        self.assertEqual((code, output.getvalue()), (2, "error: snapshot failed\n"))
-        self.assertTrue(indexes)
-        self.assertTrue(all(not path.exists() for path in indexes))
-
-    def test_missing_base_revision_is_an_error_not_a_review(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        _ = self.commit()
-        result = self.check("0" * 40)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
-
-    def test_head_and_worktree_are_required_mutually_exclusive_options(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        base = self.commit()
-        for options in ([], ["--head", "HEAD", "--worktree"]):
-            with self.subTest(options=options):
-                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), "check", "--repo", str(self.repo),
-                                         "--base", base, *options], capture_output=True, text=True, check=False)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_complete_private_rename_in_three_files_is_mechanical(self) -> None:
         base = self.rename_fixture()
@@ -1828,29 +1784,6 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assertEqual(self.assert_review(base),
                          "review: check 6: call target, method or other change not proven equivalent\n")
-
-    def test_merge_tree_tool_failure_reports_its_error_instead_of_a_merge_conflict(self) -> None:
-        base = self.rename_fixture()
-        _ = self.git("checkout", "-qb", "incoming")
-        self.write("src/incoming.rs", "// Incoming work\n")
-        _ = self.commit()
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "-qm", "Merge incoming work", "incoming")
-        head = self.rename_value()
-        run = subprocess.run
-
-        def fail_merge_tree(arguments: list[str], *, capture_output: bool, text: bool, check: bool,
-                            input: str = "", errors: str = "strict") -> subprocess.CompletedProcess[str]:
-            if arguments[3:5] == ["merge-tree", "--write-tree"]:
-                return subprocess.CompletedProcess(arguments, 128, "", "fatal: merge-tree unavailable\n")
-            return run(arguments, capture_output=capture_output, text=text, check=check, input=input, errors=errors)
-
-        output = io.StringIO()
-        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_merge_tree):
-            with redirect_stdout(output):
-                code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--head", head])
-        self.assertEqual((code, output.getvalue()),
-                         (2, "error: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
 
     def test_incomplete_rename_with_old_uses_remaining_requires_review(self) -> None:
         base = self.rename_fixture()

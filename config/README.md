@@ -313,7 +313,16 @@ The installed account file supplies these settings:
 The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
 These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
 They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
+`spot_quota_request_vcpus=128` requests capacity for four gates with 32 vCPUs each through `deploy.py quota-request`.
 The gate records its own bid and allowance in each reservation.
+`attempt_allowance_usd` reserves non-compute costs before launch.
+Admission includes every open reservation's allowance when bills exist.
+Completed gates use bill rates for root storage and public IPv4 over their actual box hours.
+They use the bill day's S3 costs divided by that day's gate launch count.
+The ledger uses the gate day's bill, the newest earlier bill, or the oldest bill for earlier days.
+Missing cost rows contribute zero.
+The configured allowance supplies the cost when the bill has no needed rows.
+Bill pricing corrects saved estimates that still include the older configured allowance.
 The installed account limits decide whether that reservation fits.
 
 The spending guard requires usable live spending settings through `ConfigRead.origin`.
@@ -635,22 +644,6 @@ Unset values differ from empty values.
 The new inputs do not change build keys or other command keys.
 Mac and SSH nextest runs receive the same values, including copy runs.
 
-## dailies.conf
-
-The counts each production's dailies show on one line above the chart, in
-every length: `counts: nightly queue 8 · proposals 3`. A line is
-`<staff id>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, `<staff id>.<label>=files <glob>`, which counts the
-matching files, or `<staff id>.<label>=issues <folder> <tag>`, which
-counts the issues directly in the folder whose frontmatter is open and tagged
-with the tag. The key uses the showrunner staff id. `~` expands, and a hyphen in the label reads as a space.
-`scripts/production/dailies_counts.py` reads it each time the dailies input is
-built, so an edit applies to the next dailies. A missing file or folder shows as
-`not found`. A bad line leaves out the counts line, and the builder prints
-`counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
-overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and hana's open hanadocs proposal issues (user, 2026-10-10).
-
 ## user_zone.conf
 
 The zone every time shown to the user is written in: `zone=<IANA zone name>`,
@@ -670,8 +663,7 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production keeps its own `User zone` line in its production doc, and the
-dailies read that. A time stored without an offset keeps the zone it was
+A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
 recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
 roster.
 

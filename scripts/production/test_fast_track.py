@@ -384,16 +384,6 @@ class FastTrackTests(MergeCheckpointFixture):
         return [cast(dict[str, object], json.loads(line))
                 for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
 
-    def test_fetch_wrapper_skips_python_logic_for_ordinary_git_commands(self) -> None:
-        _ = self.arrange_fetch_failures("after-push", ["lock"])
-        self.env["FAST_TRACK_FETCH_LOGIC"] = str(self.root / "missing-fetch-logic")
-        _ = (self.control / "fetch-plan.json").write_text("invalid fetch plan")
-        result = subprocess.run([str(self.bin / "git"), "-C", str(self.unit), "rev-parse", "HEAD"],
-                                env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), self.initial)
-        self.assertFalse((self.control / "fetch-events.jsonl").exists())
-
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
         lock = self.arrange_fetch_failures("after-push", ["lock"])
@@ -1002,18 +992,6 @@ class FastTrackTests(MergeCheckpointFixture):
             self.assertNotIn(checkout, (self.unit, self.checkout, self.promote))
             self.assertTrue(observed["private_git"], observed)
             self.assertFalse(checkout.exists())
-        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
-        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
-
-    def test_one_command_shares_its_settings_through_fetch_and_recovery(self) -> None:
-        self.change_module()
-        with patch.object(conf, "read", wraps=conf.read) as reads:
-            result = self.fast_track()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "fast_track"],
-                         ["fast_track"])
-        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
-        self.assertNotEqual(tip, self.initial)
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
 

@@ -6,6 +6,7 @@ from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -69,17 +70,31 @@ class CoverageReportTests(unittest.TestCase):
     repo: Path = Path()
     rule_dir: Path = Path()
     tip: str = ""
+    repository_seed: ClassVar[Path]
+    repository_tip: ClassVar[str]
     sources: tuple[str, ...] = tuple(
         f"crates/{crate}/src/{name}.rs"
         for crate in ("alpha", "beta") for name in ("lib", "other")
     )
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        builder = cls(methodName="runTest")
+        builder.repo = cls.repository_seed
+        builder.build_repository()
+        cls.repository_tip = builder.tip
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style/rust"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
+        self.tip = self.repository_tip
+        _ = self.git("update-index", "--refresh")
         self.rule_dir.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
@@ -87,6 +102,11 @@ class CoverageReportTests(unittest.TestCase):
             "USER_ZONE": "America/New_York",
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="report")
+
+    def build_repository(self) -> None:
+        self.repo.mkdir()
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("config", "user.name", "Coverage report tests")
         _ = self.git("config", "user.email", "coverage@example.invalid")
@@ -97,8 +117,6 @@ class CoverageReportTests(unittest.TestCase):
         for source in self.sources:
             self.write(source, "pub fn value() -> u32 { 1 }\n")
         self.tip = self.commit("Create report workspace")
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = fixture_member("showrunner", name="report")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(

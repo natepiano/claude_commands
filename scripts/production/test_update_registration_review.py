@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, dailies_render, read_production, review
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, read_production, review
 from scripts.production.cli_fixture import production_paths
 from scripts.production import showrunner_tree
 
@@ -177,9 +177,9 @@ class RegistrationTests(RegistrationFixture):
                 self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
                 rows = self.read_items()
                 self.assertEqual(len(rows), 1)
-                self.assertIsInstance(rows[0], dailies_render.ReviewUnavailableOutstandingQuestion)
+                self.assertIsInstance(rows[0], registration.ReviewUnavailableOutstandingQuestion)
                 row = rows[0]
-                assert isinstance(row, dailies_render.ReviewUnavailableOutstandingQuestion)
+                assert isinstance(row, registration.ReviewUnavailableOutstandingQuestion)
                 self.assertEqual(row.question, question)
                 self.assertIn("rewrite needs nonempty text", row.reason)
                 self.assertIn("reviewed question: " + question, output)
@@ -191,7 +191,7 @@ class RegistrationTests(RegistrationFixture):
             output = self.run_questions(state)
         self.assertIn("reviewed question: " + question, output)
         rows = self.read_items()
-        self.assertIsInstance(rows[0], dailies_render.ReviewedOutstandingQuestion)
+        self.assertIsInstance(rows[0], registration.ReviewedOutstandingQuestion)
         self.assertFalse((self.state / "notifier/showrunner-example").exists())
         self.assertEqual(showrunners.registered_showrunners(self.state / "notifier"), [])
 

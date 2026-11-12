@@ -73,9 +73,23 @@ A bare name first selects the calling showrunner or unit and its direct children
 A unit rename changes matching folder and branch suffixes.
 A unit or showrunner rename updates its worker agent names and pane labels to `<new>-<worker>`.
 Use `--to-branch NAME` for an explicit unit branch.
-Keep OLD and NEW equal to change only that branch.
+Keep OLD and NEW equal to change that branch and migrate old qualified worker names.
 A showrunner document move requires both `--to-doc PATH` and `--to-branch NAME`.
 A worker rename changes proved pane titles and keeps shared tab and workspace names.
+Use `agents rename OWNER OWNER` once per owner at deploy to migrate old qualified worker names.
+A qualified prefix must equal the owner name or end with `-<owner name>`.
+A dashed role from staff.WORKER_ROLES keeps its full name and optional trailing digits.
+Other names use the last name component as the bare worker name.
+Without a bare twin, the migration sets the agent name and pane label before the staff name.
+Only OpenWorker, StoppedWorker, or ClosedWorker evidence permits the staff rename.
+Other evidence keeps the row and prints its name and evidence reason.
+Repeat the command after the evidence recovers.
+It ends an old row only when a bare twin exists, its pane is closed, and no dispatch is active.
+It keeps other clashes and prints both rows with the reason.
+A retirement refusal keeps both rows and prints the refusal text.
+The migration then continues with the next worker.
+An undecided prefix prints `/agents rename <id> <bare>`.
+A repeated run keeps completed changes and reports only unresolved rows.
 Repeat an interrupted rename to complete its saved move.
 Show each anomaly and the final output.
 See `docs/as-built/production-rename.md` and `docs/as-built/unit-rename.md`.

@@ -144,6 +144,9 @@ ALWAYS_LINKED = frozenset({
     "paste-cache", "uploads",
 })
 CODEX_ALWAYS_LINKED = frozenset({"skills", "rules", "plugins", "sessions", "archived_sessions"})
+# Keep these links before the first append creates their shared targets.
+CODEX_WRITE_THROUGH = frozenset({"session_index.jsonl", "history.jsonl"})
+NO_WRITE_THROUGH_FILES = frozenset[str]()
 AT_FDCWD = -100  # Linux: resolve relative paths from the current directory.
 RENAME_NOREPLACE = 1  # Linux renameat2: refuse an existing destination.
 RENAME_EXCL = 4  # macOS renamex_np: refuse an existing destination.
@@ -776,12 +779,13 @@ def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> li
 
 def _shared_repair_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Judge shared entries without performing any of their possible repairs."""
     if destination == source_dir:
         return []
     if not source_dir.is_dir():
-        return _shared_link_problems(destination, source_dir, shared, folders)
+        return _shared_link_problems(destination, source_dir, shared, folders, write_through=write_through)
     problems: list[str] = []
     for name in shared:
         path, target = destination / name, source_dir / name
@@ -809,6 +813,7 @@ def _shared_repair_problems(
 
 def _repair_shared_links(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Repair entries inside an existing shared home; never create an empty shared file."""
     if (destination == source_dir or destination.is_symlink() or not destination.is_dir()
@@ -826,7 +831,7 @@ def _repair_shared_links(
                 if name in folders:
                     target.mkdir(mode=0o700, exist_ok=True)
                     target.chmod(0o700)
-                else:
+                elif name not in write_through:
                     if _is_expected_link(path, target):
                         try:
                             path.unlink()
@@ -1106,6 +1111,7 @@ def _link_problems(destination: Path) -> list[str]:
 
 def _shared_link_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], required: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     problems: list[str] = []
     for name in shared:
@@ -1125,7 +1131,7 @@ def _shared_link_problems(
                 problems.append(
                     f"accounts: {path} points to {actual}, not {target}"
                 )
-            elif not path.exists():
+            elif not path.exists() and not (name in write_through and not os.path.lexists(target)):
                 problems.append(f"accounts: {path} is broken")
         elif path.exists():
             problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
@@ -1335,6 +1341,7 @@ def _link_codex_home(label: str) -> list[str]:
         return [f"accounts: could not create {destination}: {error}"]
     problems = _repair_shared_links(
         destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     return problems
 
@@ -1396,10 +1403,11 @@ def _inspect_codex_home(label: str, destination: Path, workers_home: Path, *, al
         return CodexHomeInspection((diagnostic,), ObservedStateCause(diagnostic,
             ProblemCauseKey("access", CauseAccount(label), CauseFile(str(destination)))))
     problems = (_check_default_codex_home(workers_home) if destination == accounts_home() / ".codex"
-                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED)
+                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+                                            write_through=CODEX_WRITE_THROUGH)
                 if allow_shared_repair
                 else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
-                                           CODEX_SHARED, CODEX_ALWAYS_LINKED))
+                                           CODEX_SHARED, CODEX_ALWAYS_LINKED, write_through=CODEX_WRITE_THROUGH))
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
@@ -3361,6 +3369,7 @@ def check_codex_target(label: str, workers_home: Path, *, repair: bool = True) -
     target = _codex_move_target(label)
     problems = (_repair_shared_links if repair else _shared_repair_problems)(
         target.home, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     for problem in problems:
         account_anomaly(problem)

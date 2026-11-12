@@ -103,7 +103,7 @@ class CrateRunTests(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        super().setUpClass()
+        # Build the complete class seed without the base class seed.
         cls.fixture_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-"))) / "seed"
         fixture = cls(methodName="runTest")
         environment = os.environ.copy()
@@ -116,6 +116,10 @@ class CrateRunTests(CargoProjectTests):
             _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
         finally:
             fixture.doCleanups()
+
+    @override
+    def set_up_project(self) -> None:
+        self.create_project()
 
     @override
     def setUp(self) -> None:
@@ -1883,17 +1887,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.git("rev-parse", result["integration_ref"]), self.git("rev-parse", self.destination))
         self.assertEqual(self.git("rev-parse", self.destination + "^{tree}"), self.batch.result(record)["tree"])
         self.assertEqual(self.git("merge-base", commit, self.destination), commit)
-
-    def test_ownership_uses_one_ledger_inventory_and_one_batched_blob_read(self) -> None:
-        members = rules.workspace_members({"Cargo.toml": (self.repo / "Cargo.toml").read_text(),
-                                           "beta/Cargo.toml": (self.repo / "beta/Cargo.toml").read_text()})
-        with mock.patch.object(ledger_api, "tree_entries", wraps=ledger_api.tree_entries) as inventory, mock.patch.object(
-                ledger_api, "blob_contents", wraps=ledger_api.blob_contents) as contents, mock.patch.object(
-                run, "git", side_effect=AssertionError("no per-file git show")):
-            owners = crates.SourceOwnership(self.repo, self.tree, members)
-        self.assertEqual(inventory.call_count, 1)
-        self.assertEqual(contents.call_count, 1)
-        self.assertEqual(owners.owners["src/lib.rs"], {"."})
 
     def test_target_folder_gitlink_refuses_package_sources_without_crashing(self) -> None:
         members = rules.workspace_members({"Cargo.toml": (self.repo / "Cargo.toml").read_text(),

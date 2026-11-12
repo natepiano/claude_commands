@@ -45,7 +45,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, TypeVar, Protocol, cast, final, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -116,15 +116,6 @@ def _tab_staff() -> staff.StaffSnapshot:
     except (OSError, ValueError) as error:
         print(f"herdr: staff layout data is unknown: {error}", file=sys.stderr)
         return staff.StaffSnapshot(())
-
-
-def _tab_labels(record: staff.StaffSnapshot) -> StaffLabels | StaffLabelsRead:
-    from scripts.production.session_labels import StaffLabels
-
-    operation = _RESTORE_STAFF.get()
-    if isinstance(operation, RestoreStaff) and operation.record is record:
-        return operation.labels
-    return StaffLabels.for_record(record)
 
 
 # The transient server unit gets CPU first and keeps its memory out of swap under the pane load.
@@ -775,19 +766,6 @@ class TabSession:
     session_id: str | None
 
 
-_LabelledPane = TypeVar("_LabelledPane")
-
-
-def _match_label(label: str, panes: Sequence[_LabelledPane],
-                 label_of: Callable[[_LabelledPane], str | None]) -> _LabelledPane | NoPane | SeveralPanes:
-    matches = [pane for pane in panes if label_of(pane) == label]
-    if not matches:
-        return NoPane(label)
-    if len(matches) > 1:
-        return SeveralPanes(label, len(matches))
-    return matches[0]
-
-
 @dataclass(frozen=True)
 class PaneAtShell:
     """The pane's foreground process group is its original shell."""
@@ -1174,12 +1152,14 @@ def _bind_row_tab(saved: SavedLayout, workspace: str, row_id: str,
         target = bindings[0][2].copy() if bindings else SavedName(name=row_id, seen=time.time(), terminal_id=terminal)
         membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         entries = [*space["tabs"], target]
-        titles = [row.name if (row := membership.by_member_reference(entry["name"])) is not None
-                  else entry["name"] for entry in entries]
-        classifier = UnitTabClassifier("", [], membership)
-        units = {title for title in titles if isinstance(classifier.classify(workspace, title, []), UnitTab)}
-        kept = [SavedName(name=title, seen=entry["seen"]) for title, entry in zip(titles, space["tabs"])]
-        index = tab_order(workspace, titles, kept, units).index(len(titles) - 1)
+        keys = [entry["name"] for entry in entries]
+        units = {row.id for row in staff.active(membership, "unit")}
+        member = membership.by_member_reference(row_id)
+        owner = membership.parent_of(member) if member is not None else None
+        if owner is not None and owner.kind == "unit":
+            owner = membership.parent_of(owner)
+        first = owner.id if owner is not None else ""
+        index = tab_order(first, keys, space["tabs"], units, record=membership).index(len(keys) - 1)
     index = next((position for previous, position, _ in bindings if previous is space), index)
     for previous, _, tab in bindings:
         previous["tabs"].remove(tab)
@@ -1202,27 +1182,29 @@ def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float, *, exp
         for entry in order])
 
 
-def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
-    """The indexes of `titles` in the order the workspace `space` shows them.
+def tab_order(first_member: str, tab_references: list[str], saved: list[SavedName], unit_ids: Set[str],
+              *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> list[int]:
+    """Order fixed member references and native tab references without display text.
 
-    Saved tabs keep their saved order. A new tab goes after the last placed tab with an equal
-    or lower rule: showrunner first, then unit directors A-Z, then other tabs A-Z.
-    The first tab stays first. `sort-tabs` ignores saved order.
+    Saved references keep their positions. Current staff names set the alphabetical order.
+    The selected showrunner stays first. Unowned tabs retain their native references.
     """
-    showrunner_title = space
-    if titles and not saved and space not in titles:
-        showrunner_title = titles[0]
+    membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+    first_reference = first_member
+    if tab_references and not saved and first_member not in tab_references:
+        first_reference = tab_references[0]
 
-    def rule(title: str) -> tuple[bool, bool, str]:
-        return (title != showrunner_title, title not in unit_director_titles, title)
+    def rule(reference: str) -> tuple[bool, bool, str]:
+        member = membership.by_member_reference(reference)
+        return (reference != first_reference, reference not in unit_ids, member.name if member is not None else reference)
 
     places = {entry["name"]: place for place, entry in enumerate(saved)}
-    order = sorted((index for index, title in enumerate(titles) if title in places), key=lambda index: places[titles[index]])
-    for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
-        # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
-        start = 0 if titles[index] == space or not order else 1
+    order = sorted((index for index, reference in enumerate(tab_references) if reference in places), key=lambda index: places[tab_references[index]])
+    for index in sorted((index for index, reference in enumerate(tab_references) if reference not in places), key=lambda index: rule(tab_references[index])):
+        # Keep the selected first tab before new members.
+        start = 0 if tab_references[index] == first_member or not order else 1
         at = next((place + 1 for place in range(len(order) - 1, start - 1, -1)
-                   if rule(titles[order[place]]) <= rule(titles[index])), start)
+                   if rule(tab_references[order[place]]) <= rule(tab_references[index])), start)
         order.insert(at, index)
     return order
 
@@ -1297,6 +1279,7 @@ class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
         self.session: str = session
+        self.restore_placeholders: set[str] = set()
 
     def argv(self, *arguments: str) -> list[str]:
         """The outside-pane targeting form verified with herdr 0.9.0."""
@@ -1418,10 +1401,6 @@ class Herdr:
         return [TabSession(pane["pane_id"], label, spaces.get(pane["workspace_id"], ""), pane["session_id"])
                 for pane in panes if (label := pane.get("label")) is not None]
 
-    def session_of(self, label: str) -> TabSession | NoPane | SeveralPanes:
-        """Find exactly one labelled tab, whether its agent is running or has exited."""
-        return _match_label(label, self.tab_sessions(), lambda tab: tab.label)
-
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
         """Describe whether the pane is at its shell or running foreground work."""
         context = f"herdr session {self.session} pane {pane} process info"
@@ -1448,7 +1427,7 @@ class Herdr:
             raise HerdrFailure(f"session {target}: pane is unavailable or ambiguous")
         return matches[0]
 
-    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
         """Open a named tab and pane in an existing or new workspace."""
         options = ["--label", title, "--cwd", cwd]
         for key, value in _pane_environment(environment).items():
@@ -1471,7 +1450,7 @@ class Herdr:
             if workspace is not None:
                 _ = self._close_placeholders(workspace)
                 try:
-                    pane = self.order_tabs(workspace, saved).get(pane, pane)
+                    pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
                 except (HerdrFailure, OSError, ValueError) as error:
                     print(f"herdr {self.session}: tab order unchanged: {error}", file=sys.stderr)
             self.save_layout()
@@ -1499,6 +1478,7 @@ class Herdr:
         pane = json_text(json_object(result.get("root_pane"), "workspace pane").get("pane_id"), "pane id")
         _ = self.run("tab", "rename", tab, LAYOUT_PLACEHOLDER)
         _ = self.run("pane", "rename", pane, LAYOUT_PLACEHOLDER)
+        self.restore_placeholders.add(pane)
         workspace = self._workspace_named(name)
         if workspace is None:
             raise HerdrFailure(f"created workspace {name!r} is absent")
@@ -1510,32 +1490,34 @@ class Herdr:
             _ = self._place_saved_workspaces(saved_layout(self.session), selected)
 
     def _close_placeholders(self, workspace: str) -> bool:
+        if not self.restore_placeholders:
+            return False
         tabs = self.listed("tab", "--workspace", workspace)
         changed = False
         for tab in tabs:
-            if tab.get("label") != LAYOUT_PLACEHOLDER or tab.get("pane_count") != 1:
+            if tab.get("pane_count") != 1:
                 continue
             ident = json_text(tab.get("tab_id"), "herdr tab id")
             owned = [pane for pane in self.listed("pane") if pane.get("tab_id") == ident]
-            if len(owned) != 1 or owned[0].get("label") != LAYOUT_PLACEHOLDER:
+            if len(owned) != 1 or owned[0].get("pane_id") not in self.restore_placeholders:
                 continue
             try:
                 safe = check_target("", action="close", place=HerdrPlace(
-                    self.session, json_text(owned[0].get("pane_id"), "herdr pane id")))
+                    self.session, json_text(owned[0].get("pane_id"), "herdr pane id")), client=self)
             except HerdrFailure as error:
                 print(f"herdr {self.session}: placeholder retained: {error}", file=sys.stderr)
                 continue
             if not safe:
                 continue
-            # A late session may have renamed the placeholder while activity was read.
+            # Keep the current tab membership before the close.
             current = self.listed("tab", "--workspace", workspace)
-            if not any(tab.get("tab_id") == ident and tab.get("label") == LAYOUT_PLACEHOLDER
-                       and tab.get("pane_count") == 1 for tab in current):
+            if not any(tab.get("tab_id") == ident and tab.get("pane_count") == 1 for tab in current):
                 continue
             if len(current) == 1:
                 _ = self.run("workspace", "close", workspace)
             else:
                 _ = self.run("tab", "close", ident)
+            self.restore_placeholders.discard(json_text(owned[0].get("pane_id"), "herdr pane id"))
             changed = True
         return changed
 
@@ -1638,24 +1620,52 @@ class Herdr:
                 return NewTab(space["name"], title)
         return NewTab(fallback_workspace, title)
 
-    def producer_row_tab(self, row_id: str, title: str, workspace: str) -> NewTab | ExistingPane:
+    def producer_row_tab(self, row_id: str, title: str, workspace: str,
+                         *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
         """Reuse a producer's shell only in its own tab in the configured workspace."""
         destination = self.saved_row_tab(row_id, title, workspace)
-        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, title, workspace):
+        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, row_id, workspace, record=record):
             return destination
         return NewTab(workspace, title)
 
-    def producer_pane(self, pane_id: str, title: str, workspace: str) -> bool:
-        """Check that the producer has one shell in its named tab and configured workspace."""
+    def producer_pane(self, pane_id: str, row_id: str, workspace: str,
+                      *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
+        """Accept a producer's recorded shell in its actual tab and configured workspace."""
+        record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+        owner = record.by_id(staff.StaffId(row_id))
+        if owner is None or owner.kind != "producer":
+            return False
         panes = self.listed("pane")
         own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
         if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
             return False
         tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
-        return (tab is not None and tab.get("label") == title
-                and sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) == 1
-                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
-                        for space in self.listed("workspace")))
+        if (tab is None or sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) != 1
+                or not any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                           for space in self.listed("workspace"))):
+            return False
+        native = pane_session(own)
+        if native and record.by_member_reference(native) != owner:
+            return False
+        entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
+        launch = entries.get(pane_id)
+        if launch is not None and record.by_member_reference(launch["session_id"]) != owner:
+            return False
+        if native:
+            return True
+        terminal = own.get("terminal_id")
+        if not terminal:
+            return False
+        if any(entry.get("terminal_id") == terminal
+                and (entry.get("row_id") == owner.id or entry["name"] == owner.id)
+                for space in saved_layout(self.session)["workspaces"] for entry in space["tabs"]):
+            return True
+        try:
+            admission = json_object(cast(object, json.loads((pane_launch.record_directory()
+                / f".producer-admission-{owner.name}").read_text(encoding="utf-8"))), "producer admission")
+        except (OSError, ValueError):
+            return False
+        return admission.get("pane") == pane_id and admission.get("terminal") == terminal
 
     def _retitle(self, row: dict[str, object], title: str, *, tab: bool) -> bool:
         changed = row.get("label") != title
@@ -1891,31 +1901,42 @@ class Herdr:
         return result
 
     def order_tabs(self, workspace: str, saved: SavedLayout,
-                   *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> dict[str, str]:
+                   *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
+                   opening_members: Sequence[tuple[str, str]] = ()) -> dict[str, str]:
         """Order existing tabs and return the unchanged pane ids of moved tabs."""
-        spaces = self.listed("workspace")
-        name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
         tabs = self.listed("tab", "--workspace", workspace)
         if len(tabs) < 2:
             return {}
+        panes = self.listed("pane")
         panes_of: dict[str, list[str]] = {}
-        for row in self.listed("pane"):
-            tab = json_text(row.get("tab_id"), "herdr pane tab id")
-            panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
+        for pane in panes:
+            tab = json_text(pane.get("tab_id"), "herdr pane tab id")
+            panes_of.setdefault(tab, []).append(json_text(pane.get("pane_id"), "herdr pane id"))
         membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
-        classifier = UnitTabClassifier(
-            self.session, herdr_processes(membership=_tab_labels(membership)), membership)
-        unit_director_titles = {
-            json_text(tab.get("label"), "herdr tab label") for tab in tabs
-            if isinstance(classifier.classify(
-                name if isinstance(name, str) else "", json_text(tab.get("label"), "herdr tab label"),
-                panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), [])), UnitTab)}
-        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
-        stored = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), list[SavedName]())
-        kept = [SavedName(name=row.name, seen=item["seen"]) for item in stored
-                if not item.get("sort_after_rename")
-                and (row := membership.by_member_reference(item["name"])) is not None]
-        order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
+        scan = self.scan_row_panes(membership, panes)
+        owners: dict[str, staff.StaffRow] = {}
+        for row_id, matches in scan.found.items():
+            member = membership.rows_by_id[row_id]
+            for pane in matches:
+                tab = json_text(pane.get("tab_id"), "herdr pane tab id")
+                if tab not in owners or owners[tab].kind == "worker":
+                    owners[tab] = member
+        for pane_id, member_id in opening_members:
+            member = membership.by_id(staff.StaffId(member_id))
+            pane = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
+            if member is not None and pane is not None:
+                owners[json_text(pane.get("tab_id"), "herdr pane tab id")] = member
+        keys = [owners[tab_id].id if tab_id in owners else tab_id
+                for tab in tabs if (tab_id := json_text(tab.get("tab_id"), "herdr tab id"))]
+        units = {row.id for row in staff.active(membership, "unit")}
+        parents = {row.parent.id for row in owners.values() if row.id in units and isinstance(row.parent, staff.ReportsTo)}
+        first = next((key for key in keys if key in parents), "")
+        if not first:
+            first = next((key for key in keys if (member := membership.by_id(staff.StaffId(key))) is not None
+                          and member.kind == "showrunner"), "")
+        stored = [entry for space in saved["workspaces"] for entry in space["tabs"] if entry["name"] in keys
+                  and not entry.get("sort_after_rename")]
+        order = tab_order(first, keys, stored, units, record=membership)
         current = list(range(len(tabs)))
         moved: dict[str, str] = {}
         for position, index in enumerate(order):
@@ -3339,39 +3360,8 @@ def attach_hint(space: str, tab: str) -> str:
     return f"herdr session attach {shared_session()}, workspace {space}, tab {tab}"
 
 
-def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_tab(space, title, cwd, environment)
-
-
-def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: str) -> None:
-    """Replace an outside caller's old saved titles with the staff row id."""
-    record = _tab_staff()
-    row = record.by_path(f"{workspace}/{title}")
-    if row is None:
-        print(f"herdr {session}: staff row for {workspace}/{title} is unknown; layout retained", file=sys.stderr)
-        return
-    with _LayoutLock(session):
-        saved = saved_layout(session)
-        changed = False
-        for space in saved["workspaces"]:
-            if space["name"] != workspace or not any(tab["name"] in old_titles for tab in space["tabs"]):
-                continue
-            seen = max(tab["seen"] for tab in space["tabs"] if tab["name"] in old_titles or tab["name"] == row.id)
-            tabs: list[SavedName] = []
-            renamed = False
-            for tab in space["tabs"]:
-                if tab["name"] in old_titles:
-                    if not renamed:
-                        entry = tab.copy()
-                        entry.update(name=row.id, seen=seen)
-                        tabs.append(entry)
-                        renamed = True
-                elif tab["name"] != row.id:
-                    tabs.append(tab)
-            space["tabs"] = tabs
-            changed = True
-        if changed:
-            _write_layout(session, saved)
+def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+    return Herdr(name).open_tab(space, title, cwd, environment, **({"member": member} if member else {}))
 
 
 def save_shared_layout(running: set[str]) -> None:
@@ -5011,14 +5001,13 @@ class UnitTab:
 
 @dataclass(frozen=True)
 class OtherTab:
-    """The tab has no recorded unit identity or matching workspace membership."""
+    """The native session does not identify a current unit."""
 
 
 class UnitTabClassifier:
-    """Share the staff identity and workspace/title join between ordering and listing."""
+    """Classify units through their current native sessions and staff parents."""
 
     by_pane: dict[str, UnitTab]
-    by_workspace: dict[str, dict[str, UnitTab]]
 
     def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
         from scripts.production import staff
@@ -5030,19 +5019,12 @@ class UnitTabClassifier:
                         if process.place.session == session
                         and (ident := process.marks.get("CODEX_THREAD_ID")
                              or process.marks.get("CLAUDE_CODE_SESSION_ID")) in units}
-        self.by_workspace = {}
-        for unit in units.values():
-            self.by_workspace.setdefault(unit.parent.name, {})[unit.row.name] = unit
 
-    def has_unit_title(self, title: str) -> bool:
-        """Whether a title needs its workspace resolved before it can be classified."""
-        return any(title in units for units in self.by_workspace.values())
-
-    def classify(self, workspace: str, title: str, panes: Sequence[str]) -> UnitTab | OtherTab:
+    def classify(self, panes: Sequence[str]) -> UnitTab | OtherTab:
         for pane in panes:
             if pane in self.by_pane:
                 return self.by_pane[pane]
-        return self.by_workspace.get(workspace, {}).get(title, OtherTab())
+        return OtherTab()
 
 
 @pane_snapshot()
@@ -5293,11 +5275,13 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
     client = Herdr(name)
+    member = ""
     try:
         membership = _tab_staff()
         owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
         if owner is not None:
             session_id = owner.current_session
+            member = owner.id
         observed = (read_conversation(session_id, kind,
                     **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
                     if session_id else StoppedConversation())
@@ -5309,7 +5293,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         if isinstance(observed, UnknownConversation) and not reported_unknown:
             conversation_note(observed)
     if isinstance(destination, NewTab):
-        pane = open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env)
+        pane = open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env,
+                        **({"member": member} if member else {}))
     elif isinstance(destination, SplitPane):
         if not 0 < destination.ratio < 1 or destination.direction not in {"right", "down"}:
             print(f"herdr {name}: split direction or ratio adjusted to backend limits", file=sys.stderr)

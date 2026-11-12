@@ -476,30 +476,34 @@ def capture_release(production_name: str, *, record: staff.StaffSnapshot | None 
     if (parent is not None and not isinstance(parent, str)) or not isinstance(children, list) or not isinstance(told, list):
         raise ValueError(f"{path}: invalid release capture")
     if not all(isinstance(item, str) for item in [*cast(list[object], children), *cast(list[object], told)]):
-        raise ValueError(f"{path}: release production names must be strings")
-    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent) if isinstance(parent, str) else showrunner_tree.Root(),
-                                   tuple(cast(list[str], children)), tuple(cast(list[str], told)))
+        raise ValueError(f"{path}: release staff ids must be strings")
+    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(staff.StaffId(parent)) if isinstance(parent, str) else showrunner_tree.Root(),
+                                      tuple(staff.StaffId(item) for item in cast(list[str], children)),
+                                      tuple(staff.StaffId(item) for item in cast(list[str], told)))
 
 
 def release_edges(production_name: str, *, record: staff.StaffSnapshot | None = None) -> None:
     """Send captured wrap notices and save each completed delivery."""
     released = capture_release(production_name, record=record)
-    notices: dict[str, str] = {}
-    if isinstance(released.former_parent, showrunner_tree.ReportedTo):
-        notices[released.former_parent.parent] = f"{production_name} wrapped; its recorded parent is retained for history."
-    for child in released.former_children:
-        notices[child] = f"{production_name} wrapped; {child} keeps its recorded parent for history."
+    recipients = (*((released.former_parent.parent,) if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ()),
+                  *released.former_children)
     messages: list[str] = []
-    for target, text in notices.items():
+    for target in recipients:
         if target not in released.told:
-            told = showrunners.tell_others({target: text}, f"showrunner-tree:{production_name if isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent else target}")
+            name = staff.snapshot().rows_by_id[target].name
+            parent = isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent
+            text = (f"{production_name} wrapped; its recorded parent is retained for history." if parent else
+                    f"{production_name} wrapped; {name} keeps its recorded parent for history.")
+            told = showrunners.tell_others({name: text}, f"showrunner-tree:{production_name if parent else name}")
             if told.failed:
                 raise LifecycleStop("tree", "failed", "; ".join(told.lines))
             released = replace(released, told=(*released.told, target))
             save_release(production_name, released, record=record)
             messages.extend(told.lines)
-    above = f"retained parent {released.former_parent.parent}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
-    below = f"retained children {', '.join(released.former_children)}" if released.former_children else ""
+    current = staff.snapshot()
+    names = {target: current.rows_by_id[target].name for target in recipients}
+    above = f"retained parent {names[released.former_parent.parent]}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
+    below = f"retained children {', '.join(names[child] for child in released.former_children)}" if released.former_children else ""
     report("tree", "ok", "; ".join(part for part in (above, below, *messages) if part) or "no parent and no child showrunners")
 
 

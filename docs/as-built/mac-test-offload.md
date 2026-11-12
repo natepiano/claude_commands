@@ -191,9 +191,8 @@ Failed repair messages remain pending.
 The recorded action is `message_showrunner`.
 `MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private test roots.
 
-### Footer and dailies — `scripts/production/dailies_render.py`
-
-A pending or active block is one footer item after the build-hold lines: `Mac block: <holder> since HH:MM ZZZ, for <reason> - lifts Ddd HH:MM ZZZ` (or `Mac block pending: …`), ending ` - CI can still use the Mac` while `ci_may_still_be_on`. The renderer reads `block.json` through `read_block(state_paths().block)` alone: no lock, no `gh`, no message. An unreadable file shows as `Mac block: its state file cannot be read (<path>)`.
+2026-11-11: Dailies and their Mac block footer were retired.
+Use `/build:mac status` to read the Mac block state.
 
 ### The offload runner — `scripts/mac_test/offload.py`
 

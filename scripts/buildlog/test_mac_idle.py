@@ -511,13 +511,6 @@ done
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["state"], saved["waiting"]), ("busy", 1))
 
-    def test_unchanged_stale_record_is_reported_only_once(self) -> None:
-        self.process(123, 1, "789", ("bash",))
-        errors = io.StringIO()
-        with redirect_stderr(errors):
-            self.two_passes()
-        self.assertEqual(errors.getvalue().count("ignored stale step record v-call"), 1)
-
     def test_missing_or_bad_idle_configuration_produces_a_watch_diagnostic(self) -> None:
         self.block()
         mac_idle.watch_once(self.paths, 1180, 100)

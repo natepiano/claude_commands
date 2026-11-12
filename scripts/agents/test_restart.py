@@ -41,6 +41,7 @@ from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import shutdown_record, stop_resume, pane_record
 from scripts.lib import file_lock, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member
@@ -50,6 +51,7 @@ from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
+READ_PANES = herdr.Herdr.panes
 
 
 class RestartTestCase(ShutdownTestCase):
@@ -430,16 +432,36 @@ class SessionLaunchTests(RestartTestCase):
         project = config / "projects" / "project"
         project.mkdir(parents=True)
         (project / f"{identity}.jsonl").touch()
-        output = io.StringIO()
-        with (patch.object(pane_record, "RECORD_DIR", records),
-              patch("scripts.agents.restart.sessions.config_dirs", return_value=[config]),
-              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
-              redirect_stderr(output)):
-            kind, environment, arguments = restart.session_launch(identity, "current-name")
-        self.assertEqual(kind, "claude")
-        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
-        self.assertEqual(arguments, ["--resume", identity, "--name", "current-name"])
-        self.assertEqual(output.getvalue(), "")
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(project / f"{identity}.jsonl")
+                output = io.StringIO()
+                with (patch.object(pane_record, "RECORD_DIR", records),
+                      patch("scripts.agents.restart.sessions.config_dirs", return_value=[config]),
+                      patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+                      redirect_stderr(output)):
+                    kind, environment, arguments = restart.session_launch(identity, "current-name")
+                self.assertEqual(kind, "claude")
+                self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+                self.assertEqual(arguments, ["--resume", identity, "--name", "current-name"])
+                self.assertEqual(output.getvalue(), "")
+
+    def test_restart_reads_a_codex_transcript_without_a_pane_launch_record(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        identity = "saved-codex"
+        home = root / ".codex"
+        source = home / "sessions/2026/10/01" / f"rollout-{identity}.jsonl"
+        write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(source)
+                with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
+                      patch("scripts.agents.restart.sessions.config_dirs", return_value=[]),
+                      patch.dict(os.environ, {"CODEX_HOME": str(home)})):
+                    self.assertEqual(restart.session_launch(identity, "current-name"),
+                                     ("codex", {"CODEX_HOME": str(home)}, ["resume", identity]))
 
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -851,9 +873,9 @@ class MixedRestartTests(ShutdownTestCase):
                 self.assertIn(workers[1].current_session, launched_sessions)
                 continue
             self.assertEqual(errors.getvalue(), "", output.getvalue())
-            # Stop uses direct pane reads. Restart also classifies tabs for ordering.
+            # Both commands use direct native pane reads.
             self.assertEqual((searches.call_count, scans.call_count, processes.call_count),
-                             (1, 1, int(command == "restart")), command)
+                             (1, 1, 0), command)
             self.assertNotIn("w1:p2", launches)
             self.assertCountEqual(signals, [991100 + index for index in (0, 1, 3, 4, 5)])
             self.assertEqual(len(launches), 5 if command == "restart" else 0)
@@ -1327,19 +1349,52 @@ class RestartTests(RestartTestCase):
                                  [self.rows[0].name] if not account else [])
 
     def test_restart_all_only_stops_and_starts_only_the_requested_live_row(self) -> None:
-        with (patch.object(restart, "live_rows", return_value=list(self.rows)),
-              patch.object(restart, "stop_row") as stop,
-              patch.object(restart, "start_row", return_value="w1:p0") as start,
-              patch.object(staff, "row_operation")):
-            self.assertEqual(restart.restart(stop_all=True, only=(str(self.rows[0].id),)), 0)
-        self.assertEqual([item.args[0] for item in stop.call_args_list], [self.rows[0]])
-        self.assertEqual([item.args[0] for item in start.call_args_list], [self.rows[0]])
+        from contextlib import ExitStack
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+
+        for incomplete in (False, True):
+            with self.subTest(unselected_evidence_incomplete=incomplete), ExitStack() as scope:
+                unselected: list[staff.StaffRow] = []
+                if incomplete:
+                    fixture = WorkerPaneTests("runTest")
+                    fixture.setUp()
+                    _ = scope.callback(fixture.doCleanups)
+                    owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
+                    other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
+                    selected = fixture.worker("TEST-selected")
+                    sibling = fixture.worker("TEST-sibling")
+                    missing = fixture_member("worker", name="TEST-unselected", parent=other.id)
+                    world = fixture.world
+                    _ = scope.enter_context(patch.object(world, "panes", side_effect=lambda: READ_PANES(world)))
+                    world.add(selected, "w1:p1")
+                    world.add(other, "w2:p0", workspace="w2", tab="w2:t1")
+                    for parent, pane, tab in ((owner, "w1:p9", "w1:t1"), (other, "w2:p9", "w2:t1")):
+                        world.add(parent, pane, live=False, label="TEST-unreadable",
+                                  workspace=pane.split(":")[0], tab=tab)
+                        world.unknown[pane] = "TEST process evidence unavailable"
+                    self.rows = (selected, owner, other, sibling, missing)
+                    unselected = [sibling, missing]
+                    record = staff.snapshot()
+                    _ = scope.enter_context(patch.object(staff, "initial_snapshot", return_value=record))
+                    self.running = {"TEST-unassigned"}
+                with (nullcontext() if incomplete else
+                      patch.object(restart, "live_rows", return_value=[self.rows[0]]),
+                      patch.object(restart, "stop_row") as stop,
+                      patch.object(restart, "start_row", return_value="w1:p0") as start,
+                      patch.object(staff, "row_operation"),
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(stop_all=True, only=(str(self.rows[0].id),)), 0)
+                self.assertEqual([item.args[0] for item in stop.call_args_list], [self.rows[0]])
+                self.assertEqual([item.args[0] for item in start.call_args_list], [self.rows[0]])
+                for row in unselected:
+                    self.assertNotIn(row.name, errors.getvalue())
+                self.assertNotIn("TEST-unassigned", errors.getvalue())
 
     def test_restart_selected_caller_detaches_before_any_stop(self) -> None:
         for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             with (self.subTest(variable=variable),
                   patch.dict(os.environ, {variable: str(self.rows[0].current_session)}),
-                  patch.object(restart, "live_rows", return_value=list(self.rows)),
+                  patch.object(restart, "live_rows", return_value=[self.rows[0]]),
                   patch.object(stop_resume, "detach", create=True, return_value=self.root / "restart.log") as detach,
                   patch.object(restart, "stop_row") as stop,
                   patch.object(restart, "start_row") as start,
@@ -1359,7 +1414,7 @@ class RestartTests(RestartTestCase):
         for selected in (owner, children[0]):
             with (self.subTest(selected=selected.id),
                   patch.object(staff, "initial_snapshot", return_value=record),
-                  patch.object(restart, "live_rows", return_value=list(record.rows)),
+                  patch.object(restart, "live_rows", return_value=[selected]),
                   patch.object(restart.stop_resume, "stop_unit_workers") as stop_workers,
                   patch.object(restart, "stop_row") as stop,
                   patch.object(restart, "start_row", return_value="w1:p1") as start,

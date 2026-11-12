@@ -1011,6 +1011,27 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
                 self.assertEqual((backend.starts, backend.stops), ([], []))
                 displays.assert_not_called()
 
+    def test_pending_rename_refuses_a_different_branch_before_worker_migration(self) -> None:
+        from scripts.agents import shutdown
+
+        pending = unit_move.prepare_rename(self.owner, self.destination, "cargo-liner-destination", self.new_name)
+        renamed = staff.rename(self.owner.id, self.new_name)
+        arguments = ["rename", str(renamed.id), self.new_name, "--to-branch", "another-branch"]
+        before = file_versions(self.root)
+        with mock.patch.object(shutdown, "rename_qualified_workers") as migration:
+            result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
+                                dict(os.environ), self.checkout)
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (1, "", f"rename: {renamed.name}: finish the pending rename to {pending.name}\n"))
+            request = shutdown.RenamePlan(renamed, self.new_name,
+                                          shutdown.UnitBranchMove(pending.source_branch, "another-branch"))
+            with self.assertRaisesRegex(unit_move.RenameRefused, f"finish the pending rename to {pending.name}"):
+                _ = shutdown.rename_apply_unit(request)
+        migration.assert_not_called()
+        self.assertEqual(unit_move.pending_rename(renamed.id), pending)
+        self.assertEqual(staff.by_id(renamed.id), renamed)
+        self.assertEqual(file_versions(self.root), before)
+
     def test_completed_rename_clears_after_the_checkout_is_removed(self) -> None:
         from scripts.agents import shutdown
 
@@ -1379,7 +1400,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                 def rename_command() -> subprocess.CompletedProcess[str]:
                     return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments, dict(os.environ), self.checkout)
 
-                worker = fixture_worker("stopped-worker", self.owner.id)
+                worker = fixture_worker("stopped", self.owner.id)
                 _ = self.git("worktree", "lock", "--reason", f"staff:{self.owner.id}", str(self.source))
                 if step in ("move", "publish"):
                     _ = self.git("worktree", "move", "--force", "--force", str(self.source), str(self.destination))

@@ -1068,6 +1068,7 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each home."""
+    from scripts.lib.transcripts import transcript_paths, uncompressed_path
     from scripts.message import sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
@@ -1083,8 +1084,8 @@ def _found_backends(rows: Sequence[StaffRow],
     for home in dict.fromkeys(homes):
         try:
             for folder in ("sessions", "archived_sessions"):
-                for path in (home / folder).rglob("*.jsonl"):
-                    identity = wanted.get(StaffId(path.stem[-36:]))
+                for path in transcript_paths(home / folder):
+                    identity = wanted.get(StaffId(uncompressed_path(path).stem[-36:]))
                     if identity is not None:
                         codex_sessions.add(identity)
                         if recorded_homes.get(identity) == home:

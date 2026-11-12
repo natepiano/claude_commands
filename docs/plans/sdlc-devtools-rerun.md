@@ -155,7 +155,28 @@ A file made with exclusive create and then filled leaves a part file after a sto
 ### Phase 6 — A notice is marked sent only after it is sent  · status: todo
 **Depends on:** Phase 4
 
-`send.py --key --repeat-minutes` is the one place for "send once". Since 969f229b (origin/main `256a7214`), a keyed send that failed, was refused or was held gives back its claim (`send.py:2245-2248`), and a queued or kept send keeps it until delivery; this phase keeps that rule. Open: `claim()` (`:967`) records the key before delivery with no owner, so a sender stopped between the claim and the delivery holds the window though nothing went out. `--key` alone does not stop a second send: only `--repeat-minutes` sets a window (`:980`; a non-emergency send without it has none, `:2161`). Callers keep their own "notified" marks beside it (sweep rows `five_hour.py:92`, `codex_winddown.py:233`, `main_sync.py:122`, `send.py:1389`, `stall_watch.py:679`, `settle.py:1568` (obsolete: code deleted), `dailies_input.py:1095`; some fixed per site since; the `five_hour.py:230` marker from Phase 4). Goal: before a caller drops its mark, the Work Order sets for that caller a stable key, the episode the key names (when a new episode starts), and its repeat and reset rule (`--repeat-minutes`, `ack` and `reopen`), so a watcher tick does not send again. A claim then has two parts: a pending claim that holds its sender through `claim.py` until delivery, and a receipt written only after delivery. A rerun that finds a pending claim whose sender is GONE or REPLACED sends again. A stop after the transport took the message and before the receipt also sends again on the rerun: a repeat is accepted, a lost notice is not. No check can tell a caller's own mark from other state, so this phase adds no copy check; the Work Order lists each mark it removes. messaging-unit owns `send.py`; agree the change first.
+`send.py --key --repeat-minutes` is the one place for "send once".
+Since 969f229b (origin/main `256a7214`), failed, refused, or held keyed sends release their claims (`send.py:2245-2248`).
+Queued or kept sends retain their claims until delivery.
+This phase preserves that rule.
+Open: `claim()` (`:967`) records the key before delivery without an owner.
+A sender stopped before delivery therefore holds the window without sending anything.
+`--key` alone does not prevent a second send.
+Only `--repeat-minutes` sets a window (`:980`); non-emergency sends without it have none (`:2161`).
+Callers also retain local "notified" marks.
+The sweep found them in `five_hour.py:92`, `codex_winddown.py:233`, `main_sync.py:122`, `send.py:1389`, and `stall_watch.py:679`.
+Some were fixed later; Phase 4 also added the `five_hour.py:230` mark.
+The `settle.py:1568` code was deleted.
+Dailies and their `dailies_input.py:1095` mark were retired on 2026-11-11.
+Before removing a caller's mark, define its stable key, episode start, repeat rule, and reset rule in the Work Order.
+The reset rule names `--repeat-minutes`, `ack`, and `reopen` as needed.
+A pending claim retains its sender through `claim.py` until delivery.
+A receipt records delivery only after it occurs.
+A rerun sends again when the pending sender is GONE or REPLACED.
+A stop after transport delivery but before receipt storage also causes another send.
+A repeated notice is preferable to a lost notice.
+The Work Order lists each removed mark; no copy check can distinguish these marks from other state.
+`messaging-unit` owns `send.py`; agree the change first.
 
 ### Phase 7 — The unit lifecycle tools share one doc commit  · status: todo
 **Depends on:** Phase 1
