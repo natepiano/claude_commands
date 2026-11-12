@@ -7,6 +7,7 @@ import fcntl
 import io
 import json
 import math
+import multiprocessing
 import os
 import select
 import socket
@@ -33,10 +34,12 @@ from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.herdr import turn_end
+from scripts.herdr import turn_end, worker_panes
+from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, worker_admission
@@ -361,37 +364,39 @@ class DetachedRunsTests(unittest.TestCase):
         _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
-        script = """
-import sys
-from types import SimpleNamespace
-from unittest.mock import patch
-from scripts.agents import detached_run_process, detached_runs
-print('ready', flush=True)
-input()
-with (patch.object(detached_run_process, 'supervises', return_value=True),
-      patch.object(detached_runs.treekey, 'tree_key', return_value='fixture-tree'),
-      patch.object(detached_runs.subprocess, 'Popen', return_value=SimpleNamespace(pid=4321))):
-    code = detached_runs.main(['start', '--session-dir', sys.argv[1], '--to', sys.argv[2],
-                           '--', 'check', sys.argv[3]])
-sys.exit(code)
-"""
+        context = multiprocessing.get_context("fork")
+        ready = context.Barrier(5)
         guard = LauncherHangGuard("parallel detached starts")
-        with contextlib.ExitStack() as children, (runs / ".start.lock").open("a") as admission:
+
+        def start(index: int, announcement: int) -> int:
+            _ = os.write(announcement, b"ready\n")
+            os.close(announcement)
+            _ = ready.wait(timeout=guard.remaining())
+            with (patch.object(worker_panes, "worker_run", worker_run),
+                  patch.object(detached_run_process, "supervises", return_value=True),
+                  patch.object(treekey, "tree_key", return_value="fixture-tree"),
+                  patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321))):
+                return detached_runs.main(["start", "--session-dir", str(self.session),
+                                           "--to", WORKER, "--", "check", str(index)])
+
+        with ForkChildren() as children, (runs / ".start.lock").open("a") as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
-            processes = [children.enter_context(subprocess.Popen(
-                [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(self.session), WORKER, str(index)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
-                for index in range(4)]
-            for child in processes:
-                assert child.stdin is not None and child.stdout is not None
-                self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
-                self.assertEqual(child.stdout.readline(), "ready\n")
-                _ = child.stdin.write("start\n")
-                child.stdin.flush()
+            processes: list[ForkChild] = []
+            announcements: list[int] = []
+            for index in range(4):
+                reader, writer = children.pipe()
+                processes.append(children.start(
+                    lambda index=index, writer=writer: start(index, writer),
+                    close_fds=(admission.fileno(),), pass_fds=(writer,)))
+                announcements.append(reader)
+            for announcement in announcements:
+                self.assertTrue(select.select([announcement], [], [], guard.remaining())[0])
+                self.assertEqual(os.read(announcement, 6).decode(), "ready\n")
+            _ = ready.wait(timeout=guard.remaining())
             fcntl.flock(admission, fcntl.LOCK_UN)
-            for child in processes:
-                _ = child.communicate(timeout=guard.remaining())
-        self.assertCountEqual([child.returncode for child in processes], [0, 4, 4, 4])
+            results = [child.result(timeout=guard.remaining()) for child in processes]
+        self.assertCountEqual([result.returncode for result in results], [0, 4, 4, 4],
+                              [(result.stdout, result.stderr) for result in results])
         self.assertEqual(len(list(runs.glob("*.json"))), 1)
 
     def test_start_and_reap_preserve_an_unpublished_record_under_the_start_lock(self) -> None:

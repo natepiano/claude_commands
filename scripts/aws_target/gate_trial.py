@@ -1,4 +1,4 @@
-"""Compare pushed revisions on disposable gate instances."""
+"""Compare local revisions on disposable gate instances."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -13,6 +13,7 @@ from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
+import re
 import sys
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -33,6 +34,7 @@ from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+from scripts.lib.process_group import send_process_group
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
@@ -65,26 +67,48 @@ def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
 
 
 @dataclass(frozen=True)
-class PushedRevision:
+class TrialRevision:
     commit: str
     tree: str
 
 
 @dataclass(frozen=True)
 class PairedTrialRequest:
-    base: PushedRevision
-    changed: PushedRevision
+    base: TrialRevision
+    changed: TrialRevision
     modules: tuple[str, ...]
     rounds: int
     clone_url: str
 
 
 def checked_git(repo: Path, *arguments: str) -> str:
+    if arguments and arguments[0] in ('push', 'ls-remote'):
+        return network_git(repo, *arguments)
     return subprocess.check_output(['git', '-C', str(repo), *arguments], text=True, stderr=subprocess.PIPE).strip()
 
 
-def pushed_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
-    """Resolve public history without changing the source checkout."""
+def network_git(repo: Path, *arguments: str) -> str:
+    """Bound network Git calls and stop their process groups on cancellation."""
+    command = ['git', '-C', str(repo), *arguments]
+    timeout = cloud_gate.settings().number('git_network_timeout_s')
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as process:
+        try:
+            output, errors = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                send_process_group(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
+        return output.strip()
+
+
+def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
+    """Resolve local commits without changing the source checkout."""
     from urllib.parse import urlsplit
     if rounds <= 0 or not modules or len(set(modules)) != len(modules):
         raise ValueError('Use positive rounds and distinct modules')
@@ -96,26 +120,51 @@ def pushed_request(repo: Path, base: str, changed: str, modules: Sequence[str], 
     parsed = urlsplit(url)
     if parsed.username or parsed.password or parsed.query:
         raise ValueError('The clone URL must contain no credential')
-    tips = {line.split()[0] for line in checked_git(repo, 'ls-remote', '--heads', '--tags', url).splitlines()}
-    revisions: list[PushedRevision] = []
+    revisions: list[TrialRevision] = []
     for ref in (base, changed):
         commit = checked_git(repo, 'rev-parse', '--verify', ref + '^{commit}')
-        if not any(pushed_in(repo, commit, tip) for tip in tips):
-            raise ValueError('Both revisions must be pushed refs')
         tree = checked_git(repo, 'rev-parse', commit + '^{tree}')
         for module in modules:
             if checked_git(repo, 'cat-file', '-t', commit + ':scripts/' + module) != 'blob':
                 raise ValueError('The module is absent from a requested tree')
-        revisions.append(PushedRevision(commit, tree))
+        revisions.append(TrialRevision(commit, tree))
     return PairedTrialRequest(revisions[0], revisions[1], tuple(modules), rounds, url)
 
 
-def pushed_in(repo: Path, commit: str, tip: str) -> bool:
-    """A remote tip holds the commit; a tip absent locally holds nothing known."""
-    if tip == commit:
-        return True
-    ancestor = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', commit, tip], capture_output=True)
-    return ancestor.returncode == 0
+def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int, trial_id: str) -> None:
+    """Find and delete remote branches in this trial's unique namespace."""
+    namespace = f'refs/heads/{prefix}-{expires}-{trial_id}-'
+    try:
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'paired trial: could not list branches for trial {trial_id}', file=sys.stderr)
+        return
+    for line in remote.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[1].startswith(namespace):
+            continue
+        branch = fields[1]
+        try:
+            _ = checked_git(repo, 'push', clone_url, '--delete', branch)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+
+
+def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
+    """Delete expired trial branches without blocking a new trial on failure."""
+    namespace = f'refs/heads/{prefix}-'
+    try:
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+        for line in remote.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not fields[1].startswith(namespace):
+                continue
+            name = fields[1].removeprefix(namespace)
+            match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
+            if match and int(match[1]) < now:
+                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 
 
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:
@@ -372,7 +421,7 @@ def paired_service(command: Sequence[str], unit: str) -> int:
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
-    parser = argparse.ArgumentParser(description='Compare two pushed revisions on disposable gate boxes')
+    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
@@ -385,17 +434,29 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         rounds: int = 3
         repo: Path = Path()
     args = parser.parse_args(list(argv), namespace=PairedArguments())
+    trial_id = ''
+    prefix = ''
+    clone_url = ''
+    expires = 0
     try:
         modules = args.modules
         if len(modules) > cloud_gate.settings().whole('slots'):
             raise GateRefused('The trial needs more cloud slots than configured')
-        trial = pushed_request(args.repo, args.base, args.changed, modules, args.rounds)
+        trial = trial_request(args.repo, args.base, args.changed, modules, args.rounds)
         home = conf.read(account_settings_path()).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(directory / 'gate-deployment.json', home)
+        clone_url = trial.clone_url
+        prefix = cloud_gate.settings().text('trial_branch_prefix')
+        sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
-        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
+        trial_id = folder.name
+        for variant, revision in (('base', trial.base), ('changed', trial.changed)):
+            branch = f'{prefix}-{expires}-{folder.name}-{variant}'
+            _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
+            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
@@ -404,10 +465,14 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         command = cloud_gate.service_command('scripts.aws_target.gate_trial', ['--paired-worker', str(folder)],
                                              'cloud-paired-trial-' + folder.name, paired=True)
         return paired_service(command, 'cloud-paired-trial-' + folder.name)
-    except (OSError, ValueError, GateRefused, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, GateRefused, subprocess.SubprocessError, TrialCancelled, KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
         return 1
+    finally:
+        with defer_cleanup_signals():
+            if trial_id:
+                delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 
 
 if __name__ == '__main__':

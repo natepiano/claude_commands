@@ -122,7 +122,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
         finish = merge_gate.finish_gate_job
         started: list[merge_gate.RunningGateJob] = []
         now = [0.0]
-        clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep)
+        clock = SimpleNamespace(monotonic=lambda: now[0], sleep=time.sleep, time=time.time)
 
         def start_module(suite: str, path: Path, argv: list[str], repo: Path,
                          environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
