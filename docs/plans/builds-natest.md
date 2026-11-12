@@ -3443,7 +3443,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `direct/test_phase_table.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
 - An aws paired trial shows a CPU saving for `direct/test_phase_table.py`.
 
-### Phase 204 — Screenshot tool tests call the tool in process for argument and validation cases  · status: todo
+### Phase 204 — Screenshot tool tests call the tool in process for argument and validation cases  · status: done
 **Depends on:** none
 
 #### Work Order
