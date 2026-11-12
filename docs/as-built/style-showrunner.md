@@ -348,7 +348,10 @@ The module name is the file stem, or the folder name for `mod.rs`.
 Moving a test file into its owner removes the owner's declaration.
 Unreadable declarations and module files outside a known crate count as edited.
 Uncertain `path` attributes also count.
-These include attributes in inline modules, attributes carried by `cfg_attr`, and attributes that mount inline module folders.
+These include attributes carried by `cfg_attr` and attributes that mount inline module folders.
+A plain file-module path string that ends in another file's name does not declare the requested module file.
+This exclusion also applies inside inline modules.
+A string that ends in the requested file's name remains uncertain inside an inline module.
 `declares_module` reads raw identifiers as plain words through `plain_words`.
 Other findings include only their own file before recorded needs are appended.
 
@@ -367,9 +370,14 @@ A file outside the crate root is scanned only when it names the library, the old
 The ledger keeps that result for its lifetime.
 `EditedFiles.naming` uses one `git ls-tree` per commit.
 One `git cat-file --batch` through `style_ledger.blob_contents` reads named blobs not yet read.
-`renamed_text` or `declares_module` scans each kept path once per distinct blob.
+Restructure findings share one declaration scan per distinct blob during a refill.
+The scan keeps the token check, plain words, item starts, inline modules, and module declarations with their scopes and path attributes.
+`declares_module` reads this syntax for each requested module file.
+`EditedFiles.of` keeps each finding's computed paths and recorded needs for the selection pass.
+A second call for the same finding reads no file text.
+`SplitEditedFiles` shares these scans while its `GitReadCache` supplies the blobs.
 `EditedFiles.module_readings` keeps file rename readings.
-Thus `of` and `uncertain` share one scan.
+For file renames, `of` and `uncertain` share the same readings.
 On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files.
 Under load 20, `of` takes about 1.2 seconds.
 The read takes 0.02 seconds.
@@ -738,6 +746,14 @@ The declaration step (`Ledger.declaration_reading(ids, approved)`, `follow_decla
 
 A crate plan saves its fresh judgments (tip anchor, pinned rule blob, finding/source-history identity and physical input hashes) in `machine_judgments` before writing source. Resume checks these frozen inputs and reuses their authority; it never updates a fingerprint or manufactures a replacement judgment. An empty frozen set is also final. The ordinary rename proof still checks each combined edit plan, including interactions with other findings. A changed tip, rule, finding or physical input refuses the frozen judgment. This evidence is run-local; filing/refill site continuity and historical ledger judgments are unchanged.
 
+The declaration reading groups findings by their judged commit and returns outcomes in input order.
+A finding without an anchor has its own group.
+After each historical group, the reading frees that commit's parsed files and the other declaration caches that name the commit.
+It keeps the synced tip's entries and each finding's anchor, follow evidence, and outcome.
+The second reading in `follow_declarations` returns the same result when the rows and approvals remain unchanged.
+`run_follow` uses its planned reading directly when no outcome requires a finding write.
+It calls `follow_declarations` only for a move, rename, removal, or `FindingSite` with `UnchangedSite` evidence.
+
 Outcomes (`DeclarationOutcome`): `DeclarationNotRead`, `DeclarationInPlace`, `DeclarationMoved`, `DeclarationRemoved`, `DeclarationRenamed` (filed approved own rename → built), `RenameAwaitingApproval`, `KeptForOpenBuild`, and the left set `DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain | OutsideRenameUnresolved | StatementNotFollowed`. `style_plan`'s match over `DeclarationLeft` is exhaustive through `assert_never`.
 
 Order in `_declaration_outcome`: trait-identity uncertainty and same-identity moves; one gaining file follows (another crate leaves a filed finding, follows an unfiled one); several leave it; a filed rename's own approved rename (`_renamed_site`); built-rename chains from approved decisions in the same crate (`_built_renaming -> RenamedByBuilds | NoBuiltRename | RefusedBuiltRename | TraitIdentityUncertain`, `RenameScope = UnqualifiedName | ModuleQualified | SelfQualified | TypeQualified`; chains stop at a fork or a return to an earlier name); the outside-rename proof; then `DeclarationGoneFromFile` (filed, file still there) or `DeclarationRemoved` (withdraw with `DeclarationGone(<tip>)`). The open-build check is last over every outcome.
@@ -747,6 +763,15 @@ Order in `_declaration_outcome`: trait-identity uncertainty and same-identity mo
 **Trait identity.** `ImplementedTrait(path, arguments, position)`, `ImplPosition = FileLevelImpl | BlockScopedImpl(header_word) | UnprovedImplPosition`. Equal paths with equal arguments are the same trait; different final names or arguments differ; otherwise rooted module paths must resolve to declared traits (one declaration of the name in the crate). Plain unconditional file imports and `as` aliases prove paths; conditional imports, globs, re-exports and visible block imports block proofs. `_file_module` proves a module chain from `src/lib.rs` or `src/main.rs` through plain `mod name;` links (`#[path]`, custom targets, `src/bin`, two chains, outside `src/` give none). `_relative_trait_path` resolves file-level `self::`/`super::`. Alias expansion stops at 32 bindings and detects cycles by visited (file, binding) pairs. Uncertain identity keeps the row unchanged.
 
 **Outside-rename proof** (`OutsideRenameProven` → `DeclarationMoved`, never built): (a) the old name is declared nowhere in the crate at the synced tip; (b) a zero-context diff maps the site to a same-keyword, same-owner, same-trait declaration under a new name (`MappedSiteProof`), or exactly one changed Rust file in the crate gained one such declaration (`GainedFileProof`; the original file counts; two items in one file are ambiguous); (c) body test `2 * unchanged >= old_nonblank_count` after the identifier swap, inside the item's own delimiters. A child (method, associated item, `let`, closure parameter) follows only through a proved owner. A failed search after (a) gives `OutsideRenameUnresolved` with evidence and keeps the row.
+
+`_outside_search` examines only items with the target's keyword.
+An item's owner must equal the target's owner or the old declaration's owner.
+The evidence names the candidate count.
+It lists `passed: N` first when N candidates failed no check.
+It then lists each failed check's candidate count in `OutsideFailure` order.
+It prints `candidates: none` when the search examines no candidate.
+It keeps the reasons and mapped-site text.
+The search preserves the remaining identity, gain, and body checks.
 
 **Site proof (phase 85).** When the existing proofs leave an open finding in place or unread, `Ledger.finding_site(finding, at) -> SiteEvidence` decides it from source evidence, and `judged_at_current_file`, `_select_phase` and `_rank_waits` read that one result. `UnchangedSite(path, line)` follows the finding: a names or values finding needs its stored text on the old line, a byte-identical line in the zero-context diff and the same unambiguous owner chain; a types or modules finding also needs its complete anchored declaration, owner identity and imports unchanged, its original input scope and reads unchanged, and its proposed `before` subject located when applicable. The site proof never withdraws: changed or unproved subjects stay `NeedsJudgment`. Earlier proved declaration transitions keep their outcomes. Follow provenance preserves the finding's id, pinned rule, proposal, state and approval; it creates no cell verdict. Context rules and crate/manifest-scoped original inputs still refuse when an original input changes. Enclosing owners are recorded through the shared item scanner; a closed qualifier grammar accepts attributes/doc comments, `pub` and its restricted forms, `default`, `const`, `async`, `unsafe`, and `extern` with an optional ABI in order. Any unrecorded item keyword, unsupported prefix or unknown expression start refuses the affected owner; groups, paths, generics and `move` cannot conceal an item. Explicit field, variant, pattern, match-arm, attribute and qualified-path forms preserve expression continuations after brace groups. Unproved bodies and opaque macro bodies refuse sites inside their owner spans, without poisoning independent sibling owners, and the original owner is checked before the equal-file fast path. Tokenization failures fail closed. The repaired phase 90 census on a fresh backup copy carried **4,169 of 18,872 changed-file findings**, withdrew 0 and left **14,703** for judgment (carried: names 2,925, values 1,227, types 17, modules 0); shared follow time was **7,012.306 seconds**. Across all **30,300** open findings, **12,497** carried and **17,803** needed judgment. This is a net loss of 160 versus the pre-repair 4,329, and 3,749 more carries than round 1's 420. The committed classifier accepted 88 of these final site carries on the same backup; historical phase 85 counts were 1,972 before landing repair and 89 afterward on an older snapshot.
 
@@ -1010,3 +1035,18 @@ Rust-analyzer startup passes its active exception through the shared queue bound
 `LINT_CONFIG_FILE` selects the config file.
 The shared test helper replaces the queue boundary for direct calls and CLI child processes.
 Tests retain their private Cargo and rust-analyzer programs without a real queue place.
+
+### Crate copy lifetime
+
+Each identified crate run removes a crate's editable copy when the crate becomes `INTEGRATED` or `ABANDONED`.
+Other crates in the run can remain open.
+This rule covers native copies and adopted copies linked to the run.
+The removal uses `copies.workspace_removal_guard` after the worker locks close.
+The run keeps its lock through removal.
+`HeldCrateRunLock` passes that ownership to the guard without acquiring the lock again.
+Other callers use `AcquireCrateRunLock` to acquire the lock before removal.
+The guard reads the state of the crate that owns the copy.
+`complete_run` also removes remaining terminal copies after a crash and ends their task records.
+A terminal resume returns without creating a copy.
+Integrated result validation reads the canonical Git objects, which already hold the imported commit.
+Later crate integration, resume, import, and refusal publication do not need a terminal crate's copy.

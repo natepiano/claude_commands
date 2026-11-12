@@ -16,6 +16,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import shlex
+import subprocess
 import sqlite3
 import statistics
 import sys
@@ -23,14 +25,15 @@ import tempfile
 from typing import Literal, cast
 
 
+from scripts.accounts.role_map import ROLE_MAP_HOST
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.usage import collect, weights
 from scripts.usage.agents_log import Assignment, assignments, role_at, state_dir
 from scripts.usage.context_economy_read import (
-    CompactionEvent, MacReadFailed, MacSessions, Request, Session, SettingsSet, Start,
+    CompactionEvent, Request, Session, SettingsSet, Start,
     SettingsUnknown, ReportSettingsTimeline, configured_checkout, label, read_claude, role_of,
-    read_codex, read_mac, settings_for, settings_timeline, timeline_start,
+    read_codex, settings_for, settings_timeline, timeline_start,
 )
 
 
@@ -73,19 +76,6 @@ class GroupResult:
 
 
 @dataclass(frozen=True)
-class MacReadSucceeded:
-    """The Mac read completed, also when it returned no sessions."""
-
-
-@dataclass(frozen=True)
-class MacReadUnknown:
-    """An older result did not record the Mac read."""
-
-
-MacReadStatus = MacReadSucceeded | MacReadFailed | MacReadUnknown
-
-
-@dataclass(frozen=True)
 class Report:
     since: datetime
     until: datetime
@@ -93,7 +83,6 @@ class Report:
     left_out: int
     role_quantities: dict[str, dict[str, QuantitySummary]] = field(default_factory=dict)
     unweighted_models: dict[str, int] = field(default_factory=dict)
-    mac: MacReadStatus = field(default_factory=MacReadSucceeded)
 
 
 def summarize(values: Sequence[float]) -> QuantitySummary:
@@ -394,25 +383,8 @@ def _summary_data(summary: QuantitySummary) -> dict[str, object]:
     return {"n": summary.n, "median": summary.median, "mean": summary.mean, "p25": summary.p25, "p75": summary.p75}
 
 
-def _mac_data(mac: MacReadStatus) -> dict[str, object]:
-    if isinstance(mac, MacReadFailed):
-        return {"state": "failed", "reason": mac.reason}
-    return {"state": "unknown" if isinstance(mac, MacReadUnknown) else "read"}
-
-
-def _saved_mac(data: dict[str, object]) -> MacReadStatus:
-    mac = _object(data.get("mac", {"state": "unknown"}))
-    if mac["state"] == "failed":
-        return MacReadFailed(cast(str, mac["reason"]))
-    return MacReadSucceeded() if mac["state"] == "read" else MacReadUnknown()
-
-
 def save_result(name: str, report: Report, folder: Path) -> Path:
     """Write one result with exclusive creation; an existing result remains unchanged."""
-    return _publish_result(name, report, folder, replace_existing=False)
-
-
-def _publish_result(name: str, report: Report, folder: Path, *, replace_existing: bool) -> Path:
     path = folder / (name + ".json")
     groups: list[dict[str, object]] = [{
         "machine": group.machine, "family": group.family,
@@ -423,7 +395,6 @@ def _publish_result(name: str, report: Report, folder: Path, *, replace_existing
     } for group in report.groups]
     data = {"name": name, "window": {"since": report.since.isoformat(), "until": report.until.isoformat()},
             "left_out": report.left_out, "groups": groups, "unweighted_models": report.unweighted_models,
-            "mac": _mac_data(report.mac),
             "role_quantities": {role: {quantity: _summary_data(summary) for quantity, summary in quantities.items()}
                                 for role, quantities in report.role_quantities.items()}}
     folder.mkdir(parents=True, exist_ok=True)
@@ -434,10 +405,7 @@ def _publish_result(name: str, report: Report, folder: Path, *, replace_existing
         with temporary as stream:
             json.dump(data, stream, ensure_ascii=False, indent=2)
             _ = stream.write("\n")
-        if replace_existing:
-            os.replace(temporary_path, path)
-        else:
-            os.link(temporary_path, path)
+        os.link(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
@@ -459,7 +427,7 @@ def read_result(path: Path) -> Report:
     groups: list[GroupResult] = []
     for raw in cast(list[object], data["groups"]):
         group = _object(raw)
-        groups.append(GroupResult(cast(str, group["machine"]), cast(Literal["claude", "codex"], group["family"]),
+        groups.append(GroupResult(cast(str, group.get("machine", "")), cast(Literal["claude", "codex"], group["family"]),
             cast(str, group["settings_label"]), _object(group["settings_values"]),
             cast(str, group["settings_commit"]), cast(str, group["week"]), cast(str, group["role"]),
             cast(str, group["model"]), cast(int, group["requests"]), tuple(cast(list[str], group["cli_versions"])),
@@ -468,43 +436,82 @@ def read_result(path: Path) -> Report:
                   groups, cast(int, data["left_out"]),
                   {role: {name: _summary(value) for name, value in _object(quantities).items()}
                    for role, quantities in _object(data["role_quantities"]).items()},
-                  {model: cast(int, count) for model, count in _object(data["unweighted_models"]).items()}, _saved_mac(data))
+                  {model: cast(int, count) for model, count in _object(data["unweighted_models"]).items()})
 
 
-def _confounds(saved: Report, current: Report) -> list[str]:
-    names = sorted({key for report in (saved, current) for group in report.groups for key in group.settings_values})
+def _confounds(saved: Sequence[GroupResult], current: Sequence[GroupResult]) -> list[str]:
+    names = sorted({key for report in (saved, current) for group in report for key in group.settings_values})
     differences: list[str] = []
     for name in names:
         before = {(name in group.settings_values, json.dumps(group.settings_values.get(name), sort_keys=True))
-                  for group in saved.groups}
+                  for group in saved}
         after = {(name in group.settings_values, json.dumps(group.settings_values.get(name), sort_keys=True))
-                 for group in current.groups}
+                 for group in current}
         if before != after:
             differences.append(name)
-    if {version for group in saved.groups for version in group.cli_versions} != {
-            version for group in current.groups for version in group.cli_versions}:
+    if {version for group in saved for version in group.cli_versions} != {
+            version for group in current for version in group.cli_versions}:
         differences.append("Claude Code version")
-    if {group.model for group in saved.groups} != {group.model for group in current.groups}:
+    if {group.model for group in saved} != {group.model for group in current}:
         differences.append("model")
     for dimension, before, after in (
-        ("machine", {group.machine for group in saved.groups}, {group.machine for group in current.groups}),
-        ("family", {group.family for group in saved.groups}, {group.family for group in current.groups}),
+        ("machine", {group.machine for group in saved}, {group.machine for group in current}),
+        ("family", {group.family for group in saved}, {group.family for group in current}),
     ):
         differences.extend(f"{dimension}={value} (saved only)" for value in sorted(before - after))
         differences.extend(f"{dimension}={value} (current only)" for value in sorted(after - before))
     return list(dict.fromkeys(differences))
 
 
+@dataclass(frozen=True)
+class SampleMean:
+    """A sample count weights one mean without inventing pooled percentiles."""
+
+    n: int
+    mean: float
+
+
+@dataclass(frozen=True)
+class ComparisonMeasurements:
+    """Machine groups select the measurements that enter comparisons."""
+
+    groups: Sequence[GroupResult]
+    role_quantities: dict[str, dict[str, SampleMean]]
+    notice: str = ""
+
+
+def comparison_measurements(report: Report) -> ComparisonMeasurements:
+    if any(not group.machine for group in report.groups) or (not report.groups and report.role_quantities):
+        return ComparisonMeasurements(report.groups, {
+            role: {name: SampleMean(summary.n, summary.mean) for name, summary in quantities.items()}
+            for role, quantities in report.role_quantities.items()
+        }, "No machine split: stored totals may include Mac data; shown unchanged and not isolated to natedev.")
+    groups = [group for group in report.groups if group.machine == ROLE_MAP_HOST]
+    roles: dict[str, dict[str, SampleMean]] = {}
+    for group in groups:
+        quantities = roles.setdefault(group.role, {name: SampleMean(0, 0) for name in QUANTITIES})
+        for name, summary in group.quantities.items():
+            previous = quantities[name]
+            count = previous.n + summary.n
+            quantities[name] = SampleMean(count, (previous.mean * previous.n + summary.mean * summary.n) / count if count else 0)
+    return ComparisonMeasurements(groups, roles)
+
+
 def compare_reports(saved: Report, current: Report) -> str:
+    saved_measurements = comparison_measurements(saved)
+    current_measurements = comparison_measurements(current)
     lines = ["Saved window: " + _window(saved), "Current window: " + _window(current),
-             "confounds: " + (", ".join(_confounds(saved, current)) or "none"), "",
+             "confounds: " + (", ".join(_confounds(saved_measurements.groups, current_measurements.groups)) or "none"), "",
              "| quantity | role | saved mean | current mean | change | saved n | current n |",
              "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
-    empty = QuantitySummary(0, 0, 0, 0, 0)
-    for role in sorted(saved.role_quantities.keys() | current.role_quantities.keys()):
+    for name, measurements in (("Saved", saved_measurements), ("Current", current_measurements)):
+        if measurements.notice:
+            lines.insert(2, f"{name}: {measurements.notice}")
+    empty = SampleMean(0, 0)
+    for role in sorted(saved_measurements.role_quantities.keys() | current_measurements.role_quantities.keys()):
         for quantity in QUANTITIES:
-            before = saved.role_quantities.get(role, {}).get(quantity, empty)
-            after = current.role_quantities.get(role, {}).get(quantity, empty)
+            before = saved_measurements.role_quantities.get(role, {}).get(quantity, empty)
+            after = current_measurements.role_quantities.get(role, {}).get(quantity, empty)
             if min(before.n, after.n) < 10:
                 change = "too few"
             elif before.mean == 0:
@@ -800,21 +807,23 @@ def render_changes(analyses: Sequence[ChangeAnalysis], *, since: datetime, files
 
 def trend(folder: Path, role: str = "") -> str:
     reports = [(path.stem, read_result(path)) for path in folder.glob("*.json")]
-    lines = ["| result | window | mac | roles | requests | " + " | ".join(QUANTITIES) + " |",
-             "| --- | --- | --- | --- | ---: | " + " | ".join(["---"] * len(QUANTITIES)) + " |"]
+    lines = ["| result | window | roles | requests | " + " | ".join(QUANTITIES) + " |",
+             "| --- | --- | --- | ---: | " + " | ".join(["---"] * len(QUANTITIES)) + " |"]
     for name, report in sorted(reports, key=lambda entry: (entry[1].since, entry[0])):
-        roles = sorted(group_role for group_role in report.role_quantities if not role or group_role == role)
+        measurements = comparison_measurements(report)
+        if measurements.notice:
+            lines.append(f"{name}: {measurements.notice}")
+        roles = sorted(group_role for group_role in measurements.role_quantities if not role or group_role == role)
         if role and not roles:
             continue
         quantities = ["; ".join(f"{group_role}: {_value(summary.mean, quantity)} (n={summary.n})"
                                if summary.n else f"{group_role}: — (n=0)"
                                for group_role in roles
-                               for summary in [report.role_quantities[group_role][quantity]])
+                               for summary in [measurements.role_quantities[group_role][quantity]])
                       for quantity in QUANTITIES]
-        count = sum(group.requests for group in report.groups if group.role in roles)
+        count = sum(group.requests for group in measurements.groups if group.role in roles)
         lines.append("| " + " | ".join(_cell(column) for column in
-            [name, _window(report), "mac failed" if isinstance(report.mac, MacReadFailed) else "",
-             ", ".join(roles), str(count), *quantities]) + " |")
+            [name, _window(report), ", ".join(roles), str(count), *quantities]) + " |")
     return "\n".join(lines)
 
 
@@ -910,7 +919,7 @@ class _HourlyRow:
 
 
 def hourly_rates(store: Path) -> str:
-    """Read the unit director cost of each complete hour from the ledger, without session logs."""
+    """Read natedev unit director costs for complete hours without session logs."""
     from scripts.usage.usage_report import open_read_store
 
     configuration = conf.read("context_economy")
@@ -918,7 +927,8 @@ def hourly_rates(store: Path) -> str:
     baseline_days = configuration.whole("hourly_baseline_days")
     dated = weights.sql_weights("t.model", "t.at")
     with closing(open_read_store(store)) as database:
-        newest = cast(str | None, cast(sqlite3.Row, database.execute("SELECT max(at) AS newest FROM turns").fetchone())["newest"])
+        newest = cast(str | None, cast(sqlite3.Row, database.execute(
+            "SELECT max(at) AS newest FROM turns WHERE machine = 'natedev'").fetchone())["newest"])
         if newest is None:
             return "No requests in the ledger."
         as_of = datetime.fromisoformat(newest).astimezone(timezone.utc)
@@ -929,7 +939,7 @@ def hourly_rates(store: Path) -> str:
             + "sum(t.input + w.cached * t.cache_read + w.write_5m * t.cache_write_5m "
             + "+ w.write_1h * t.cache_write_1h + w.output * t.output) AS cost "
             + f"FROM turns t JOIN ({dated.entries}) w ON w.weight_entry = {dated.active_entry} "
-            + "WHERE t.role = 'director' AND t.at >= ? AND t.at < ? GROUP BY hour ORDER BY hour",
+            + "WHERE t.machine = 'natedev' AND t.role = 'director' AND t.at >= ? AND t.at < ? GROUP BY hour ORDER BY hour",
             ((recent - timedelta(days=baseline_days)).isoformat(), end.isoformat())).fetchall())
     zone = user_zone()
     hours = [(datetime.fromisoformat(cast(str, row["hour"]) + ":00:00+00:00"), cast(int, row["units"]), cast(float, row["cost"]))
@@ -956,6 +966,13 @@ def last_week(now: datetime) -> tuple[str, datetime, datetime]:
 
 
 def main(argv: Sequence[str] = ()) -> int:
+    if socket.gethostname().split(".", 1)[0] != ROLE_MAP_HOST:
+        command = "~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py " + shlex.join(argv)
+        try:
+            return subprocess.run(("ssh", "-o", "BatchMode=yes", ROLE_MAP_HOST, command)).returncode
+        except OSError as error:
+            print(f"context_economy: {error}", file=sys.stderr)
+            return 2
     args = _parser().parse_args(argv, namespace=_Arguments())
     try:
         if args.command == "trend":
@@ -965,17 +982,14 @@ def main(argv: Sequence[str] = ()) -> int:
             print(hourly_rates(args.store))
             return 0
         now = current_time()
-        retry_week = False
         if args.command == "save" and args.last_week:
             if args.name or args.since or args.until or args.where or args.family != "all":
                 raise ValueError("save --last-week takes no name, --since/--until, --where, or filtered --family")
             args.name, since, until = last_week(now)
             existing = args.saved_results / (args.name + ".json")
             if existing.is_file():
-                if not isinstance(read_result(existing).mac, MacReadFailed):
-                    print(existing)
-                    return 0
-                retry_week = True
+                print(existing)
+                return 0
         else:
             if args.command == "save" and not args.name:
                 raise ValueError("save needs a name or --last-week")
@@ -988,41 +1002,24 @@ def main(argv: Sequence[str] = ()) -> int:
         roots = args.codex_root or sorted(Path.home().glob(".codex*/sessions"))
         sessions.extend(read_codex(roots, read_since, until, machine))
         timelines = {machine: settings_timeline(args.checkout, timeline_start(sessions, read_since), until)}
-        mac = read_mac(read_since, until)
-        if isinstance(mac, MacSessions):
-            sessions.extend(mac.sessions)
-            for remote_machine in {session.machine for session in mac.sessions} or {"mac"}:
-                timelines[remote_machine] = mac.timeline
         if args.command == "changes":
-            if isinstance(mac, MacReadFailed):
-                print(f"mac: {mac.reason}")
             selected = [session for session in sessions if args.family == "all" or session.family == args.family]
             analyses = analyze_changes(selected, timelines, args.store, since, until, files=args.files)
             print(render_changes(analyses, since=since, files=args.files, detail=args.detail))
             return 0
         report = build_report(sessions, timelines, args.store, since, until,
                               by=args.by, role=args.role, family=args.family, where=args.where)
-        report = replace(report, mac=mac if isinstance(mac, MacReadFailed) else MacReadSucceeded())
         if args.command == "save":
-            if retry_week:
+            try:
+                saved = save_result(args.name, report, args.saved_results)
+            except FileExistsError:
+                if not args.last_week:
+                    raise
                 saved = args.saved_results / (args.name + ".json")
-                if isinstance(mac, MacSessions):
-                    saved = _publish_result(args.name, report, args.saved_results, replace_existing=True)
-            else:
-                try:
-                    saved = save_result(args.name, report, args.saved_results)
-                except FileExistsError:
-                    if not args.last_week:
-                        raise
-                    saved = args.saved_results / (args.name + ".json")
             print(saved)
-            if isinstance(mac, MacReadFailed):
-                print(f"mac: {mac.reason}")
         elif args.command == "compare":
             print(compare_reports(read_result(args.saved_results / (args.name + ".json")), report))
         else:
-            if isinstance(mac, MacReadFailed):
-                print(f"mac: {mac.reason}")
             print(render_report(report))
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"context_economy: {error}", file=sys.stderr)

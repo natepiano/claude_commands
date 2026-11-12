@@ -138,8 +138,7 @@ Read that reply before the next workflow step.
 A completed pass closes its pane and keeps its staff row and native conversation.
 A live detached run keeps the pass active. Its completion uses the same receipt rule.
 A finished run with an absent transcript result permits DONE completion and adds one anomaly line.
-A pending friend reply keeps the same pass and saved launcher arguments.
-Send no recovery prompt while either result remains pending.
+Send no recovery prompt while a run result remains pending.
 For `no DONE`, request a complete result with the saved dispatch id. The next turn hook records it.
 Exit 2 means refused. Exit 4 reports a Codex question and its visible pane lines.
 Answer with `worker.py answer <name> --text "<answer>"`. Keep the same pass.

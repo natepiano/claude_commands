@@ -156,11 +156,22 @@ class StaffRouting:
         return self.runners_by_name.get(name)
 
     @cached_property
+    def document_lines(self) -> dict[Path, list[str]]:
+        """Share one document read across list and question routing."""
+        documents: dict[Path, list[str]] = {}
+        for doc in dict.fromkeys(self.documents.values()):
+            try:
+                documents[doc] = doc.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+        return documents
+
+    @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
             try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
+                lines = self.document_lines.get(doc, [])
                 listing = Path(production_field(lines, "Change review")).expanduser()
                 for name, known in self.documents.items():
                     if known == doc:

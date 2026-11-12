@@ -25,9 +25,10 @@ An entry is one top-level file, folder or link under a root: /tmp/claude,
 folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
 (/tmp/claude/scratch), where each task's folder is an entry: it stays while its task is open, goes
 when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
-session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) and each run folder's tmp/ (the
-run's TMPDIR) stays, and every entry in it is one too, judged by the 4 h rule: sessions run for
-weeks, so nothing waits on a session end. In a temp folder a folder's ctime is no change, since
+session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays, as does each run's tmp/ (its TMPDIR).
+Run keep reasons keep the run folder. Its tmp/ entries use the 4 h and process-use rules.
+An unreadable ownership record keeps those entries. Each session temp entry also uses the 4 h rule.
+In a temp folder a folder's ctime is no change, since
 systemd-tmpfiles-clean moves it each day when it sets the folder's times back. In a temp folder (/tmp, $TMPDIR
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
@@ -49,8 +50,7 @@ both are true:
     (one /proc scan per run; where no /proc exists, one lsof scan).
 
 These stay too: runs named by staff rows, runs with any worker not ended (including
-paused workers), and runs using a live or paused session worktree. Unreadable ownership records
-keep runs too, including their temp entries. These runs also keep folders named by cwd in their
+paused workers), and runs using a live or paused session worktree. These runs also keep folders named by cwd in their
 detached_runs/*.json records. Empty detached_runs files are not records. Pending files are not read.
 A worker thread not ended keeps its session temp parent, but its old temp entries can go.
 An unreadable worker record keeps scratch entries and top-level /tmp/claude entries, and names
@@ -1074,11 +1074,14 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                     reason = state.why
                 elif isinstance(state, scratch.Unknown):
                     reason = state.reason
-            # Apply to every deletion path, including entries inside a protected run's tmp/.
+            # Run guards keep tmp/ entries only when ownership or the session registry cannot be read.
             if reason != ROOT:
                 # Resolve only the parents: a link inside a protected run is judged where it lies.
                 path = os.path.join(os.path.realpath(os.path.dirname(entry.path)), entry.name)
                 for folder, guard in guarded.items():
+                    if (root == os.path.join(folder, RUN_TEMP_NAME)
+                            and live is not None and guard is not RunKeepReason.UNREADABLE_RECORD):
+                        continue
                     if path == folder or path.startswith(folder + os.sep) or folder.startswith(path + os.sep):
                         reason = NO_SESSIONS if live is None else guard.value
                         break

@@ -47,7 +47,7 @@ class RemoveWorkersTests(StaffTestCase):
         self.run_dir.mkdir()
         self.write_json(self.run_dir / "progress_history_state.json", {
             "owner_staff_id": self.parent.id,
-            "pass": {"impl": {"instance_id": "dispatch", "worker_name": self.first.name}},
+            "pass": {"impl": {"instance_id": "dispatch", "worker_id": self.first.id}},
         })
 
     def invoke(self, caller: str, runs: list[Path], code: int = 0) -> tuple[int, list[str], str]:

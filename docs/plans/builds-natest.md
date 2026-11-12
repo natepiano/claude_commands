@@ -2541,7 +2541,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:**
 - `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
-- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`.
 - Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
 - A new reader is missed until the next full gate records it.
 
@@ -3349,70 +3349,204 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `d3269a529`. `scripts/hana_shot/test_hana_shot.py` runs its argument and validation content cases through `hana_shot.main` in process with the shared `invoke_cli` helper. A test helper gives each direct call a private `worker_pool` and `EXIT_SIGNAL_LATCH` and closes the pool after the call. Eighteen cases keep real CLI starts: entry and cold imports, timeout limits, traceback output, background cleanup at exit, keep-awake child lifetime, and signal delivery. All 117 test methods and 575 assertions stay; no production file changed. natedev gave the go; file SHA-256 `fecae85b`. aws pairs: 24.95 to 6.88 CPU s (18.07 s, 3/3 rounds); wall 25.9 to 7.7 s.
 
-### Phase 205 — Measure build-target command starts that tests could run in process
+### Phase 205 — Measure build-target command starts that tests could run in process  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. Report: `phases/205/content_call_report.md` in the run folder (160 modules, with starts, CPU, source lines, owners and isolation needs). Measured: 771 direct target-command starts (136.859 local CPU s), 211 target-wrapper starts (30.136 s) and 11 cold entries (1.092 s). Removable CPU under the verify conditions is zero in every module: direct content tests already run in process; the remaining starts check shell integration, imports, guards, waits, signals or ownership. No aws trial qualifies. All 160 modules pass after one repeat caused by a build hold.
+
+### Phase 206 — Copies asks Git for the bare flag in one query  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/copies/copies.py` reads the common dir, the git dir and the bare flag with one `git rev-parse --path-format=absolute --git-common-dir --git-dir --is-bare-repository` call; it used two. Table rows in `scripts/copies/test_copies.py` cover normal, bare, separate-metadata and linked-worktree repositories on the old and new code; all 120 test methods remain. 25 importer modules pass (1,469 tests). aws pairs, 3 rounds: `copies/test_copies.py` 30.82 → 30.43, `style/test_crate_run.py` 56.07 → 55.00, `style/test_bulk_run.py` 43.31 → 43.06 CPU s (1.70 s saved). queue reviewed the diff. Checkpoint `5502f4ed1`.
+
+### Phase 207 — Measure where model resolution spends CPU in tests  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research only; no repository file changed. Report: `phases/207/model_resolution_report.md` in the run folder. `production/test_add_unit.py` costs 29.98 and 28.45 CPU s in two runs; 110 registry-reader starts cost 7.07 s. Per caller (reads / publication / catalog): add_unit 110 starts 5.585 s / 0 / 0; models_conf_publish 50 starts 2.532 s / 1,703 tasks 17.674 s / 720 tasks 3.285 s; agent_exec 48 starts 2.624 s; assign_claude_follow 14 starts 2.923 s; add_showrunner 44 starts 2.723 s. Snapshot reuse alone removes no start; the cost is Python starts. Ranked candidates pass a parsed table into an existing shell resolver: `models_registry.py:135` (models; 50 starts; 0–3.392 s), `add_unit.py:459` (devtools and sdlc; 64 starts; 0–3.219 s), `assign.py:418` (sdlc and devtools; 12 starts; 0–2.002 s). Rejected: a gate-wide snapshot, edit-base reuse, skipped catalog synchronization, reuse of the missing add-showrunner registry, nested launch reuse.
+
+### Phase 208 — The Claude model resolver takes the parsed launch table  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `claude_model` in `scripts/lib/models_registry.py` builds one `LaunchModelConfiguration` per call and sends `configuration_shell(configuration)` through stdin to the existing Claude model shell, so the shell starts no registry-reader Python child. No resolved model, catalog or snapshot is reused. The `scripts/notify/test_review.py` process fixture accepts `input` (default `None`) and forwards it (sdlc, 2026-11-12). 44 importer modules pass (2,634 tests). aws pairs, 3 rounds: `notify/test_review.py` 10.38 → 3.38, `production/test_add_unit.py` 23.72 → 21.53, `direct/test_assign_claude_follow.py` 33.49 → 32.78, `agents/test_agent_exec.py` 19.69 → 19.60 CPU s (10.04 s saved). sdlc approved the design and saw the numbers. Checkpoint `ce9febf6d`.
+
+### Phase 209 — The style ledger reads the commit and its tree in one Git query  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `_tip` in `scripts/style/style_ledger.py` reads the commit and its tree with one `git rev-parse --end-of-options <c>^{commit} <c>^{tree}` call; it used two. A reply that is not the echoed marker and two object ids (40 or 64 hex) raises `GitReadFailed` with status 0, so a revision range keeps a typed failure; missing, non-commit and ambiguous names keep status 128. `test_tree_entries_share_commit_and_bare_tree_inventory` in `scripts/style/test_style_ledger.py` gets four rows (missing, tree id, ambiguous prefix with SHA-1 and SHA-256 input pairs, range). By builds' order, `scripts/production/test_add_unit.py` sets `HERDR_BIN=/nonexistent/herdr` in `test_resume_uses_the_renamed_native_owner_for_arguments_and_tab`; that test raised `HerdrMissing` on a host without herdr (the aws box) since it came in (`c8dec492b`). aws pairs, 3 rounds: `style/test_style_ledger.py` 13.32 → 12.53, `style/test_style_ledger_findings.py` 27.20 → 26.20, `style/test_style_ledger_tickets.py` 23.22 → 22.37 CPU s (2.68 s saved); `test_add_unit` passes on the aws box. style approved through sdlc. Checkpoint `72252ade3`.
+
+### Phase 210 — Usage report tests call the report in process  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `report()` in `scripts/usage/test_usage_report.py` calls the usage report `main` in process through `invoke_cli` (`scripts/production/cli_fixture.py:84`); four metric cases use scoped `METRICS` patches. Four tests keep a real process: the CLI entry with cold imports, the SQLite snapshot during a writer commit, and two `-c` scripts with their own assertions; each keeps its timeout. One embedded `assert main(...) == 0` became an `assertEqual` on the in-process status (Work Order authorized). Report script starts fell from 74 to 1. `scripts/agents/test_restart.py` binds a private `HERDR_BIN` in `RestartTestCase.setUp`; the fake-CLI override stays. On the aws box the module had 19 failures and 105 errors per run (`HerdrMissing`); now all 107 pass. aws pairs, 3 rounds: `usage/test_usage_report.py` 21.93 → 6.98 CPU s (14.92 s saved); `agents/test_restart.py` 23.15 (stops early on errors) → 24.08 CPU s, all pass. sdlc gave the owner go. Checkpoint `db1ec4e5e`.
+
+### Phase 211 — Escalation tests call the escalation command in process  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/message/test_escalate.py` calls the escalation command in process; escalate process starts fell from 57 to 3. Tests that need a real process keep one. All tests and assertions stay. aws pairs, 3 rounds, 31 tests: `message/test_escalate.py` 13.13 → 3.93 CPU s (9.19 s saved). sdlc gave the owner go. Checkpoint `944dad03d`.
+
+### Phase 212 — Showrunners tests call the showrunners command in process  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `ShowrunnerFixture.cli` in `scripts/production/test_showrunners.py` calls `showrunners.main` in process through `invoke_cli(production_state=True)`. Calls with pane or caller arguments keep the real CLI process. Showrunners Python starts fell from 28 to 4. All 38 tests and 154 assertions stay. aws pairs, 3 rounds: `production/test_showrunners.py` 5.03 → 2.47 CPU s (2.56 s saved). sdlc gave the owner go. Checkpoint `6ad7a4767`.
+
+### Phase 213 — The unit director resolver takes the parsed launch table  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `director_agent` in `scripts/production/add_unit.py` reads the launch configuration in process through `models_registry.launch_configuration(os.environ, registry=models_registry.registry_path(os.environ))` in the script's checkout. The resolver shell gets the parsed table through stdin: `{ IFS= read -r -d "" table; _models_table_load "$table"; }`. Read errors become a Refusal. `models_registry.registry_path(environment)` is the one rule for `MODELS_CONFIG_FILE` or HOME. Registry-reader starts fell from 64 to 0. All tests stay. aws pairs, 3 rounds: `production/test_add_unit.py` 20.07 → 16.80 CPU s (3.28 s saved); `notify/test_review.py` no change. sdlc approved the diff. Checkpoint `719978efd`.
+
+### Phase 214 — The assignment resolver takes the parsed launch table
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report names each test module that starts `build_targets.py`, counts its starts, separates content cases from cases whose check is the process boundary, and gives the local CPU s the content-call pattern would remove per module.
+**Goal:** `resolve_model` in `scripts/direct/assign.py` sends the parsed launch table to its existing resolver shell through stdin, so the shell starts no registry-reader Python child, and aws pairs show a CPU gain.
 
-**Decision:** builds, 2026-11-12: after Phase 199, drop target read caching (0–1.2 s bound); the first lever is the content-call pattern for the verify and mac_test tests that start `build_targets.py`. Ask verify and resources for goes with the measured start count and CPU s. Research only; no code change. verify, 2026-11-12: yes, measure; conditions for code: (a) move only direct test calls that check output content; calls `verify.sh` makes stay real; (b) real starts stay for entry paths, locks between processes, signals, timeouts and the generated reserve queue hook; (c) no state leaks between cases: restore the `build_targets` globals and drop the parsed registry after each call; (d) keep every assertion; a `build_targets.py` change also needs the resources go. Do not change `test_verify_ssh_targets_routing.py` (verify owns its open trace fault).
+**Decision:** sdlc showrunner (owner), 2026-11-12: go; keep the change to the speed fix only; send sdlc the diff before land.
 
 **Spec:**
-1. Read `phases/177/body_command_census.md` (the `build_targets.py` rows and caller table) and `phases/199/target_reads_report.md` in the session folder.
-2. Find every test module and test helper that starts `build_targets.py`, directly or through `verify.sh` and `verify_mac_offload_test_support.py:1022`. Give file, line, start path and owner.
-3. For each module, count starts per run with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> <module> --tests 10 --commands 15`, and give the local CPU s of those starts.
-4. Classify each start: a content case that can call the command's main in process through `scripts/production/cli_fixture.py:84` `invoke_cli`, or a case whose check is the process boundary (entry path, locks between processes, signals, timeouts, detached children, a shell caller that must stay real). A start inside `verify.sh` stays real unless the test can call the shell's target step directly; say which.
-5. Name the isolation each module needs (module caches, lock files, state folders, signal handlers), with file and line.
-6. Rank modules by removable local CPU s. Name the first module for an aws trial.
-7. Change no repository file. Write the report to `phases/205/content_call_report.md` in the session folder.
+1. Read rank 3 in `phases/207/model_resolution_report.md` (unit session folder) and the Phase 208 as-built.
+2. In `resolve_model` (`assign.py:418`), build one `models_registry.LaunchModelConfiguration` from the call's `env`. A parent's `MODELS_LAUNCH_CONFIGURATION` in `env` stays the source when present.
+3. Replace `models_launch_configuration` in the shell with a stdin table load (`IFS= read -r -d "" table; _models_table_load "$table"`). Send `models_registry.configuration_shell(configuration)` as stdin.
+4. Keep the catalog sync behavior that `models_launch_configuration` runs today; prove it with a test row or a cited code path.
+5. Keep override validation (`_agents_validate_pair`), the four returned values, exit status 2 on a failure, and `env["MODELS_LAUNCH_CONFIGURATION"]` set to the same encoded configuration.
+6. No caches. No snapshot reuse across calls. Keep `RegistryEditBase` apart.
+7. Keep every test and assertion. Add a row only where a changed path has no cover.
+8. Run every module that imports `assign` (`git grep -l "direct import.*assign\b\|direct.assign\b" -- 'scripts/*test_*.py'`) and basedpyright on each changed file.
+9. Measure `direct/test_assign_claude.py` and `direct/test_assign_claude_follow.py` with `module_cost.py --commands 15` before and after. Report registry-reader starts.
 
 **Files:**
-- `phases/205/content_call_report.md` — in the session folder.
+- `scripts/direct/assign.py` — `resolve_model` and `call` (an `input=` keyword, sdlc 2026-11-12). It uses `models_registry.registry_path(env)` from Phase 213 and does not edit `models_registry.py`.
 
-**Workers:** 1 researcher; no repository file changes.
-- impl: the report.
+**Workers:** 1 writer; one function, no split.
+- impl: `scripts/direct/assign.py`.
 
 **Constraints from prior phases:**
-- Phase 199: one target command costs 0.11–0.35 local CPU s; the 541 starts (90.9 local CPU s) are mostly process start.
-- Phases 201–204: `invoke_cli` saved 9.85–21.38 CPU s per module; a recorder thread calls its main directly, not through `invoke_cli` (Phase 202 F001).
-- resources owns `build_targets.py`; verify owns `verify.sh` and its tests. Code needs both goes.
-
-**State:** none.
+- Phase 208 sends the table to `claude_model` the same way. The bound is 0–2.002 s for 12 starts, including `assign_claude_test_support.py:447`.
 
 **Acceptance gate:**
-- The report gives starts, local CPU s and a removable share per module, with file, line and owner, and the first trial module.
-- No repository file changes.
+- Registry-reader starts fall in the two measured modules.
+- All importer modules pass; basedpyright reports 0 errors and 0 warnings.
+- aws paired trial shows a CPU gain with the same tests passing.
+- sdlc sees the diff before land.
 
-### Phase 206 — Copies asks Git for the bare flag in one query
+### Phase 215 — Worker usage tests call the readout in process
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `scripts/copies/copies.py` reads the bare-repository flag and its paired value with one Git query in place of two, with linked-worktree coverage, and saves measured aws CPU.
+**Goal:** the content checks in `scripts/whoami/test_worker_usage.py` call the worker usage readout `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
 
-**Decision:** queue (owner of `copies.py`), 2026-11-12: go for one aws trial on the combined bare-flag query (`copies.py:476,478`) after linked-worktree coverage; code only on a measured gain; any measured gain ships; send the diff and the paired numbers before land. Phase 200 bound: 0–0.755 local CPU s, 799 starts.
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
 
 **Spec:**
-1. Read `phases/200/git_metadata_report.md` in the session folder (the rank 3 row and the linked-layout note).
-2. Combine the two Git queries at `copies.py:476,478` into one query that returns both values. Keep each value's meaning, type and error behavior on normal, bare, separate-metadata and linked-worktree repositories.
-3. Add linked-worktree coverage as rows in an existing test in `scripts/copies/test_copies.py` (test growth rule 1). Show the rows pass on the old code and the new code.
-4. Run every module that imports `copies` (`git grep`), and basedpyright on each changed file.
-5. Measure local CPU with `module_cost.py` on the three most affected modules; aws pairs decide.
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `whoami/test_worker_usage.py`.
+2. In `readout` (`test_worker_usage.py:144`), call the readout `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment()`, the same arguments and the `outside-checkout` cwd.
+3. Bind each module-level path the readout reads from the environment (`HOME`, `USAGE_STATE_DIR`) for each call; restore it after the call.
+4. Keep a real process where a test proves the snapshot, the instrumentation (`script=` calls) or the run from an external directory with cold imports.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the readout, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
 
 **Files:**
-- `scripts/copies/copies.py` — the query.
-- `scripts/copies/test_copies.py` — linked-worktree rows.
+- `scripts/whoami/test_worker_usage.py` — `readout`.
 
-**Workers:** 1 writer; the change is one function and its test rows.
-- impl: both files.
+**Workers:** 1 writer; one test module.
+- impl: the file.
 
 **Constraints from prior phases:**
-- Phase 200: fresh refs and working-tree checks stay live; only immutable repository metadata may combine.
-
-**State:** none.
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern. A recorder that runs in a thread calls its main directly (Phase 202 F001).
+- Census: 23 starts, 6.668 local CPU s; upper bound.
 
 **Acceptance gate:**
-- The two values keep their behavior on all four repository layouts; the linked-worktree rows pass.
-- All importer modules pass; basedpyright clean.
-- aws pairs show a gain before land; queue receives the diff and numbers first.
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 216 — Codex hook installer tests call the installer in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/hooks/test_codex_hooks.py` call the installer `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
+
+**Spec:**
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `hooks/test_codex_hooks.py`.
+2. In `run_installer` (`test_codex_hooks.py:197`), call the installer `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment`, the same action and the same cwd.
+3. Bind each module-level path the installer reads from the environment for each call; restore it after the call.
+4. Keep real processes for the fake app-server and stub processes, the closure cases and one CLI entry test.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the installer, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/hooks/test_codex_hooks.py` — `run_installer`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern.
+- Census: 67 starts, 8.074 local CPU s; upper bound.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 217 — Codex wind-down tests call the wind-down command in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/production/test_codex_winddown.py` call the wind-down `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
+
+**Spec:**
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `production/test_codex_winddown.py`.
+2. In `run_script` (`test_codex_winddown.py:637`), call the wind-down `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment` and the same arguments. Use `production_state=True` where the production paths apply.
+3. Bind `STATE`, `NOTIFIER`, the broadcast paths and the production paths from that environment for each call; restore them after the call.
+4. Keep real processes where a test proves a detached child, a signal, a timeout, the caller's pane or process evidence, or the CLI entry.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the wind-down script, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/production/test_codex_winddown.py` — `run_script`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern; Phase 212 used `production_state=True`.
+- Census: 21 starts, 7.674 local CPU s; upper bound.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 218 — The unit lookup test module keeps only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/production/test_unit_lookup.py` went from 67 to 60 tests under Rule 2. The removed tests checked a constructor type, timer and process-scan call counts, and a retired history tail reader. The `live_hosts` helper and unused `renamed_production` rows went with them. All 60 retained tests and 205 assertions are unchanged. Both blind reviews approved each removal. Checkpoint `76007751d`.
+

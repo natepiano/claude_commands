@@ -5174,14 +5174,20 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
         notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+            ProblemCause("warning", warning), NoUserStep())))
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 

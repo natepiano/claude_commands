@@ -105,7 +105,7 @@ def paired_trial():
         subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30',
                         '-X', 'PUT', '--data-binary', '@-', url], input=content, check=True)
     def upload():
-        put(links['log'], log.read_bytes() if log.exists() else b'')
+        put(links['log'], b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists()))
     try:
         repo = root / 'repo'
         subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
@@ -128,6 +128,8 @@ def paired_trial():
                 remaining = gate_request['expires'] - time.time() - gate_request['delivery_s']
                 budget = min(gate_request['module_time_limit_s'], max(0, remaining / (2 * (gate_request['rounds'] - round_number + 1))))
                 for variant in variants:
+                    stage('warm-up ' + variant if warming else f"round {round_number} of {gate_request['rounds']} {variant}")
+                    upload()
                     repo = trees[variant]
                     subprocess.run(['git', '-C', str(repo), 'reset', '--hard'], check=True, capture_output=True)
                     subprocess.run(['git', '-C', str(repo), 'clean', '-fdx', '-e', '__pycache__/'], check=True, capture_output=True)
@@ -200,7 +202,7 @@ def paired_trial():
                             output.write((work / 'output').read_text(errors='replace') + '\n')
                             if not warming:
                                 output.write(json.dumps(row) + '\n')
-                        upload()
+        stage('finish')
         reply['verdict'] = 'pass' if len(rows) == 2 * gate_request['rounds'] and all(row['status'] == 0 and row['tests'] is not None for row in rows) else 'fail'
     except BaseException:
         reply['error'] = traceback.format_exc()
@@ -262,12 +264,15 @@ for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/clou
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         continue
     break
+def stage(name):
+    try:
+        with (root / 'boot.log').open('a') as output:
+            output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
+    except OSError:
+        pass
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
-def stage(name):
-    with (root / 'boot.log').open('a') as output:
-        output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
 def get(url, destination):
     subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
 def put(url, content):

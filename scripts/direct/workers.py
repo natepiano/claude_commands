@@ -160,13 +160,11 @@ def shown_name(run: Path, address: str, *, role: str = "", held_design_id: str =
     owner = membership.parent_of(parent)
     assigned_role = role
     if not assigned_role:
-        from scripts.direct import progress_history
-        dispatch = progress_history.last_dispatch(member.id)
-        assigned_role = dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch) else ""
+        assigned_role = member.role.value if isinstance(member.role, staff.KnownWorkerRole) else ""
     jobs: dict[str, JobKey] = {"impl": "implementer", "test": "tester", "fix": "repair_worker",
                                "review": "code_reviewer"}
     peers = [row.name for row in membership.find(kind="worker", parent=parent.id)]
-    ordinal = peers.index(address) + 1
+    ordinal = peers.index(member.name) + 1
     return titles.unit_worker_title(owner.name if owner is not None else "", parent.name,
                                     jobs.get(assigned_role, "worker"),
                                     ordinal, address)

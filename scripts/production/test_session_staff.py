@@ -60,12 +60,13 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
         fixture = self.row_production()
         showrunner_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        resumed_unit = replace(fixture.unit, current_session=fixture_runtime_id("resumed-run-owner"))
         rows = (fixture.runner, fixture.unit, fixture.worker)
         before = self.staff_state()
         for state, membership, expected in (
             ({"owner_staff_id": fixture.unit.id}, rows, (fixture.worker,)),
             ({"owner_staff_id": fixture.runner.id}, (*rows[:-1], showrunner_worker), (showrunner_worker,)),
-            ({"main_agent": {"session_id": fixture.unit.current_session}}, rows, (fixture.worker,)),
+            ({"owner_staff_id": fixture.unit.id}, (fixture.runner, resumed_unit, fixture.worker), (fixture.worker,)),
             ({}, rows, ()),
         ):
             with self.subTest(state=state):

@@ -208,7 +208,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
-        for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
+        for name in ("direct/board.sh", "direct/file_lock.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
                      "lib/process_start.py", "lib/conf.sh", "lib/conf_record.sh", "lib/conf.py", "lib/conf_reads.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)

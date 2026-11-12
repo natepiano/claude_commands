@@ -94,7 +94,8 @@ def _record(launch: ClaudeLaunch, name: str) -> bool:
             if not session:
                 return False
             with worker_lifecycle.locked_state(path) as state:
-                state.publish(json.dumps({**state.read_object(), **identity}))
+                state.publish(json.dumps({**{key: value for key, value in state.read_object().items()
+                                             if key not in ("name", "family")}, **identity}))
             return True
     except Exception:
         return False

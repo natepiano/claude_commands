@@ -79,9 +79,10 @@ def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
     return path, text, tuple(_records(text))
 
 
-def launch_configuration(environment: Mapping[str, str]) -> LaunchModelConfiguration:
+def launch_configuration(environment: Mapping[str, str], *, registry: Path | None = None) -> LaunchModelConfiguration:
     """Use the parent's operation configuration, or read a new configuration."""
-    return LaunchModelConfiguration(*_snapshot(environment, OPERATION_ENVIRONMENT[0], registry_path(), synchronize=True))
+    return LaunchModelConfiguration(*_snapshot(
+        environment, OPERATION_ENVIRONMENT[0], registry or registry_path(), synchronize=True))
 
 
 def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
@@ -135,11 +136,15 @@ class LaunchSettings(NamedTuple):
 def claude_model(model: str, environment: Mapping[str, str]) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
+        configuration = LaunchModelConfiguration(*_snapshot(
+            environment, OPERATION_ENVIRONMENT[0], registry_path(environment)))
         result = subprocess.run(
-            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+            ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+             + '_agents_model_slug claude "$2"', "claude-model",
              str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            input=configuration_shell(configuration),
             env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return model
     return result.stdout.strip()
 
@@ -212,9 +217,14 @@ class FastForward(NamedTuple):
     registry_entry: str
 
 
-def registry_path() -> Path:
-    configured = os.environ.get("MODELS_CONFIG_FILE")
-    return Path(configured) if configured else DEFAULT_PATH
+def registry_path(environment: Mapping[str, str] | None = None) -> Path:
+    configured = (os.environ if environment is None else environment).get("MODELS_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    if environment is None:
+        return DEFAULT_PATH
+    home = Path(environment.get("HOME", str(Path.home())))
+    return home / ".claude/config/models.conf"
 
 
 def registry_text(registry: Path | None = None) -> str:

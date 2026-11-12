@@ -473,9 +473,9 @@ def origin_url(source: Path) -> str | None:
 
 def main_checkout(source: Path) -> Path:
     """Read the main checkout, including repositories with separate Git metadata."""
-    common, current = git(source, "rev-parse", "--path-format=absolute",
-                          "--git-common-dir", "--git-dir").decode().splitlines()
-    if common == current and git(source, "rev-parse", "--is-bare-repository").strip() == b"false":
+    common, current, bare = git(source, "rev-parse", "--path-format=absolute",
+                                "--git-common-dir", "--git-dir", "--is-bare-repository").decode().splitlines()
+    if common == current and bare == "false":
         return Path(git(source, "rev-parse", "--show-toplevel").decode().strip())
     first = git(source, "worktree", "list", "--porcelain").decode().splitlines()[0]
     checkout = Path(first.removeprefix("worktree "))
@@ -1069,18 +1069,38 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
             COMMAND_LOCKS.reset(token)
 
 
-def end_workspaces(task: str, paths: list[Path]) -> None:
-    """End native copies for the sweep and remove adopted workers through guarded cleanup."""
+@dataclass(frozen=True)
+class HeldCrateRunLock:
+    """The caller holds this run lock through workspace removal."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class AcquireCrateRunLock:
+    """The removal guard must acquire the linked run lock."""
+
+
+CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
+ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+
+
+def end_workspaces(task: str, paths: list[Path], *,
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
+    """End workspace records and remove copies linked to terminal crates."""
     holds = scratch.holds()
     changed = False
-    for hold in holds.values():
-        if hold["task"] == task:
+    selected = {str(path.resolve()) for path in paths}
+    for path, hold in holds.items():
+        if path in selected and hold["task"] == task:
             hold["ended"] = time.time()
             changed = True
     if changed:
         scratch.write_holds(holds)
     for tree in paths:
-        if copy_record.copy_folder(tree) != tree.resolve():
+        record = scratch.task_of(tree)
+        if (copy_record.copy_folder(tree) != tree.resolve()
+                and not (isinstance(record, copy_record.Registered) and "crate_run" in record.fields)):
             if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
                     or scratch.end_copy(tree, task, time.time())):
                 hold = scratch.holds().get(str(tree.resolve()))
@@ -1088,15 +1108,33 @@ def end_workspaces(task: str, paths: list[Path]) -> None:
                     _ = scratch.release(tree)
             continue
         if not tree.exists():
+            if isinstance(record, copy_record.Registered) and record.task == task:
+                with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, scratch.removal_lock(tree) as idle:
+                    if not idle:
+                        raise CopyError(f"{tree}: workspace is busy during task completion")
+                    validate()
+                    scratch.remove_with_cargo_output(tree, scratch.remove)
+                    scratch.removal_mark(tree).unlink(missing_ok=True)
+            hold = scratch.holds().get(str(tree.resolve()))
+            if hold is not None and hold["task"] == task:
+                _ = scratch.release(tree)
             continue
-        with claim_tree(tree, create=False) as state:
+        if not isinstance(record, copy_record.Registered) or record.task != task:
+            raise CopyError(f"{tree}: workspace task differs")
+        with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, claim_tree(tree, create=False) as state:
             if state is not ClaimState.ACQUIRED:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(record, copy_record.Registered) or record.task != task:
+            def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+                if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise CopyError(f"{tree}: workspace task differs")
-                return {**record.fields, "ended": time.time(), "ended_task": task}
-            _ = scratch.update_record(tree, ended)
+                return {**current.fields, "ended": time.time(), "ended_task": task}
+            validate()
+            if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
+                _ = scratch.update_record(tree, ended)
+            if "crate_run" not in record.fields:
+                continue
+            scratch.remove_marked(tree, scratch.remove)
+        _ = scratch.release(tree)
 
 
 @contextmanager
@@ -1304,8 +1342,9 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
 
 
 @contextmanager
-def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Generator[Callable[[], None]]:
-    """Lock the linked run before the copy, then read its state under both locks."""
+def workspace_removal_guard(tree: Path, record: copy_record.Registered, *,
+                            run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> Generator[Callable[[], None]]:
+    """Use the caller's run lock or acquire it before the copy lock."""
     if "crate_run" not in record.fields:
         yield lambda: None
         return
@@ -1329,7 +1368,7 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 raise ValueError("manifest authority differs or crate records are missing")
             stages: list[str] = []
             matched = False
-            terminal = True
+            terminal = False
             for package, item in cast(dict[str, object], crates).items():
                 if not isinstance(item, dict):
                     raise ValueError("invalid crate record")
@@ -1337,19 +1376,24 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 checkout, stage = fields.get("checkout"), fields.get("stage")
                 if not isinstance(checkout, str) or not isinstance(stage, str):
                     raise ValueError("crate checkout or stage is missing")
-                matched |= Path(checkout).resolve() == tree.resolve()
+                if Path(checkout).resolve() == tree.resolve():
+                    matched = True
+                    terminal = stage in ("integrated", "abandoned")
                 stages.append(f"{package}={stage}")
-                terminal &= stage in ("integrated", "abandoned")
             if not matched:
                 raise ValueError("manifest does not own this copy")
             stage_summary = ", ".join(stages)
             if not terminal:
-                raise CopyError(f"{tree}: crate run {path} is not terminal; stages: {stage_summary}")
+                raise CopyError(f"{tree}: crate run {path}: owning crate is not terminal; stages: {stage_summary}")
         except (OSError, UnicodeError, ValueError) as error:
             raise CopyError(f"{tree}: repair crate run {path}: {error}") from error
 
+    lock_path = path.parent / "run.lock"
+    if isinstance(run_lock, HeldCrateRunLock) and run_lock.path == lock_path:
+        yield validate
+        return
     try:
-        with file_lock.exclusive(path.parent / "run.lock", wait=False) as state:
+        with file_lock.exclusive(lock_path, wait=False) as state:
             if state is file_lock.LockResult.BUSY:
                 pid = file_lock.lock_holder(str(path.parent / "run.lock"))
                 busy = BusyCopy(tree, KnownHolder(pid) if pid is not None else None)

@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.direct import plan_history  # noqa: E402
 from scripts.history import rounds  # noqa: E402
-from scripts.lib.transcripts import open_transcript, transcript_paths
+from scripts.lib.transcripts import distinct_files, open_transcript, transcript_paths
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.style.git_process import GitBlob, read_batch_blob
 from scripts.usage import collect, weights  # noqa: E402
@@ -910,7 +910,7 @@ def read_director_transcripts(home: Path, directors: Sequence[DirectorSession]) 
         if director.family != "claude":
             result[director] = NotRecorded("director transcript", f"{director.family} has no compact_boundary/Read evidence")
             continue
-        paths = sorted(transcript_paths(home / ".claude/projects", f"*/{director.session}.jsonl"))
+        paths = distinct_files(transcript_paths(home / ".claude/projects", f"*/{director.session}.jsonl"))
         result[director] = (read_transcript(paths[0]) if len(paths) == 1 else
                             NotRecorded("director transcript", "transcript is absent or has multiple paths"))
     return result

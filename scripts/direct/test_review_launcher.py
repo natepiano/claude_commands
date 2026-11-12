@@ -13,6 +13,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import unittest
 from scripts.direct import review_launcher_test_support as support
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from pathlib import Path
 from typing import cast
@@ -174,11 +175,41 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                 self.assertIn("1", str(row["review_pass"]))
 
     def test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot(self) -> None:
-        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass")
-        command = self.review_command(session, "contract", "")
-        first = subprocess.run(command, env=environment, capture_output=True, text=True,
-                               timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        for restricted_path in (False, True):
+            with self.subTest(restricted_path=restricted_path):
+                self.assert_shared_fast_fix_snapshot(restricted_path)
+
+    def assert_shared_fast_fix_snapshot(self, restricted_path: bool) -> None:
+        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass-" + str(restricted_path))
+        if restricted_path:
+            tools = self.root / "snapshot-tools"
+            tools.mkdir()
+            for name in ("awk", "bash", "cat", "cp", "cut", "date", "dirname", "env", "git", "grep",
+                         "head", "id", "ln", "mkdir", "mktemp", "mv", "ps", "python3", "readlink", "rm", "sed",
+                         "sleep", "sort", "stat", "tail", "touch", "tr", "uname", "wc"):
+                command_path = shutil.which(name)
+                self.assertIsNotNone(command_path, name)
+                assert command_path is not None
+                (tools / name).symlink_to(command_path)
+            environment["PATH"] = str(tools)
+            self.assertIsNone(shutil.which("flock", path=environment["PATH"]))
+            self.assertIsNone(shutil.which("perl", path=environment["PATH"]))
+        calls = session / "snapshot-calls"
+        script = self.root / "scripts/production/fast_track.py"
+        _ = script.write_text("from pathlib import Path\nimport sys\n"
+                              + "if '--pending' in sys.argv:\n"
+                              + "    with Path(" + repr(str(calls)) + ").open('a') as output:\n"
+                              + "        output.write('pending\\n')\n" + script.read_text())
+        lenses = ("contract", "adversary") if restricted_path else ("contract",)
+        with ThreadPoolExecutor(max_workers=len(lenses)) as executor:
+            reviews = [executor.submit(subprocess.run, self.review_command(session, lens, ""),
+                                       env=environment, capture_output=True, text=True,
+                                       timeout=TEST_HANG_GUARD_SECS) for lens in lenses]
+            for review in reviews:
+                first = review.result(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        snapshot = session / "review_fast_track_1.diff"
+        original = snapshot.read_bytes(), snapshot.stat().st_mtime_ns, snapshot.stat().st_ino
         later = {**self.fast_track_review_rows()[0], "commit": "1" * 40,
                  "patch_sha256": hashlib.sha256(b"next pass fix").hexdigest(), "review": "pending"}
         records = self.root / "fast-track-state/records.jsonl"
@@ -193,6 +224,8 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                 self.assertIn(tip, prompt)
                 self.assertIn("+already pushed fast fix", prompt)
                 self.assertNotIn(str(later["commit"]), prompt)
+                self.assertEqual((snapshot.read_bytes(), snapshot.stat().st_mtime_ns, snapshot.stat().st_ino), original)
+        self.assertEqual(calls.read_text().splitlines(), ["pending"])
         reviewed, pending = self.fast_track_review_rows()
         self.assertEqual(reviewed["review"], "reviewed")
         self.assertEqual(pending["review"], "pending")

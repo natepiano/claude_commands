@@ -476,10 +476,11 @@ class CrateRunTests(CargoProjectTests):
                     if path == worker and boundary == "before hold release":
                         raise RuntimeError(boundary)
                     return original_release(path)
-                def end(task: str, paths: list[Path]) -> None:
+                def end(task: str, paths: list[Path], *,
+                        run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
                     if boundary == "before cleanup":
                         raise RuntimeError(boundary)
-                    original_end(task, paths)
+                    original_end(task, paths, run_lock=run_lock)
                 with (mock.patch.object(scratch, "remove", side_effect=remove),
                       mock.patch.object(scratch, "release", side_effect=release),
                       mock.patch.object(copies, "end_workspaces", side_effect=end)):
@@ -492,22 +493,21 @@ class CrateRunTests(CargoProjectTests):
                 self.assertFalse(scratch.removal_mark(worker).exists())
                 self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
 
-    def test_terminal_cleanup_keeps_locked_or_unsaved_adopted_workers(self) -> None:
+    def test_terminal_cleanup_keeps_locked_adopted_workers_then_removes_unsaved_work(self) -> None:
         worker = self.legacy_worker()
         with mock.patch.object(copies, "end_workspaces"):
             manifest = self.finish_run()
         with scratch.busy_locks(worker, create=True) as idle:
             self.assertTrue(idle)
-            copies.end_workspaces(self.batch.task, [worker])
+            with self.assertRaisesRegex(copies.CopyError, "workspace is busy"):
+                copies.end_workspaces(self.batch.task, [worker])
             self.assertTrue(worker.exists())
             self.assertIn(str(worker), scratch.holds())
         _ = (worker / "pending.txt").write_text("keep unsaved work\n")
         _ = self.finish_run()
-        self.assertTrue(worker.exists())
-        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
-        self.assertEqual((worker / "pending.txt").read_text(), "keep unsaved work\n")
+        self.assertFalse(worker.exists())
+        self.assertNotIn(str(worker), scratch.holds())
         self.assertEqual(self.batch.read(), manifest)
-        (worker / "pending.txt").unlink()
         with (self.subTest(resume="without frozen checkout"),
               mock.patch.object(self.batch, "frozen_checkout",
                                 side_effect=AssertionError("terminal resume builds the frozen checkout"))):
@@ -535,8 +535,8 @@ class CrateRunTests(CargoProjectTests):
                 _ = self.advance("beta")
         self.assertTrue(worker.exists())
         _ = self.advance("beta")
-        self.assertIsInstance(scratch.lifetime(worker), scratch.Ended)
-        self.assertIn(worker, scratch.end(self.batch.task))
+        self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
+        self.assertNotIn(worker, scratch.end(self.batch.task))
         self.assertFalse(worker.exists())
 
     def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
@@ -587,6 +587,7 @@ class CrateRunTests(CargoProjectTests):
             if (repo / copies.GATE_RECORD).is_file():
                 self.assertEqual(copies.read_record(repo).owner, frozen_owner)
             else:
+                self.assertIn(repo, list(scratch.copy_paths()))
                 record = scratch.task_of(repo)
                 self.assertIsInstance(record, copy_record.Registered)
                 assert isinstance(record, copy_record.Registered)
@@ -598,9 +599,9 @@ class CrateRunTests(CargoProjectTests):
         for package in manifest["crates"]:
             result = self.batch.advance(package, renamed, registered, available, fixture_execute)
             worker = Path(result["crates"][package]["checkout"])
-            self.assertIn(worker, list(scratch.copy_paths()))
-            self.assertIsInstance(scratch.task_of(worker), copy_record.Registered)
-            self.assertIsNone(scratch.unsaved_work(worker))
+            self.assertNotIn(worker, list(scratch.copy_paths()))
+            self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
+            self.assertFalse(worker.exists())
         gates = list((copies.gates_root() / self.repo.name).iterdir())
         self.assertEqual({tree.name for tree in gates}, {"sample-style-gate", "sample-style-gate-2"})
         self.assertTrue(all((tree / "target").is_dir() for tree in gates))
@@ -1628,13 +1629,22 @@ class CrateRunTests(CargoProjectTests):
         _ = self.git("update-ref", self.destination, self.base)
         self.authority.set_tip(self.base)
         self.freeze(paths=("src/lib.rs",))
-        result = self.advance("bulk_sample")
+        end_workspaces = copies.end_workspaces
+
+        def unchanged_before_removal(task: str, paths: list[Path], *,
+                                     run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
+            record = self.batch.read()["crates"]["bulk_sample"]
+            self.assertEqual((Path(record["checkout"]) / "src/lib.rs").read_bytes(),
+                             (self.repo / "src/lib.rs").read_bytes())
+            end_workspaces(task, paths, run_lock=run_lock)
+
+        with mock.patch.object(copies, "end_workspaces", side_effect=unchanged_before_removal):
+            result = self.advance("bulk_sample")
         record = result["crates"]["bulk_sample"]
         self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
         self.assertIn("shared or cross-crate", record.get("error", ""))
         self.assertEqual(self.commands.calls, [])
-        self.assertEqual((Path(record["checkout"]) / "src/lib.rs").read_bytes(),
-                         (self.repo / "src/lib.rs").read_bytes())
+        self.assertFalse(Path(record["checkout"]).exists())
 
     def test_partial_refusal_publication_resumes_without_releasing_checkpointed_ticket(self) -> None:
         _ = (self.repo / "src/second.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
