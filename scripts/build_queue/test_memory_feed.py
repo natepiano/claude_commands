@@ -137,6 +137,51 @@ class MemoryFeedTests(unittest.TestCase):
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
             "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
 
+    def test_row_tooltips_keep_fields_after_the_step_table_is_removed(self) -> None:
+        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(os, "cpu_count", return_value=4)):
+            page = memory_feed.reading()
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        html = self.expected_page()
+        functions = html[html.index("const TIPS ="):html.index("const tip =")]
+        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        javascript = functions + constants + """
+const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+process.stdout.write(JSON.stringify({
+  walk:data.walk.map((row,index)=>tipText('row:'+index,data)),
+  waiters:data.waiters.map((row,index)=>tipText('wait:'+index,data))}));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload), text=True,
+            capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tips = cast(dict[str, list[list[str]]], json.loads(result.stdout))
+        for collection, kind in (("walk", "row"), ("waiters", "wait")):
+            rows = cast(list[dict[str, object]], payload[collection])
+            local_position = 0
+            for index, row in enumerate(rows):
+                if kind == "row" and not (row.get("queued") or row.get("kind") == "cloud"):
+                    continue
+                if kind == "wait" and row.get("kind") != "cloud":
+                    local_position += 1
+                with self.subTest(kind=kind, pid=row["pid"]):
+                    tooltip = tips[collection][index]
+                    text = "\n".join(tooltip)
+                    place = "run" if kind == "row" else "cloud" if row.get("kind") == "cloud" else str(local_position)
+                    self.assertIn(f"Place: {place}", text)
+                    self.assertIn(f"Pid: {row['pid']}", text)
+                    self.assertIn(f"Machine: {row.get('machine') or 'not assigned'}", text)
+                    self.assertIn(f"vCPU: {row['vcpus'] if kind == 'row' else 'not assigned'}", text)
+                    unit = str(row["unit"])
+                    if unit and unit == row["name"]:
+                        self.assertNotIn("Unit:", text)
+                    else:
+                        self.assertIn(f"Unit: {unit or 'not recorded'}", text)
+                    self.assertNotIn(str(row["name"]), text)
+                    if row.get("kind") == "cloud":
+                        self.assertNotIn(str(row.get("status") or row.get("reason")), text)
+
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
         self.assertIn('id="answer" data-tip="answer">Next step room</div>', page)
