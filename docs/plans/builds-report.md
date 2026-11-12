@@ -1014,51 +1014,71 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
 
 ### Phase 50 — Gate records hold each module's start and end time · status: done
-**Depends on:** the owners' go: sdlc for `scripts/production/merge_gate.py`, natest for `scripts/test_times/gate_record.py`, and aws for `scripts/aws_target/gate_box.py`.
 
-From the sdlc showrunner (not the user), 2026-11-11: go on `merge_gate.py` and `test_merge_gate_suites_tripwires.py`. Keep the rule: no verdict, selection or scheduling change. Before the checkpoint notice, merge `origin/main` after the sdlc-devtools branch lands; it changes the nightly result code in `merge_gate.py`.
+#### As-built
 
-From the aws unit (not the user), 2026-11-11: go on `gate_box.py`. Keep the result fields that `cloud_gate.py` reads unchanged, and run the `scripts/aws_target` tests.
+- Each gate module run records its wall-clock start and end. `start_gate_job` sets `RunningGateJob.started_at`; `finish_gate_job` passes it on and sets `ended_at`. A hold restart keeps both times.
+- `GateJobResult` and `gate_record.Execution` carry `started_at` and `ended_at` as keyword-only `float | None`. `None` means "not recorded": a job that never started, or a result from a box that runs an older tree.
+- `gate_record.module_runs` writes `started_at` and `ended_at` as UTC ISO text (`store.utc_iso`) only when recorded. `ModuleRun` marks both keys `NotRequired`.
+- The cloud transfer keeps the times. `gate_box.encode_run` leaves out an unknown time. The decoder accepts a row with no times and refuses a negative or non-finite time.
+- `buildlog` schema 40 adds `gate_modules.module_started_at` and `module_ended_at` (TEXT). Older records give NULL. `gate_runs.started_at` is still the run start.
+- `docs/as-built/merge-gate-and-test-speed.md` has a "Module start and end times" section with the ordering query.
 
-From natest (not the user), 2026-11-11: go on `gate_record.py`. Add fields only and keep existing names: natest Phase 176 edits `scripts/production/affected_modules.py`, which imports `gate_record`. Send natest the hash when it lands; natest Phase 174 needs the start times.
+**Files:**
+- `scripts/production/merge_gate.py` — `GateJobResult`, `RunningGateJob`, `start_gate_job`, `finish_gate_job`, `record_gate_run`.
+- `scripts/test_times/gate_record.py` — `ModuleRun`, `Execution`, `module_runs`.
+- `scripts/aws_target/gate_box.py` — `encode_run`, the job decoder, `execution_records`.
+- `scripts/buildlog/index.py` — `SCHEMA_VERSION`, `GATE_MODULE_COLUMNS`, `add_gate_run`.
+- `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
 
-From the builds showrunner (not the user), 2026-11-11: "Gate records hold no module start or end time: every module row has the gate start time (scripts/buildlog/index.py:955,964). So no one can measure the gate tail or module order. Record each module's start and end time in the gate records, from merge_gate.py through the index. One owner switches all callers."
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: todo
+**Depends on:** Phase 50, and the owners' go: sdlc for `scripts/production/merge_gate.py`, natest for `scripts/test_times/gate_record.py`, and aws for `scripts/aws_target/gate_box.py`.
 
-Director decisions: `gate_modules.started_at` stays the run's start, because the index key, `gate_tests` and window queries use it. Two new columns hold the module's own times. Records made before this phase have NULL in them; a rebuild cannot make up a time that was never recorded.
+Director decision, 2026-11-11 (Phase 50 phase review): Phase 50 put two bare `float | None` fields on `GateJobResult` and `gate_record.Execution`. The Type Design Contract treats a bare optional in a domain type as a design defect. The two optionals also allow a start with no end. `gate_record` already names its absent states (`NoModuleTimes`, `TimingNotApplicable`), so this phase follows that form.
+
+From the sdlc showrunner (not the user), 2026-11-11: go on `merge_gate.py` and `test_merge_gate_suites_tripwires.py`. A cloud row with only one of the two times gives a record refusal, not a failed gate verdict. Before the checkpoint notice, check the hash against `origin/sdlc-devtools`, which still waits to land.
+
+From natest (not the user), 2026-11-11: go on `gate_record.py` and `test_gate_record.py`. natest reads only the JSON keys and the `buildlog` columns. Send natest the hash when it lands on builds.
+
+From the aws unit (not the user), 2026-11-11: go on `gate_box.py` and `test_gate_box.py`. A cloud row with only one time must not fail or void the gate verdict; keep the pass or fail result, and add a test row that shows it.
 
 #### Work Order
 
-**Goal:** Each gate module attempt records the wall-clock time it started and ended. `gate_modules` shows both times, so a query can order modules and measure the gate tail.
+**Goal:** One field states whether a gate module attempt has a recorded wall-clock span. The JSON record, the cloud wire format and the `buildlog` columns do not change.
 
 **Spec:**
-- `scripts/production/merge_gate.py`: `RunningGateJob` gets `started_at: float`, the `time.time()` when the job starts, beside the monotonic `started`. `GateJobResult` gets `started_at: float` and `ended_at: float`, wall-clock epoch seconds, as keyword fields with `field(default_factory=time.time)`. `finish_gate_job` sets `started_at` from the running job and `ended_at` to `time.time()`. A result made without a run (the type-check setup failure, the runner error) keeps the default: start and end are the time it was made.
-- `scripts/test_times/gate_record.py`: `Execution` gets `started_at: float` and `ended_at: float`. `ModuleRun` gets `started_at: str` and `ended_at: str`, in the UTC ISO form that `GateRun` uses. `module_runs` fills them from the execution.
-- Every builder of `gate_record.Execution` passes the two times: `record_gate_run` in `merge_gate.py` and `execution_records` in `scripts/aws_target/gate_box.py`. The cloud decoder in `gate_box.py` reads `started_at` and `ended_at` as finite nonnegative numbers, as it reads `seconds`. `encode_run` already sends every field.
-- `scripts/buildlog/index.py`: `gate_modules` gets `module_started_at` and `module_ended_at` (TEXT, UTC ISO). `add_gate_run` fills them from the module's own `started_at` and `ended_at`. A record without them gives NULL. `started_at` stays the run's start. `SCHEMA_VERSION` goes up by one, so the index rebuilds from the JSON lines.
-- Tests add rows to existing tests:
-  - `scripts/test_times/test_gate_record.py`: the `module_runs` test checks both times.
-  - `scripts/buildlog/test_gate_index.py`: a new record fills both columns. A record without module times gives NULL. `started_at` stays the run's start.
-  - `scripts/aws_target/test_gate_box.py`: the decode table gets rows for a missing, negative and NaN `started_at`, and the round trip keeps both times.
-  - `scripts/production/test_merge_gate_suites_tripwires.py` (or the test that runs `finish_gate_job`): a finished job has `started_at <= ended_at`, both wall-clock.
-- `docs/as-built/merge-gate-and-test-speed.md` names the two columns and gives one query that orders a run's modules by `module_started_at`.
+- `scripts/test_times/gate_record.py`: add two frozen dataclasses beside `NoModuleTimes`:
+  - `WallClockSpan(started_at: float, ended_at: float)` — the wall-clock epoch seconds when one module attempt started and ended.
+  - `WallClockNotRecorded(reason: str)` — the attempt has no recorded span. Reasons: the job never ran, or the cloud box ran a tree without module times.
+- `Execution` replaces `started_at` and `ended_at` with one keyword field `wall_clock: WallClockSpan | WallClockNotRecorded`, default `WallClockNotRecorded("not recorded")`. `module_runs` writes `started_at` and `ended_at` (UTC ISO, `store.utc_iso`) only for a `WallClockSpan`. `ModuleRun` keeps both keys `NotRequired`.
+- `scripts/production/merge_gate.py`: `GateJobResult` replaces its two fields with the same `wall_clock` field, default `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets `WallClockSpan(job.started_at, time.time())`. `RunningGateJob.started_at` stays a `float`. `record_gate_run` passes `wall_clock=job.wall_clock`.
+- `scripts/aws_target/gate_box.py`: the wire format stays the same. `encode_job` writes top-level `started_at` and `ended_at` for a `WallClockSpan` and leaves both out for `WallClockNotRecorded`; it writes no `wall_clock` key. The decoder makes a `WallClockSpan` when both keys are present (finite, nonnegative), `WallClockNotRecorded("box result has no module times")` when both are absent, and `WallClockNotRecorded("box result has only one module time")` when only one is present. A half-timed row never fails the decode or the gate verdict. A present time that is negative or not finite is still refused, as in Phase 50. `execution_records` passes `wall_clock`.
+- No other module reads the two old fields. `scripts/buildlog/index.py` reads the JSON keys and does not change.
+- Tests change rows in existing tests only:
+  - `scripts/test_times/test_gate_record.py`: the table builds `WallClockSpan` values; the `test_legacy.py` row uses `WallClockNotRecorded` and has no time keys.
+  - `scripts/aws_target/test_gate_box.py`: the round trip keeps the span; the `recorded_times=False` subtest decodes to `WallClockNotRecorded`; a row with only `started_at` and a row with only `ended_at` decode to `WallClockNotRecorded` and keep the job status.
+  - `scripts/production/test_merge_gate_suites_tripwires.py`: the wall-clock assertions read `result.wall_clock`.
 
 **Files:**
-- `scripts/production/merge_gate.py`
 - `scripts/test_times/gate_record.py`
+- `scripts/production/merge_gate.py`
 - `scripts/aws_target/gate_box.py`
-- `scripts/buildlog/index.py`
 - `scripts/test_times/test_gate_record.py`
-- `scripts/buildlog/test_gate_index.py`
 - `scripts/aws_target/test_gate_box.py`
 - `scripts/production/test_merge_gate_suites_tripwires.py`
-- `docs/as-built/merge-gate-and-test-speed.md`
 
 **Workers:** `1 writer`
-- writer — all files and the tests.
+- writer — all files and the tests. `merge_gate.py` and `gate_record.py` change together, so one slot holds both.
 
-**State:** the buildlog index schema goes up by one. The index rebuilds from the JSON lines on the next read. Old JSON lines do not change.
+**Constraints from prior phases:**
+- Phase 50: the cloud box imports `merge_gate` and `gate_box` from the gated tree, but `cloud_gate.py` decodes with the local tool checkout. Keep the top-level `started_at`/`ended_at` keys, so boxes on older and newer trees decode both ways.
+- Phase 50: `gate_modules.started_at` is the run's start; `module_started_at` and `module_ended_at` hold the module's times. Do not change them.
+- natest Phase 174 reads the JSON keys and the `buildlog` columns, which stay the same.
+
+**State:** none. The JSON record, the wire format and the index schema do not change.
 
 **Acceptance gate:**
-- After one targeted test run, `buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"` lists each module with two times inside the run's start and end.
-- The four test modules above, `scripts.buildlog.test_index` and every `scripts/aws_target` test module pass.
+- `grep -n "started_at: float | None\|ended_at: float | None" scripts/production/merge_gate.py scripts/test_times/gate_record.py` finds nothing.
+- `scripts.test_times.test_gate_record`, `scripts.buildlog.test_gate_index`, `scripts.production.test_merge_gate_suites_tripwires`, `scripts.production.test_merge_gate_holds` and every `scripts/aws_target` test module pass.
 - `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
