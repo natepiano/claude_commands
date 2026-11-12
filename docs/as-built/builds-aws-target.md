@@ -646,6 +646,48 @@ Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
 
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
+The price lock stores the last refresh attempt time.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
+Each read requests all configured gate `instance_types` for Linux/UNIX.
+The controller keeps the latest price for each zone and type.
+It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
+Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
+The price refresh does not change `controller.json`.
+Failed attempts use the same refresh interval.
+The price read remains active when the former builder route is disabled or removed.
+
+A new gate ranks only variants from its deployment.
+Available variants precede variants under a capacity cooldown.
+Within each group, larger vCPU sizes precede smaller sizes.
+Types with equal vCPU counts compete on expected gate cost.
+That cost equals the hourly Spot price times expected gate hours, plus the remote region transfer charge.
+Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
+Without recent durations, it uses `lifetime_minutes`.
+`remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
+Local measurements cover 692 gates with a source bundle, request, and result.
+Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
+The median combined size is 7,107,672 bytes.
+At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+Equal costs keep configured order.
+Missing or stale prices follow fresh prices for the same vCPU count.
+Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+`MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
+Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
+It stops at the first row before the longer of the price-age and cooldown windows.
+The current two-hour window reads 65,536 bytes from a 750,584-byte local history file.
+`launch.json` saves the ranked region, type, subnet, and zone list before the first launch step.
+Resumed launches keep that list and their offset-based ClientToken values.
+Older files with only `variant` retain configured order.
+Refusal handling, regional cost bookings, and the $35 daily and $400 monthly limits remain unchanged.
+
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
@@ -666,7 +708,7 @@ The administrator IAM policy is outside the repository and needs `servicequotas:
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 128 vCPUs.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
-It uses `gpu_spot_quota_request_vcpus=4` for one xlarge GPU box.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 All three new keys are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.

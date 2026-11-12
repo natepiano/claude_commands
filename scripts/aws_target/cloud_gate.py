@@ -8,15 +8,17 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,14 @@ class LocalFallback:
 @dataclass(frozen=True)
 class CloudCompleted:
     run: gate.GateRun
+
+
+@dataclass(frozen=True)
+class GateLaunchVariant:
+    region: str
+    instance_type: str
+    subnet_id: str
+    zone: str
 
 
 def settings() -> conf.ConfigRead:
@@ -404,6 +414,57 @@ class GateWorker:
         if result == 'refused':
             print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
 
+    def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str) -> list[GateLaunchVariant]:
+        """Prefer available capacity, larger sizes, and the lowest total gate cost."""
+        values = settings()
+        policy = conf.read(self.settings_path)
+        now = self.clock()
+        max_age = policy.whole('price_max_age_seconds')
+        cooldown = values.whole('capacity_cooldown_seconds')
+        try:
+            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown))
+        except OSError:
+            history = ()
+        recent = [row for row in history if float(str(row['time'])) <= now]
+        zone_codes = {'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'}
+        quota_codes = {'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'}
+        refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
+        zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
+                 for row in refused if row.get('error_code') in zone_codes}
+        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in quota_codes}
+        def cooled(variant: GateLaunchVariant) -> bool:
+            return variant.region in regions or (variant.region, variant.instance_type, variant.zone) in zones
+        try:
+            prices = {(row.region, row.instance_type, row.zone): row.usd_per_hour
+                      for row in sorted(ledger.read_spot_prices(self.book.directory), key=lambda row: row.read_at)
+                      if 0 <= now - row.read_at <= max_age}
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+            prices = {}
+        if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
+            return sorted(variants, key=cooled)
+        durations: list[float] = []
+        for row in recent:
+            if row.get('result') != 'finished' or row.get('mode') != mode or float(str(row['time'])) < now - max_age:
+                continue
+            try:
+                duration = float(str(row['gate_s']))
+                if math.isfinite(duration) and duration > 0:
+                    durations.append(duration)
+            except (ValueError, KeyError, TypeError):
+                continue
+        hours = (Decimal(str(statistics.median(durations))) / 3600 if durations
+                 else Decimal(values.whole('lifetime_minutes')) / 60)
+        transfer = conf.decimal(values.text('remote_region_transfer_usd'))
+        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
+            position, variant = item
+            size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', variant.instance_type)
+            vcpus = (2 if size[1] == 'large' else 4 * int(size[2] or '1')) if size else 0
+            key = (variant.region, variant.instance_type, variant.zone)
+            cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
+                    if key in prices else Decimal(0))
+            return cooled(variant), -vcpus, key not in prices, cost, position
+        return [variant for _, variant in sorted(enumerate(variants), key=order)]
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
@@ -411,8 +472,17 @@ class GateWorker:
             self.box_region = str(launch.get('region', self.api.region))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
-        variants = [(regional, size, row) for regional in ledger.rows(deployment, 'regions')
-                    for size in sizes for row in ledger.rows(regional, 'subnets')]
+        variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
+                    for regional in ledger.rows(deployment, 'regions') for size in sizes for row in ledger.rows(regional, 'subnets')]
+        if not path.exists():
+            variants = self.rank_variants(variants, ledger.text(request, 'mode'))
+            launch = {'variant': 0, 'variants': [asdict(row) for row in variants]}
+            save(path, launch)
+        elif 'variants' in launch:
+            variants = [GateLaunchVariant(ledger.text(row, 'region'), ledger.text(row, 'instance_type'),
+                ledger.text(row, 'subnet_id'), ledger.text(row, 'zone')) for row in ledger.rows(launch, 'variants')]
+        saved_order = {'variants': launch['variants']} if 'variants' in launch else {}
+        regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         for offset in range(index, stop):
@@ -422,9 +492,12 @@ class GateWorker:
                 size = ledger.text(arguments, 'InstanceType')
                 zone = str(launch.get('zone', ''))
             else:
-                regional, size, subnet = variants[offset]
+                variant = variants[offset]
+                regional = regional_rows[variant.region]
+                size = variant.instance_type
+                subnet = {'id': variant.subnet_id, 'zone': variant.zone}
                 self.box_region = ledger.text(regional, 'region')
-                zone = ledger.text(subnet, 'zone')
+                zone = variant.zone
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
@@ -460,7 +533,7 @@ class GateWorker:
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 if regional.get('image'):
                     arguments['ImageId'] = ledger.text(regional, 'image')
-                launch = {'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
+                launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
                 save(path, launch)
             api = self.regional_api(self.box_region)
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
@@ -496,8 +569,8 @@ class GateWorker:
             except AwsUnavailable as error:
                 # A saved request keeps its token and bytes after an uncertain reply.
                 if capacity_error(str(error)):
-                    launch = {}
-                    save(path, {'variant': offset + 1})
+                    launch = {**saved_order, 'variant': offset + 1}
+                    save(path, launch)
                     continue
                 if not definite_refusal(str(error)):
                     raise
