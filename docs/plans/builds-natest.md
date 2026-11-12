@@ -3380,7 +3380,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `1674a8375`. `scripts/buildlog/test_record.py` runs its record-content cases through `recorder.main` and `step_context.main` in process with one `invoke_cli` helper (`test_record.py:169`). The helper sets the full environment, working folder, argv, stdin and captured output per call, maps `SystemExit` to the status, patches `recorder.detach` (`setsid` and descriptor closure), and restores all of them after the call. Real CLI starts stay for `test_step_record_fields`, the metadata stdin case, the entry-point case (now with an argument-error status) and the shell integration cases. All 84 test methods and every assertion stay; no production file changed. report approved the file at SHA-256 `feb6fcda`. aws pairs: `buildlog/test_record.py` 22.90 to 11.50 CPU s (11.40 s, 3/3 rounds); `test_record_rerun.py` 0.25 s; `test_step_row.py` unchanged.
 
-### Phase 202 — Hold-event tests run the recorder in process  · status: todo
+### Phase 202 — Hold-event tests run the recorder in process  · status: done
 **Depends on:** none
 
 #### Work Order
