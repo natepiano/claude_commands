@@ -270,7 +270,7 @@ class PaneWorld(herdr.Herdr):
         process = self.processes[pid]
         if isinstance(process.identity, herdr.LaunchArgument):
             if not reported:
-                raise ValueError("Codex launch identity is unavailable")
+                raise herdr.CodexPaneStarting(herdr.StartingCodexPane(pid))
             return herdr.NativeAgentProcess(herdr.PaneSessionReport(reported), process.started, process.environment)
         return process
 

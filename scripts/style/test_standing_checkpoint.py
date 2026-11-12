@@ -15,6 +15,7 @@ import unittest
 from contextlib import closing
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from typing import ClassVar, cast, final, override
 
@@ -235,7 +236,10 @@ class StandingCheckpointTests(unittest.TestCase):
         return first, second
 
     def publish(self, ticket: str) -> str:
-        return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
+        run_command = partial(run_style_command, self.root, self)
+        with mock.patch.object(style_plan, "subprocess", SimpleNamespace(
+                run=run_command, CalledProcessError=subprocess.CalledProcessError)):
+            return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
 
     def test_single_ticket_publishes_a_mechanical_file_outside_its_footprint_and_runs_doc_in_the_tree(self) -> None:
         extra = "alpha/src/extra.rs"
@@ -265,7 +269,9 @@ class StandingCheckpointTests(unittest.TestCase):
             return subprocess.CompletedProcess([stage, package], 0)
         with mock.patch.object(style_plan, "run_verification_step", side_effect=verify), \
                 mock.patch.object(style_plan, "candidate_source", side_effect=AssertionError("N=1 uses the editing tree")):
-            checkpoint = self.publish(ticket["id"])
+            # Keep one publication path through the real footprint child.
+            checkpoint = style_plan.publish_checkpoint(
+                self.unit, ticket["id"], self.root / "run", ticket["id"], "Checkpoint test\n")
         self.assertEqual(set(self.git(self.unit, "diff-tree", "--no-commit-id", "--name-only", "-r", checkpoint).splitlines()),
                          {ticket["files"][0], extra})
         self.assertEqual(self.git(self.unit, "status", "--porcelain"), "")
@@ -305,7 +311,10 @@ class StandingCheckpointTests(unittest.TestCase):
         self.write(self.unit / second["files"][0], "fn unfinished(\n")
         with style_ledger.open_ledger(self.unit) as ledger:
             self.assertTrue(style_plan.isolated_ticket_source(ledger, first))
-        self.assertEqual(style_plan.gate(self.unit, first["id"]), 0)
+        run_command = partial(run_style_command, self.root, self)
+        with mock.patch.object(style_plan, "subprocess", SimpleNamespace(
+                run=run_command, CalledProcessError=subprocess.CalledProcessError)):
+            self.assertEqual(style_plan.gate(self.unit, first["id"]), 0)
 
     def test_publication_recovers_a_crash_before_branch_movement(self) -> None:
         first, _ = self.parallel_tickets()

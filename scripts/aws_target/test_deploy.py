@@ -508,6 +508,9 @@ class DeploymentTests(CostFixture):
         gates = self.root / 'cloud_gate.conf'
         _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
         text_setting(gates, 'regions', 'us-east-1')
+        # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
+        _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
+                                    re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
         _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'
@@ -1013,6 +1016,10 @@ sys.exit(7)
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
+        gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
+        price_regions: list[str] = []
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
             region = args[args.index('--region') + 1]
@@ -1023,20 +1030,29 @@ sys.exit(7)
             elif 'describe-availability-zones' in args:
                 reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
             else:
-                reply = {'SpotPriceHistory': [{'InstanceType': 'm7a.8xlarge', 'AvailabilityZone': region + 'a',
-                                              'SpotPrice': '.25', 'Timestamp': 'fixture'}]}
+                self.assertIn('describe-spot-price-history', args)
+                price_regions.append(region)
+                sizes = args[args.index('--instance-types') + 1:args.index('--product-descriptions')]
+                self.assertTrue(set(gpu_types).issubset(sizes))
+                self.assertEqual(len(sizes), len(set(sizes)))
+                reply = {'SpotPriceHistory': [
+                    {'InstanceType': size, 'AvailabilityZone': region + 'a', 'SpotPrice': '.25', 'Timestamp': 'fixture'}
+                    for size in ('m7a.8xlarge', *gpu_types)]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         with (mock.patch.object(subject, '_api', return_value=aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)),
               redirect_stdout(StringIO()) as output):
             subject.prices()
         lines = output.getvalue().splitlines()
+        self.assertEqual(price_regions, ['us-east-2', 'us-west-2', 'us-east-1'])
         self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
-        for region in ('us-east-2', 'us-west-2'):
+        for region in ('us-east-2', 'us-west-2', 'us-east-1'):
             self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
             self.assertEqual(lines[lines.index(f'{region}: Spot quota 128 vCPUs') + 1],
                              f'{region}: G and VT Spot quota 48 vCPUs')
             for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
                 self.assertIn(f'{region} {size} {region}a unavailable', lines)
+            for size in gpu_types:
+                self.assertIn(f'{region} {size} {region}a .25', lines)
         self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
 
     def test_prices_and_up_report_regional_quotas_through_the_admin_executor(self) -> None:
@@ -1058,6 +1074,7 @@ sys.exit(7)
                 with self.subTest(command=command, quotas=quotas, instance_types=instance_types):
                     gates = self.root / 'cloud_gate.conf'
                     text_setting(gates, 'regions', ' '.join(quotas))
+                    text_setting(gates, 'spot_candidate_regions', ' '.join(quotas))
                     text_setting(gates, 'instance_types', instance_types)
                     subject = self.deployment()
                     subject.admin.credentials = subject.admin.get()
@@ -1134,6 +1151,7 @@ sys.exit(7)
                     self.assertNotIn('fixture-admin-secret', output)
 
     def test_prices_prints_whole_quotas_and_the_header_after_the_passphrase_prompt(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-east-1')
         subject = self.deployment()
         credentials = subject.admin.get()
         prompted = False
@@ -1232,6 +1250,7 @@ sys.exit(7)
                 subject = self.deployment()
                 subject.admin.credentials = subject.admin.get()
                 calls: list[tuple[str, str]] = []
+                gpu_regions: list[str] = []
 
                 def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
                             timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -1244,6 +1263,10 @@ sys.exit(7)
                     self.assertIsNotNone(env)
                     self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
                     self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                    if arguments[arguments.index('--quota-code') + 1] == 'L-3819A6DF':
+                        self.assertEqual(operation, get_quota)
+                        gpu_regions.append(region)
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 4}}), '')
                     expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', 'L-34B43A08']
                     if operation == request:
                         expected.extend(['--desired-value', '128'])
@@ -1277,7 +1300,10 @@ sys.exit(7)
                       mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
                       redirect_stdout(StringIO()) as captured):
                     self.assertEqual(deploy.main(), 0 if success else 1)
-                lines = captured.getvalue().splitlines()
+                lines = [line for line in captured.getvalue().splitlines() if 'G and VT' not in line]
+                self.assertEqual(gpu_regions, ['us-east-2', 'us-west-2'])
+                self.assertEqual([line for line in captured.getvalue().splitlines() if 'G and VT' in line],
+                    [f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gpu_regions])
                 self.assertEqual(lines[-1], 'us-west-2: Spot quota 300 vCPUs; no request is needed for 128 vCPUs')
                 expected_operations = [get_quota]
                 if quota < 128 and failure != get_quota:
@@ -1297,6 +1323,116 @@ sys.exit(7)
                     self.assertEqual(lines[0], f'us-east-1: Spot quota request 128 vCPUs; status {request_status}')
                 for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
                     self.assertNotIn(private, captured.getvalue())
+
+    def test_gpu_quota_request_cases_and_failures_in_each_candidate_region(self) -> None:
+        get_quota = 'get-service-quota'
+        history = 'list-requested-service-quota-change-history-by-quota'
+        request = 'request-service-quota-increase'
+        candidates = ('us-west-2', 'us-east-2')
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', ' '.join(candidates))
+        cases = (
+            (8, '', '', '', True),
+            (4, '', '', '', True),
+            (0, 'PENDING', '', '', True),
+            (0, 'CASE_OPENED', '', '', True),
+            (0, 'IN_PROGRESS', '', '', True),
+            (0, '', 'PENDING', '', True),
+            (0, 'APPROVED', 'CASE_OPENED', '', True),
+            (0, 'DENIED', 'PENDING', '', True),
+            (0, 'CASE_CLOSED', 'PENDING', '', True),
+            (0, 'NOT_APPROVED', 'PENDING', '', True),
+            (0, 'INVALID_REQUEST', 'PENDING', '', True),
+            (0, '', 'DENIED', '', False),
+            (0, '', 'NOT_APPROVED', '', False),
+            (0, '', 'INVALID_REQUEST', '', False),
+            (0, '', '', get_quota, False),
+            (0, '', '', history, False),
+            (0, '', '', request, False),
+            (0, '', '', 'timeout', False),
+            (0, '', '', 'uncoded', False),
+            (0, '', '', 'malformed', False),
+        )
+        for selected_region in candidates:
+            for quota, history_status, request_status, failure, success in cases:
+                with self.subTest(region=selected_region, quota=quota, history=history_status,
+                                  request=request_status, failure=failure):
+                    subject = self.deployment()
+                    calls: list[tuple[str, str, str]] = []
+
+                    def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                                timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                        self.assertTrue(capture_output)
+                        self.assertTrue(text)
+                        self.assertFalse(check)
+                        self.assertNotIn('--profile', arguments)
+                        self.assertIsNotNone(env)
+                        self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                        region = arguments[arguments.index('--region') + 1]
+                        code = arguments[arguments.index('--quota-code') + 1]
+                        operation = arguments[arguments.index('service-quotas') + 1]
+                        calls.append((region, code, operation))
+                        expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', code]
+                        if operation == request:
+                            expected.extend(['--desired-value', '4'])
+                        self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
+                        if code == 'L-34B43A08':
+                            self.assertEqual(region, 'us-east-1')
+                            self.assertEqual(operation, get_quota)
+                            reply: dict[str, object] = {'Quota': {'Value': 128}}
+                        elif region != selected_region:
+                            self.assertEqual(code, 'L-3819A6DF')
+                            self.assertEqual(operation, get_quota)
+                            reply = {'Quota': {'Value': 4}}
+                        elif operation == failure:
+                            return subprocess.CompletedProcess(arguments, 1, '',
+                                'An error occurred (AccessDeniedException) when calling the quota operation: '
+                                + 'private-request private-case private-account fixture-admin-secret')
+                        elif operation == request and failure == 'timeout':
+                            raise subprocess.TimeoutExpired('private-request', timeout)
+                        elif operation == request and failure == 'uncoded':
+                            return subprocess.CompletedProcess(arguments, 1, '', 'private-request private-case private-account')
+                        elif operation == get_quota:
+                            reply = {'Quota': {'Value': quota}}
+                        elif operation == history:
+                            reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 8,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}]
+                                if history_status else []}
+                        else:
+                            self.assertEqual(operation, request)
+                            reply = {} if failure == 'malformed' else {'RequestedQuota': {'Status': request_status,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}}
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                    subject.execute = execute
+                    with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                          mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                          redirect_stdout(StringIO()) as captured):
+                        self.assertEqual(deploy.main(), 0 if success else 1)
+                    expected_calls = [('us-east-1', 'L-34B43A08', get_quota)]
+                    for region in candidates:
+                        expected_calls.append((region, 'L-3819A6DF', get_quota))
+                        if region == selected_region and quota < 4 and failure != get_quota:
+                            expected_calls.append((region, 'L-3819A6DF', history))
+                            if failure != history and history_status not in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                                expected_calls.append((region, 'L-3819A6DF', request))
+                    self.assertEqual(calls, expected_calls)
+                    lines = captured.getvalue().splitlines()
+                    self.assertEqual(lines[0], 'us-east-1: Spot quota 128 vCPUs; no request is needed for 128 vCPUs')
+                    if failure:
+                        reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable', 'malformed': 'KeyError'}.get(
+                            failure, 'AccessDeniedException')
+                        expected_line = f'{selected_region}: G and VT Spot quota request failed: {reason}'
+                    elif quota >= 4:
+                        expected_line = f'{selected_region}: G and VT Spot quota {quota} vCPUs; no request is needed for 4 vCPUs'
+                    elif history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                        expected_line = f'{selected_region}: open G and VT Spot quota request 8 vCPUs; status {history_status}'
+                    else:
+                        expected_line = f'{selected_region}: G and VT Spot quota request 4 vCPUs; status {request_status}'
+                    self.assertEqual(lines, [lines[0], *[
+                        expected_line if region == selected_region else
+                        f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in candidates]])
+                    for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
+                        self.assertNotIn(private, captured.getvalue())
 
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
