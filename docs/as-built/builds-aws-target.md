@@ -493,7 +493,15 @@ The same administrator session reads failure details without another passphrase 
 ## Paired speed trials
 
 Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
-Both refs must exist in pushed public history for `~/.claude`.
+Both refs can name local commits in `~/.claude`.
+The trial pushes each commit to a fresh `gate-trial-<id>-base|changed` branch with a plain push.
+The trial folder's UUID supplies the id; `trial_branch_prefix` configures the prefix.
+At trial end, it lists the trial's remote branch namespace and deletes each branch, including after failures and signals.
+This cleanup covers a push accepted remotely before the client reports an error.
+Each network Git call uses `git_network_timeout_s`, which defaults to 60 seconds.
+A timeout or cancellation kills the Git process group, including SSH children.
+A cleanup failure prints one stderr line for the trial or branch and preserves the trial's exit code.
+The pushes use the invoking terminal's Git credentials.
 Each module uses one disposable gate box.
 All boxes launch after the full trial obtains its cloud slots and cost reservations.
 The trial refuses costs above the daily or monthly room.
