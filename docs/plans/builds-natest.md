@@ -1268,7 +1268,6 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 
 **Ruled out:** moving the SSH cases in this phase with no CPU gain. The worktree keeps that first step for Phase 66, which keeps a move only if it cuts CPU or another proof needs it.
 
-
 ### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
 
@@ -2195,7 +2194,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
 - `commands/test_times.md` — the `top` description
 
-
 ### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
 
 #### As-built
@@ -2220,7 +2218,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
 
-
 ### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
 
 #### As-built
@@ -2243,7 +2240,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A measured per-module file map: the name check keeps nearly the same gain with much less work.
 - Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
-
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
 
@@ -3107,4 +3103,66 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### As-built
 
-- Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 28 tests (about 1.3 CPU s). copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
+- Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 27 tests (about 1.3 CPU s); the report named 28, but one test changes its base before it freezes. copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
+
+### Phase 170 — The four unheld lock-contention tests use forked children  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** four tests that start fresh Python children for lock contention start forked children instead. Every test, assertion, real handler and contention boundary stays.
+
+**Decision:** Architect review after Phase 168, finding 1 (next item 6b, phase 1). Phase 168 ceiling: 2.18 CPU s. sdlc go, 2026-11-11: the three files are free.
+
+**Spec:**
+1. Convert these tests to forked children that call the real handler or `main` (the Phase 163 pattern, `scripts/production/test_waiting.py` `eta_request_processes`):
+   - `scripts/production/test_ci_points.py:1009`, `test_simultaneous_watch_calls_claim_only_one_first_alert`: 2 children; both reach the held review lock; one alert and one log record.
+   - `scripts/agents/test_detached_runs.py:381`, `test_parallel_starts_cannot_exceed_one_configured_place`: 4 children; real admission lock; statuses `[0, 4, 4, 4]`; one saved run.
+   - `scripts/usage/test_agents_log.py:343`, `test_concurrent_default_registration_writes_one_assignment_and_returns_one_true`: 6 children; one returns true; one saved assignment.
+   - `scripts/usage/test_agents_log.py:530`, `test_concurrent_processes_append_complete_json_lines`: 4 children; 80 complete records.
+2. In each child: call `os.setpgid(0, 0)`, close inherited parent lock descriptors before the contention starts, and keep the intended child patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor). Do not let a child depend on an unrelated parent patch.
+3. Give each child its own output capture. In cleanup, kill each group through `send_process_group` (`scripts/lib/process_group.py`), join the child and close every descriptor. Never call `os.killpg` directly.
+4. Keep every existing assertion. Use no threads.
+5. If a child cannot keep its boundary in a fork, leave that test as it is and say why.
+
+**Files:**
+- `scripts/production/test_ci_points.py` — item 1, CI watch.
+- `scripts/agents/test_detached_runs.py` — item 1, admission.
+- `scripts/usage/test_agents_log.py` — item 1, registration and append.
+
+**Workers:** 1 writer; one pattern across three files.
+- impl4: all three files.
+
+**Constraints from prior phases:**
+- Phase 163: the fork pattern and its process-group cleanup; `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`.
+- Phase 168: lock waits cost almost no CPU; the saving is interpreter start and entry imports.
+- Phase 166: local CPU numbers are a guide only; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_ci_points scripts.agents.test_detached_runs scripts.usage.test_agents_log scripts.lib.test_process_group_sources` passes three times with 126 tests in the three modules.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- No process or folder stays behind.
+- Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
+
+### Phase 171 — The crate run tests share one default frozen state  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `e870b2059`. `test_crate_run.py` builds one default frozen state for each class in a `tempfile.TemporaryDirectory`; 27 prerequisite tests copy it and rebuild ownership and locks. `test_moved_destination_clean_overlap_is_merged_and_reproved` keeps the real freeze: it changes the base first. All 96 tests and 587 assertions stay. aws CPU: 59.32 to 58.44 s (0.89 s). The three judgment continuations (`test_crate_run.py:970`) stay unseeded.
+
+### Phase 172 — The Pushover notice tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `fc3900f9b`. Rule 2 on `notify/test_pushover.py`: 86 to 86 tests. Each rare case guards delivery, saved send records, status or private data. The family is at its floor.
+
+### Phase 173 — The test-time trend shows the booked cost of each aws gate  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `8c7e63ab5`. `show.py` `gate_costs()` adds `ledger.gate_allowance(row).usd` to the box-hour cost. `read_snapshot()` already decodes `booked_allowance`, so no `priced_snapshot` call is needed. `TREND_CACHE_VERSION` is 4, so each cached day is priced again once. The trend cost tests carry booked allowances that differ from `allowance_usd`.
