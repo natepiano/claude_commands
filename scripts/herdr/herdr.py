@@ -1322,6 +1322,10 @@ def forget_pane_evidence(session: str, pane: str) -> None:
         _ = observed.replies.pop((session, ("pane", "process-info", "--pane", pane)), None)
 
 
+class CodexArgumentsSource(Enum):
+    FOREGROUND = "arguments from the selected foreground process"
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -2160,7 +2164,8 @@ class Herdr:
             raise HerdrFailure("producer process changed before admission")
         return entry
 
-    def codex_launch(self, pane: str, arguments: Sequence[str] = ()) -> pane_launch.PaneLaunch:
+    def codex_launch(self, pane: str,
+                     arguments: Sequence[str] | CodexArgumentsSource = CodexArgumentsSource.FOREGROUND) -> pane_launch.PaneLaunch:
         """Read one Codex launch from its exact foreground process."""
         forget_pane_evidence(self.session, pane)
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
@@ -2168,16 +2173,18 @@ class Herdr:
         return self._codex_launch(pane, info, arguments)
 
     def _codex_launch(self, pane: str, info: dict[str, object],
-                      arguments: Sequence[str]) -> pane_launch.PaneLaunch:
-        matches: list[dict[str, object]] = []
+                      arguments: Sequence[str] | CodexArgumentsSource) -> pane_launch.PaneLaunch:
+        matches: list[tuple[dict[str, object], list[str]]] = []
         for value in json_items(info.get("foreground_processes"), "Codex launch processes"):
             process = json_object(value, "Codex launch process")
             argv = _foreground_arguments(process)
             if is_codex_process(argv):
-                matches.append(process)
+                matches.append((process, argv))
         if len(matches) != 1:
             raise ValueError("Codex launch has no unique foreground process")
-        process = matches[0]
+        process, argv = matches[0]
+        if isinstance(arguments, CodexArgumentsSource):
+            arguments = argv[2:] if Path(argv[0]).name in {"node", "nodejs"} else argv[1:]
         pid = process.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise ValueError("Codex launch has no process id")

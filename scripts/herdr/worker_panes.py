@@ -454,27 +454,27 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         if isinstance(read.launches, LaunchRecordsUnavailable):
             states.append(_uncertain(row, read.launches.reason))
             continue
-        labelled = [pane for pane in panes
+        recovery = [pane for pane in panes
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
                     and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
         related_unknown = [item for item in scan.unknown if any(
-            _text(pane, "pane_id") == item.pane for pane in labelled)]
+            _text(pane, "pane_id") == item.pane for pane in recovery)]
         if related_unknown:
             unknown = related_unknown[0]
-            location = next(pane for pane in labelled if _text(pane, "pane_id") == unknown.pane)
+            location = next(pane for pane in recovery if _text(pane, "pane_id") == unknown.pane)
             states.append(ProcessUnknownWorker(row, unknown.pane, _text(location, "terminal_id"), unknown.reason))
-        elif len(labelled) > 1:
-            states.append(_uncertain(row, "multiple labelled recovery panes"))
-        elif labelled:
-            pane = labelled[0]
+        elif len(recovery) > 1:
+            states.append(_uncertain(row, "multiple recovery panes"))
+        elif recovery:
+            pane = recovery[0]
             identity, terminal = _text(pane, "pane_id"), _text(pane, "terminal_id")
             if not terminal or sum(_text(item, "terminal_id") == terminal for item in panes) != 1:
                 states.append(_uncertain(row, "recovery terminal identity is missing or duplicated"))
                 continue
             owners = [key for key, found in scan.found.items() if pane in found]
             if owners:
-                states.append(_uncertain(row, "labelled pane belongs to another native session"))
+                states.append(_uncertain(row, "recovery pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
         elif not isinstance(selection, SelectedWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
@@ -552,16 +552,6 @@ def labelled_pane(panes: Sequence[Mapping[str, object]], tab: str, label: str, *
     if not terminal or sum(item.get("terminal_id") == terminal for item in panes) != 1:
         raise ValueError(f"{label}: terminal identity is missing or duplicated")
     return pane
-
-
-def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
-                         owner: staff.StaffRow, name: str) -> Mapping[str, object] | herdr.NoPane:
-    """Find the full worker label, or a retained short label."""
-    for label in (agent_name(owner, name), name):
-        pane = labelled_pane(panes, tab, label)
-        if not isinstance(pane, herdr.NoPane):
-            return pane
-    return herdr.NoPane(name)
 
 
 def worker_run(member: staff.StaffRow, *,
@@ -908,6 +898,28 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
         return _uncertain(worker.row, f"running launch policy is unproved: {error}")
 
 
+def _interrupted_pane(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
+                      client: herdr.Herdr) -> Mapping[str, object] | herdr.NoPane | StartRefused | UncertainWorker:
+    """Recover an interrupted start only when no record or native staff owner claims its pane."""
+    parents = evidence.scan.found.get(parent.id, [])
+    tab = _text(parents[0], "tab_id") if len(parents) == 1 else ""
+    if not tab:
+        return herdr.NoPane(name)
+    try:
+        for label in (agent_name(parent, name), name):
+            pane = labelled_pane(evidence.panes, tab, label)
+            if isinstance(pane, herdr.NoPane):
+                continue
+            if any(pane in found for found in evidence.scan.found.values()):
+                return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "recovery pane holds another live staff session")
+            records = pane_launch.read_entries(pane_launch.record_directory() / f"{client.session}.json")
+            if str(pane["pane_id"]) not in records:
+                return pane
+    except (OSError, ValueError) as error:
+        return _uncertain(parent, str(error))
+    return herdr.NoPane(name)
+
+
 def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
                  client: herdr.Herdr) -> herdr.SplitPane | herdr.ExistingPane | StartRefused | UncertainWorker:
     parents = evidence.scan.found.get(parent.id, [])
@@ -916,14 +928,13 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     parent_pane = parents[0]
     tab = _text(parent_pane, "tab_id")
     label = agent_name(parent, name)
-    try:
-        pane = worker_labelled_pane(evidence.panes, tab, parent, name)
-    except ValueError as error:
-        return _uncertain(parent, str(error))
+    pane = _interrupted_pane(parent, name, evidence, client)
+    if isinstance(pane, (StartRefused, UncertainWorker)):
+        return pane
     if not isinstance(pane, herdr.NoPane):
         identity, terminal = str(pane["pane_id"]), str(pane["terminal_id"])
         if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
-            return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "labelled recovery pane is live")
+            return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "interrupted recovery pane is live")
         return herdr.ExistingPane(identity, terminal)
     ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
@@ -1048,19 +1059,13 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
     if current is None:
-        parents = evidence.scan.found.get(owner.id, [])
-        tab = _text(parents[0], "tab_id") if len(parents) == 1 else ""
-        try:
-            pane = worker_labelled_pane(evidence.panes, tab, owner, name.value) if tab else herdr.NoPane(name.value)
-        except ValueError as error:
-            return _uncertain(owner, str(error))
+        pane = _interrupted_pane(owner, name.value, evidence, client)
+        if isinstance(pane, (StartRefused, UncertainWorker)):
+            return pane
         if not isinstance(pane, herdr.NoPane):
             pane = dict(pane)
             identity = _text(pane, "pane_id")
             unknown = next((item for item in evidence.scan.unknown if item.pane == identity), None)
-            claimed = [key for key, found in evidence.scan.found.items() if pane in found]
-            if claimed:
-                return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "labelled recovery pane holds another live staff session")
             try:
                 activity = client.pane_activity(identity)
                 if unknown is not None:
@@ -1076,7 +1081,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
                     row = worker_admission.publish(allowed, native).row
                     lock.bind(row)
+                    if policy.settings.kind == "codex":
+                        entry = client.codex_launch(identity)
+                        pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
                 except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                    if row is not None:
+                        return _uncertain(row, f"launch proof is incomplete: {error}")
                     return UnpublishedWorker(identity, str(error))
                 recovered = _evidence(owner.id, staff.snapshot(), client, selection=selection)
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
@@ -1170,6 +1180,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_terminals: dict[str, str] = {}
     launch_processes: dict[str, herdr.AgentProcessIdentity] = {}
     launch_destinations: dict[str, herdr.SplitPane | herdr.ExistingPane] = {}
+    first_turn_launches: dict[str, pane_launch.PaneLaunch] = {}
 
     def start(handoff: worker_admission.FamilyHandoff) -> str:
         del handoff
@@ -1188,8 +1199,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_destination = selected
         identity = str(row.current_session) if row is not None and not switching else ""
         launch = partial(herdr.launch_prepared_agent, codex=codex) if isinstance(codex, herdr.CodexConversations) else herdr.launch_prepared_agent
+        arguments = launch_arguments(policy, identity, directory)
         launched = launch(client.session, launch_destination, prepared, policy.settings.kind,
-            launch_arguments(policy, identity, directory), herdr.NoOpeningPrompt(),
+            arguments, herdr.NoOpeningPrompt(),
             int(start_seconds * 1000), agent=name.value, agent_name=agent_name(owner, name.value))
         launches.append(launched)
         launch_destinations[launched.pane] = launch_destination
@@ -1206,7 +1218,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not identity and policy.settings.kind == "codex":
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
-            return _codex_start_session(client, launched.pane)
+            native = _codex_start_session(client, launched.pane)
+            first_turn_launches[launched.pane] = pane_launch.launch(launched.pane, native, str(prepared.directory),
+                prepared.env, ["codex", *arguments], kind="codex")
+            return native
         return client.native_session(launched.pane, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS)
 
     def created_pane() -> CreatedWorkerPane | NoCreatedWorkerPane:
@@ -1269,6 +1284,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             if row is None:
                 row = worker_admission.publish(allowed, identity, launch_home=launch_home).row
                 lock.bind(row)
+        launched = launches[-1]
+        if launched.pane in first_turn_launches:
+            pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", first_turn_launches[launched.pane])
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:
             return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
