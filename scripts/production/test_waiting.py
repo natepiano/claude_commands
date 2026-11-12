@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
 from scripts.production import add_unit
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
@@ -698,7 +699,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             finally:
                 for process in processes:
                     try:
-                        os.killpg(cast(int, process.pid), signal.SIGKILL)
+                        send_process_group(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     process.join(timeout=TEST_HANG_GUARD_SECS)
