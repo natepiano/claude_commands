@@ -374,11 +374,17 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
     return result
 
 
-def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun) -> str:
+def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_record: object = None) -> str:
+    """Show open phases outside the plan, excluding the phase that Notes names."""
     if isinstance(run, NoOpenUnitRun):
         return display_cells.NONE
     fields = record_fields(record)
     phase_ids = {str(row.get("phase")) for row in plan_phase_rows(fields)}
+    notes_fields = record_fields(notes_record)
+    current = notes_fields.get("current")
+    if (not isinstance(notes_fields.get("unavailable"), str) and isinstance(current, dict)
+            and current.get("phase") in {row.get("phase") for row in plan_phase_rows(notes_fields)}):
+        phase_ids.add(current["phase"])
     work: list[str] = []
     for identifier, step in run.phases:
         if identifier and identifier not in phase_ids:
@@ -388,13 +394,15 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun) -> str:
     return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
 
 
-def queued_cell(staff_id: staff.StaffId, record: object = None) -> str:
+def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE) -> str:
+    """Show queued work, excluding queue items equal to Notes."""
     try:
         items = unit_queue.read(staff_id)
     except (OSError, ValueError) as error:
         print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
         queue = "queue unreadable"
     else:
+        items = [item for item in items if item != notes]
         queue = (shortened(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
     rows = [row for row in plan_phase_rows(record_fields(record)) if row.get("status") not in ("done", "running", "open")]
     plan = ""
@@ -478,19 +486,19 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             print(f"unit_phases: workers: {error}", file=sys.stderr)
             pane_rows = {}
     machines = display_cells.machine_column([unit.machine for unit in units])
-    table_rows: list[tuple[str, ...]] = []
+    status_rows: list[tuple[str, ...]] = []
+    work_rows: list[tuple[str, ...]] = []
     show_plan_eta = False
     for index, unit in enumerate(units):
         record = records.get(unit.unit)
         progress_record = record
         member = unit.member
-        other = display_cells.NONE
-        queued = display_cells.NONE
+        opened: OpenUnitRun | NoOpenUnitRun = NoOpenUnitRun()
+        queued_record = record
         workers = display_cells.NONE
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         if isinstance(member, staff.StaffRow):
             run = newest.get(member.id)
-            queued_record = record
             opened = runs.get(member.id, NoOpenUnitRun())
             if not plan_phase_rows(record_fields(record)) and run is not None:
                 queued_record = fallback_plan(member, run, opened,
@@ -506,37 +514,41 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_run_phases = tuple(phase for phase in run_record.phases if isinstance(phase, phase_table.OpenPhase))
                 if not phase_ids:
                     progress_record = run_record
-            other = non_phase_cell(record, opened)
-            queued = queued_cell(member.id, queued_record)
             if (run is not None and isinstance(member.worktree, staff.PresentWorktree)
                     and member.worktree.machine == remote.local_machine()):
                 rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
                                                      snapshot, member.id, read_run(run.path), runs_reader)
                 workers = workers_cell(rows, now=now)
         notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
+        notes = notes_cell(notes_record, read_run=read_run)
+        queued = (queued_cell(member.id, queued_record, notes=notes)
+                  if isinstance(member, staff.StaffRow) else display_cells.NONE)
         show_plan_eta = show_plan_eta or running_plan(progress_record)
-        cells = (unit.unit, unit.status, *((machines[index],) if machines else ()),
-                 progress_cell(progress_record), phase_cell(progress_record), notes_cell(notes_record, read_run=read_run),
-                 eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
-                 eta_plan_cell(progress_record, now=now, zone=zone), workers, other, queued)
-        table_rows.append(cells)
-    workers_heading = worker_heading()
-    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "Notes", "ETA Next",
-               "ETA Plan", workers_heading, "Non-Phase Work", "Queued")
+        status_rows.append((unit.unit, unit.status, *((machines[index],) if machines else ()),
+                            progress_cell(progress_record), phase_cell(progress_record),
+                            eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
+                            eta_plan_cell(progress_record, now=now, zone=zone)))
+        work_rows.append((unit.unit, notes, workers, non_phase_cell(record, opened, notes_record=notes_record), queued))
+    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan")
+    work_headers = ("Unit", "Notes", worker_heading(), "Non-Phase Work", "Queued")
     if not show_plan_eta:
-        plan_column = headers.index("ETA Plan")
-        headers = headers[:plan_column] + headers[plan_column + 1:]
-        table_rows = [cells[:plan_column] + cells[plan_column + 1:] for cells in table_rows]
+        status_headers = status_headers[:-1]
+        status_rows = [cells[:-1] for cells in status_rows]
     progress_column = 3 if machines else 2
-    show_progress = any(cells[progress_column] != display_cells.NONE for cells in table_rows)
-    headers, table_rows = display_cells.fitted(
-        headers, table_rows, cuttable=(len(headers) - 1, len(headers) - 2, len(headers) - 3, 5 if machines else 4),
-        columns=conf.read_or_repository("production").whole("units_table_columns"))
-    lines = ["| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
-             "| " + " | ".join(("---",) * len(headers)) + " |"]
-    lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
-    if show_progress:
-        lines.extend(("", progress_legend()))
+    show_progress = any(cells[progress_column] != display_cells.NONE for cells in status_rows)
+    columns = conf.read_or_repository("production").whole("units_table_columns")
+    lines: list[str] = []
+    for headers, table_rows, cuttable, cut_order in (
+            (status_headers, status_rows, (), display_cells.CutOrder.LISTED),
+            (work_headers, work_rows, (4, 3, 2, 1), display_cells.CutOrder.WIDEST_FIRST)):
+        if lines:
+            if show_progress:
+                lines.extend(("", progress_legend()))
+            lines.append("")
+        headers, table_rows = display_cells.fitted(headers, table_rows, cuttable=cuttable, columns=columns, cut_order=cut_order)
+        lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
+                      "| " + " | ".join(("---",) * len(headers)) + " |"))
+        lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
     return "\n".join(lines)
 
 
