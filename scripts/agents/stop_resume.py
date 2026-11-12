@@ -189,10 +189,13 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
     if threads:
         codex = herdr.codex_conversations()
         named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
+    membership = staff.initial_snapshot()
     for daemon in codex_daemon.read_daemons(os.environ):
         if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
             raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")
-        named.extend((row.thread_id, ()) for row in daemon.sessions if row.name == name)
+        named.extend((row.thread_id, ()) for row in daemon.sessions
+                     if (member := membership.by_current_session(row.thread_id)) is not None
+                     and member.kind == "producer" and member.name == name)
     for identity, pids in named:
         places = [pane["pane_id"] for pane in panes if pane["session_id"] == identity]
         if not places:

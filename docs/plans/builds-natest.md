@@ -1268,7 +1268,6 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 
 **Ruled out:** moving the SSH cases in this phase with no CPU gain. The worktree keeps that first step for Phase 66, which keeps a move only if it cuts CPU or another proof needs it.
 
-
 ### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
 
@@ -2195,7 +2194,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
 - `commands/test_times.md` — the `top` description
 
-
 ### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
 
 #### As-built
@@ -2220,7 +2218,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
 
-
 ### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
 
 #### As-built
@@ -2243,7 +2240,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A measured per-module file map: the name check keeps nearly the same gain with much less work.
 - Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
-
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
 
@@ -3060,7 +3056,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Checkpoint `a9b62f887`. The two parallel ETA tests in `production/test_waiting.py` start 12 forked children behind a barrier (`eta_request_processes`, line 653) in place of 12 fresh `waiting.py` interpreters. Each child runs the real handler with its own output capture and leads its own process group; cleanup kills each group. aws pairs: 27.59 to 14.61 CPU s (12.98 s, 47%); 34 tests pass.
 - Profile of one fresh child: imports 0.49 CPU s, live unit lookup 0.15 s, state work under 0.001 s.
 
-**Gotchas:** `process.kill()` on a forked child leaves its Git children alive; give each child its own process group and kill the group.
+**Gotchas:** `process.kill()` on a forked child leaves its Git children alive; give each child its own process group and kill the group through `send_process_group` (`scripts/lib/process_group.py`). `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`; fix `04a1f121b` after chain372 went red.
 
 ### Phase 164 — Measure the shared style Git work in three style modules  · status: done
 **Depends on:** none
@@ -3082,148 +3078,91 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 166 — The bulk run tests build their workspace once for each class and the admission window test costs less  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_bulk_run.py` builds the `WorkspaceRunTests` workspace extension once for each class, and `test_admission_window_preserves_only_admission_interrupts` loses the CPU a test change can remove. Every test and assertion stays.
+- Checkpoint `ce820d5f5`. `WorkspaceRunTests` in `style/test_bulk_run.py` builds its two-crate workspace commit once in `setUpClass` on the class seed; each test copies the seed and runs `git update-index --refresh`. The admission window test copies the prepared root once and restores it before each of its four cases. All 108 tests and 600 assertions stay. aws pairs: 45.12 to 43.85 CPU s (1.27 s).
 
-**Decision:** Phase 164 report (next item 6b). style-unit go, 2026-11-11: keep every assertion; aws pairs decide.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 style/test_bulk_run.py`.
-2. `WorkspaceRunTests.setUp` (line 350) extends the copied project in each of 96 tests: it writes the `beta` member, then runs `git add`, `git commit`, `rev-parse HEAD` and `rev-parse HEAD^{tree}` (lines 358–365). Phase 164 measured 0.68 child CPU s for these four calls.
-3. Build the extended repository once in a class seed, after the `CargoProjectTests` setup (`test_bulk_rename.py:92`). Each test copies it to the same absolute path, with `copytree(..., symlinks=True)`, and refreshes the index. Keep `self.base` and `self.tree` equal to the seed's commit and tree.
-4. Keep per test: the environment patch, the `gate_owner` patch, `FakeRunner`, `ScriptedServer` and every per-test file.
-5. Profile `test_admission_window_preserves_only_admission_interrupts` (line 702, 6.6 CPU s, the largest row). Name where its CPU goes. Cut only what a test change can remove: repeated setup, waits, or duplicate process starts. Keep its real admission and interrupt boundaries and every assertion.
-6. Change no production script.
-7. Measure local CPU before and after with the step 1 command. The director runs three aws pairs; only aws pairs decide.
-
-**Files:**
-- `scripts/style/test_bulk_run.py` — all items.
-
-**Workers:** 1 writer; one file.
-- impl3: `scripts/style/test_bulk_run.py`.
-
-**Constraints from prior phases:**
-- Phase 160: a class seed must copy every environment isolation that the old per-test setup made.
-- Phase 158: copied Git indexes need `git update-index --refresh`.
-- Phase 164: `FakeRunner` still runs real Git through `bulk_run.git` (`bulk_run.py:64`); a CLI adapter does not remove that work.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.style.test_bulk_run` passes with 108 tests, three runs.
-- basedpyright on the file reports 0 errors and 0 warnings.
-- The module leaves no process and no folder behind.
-- aws pairs show a CPU gain; with no gain, the phase lands nothing.
+**Gotchas:** the local measure (44.3 to 30.6 CPU s) overstated the saving tenfold; only aws pairs decide. A spot instance termination can end an aws trial after one round; run it again.
 
 ### Phase 167 — The style-plan selection tests keep only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `test_style_plan_selection.py`, `test_style_plan_batches.py` and `test_style_plan_structure.py` lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
-
-**Decision:** Architect review after Phase 165, findings 1 and 5. Rule 2 (user, 2026-11-07). style-unit go, 2026-11-11: no test kept by name beyond Rule 2; keep the unit-tip fast-forwards in the `test_style_plan_selection.py` fixtures (refill-behind-tip, `74ccb1a37`), without which refill exits 6 or 3.
-
-**Spec:**
-1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (ledgers, tickets, plan docs, Git refs, waits, assignments, checkpoints) or lose work. Remove each other rare-case test.
-3. Keep the unit-tip fast-forwards in the `test_style_plan_selection.py` fixtures (style-unit, `74ccb1a37`). Judge each assertion, not the test name: Phase 165 showed a full returned value can guard harm.
-4. Keep the coverage of ticket selection, batch assignment, plan structure and saved checkpoints.
-5. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in `style_plan_test_support.py` may go only when `grep -rn <name> scripts` finds no other user; 28 style modules import it. Do not change production code.
-6. Do not merge tests into table rows in this phase.
-7. Write `phases/167/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
-8. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Check that another module is the real remaining cover before you cite it.
-9. Run the required checks on the final tree, and name the tested revision in the report.
-
-**Files:**
-- `scripts/style/test_style_plan_selection.py` — 37 tests.
-- `scripts/style/test_style_plan_batches.py` — 19 tests.
-- `scripts/style/test_style_plan_structure.py` — 17 tests.
-- `scripts/style/style_plan_test_support.py` — shared support; cleanup only.
-
-**Workers:** 1 writer; 73 tests in one fixture family, and the support file is the hub.
-- test: all three modules; hub: `style_plan_test_support.py`.
-
-**Constraints from prior phases:**
-- Phase 165: review returned the only removal; its full file-list assertion guarded a busy-file assignment.
-- Phase 159: check where a tested step sits before state writes, not only what the test asserts.
-- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom. Spec item 8 carries this.
-- Phase 156: run the checks on the final tree. Spec item 9 carries this.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.style.test_style_plan_selection scripts.style.test_style_plan_batches scripts.style.test_style_plan_structure` passes.
-- Every other module that imports `style_plan_test_support` passes when the support file changes.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- `phases/167/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+- Checkpoint `8d1005406`. Rule 2 on `test_style_plan_selection.py`, `test_style_plan_batches.py` and `test_style_plan_structure.py`: 73 to 72 tests. Removed `test_modules_reads_blocking_structure_before_scanning_decision_footprints` (read order only); `test_modules_reads_blocking_structure_before_approved_decisions` keeps the saved-ticket check. Both reviews approved the 32 kept rare cases. The family is at its floor.
 
 ### Phase 168 — Measure the forked-process candidates for repeated Python starts  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a measured report says, for each fork candidate, how much CPU its fresh interpreters cost and how much a forked child could remove. No code changes.
+- Checkpoint `fe4c134c2`. Read-only. Forked children can remove at most 4.68 CPU s across the six fork candidates, all test-only; the two `test_change_review.py` candidates (2.50 s) are under the sdlc hold. Entry imports: ci_points 0.50 s, change_review 0.22 s, detached_runs 0.14 s, agents_log 0.02 s. Lock waits cost almost no CPU. Results are in next item 6b.
 
-**Decision:** Architect review after Phase 165, finding 2 (next item 6b, phase 1). Read-only; a production change goes to its owner as a proposal.
+### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: done
+**Depends on:** none
 
-**Spec:**
-1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10` on `usage/test_agents_log.py`, `agents/test_detached_runs.py`, `production/test_ci_points.py` and `production/test_change_review.py`. Record the revision and the test counts.
-2. For each candidate test in the next item 6b fork table (`scripts/usage/test_agents_log.py:343,530`, `scripts/agents/test_detached_runs.py:381`, `scripts/production/test_ci_points.py:1009`, `scripts/production/test_change_review.py:1356,1636`), measure the test CPU. Separate interpreter start and imports, handler work, and synchronization waits.
-3. Do not use Phase 163's 0.49 s import cost as an estimate. Measure the import cost of each child's entry module.
-4. For each candidate, give the removable CPU from a forked child, with file and line, and the boundary the test must keep (the table's last column).
-5. Name each candidate where a fork cannot keep the boundary: for example, a child that must load a fresh module state or a real entry point.
-6. Rank the candidates by removable CPU. Mark each one test-only or production, and name the owner of each production change.
-7. Write the report to `phases/168/fork_candidates_report.md` in the session folder. Change no repository file.
+#### As-built
 
-**Files:**
-- `phases/168/fork_candidates_report.md` — the report, in the session folder; no repository file changes.
+- Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 27 tests (about 1.3 CPU s); the report named 28, but one test changes its base before it freezes. copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
 
-**Workers:** 1 researcher; read-only.
-- impl4: the report.
-
-**Constraints from prior phases:**
-- Phase 163: the forked children in `test_waiting.py` use `os.setpgid(0, 0)` in the child and `os.killpg` in cleanup, close inherited lock descriptors, and capture output for each child. aws CPU fell from 27.59 to 14.61 s.
-- Keep cold-import tests such as `scripts/buildlog/test_repo_root_imports.py:40,84` on fresh interpreters.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives per-module CPU, the per-candidate split (start and imports, handler, waits), and the removable CPU for each candidate.
-- `git status` shows no change from the researcher.
-
-### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: todo
+### Phase 170 — The four unheld lock-contention tests use forked children  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** a measured report says how much CPU `test_crate_run.py` spends to prepare crate copies, and which part a test fixture or a production change could remove. No code changes.
+**Goal:** four tests that start fresh Python children for lock contention start forked children instead. Every test, assertion, real handler and contention boundary stays.
 
-**Decision:** Architect review after Phase 165, finding 3 (next item 6b, phase 2). Read-only. natest owns fixture candidates; copies-unit owns production synchronization proposals; style-unit owns `crate_run.py`.
+**Decision:** Architect review after Phase 168, finding 1 (next item 6b, phase 1). Phase 168 ceiling: 2.18 CPU s. sdlc go, 2026-11-11: the three files are free.
 
 **Spec:**
-1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 15 --commands 15` on `style/test_crate_run.py`. Record the revision and the test count.
-2. Attribute the copy work to its callers: `copies.py:763,936` (fetch), `copies.py:803` (clone), `copies.py:450,469,760` (commit resolution, remote discovery, remote HEAD deletion), and the `freeze()` setup at `test_crate_run.py:205`.
-3. For each test, mark whether copy creation is part of the tested behavior or only a prerequisite. Use an assertion map: which assertion reads copy state.
-4. For prerequisite-only tests, give the CPU a private seed could remove. Start from the project seed at `test_crate_run.py:105` and a frozen-state seed for continuation tests. Keep live ownership and locks built per test.
-5. Keep the validation checkouts and stale-candidate proofs (`crate_run.py:1123,1392`; `test_crate_run.py:1017,2288`).
-6. For each proposed change, give the removable CPU, with file and line. Mark each one test-only or production, and name the owner.
-7. Write the report to `phases/169/crate_copy_report.md` in the session folder. Change no repository file.
+1. Convert these tests to forked children that call the real handler or `main` (the Phase 163 pattern, `scripts/production/test_waiting.py` `eta_request_processes`):
+   - `scripts/production/test_ci_points.py:1009`, `test_simultaneous_watch_calls_claim_only_one_first_alert`: 2 children; both reach the held review lock; one alert and one log record.
+   - `scripts/agents/test_detached_runs.py:381`, `test_parallel_starts_cannot_exceed_one_configured_place`: 4 children; real admission lock; statuses `[0, 4, 4, 4]`; one saved run.
+   - `scripts/usage/test_agents_log.py:343`, `test_concurrent_default_registration_writes_one_assignment_and_returns_one_true`: 6 children; one returns true; one saved assignment.
+   - `scripts/usage/test_agents_log.py:530`, `test_concurrent_processes_append_complete_json_lines`: 4 children; 80 complete records.
+2. In each child: call `os.setpgid(0, 0)`, close inherited parent lock descriptors before the contention starts, and keep the intended child patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor). Do not let a child depend on an unrelated parent patch.
+3. Give each child its own output capture. In cleanup, kill each group through `send_process_group` (`scripts/lib/process_group.py`), join the child and close every descriptor. Never call `os.killpg` directly.
+4. Keep every existing assertion. Use no threads.
+5. If a child cannot keep its boundary in a fork, leave that test as it is and say why.
 
 **Files:**
-- `phases/169/crate_copy_report.md` — the report, in the session folder; no repository file changes.
+- `scripts/production/test_ci_points.py` — item 1, CI watch.
+- `scripts/agents/test_detached_runs.py` — item 1, admission.
+- `scripts/usage/test_agents_log.py` — item 1, registration and append.
 
-**Workers:** 1 researcher; read-only.
-- impl3: the report.
+**Workers:** 1 writer; one pattern across three files.
+- impl4: all three files.
 
 **Constraints from prior phases:**
-- Phase 164: in crate_run, fetch and clone cost 7.80 child CPU s, and commit resolution, remote discovery and remote HEAD deletion cost 3.19 s. Keep measured costs separate from estimated savings.
-- Phase 153: `CargoProjectTests` builds the project seed once for each class.
+- Phase 163: the fork pattern and its process-group cleanup; `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`.
+- Phase 168: lock waits cost almost no CPU; the saving is interpreter start and entry imports.
+- Phase 166: local CPU numbers are a guide only; aws pairs decide.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report gives the module CPU, the copy work by caller with file and line, the assertion map, and the removable CPU for each proposed change.
-- `git status` shows no change from the researcher.
+- `python3 -m unittest scripts.production.test_ci_points scripts.agents.test_detached_runs scripts.usage.test_agents_log scripts.lib.test_process_group_sources` passes three times with 126 tests in the three modules.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- No process or folder stays behind.
+- Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
+
+### Phase 171 — The crate run tests share one default frozen state  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `e870b2059`. `test_crate_run.py` builds one default frozen state for each class in a `tempfile.TemporaryDirectory`; 27 prerequisite tests copy it and rebuild ownership and locks. `test_moved_destination_clean_overlap_is_merged_and_reproved` keeps the real freeze: it changes the base first. All 96 tests and 587 assertions stay. aws CPU: 59.32 to 58.44 s (0.89 s). The three judgment continuations (`test_crate_run.py:970`) stay unseeded.
+
+### Phase 172 — The Pushover notice tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `fc3900f9b`. Rule 2 on `notify/test_pushover.py`: 86 to 86 tests. Each rare case guards delivery, saved send records, status or private data. The family is at its floor.
+
+### Phase 173 — The test-time trend shows the booked cost of each aws gate  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `8c7e63ab5`. `show.py` `gate_costs()` adds `ledger.gate_allowance(row).usd` to the box-hour cost. `read_snapshot()` already decodes `booked_allowance`, so no `priced_snapshot` call is needed. `TREND_CACHE_VERSION` is 4, so each cached day is priced again once. The trend cost tests carry booked allowances that differ from `allowance_usd`.
