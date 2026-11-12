@@ -9,6 +9,10 @@ from pathlib import Path
 from types import UnionType
 from typing import Callable, Literal, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
 
+# Literal unions use typing.Union on Python 3.13.
+LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+
+
 @lru_cache(maxsize=None)
 def snapshot_fields(schema: type) -> dict[str, object]:
     return cast(dict[str, object], get_type_hints(schema, include_extras=True))
@@ -55,8 +59,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
-    # A union of Literal aliases still has typing.Union as its origin on 3.13.
-    if origin is UnionType or origin is get_origin(Literal[0] | Literal[1]):
+    if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
