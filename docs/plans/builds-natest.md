@@ -3297,35 +3297,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_crate_run.py` and `style/test_standing_checkpoint.py` use less CPU, with every test, assertion, path and proof kept.
-
-**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R3, R4 and R5): frozen seeds and the command adapter. Tell style before the edit. Paired aws trials decide; ship any measured gain.
-
-**Spec:**
-1. R3. Add one single-file frozen class seed (`paths=("src/lib.rs",)`) for the thirteen first-statement setup calls the Phase 191 report lists (`test_crate_run.py:135,161,242`). The real fixture writers run once per class. Keep all fixture paths, private ledgers, refs, workspaces, cached properties and per-test cleanup.
-2. R5. Use the existing default `frozen_tests` seed for the seven setup-only cases the report lists (`test_crate_run.py:102,161`). Keep `test_manifest_pins_exact_selection_rule_and_result_paths` (line 1401) and the custom source, changed manifest, shared proposal, dry-run, loader and pre-freeze edit cases on their current paths.
-3. R4. Route the direct `publish` helper (`test_standing_checkpoint.py:237`) and the direct gate call (`:305`) through `run_style_command`, as the CLI helper at `:176` does. Keep one original publication-to-footprint child path and both notification CLI calls at `:539`. Keep real Git, publication locks, candidate checkouts, index bytes, crash journals and verification callbacks.
-4. Change no production code. Keep every test and assertion.
-5. Run both modules and the importers of `style_plan_test_support.py` that the change touches. The director runs three aws pairs per module.
-
-**Files:**
-- `scripts/style/test_crate_run.py` — the R3 seed and the R5 cases.
-- `scripts/style/test_standing_checkpoint.py` — the R4 adapter calls.
-
-**Workers:** 1 writer; the two files are small changes in one fixture family.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 191 bounds: R3 0–1.09 s, R5 0–0.57 s, R4 0–0.78 s. Not measured. `test_standing_checkpoint.py` measured 6.9 CPU s locally.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest` passes both modules with unchanged test counts.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- Three aws pairs per module show a CPU gain with unchanged test counts; a module with no gain lands nothing.
+- Checkpoint `c2bc18282`. `test_crate_run.py` adds one single-file frozen class seed (`paths=("src/lib.rs",)`) for thirteen setup calls and moves seven setup-only cases onto the default `frozen_tests` seed; each test restores its private files and opens its own ledger. `test_standing_checkpoint.py` routes the direct publish and gate helpers through `run_style_command` for `style_plan` calls only; Git calls keep their lock descriptors, and one publication-to-footprint child path and both notification CLI calls stay. The manifest, custom-source, changed-manifest, shared-proposal, dry-run, loader and pre-freeze cases keep their live paths. 111 tests and 687 assertion nodes kept. aws pairs: `test_crate_run.py` 58.29 to 57.86 CPU s (0.43 s), `test_standing_checkpoint.py` 10.25 to 9.27 (0.98 s).
 
 ### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: todo
 **Depends on:** Phase 193
