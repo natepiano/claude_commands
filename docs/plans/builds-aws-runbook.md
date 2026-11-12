@@ -72,6 +72,7 @@ Use these commands at your terminal:
 ```sh
 python3 scripts/aws_target/deploy.py prices
 python3 scripts/aws_target/deploy.py quota-request
+python3 scripts/aws_target/deploy.py quota-status
 ```
 
 `prices` reads deployed-region configuration and candidate-region configuration without duplicates.
@@ -87,11 +88,27 @@ It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.
 Any regional failure makes the command exit with status 1.
 A requested quota does not prove an applied quota.
+
+`quota-status` reports the applied quotas and their request history without creating a request or writing local state.
+It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
+Each request row shows the region, quota name, asked value, current applied value, status, case ID, and date.
+The date uses the latest update time, or the creation time when no update time exists.
+Dates use the zone from `config/user_zone.conf`, with `USER_ZONE` as an override.
+A quota with no request history has one row with status `none`.
+The command prints progress for each region and a final completion time.
+A regional failure prints only its error code and makes the command exit with status 1 after the remaining regions.
+The report includes case IDs and omits account IDs, ARNs, and request IDs.
+It calls only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota` through the AWS CLI.
+The AWS CLI reads every page of request history.
+[AWS provides Service Quotas at no additional charge](https://aws.amazon.com/about-aws/whats-new/2023/03/service-quotas-additional-regions/).
+
 The administrator IAM policy needs these actions:
 
 1. `servicequotas:GetServiceQuota`.
 2. `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`.
 3. `servicequotas:RequestServiceQuotaIncrease`.
+
+`quota-status` needs only the first two actions, which this list already includes.
 
 ## Deploy gate resources
 
