@@ -5418,9 +5418,11 @@ class RunPlaceTests(unittest.TestCase):
             model = queue_view.QueueModel(reading, {}, records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
                 queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
             rendered = plain(queue_view.render_view(model, 100))
+            heading, = [line for line in rendered.splitlines() if line.lstrip().startswith("# ")]
             row, = [line for line in rendered.splitlines()
-                    if line.split()[:1] == ["1"] and line.split()[3:5] == ["project", "check"]]
-            self.assertEqual(row.split()[5], "0", rendered)
+                    if line.lstrip().startswith("1 ") and "project check" in line]
+            minute_column = heading.index("min")
+            self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
             settings_path = fixture.root / "aws_target.conf"
             _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
                                      + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
