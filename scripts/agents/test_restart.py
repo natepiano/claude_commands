@@ -81,6 +81,7 @@ class RestartTestCase(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(home), "CODEX_HOME": str(home / ".codex"),
             "HERDR_PROC": str(home / "proc"), "ROSTER_RUN_ROOT": str(home / "runs"),
+            "HERDR_BIN": "/nonexistent/herdr",
             "UNIT_RUN_DIR": str(home / "run"), "PLAN_DELEGATE_BOARD_DIR": "",
             "XDG_STATE_HOME": str(home / "state"), "SHUTDOWN_STATE_DIR": str(home / "shutdown"),
         })))
