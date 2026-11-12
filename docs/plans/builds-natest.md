@@ -3412,40 +3412,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `director_agent` in `scripts/production/add_unit.py` reads the launch configuration in process through `models_registry.launch_configuration(os.environ, registry=models_registry.registry_path(os.environ))` in the script's checkout. The resolver shell gets the parsed table through stdin: `{ IFS= read -r -d "" table; _models_table_load "$table"; }`. Read errors become a Refusal. `models_registry.registry_path(environment)` is the one rule for `MODELS_CONFIG_FILE` or HOME. Registry-reader starts fell from 64 to 0. All tests stay. aws pairs, 3 rounds: `production/test_add_unit.py` 20.07 → 16.80 CPU s (3.28 s saved); `notify/test_review.py` no change. sdlc approved the diff. Checkpoint `719978efd`.
 
-### Phase 214 — The assignment resolver takes the parsed launch table
+### Phase 214 — The assignment resolver takes the parsed launch table  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `resolve_model` in `scripts/direct/assign.py` sends the parsed launch table to its existing resolver shell through stdin, so the shell starts no registry-reader Python child, and aws pairs show a CPU gain.
-
-**Decision:** sdlc showrunner (owner), 2026-11-12: go; keep the change to the speed fix only; send sdlc the diff before land.
-
-**Spec:**
-1. Read rank 3 in `phases/207/model_resolution_report.md` (unit session folder) and the Phase 208 as-built.
-2. In `resolve_model` (`assign.py:418`), build one `models_registry.LaunchModelConfiguration` from the call's `env`. A parent's `MODELS_LAUNCH_CONFIGURATION` in `env` stays the source when present.
-3. Replace `models_launch_configuration` in the shell with a stdin table load (`IFS= read -r -d "" table; _models_table_load "$table"`). Send `models_registry.configuration_shell(configuration)` as stdin.
-4. Keep the catalog sync behavior that `models_launch_configuration` runs today; prove it with a test row or a cited code path.
-5. Keep override validation (`_agents_validate_pair`), the four returned values, exit status 2 on a failure, and `env["MODELS_LAUNCH_CONFIGURATION"]` set to the same encoded configuration.
-6. No caches. No snapshot reuse across calls. Keep `RegistryEditBase` apart.
-7. Keep every test and assertion. Add a row only where a changed path has no cover.
-8. Run every module that imports `assign` (`git grep -l "direct import.*assign\b\|direct.assign\b" -- 'scripts/*test_*.py'`) and basedpyright on each changed file.
-9. Measure `direct/test_assign_claude.py` and `direct/test_assign_claude_follow.py` with `module_cost.py --commands 15` before and after. Report registry-reader starts.
-
-**Files:**
-- `scripts/direct/assign.py` — `resolve_model` and `call` (an `input=` keyword, sdlc 2026-11-12). It uses `models_registry.registry_path(env)` from Phase 213 and does not edit `models_registry.py`.
-
-**Workers:** 1 writer; one function, no split.
-- impl: `scripts/direct/assign.py`.
-
-**Constraints from prior phases:**
-- Phase 208 sends the table to `claude_model` the same way. The bound is 0–2.002 s for 12 starts, including `assign_claude_test_support.py:447`.
-
-**Acceptance gate:**
-- Registry-reader starts fall in the two measured modules.
-- All importer modules pass; basedpyright reports 0 errors and 0 warnings.
-- aws paired trial shows a CPU gain with the same tests passing.
-- sdlc sees the diff before land.
+- `resolve_model` in `scripts/direct/assign.py` reads the launch configuration in process with `models_registry.registry_path(env)` and sends the parsed table to the resolver shell through stdin; `call()` takes `input=`. The read form is errexit-safe: `source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } || exit 2`. `_sync_catalog(path, environment)` reads HOME, the tier flag, the state file and both Codex sources from the call environment and runs the sync with it. `unit_effort.py` keeps its fresh editor read with `edit_base({**os.environ, OPERATION_ENVIRONMENT[1]: ""})`. Four test calls that passed `{}` pass the fixture environment, so no catalog sync starts in those tests. A direct `resolve_model` check under `SHELLOPTS=errexit` replaced a whole extra launcher row (1.80 s). aws pairs, 3 rounds: `direct/test_assign_claude_follow.py` 42.84 → 41.13 CPU s (1.55 s saved); net 1.45 s. sdlc approved the final diff. Checkpoint `b4906cdb2`.
 
 ### Phase 215 — Worker usage tests call the readout in process
 **Depends on:** none
