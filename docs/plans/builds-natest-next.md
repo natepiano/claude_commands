@@ -171,6 +171,8 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
 
 ## Items to consider
 
+- Trivial-test review of `scripts/production/test_unit_lookup.py`: held from the batch C and D removal reviews until sdlc's hierarchies section 9 landed. sdlc freed it on 2026-11-12 (main `4f458f9a0`). Run the same review as batches C and D: remove only tests that another test covers, and keep each assertion that proves behavior.
+
 - [x] **Host-independent fixtures.** Done in Phase 210 (`db1ec4e5e`): `scripts/agents/test_restart.py` binds a private `HERDR_BIN` in `RestartTestCase.setUp`; all 107 tests pass on the aws box, which has no herdr. Phase 209 fixed `production/test_add_unit.py` the same way.
 
 - [x] **Shared test setup costs are measured across a whole gate before the next speed phase is picked.** Done 2026-11-09, 739 modules, natedev at low load, total 3,056 CPU s. Admission setup 28.0, admission loop 25.9, admission cleanup 3.1, process scans 24.8, process cleanup 24.0, seed copies 13.3. The highest eligible module is 50.3. Phase 113 takes the admission costs. Keep the required leak scans. Phase 157 removes the redundant `reap()` scan after an empty `wait_for_marker_exit` result; aws pairs measure the saving, and every importing module must pass before it lands.
