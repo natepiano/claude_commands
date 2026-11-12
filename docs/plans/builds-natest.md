@@ -3481,34 +3481,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - All merge-gate, targeted-test, test_times and aws_target modules pass; basedpyright clean on each changed file.
 - A fake-clock test shows a gate past its limit stops, names its running modules, and reports red.
 
-### Phase 220 — Pane summary tests call the summary function directly  · status: todo
+### Phase 220 — Pane summary tests call the summary function directly  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the pane summary cases in `scripts/direct/test_assign_claude_panes.py` call `claude_worker._summary` (`scripts/direct/claude_worker.py:389`) directly in place of a whole Claude launcher run, and aws pairs show a CPU gain.
-
-**Decision:** architect reviews 25 and 26, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on `direct/test_assign_claude_panes.py`.
-2. For the cases at `test_assign_claude_panes.py:12,30,63` (and any other case whose assertions read only the summary output), build the pane bytes and the summary inputs in the test and call `claude_worker._summary` directly. Assert the same summary text, length and log bytes.
-3. Keep the case at `:44` (control cleanup before the character cut) as a whole launcher test, so one test still proves the launcher writes the summary and the agent log.
-4. Keep every assertion. Keep the test count. Add no new general adapter.
-5. Run the module, every module that imports `claude_worker`, and basedpyright on each changed file.
-
-**Files:**
-- `scripts/direct/test_assign_claude_panes.py`
-
-**Workers:** 1 writer; one test module.
-- impl: the file.
-
-**Constraints from prior phases:**
-- Phase 214: a test row must call the function directly, not run a whole launcher.
-
-**Acceptance gate:**
-- Launcher runs fall; all tests and assertions remain; importer modules pass; basedpyright clean.
-- aws pairs show a gain; sdlc sees the diff before land.
+- Three pane summary cases in `scripts/direct/test_assign_claude_panes.py` call `claude_worker._summary` directly through one `summary_turn` fixture method and the `WRITE_SUMMARY` constant (sdlc asked for both). The cleanup-before-cut case keeps the whole launcher. Launcher starts fell from 4 to 1. Three launcher exit checks became checks of the unchanged source log bytes, because `_summary` returns None; the launcher case still checks the exit. All 4 tests and 12 assertions stay. aws pairs, 3 rounds: `direct/test_assign_claude_panes.py` 8.26 → 2.46 CPU s (5.80 s saved); peak memory 157.7 → 164.0 MiB. sdlc approved the diff. Checkpoint `dcaafbc0c`.
 
 ### Phase 221 — Follow and records tests make content calls in process  · status: todo
 **Depends on:** none
