@@ -3268,7 +3268,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright reports 0 errors and 0 warnings on the changed files.
 - The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
 
-### Phase 185 — The recorder commands that review launches call import less  · status: todo
+### Phase 185 — The recorder commands that review launches call import less  · status: done
 **Depends on:** none
 
 #### Work Order
