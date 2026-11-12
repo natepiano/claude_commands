@@ -3273,31 +3273,41 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright reports 0 errors and 0 warnings on the changed files.
 - The replay keeps containment for all 55 runs and shows the added median before and after.
 
-### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: todo
+### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Target commands cost 28.462 CPU s in `test_verify_wait_holder.py` (7.420), `test_verify_mac_only.py` (11.064) and `test_verify_ssh_targets_routing.py` (9.978), all required eligibility, probe, reserve and release work. Repeats that read unchanged data: `target_platform` (`verify.sh:2628`), `target_for_settings` (`verify.sh:2639`), and the reserve command that `route_test` builds twice per attempt (`verify.sh:2848,2865`). Estimate, not measured: 0–0.22 CPU s for 446 excess reads. Owner proposal sent to verify-unit via builds: build `ssh_reserve_hook` once per `route_test` attempt; natest recommends no action at this gain. Report: `phases/190/target_command_report.md` in the session folder. Architect after Phase 190: the tested verify harness changes are at a practical floor; the next verify step is a startup-reuse owner trial (next items).
+
+### Phase 191 — Profile the three slowest test modules outside verify and name their removable work  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report names the target-command work that repeats inside `test_verify_wait_holder.py`, `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py`, with the removable part kept apart from the required part.
+**Goal:** A report names the removable CPU in `production/test_fast_track.py`, `style/test_crate_run.py` and `style/test_standing_checkpoint.py`, kept apart from required work, with an owner for each change.
 
-**Decision:** architect after Phase 187 (next items order step 2). natest measures; verify-unit owns any production design. Keep every check, full entry, reservation, live probe, lock and release.
+**Decision:** architect after Phase 190 (next items step 6); builds go, 2026-11-12: aws pairs first, each owner's go before code. Verify harness work is at a practical floor. natest measures; production owners decide production changes (fast-track Git: devtools-unit; crate-run sync: copies-unit and style-unit).
 
 **Spec:**
-1. For each module, run `module_cost.py --tests 10 --commands 10`. Count the `build_targets.py` and `verify.sh` target-metadata calls per test, with their arguments.
-2. Trace the calls through `verify.sh:783,2395` and the `build_targets.py` eligibility and reservation handlers. Mark each repeated call as an immutable read (same input, same output in one test) or required work.
-3. Estimate removable CPU from the immutable repeats only. Keep estimates apart from measurements. Phase 177 measured 8.019, 8.658 and 8.156 target-command CPU s; 0–24.833 s is a gross ceiling.
-4. Name the smallest owner change (a file and function in verify's code) that removes the repeats, and the test-side change, if any, that natest can make alone.
+1. For each module, run `python3 scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 <folder>/<file>`. Report CPU, process starts, execs, wall, the ten costliest tests and fixtures, and the ten costliest commands.
+2. For each costly command family, mark it as required work (the proof needs it) or removable (repeated setup, a fixture built per test where per class gives the same proof, a real Git or process boundary that a function test already proves). Name the file and line.
+3. Estimate removable CPU per change, bounded by the measured operations it changes. Keep estimates apart from measurements.
+4. Name, per change, the owner (natest alone for test-only fixture changes; the production owner otherwise) and the smallest change.
+5. Rank the changes by estimated CPU saved. Name which one natest should trial first in aws pairs.
+6. Keep every test, assertion and real boundary that supplies a proof.
 
 **Files:**
-- `phases/190/target_command_report.md` — in the session folder.
+- `phases/191/module_profile_report.md` — in the session folder.
 
 **Workers:** 1 researcher; one report.
 - impl: the measurement and the report.
 
 **Constraints from prior phases:**
-- Phases 181, 183 and 185 saved 1.37, 0.71 and about 2.7 CPU s in aws pairs. Phase 186 (fixed-reply Cargo installer) is open on the shared verify fixtures; local CPU can be high while its runs go. Report counts first; CPU is a guide only, and aws pairs decide.
+- Phase 186: local totals said 25 s and aws pairs 1.2 s. Local numbers name operations only; aws control and trial pairs decide any saving.
+- Rolling gate medians: `test_fast_track.py` 48.2 s (50 tests), `test_crate_run.py` 47.6 s (96 tests), `test_standing_checkpoint.py` 39.9 s (15 tests). These are not paired baselines.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report has per-module call counts, the immutable-repeat list with file and line, the CPU estimate range and the owner proposal.
+- The report has per-module profiles, the required and removable split with file and line, a bounded estimate per change, an owner per change and the first trial.
