@@ -3155,6 +3155,24 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIsInstance(found[absent.id], worker_panes.ClosedWorker)
         self.assertEqual(self.world.commands, [])
 
+    def test_failed_retitle_after_rename_keeps_unknown_worker_by_fixed_staff_id(self) -> None:
+        row = self.worker("old-name")
+        self.world.add(row, "w1:p1")
+        with (patch.object(herdr.Herdr, "retitle_row", side_effect=herdr_types.HerdrFailure("fixture retitle failed")),
+              redirect_stderr(io.StringIO())):
+            renamed = staff.rename(row.id, "new-name")
+        self.world.unknown["w1:p1"] = "process permission denied"
+        with redirect_stderr(io.StringIO()) as errors:
+            observed = self.observation(renamed)
+        self.assertEqual(self.world.locations["w1:p1"]["label"], "old-name")
+        self.assertEqual(observed, worker_panes.ProcessUnknownWorker(
+            renamed, "w1:p1", "terminal-w1:p1", "process permission denied"))
+        self.assertIn("pane evidence is unknown", errors.getvalue())
+        with redirect_stderr(io.StringIO()):
+            closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(renamed.name))
+        self.assertIsInstance(closed, worker_panes.UncertainWorker)
+        self.assertEqual(self.world.closed, [])
+
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
         self.world.add(self.parent, "w1:p9", live=False, label="foreign")
