@@ -117,6 +117,7 @@ class PaneWorld(herdr.Herdr):
         self.report_reads_before_publish = 0
         self.report_reads_at_wait: list[int] = []
         self.disappear_after_launch = False
+        self.publish_claude_start = True
 
     def setup(self, test: StaffTestCase) -> None:
         """Install shared accounts, configuration, and process facts."""
@@ -402,9 +403,12 @@ class PaneWorld(herdr.Herdr):
             source = Path(prepared.env["CODEX_HOME"]) / "sessions" / f"{identity}.jsonl"
             if not source.read_text():
                 write_text_atomic(source, json.dumps({"type": "session_meta", "payload": {"id": identity}}) + "\n")
-        if kind == "codex" and not isinstance(self.processes[pid].identity, herdr.LaunchArgument):
+        if kind == "claude" and self.publish_claude_start or kind == "codex" and not isinstance(
+                self.processes[pid].identity, herdr.LaunchArgument):
             entry = pane_launch.launch(pane, identity, str(prepared.directory), prepared.env,
                                        [kind, *agent_arguments], kind=cast(Literal["claude", "codex"], family))
+            if kind == "codex":
+                entry["name"] = server_name
             pane_launch.write(pane_launch.record_directory() / f"{self.session}.json", entry)
         if self.interrupt == "agent":
             self.interrupt = ""
@@ -631,6 +635,7 @@ class WorkerPaneTests(StaffTestCase):
         return result
 
     def test_new_worker_admission_completes_the_started_pane_home(self) -> None:
+        self.world.session = "TEST-admission"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
         for retained_launch in (True, False):
             with self.subTest(retained_launch=retained_launch):
@@ -679,9 +684,12 @@ class WorkerPaneTests(StaffTestCase):
         self.world.processes[self.world.foreground["w1:p1"][0]].environment["CODEX_HOME"] = str(home)
         self.world.locations["w1:p1"]["cwd"] = str(self.root)
         entry = pane_launch.launch("w1:p1", identity, str(self.root), {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+        entry["name"] = row.name
+        pane_record.write("agents", entry)
         pane_record.write("TEST-recovery", entry)
         self.assertIsNone(staff.snapshot().by_current_session(identity))
-        result = self.start(row.name)
+        with patch.object(self.world, "session", "TEST-recovery"):
+            result = self.start(row.name)
         self.assertIsInstance(result, worker_panes.OpenWorker)
         assert isinstance(result, worker_panes.OpenWorker)
         self.assertEqual(result.row.home, staff.SessionHome(home))
@@ -700,6 +708,9 @@ class WorkerPaneTests(StaffTestCase):
                 pane = "w1:p2" if explicit_home else "w1:p3"
                 self.world.add(row, pane, family="codex", label=worker_panes.agent_name(self.parent, row.name))
                 process = self.world.processes[self.world.foreground[pane][0]]
+                # This process models an interrupted worker start before its thread is proved.
+                self.world.processes[self.world.foreground[pane][0]] = herdr.NativeAgentProcess(
+                    herdr.LaunchArgument(process.identity.id), process.started, process.environment)
                 if explicit_home:
                     process.environment["CODEX_HOME"] = str(home)
                 self.world.locations[pane]["cwd"] = str(self.root)
@@ -724,6 +735,8 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(staff.by_id(result.row.id), result.row)
                 self.assertEqual(staff.backend(result.row), staff.CodexBackend(home))
                 self.assertEqual(self.world.launches, [])
+                publication = pane_launch.read(pane_launch.record_directory() / "agents.json")[pane]
+                self.assertEqual(publication.get("staff_id"), result.row.id)
 
     def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
         name = self.parent.name + "-astra-reviewer"
@@ -2369,6 +2382,33 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.closed, [])
 
     def test_start_rerun_after_agent_start_publishes_the_existing_backend(self) -> None:
+        for shown in (None, "old-worker-title"):
+            with self.subTest(native_title=shown):
+                case = WorkerPaneTests()
+                case.setUp()
+                try:
+                    case.world.interrupt = "agent"
+                    _ = case.start("native-reviewer", "review")
+                    pane = "w1:p1"
+                    pid = case.world.foreground[pane][0]
+                    process = case.world.processes[pid]
+                    case.world.processes[pid] = herdr.NativeAgentProcess(
+                        herdr.PaneSessionReport(process.identity.id), process.started, process.environment)
+                    entry = pane_launch.launch(pane, process.identity.id, str(case.root),
+                        process.environment, ["codex", "-n", "native-reviewer"], kind="codex")
+                    pane_launch.write(pane_launch.record_directory() / "agents.json", entry)
+                    case.world.locations[pane]["label"] = shown
+                    foreign = case.worker("foreign-reviewer", family="codex")
+                    case.world.add(foreign, "w1:p8", family="codex", label="native-reviewer")
+                    result = case.start("native-reviewer", "review")
+                    self.assertIsInstance(result, worker_panes.OpenWorker)
+                    assert isinstance(result, worker_panes.OpenWorker)
+                    self.assertEqual((result.row.current_session, result.pane), (process.identity.id, pane))
+                    self.assertEqual(len(case.world.launches), 1)
+                    self.assertEqual(case.world.closed, [])
+                finally:
+                    case.doCleanups()
+
         self.world.interrupt = "agent"
         try:
             _ = self.start()
@@ -2381,6 +2421,55 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual((result.row.current_session, result.pane), (identity, "w1:p1"))
         self.assertEqual(len(self.world.launches), 1)
         self.assertEqual(self.world.closed, [])
+
+    def test_proved_codex_start_survives_an_interruption_before_admission(self) -> None:
+        publish = worker_admission.publish
+        def interrupted(*arguments: object, **options: object) -> object:
+            del arguments, options
+            raise KeyboardInterrupt("interrupted before admission")
+        with patch.object(worker_admission, "publish", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.start("proved-reviewer", "review")
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+        self.world.locations["w1:p1"]["label"] = "changed display"
+        with patch.object(worker_admission, "publish", wraps=publish):
+            result = self.start("proved-reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.pane, "w1:p1")
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_recovered_codex_proof_survives_an_interruption_before_admission(self) -> None:
+        self.world.interrupt = "agent"
+        _ = self.start("proved-reviewer", "review")
+        publish = worker_admission.publish
+        def interrupted(*arguments: object, **options: object) -> object:
+            del arguments, options
+            raise KeyboardInterrupt("interrupted before admission")
+        with patch.object(worker_admission, "publish", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.start("proved-reviewer", "review")
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+        self.world.locations["w1:p1"]["label"] = "changed display"
+        with patch.object(worker_admission, "publish", wraps=publish):
+            result = self.start("proved-reviewer", "review")
+        self.assertIsInstance(result, worker_panes.OpenWorker)
+        assert isinstance(result, worker_panes.OpenWorker)
+        self.assertEqual(result.pane, "w1:p1")
+        self.assertEqual(len(self.world.launches), 1)
+
+    def test_interrupted_start_keeps_a_failed_native_read_uncertain(self) -> None:
+        self.world.interrupt = "agent"
+        _ = self.start("unreadable-reviewer", "review")
+        native = pane_launch.native_sessions
+        def failed(client: pane_launch.NativePaneServer, pane: Mapping[str, object]) -> set[str]:
+            if pane["pane_id"] == "w1:p1":
+                raise OSError("native process read failed")
+            return native(client, pane)
+        with patch.object(pane_launch, "native_sessions", side_effect=failed):
+            result = self.start("unreadable-reviewer", "review")
+        self.assertIsInstance(result, worker_panes.ProcessUnknownWorker)
+        self.assertEqual(len(self.world.launches), 1)
 
     def test_start_rerun_after_row_write_retains_the_published_native_row(self) -> None:
         publish = staff.ensure_worker

@@ -1510,13 +1510,13 @@ class Herdr:
         return panes
 
     def tab_sessions(self) -> list[TabSession]:
-        """Read labelled panes with workspace names and their last known conversation ids."""
+        """Read pane conversations and retain their display names."""
         panes = self.panes()
         spaces = {json_text(space.get("workspace_id"), "herdr workspace id"):
                   "" if space.get("label") is None else json_text(space["label"], "herdr workspace label")
                   for space in self.listed("workspace")}
-        return [TabSession(pane["pane_id"], label, spaces.get(pane["workspace_id"], ""), pane["session_id"])
-                for pane in panes if (label := pane.get("label")) is not None]
+        return [TabSession(pane["pane_id"], pane.get("label") or "", spaces.get(pane["workspace_id"], ""), pane["session_id"])
+                for pane in panes]
 
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
         """Describe whether the pane is at its shell or running foreground work."""
