@@ -344,8 +344,8 @@ handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signa
 def execute(arguments, **options):
     assert handlers == {number: signal.getsignal(number) for number in handlers}
     reply = fake(arguments, **options)
-    kill = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json')
-    if kill:
+    raise_now = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json')
+    if raise_now:
         signal.raise_signal(number)
     return reply
 api = AwsCli('build-scaler', 'fixture-region', 1, execute=execute)
