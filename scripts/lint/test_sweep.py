@@ -4134,20 +4134,35 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         else f"In the natedev Claude session, say which {machine.value} folders to delete.")
 
     def test_crossing_session_keeps_trash_and_scratch_effects(self) -> None:
-        for folder, effect, recommendation in (
+        for folder, effect, recommendation, age in (
             ("/private/Trash", "Deleting it removes discarded files.",
-             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
             ("/private/scratch/work", "Deleting it removes temporary work; check for work you still need.",
-             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
+            ("/private/daily", "Deleting it removes its contents; their use is unknown.",
+             "Review /private/daily first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 26 * 3600),
+            ("/private/missed", "Deleting it removes its contents; their use is unknown.", "", 100801),
         ):
-            with self.subTest(folder=folder), self.crossing_delivery({}) as delivery:
-                measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+            with self.subTest(folder=folder, age=age), self.crossing_delivery({}) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_snapshot_max_age_seconds=100800\n")
+                now = time.time()
+                measurement = sweep.AvailableDiskMeasurement(datetime.fromtimestamp(now - age, UTC), sweep.NoEarlierDiskMeasurement(), [
                     sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
                 ], 0)
                 with (self.measured_output_roots((folder,)),
                       mock.patch.object(sweep, "read_disk_measurement", return_value=measurement)):
                     self.finalize_crossing(140)
                 message = delivery.attempts[0].text
+                if age > 100800:
+                    self.assertNotIn(folder, message)
+                    self.assertIn("Folder sizes are unknown.", message)
+                    self.assertIn("Folder sizes are unknown.", phone_text(delivery.attempts))
+                    details = sweep.disk_measurement_lines(
+                        measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))
+                    self.assertIn("stale", "\n".join(details))
+                    continue
+                self.assertNotIn("stale", "\n".join(sweep.disk_measurement_lines(
+                    measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))))
                 lines = [
                     "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
                     "The cleanup run freed nothing.",
