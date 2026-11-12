@@ -3370,69 +3370,16 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Research only; no repository file changed. Report: `phases/207/model_resolution_report.md` in the run folder. `production/test_add_unit.py` costs 29.98 and 28.45 CPU s in two runs; 110 registry-reader starts cost 7.07 s. Per caller (reads / publication / catalog): add_unit 110 starts 5.585 s / 0 / 0; models_conf_publish 50 starts 2.532 s / 1,703 tasks 17.674 s / 720 tasks 3.285 s; agent_exec 48 starts 2.624 s; assign_claude_follow 14 starts 2.923 s; add_showrunner 44 starts 2.723 s. Snapshot reuse alone removes no start; the cost is Python starts. Ranked candidates pass a parsed table into an existing shell resolver: `models_registry.py:135` (models; 50 starts; 0–3.392 s), `add_unit.py:459` (devtools and sdlc; 64 starts; 0–3.219 s), `assign.py:418` (sdlc and devtools; 12 starts; 0–2.002 s). Rejected: a gate-wide snapshot, edit-base reuse, skipped catalog synchronization, reuse of the missing add-showrunner registry, nested launch reuse.
 
-### Phase 208 — The Claude model resolver takes the parsed launch table
+### Phase 208 — The Claude model resolver takes the parsed launch table  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `claude_model` in `scripts/lib/models_registry.py` passes the parsed launch table into the existing Claude model shell, so the shell starts no registry-reader Python child, and aws pairs show a CPU gain.
+- `claude_model` in `scripts/lib/models_registry.py` builds one `LaunchModelConfiguration` per call and sends `configuration_shell(configuration)` through stdin to the existing Claude model shell, so the shell starts no registry-reader Python child. No resolved model, catalog or snapshot is reused. The `scripts/notify/test_review.py` process fixture accepts `input` (default `None`) and forwards it (sdlc, 2026-11-12). 44 importer modules pass (2,634 tests). aws pairs, 3 rounds: `notify/test_review.py` 10.38 → 3.38, `production/test_add_unit.py` 23.72 → 21.53, `direct/test_assign_claude_follow.py` 33.49 → 32.78, `agents/test_agent_exec.py` 19.69 → 19.60 CPU s (10.04 s saved). sdlc approved the design and saw the numbers. Checkpoint `ce9febf6d`.
 
-**Decision:** sdlc showrunner (for models, sdlc and devtools), 2026-11-12: go for the trial at `models_registry.py:135` as designed: pass the parsed launch table into the Claude model shell; no caches, no snapshot; the nested-launch proof stays. Land on a measured aws gain; send sdlc the diff and numbers before land.
-
-**Spec:**
-1. Read the "Ranked conditional proposals", "Reuse and isolation requirements" and "First aws trial" sections of `phases/207/model_resolution_report.md` in the session folder.
-2. In `claude_model` (`models_registry.py:135`), build a `LaunchModelConfiguration` for the current registry path and environment, and prefix the shell with `configuration_shell(configuration)` (line 256), as `launch_settings` (line 160) does. The shell must then start no registry-reader Python child for this call.
-3. Keep the result, the fallback to the input model on a resolver failure (line 143), `MODELS_CONFIG_TIER_ONLY`, account selection and provider-catalog resolution at their boundaries.
-4. Do not cache resolved models or catalogs. Do not reuse a snapshot across calls. Keep `RegistryEditBase` apart from `LaunchModelConfiguration`. Keep `scripts/agents/test_agent_exec.py:96` and the real backend children in agent_exec and Claude follow unchanged.
-5. Keep every test and assertion. Add a row to an existing test only if a changed path has no cover (test growth rule 1).
-6. Run every module that imports `models_registry` (`git grep`), and basedpyright on each changed file.
-7. Measure local CPU with `module_cost.py --commands 15` on `production/test_add_unit.py`, `direct/test_assign_claude_follow.py` and `agents/test_agent_exec.py`, before and after; report registry-reader starts.
-
-**Files:**
-- `scripts/lib/models_registry.py` — `claude_model`.
-
-**Workers:** 1 writer; one function.
-- impl: the file and any test row.
-
-**Constraints from prior phases:**
-- Phase 207: snapshot reuse alone removes no start; only a passed table removes the Python child. Bound 0–3.392 local CPU s, 50 starts (46 in add_unit).
-- `models_registry.py:71` trusts an inherited snapshot's path and text: no gate-wide snapshot.
-
-**State:** none.
-
-**Acceptance gate:**
-- Registry-reader starts fall in the three modules; all tests and assertions remain; all importer modules pass; basedpyright clean.
-- aws pairs show a gain before land; sdlc receives the diff and numbers first.
-
-### Phase 209 — The style ledger reads the commit and its tree in one Git query
+### Phase 209 — The style ledger reads the commit and its tree in one Git query  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `_tip` in `scripts/style/style_ledger.py` verifies the commit and reads its tree with one Git query in place of two, with the same failure behavior, and aws pairs show a CPU gain.
-
-**Decision:** builds showrunner, 2026-11-12: the Phase 200 Git trials run third, style's commit and tree combine first (0–2.039 s). style (owner) has no objection to a trial; landing needs style's review through sdlc. Land only on a measured aws gain.
-
-**Spec:**
-1. Read rank 1 and rank 4 in `phases/200/git_metadata_report.md` in the session folder.
-2. In `_tip` (`style_ledger.py:1938–1940`), get the verified commit and its tree from one `git rev-parse` call (for example `rev-parse --verify --end-of-options <c>^{commit}` combined with the tree, or another single query). Keep the error behavior for a missing revision, a non-commit object and an ambiguous name; prove each case on the old and new code.
-3. Keep `tree_entries` and every fresh branch and worktree check.
-4. Keep every test and assertion. Add failure-case rows to an existing test in the style tests (test growth rule 1) if no test covers them.
-5. Run every module that imports `style_ledger` (`git grep`), and basedpyright on each changed file.
-6. Measure local CPU with `module_cost.py` on the three importer modules with the most `_tip` calls; aws pairs decide.
-
-**Files:**
-- `scripts/style/style_ledger.py` — `_tip`.
-- One existing style test module — failure rows, only if needed.
-
-**Workers:** 1 writer; one function.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 200: 3,061 observed tasks; the replacement failure contract is unproved, so the failure rows come first. Rank 4 (reuse the verified `set_tip` commit, 0–0.459 s) overlaps; do not change it here.
-
-**State:** none.
-
-**Acceptance gate:**
-- The three failure cases keep their behavior on old and new code; all importer modules pass; basedpyright clean.
-- aws pairs show a gain before land; style reviews through sdlc before land.
+- `_tip` in `scripts/style/style_ledger.py` reads the commit and its tree with one `git rev-parse --end-of-options <c>^{commit} <c>^{tree}` call; it used two. A reply that is not the echoed marker and two object ids (40 or 64 hex) raises `GitReadFailed` with status 0, so a revision range keeps a typed failure; missing, non-commit and ambiguous names keep status 128. `test_tree_entries_share_commit_and_bare_tree_inventory` in `scripts/style/test_style_ledger.py` gets four rows (missing, tree id, ambiguous prefix with SHA-1 and SHA-256 input pairs, range). By builds' order, `scripts/production/test_add_unit.py` sets `HERDR_BIN=/nonexistent/herdr` in `test_resume_uses_the_renamed_native_owner_for_arguments_and_tab`; that test raised `HerdrMissing` on a host without herdr (the aws box) since it came in (`c8dec492b`). aws pairs, 3 rounds: `style/test_style_ledger.py` 13.32 → 12.53, `style/test_style_ledger_findings.py` 27.20 → 26.20, `style/test_style_ledger_tickets.py` 23.22 → 22.37 CPU s (2.68 s saved); `test_add_unit` passes on the aws box. style approved through sdlc. Checkpoint `72252ade3`.
