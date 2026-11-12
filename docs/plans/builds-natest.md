@@ -3318,3 +3318,33 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The byte-for-byte event row passes and fails when the shell quoting is broken.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `task_cpu.py` measures a run in which a task name holds byte `0xff`, with the same results for ordinary tasks.
+
+**Decision:** next item 6a (architect after Phase 178): repair this measurement tool before another broad command census; keep it apart from test-speed savings.
+
+**Spec:**
+1. `task_ids` (`scripts/test_times/task_cpu.py:59`) decodes the whole `/proc/<pid>/status` file as text. A task name with byte `0xff` broke it in Phase 177. Read the file as bytes and parse only the numeric `Tgid:` and `PPid:` fields.
+2. Add rows to the existing task CPU tests in `scripts/test_times/test_module_cost.py`: a status input with byte `0xff` in `Name:`, and an ordinary status input. The `0xff` row fails on the old code.
+3. Change nothing else.
+
+**Files:**
+- `scripts/test_times/task_cpu.py` — `task_ids`.
+- `scripts/test_times/test_module_cost.py` — the two rows.
+
+**Workers:** 1 writer; one function and its rows.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 177: an in-memory replacement worked around this in its measurement record.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.test_times.test_module_cost` passes; the `0xff` row fails on the old code.
+- basedpyright on both files reports 0 errors and 0 warnings.
