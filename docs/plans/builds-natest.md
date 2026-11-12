@@ -3051,3 +3051,114 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `f8b27fda5`. Rule 2 removes `test_example_without_a_manifest_has_no_step` from `test_merge_checkpoint.py`: a missing crate manifest gives a visible failure before publication. The three modules go from 53 to 52 tests. The history and batch modules keep all their tests; each guards saved completion records or the checkpoints that lifecycle and CI decisions use.
 - The merge checkpoint family review is complete (Phases 159 and 162).
+
+### Phase 163 — The parallel ETA tests start fewer Python interpreters  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the two parallel ETA tests in `production/test_waiting.py` keep 12 real concurrent processes each, but each process stops paying for a fresh interpreter start, imports and lookups. Every test and assertion stays.
+
+**Decision:** Architect review after Phase 162, findings 2 and 4 (next item 6b, phase 1). sdlc go, 2026-11-11: `test_waiting.py` stays free.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 production/test_waiting.py`. Split the CPU of one `eta-request` child into interpreter start, imports, production lookup, live unit lookup and state work.
+2. `test_parallel_eta_requests_for_different_phases_keep_every_record` (line 657) and `test_parallel_eta_requests_for_one_phase_print_once` (line 667) start 12 `waiting.py` processes each through `eta_request_process` (line 650).
+3. Replace the 12 fresh interpreters with 12 child processes that reuse the module the test already imported, for example `multiprocessing` with the `fork` start method. Each child calls the real ETA request handler with the same arguments, environment and working directory.
+4. Keep: 12 contenders, separate output capture for each child, real file locks, atomic publication of `eta_seen.json`, and every existing assertion. Use no threads.
+5. Keep `test_eta_request_waits_for_its_state_lock` (line 677) as it is. It proves the real CLI and lock boundary.
+6. If the profile shows that lookups, not interpreter start, take the time, say so and propose the smallest test-only change. Change no production script.
+7. Measure local CPU before and after with the step 1 command. The director runs three aws pairs; only aws pairs decide.
+
+**Files:**
+- `scripts/production/test_waiting.py` — all items.
+
+**Workers:** 1 writer; one file.
+- impl4: `scripts/production/test_waiting.py`.
+
+**Constraints from prior phases:**
+- Phase 160: the class seed and its private `XDG_CONFIG_HOME` stay as they are.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_waiting` passes with 34 tests, three runs.
+- basedpyright on the file reports 0 errors and 0 warnings.
+- The module leaves no process and no folder behind.
+- aws pairs show a CPU gain; with no gain, the phase lands nothing.
+
+### Phase 164 — Measure the shared style Git work in three style modules  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report says how much CPU `test_style_sync.py`, `test_bulk_run.py` and `test_crate_run.py` spend in shared ledger and Git reads, and which part one change could remove. No code changes.
+
+**Decision:** Architect review after Phase 162, findings 3 and 4 (next item 6b, phase 2). Read-only; any production change goes to style-unit as a proposal.
+
+**Spec:**
+1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10` on `style/test_style_sync.py`, `style/test_bulk_run.py` and `style/test_crate_run.py`. Record the revision and the test counts.
+2. Attribute the Git and process work in each module to its callers. Start at the shared ledger path `style_ledger.py:7781`, the immutable-read cache at `style_ledger.py:2352`, `style_sync.py:236,257` and `crate_run.py:818`.
+3. Separate immutable object reads (cacheable) from reads of mutable refs, indexes, locks and publication (not cacheable).
+4. Note that `style_plan_test_support.py:73` already moves synchronous commands in process. Bulk-run and crate-run tests use injected runners, so a CLI adapter does not reach their Git work.
+5. For each proposed change, give the removable CPU in each module and the sum across the three, with file and line. Mark each change test-only or production.
+6. Do not reuse the rejected Phase 141 metadata trial as evidence.
+7. Write the report to `phases/164/style_git_report.md` in the session folder. Change no repository file.
+
+**Files:**
+- `phases/164/style_git_report.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl3: the report.
+
+**Constraints from prior phases:**
+- Phase 141: the metadata trial was rejected; do not reuse it.
+- Phase 161: class seeds in the style modules saved little; the cost is in the test bodies and commands.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives per-module CPU, the attributed callers with file and line, and the removable CPU for each proposed change.
+- `git status` shows no change from the researcher.
+
+### Phase 165 — The style-plan recovery tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `test_style_plan_recovery.py` and `test_style_plan_checkpoint_refill.py` lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** Architect review after Phase 162, finding 4 (next item 6b, phase 3). Rule 2 (user, 2026-11-07). style-unit go, 2026-11-11, with two tests kept by name: they guard ticket 1427 (a ticket got a file from the wrong tip), from `74ccb1a37` on main.
+
+**Spec:**
+1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (ledgers, tickets, plan docs, Git refs, waits, assignments, checkpoints) or lose work. Remove each other rare-case test.
+3. Keep `test_refill_waits_for_the_style_branch_when_the_unit_base_is_behind_the_synced_tip` in `test_style_plan_recovery.py` and the refill-behind-tip fixture fast-forwards in `test_style_plan_checkpoint_refill.py` (style-unit, ticket 1427).
+4. Keep the coverage of recovery, refill, saved waits, assignments and checkpoints.
+5. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in `style_plan_test_support.py` may go only when `grep -rn <name> scripts` finds no other user; 28 style modules import it. Do not change production code.
+6. Do not merge tests into table rows in this phase.
+7. Write `phases/165/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
+8. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Check that another module is the real remaining cover before you cite it.
+9. Run the required checks on the final tree, and name the tested revision in the report.
+
+**Files:**
+- `scripts/style/test_style_plan_recovery.py` — 26 tests.
+- `scripts/style/test_style_plan_checkpoint_refill.py` — 16 tests.
+- `scripts/style/style_plan_test_support.py` — shared support; cleanup only.
+
+**Workers:** 1 writer; 42 tests in one fixture family, and the support file is the hub.
+- test: both modules; hub: `style_plan_test_support.py`.
+
+**Constraints from prior phases:**
+- Phase 159: check where a tested step sits before state writes, not only what the test asserts.
+- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom. Spec item 8 carries this.
+- Phase 156: run the checks on the final tree. Spec item 9 carries this.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.style.test_style_plan_recovery scripts.style.test_style_plan_checkpoint_refill` passes.
+- Every other module that imports `style_plan_test_support` passes when the support file changes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- `phases/165/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
