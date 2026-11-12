@@ -641,7 +641,7 @@ class MixedRestartTests(ShutdownTestCase):
             "ROSTER_RUN_ROOT": str(root / "runs"), "UNIT_RUN_DIR": str(root / "runs/pane"),
             "CONF_DIR": str(root / "conf"), "SHUTDOWN_PROOF_WORKSPACE": "w1",
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
-            "AGENTS_CALLER_FAMILY": "", "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
+            "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(root / "conf" / source.name, source.read_text())

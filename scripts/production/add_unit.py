@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import json
 from collections.abc import Iterator, Mapping
+from contextlib import chdir
 import os
 import shlex
 import subprocess
@@ -25,7 +26,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude
+from scripts.lib import git_exclude, models_registry
 from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -478,10 +479,17 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
 def director_agent(request: UnitLaunch) -> DirectorAgent:
     """Resolve the unit director in this script's checkout before any writes."""
     resolver = Path(__file__).resolve().parents[1] / "agents" / "models_config.sh"
+    try:
+        with chdir(request.production.checkout):
+            configuration = models_registry.launch_configuration(
+                os.environ, registry=models_registry.registry_path(os.environ))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"ERROR: {error}") from error
     result = subprocess.run(
-        ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
+        ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+         + 'agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
          "_", str(resolver)], cwd=request.production.checkout,
-        text=True, capture_output=True, check=False)
+        input=models_registry.configuration_shell(configuration), text=True, capture_output=True, check=False)
     if result.returncode != 0:
         error = next((line for line in result.stderr.splitlines() if line.startswith("ERROR:")),
                      result.stderr.splitlines()[0] if result.stderr else "ERROR: cannot resolve production.director.")
