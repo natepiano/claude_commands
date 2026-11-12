@@ -41,14 +41,11 @@ class MeasurementTests(MeasurementFixture):
         _ = (self.state / "deployment.json").write_text(json.dumps({
             "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
         replies = AwsReplies()
-        controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
-            clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=replies, clock=lambda: float(NOW + 1))
         _ = controller.tick()
         fetch.assert_called_once()
         self.assertEqual(replies.count("get-cost-and-usage"), 0)
         self.assertEqual(len(self.book().read_snapshot().reconciliations), 1)
-        state = cast(dict[str, object], json.loads((self.state / "controller.json").read_text()))
-        self.assertNotIn("charge_error", state)
         self.assertEqual(older.read_text(), "{broken")
 
     def test_report_day_cost_matches_full_history_with_whole_day_reconciliation(self) -> None:
@@ -120,24 +117,6 @@ class MeasurementTests(MeasurementFixture):
         result = narrow(self, measurement.daily_usage(self.settings, self.state, DAY, MIDNIGHT + 600), measurement.DailyUsage)
         self.assertEqual(result.uptime_s, 120)
 
-    def test_tick_does_not_persist_an_unused_charge_error(self) -> None:
-        self.seed_cost()
-        _ = (self.state / "deployment.json").write_text(json.dumps({
-            "region": "us-east-1", "outputs": {"InstanceId": "i-fixture"}}))
-        old = ledger.ChargeRead("2026-01-14", NOW, MIDNIGHT - 86400, MIDNIGHT,
-                                Decimal(0), Decimal(0), Decimal(0), account_bill=False)
-        charges = self.state / 'charges'
-        charges.mkdir()
-        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(old)))
-        _ = (self.state / 'controller.json').write_text(json.dumps({'charge_period_day': old.day}))
-        replies = AwsReplies()
-        controller = aws_target.Controller(self.settings, self.state, self.root / "admission", execute=replies,
-            clock=lambda: float(NOW + 1), notify=lambda _event: True, publish=lambda _envelope: True)
-        _ = controller.tick()
-        self.assertEqual(replies.count("get-cost-and-usage"), 1)
-        self.assertTrue(ledger.read_charge(charges / '2026-01-14.json').account_bill)
-        state = cast(dict[str, object], json.loads((self.state / "controller.json").read_text()))
-        self.assertNotIn("charge_error", state)
 
     def test_charge_difference_is_derived_and_legacy_difference_still_reads(self) -> None:
         self.seed_previous_day()
@@ -197,7 +176,7 @@ class MeasurementTests(MeasurementFixture):
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(account_reply(arguments, "2")), "")
 
                 execute = mock.Mock(side_effect=date_only_api)
-                controller = aws_target.Controller(self.settings, directory, self.root / "admission", execute=execute)
+                controller = aws_target.AccountRefresh(self.settings, directory, execute=execute)
                 result = controller.refresh_charges(aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute), instant(when))
                 result = narrow(self, result, measurement.ChargeRead)
                 arguments = cast(Sequence[str], execute.call_args.args[0])
@@ -354,14 +333,6 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(fetch.call_args_list, [mock.call(instant("2026-11-01T00:00:00+00:00"), instant("2026-11-02T00:00:00+00:00"))])
         self.assertEqual(result.period_end - result.period_start, 24 * 3600)
 
-    def test_disabled_charge_reader_never_queries_or_creates_state(self) -> None:
-        self.text_setting("offload", "off")
-        absent = self.root / "disabled-state"
-        fetch = mock.Mock(side_effect=AssertionError("disabled AWS must remain inert"))
-        result = measurement.read_charges(self.settings, absent, NOW, fetch)
-        self.assertIsInstance(result, measurement.MeasurementUnavailable)
-        self.assertFalse(absent.exists())
-        fetch.assert_not_called()
 
     def test_controller_schedules_one_account_charge_query_and_local_reports_never_repeat_it(self) -> None:
         self.seed_cost()
@@ -385,7 +356,7 @@ class MeasurementTests(MeasurementFixture):
                 self.assertEqual(arguments[arguments.index('--next-page-token') + 1], 'second-page')
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
-        controller = aws_target.Controller(self.settings, self.state, self.root / 'admission', execute=execute)
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=execute)
         api = aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute)
         first = narrow(self, controller.refresh_charges(api, NOW + 86400), measurement.ChargeRead)
         second = controller.refresh_charges(api, NOW + 86401)

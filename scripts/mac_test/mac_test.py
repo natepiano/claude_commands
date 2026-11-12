@@ -1756,16 +1756,6 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     return ClaimFinished(13)
 
 
-def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
-    """Bind new AWS work without changing retained claim evidence."""
-    from scripts.mac_test import offload
-
-    if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
-        generation = offload.expected_instance_generation(paths.target)
-        if generation:
-            claim['instance_generation'] = generation
-
-
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
@@ -1858,7 +1848,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
-        bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
     if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -1933,7 +1922,6 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = {**claim.record}
     else:
         record = {**claim.record, "remote_host": args.remote}
-        bind_instance_generation(paths, record)
     record["pid"] = args.pid
     record["proc_start"] = start.start
     write_json(claim.path, record)
@@ -2525,25 +2513,6 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
     return command_status(paths, config)
-
-
-@dataclass(frozen=True)
-class StoppedInstanceEvidence:
-    target: str
-    generation: str
-    state: str
-    observed_at: float
-    claims: tuple[HeldClaim, ...]
-    remote_host: str
-
-
-def release_host(paths: StatePaths, generation: str) -> str:
-    from scripts.mac_test import offload
-
-    configured = offload.configured_ssh_target(paths.target)
-    if not target_config.is_aws_target(configured) or not generation:
-        raise StateReadError('instance evidence cannot release these claims')
-    return offload.read_connection_settings(configured.settings).host
 
 
 if __name__ == "__main__":
