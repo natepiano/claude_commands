@@ -3819,12 +3819,13 @@ def codex_resume_thread(pid: int) -> str:
         return launch.id
     if isinstance(launch, (StartingCodexPane, CodexWrapperPending)):
         raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
-    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+    raise ValueError(launch.reason)
 
 
 def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | CodexLaunchIdentityUnknown:
     """Classify the launch arguments without requiring a conversation identity."""
-    unknown = CodexLaunchIdentityUnknown(f"pid {pid}: Codex launch identity is unavailable")
+    unavailable = f"pid {pid}: Codex launch identity is unavailable"
+    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: arguments unreadable")
     if _platform() == "darwin":
         process = next((process for process in _darwin_processes() if process.pid == pid), None)
         if process is None or isinstance(process.arguments, UnreadableProcessArguments):
@@ -3849,8 +3850,10 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
             if option in value_options:
                 if not option_value or option_value.startswith("-"):
                     fresh = False
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has a missing or dash value")
                 if option in {"-c", "--config"} and "=" not in option_value:
                     fresh = False
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has no =")
             elif option == "--":
                 return StartingCodexPane(pid) if fresh else unknown
             elif not option.startswith("-"):
@@ -3858,22 +3861,24 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
                     try:
                         return LaunchArgument(staff.native_id(next(options, "")))
                     except staff.StaffRefused:
-                        return unknown
+                        return CodexLaunchIdentityUnknown(f"{unavailable}: bad resume id")
                 if option in {"exec", "e", "review", "fork", "login", "logout", "mcp", "mcp-server",
                               "app-server", "app", "completion", "sandbox", "debug", "apply", "a",
                               "cloud", "features", "help"}:
-                    return unknown
+                    return CodexLaunchIdentityUnknown(f"{unavailable}: subcommand {option}")
                 return StartingCodexPane(pid) if fresh else unknown
             elif option in {"--no-daemon", "--no-alt-screen", "--full-auto", "--search", "--oss",
                             "--dangerously-bypass-approvals-and-sandbox"}:
                 continue
             else:
                 fresh = False
+                name = option_name if option_name.startswith("--") else option_name[:2]
+                unknown = CodexLaunchIdentityUnknown(f"{unavailable}: unknown option {name}")
         else:
             if fresh:
                 return StartingCodexPane(pid)
     else:
-        return CodexWrapperPending(unknown.reason)
+        return CodexWrapperPending(unavailable)
     return unknown
 
 
