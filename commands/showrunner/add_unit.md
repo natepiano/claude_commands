@@ -1,9 +1,9 @@
 ---
 description: Add and start a production unit.
-argument-hint: "<name>"
+argument-hint: "<name> [--unit-type direct|merge|style]"
 ---
 
-**Usage:** `/showrunner:add_unit <name>`
+**Usage:** `/showrunner:add_unit <name> [--unit-type direct|merge|style]`
 
 Run this command from the parent showrunner:
 
@@ -12,6 +12,10 @@ Run this command from the parent showrunner:
 ```
 
 Pass the current production name with `--production`.
+Pass a supplied `--unit-type` to the launcher.
+Select `style` for units in the production document's `Style units` table.
+New units default to `direct`; existing units retain their staff type when the option is absent.
+The launcher refuses an explicit type that conflicts with staff.
 The plan comes from the unit's saved configuration or its row in the production document.
 A missing default reports its source paths.
 Optional `--plan`, `--brief`, `--standby`, or `--permanent` selects the launch mode.
@@ -23,6 +27,7 @@ Repeat `--responsibility <name>` for short duty names.
 The launcher preserves an existing configuration and refuses conflicting values.
 Every unit uses a tab in the shared `agents` session.
 Admission writes the worktree to the staff row.
+Staff stores `unit_type` and selects `/unit:direct`, `/unit:merge`, or `/unit:style`.
 It writes the plan, port, and responsibilities to untracked `.unit.toml`.
 The director profile comes from `/default_models production.director`.
 Use `--resume` with `--cwd` to restore a stopped conversation.

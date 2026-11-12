@@ -74,7 +74,7 @@ def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
         path, text = _decoded(encoded)
     else:
         if synchronize:
-            _sync_catalog(path)
+            _sync_catalog(path, environment)
         text = registry_text(path)
     return path, text, tuple(_records(text))
 
@@ -90,20 +90,20 @@ def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
     return RegistryEditBase(*_snapshot(environment, OPERATION_ENVIRONMENT[1], registry_path(), synchronize=True))
 
 
-def _sync_catalog(path: Path) -> None:
-    if os.environ.get("MODELS_CONFIG_TIER_ONLY") == "1":
+def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
+    if environment.get("MODELS_CONFIG_TIER_ONLY") == "1":
         return
-    home = Path.home()
+    home = Path(environment.get("HOME", str(Path.home())))
     script = Path(__file__).resolve().parents[1] / "agents/sync_codex_catalog.sh"
-    state = Path(os.environ.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
-    sources = (Path(os.environ.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
-               Path(os.environ.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
+    state = Path(environment.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
+    sources = (Path(environment.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
+               Path(environment.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
     if not path.is_file() or not os.access(script, os.X_OK):
         return
     if state.is_file() and not any(source.exists() and source.stat().st_mtime > state.stat().st_mtime for source in sources):
         return
     try:
-        result = subprocess.run([str(script)], env={**os.environ, "MODELS_CONFIG_FILE": str(path)},
+        result = subprocess.run([str(script)], env={**environment, "MODELS_CONFIG_FILE": str(path)},
                                 stdout=subprocess.DEVNULL, check=False)
         if result.returncode == 0:
             return

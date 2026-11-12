@@ -33,7 +33,7 @@ from scripts.lib import conf, test_hang_guard
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
 
 class FeedStopped(Exception):
@@ -136,51 +136,6 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
             "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-
-    def test_row_tooltips_keep_fields_after_the_step_table_is_removed(self) -> None:
-        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(os, "cpu_count", return_value=4)):
-            page = memory_feed.reading()
-        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-        html = self.expected_page()
-        functions = html[html.index("const TIPS ="):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
-        javascript = functions + constants + """
-const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-process.stdout.write(JSON.stringify({
-  walk:data.walk.map((row,index)=>tipText('row:'+index,data)),
-  waiters:data.waiters.map((row,index)=>tipText('wait:'+index,data))}));
-"""
-        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload), text=True,
-            capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        tips = cast(dict[str, list[list[str]]], json.loads(result.stdout))
-        for collection, kind in (("walk", "row"), ("waiters", "wait")):
-            rows = cast(list[dict[str, object]], payload[collection])
-            local_position = 0
-            for index, row in enumerate(rows):
-                if kind == "row" and not (row.get("queued") or row.get("kind") == "cloud"):
-                    continue
-                if kind == "wait" and row.get("kind") != "cloud":
-                    local_position += 1
-                with self.subTest(kind=kind, pid=row["pid"]):
-                    tooltip = tips[collection][index]
-                    text = "\n".join(tooltip)
-                    place = "run" if kind == "row" else "cloud" if row.get("kind") == "cloud" else str(local_position)
-                    self.assertIn(f"Place: {place}", text)
-                    self.assertIn(f"Pid: {row['pid']}", text)
-                    self.assertIn(f"Machine: {row.get('machine') or 'not assigned'}", text)
-                    self.assertIn(f"vCPU: {row['vcpus'] if kind == 'row' else 'not assigned'}", text)
-                    unit = str(row["unit"])
-                    if unit and unit == row["name"]:
-                        self.assertNotIn("Unit:", text)
-                    else:
-                        self.assertIn(f"Unit: {unit or 'not recorded'}", text)
-                    self.assertNotIn(str(row["name"]), text)
-                    if row.get("kind") == "cloud":
-                        self.assertNotIn(str(row.get("status") or row.get("reason")), text)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
@@ -360,6 +315,70 @@ process.stdout.write(JSON.stringify({
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(float(result.stdout), stale)
+
+    def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
+        _ = write_config_fixture(self.root / "build_folders.conf")
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        chrome = self.root / "chrome"
+        report = self.root / "chrome-report.json"
+        _ = chrome.write_text(f"#!{sys.executable}\n" + textwrap.dedent(r"""
+            import base64, hashlib, json, os, signal, socket, sys, tempfile
+            from pathlib import Path
+            profile = next(argument.split('=', 1)[1] for argument in sys.argv if argument.startswith('--user-data-dir='))
+            allocated = tempfile.mkdtemp(prefix='url_fetcher_')
+            record = {'profile': profile, 'temporary': os.environ['TMPDIR'], 'allocated': allocated}
+            report = Path(os.environ['CHROME_REPORT'])
+            report.write_text(json.dumps(record))
+            if os.environ['CHROME_END'] == 'request':
+                with socket.socket() as server:
+                    server.bind(('127.0.0.1', 0))
+                    server.listen(1)
+                    print(f'DevTools listening on ws://127.0.0.1:{server.getsockname()[1]}/debugger', file=sys.stderr, flush=True)
+                    with server.accept()[0] as connection:
+                        stream = connection.makefile('rb')
+                        headers = {}
+                        while line := stream.readline().strip():
+                            if b':' in line:
+                                key, value = line.split(b':', 1)
+                                headers[key.lower()] = value.strip()
+                        key = headers[b'sec-websocket-key'] + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+                        accept = base64.b64encode(hashlib.sha1(key).digest())
+                        connection.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+                        frame = stream.read(2)
+                        size = frame[1] & 127
+                        if size == 126:
+                            size = int.from_bytes(stream.read(2), 'big')
+                        mask = stream.read(4)
+                        payload = bytes(value ^ mask[index % 4] for index, value in enumerate(stream.read(size)))
+                        record['request'] = json.loads(payload)['method']
+                        report.write_text(json.dumps(record))
+                        os.kill(os.getpid(), signal.SIGKILL)
+            if os.environ['CHROME_END'] == 'kill':
+                os.kill(os.getpid(), signal.SIGKILL)
+            sys.exit(1)
+        """))
+        chrome.chmod(0o755)
+        for ending in ('exit', 'kill', 'request'):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                caller = Path(directory)
+                environment = {**os.environ, "TMPDIR": str(caller), "CHROME": str(chrome),
+                    "CHROME_REPORT": str(report), "CHROME_END": ending}
+                result = subprocess.run([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
+                    str(self.root / "proof")], env=environment, text=True, capture_output=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                if ending == 'request':
+                    self.assertRegex(result.stderr, "Chrome (closed during a debugger request|debugger connection closed)")
+                else:
+                    self.assertIn("Chrome closed before its debugger started", result.stderr)
+                record = cast(dict[str, str], json.loads(report.read_text()))
+                if ending == 'request':
+                    self.assertEqual(record['request'], 'Target.createTarget')
+                profile, temporary, allocated = (Path(record[key]) for key in ("profile", "temporary", "allocated"))
+                self.assertTrue(temporary.is_relative_to(profile))
+                self.assertTrue(allocated.is_relative_to(temporary))
+                self.assertFalse(profile.exists())
+                self.assertEqual(list(caller.iterdir()), [])
 
     def test_an_interrupted_page_publication_preserves_the_previous_page(self) -> None:
         self.output.mkdir()
@@ -757,6 +776,27 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["priority_text"], expected)
+
+    def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
+        reading = cloud_reading(with_queue_priority(with_wait_reason(
+            reservation_reading(), admission_records.StartSpacingWait(110))))
+        for priority, unit in ((True, "research"), (False, "research"), (True, "other")):
+            with self.subTest(priority=priority, unit=unit):
+                labels = {step.session_id: unit_labels.UnitLabels("fixture", "fixture-production", unit)
+                          for step in (*reading.view.running, *reading.view.waiting)}
+                current = reading if priority else replace(reading, explanation=replace(
+                    reading.explanation, priority=admission_records.NoQueuePriority()))
+                with (mock.patch.object(admission_client, "view", return_value=current),
+                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+                    page = memory_feed.reading()
+                for row in (*page["walk"], *page["waiters"]):
+                    expected = "queue priority: research (the user's bump)" if priority and row["unit"] == "research" else ""
+                    self.assertEqual(row.get("priority_text", ""), expected)
+                self.assertEqual(page["unmatched_priority_text"],
+                    "queue priority: research (the user's bump)" if priority and unit == "other" else "")
+                notes = [row["head_text"] for row in page["waiters"] if "head_text" in row]
+                self.assertEqual(notes, [page["head_text"]])
+                self.assertIn("cloud 1 of 1 slots", notes[0])
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -1163,6 +1203,10 @@ def write_browser_fixture(folder: Path) -> None:
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         readings["priority"] = with_queue_priority(base)
         with mock.patch.object(admission_client, "view", return_value=readings["priority"]):
+            pages["priority_unmatched"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        labels = {base.view.running[0].session_id: unit_labels.UnitLabels("fixture", "fixture-production", "research")}
+        with (mock.patch.object(admission_client, "view", return_value=readings["priority"]),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             pages["priority"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         _ = write_idle_config(fixture.root)
         _ = write_idle_alert(fixture.root / "mac-idle", base.explanation.now)

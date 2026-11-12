@@ -2,7 +2,11 @@
 description: Promote a session to unit director.
 ---
 
-**Usage:** `/showrunner:promote_unit <session name> [unit plan]`. Run it in a showrunner session during `/showrunner:produce`, with that command's state (`PRODUCTION_DOC`, `CHECKOUT`, `MERGE_BRANCH`, `LOG`, `ZONE`, `PROMPT_FILE`).
+**Usage:** `/showrunner:promote_unit <session name> [unit plan] [--unit-type direct|merge|style]`.
+Run it in a showrunner session during `/showrunner:produce`.
+Use that command's state: `PRODUCTION_DOC`, `CHECKOUT`, `MERGE_BRANCH`, `LOG`, `ZONE`, and `PROMPT_FILE`.
+Pass a supplied `--unit-type` to both `add_unit.py` calls below.
+New units default to `direct`; existing units retain their staff type when the option is absent.
 
 The other direction, a unit becoming the showrunner of its own production under this one, is `/showrunner:promote_showrunner`.
 

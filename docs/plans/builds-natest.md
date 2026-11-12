@@ -3405,40 +3405,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `ShowrunnerFixture.cli` in `scripts/production/test_showrunners.py` calls `showrunners.main` in process through `invoke_cli(production_state=True)`. Calls with pane or caller arguments keep the real CLI process. Showrunners Python starts fell from 28 to 4. All 38 tests and 154 assertions stay. aws pairs, 3 rounds: `production/test_showrunners.py` 5.03 → 2.47 CPU s (2.56 s saved). sdlc gave the owner go. Checkpoint `6ad7a4767`.
 
-### Phase 213 — The unit director resolver takes the parsed launch table
+### Phase 213 — The unit director resolver takes the parsed launch table  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `director_agent` in `scripts/production/add_unit.py` sends the parsed launch table to its existing resolver shell through stdin, so the shell starts no registry-reader Python child, and aws pairs show a CPU gain.
-
-**Decision:** sdlc showrunner (owner), 2026-11-12: go; keep the change to the speed fix only; send sdlc the diff before land.
-
-**Spec:**
-1. Read rank 2 in `phases/207/model_resolution_report.md` (unit session folder) and the Phase 208 as-built.
-2. In `director_agent` (`add_unit.py:459`), build one `models_registry.LaunchModelConfiguration` and send `models_registry.configuration_shell(configuration)` through stdin. The shell loads it with `IFS= read -r -d "" table; _models_table_load "$table"` before `agents_resolve production.director`. `models_registry.launch_settings` is the model for this shape.
-3. Read the registry from the same path and environment the shell reads today. Keep the catalog sync behavior that the shell resolver runs today; prove it with a test row or a cited code path.
-4. Keep the three returned values, every refusal text, the resolver in this script's checkout, and the cwd.
-5. No caches. No snapshot reuse across calls. Keep `RegistryEditBase` apart.
-6. Keep every test and assertion. Add a row only where a changed path has no cover.
-7. Run every module that imports `add_unit` (`git grep -l add_unit -- 'scripts/*test_*.py'`) and basedpyright on each changed file.
-8. Measure `production/test_add_unit.py` with `module_cost.py --commands 15` before and after. Report registry-reader starts.
-
-**Files:**
-- `scripts/production/add_unit.py` — `director_agent`.
-- `scripts/lib/models_registry.py` — `launch_configuration` takes an optional `registry=` path; `registry_path` takes an optional environment and is the one registry path rule for `director_agent`, `claude_model` and Phase 214 (sdlc, 2026-11-12).
-
-**Workers:** 1 writer; it owns the shared `models_registry.py` change.
-- impl: `scripts/production/add_unit.py`, hub: `scripts/lib/models_registry.py`.
-
-**Constraints from prior phases:**
-- Phase 208 sends the table to `claude_model` the same way; its 46 removed add-unit readers are outside this bound (0–3.219 s, 64 starts).
-
-**Acceptance gate:**
-- Registry-reader starts fall in `production/test_add_unit.py`.
-- All importer modules pass; basedpyright reports 0 errors and 0 warnings.
-- aws paired trial shows a CPU gain with the same tests passing.
-- sdlc sees the diff before land.
+- `director_agent` in `scripts/production/add_unit.py` reads the launch configuration in process through `models_registry.launch_configuration(os.environ, registry=models_registry.registry_path(os.environ))` in the script's checkout. The resolver shell gets the parsed table through stdin: `{ IFS= read -r -d "" table; _models_table_load "$table"; }`. Read errors become a Refusal. `models_registry.registry_path(environment)` is the one rule for `MODELS_CONFIG_FILE` or HOME. Registry-reader starts fell from 64 to 0. All tests stay. aws pairs, 3 rounds: `production/test_add_unit.py` 20.07 → 16.80 CPU s (3.28 s saved); `notify/test_review.py` no change. sdlc approved the diff. Checkpoint `719978efd`.
 
 ### Phase 214 — The assignment resolver takes the parsed launch table
 **Depends on:** none
@@ -3571,35 +3543,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
 - aws pairs show a gain; sdlc sees the diff before land.
 
-### Phase 218 — The unit lookup test module keeps only the tests that pay their way
+### Phase 218 — The unit lookup test module keeps only the tests that pay their way  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_unit_lookup.py` loses every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+- `scripts/production/test_unit_lookup.py` went from 67 to 60 tests under Rule 2. The removed tests checked a constructor type, timer and process-scan call counts, and a retired history tail reader. The `live_hosts` helper and unused `renamed_production` rows went with them. All 60 retained tests and 205 assertions are unchanged. Both blind reviews approved each removal. Checkpoint `76007751d`.
 
-**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Phase 150 held this module; sdlc freed it on 2026-11-12 (main `4f458f9a0`).
-
-**Spec:**
-1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
-2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
-3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
-4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Check each fixture output the removed test read (Phase 150 gotcha). Do not change production code.
-5. Do not merge tests into table rows in this phase.
-6. Write `phases/218/removed_tests.md` in the unit session: one row per removed test, with test name, kind of rare case and the reason no user harm follows. Give the counts before and after.
-7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Keep a test whose code a live tool still calls. `unit_lookup.unit_row` feeds `change_review.unit_producer` and the merge gate.
-
-**Files:**
-- `scripts/production/test_unit_lookup.py` — 67 tests.
-
-**Workers:** 1 writer; one module.
-- impl: the module and the removal table.
-
-**Constraints from prior phases:**
-- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
-- Phases 145–152: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
-
-**Acceptance gate:**
-- The module and every module that imports it pass; basedpyright reports 0 errors and 0 warnings on the edited file.
-- `phases/218/removed_tests.md` lists every removed test with its reason, and the counts.
-- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.

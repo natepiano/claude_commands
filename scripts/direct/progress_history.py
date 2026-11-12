@@ -1401,6 +1401,7 @@ def _close_slot_pass(
         return False
     event = _event(state, "pass_finished", now, current_pass)
     event["status"] = status
+    event["reply_file"] = dispatch_delivery(current_pass).reply_file
     # Taken from the pass, not from the environment. A stale pass is closed by
     # whichever launcher starts the next one in that worker, and reading the
     # environment here would stamp the closer's worker onto the opener's work.

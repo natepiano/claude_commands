@@ -370,7 +370,7 @@ class PaneRecordTests(unittest.TestCase):
         _ = evidence.write_text(json.dumps({"w1:p2": entry}))
         before = evidence.read_bytes()
         identity = staff.StaffId(entry["session_id"])
-        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
         with (mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(source)}),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))),
               mock.patch.object(pane_record, "RECORD_DIR", self.records)):
@@ -482,7 +482,7 @@ class PaneRecordTests(unittest.TestCase):
         location = staff.PresentWorktree(remote.local_machine(), self.root / "unit")
         unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
                              current_session=staff.StaffId("unit-session"),
-                             worktree=location)
+                             worktree=location, unit_type=staff.UnitDetails("direct"))
         for parent in (staff.ReportsTo(unit.id), staff.StaffRoot()):
             with self.subTest(parent=parent):
                 worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", parent,
@@ -729,7 +729,7 @@ class PaneRecordTests(unittest.TestCase):
         from scripts.production.session_labels import StaffLabels
 
         parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", staff.StaffRoot(), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
-        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", staff.ReportsTo(parent.id), current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"), unit_type=staff.UnitDetails("direct"))
         entry = pane_record.launch("new", "019b3a40-4250-7000-8000-000000000102", "/fixture", {"CLAUDE_CODE_SESSION_ID": owner.current_session}, ["claude"])
         labels = StaffLabels(staff.StaffSnapshot((parent, owner)))
         self.assertEqual(labels.environment(entry["environment"], owner.current_session), {"CLAUDE_CODE_SESSION_ID": owner.current_session})
