@@ -77,7 +77,7 @@ job (15 s) → notifier.sh tick
   for each instance with ENABLED=1 and now ≥ NEXT_DUE (a run-only instance: launch_run, below), in a background subshell:
     lock; claim the slot (NEXT_DUE = next one); unlock
     CHECK under a watchdog          → 0 go on, 2 remove instance, other skip
-    sessions.py socket TARGET       → none: skip "session not running"; records unreadable
+    sessions.py member-socket TARGET → none: skip "session not running"; records unreadable
                                       (exit 3): skip "session lookup exit 3"
     hold (HOLD=1 only)              → skip, or release and go on
     PROMPT=scheduled               → build prompt from the current owner row; failure skips this tick
@@ -99,10 +99,13 @@ For `session:<staff-id>`, the staff row supplies the current session.
 A restarted session can therefore receive messages at its current socket.
 
 `COMMAND` supplies fixed message text.
+`codex_winddown.start_count` passes its `TICK` text through `--command` and creates no prompt file.
 For `PROMPT=scheduled`, the notifier runs `update_registration.py prompt --owner <staff-id>` before delivery.
 It removes the `session:` prefix from `TARGET` for that command.
-The command reads the owner's current staff row and production document.
-The document supplies the update interval; the staff row supplies the current name and document path.
+The command resolves the owner's current name and document through staff.
+It reads the update interval from that document.
+`scheduled_prompt(minutes, production)` fills the template's interval, zone, name, and state directory.
+The output contains the template text without an added document-path line.
 A failed build skips the tick and prints one stderr line.
 It does not record `LAST_SENT` or send a message.
 
@@ -172,7 +175,8 @@ notifier.sh new showrunner-<staff-id> --to session:<staff-id> --every <N> \
 Registration writes `PROMPT=scheduled` and creates no prompt file.
 Each tick builds the prompt from the current owner row, production document, and `commands/showrunner/produce.md` template.
 A rename changes the name in the next prompt.
-A document move changes the path in the next prompt.
+A document move changes the source read for the next prompt.
+`adopt_moved_state` copies missing scratchpad state and writes no prompt file.
 
 N comes from the document's `**Updates:** every N minutes` line.
 The text `on the hour` adds `--aligned`.

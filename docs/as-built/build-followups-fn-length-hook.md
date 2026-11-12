@@ -104,7 +104,10 @@ The reply footer, its `Waiting on:` block, the footers-off switch and `/showrunn
 
 Files: `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.py`, the Open-questions list and The hook bullets of `commands/showrunner/produce.md`. The Stop hook that checked a showrunner's reply is gone (2026-10-19).
 
-- **Production.** `read_production(instance_dir) -> Production | None` takes the doc from the last token of the instance's `CHECK`, requires `Status: PRODUCTION — running`, takes the zone from the user's zone setting (`scripts/lib/user_zone.py`; the doc's `- **User zone:**` line is not read), and builds `schedule` from state: `ScheduledDailies(next_due)` when `ENABLED=1`, else `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`. Anything unreadable gives `None` (the production is skipped).
+- **Production.** `read_production(instance_dir) -> Production | None` reads the document from the timer owner's current staff row.
+  It requires `Status: PRODUCTION — running` and reads the zone through `scripts/lib/user_zone.py`.
+  It builds `ScheduledDailies(next_due)` when `ENABLED=1`; otherwise, it uses `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`.
+  An unreadable document gives `None`.
 - **Open questions.** `open_questions(productions) -> int | None` counts the items now due in every production's needs-user file: an item with no `after`, or whose `after` is at or before now in the production's zone. It is `None` when a file cannot be read.
 - **Counts line.** `scripts/production/footer_counts.py` reads each count at render time and stores none. `changes` uses the staff routing function in `scripts/production/change_routing.py`, which also supplies the change page tabs.
 The router reads the fixed staff id in each row's Producer cell.
@@ -160,11 +163,65 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
   - Idle for `stall_minutes` with no work and a `holding:` status naming an outside party: only a per-unit log line, with no bump or showrunner tell. The hold leaves `tell_sent` false. A later idle unit can receive its bump and tell in the same stretch. Other idle units, including holds naming only their own work and units with no turn-end status, keep one bump to the unit's own socket (`stall-watch: you have been idle since HH:MM <zone> with nothing running. Continue your run; …`, key `stall-watch:<unit>:<since>:bump`) and one report to its showrunner (`<unit> idle since …, nothing running; bumped. Last status: <line>`, key `…:tell`) per idle stretch.
   - `send_all` starts every `send.py --to uds:<socket> --from stall-watch --key <key> --text …` together and waits at most 90 s for the batch; a failed recipient is retried next tick with the same key; the stretch flag is set only after a successful send. A successful prompt alert immediately saves `alerted` and its report as `case_pending`. `retry_cases` opens pending cases after the batch and on later ticks, clearing each report only when its case opens or joins; case retries send no second alert. A cleared prompt retires its alert even while the case is pending. Successful retirement moves a pending case to its own `.case.json` snapshot, freeing the active prompt state for new alerts. `retry_cases` reads both prompt and case files and removes each case file only after its case opens or joins.
 
-- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` makes a run-only instance (`RUN=` in `conf`; not combinable with `--to`, `--from`, `--check`, `--command`, `--prompt-file`, `--hold` or `--aligned`; timeout defaults to 120 s). `cmd_tick` starts each due `RUN=` job outside the tick through `launch_run`: a transient `systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on macOS a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label; with neither launcher it logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job after the tick lock is released. The job claims its slot, runs the command with output to `<instance>/run.log` (replaced each run), has a `zselect` watchdog that sends TERM at the timeout, and appends `run timeout` or `run exit <rc>` to `fire.log`. Non-run jobs still run inside the tick.
+- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` creates a run-only instance with `RUN=` in `conf`.
+  It cannot combine `--run` with `--to`, `--from`, `--check`, `--command`, `--prompt`, `--hold` or `--aligned`.
+  The timeout defaults to 120 seconds.
+  `cmd_tick` starts each due job through `launch_run` outside the tick.
+  Linux uses a transient `systemd-run --user --collect --quiet --no-block` service named `session-notifier-<name>-<pid>-<random>`.
+  macOS uses a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label.
+  Without either launcher, the notifier logs `run launcher unavailable: <name>; waiting after tick` and runs the job after it releases the tick lock.
+  The job claims its slot and replaces `<instance>/run.log` with its command output.
+  A `zselect` watchdog sends TERM at the timeout.
+  The job appends `run timeout` or `run exit <rc>` to `fire.log`.
+  Other jobs run inside the tick.
+
+### Production launch and wrap records
+
+`scripts/production/add_showrunner.py` writes `~/.local/state/showrunner/<owner staff id>/add_showrunner.json`.
+The receipt stores `owner`, `caller`, `resume` and `started_at`.
+It stores no `session_id`.
+A pending receipt also stores `doc` and `config_dir` as creation claims.
+
+`finish_publication` saves `config_dir` as the owner's home through `staff.set_home`.
+It then rewrites the receipt without `doc` and `config_dir`.
+The first launch and a repeated owned launch with creation claims both call `finish_publication`.
+This order lets a repeated launch complete an interrupted home write.
+
+`completion_receipt.read_launch_receipt` resolves `owner` through staff and returns `OwnedReceipt`, `UnpublishedReceipt` or `NoReceipt`.
+An owned receipt uses the owner's current session, document and home from staff.
+An unpublished receipt has no staff row and uses `owner` as its native session identity.
+Its creation claims supply the document and account directory until publication completes.
+`ShowrunnerLaunch.from_receipt` accepts the receipt variant and reads `started_at` from its fields.
+
+`scripts/production/production_lifecycle.py` saves `wrap_release.json` under the same owner directory.
+`former_parent` stores a recipient staff id or `null`.
+`former_children` and `told` store lists of recipient staff ids.
+`showrunner_tree.edges_to_release` captures these ids from staff relationships.
+`release_edges` reads each recipient's current staff name immediately before its delivery.
+After a successful delivery, it saves that recipient's id in `told`.
+It reads current names again for the final parent and children report.
+This per-delivery lookup preserves correct routing when a recipient changes name during an earlier delivery.
 
 ### Adhoc review pause
 
-`scripts/production/review_pause.py pause | status | resume dailies|none` acts on each production targeting `$CLAUDE_CODE_SESSION_ID`. The record is `~/.local/state/showrunner/review-paused/<showrunner name>.json`, `ReviewPauseRecord{dailies}` with the action an `ActionState`: `untouched`, `attempted`, `done` or `skipped` (legacy booleans read as `done`/`skipped`; a `footers` key from before 2026-10-18 is ignored), written atomically before and after the action. `pause` stops dailies (`notifier.sh stop showrunner-<showrunner name>`, 10 s timeout) when enabled; `reconcile_attempted(instance, path, record)` (shared by `pause`, `status`, `resume`) turns an `attempted` action into `done` when its effect is observable. A failed stop leaves `attempted`, so a re-run redoes only what did not happen. `resume dailies` turns dailies back on only when the record says `done`; `resume none` leaves them off; both delete the record. `/adhoc_review` Step 2 runs `pause`; Step 5 runs `status` and, when the review paused dailies, asks `Turn dailies back on? (yes / leave off)`, then `resume dailies` or `resume none`.
+`scripts/production/review_pause.py pause | status | resume dailies|none` acts on productions targeting the staff owner of `$CLAUDE_CODE_SESSION_ID`.
+`pause`, `status` and `resume` resolve each timer's owner through staff and show the current production name in output.
+The record path is `~/.local/state/showrunner/review-paused/<owner staff id>.json`.
+`showrunner_footer.review_pause_path` builds this path.
+`conversation_pause._review_names` resolves timer owners to staff ids before the review check reads these files.
+
+`ReviewPauseRecord{dailies}` stores one `ActionState`: `untouched`, `attempted`, `done` or `skipped`.
+The reader accepts legacy booleans as `done` or `skipped` and ignores a legacy `footers` key.
+The writer saves the record atomically before and after the action.
+`pause` stops enabled dailies through `notifier.sh stop showrunner-<owner staff id>`, with a 10-second timeout.
+`reconcile_attempted(instance, path, record)` changes `attempted` to `done` when it observes the effect.
+All three commands use this function.
+A failed stop retains `attempted`, so a repeated command retries the incomplete action.
+`resume dailies` starts dailies only when the record says `done`.
+`resume none` leaves dailies stopped.
+Both resume choices delete the record.
+`/adhoc_review` runs `pause` at Step 2 and `status` at Step 5.
+If the review stopped dailies, it asks `Turn dailies back on? (yes / leave off)` before the selected resume command.
 
 ### Cargo token and step groups
 
@@ -265,7 +322,9 @@ Run files keep staff references instead of copied native identities.
 
 - **No Stop hook for asked questions** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The reply footer it once checked is gone (user, 2026-10-18).
 
-- **The switch is a file keyed by showrunner staff name** so it survives compaction, resume and a retargeted notifier instance; the review pause records what it changed so `resume` restores only that, and per-action states make a failed pause retryable.
+- **Review records use fixed staff ids.** A production rename, compaction or session change preserves its review record.
+  The record identifies the action that the review completed.
+  `resume` restores only that action, and action states let a repeated pause complete an interrupted action.
 
 - **Run jobs get their own service.** A background child stays in the tick's cgroup or launchd job and dies with it; a separate service keeps the run, its watchdog and its final log write alive.
 

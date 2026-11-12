@@ -61,7 +61,16 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Named states**: every optional or alternative value crossing a reader boundary is a `NamedTuple` union (`FieldPresent | FieldAbsent`, `PushedTip | NotYetPushed`, `EtaFresh | EtaStale | EtaPassed | EtaNone`, and so on), never a string or `None`.
 
-- **Session state**: `showrunners.session_state_dir(<staff id>)` is `~/.local/state/showrunner/<staff id>/session` (`STATE_DIR` in `produce.md`). It holds `showrunner_state.json`, `dailies_judgment.json`, `dailies_state.json`, `unit_status/` and `dailies_input_state/`, which a scratchpad held before. A new session id, a restart and a reboot keep it; a rename preserves the staff id folder, and a wrap deletes that folder. `showrunners.copy_session_state` copies each of the five that a scratchpad holds and the folder does not; a completed copy never replaces a file. Each copy goes to a temporary sibling first, then moves into place. A rerun discards an incomplete sibling and copies again. It runs with no step by anyone: `update_registration.adopt_moved_state`, which every `update_registration.py` call and every `dailies_input.py` run calls first, looks for the files the folder lacks in the scratchpad of the session the update timer's TARGET names (`/tmp/claude-*/*/<session id>/scratchpad`), and rewrites `prompt.txt` when it differs from what `produce.md` gives now. `load --scratch <SCRATCH>` runs the same copy from a named scratchpad.
+- **Session state.** `showrunners.session_state_dir(<staff id>)` is `~/.local/state/showrunner/<staff id>/session` (`STATE_DIR` in `produce.md`).
+  It holds `showrunner_state.json`, `dailies_judgment.json`, `dailies_state.json`, `unit_status/` and `dailies_input_state/`.
+  A session change, restart, reboot or production rename preserves the staff id folder.
+  Wrapping a production removes that folder.
+  `showrunners.copy_session_state` copies missing scratchpad files through atomic writes and preserves existing files.
+  `update_registration.adopt_moved_state` selects the timer owner's current session through staff.
+  It copies missing state from `/tmp/claude-*/*/<session id>/scratchpad` and writes no prompt file.
+  Registration and dailies commands call it before their work.
+  `load --scratch <SCRATCH>` copies missing state from the named scratchpad.
+  Scheduled prompt delivery reads the current owner and document schedule without adopting state.
 - **State directory**: `DAILIES_STATE_DIR` (`<STATE_DIR>/dailies_input_state`, in `produce.md`'s State list) is the one `--state-dir` for the dailies builder, every stateful `ci_points.py` call and every stateful `waiting.py` call. It holds `eta_seen.json`, `ci_points.json`, `ci_run.json`, `review_watch.json`, `agenda_seen.json` and the scratch-test logs.
 
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
