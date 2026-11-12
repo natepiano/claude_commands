@@ -2,7 +2,21 @@
 
 ## What it is
 
-Every build on natedev, CI's and the sessions', is admitted so that it fits in memory, and earlyoom is a last resort rather than a routine event (target: a normal working day with no earlyoom kill). Before this, two admission systems could not see each other: CI ran outside steve in a slice whose limit counted page cache, sessions took steve slots that were admitted before their compilers grew, swap sat full of idle processes so earlyoom's swap condition always held, and a build hold released every session at the same instant. On 2026-10-04, 58 earlyoom SIGTERMs failed whole build steps and CI jobs. Now session builds and their compiles run in one bounded user slice, CI runs in its own smaller slice and slot pool with a kill order below the sessions', build steps sit above both so earlyoom kills the largest build first, every compiling step and every BRP launch waits for free memory before it starts, a build hold releases every held session at once into those gates, and the build log measures all of it: per-slice samples and snapshots, a window memory report, the day's waits, memory kills and CI freshness. The same body of work also hardened neighbors that share these files: the example-test guard in `verify.sh`, prompt reclaim of a cargo token whose `verify.sh` was killed, CI queue-time accounting, BRP launch recording, the disk-floor alerts, the Codex launcher's capacity handling, the dailies Agents section, and broadcasts to every live session.
+Build admission keeps CI and session builds within available memory on natedev.
+The target is a normal working day without an earlyoom kill.
+On 2026-10-04, 58 earlyoom SIGTERMs failed build steps and CI jobs.
+Two admission systems previously could not see each other.
+CI ran outside steve in a slice whose limit counted page cache.
+Session compilers grew after steve admitted their slots.
+Full swap caused earlyoom's swap condition to remain true.
+A build hold released every session at once.
+Session builds and compilers now share one bounded user slice.
+CI uses a smaller slice and slot pool, with a lower kill priority than sessions.
+Build steps sit above both, so earlyoom kills the largest build first.
+Every compiling step and BRP launch waits for free memory.
+A build-hold release sends held sessions through those memory gates.
+The build log records slice samples, snapshots, memory reports, waits, kills, and CI freshness.
+This work also hardened the example-test guard, Cargo token recovery, CI queue accounting, BRP records, disk alerts, Codex capacity handling, and session broadcasts.
 
 ## How it works
 
@@ -948,7 +962,23 @@ The hourly task can retry the exchange.
 
 ### Build hold (`scripts/build_hold/build_hold.py`, `commands/build/hold.md`)
 
-**Holder files.** One file per holder in `BUILD_HOLD_DIR` (default `~/.local/state/build-hold/`), one JSON line `{holder, since, for, release_eta, keep}`. `keep` holds PID/start-time pairs and defaults to empty for old files. Installed scripts refuse set directory variables or a changed `HOME`; unset the variable or use a shell with the user's home. The shell guard also refuses read-only `HOME`. The legacy free-text form reads, and an unreadable or malformed regular file stays a hold. Types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, `Holder(name, since, purpose, release, key, keep)`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `ReleaseRequest = NoReleaseEta | ClockReleaseEta`. `write_hold` and `start_hold` take the resolved identity. Holder files supply state to status, dailies and Rust release checks. `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle. Every present holder file is in force, even when the cycle has `released_at` or `release_started_at`. There is no releasing state. Only removal ends that holder's hold.
+**Holder files.** `BUILD_HOLD_DIR` defaults to `~/.local/state/build-hold/`.
+Each holder has one file with one JSON line: `{holder, since, for, release_eta, keep}`.
+`keep` holds PID/start-time pairs and defaults to empty for old files.
+Installed scripts refuse directory overrides or a changed `HOME`.
+Unset the override or use a shell with the user's home.
+The shell guard also refuses a read-only `HOME`.
+Legacy free text remains readable.
+An unreadable or malformed regular file remains a hold.
+The types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, and `Holder(name, since, purpose, release, key, keep)`.
+`ReleaseEta = KnownReleaseEta | UnknownReleaseEta` describes the release time.
+`ReleaseRequest = NoReleaseEta | ClockReleaseEta` describes the request.
+`write_hold` and `start_hold` take the resolved identity.
+Holder files supply state to status and Rust release checks.
+`natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle.
+Every present holder file remains in force, including when the cycle has `released_at` or `release_started_at`.
+There is no releasing state.
+Only removal ends the holder's hold.
 
 ### Step state publication
 
@@ -1086,9 +1116,20 @@ The `hold`, `status`, and `audit` commands accept `--proc-root` for a fake proce
 
 The audit calls `hold_enforcer.record_build(..., action="audit")` for each `other_session` or `no_session` build. The enforcer uses the same writer with `action="stopped"` for each stopped root. Both call `store.append_line` in the current process, after the audit read; no detached audit recorder runs. The kernel boot id, PID and process start time identify the build. The permanent file is `buildlog/<host>/hold-builds-<hold hash>.jsonl`. A separate `.lock` file covers the duplicate check and append, once per build, holder key, `since` and action. A new hold or a reused PID gets a new row. Index schema 21 adds `action` to `hold_builds`; old rows read as `audit`. Rows record hold identity, build identity, class, owner, command as shell text, working directory and observation time. Holder and admitted builds get no audit row.
 
-**Holder key (2026-10-08).** A hold file is named by the holder's Claude session id: the caller's (`CLAUDE_CODE_SESSION_ID`) when `--holder` is left out, else the live session `--holder` means (`sessions.addressed`: its name now, or a name it alone once had). `Holder.key` is that file name and `Holder.name` is the session's name now, looked up at each read; the `holder` field in the file is the name at hold time and is shown only while the session is not live. `cycle["holders"]` keeps the key given to `start_hold`; `holder_path` replaces unsafe characters to make `Holder.key`, the file name. Different keys can name the same file, so a recorded release matches both that file name and its `since` instant. A holder that is no live Claude session keeps its name as the key. `held_key` finds a hold taken under a name before this change by the name given, the session's name now and its former names.
+**Holder key.** A staff holder uses its fixed staff ID as the file key. Without `--holder`, `CLAUDE_CODE_SESSION_ID` must resolve through `staff.snapshot().by_current_session`. A given holder resolves through its fixed ID, current session, or current staff name. An explicit holder outside staff keeps its given text as the key. Registry names and former names do not select holds or release records. `Holder.name` shows the current staff name when the key resolves. `cycle["holders"]` retains the key from `start_hold`. `holder_path` replaces unsafe file-name characters in that key. A recorded release matches the resulting file name and its `since` instant. The deployment converter handles old keys once; runtime readers accept only the fixed key.
 
-**Hold cycle.** `BUILD_HOLD_RELEASE_DIR` defaults to `~/.local/state/build-hold-release`, outside the holder directory. `current` names `<id>/cycle.json`, atomically replaced under `release.lock`. `HoldCycle` stores its id, open time, holders with `{since, released_at}`, recipients by session id, release start and `ReleaseEntry` rows with session id, name and delivery outcome. The first hold with no files opens a cycle without reading an old one. With other holders it joins the cycle; without a readable cycle it writes its file and opens none. Old cycle files with call, generation and gate fields still read; those fields no longer control a build.
+**Hold cycle.** `release_directory()` uses `BUILD_HOLD_RELEASE_DIR` when set.
+Otherwise, it uses a sibling of `holder_directory()` named `<hold folder name>-release`.
+With neither variable set, the release folder remains `~/.local/state/build-hold-release`.
+`current` names `<id>/cycle.json`.
+The writer replaces this file atomically under `release.lock`.
+`HoldCycle` stores its id, open time, and holders with `{since, released_at}`.
+It also stores recipients by session id, release start, and `ReleaseEntry` rows with session id, name, and delivery outcome.
+The first hold with no files opens a cycle without reading an old one.
+With other holders, it joins the cycle.
+Without a readable cycle, it writes its holder file and opens no cycle.
+Readers still accept old cycle files with call, generation, and gate fields.
+These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
@@ -1100,7 +1141,16 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 `status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, unsent names and `/build:hold release` to finish it. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted` or `DeliveryFailed` means unsent; a broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
 
-**Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities and delivery outcomes and requires each holder's `since` to be an instant with an offset; it raises `ReleaseRecordReadError` (a `ValueError`) naming the fault. An invalid holder time follows the same recovery path as any other unreadable record. Changing commands read through `read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside(path)` under the lock: on damage it renames `cycle.json` (when it exists or is a dangling symlink), else `current`, to `<name>.damaged-<UTC YYYYMMDDTHHMMSSZ>` (`-2`, `-3`... when taken), removes `current`, and prints `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`. Read-only `status` and the dailies footer print `release record could not be read: <error>; /build:hold release sets it aside and ends the hold` and change nothing.
+**Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities, and delivery outcomes.
+Each holder's `since` must have a time offset.
+It raises `ReleaseRecordReadError`, a `ValueError`, that names the fault.
+An invalid holder time uses the same recovery path as another unreadable record.
+Changing commands call `read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside(path)` under the lock.
+On damage, it renames `cycle.json`, including a dangling symlink, or `current` when no cycle file exists.
+The new name is `<name>.damaged-<UTC YYYYMMDDTHHMMSSZ>`, with `-2`, `-3`, or later suffixes when needed.
+It removes `current` and prints `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`.
+Read-only `status` prints `release record could not be read: <error>; /build:hold release sets it aside and ends the hold`.
+It changes nothing.
 
 **Recorded hold intervals.** A new holder file queues a `began` event after writing the file; every removal in `release_hold` queues `ended`, using that file's key, name and reason. Repeating a hold writes no event. The event's UTC `at` is taken under the coordination lock and queued there; a detached `record.py hold-event` starts after the lock closes. A stalled event log cannot delay hold or release. Both reports read current coordination state independently. A lost event reads `end not recorded` or `began not recorded`, never a changed hold. The index keeps one row per event with its source file; the `holds` view pairs by host, target and key, ordering equal instants began first. Overlapping holders count once in held duration. A present holder file keeps an interval with no recorded end open, regardless of cycle release fields. Times shown use the user's zone, stored instants UTC.
 
@@ -1112,11 +1162,8 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 `top_level.py` takes no arguments (any argument: `usage: top_level.py`, exit 2) and runs no ssh. `forwarded_sessions()` reads this machine's roster (`roster.roster(os.environ, roster.ThisMachine())`, `docs/as-built/session-roster.md`) and keeps each `roster.is_top_level` row: a Claude session that is neither a worker nor a unit director under a showrunner, so a unit director with no running showrunner is included. It leaves out the sender by `roster.sender_identity` and `roster.is_sender`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`; with neither set nobody is left out. Roster problems print on stderr as `top_level: roster: <problem>` and the rest still prints. Each row's socket comes from the newest running record for its session id (`sessions.running_sessions()`), so a conversation two processes hold (resumed in a terminal while the desktop app still has it open; seen 2026-10-08 as `bevy_brp` listed twice) is listed once, and two sessions that share only a name are both listed. Each row becomes `AddressableSession(name, session_id, address) | UnaddressableSession(name, session_id)`. Only addressable sessions print, one `<name>\tuds:<messagingSocketPath>` line each, sorted by name then address, and are recorded as hold recipients (`build_hold.py record-recipient`; `main` returns 1 when a record fails); each unaddressable one prints `not reachable: <name> [<session id>] has no messaging socket` on stderr. `/notify_top_level` sends to each `uds:` address, adds every ListAgents peer on another machine unless `--here`, asks showrunners to pass the message to their unit directors, names held or refused deliveries by name and address, and reports each `not reachable` line as a session not told.
 
-### Dailies (`scripts/production/dailies_render.py`)
-
-- Holds: `read_dailies_hold()` reads the holder files. The report and `--footer` show each holder's purpose, start time and release ETA. Old files show `released HH:MM ZONE; the memory gate orders builds`. `hold_action_lines` names recipients without a confirmed notice: `<session> could not be told builds are released; tell it`. It uses the session name, or `an unnamed session` when only an id exists. `build_hold.py status` keeps the delivery list. The last release removes the holder file. The renderer refuses these states with exit 2: a top-level `build_hold` field; a build hold marker without a holder file; an invalid holder marker. Active holders require a marker when any report unit does not hold the builds itself. A report with no units can render. A report whose units all hold the builds can render. A holder marker is invalid when its unit carries `holds_builds` or matches an active holder's name. The diagnostic is `units.build_hold: <unit> holds the build hold itself; remove its marker`. A holder purpose cannot contain production plumbing words.
-- `### Agents` sits after the hold lines and above `waiting on you:` (the `--footer` form writes the same lines as bullets, with no heading): one line per note in use (`role` or `sessions`) in `AGENTS_DIR` (`~/rust/hanadocs/agents/`), by account label, e.g. `- codex2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29`; `- none active` otherwise. Run-out = reading time + (100 - used) / rate, rounded to the minute. The rate is `run_out.weighted_rate` over the `READINGS_LOG` readings: each rise weighted by half per 12 h of age; refills, time at 100% and gaps over 15 min are skipped. Until the readings cover a weighted hour, it is used percent over the time since the later of the last refill and 24 h ago. `scripts/whoami/agent_notes.apply` appends `{"account", "at", "remaining"}` to `~/.local/state/agent-notes/readings.jsonl` and keeps 8 days.
-- `same_phase` compares only the title after the first `: `, so a renumbered phase keeps its ETA history and a retitled one starts afresh. `draw_from` sets the latest cell only when it is after the ETA cell.
+2026-11-11: Dailies and their build-hold footer were retired.
+Use `build_hold.py status` to read holder and release-delivery state.
 
 ### Disk floor: what it removes (`scripts/lint/sweep.py`)
 
@@ -1356,7 +1403,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - A cargo token is reclaimed early only through a `holder_pid` that names a gone process; holder and waiter share one pid namespace. The guard file is never removed.
 - Holder files supply current hold state. Old cycles distinguish files still in force from completed holds. A release removes its holder file at once. Historical log rows never decide whether a build can start.
 - Releases go by session id, never by name. A session that cannot be messaged is never recorded as a recipient.
-- Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status` or the dailies.
+- Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status`.
 - `steps.mem_wait_s` is the memory wait. `steps.wait_s` is the call's lookup and token wait. The file name hashes the schema SQL. Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - Only `ran` CI jobs carry duration and queue time. CI days key on the run attempt's `started_at` everywhere.
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
@@ -1390,7 +1437,11 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - **Disk floor order.** A no-op cargo build writes nothing under `target/`, and relatime refreshes atimes at most once a day, so only the use stamp records a step that compiled nothing. The stamp lags a lint step by up to 5 minutes (`invoke.sh`'s sweep rate limit), which only reorders targets used within the same 5 minutes. The build log's `sweep_freed_bytes` counts each workspace's budget sweep and the floor sweep after it together, so it is not the floor's cost alone; the journal's per-target lines are.
 - **procps cuts user names** over 8 characters unless the format says `user:32`.
 - **Codex.** On an idle thread the app-server opens a turn per queued message, so never `thread/queue/add` to a thread no launcher streams. `thread/read` can report active with no turn id; get the id from a steer probe before `turn/interrupt`. `turn/interrupt` errors when the turn ended in between; only a re-read tells that from a live turn.
-- **Dailies.** The run-out time rounds to the minute in epoch seconds (rounding aware local time loses the DST fold). `resets` is the writing machine's wall time with its offset (2026-10-12: notes travel between machines in hanadocs, and an offset-free value read on the other machine was off by the zones' difference); `note_file.reset_time` reads it for `agent_notes.still_ahead`, `quota_alert.ahead` and its two account checks, and `codex_pacer.parse_local`, taking a value written before the offset as the reading machine's wall time. A naive `limit_reset` is the writing machine's wall time. Every subprocess dailies test sets `HOME` to a temporary directory.
+- **Account reset times.** `resets` records the writing machine's wall time with its offset.
+  Notes can move between machines with different zones.
+  `note_file.reset_time` reads that value for account checks and alerts.
+  For older offset-free values, readers use their own wall time.
+  A naive `limit_reset` uses the writing machine's wall time.
 - **`verify.sh` guard.** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2.
 - **Live scripts.** Units run `~/.claude/scripts/direct/board.sh` and `verify.sh` while they change, and bash reads a script as it runs: replace either by writing a temp file beside it, setting its mode, and `mv`ing it over.
 - **A target with neither marker.** A folder made before a build that runs with `CARGO_CACHE_RUSTC_INFO=0` has no `.rustc_info.json` and no `CACHEDIR.TAG`; the floor and the disk measurement do not see it. Nothing on natedev sets that variable.
@@ -1427,7 +1478,6 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
   - Keying the example guard on the target's `test` setting or advising `test = true`: examples carry no tests (user, 2026-10-04).
   - Withholding the phone push when a removal failed, or cutting a path's last component to fit 1,024 characters.
   - Queuing a message to an out-of-retries Codex thread (it opens a turn nothing streams); changing the service tier on capacity.
-  - The dailies renderer importing the note code from `scripts/whoami`: it parses the flat frontmatter itself and imports only `run_out`.
 
 ## Not built
 
@@ -1443,7 +1493,9 @@ A test-width update persists the reservation in `state.json` through `os.replace
 
 A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.
 
-Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
+Python queue layouts and evidence tables share `scripts/lib/terminal_cells.py::terminal_width`.
+Combining marks occupy zero cells.
+Wide characters occupy two cells.
 
 **One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
 The service commits proposals and stores the pass.

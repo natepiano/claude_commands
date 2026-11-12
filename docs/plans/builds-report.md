@@ -541,7 +541,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 - `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
 - No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
-- `buildlog costs` is gone: the CLI prints its unknown-command usage and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
+- `buildlog costs` is gone: the CLI takes its unknown-command path and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
 - `render_html`, `publish`, `PAGE`, `chart_data` and the cost text output are gone. Calculation tests read the typed `ChartSet`.
 - The cost Definitions are sentences in `docs/as-built/buildlog-memory-stalls.md`. `build-report-session.md`, `build-targets.md` and `mac-test-offload.md` name `buildlog charts`.
 - Live check, 2026-11-09, from this branch: `buildlog charts --no-open` printed `http://100.103.14.30:8765/h7uj5c/memory_live.html`, the same line as `/build:page`.
@@ -979,7 +979,7 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 #### As-built
 
-- `buildlog charts` is removed. It takes the unknown-command path: the usage text on stderr and exit 2, as `buildlog costs` does.
+- `buildlog charts` is removed. It takes the unknown-command path and exits 2, as `buildlog costs` does.
 - `/build:page` is the one way to the shared build page link. `charts.page_data` stays and feeds that page, with the same output.
 - `charts.main`, `local_display` and `MEMORY_FEED` are removed with their tests.
 - The as-built docs and the charts design name `/build:page`.
@@ -988,3 +988,64 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/cli.py` — the command list and usage text.
 - `scripts/buildlog/charts.py` — `page_data` and the chart series.
 - `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.
+
+### Phase 48 — buildlog names a wrong command in one line · status: done
+
+#### As-built
+
+- An unknown `buildlog` command prints one line to stderr and exits 2: `buildlog: unknown command '<word>'; type buildlog to see the commands`. It prints no help page.
+- `buildlog` with no command prints the help page and exits 2. `help`, `-h` and `--help` print it and exit 0.
+- `test_unknown_commands_and_help_do_not_read_the_index` is one table: `costs`, `charts`, a word that never was a command, no command, and the three help forms. No row opens the index.
+
+**Files:**
+- `scripts/buildlog/cli.py` — the unknown-command line at the end of `main`.
+- `scripts/buildlog/test_costs.py` — the unknown-command and help table.
+
+### Phase 49 — buildlog query uses the shared table printer · status: done
+
+#### As-built
+
+- `buildlog query` prints its text table through `scripts/lib/terminal_cells.print_table`. `cli.py` has no table printer of its own.
+- `cli.cell` makes the text of each value: NULL is `—`, a float uses `:g` below `1e15`, any other value uses `str`. A number column with NULLs stays right-aligned, because the shared number test counts `—` as a number.
+- An empty result prints `no rows`. The table has no dashed line under the headers. The `--json` output and the stderr timing line do not change.
+
+**Files:**
+- `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
+- `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
+
+### Phase 50 — Gate records hold each module's start and end time · status: done
+
+#### As-built
+
+- Each gate module run records its wall-clock start and end. `start_gate_job` sets `RunningGateJob.started_at`; `finish_gate_job` passes it on and sets `ended_at`. A hold restart keeps both times.
+- `GateJobResult` and `gate_record.Execution` carry `started_at` and `ended_at` as keyword-only `float | None`. `None` means "not recorded": a job that never started, or a result from a box that runs an older tree.
+- `gate_record.module_runs` writes `started_at` and `ended_at` as UTC ISO text (`store.utc_iso`) only when recorded. `ModuleRun` marks both keys `NotRequired`.
+- The cloud transfer keeps the times. `gate_box.encode_run` leaves out an unknown time. The decoder accepts a row with no times and refuses a negative or non-finite time.
+- `buildlog` schema 40 adds `gate_modules.module_started_at` and `module_ended_at` (TEXT). Older records give NULL. `gate_runs.started_at` is still the run start.
+- `docs/as-built/merge-gate-and-test-speed.md` has a "Module start and end times" section with the ordering query.
+
+**Files:**
+- `scripts/production/merge_gate.py` — `GateJobResult`, `RunningGateJob`, `start_gate_job`, `finish_gate_job`, `record_gate_run`.
+- `scripts/test_times/gate_record.py` — `ModuleRun`, `Execution`, `module_runs`.
+- `scripts/aws_target/gate_box.py` — `encode_run`, the job decoder, `execution_records`.
+- `scripts/buildlog/index.py` — `SCHEMA_VERSION`, `GATE_MODULE_COLUMNS`, `add_gate_run`.
+- `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
+
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: done
+
+#### As-built
+
+- `gate_record.py` has two frozen dataclasses. `WallClockSpan(started_at, ended_at)` holds the wall-clock epoch seconds of one module attempt. `WallClockNotRecorded(reason)` means the attempt has no recorded span.
+- `gate_record.Execution` and `merge_gate.GateJobResult` hold one keyword field `wall_clock: WallClockSpan | WallClockNotRecorded`. The defaults are `WallClockNotRecorded("not recorded")` and `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets a `WallClockSpan`; `RunningGateJob.started_at` stays a `float`.
+- `module_runs` writes `started_at` and `ended_at` only for a span. The JSON record and the `buildlog` columns do not change.
+- The cloud wire format does not change. `gate_box.encode_job` writes the top-level `started_at` and `ended_at` keys only for a span. The decoder gives a span for both keys, `WallClockNotRecorded("box result has no module times")` for none, and `WallClockNotRecorded("box result has only one module time")` for one. A row with one time keeps its job status and gate result. A negative or non-finite time is still refused.
+- `docs/as-built/merge-gate-and-test-speed.md` says that a cloud row with only one of the two times records neither.
+- A separate main fix (0236b558e) narrowed the Phase 50 test times. A merge of it with this phase conflicts in `test_merge_gate_suites_tripwires.py`; keep this phase's side.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `WallClockSpan`, `WallClockNotRecorded`, `Execution`, `module_runs`.
+- `scripts/production/merge_gate.py` — `GateJobResult`, `finish_gate_job`, `record_gate_run`.
+- `scripts/aws_target/gate_box.py` — `encode_job`, the job decoder, `execution_records`.
+- `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py` — the tests, with half-timed cloud rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — partial cloud times.

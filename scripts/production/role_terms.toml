@@ -195,12 +195,6 @@ other_names = ["change-review row"]
 other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
 
 [[terms]]
-name = "dailies"
-kind = "document"
-defined_in = "commands/showrunner/dailies.md#Dailies"
-other_names = ["scheduled update"]
-
-[[terms]]
 name = "checkpoint"
 kind = "step"
 defined_in = "commands/unit/checkpoint.md#<CheckpointCommit/>"

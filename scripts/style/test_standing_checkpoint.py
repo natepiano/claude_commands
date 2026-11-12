@@ -6,15 +6,18 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import closing
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
-from typing import cast, final, override
+from typing import ClassVar, cast, final, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.direct import phase_reservation
@@ -26,9 +29,10 @@ from scripts.style import style_ledger
 from scripts.style import style_footprint
 from scripts.style.ledger_test_support import write_style_units
 from scripts.style.style_config import StyleUnitAssignment
-from scripts.style.style_plan_test_support import private_class_catalog, unit_staff_id
+from scripts.style.style_plan_test_support import private_class_catalog, run_style_command, unit_staff_id
 from scripts.style import style_rules
 from scripts.production import unit_config
+from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
 
@@ -37,6 +41,10 @@ SCRIPTS = Path(__file__).resolve().parent
 
 @final
 class StandingCheckpointTests(unittest.TestCase):
+    fixture_root: ClassVar[Path]
+    fixture_snapshot: ClassVar[Path]
+    fixture_tip: ClassVar[str]
+    fixture_template_before: ClassVar[bytes]
     root: Path = Path()
     repo: Path = Path()
     style: Path = Path()
@@ -51,22 +59,43 @@ class StandingCheckpointTests(unittest.TestCase):
     template_before: bytes = b""
     rule: str = ""
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.fixture_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="standing-checkpoint-"))) / "case"
+        cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
+        builder = cls(methodName="runTest")
+        try:
+            builder.bind_fixture(cls.fixture_root)
+            builder.build_fixture()
+            cls.fixture_tip = builder.tip
+            cls.fixture_template_before = builder.template_before
+            _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot, symlinks=True)
+        finally:
+            builder.doCleanups()
+        shutil.rmtree(cls.fixture_root)
+
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="standing-checkpoint-")))
+        self.addCleanup(shutil.rmtree, self.fixture_root)
+        # Restore the original paths for Git's linked worktree metadata.
+        _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
+        self.bind_fixture(self.fixture_root)
+        self.tip = self.fixture_tip
+        self.template_before = self.fixture_template_before
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
+        # Refresh copied index stat data for the new file metadata.
+        for checkout in (self.repo, self.style, self.unit):
+            _ = self.git(checkout, "update-index", "--refresh")
+
+    def bind_fixture(self, root: Path) -> None:
+        self.root = root
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
         self.unit = self.root / "sample-style-names"
         self.catalog = self.root / "nate_style/rust"
-        self.catalog.mkdir(parents=True)
-        # The CLI checks the class list against this catalog, so each listed rule is here as a tier E rule, which has
-        # no cells.
-        with private_class_catalog(self.root):
-            listed = mechanical_classes.classes()
-        for rule in sorted({rule for entry in listed for rule in entry.rules}):
-            self.write(self.catalog / f"{rule}.md", f"---\ntier: E\n---\n# {rule}\n")
         self.bin = self.root / "bin"
-        self.bin.mkdir()
         self.env = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root / "home"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
@@ -75,6 +104,19 @@ class StandingCheckpointTests(unittest.TestCase):
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             fake_fmt.STATE: str(self.root / "fmt"),
         }
+        self.doc = self.style / "docs/sample-style-production.md"
+        self.plan = self.unit / "docs/style-production/units/names-unit.md"
+        self.template = self.style / "docs/style-production/units/names-unit.md"
+        self.rule = "global:rust/names.md"
+
+    def build_fixture(self) -> None:
+        self.catalog.mkdir(parents=True)
+        # Tier E catalog rules have no cells.
+        with private_class_catalog(self.root):
+            listed = mechanical_classes.classes()
+        for rule in sorted({rule for entry in listed for rule in entry.rules}):
+            self.write(self.catalog / f"{rule}.md", f"---\ntier: E\n---\n# {rule}\n")
+        self.bin.mkdir()
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
         fake_fmt.install(self.bin, self.root / "fmt")
         board = self.bin / "cargo-berth"
@@ -98,7 +140,6 @@ class StandingCheckpointTests(unittest.TestCase):
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "style/main", str(self.style))
         _ = self.git(self.repo, "worktree", "add", "-q", "-b", "sample-style-names", str(self.unit))
         self.write(self.repo / ".git/info/exclude", "/docs/style-production/\n/docs/sample-style-production.md\n/docs/sample-style-log.md\n")
-        self.doc = self.style / "docs/sample-style-production.md"
         parent = self.repo / "docs/product-production.md"
         # The parent is outside style's excluded doc pattern; exclude it separately.
         with (self.repo / ".git/info/exclude").open("a") as exclude:
@@ -109,10 +150,8 @@ class StandingCheckpointTests(unittest.TestCase):
         _ = recorded_showrunner("sample", parent)
         owner = recorded_showrunner("sample-style", self.doc, parent="sample")
         _ = fixture_unit_location(owner, "names", self.unit)
-        self.plan = self.unit / "docs/style-production/units/names-unit.md"
         _ = unit_config.write(self.unit, unit_config.UnitConfig(
             unit_config.PlanFile(self.plan.relative_to(self.unit)), unit_config.NoAppPort(), ()))
-        self.template = self.style / "docs/style-production/units/names-unit.md"
         header = "\n".join([
             "# Standing names", "> **Standing:** style_plan.py",
             "", "## Delegation Context", "Read the pinned names rule and judge every ticket file.",
@@ -121,7 +160,6 @@ class StandingCheckpointTests(unittest.TestCase):
         self.write(self.plan, header)
         self.write(self.template, header + "Showrunner-only template line.\n")
         self.template_before = self.template.read_bytes()
-        self.rule = "global:rust/names.md"
         self.write(self.catalog / "names.md", "---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\nUse clear names.\n")
         result = self.cli("style_ledger.py", "set-tip", "--repo", str(self.repo), "--tip", self.tip, "--style-branch", "style/main")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -137,8 +175,15 @@ class StandingCheckpointTests(unittest.TestCase):
         return result.stdout.strip()
 
     def cli(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(style_cli_command(SCRIPTS / script, *args), cwd=self.unit,
-                              env=self.env, capture_output=True, text=True, check=False)
+        if process_boundary_for_case(self):
+            return subprocess.run(style_cli_command(SCRIPTS / script, *args), cwd=self.unit,
+                                  env=self.env, capture_output=True, text=True, check=False)
+        run_command = partial(run_style_command, self.root, self)
+        with (unqueued_style_children(),
+              mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent),
+              mock.patch.object(subprocess, "run", side_effect=run_command)):
+            return run_command([str(SCRIPTS.parent / "lib/py"), str(SCRIPTS / script), *args],
+                               cwd=self.unit, env=self.env, capture_output=True, text=True, check=False)
 
     def rustfmt_calls(self) -> list[str]:
         return fake_fmt.calls(self.root / "fmt", "rustfmt")
@@ -191,7 +236,10 @@ class StandingCheckpointTests(unittest.TestCase):
         return first, second
 
     def publish(self, ticket: str) -> str:
-        return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
+        run_command = partial(run_style_command, self.root, self)
+        with mock.patch.object(style_plan, "subprocess", SimpleNamespace(
+                run=run_command, CalledProcessError=subprocess.CalledProcessError)):
+            return style_plan.publish_checkpoint(self.unit, ticket, self.root / "run", ticket, "Checkpoint test\n")
 
     def test_single_ticket_publishes_a_mechanical_file_outside_its_footprint_and_runs_doc_in_the_tree(self) -> None:
         extra = "alpha/src/extra.rs"
@@ -221,7 +269,9 @@ class StandingCheckpointTests(unittest.TestCase):
             return subprocess.CompletedProcess([stage, package], 0)
         with mock.patch.object(style_plan, "run_verification_step", side_effect=verify), \
                 mock.patch.object(style_plan, "candidate_source", side_effect=AssertionError("N=1 uses the editing tree")):
-            checkpoint = self.publish(ticket["id"])
+            # Keep one publication path through the real footprint child.
+            checkpoint = style_plan.publish_checkpoint(
+                self.unit, ticket["id"], self.root / "run", ticket["id"], "Checkpoint test\n")
         self.assertEqual(set(self.git(self.unit, "diff-tree", "--no-commit-id", "--name-only", "-r", checkpoint).splitlines()),
                          {ticket["files"][0], extra})
         self.assertEqual(self.git(self.unit, "status", "--porcelain"), "")
@@ -261,7 +311,10 @@ class StandingCheckpointTests(unittest.TestCase):
         self.write(self.unit / second["files"][0], "fn unfinished(\n")
         with style_ledger.open_ledger(self.unit) as ledger:
             self.assertTrue(style_plan.isolated_ticket_source(ledger, first))
-        self.assertEqual(style_plan.gate(self.unit, first["id"]), 0)
+        run_command = partial(run_style_command, self.root, self)
+        with mock.patch.object(style_plan, "subprocess", SimpleNamespace(
+                run=run_command, CalledProcessError=subprocess.CalledProcessError)):
+            self.assertEqual(style_plan.gate(self.unit, first["id"]), 0)
 
     def test_publication_recovers_a_crash_before_branch_movement(self) -> None:
         first, _ = self.parallel_tickets()
@@ -492,6 +545,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.open_ticket()["state"], "assigned")
         self.assertEqual(self.git(self.unit, "diff", "--cached", "--name-only"), "")
 
+    @process_boundary
     def test_notify_cli_is_silent_for_another_branch_point_and_an_absent_production(self) -> None:
         for present in (True, False):
             if not present:

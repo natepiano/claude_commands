@@ -276,8 +276,7 @@ class HeadFactsTests(AdmissionLogTests):
 
     def test_live_queue_priority_is_shown_with_legacy_bump_history(self) -> None:
         reading = head_reading()
-        priority: admission_records.QueuePriority = {"unit": "resources", "why": "user work", "set_at": NOW,
-            "set_by": "showrunner", "transition": admission_records.SettledPriority()}
+        priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "resources", 'why': "user work", 'set_at': NOW, 'set_by': "showrunner"},), admission_records.SettledPriority())
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         write_bumps(NOW, [bump_line(NOW - 5)])
         facts = self.facts(reading)

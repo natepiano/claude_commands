@@ -96,7 +96,7 @@ import math, signal, tempfile
 def paired_trial():
     rows = []
     reply = {key: gate_request[key] for key in ('attempt', 'commit', 'tree', 'base', 'changed', 'module', 'rounds')}
-    reply.update(runs=rows, gate_s=0, verdict='error')
+    reply.update(timestamps, runs=rows, gate_s=0, verdict='error')
     started = time.monotonic()
     active = None
     adopt_descendants()
@@ -237,14 +237,33 @@ def paired_supervisor() -> str:
 
 
 # This program runs inside the instance's tool shell, not on natedev.
-LEGACY_GUEST = r'''import concurrent.futures, contextlib, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
+LEGACY_GUEST = r'''import concurrent.futures, contextlib, datetime, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
 if links.get('production'):
     gate_request = json.loads((root / 'request.json').read_text())
+timestamps = {'nix_ready_at': time.time()}
+started_at = os.environ.pop('GATE_USER_DATA_STARTED_AT', '')
+if started_at:
+    timestamps['user_data_started_at'] = int(started_at)
+try:
+    timestamps['kernel_boot_at'] = next(int(line.split()[1]) for line in pathlib.Path('/proc/stat').read_text().splitlines()
+                                        if line.startswith('btime '))
+except (OSError, ValueError, StopIteration):
+    pass
+# Read cached metadata without a network request.
+for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/cloud-init/instance-data.json'):
+    try:
+        metadata = json.loads(pathlib.Path(metadata_path).read_text())
+        if 'ds' in metadata:
+            metadata = metadata['ds']['dynamic']['instance-identity']['document']
+        timestamps['instance_running_at'] = datetime.datetime.fromisoformat(metadata['pendingTime'].replace('Z', '+00:00')).timestamp()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        continue
+    break
 links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
-result = {'nix_ready_at': time.time(), 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
+result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
 def stage(name):
     with (root / 'boot.log').open('a') as output:
@@ -495,6 +514,8 @@ exec python3 "$box_dir/guest.py"'
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
                 if links.get('production') else f'shutdown -h +{lifetime_minutes}')
     return f'''#!/bin/sh
+GATE_USER_DATA_STARTED_AT=$(date -u +%s)
+export GATE_USER_DATA_STARTED_AT
 {deadline}
 set -eu
 umask 077
@@ -520,12 +541,22 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.merge_gate import GateRun, GateJobResult
     from dataclasses import asdict
     if not isinstance(run, GateRun):
         raise TypeError('expected a completed gate')
-    return {'jobs': [asdict(job) | {'kind': job.kind.name} for job in run.jobs],
-            'executions': [asdict(job) | {'kind': job.kind.name} for job in run.executions],
+
+    def encode_job(job: GateJobResult) -> dict[str, object]:
+        row: dict[str, object] = asdict(job)
+        row['kind'] = job.kind.name
+        del row['wall_clock']
+        if isinstance(job.wall_clock, gate_record.WallClockSpan):
+            row['started_at'] = job.wall_clock.started_at
+            row['ended_at'] = job.wall_clock.ended_at
+        return row
+
+    return {'jobs': [encode_job(job) for job in run.jobs],
+            'executions': [encode_job(job) for job in run.executions],
             'seconds': run.seconds, 'peak_memory_mib': run.peak_memory_mib,
             'tests_reused': run.tests_reused, 'selection_certified': run.selection_certified}
 
@@ -553,10 +584,18 @@ def decode_run(value: object) -> GateRun:
         restart = row['restart']
         if restart not in ('', 'hold'):
             raise ValueError('unknown restart')
+        wall_clock_fields = {key: number(row, key) for key in ('started_at', 'ended_at') if key in row}
+        if len(wall_clock_fields) == 2:
+            wall_clock: gate_record.WallClockSpan | gate_record.WallClockNotRecorded = gate_record.WallClockSpan(
+                wall_clock_fields['started_at'], wall_clock_fields['ended_at'])
+        elif wall_clock_fields:
+            wall_clock = gate_record.WallClockNotRecorded('box result has only one module time')
+        else:
+            wall_clock = gate_record.WallClockNotRecorded('box result has no module times')
         return GateJobResult(text(row, 'suite'), text(row, 'module'), status, number(row, 'seconds'),
                              str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
                              GateJobKind[text(row, 'kind')], number(row, 'cpu_seconds'), measured,
-                             number(row, 'peak_mib'), restart)
+                             number(row, 'peak_mib'), restart, wall_clock=wall_clock)
 
     row = mapping(value)
     for key in ('tests_reused', 'selection_certified'):
@@ -570,7 +609,8 @@ def decode_run(value: object) -> GateRun:
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
-                                  job.returncode, job.restart, job.times, job.output)
+                                  job.returncode, job.restart, job.times, job.output,
+                                  wall_clock=job.wall_clock)
             for job in value.executions or value.jobs]
 
 

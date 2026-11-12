@@ -622,19 +622,30 @@ def showrunners_now() -> list[Showrunner]:
 
 def recipients(config: Config, here: str | None = None) -> list[str]:
     """Recipients for five-hour, Claude no-room and blocked next-head notices."""
-    from scripts.message import sessions
+    from scripts.message import send
+    from scripts.production import staff
 
-    aliases: dict[str, str] = {}
-    for observation in sessions.read_registry().entries:
-        record = observation.record
-        address = "session:" + record["sessionId"]
-        for name in (record["sessionId"], address, record["name"], *record["formerNames"]):
-            if name:
-                aliases[name] = address
-    names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
-    excluded = aliases.get(here or "", here)
-    return list(dict.fromkeys(aliases.get(name, name) for name in names
-                             if aliases.get(name, name) != excluded))
+    membership = staff.snapshot()
+    names = [*config["always"], *(runner["name"] for runner in showrunners_now() if runner["session"])]
+    excluded = send.staff_named(here, membership) if here and not here.startswith("uds:") else None
+    found: list[str] = []
+    identities: set[str] = set()
+    for target in names:
+        member = send.staff_named(target, membership) if not target.startswith("uds:") else None
+        if isinstance(member, staff.StaffRow):
+            if isinstance(excluded, staff.StaffRow) and member.id == excluded.id:
+                continue
+            if member.id in identities:
+                continue
+            identities.add(member.id)
+            address = target if target.startswith("session:") else str(member.id)
+        elif target.startswith(("session:", "uds:")):
+            address = target
+        else:
+            raise ValueError(f"{target}: no staff recipient")
+        if address != here and address not in found:
+            found.append(address)
+    return found
 
 
 def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
@@ -2399,11 +2410,15 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
 
 
 def current_session() -> str | None:
-    """The name of the Claude session this process runs under, if any."""
+    """Return the current staff name of this process's Claude owner."""
+    from scripts.production import staff
+
     pid = os.getppid()
     while pid > 1:
         try:
-            return cast(dict[str, str], json.loads((SESSIONS / f"{pid}.json").read_text(encoding="utf-8"))).get("name")
+            identity = cast(dict[str, str], json.loads((SESSIONS / f"{pid}.json").read_text(encoding="utf-8"))).get("sessionId", "")
+            owner = staff.snapshot().by_current_session(identity)
+            return owner.name if owner is not None else None
         except (OSError, ValueError):
             pass
         found = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)

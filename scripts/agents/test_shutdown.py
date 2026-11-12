@@ -9,12 +9,13 @@ import os
 import signal
 import unittest
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from unittest.mock import call, patch
 
 from scripts.agents import pane_record, shutdown, test_stop_resume
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.lib import atomic_file
 from scripts.message import sessions
 from scripts.production import staff
@@ -88,6 +89,53 @@ class ProducerCommandsTests(unittest.TestCase):
                 self.assertIn(f"{identity}: stopped pid 123", output.getvalue())
                 self.assertEqual(case.client.closed, [])
                 case.doCleanups()
+
+        from scripts.agents.test_shutdown_cli import DIRECTOR, RetireUnitTests
+        from scripts.copies import copies
+        from scripts.lib import conf
+
+        case = RetireUnitTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        unit = shutdown.retirement_find_unit("alpha", "alpha")
+        member = replace(unit.staff_member, id=staff.StaffId(fixture_runtime_id("fixed-retiring-holder")))
+        self.assertNotEqual(member.id, member.current_session)
+        unit = replace(unit, staff_member=member)
+        holds = Path(os.environ["BUILD_HOLD_DIR"])
+        fixed_hold = (holds / DIRECTOR).rename(holds / member.id)
+        with patch.object(shutdown, "retirement_remove", return_value=[]) as remove, \
+             patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output:
+            code = shutdown.retirement_clear_worktree(unit, settings=conf.read("production"),
+                record=staff.StaffSnapshot((member,)), pane_workers=[], pane=herdr.NoPane("alpha"), require_cleanup=True)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
+        self.assertFalse(fixed_hold.exists())
+        remove.assert_called_once()
+        trees.assert_called_once_with(str(member.id))
+
+        case.doCleanups()
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        with self.subTest(record="reused pane"):
+            self.assertEqual(shutdown.retirement_pane(owner, staff.snapshot()),
+                             shutdown.RetiringPane("agents", "w1:p7", "terminal-w1:p7"))
+
 
     def test_remove_stray_preserves_the_real_producer_and_completes_a_rerun(self) -> None:
         for target, failure_step in (("stray", ""), ("current", ""), ("split", ""), ("pane-admission", ""),

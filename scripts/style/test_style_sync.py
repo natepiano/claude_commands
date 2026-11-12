@@ -19,8 +19,9 @@ import unittest
 from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
+from types import ModuleType
 
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 
 from scripts.style import style_sync
@@ -34,6 +35,8 @@ from scripts.style import style_rules
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff
+from scripts.production.cli_fixture import invoke_cli
+from scripts.style.style_plan_test_support import run_style_command
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
 from scripts.style.style_config import StyleUnitAssignment
@@ -42,6 +45,13 @@ from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+
+
+INITIAL_FILES = {
+    "Cargo.toml": '[package]\nname="sample"\nversion="0.1.0"\n',
+    "src/lib.rs": "fn value() {}\n",
+}
+REAL_RUN = subprocess.run
 
 
 class RecordedCall(TypedDict):
@@ -124,6 +134,28 @@ class StyleSyncTests(unittest.TestCase):
     tip: str = ""
     lint_temp: Path = Path()
     resolve_owner = staticmethod(style_sync.gate_owner)
+    initial_repository: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.initial_repository = Path(cls.enterClassContext(
+            tempfile.TemporaryDirectory(prefix="style-sync-seed-"))) / "sample"
+        cls.initial_repository.mkdir()
+        for relative, content in INITIAL_FILES.items():
+            path = cls.initial_repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(content)
+        for arguments in (
+            ["init", "-q", "--initial-branch=main"],
+            ["config", "user.name", "Sync tests"],
+            ["config", "user.email", "sync@example.invalid"],
+            ["add", "--all"],
+            ["commit", "-qm", "Initial"],
+        ):
+            _ = subprocess.run(["git", "-C", str(cls.initial_repository), *arguments],
+                               capture_output=True, text=True, check=True)
 
     @override
     def setUp(self) -> None:
@@ -132,14 +164,11 @@ class StyleSyncTests(unittest.TestCase):
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
         self.repo.mkdir()
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Sync tests")
-        _ = self.git("config", "user.email", "sync@example.invalid")
-        (self.repo / "src").mkdir()
-        _ = (self.repo / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
-        _ = (self.repo / "src/lib.rs").write_text("fn value() {}\n")
-        _ = self.git("add", "--all")
-        _ = self.git("commit", "-qm", "Initial")
+        for relative, content in INITIAL_FILES.items():
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(content)
+        _ = shutil.copytree(self.initial_repository / ".git", self.repo / ".git")
         self.tip = self.git("rev-parse", "HEAD")
         self.doc = self.style / "docs/sample-style-production.md"
         rule_root = self.root / "nate_style"
@@ -177,6 +206,48 @@ class StyleSyncTests(unittest.TestCase):
         self.lint_temp.mkdir()
         _ = self.enterContext(mock.patch.object(style_sync, "LINT_TEMP_PARENT", self.lint_temp))
         _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
+
+    def run_command(self, command: list[str], *, capture_output: bool = False, text: bool = False,
+                    check: bool = False, cwd: Path | str | None = None, env: dict[str, str] | None = None,
+                    stdin: int | None = None, stdout: int | None = None, stderr: int | None = None,
+                    encoding: str | None = None, errors: str | None = None,
+                    input: str | bytes | None = None, timeout: float | None = None,
+                    pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
+        """Run synchronous fixture commands and preserve the required child processes."""
+        if pass_fds or isinstance(input, bytes):
+            return REAL_RUN(command, capture_output=capture_output, text=text, check=check, cwd=cwd, env=env,
+                            stdin=stdin, stdout=stdout, stderr=stderr, encoding=encoding, errors=errors,
+                            input=input, timeout=timeout, pass_fds=pass_fds)
+        script = Path(command[1]) if len(command) > 1 else Path()
+        if (len(command) > 1 and command[0] in {str(style_sync.PYTHON), sys.executable}
+                and script.parent == self.root and script.name in {"address.py", "send.py", "roster.py"}):
+            module = ModuleType("style_sync_fixture_cli")
+            module.__file__ = str(script)
+
+            def main() -> int:
+                exec(compile(script.read_text(), str(script), "exec"), {**vars(module), "__name__": "__main__"})
+                return 0
+        elif command[:3] == [str(style_sync.PYTHON), str(Path(scratch.__file__)), "cargo-save"]:
+            module = scratch
+
+            def main() -> int:
+                return scratch.main(sys.argv[1:])
+        else:
+            return run_style_command(self.root, self, command, capture_output=capture_output, text=text,
+                                     check=check, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
+                                     encoding=encoding, errors=errors, input=input, timeout=timeout)
+        result = invoke_cli(module, main, command[2:], dict(os.environ) if env is None else env,
+                            Path.cwd() if cwd is None else Path(cwd), combined_output=stderr == subprocess.STDOUT)
+        result.args = command
+        if not capture_output:
+            if stdout != subprocess.DEVNULL:
+                print(result.stdout, end="")
+            if stderr not in {subprocess.DEVNULL, subprocess.STDOUT}:
+                print(result.stderr, end="", file=sys.stderr)
+        if check:
+            result.check_returncode()
+        return result
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],

@@ -36,6 +36,7 @@ from scripts.usage.collect_test_support import (
     THREAD,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.production.staff_test_support import isolated_source_readers, isolated_staff_file, source_environment
 
 
@@ -55,6 +56,22 @@ class CollectTests(CollectorFixture):
 
     def test_collector_cli_can_disable_sync_for_disposable_ledgers(self) -> None:
         self.assert_cli_durability(["--durability", "off"], "PRAGMA synchronous=OFF")
+
+    def test_compressed_sources_keep_turns_and_offsets(self) -> None:
+        _ = self.collect()
+        before = self.rows("SELECT family, agent_id, turn_key, input, output FROM turns ORDER BY family, agent_id, turn_key")
+        sources = [*self.claude_root.rglob("*.jsonl"), *self.codex_root.rglob("*.jsonl")]
+        for path in sources:
+            _ = compressed_copy(path)
+        _ = self.collect()
+        self.assertEqual([tuple(row) for row in self.rows(
+            "SELECT family, agent_id, turn_key, input, output FROM turns ORDER BY family, agent_id, turn_key")],
+            [tuple(row) for row in before])
+        self.db_path.unlink()
+        _ = self.collect()
+        self.assertEqual([tuple(row) for row in self.rows(
+            "SELECT family, agent_id, turn_key, input, output FROM turns ORDER BY family, agent_id, turn_key")],
+            [tuple(row) for row in before])
 
     def test_two_session_files_keep_requests_at_the_same_byte_offset(self) -> None:
         first, second, offset, _ = self.two_codex_sessions()

@@ -72,6 +72,8 @@ if sys.argv[1] == "reserve":
     def test_excluded_linux_target_does_not_record_a_mac_decline(self) -> None:
         self.configure("natedev,mac,aws")
         self.enable_mac()
+        # Keep local admission before the retry that can reserve the Mac.
+        self.control_admission_clock()
         self.write_executable(self.bin_directory / "ssh", '''#!/bin/sh
 case "$*" in *fake-aws*) exit 255 ;; esac
 printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'

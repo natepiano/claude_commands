@@ -35,7 +35,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                   redirect_stderr(errors)):
                 for _ in range(2):
                     self.assertEqual(unit_labels.unit_labels_for([owner.current_session], {}), {
-                        owner.current_session: unit_labels.UnitLabels("recorded-holder"),
+                        owner.current_session: unit_labels.UnitLabels("docless"),
                     })
             self.assertEqual(errors.getvalue(), "")
 
@@ -85,7 +85,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                 "pid": 123, "sessionId": identity, "name": "healthy", "messagingSocketPath": "",
                 "updatedAt": 1, "tmux": "", "formerNames": [],
             }
-            healthy = showrunners.Showrunner(session="healthy", socket="", name="healthy-owner",
+            healthy = showrunners.Showrunner(session="healthy-owner", socket="", name="healthy-owner",
                                              zone="UTC", doc=str(doc))
             resolver = session_staff.RowResolver(staff.StaffSnapshot((healthy_owner, missing)))
             problems: list[str] = []
@@ -165,6 +165,18 @@ class FileOnlyLabelTests(unittest.TestCase):
                              {unit_labels.DirectsUnit(f"healthy-{number}") for number in range(3)})
             self.assertEqual(len(problems), 1)
             self.assertIn("fixture timer failed", problems[0])
+            renamed = staff.rename(parents[0].id, "renamed-owner")
+            live: SessionRecord = {"pid": 123, "sessionId": renamed.current_session, "name": "stale registry name",
+                "messagingSocketPath": "/private.sock", "updatedAt": 1, "tmux": "", "formerNames": []}
+            record = staff.snapshot()
+            with mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("fixture")):
+                registrations = unit_labels.registered_showrunners(unit_labels.StaffDiagnostics(),
+                    known_sessions={renamed.current_session: live}, membership=record)
+                places = unit_labels.production_places([live], set(), unit_labels.StaffDiagnostics(), record=record)
+            self.assertEqual(registrations[0]["session"], "renamed-owner")
+            self.assertEqual(registrations[0]["socket"], "/private.sock")
+            self.assertEqual([place.showrunner for place in places.values() if place.director.unit.startswith("healthy-")],
+                [unit_labels.UnderShowrunner("renamed-owner", "renamed-owner", f"session:{renamed.current_session}")] * 3)
 
     def test_unreadable_timer_file_does_not_remove_another_showrunners_rows(self) -> None:
         from scripts.message import unit_labels
@@ -278,6 +290,6 @@ print(json.dumps({
         self.assertEqual(result.returncode, 0, result.stderr)
         observed = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual(observed["labels"], {
-            "51e7edcb-739e-4f5c-a614-c06f4945a3dd": {"session": "queue-reader-test", "showrunner": "—", "unit": "—"},
+            "51e7edcb-739e-4f5c-a614-c06f4945a3dd": {"session": "", "showrunner": "—", "unit": "—"},
         })
         self.assertEqual(observed["herdr_modules"], [])

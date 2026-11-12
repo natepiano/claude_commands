@@ -6,7 +6,6 @@ except FileNotFoundError:
     pass
 
 import sys
-import fcntl
 import json
 import shlex
 import subprocess
@@ -236,10 +235,14 @@ def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
             for name, raw in entries.items() if isinstance(raw, dict)}
 
 
-def read_worker_roster(path: Path) -> dict[str, object]:
-    from scripts.agents import worker_lifecycle
-    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
-        return handle.read_object()
+def run_workers(state: Mapping[str, object], record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Read the selected run's workers from the same staff snapshot as its owner."""
+    from scripts.lib import unit_runs
+
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+        return ()
+    return tuple(record.find(kind="worker", parent=owner.id))
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:
@@ -419,7 +422,7 @@ class RowResolver:
             return LocationUnfilled("the worktree is not recorded")
         retired = isinstance(tree, RemovedWorktree)
         if retired:
-            home = Path.home() if tree.machine == remote.local_machine() else Path("~")
+            home = None if tree.machine == remote.local_machine() else Path("~")
             path = configuration.parked_path(holder.id, home=home)
         else:
             path = tree.path / ".unit.toml"
@@ -453,11 +456,9 @@ class RowResolver:
         if isinstance(tree, WorktreeUnfilled):
             return LocationUnfilled("the worktree is not recorded")
         if isinstance(tree, RemovedWorktree):
-            config = self.unit_config(holder)
-            if isinstance(config, UnitConfig) and isinstance(config.retired, configuration.RetiredSession):
-                return Branch(config.retired.branch.value)
-            return RetiredFactsUnavailable(config.reason if isinstance(config, (ConfigMissing, RetiredFactsUnavailable))
-                                          else "parked retirement facts are missing")
+            if isinstance(tree.branch, staff.ParkedBranch):
+                return Branch(tree.branch.value)
+            return RetiredFactsUnavailable("the parked branch is not recorded in staff")
         state, text = self._fact(tree.machine, "git", tree.path)
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
@@ -863,7 +864,7 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        if agent_kind(launch) == "codex":
+        if agent_kind(launch, record=self.record) == "codex":
             return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)
         owner = self.record.by_member_reference(launch["session_id"])

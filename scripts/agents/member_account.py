@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, cast
+from collections.abc import Callable
+from scripts.herdr.place import HerdrPlace
 from importlib import import_module
 from pathlib import Path
 import subprocess
@@ -60,6 +62,9 @@ def repair_home(row: StaffRow, kind: str, pid: int) -> None:
             if not isinstance(claude, account.ConfiguredClaudeFolder):
                 return
             folder = claude.path
+        place = cast(Callable[[int], object], import_module("scripts.herdr.herdr").herdr_place_of)(pid)
+        if isinstance(place, HerdrPlace):
+            cast(Callable[[str, str], None], import_module("scripts.herdr.herdr").forget_pane_evidence)(place.session, place.pane)
         current = reader.native_process(pid, kind)
         if current.current_identity != observed.current_identity or current.started != observed.started:
             return

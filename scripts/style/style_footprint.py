@@ -2655,6 +2655,10 @@ def crate_manifest(sources: RevisionTree, crate: str) -> dict[str, object]:
             targets.extend(cast(list[object], entries))
     if any(isinstance(target, dict) and "path" in target for target in targets):
         raise MoveRefused(f"{manifest} sets a target path")
+    package = data.get("package")
+    if isinstance(package, dict) and any(cast(dict[str, object], package).get(key) is False
+                                         for key in ("autolib", "autobins", "autoexamples", "autotests", "autobenches")):
+        raise MoveRefused(f"{manifest} changes target discovery")
     main = str(root / "src" / "main.rs")
     if (str(root / "src" / "lib.rs") in sources.paths and main in sources.paths
             and any(token.value == "mod" for token in tokens(sources.text(main)))):
@@ -3644,14 +3648,39 @@ def configured(words: tuple[str, ...], start: int, end: int, inner: bool) -> boo
                and attribute_name(words, begin) in {"cfg", "cfg_attr"} for begin, _ in attribute_spans(words))
 
 
-def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
-                 texts: Mapping[str, MoveText]) -> str | None:
-    """Why the crate does not compile the module's file plainly in the tree of texts, or None.
+class ModulePathConditions(Enum):
+    """The cfg attributes that a module path can contain."""
 
-    Each module on the path from the crate root needs a `mod <name>;` line in its parent's file whose attributes are
-    all inert and hold no comment, and no file below the crate root on the path may hold an inner `cfg` or
-    `cfg_attr`.
+    UNCONDITIONAL = "unconditional"
+    ALLOW_CFG = "allow_cfg"
+
+
+def module_path_attribute(words: tuple[str, ...], allowed: frozenset[str],
+                          conditions: ModulePathConditions) -> str | None:
+    """Return the first unsupported attribute, including attributes carried by cfg_attr."""
+    start = 3 if words[1] == "!" else 2
+    if (conditions is ModulePathConditions.ALLOW_CFG
+            and words[start:start + 2] == ("cfg_attr", "(")):
+        for argument in attribute_arguments(words)[1:]:
+            name = module_path_attribute(("#", "[", *argument, "]"), allowed, conditions)
+            if name is not None:
+                return name
+        return None
+    return macro_attribute(words, allowed)
+
+
+def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
+                 texts: Mapping[str, MoveText],
+                 conditions: ModulePathConditions = ModulePathConditions.UNCONDITIONAL) -> str | None:
+    """Return the reason that the module path is unsupported, or None.
+
+    Each parent must declare its child with a `mod <name>;` line.
+    Declaration attributes must be inert and contain no comments.
+    By default, declarations and files below the crate root must contain no `cfg` or `cfg_attr` attributes.
+    ALLOW_CFG permits outer and inner `cfg` attributes.
+    It also permits `cfg_attr` when each carried attribute passes the same rules.
     """
+    allowed_cfg = frozenset({"cfg"}) if conditions is ModulePathConditions.ALLOW_CFG else frozenset[str]()
     files = crate_files(sources, crate, tuple())
     files.update({path: text.scope.module for path, text in texts.items()})
     for size in range(len(module) + 1):
@@ -3662,12 +3691,12 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
             text = texts[path].text if path in texts else sources.text(path)
             spans = texts[path].spans if path in texts else token_spans(text)
             words = tuple(span.token.value for span in spans)
-            if size and configured(words, 0, len(words), inner=True):
+            if size and conditions is ModulePathConditions.UNCONDITIONAL and configured(words, 0, len(words), inner=True):
                 return f"{path}: a cfg attribute on the path to {module_path(module)}"
-            # An inner attribute such as `no_implicit_prelude` reaches the child modules. The crate root's reach A
-            # and B alike.
+            # Inner attributes reach child modules. Crate root attributes reach both source and destination modules.
             for begin, end in attribute_spans(words) if size else ():
-                name = macro_attribute(words[begin:end], INNER_ATTRIBUTES) if words[begin + 1] == "!" else None
+                name = (module_path_attribute(words[begin:end], INNER_ATTRIBUTES | allowed_cfg, conditions)
+                        if words[begin + 1] == "!" else None)
                 if name is not None:
                     return f"{path}: the inner attribute {name} on the path to {module_path(module)}"
             if size == len(module):
@@ -3677,10 +3706,12 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
                 return f"{path}: cannot read its items"
             for item in items:
                 if item.kind == "mod" and item.name == module[size] and words[item.end - 1] == ";":
-                    if configured(words, item.start, item.keyword, inner=False):
+                    if (conditions is ModulePathConditions.UNCONDITIONAL
+                            and configured(words, item.start, item.keyword, inner=False)):
                         return f"{path}: a cfg attribute on the path to {module_path(module)}"
                     for begin, end in attribute_spans(words[item.start:item.keyword]):
-                        name = macro_attribute(words[item.start + begin:item.start + end])
+                        name = module_path_attribute(
+                            words[item.start + begin:item.start + end], INERT_ATTRIBUTES | allowed_cfg, conditions)
                         if name is not None:
                             return f"{path}: the attribute {name} on the path to {module_path(module)}"
                         if attribute_comment(text, spans, item.start + begin, item.start + end):
@@ -3922,8 +3953,8 @@ def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
             whole_file = test_file(before, change.path) if whole_file is None else whole_file
             if not whole_file:
                 return False
-        if following is not None and lint_arguments(new[following.start:following.end]) != [
-                group for group in lint_arguments(old[previous.start:previous.end])
+        if following is not None and attribute_arguments(new[following.start:following.end]) != [
+                group for group in attribute_arguments(old[previous.start:previous.end])
                 if tuple(token.value for token in group) not in removed]:
             return False
         if following is not None and (old[previous.start:previous.start + 4] != new[following.start:following.start + 4]
@@ -4018,16 +4049,20 @@ def test_file(sources: RevisionTree, path: str) -> bool:
     return test_module(path, frozenset({path}))
 
 
-def lint_arguments(attribute: tuple[Token, ...]) -> list[tuple[Token, ...]]:
-    """The comma-separated arguments of an outer `#[level(...)]` attribute, with no empty group for a trailing comma."""
-    groups: list[tuple[Token, ...]] = []
-    current: list[Token] = []
-    for token in attribute[4:-2]:
-        if token.value == ",":
+def attribute_arguments[T: (Token, str)](attribute: tuple[T, ...]) -> list[tuple[T, ...]]:
+    """Read comma-separated attribute arguments and preserve nested groups. Omit an empty group after a trailing comma."""
+    words = tuple(token.value if isinstance(token, Token) else token for token in attribute)
+    groups: list[tuple[T, ...]] = []
+    current: list[T] = []
+    depth = 0
+    start = 5 if words[1] == "!" else 4
+    for token, word in zip(attribute[start:-2], words[start:-2]):
+        if word == "," and depth == 0:
             groups.append(tuple(current))
             current = []
         else:
             current.append(token)
+            depth += (word in {"(", "[", "{"}) - (word in {")", "]", "}"})
     if current:
         groups.append(tuple(current))
     return groups

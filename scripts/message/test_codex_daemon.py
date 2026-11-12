@@ -89,8 +89,8 @@ class CodexDaemonTests(unittest.TestCase):
             found = codex_daemon.loaded_sessions(socket_path)
 
         self.assertEqual(found, [
-            codex_daemon.DaemonSession("thread-one", "First window", "/work/one", "active"),
-            codex_daemon.DaemonSession("thread-two", "Second window", "/work/two", "idle"),
+            codex_daemon.DaemonSession("thread-one", "/work/one", "active"),
+            codex_daemon.DaemonSession("thread-two", "/work/two", "idle"),
         ])
         self.assertEqual(methods, [
             "initialize", "initialized", "thread/loaded/list", "thread/loaded/list",

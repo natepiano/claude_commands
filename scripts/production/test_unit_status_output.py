@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
-from scripts.production.dailies_input import ClaudeNotRunning, Decision, SessionGone, StillWaiting
+from scripts.production.unit_status import Decision, StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
@@ -13,7 +13,7 @@ class UnitStatusTests(UnitStatusFixture):
         stated = [line for line in outputs[0].splitlines() if "ETA" in line]
         self.assertEqual(stated, ["Phase ETA: 12:55 EDT", "ETA 11:00", "ETA 10:00 PDT"])
 
-    def test_real_gate_outputs_become_dailies_flags_or_activity(self) -> None:
+    def test_real_gate_outputs_become_status_flags_or_activity(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"
         outputs, _, _ = self.run_statuses(
             None, "ok", 0,
@@ -42,31 +42,3 @@ class UnitStatusTests(UnitStatusFixture):
         peer_routed = self.status_block(peer_outputs[0], "hook", ("hook", "peer"))
         self.assertEqual(peer_routed.flags, ())
         self.assertTrue(any("gate: peer" in line.text for line in peer_routed.activity))
-
-    def test_a_unit_with_no_marked_session_reads_gone_while_a_marked_one_lives(self) -> None:
-        outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
-                                          missing_units=("hook",), stopped_units=("hookworm",))
-        # A unit without a marked session prints its staff unit id.
-        gone = self.status_block(outputs[0], "hook", ("hook", "hookworm"))
-        live = self.status_block(outputs[0], "hookworm", ("hook", "hookworm"))
-        self.assertIsInstance(gone.state, SessionGone, outputs[0])
-        self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])
-
-    def test_herdr_units_report_activity_and_tick_health(self) -> None:
-        outputs, calls, seen = self.run_statuses(
-            "/tmp/native-run\n", "failing: no instance", 1,
-            units=("hook", "native"),
-            panes=({"hook": "● Check hook progress\nPhase ETA: 12:00 EDT\n— holding: running\n",
-                    "native": "● Check herdr progress\nPhase ETA: 13:00 EDT\n— gate: approve release\n"},),
-        )
-        output = outputs[0]
-        self.assertIn("== hook", output)
-        self.assertIn("● Check hook progress", output)
-        self.assertIn("== native", output)
-        self.assertIn("● Check herdr progress", output)
-        self.assertIn("Phase ETA: 13:00 EDT", output)
-        self.assertIn("=== DECISION for you from native ===", output)
-        self.assertNotIn("CLAUDE NOT RUNNING", output)
-        self.assertNotIn("SESSION GONE", output)
-        self.assertEqual(calls, "health unit-native-run\n" * 2)
-        self.assertEqual(seen, f"{self.unit_ids['native']}|— gate: approve release\n")

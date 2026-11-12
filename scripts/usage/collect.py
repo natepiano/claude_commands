@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 
 from scripts.lib import unit_runs
+from scripts.lib.transcripts import open_transcript, uncompressed_path
 from scripts.usage.activity import (
     RequestActivity, RequestEvidence, Waiting, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
 )
@@ -241,9 +242,8 @@ class RunHistoryEvent:
 
 # Each entry names a stored field, its event field, and its validation rule.
 HISTORY_FIELDS: dict[HistoryEventType, tuple[tuple[str, str, Literal["text", "count", "covered"]], ...]] = {
-    "run_started": (("plan_doc", "plan_doc", "text"), ("worktree", "worktree", "text"),
-                    ("branch", "branch", "text")),
-    "run_finished": (("state", "status", "text"),),
+    "run_started": (("plan_doc", "plan_doc", "text"), ("worktree", "worktree", "text")),
+    "run_finished": (),
     "phase_started": (("phase_instance_id", "phase_instance_id", "text"),
                       ("phase_id", "phase_id", "text"), ("title", "phase_title", "text")),
     "phase_finished": (("phase_instance_id", "phase_instance_id", "text"), ("state", "status", "text")),
@@ -470,7 +470,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS claude_edit_message ON edits (machine, edit_ke
     WHERE family = 'claude';
 CREATE TABLE IF NOT EXISTS runs (
     machine TEXT NOT NULL, run_id TEXT NOT NULL, started_at TEXT NOT NULL,
-    plan_doc TEXT, worktree TEXT, branch TEXT, state TEXT, finished_at TEXT, source_event TEXT NOT NULL,
+    plan_doc TEXT, worktree TEXT, finished_at TEXT, source_event TEXT NOT NULL,
     PRIMARY KEY (machine, run_id)
 );
 CREATE TABLE IF NOT EXISTS phases (
@@ -722,6 +722,7 @@ def cursor_at(db: sqlite3.Connection, machine: str, path: str) -> int:
 
 
 def claude_identity(machine: str, path: Path) -> ClaudeSession | ClaudeSubagent:
+    path = uncompressed_path(path)
     if path.parent.name == "subagents":
         return ClaudeSubagent(machine, path.parent.parent.name, path.stem.removeprefix("agent-"))
     return ClaudeSession(machine, path.stem)
@@ -748,6 +749,8 @@ def read_file(machine: str, path: Path, family: Family,
     identity = [stat.st_dev, stat.st_ino]
     resumed = (held.get("parser") is True and held.get("identity") == identity and stat.st_size >= previous
                and stat.st_size >= cast(int, held.get("size", 0)))
+    if path.suffix == ".zst" and held.get("identity") == identity:
+        resumed = True
     if resumed and held.get("size") == stat.st_size:
         if held.get("mtime") == stat.st_mtime_ns and held.get("ctime") == stat.st_ctime_ns:
             return
@@ -756,7 +759,7 @@ def read_file(machine: str, path: Path, family: Family,
         previous = 0
     if not saved and previous == stat.st_size:
         return
-    context = CodexContext(machine, path.name)
+    context = CodexContext(machine, uncompressed_path(path).name)
     agent = claude_identity(machine, path)
     edit_seen = False
     # One Claude message spans a line per content block; user lines between them keep it open.
@@ -781,7 +784,7 @@ def read_file(machine: str, path: Path, family: Family,
         evidence = saved_evidence(held.get("evidence"))
         context.evidence = saved_evidence(held.get("codex_evidence"))
         completed = previous
-    with path.open("rb") as source:
+    with open_transcript(path) as source:
         if resumed:
             _ = source.seek(previous)
         for offset, line in complete_lines(source):
@@ -855,7 +858,7 @@ def collect_file(db: sqlite3.Connection, machine: str, path: str, local_path: Pa
 
 
 def known_sessions(db: sqlite3.Connection, machine: str, paths: Iterable[Path]) -> set[str]:
-    sessions = {path.stem for path in paths if path.parent.name != "subagents"}
+    sessions = {uncompressed_path(path).stem for path in paths if path.parent.name != "subagents"}
     rows = db.execute("SELECT DISTINCT agent_id FROM turns " +
                       "WHERE machine = ? AND family = 'claude' AND kind = 'session'", (machine,))
     sessions.update(cast(str, row[0]) for row in cast(Iterable[sqlite3.Row], rows))
@@ -875,7 +878,7 @@ def validate_history_fields(kind: HistoryEventType, fields: dict[str, HistoryFie
         value = fields[name]
         if isinstance(value, EventFieldNotCarried) or value == "":
             raise ValueError(f"history {name} missing")
-    if kind.endswith("finished"):
+    if kind in ("phase_finished", "pass_finished"):
         state = fields["state"]
         if state == "open":
             raise ValueError("finished history event has open status")
@@ -945,8 +948,9 @@ def save_history_event(db: sqlite3.Connection, event: RunHistoryEvent) -> int:
     fields = event.fields
     values = {name: history_column(event, name) for name in fields}
     if kind == "run_started":
-        row = db.execute("INSERT OR IGNORE INTO runs VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?)",
-                         (machine, run_id, at, values["plan_doc"], values["worktree"], values["branch"], event.event_id))
+        row = db.execute("INSERT OR IGNORE INTO runs " +
+                         "(machine, run_id, started_at, plan_doc, worktree, source_event) VALUES (?, ?, ?, ?, ?, ?)",
+                         (machine, run_id, at, values["plan_doc"], values["worktree"], event.event_id))
     elif kind == "phase_started":
         row = db.execute("INSERT OR IGNORE INTO phases VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?)",
                          (machine, run_id, values["phase_instance_id"], values["phase_id"], values["title"], at, event.event_id))
@@ -962,12 +966,14 @@ def save_history_event(db: sqlite3.Connection, event: RunHistoryEvent) -> int:
         row = db.execute("INSERT OR IGNORE INTO repair_rounds VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?, ?)",
                          (machine, run_id, values["phase_instance_id"], values["round"], at, values["covered"], at, event.event_id))
     else:
-        if kind in ("run_finished", "phase_finished", "pass_finished"):
-            table, key = {"run_finished": ("runs", "run_id"), "phase_finished": ("phases", "phase_instance_id"),
+        if kind == "run_finished":
+            _ = db.execute("UPDATE runs SET finished_at = ? WHERE machine = ? AND run_id = ?",
+                           (at, machine, run_id))
+        elif kind in ("phase_finished", "pass_finished"):
+            table, key = {"phase_finished": ("phases", "phase_instance_id"),
                           "pass_finished": ("passes", "pass_instance_id")}[kind]
-            identity = run_id if key == "run_id" else values[key]
             _ = db.execute(f"UPDATE {table} SET state = ?, finished_at = ? WHERE machine = ? AND {key} = ?",
-                           (values["state"], at, machine, identity))
+                           (values["state"], at, machine, values[key]))
         elif kind == "finding_verdict":
             _ = db.execute("UPDATE findings SET state = ?, state_at = ? " +
                            "WHERE machine = ? AND phase_instance_id = ? AND finding_id = ?",
@@ -1066,6 +1072,8 @@ def source_paths(root: Path, family: LogFamily) -> tuple[tuple[Path, ...], Sourc
         return (), SourceState.UNREADABLE
     patterns = {"claude": (("*", "*.jsonl"), ("*", "*", "subagents", "agent-*.jsonl")),
                 "codex": (("*", "*", "*", "*.jsonl"),), "history": (("*.jsonl",),)}[family]
+    if family != "history":
+        patterns = (*patterns, *(parts[:-1] + (parts[-1] + ".zst",) for parts in patterns))
     paths: set[Path] = set()
     state = SourceState.READY
 
@@ -1540,6 +1548,7 @@ def reader_payload(offsets: dict[str, int]) -> str:
         ("scripts.lib.unit_runs", "scripts/lib/unit_runs.py"),
         ("scripts.usage.activity", "scripts/usage/activity.py"),
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
+        ("scripts.lib.transcripts", "scripts/lib/transcripts.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.collect", "scripts/usage/collect.py"),
     )}

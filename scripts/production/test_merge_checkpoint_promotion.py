@@ -32,12 +32,12 @@ from scripts.message import sessions
 from scripts.production.merge_checkpoint import promote, request_from
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
-from scripts.production.production_doc import Production
+from scripts.production.production_doc import Production, ProductionDocument
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -317,6 +317,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             pass
 
         self.prepare_bump_gate()
+        gate_command = self.bin / "checkpoint-test"
+        self.executable(gate_command, gate_command.read_text() + '''
+(state / "detached-lock-marker").write_text(os.environ.get("MAIN_PUSH_LOCK_HELD", ""))
+''')
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
@@ -354,6 +358,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), first["tip"])
         self.release_bump_gate()
         self.assertEqual(self.wait_bump_result(first["tip"])["result"], "green")
+        self.assertEqual((self.state / "detached-lock-marker").read_text(), "")
 
     def assert_gate_notices_follow_local_promotion(self, *, launch_failure: bool) -> None:
         self.prepare_bump_gate(red=True)
@@ -509,6 +514,61 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
     def test_handoff_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=True)
+
+    def test_handoff_retest_blocks_main_push_until_promotion_finishes(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        with mock.patch.object(merge_checkpoint, "promote", side_effect=checkpoint_gate.Stop(
+                "promote", "failed", "interrupted promotion", "retry")):
+            failed = self.run_handoff(checkpoint)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        test_events = self.events("checkpoint-test")
+        fix = self.push_main_change("fast-fix.txt", "keep this main fix\n")
+        writer = self.root / "retest-writer"
+        _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        original_tests = merge_checkpoint.checkpoint_tests
+        competing_tips: list[str] = []
+
+        def try_main_push() -> None:
+            with (common / "main-push.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                _ = self.git("fetch", "origin", "main", cwd=writer)
+                _ = self.git("reset", "--hard", "origin/main", cwd=writer)
+                self.write(writer, "during-retest.txt", "the competing main change\n")
+                _ = self.git("add", "during-retest.txt", cwd=writer)
+                _ = self.git("-c", "user.name=Checkpoint Test", "-c", "user.email=checkpoint@example.invalid",
+                             "commit", "-m", "competing main change", cwd=writer)
+                _ = self.git("push", "origin", "main", cwd=writer)
+                competing_tips.append(self.git("rev-parse", "HEAD", cwd=writer))
+
+        def retest(production: Production, paths: tuple[str, ...], checkpoint: str,
+                   merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
+                   merge_head: str, flaky_tests: frozenset[str], *, before_merge_tip: str = "") -> str:
+            result = original_tests(production, paths, checkpoint, merge_tests, flakes, scratch,
+                                    merge_head, flaky_tests, before_merge_tip=before_merge_tip)
+            if not competing_tips:
+                try_main_push()
+            return result
+
+        with mock.patch.object(merge_checkpoint, "checkpoint_tests", side_effect=retest):
+            resumed = self.run_handoff(checkpoint)
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
+        tip = self.git("rev-parse", "main", cwd=self.origin)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", fix, tip), "")
+        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tip), "")
+        try_main_push()
+        competing_tip, = competing_tips
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), competing_tip)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", tip, competing_tip, cwd=self.origin), "")
 
     def test_fast_main_push_waits_until_checkpoint_promotion_push_finishes(self) -> None:
         self.promotions = str(self.promote)
@@ -674,7 +734,7 @@ with lock.open("a") as held:
               mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes")):
             request = request_from(argparse.Namespace(
                 production="example", unit="alpha", phase="2", hash=sha,
-                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
             ))
@@ -710,10 +770,43 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
+        original_prepare = merge_checkpoint.prepare_checkpoint
+        original_push = merge_checkpoint.push_git
+        original_promote = merge_checkpoint.promote_local_checkout
+        missing_at: list[str] = []
+
+        def remove_origin_refs(checkout: Path) -> None:
+            _ = self.git("config", "remote.origin.fetch", "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch", cwd=checkout)
+            for branch in ("production", "main"):
+                _ = self.git("update-ref", "-d", f"refs/remotes/origin/{branch}", cwd=checkout)
+            self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/production", "refs/remotes/origin/main", cwd=checkout), "")
+
+        def prepare_without_refs(production: ProductionDocument, merge_head: str, *, published_tip: str = "") -> tuple[str, ...]:
+            remove_origin_refs(production.checkout)
+            missing_at.append("prepare")
+            return original_prepare(production, merge_head, published_tip=published_tip)
+
+        def push_without_refs(production: ProductionDocument, may_undo: bool) -> str:
+            _ = self.git("update-ref", "-d", "refs/remotes/origin/production", cwd=production.checkout)
+            self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/production", cwd=production.checkout), "")
+            missing_at.append("push")
+            return original_push(production, may_undo)
+
+        def promote_without_refs(checkout: Path, branch: str, tip: str) -> (
+                merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+            remove_origin_refs(checkout)
+            missing_at.append("promote")
+            return original_promote(checkout, branch, tip)
+
+        with (mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now),
+              mock.patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=prepare_without_refs),
+              mock.patch.object(merge_checkpoint, "push_git", side_effect=push_without_refs),
+              mock.patch.object(merge_checkpoint, "promote_local_checkout", side_effect=promote_without_refs)):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertEqual(missing_at, ["prepare", "push", "promote"])
         tip = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)

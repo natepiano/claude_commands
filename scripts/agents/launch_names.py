@@ -111,19 +111,9 @@ class LaunchNames:
         current = pane_record.without_legacy_identity(entry)
         if isinstance(self.record, StaffNamesUnavailable):
             return current
-        owner = self.record.by_member_reference(entry["session_id"])
-        if owner is None:
-            print(f"launch names: {entry['session_id']} ({entry['name']}): no staff row; saved name retained",
-                  file=sys.stderr)
-            return current
-        current["session_id"] = owner.current_session
-        current["name"] = owner.name
-        from scripts.production import staff
-
-        unit = self.record.parent_of(owner) if owner.kind == "worker" else owner
-        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
-            current["cwd"] = str(unit.worktree.path)
-        return current
+        if isinstance(pane_launch.launch_reference(current, self.record), pane_launch.NativeLaunchReference):
+            print(f"launch names: {entry['session_id']} ({entry['name']}): no staff row; saved name retained", file=sys.stderr)
+        return pane_launch.current_launch(current, self.record)
 
     def resume_proof(self, original: PaneLaunch, current: PaneLaunch) -> pane_launch.VerifiedResume:
         """Accept the fixed member reference and the observed native resume identity."""

@@ -529,6 +529,7 @@ class StylePlanTests(StylePlanFixture):
         self.write("crates/beta/Cargo.toml", '[package]\nname = "cargo-handler"\nversion = "0.1.0"\n')
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** cargo-handler\n\n## Phases"))
         result = self.run_next()
         self.assertEqual(result[0], 0, result)

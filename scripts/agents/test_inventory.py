@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -27,7 +28,7 @@ from scripts.agents.test_support import ShutdownTestCase, linux_process_fixture
 from scripts.agents import inventory
 from scripts.whoami import account
 from scripts.herdr import herdr
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.agents import shutdown
@@ -253,8 +254,13 @@ class InventoryTests(ShutdownTestCase):
             _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
             os.utime(path, (timestamp, timestamp))
         self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        model = inventory.last_model(newer)
+        self.assertEqual(model, "newer")
+        archived = compressed_copy(newer)
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), archived)
+        self.assertEqual(inventory.last_model(archived), model)
         older.unlink()
-        newer.unlink()
+        archived.unlink()
         self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
 
     def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:
@@ -501,7 +507,7 @@ class InventoryTests(ShutdownTestCase):
             patch.object(Path, "home", return_value=self.home)
         )
         _live_context: object = self.enterContext(
-            patch.object(sessions, "live_session", return_value=True)
+            patch.object(session_records, "live_session", return_value=True)
         )
         _unit_live_context: object = self.enterContext(
             patch.object(unit_lookup, "live_session", return_value=True)

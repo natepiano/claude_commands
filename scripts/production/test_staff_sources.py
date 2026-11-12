@@ -332,7 +332,7 @@ class StaffSourcesTests(StaffTestCase):
             "staff sources: Codex process 42401: process disappeared"])
 
     def test_codex_worker_without_a_launch_record_is_staff(self) -> None:
-        from scripts.message import codex_daemon, process_table
+        from scripts.message import process_table
 
         owner = unit_membership("show", "unit")
         worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
@@ -356,13 +356,16 @@ class StaffSourcesTests(StaffTestCase):
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
                       mock.patch.object(herdr.Herdr, "result", return_value={
-                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}}),
-                      mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
-                          codex_daemon.DaemonSession(worker.current_session, "impl", str(self.root), "idle")])):
+                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}})):
                     evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
-                self.assertEqual(evidence.diagnostics, ())
-                self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
-                self.assertEqual([entry.row for entry in evidence.workers], [worker])
+                if source == "terminal":
+                    self.assertEqual(evidence.identities, {})
+                    self.assertEqual(evidence.workers, ())
+                    self.assertEqual(evidence.diagnostics, ())
+                else:
+                    self.assertEqual(evidence.diagnostics, ())
+                    self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
+                    self.assertEqual([entry.row for entry in evidence.workers], [worker])
 
     def test_only_the_panes_foreground_codex_can_use_its_metadata(self) -> None:
         from scripts.message import process_table
