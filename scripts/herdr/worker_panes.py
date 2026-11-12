@@ -562,7 +562,7 @@ def worker_fallback_run(parent: staff.StaffRow) -> Path:
     return Path(current) if current else unit_runs.state_dir() / "staff" / "workers" / parent.id
 
 
-def _worker_run_scan(record: staff.StaffSnapshot) -> dict[str, list[str]]:
+def parent_run_index(record: staff.StaffSnapshot) -> dict[str, list[str]]:
     """Read the launcher's run roots once for all parent sessions."""
     design_root = cast(Callable[[], Path], import_module("scripts.astra.design_roles").state_root)()
     return unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record,
@@ -574,7 +574,7 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
     workers = record.find(kind="worker")
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
-    scanned = _worker_run_scan(record)
+    scanned = parent_run_index(record)
     found: dict[StaffId, tuple[Path, ...]] = {}
     for row in workers:
         parent = record.parent_of(row) or row
@@ -601,7 +601,7 @@ def worker_run(member: staff.StaffRow, *,
         parent = record.parent_of(member) or member
     if scanned is None:
         record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
-        scanned = _worker_run_scan(record)
+        scanned = parent_run_index(record)
     runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
     fallback = Path(runs[0]) if runs else worker_fallback_run(parent)
     if member.kind == "worker":
