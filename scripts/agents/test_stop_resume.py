@@ -910,27 +910,37 @@ class StopResumeTests(unittest.TestCase):
         self.client.rows.clear()
         return identity
 
-    def test_resume_resolves_an_exact_codex_name_and_reports_distinct_candidates(self) -> None:
+    def test_resume_rejects_codex_names_with_duplicate_or_distinct_index_entries(self) -> None:
         identity = self.saved_codex_name()
         path = self.root / ".codex2/session_index.jsonl"
         first = path.read_text()
-        with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
-              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ClaudeUp(identity, "pane", "codex1")) as once):
-            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
-            self.assertEqual(once.call_args.args[0], identity)
-            atomic_file.write_text_atomic(path, first + first)
-            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
-            atomic_file.write_text_atomic(path, first + json.dumps({"id": "another-id", "thread_name": "saved-worker"}) + "\n")
-            once.reset_mock()
-            result = stop_resume.resume("saved-worker")
-            self.assertIsInstance(result, stop_resume.ResumeFailed)
-            assert isinstance(result, stop_resume.ResumeFailed)
-            self.assertIn("ambiguous name; candidates:", result.reason)
-            self.assertIn(identity, result.reason)
-            self.assertIn("another-id", result.reason)
-            once.assert_not_called()
-            once.return_value = stop_resume.SessionNotFound("saved")
-            self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
+
+        def resume_selected(target: str, **_: object) -> stop_resume.ResumeResult:
+            return (stop_resume.ClaudeUp(identity, "pane", "codex1") if target == identity
+                    else stop_resume.SessionNotFound(target))
+
+        for content in (first, first + first,
+                first + json.dumps({"id": "another-id", "thread_name": "saved-worker"}) + "\n",
+                first + json.dumps({"id": fixture_runtime_id("another-thread"), "thread_name": "saved-worker"}) + "\n"):
+            with self.subTest(content=content):
+                atomic_file.write_text_atomic(path, content)
+                with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
+                      patch.object(stop_resume, "_resume_once", side_effect=resume_selected) as once,
+                      patch.object(herdr, "launch_prepared_agent") as launch):
+                    result = stop_resume.resume("saved-worker")
+                    self.assertEqual(result,
+                                     stop_resume.ResumeFailed("saved-worker", "unknown name"))
+                    self.assertIsInstance(result, stop_resume.ResumeFailed)
+                    assert isinstance(result, stop_resume.ResumeFailed)
+                    self.assertEqual(result.reason, "unknown name")
+                    self.assertNotIn(identity, result.reason)
+                    self.assertNotIn("another-id", result.reason)
+                    once.assert_called_once()
+                    self.assertEqual(once.call_args.args[0], "saved-worker")
+                    self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
+                launch.assert_not_called()
+                self.start.assert_not_called()
+                self.assertNotIn(identity, self.launched)
 
     def test_raw_codex_id_wins_over_another_threads_name(self) -> None:
         identity = self.saved_codex_name()
@@ -1021,7 +1031,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("anomaly: pid unreadable; not blocking", errors)
         self.assertIn("observer anomaly:", errors)
 
-    def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
+    def test_resume_codex_id_uses_the_workers_account_and_the_rollout_folder(self) -> None:
         for compressed in (False, True):
             with self.subTest(compressed=compressed):
                 identity = self.saved_codex_name()
@@ -1040,7 +1050,7 @@ class StopResumeTests(unittest.TestCase):
                               self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
                           patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                               "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                        result = stop_resume.resume("saved-worker", to=target)
+                        result = stop_resume.resume(identity, to=target)
                         self.assertIsInstance(result, stop_resume.ClaudeUp)
                         assert isinstance(result, stop_resume.ClaudeUp)
                         self.assertEqual((result.session_id, result.account), (identity, expected))
@@ -1070,7 +1080,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
               redirect_stderr(io.StringIO()) as errors):
-            result = stop_resume.resume("saved-worker")
+            result = stop_resume.resume(identity)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
@@ -1094,7 +1104,7 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(self.client, "open_tab") as opened,
                       patch.object(herdr, "launch_prepared_agent") as launch,
                       redirect_stderr(io.StringIO()) as errors):
-                    result = stop_resume.resume("saved-worker", to="codex1")
+                    result = stop_resume.resume(identity, to="codex1")
                 self.assertIsInstance(result, stop_resume.ClaudeUp)
                 assert isinstance(result, stop_resume.ClaudeUp)
                 self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
@@ -1106,14 +1116,14 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
                 self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
 
-    def test_resume_of_a_running_codex_name_keeps_its_current_account(self) -> None:
+    def test_resume_of_a_running_codex_id_keeps_its_current_account(self) -> None:
         identity = self.saved_codex_name()
         with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (456,)}, ())),
               patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex2")),
               patch.object(accounts, "codex_home_label", return_value="codex2"),
               patch.object(herdr, "launch_prepared_agent") as launch):
-            result = stop_resume.resume("saved-worker", to="codex1")
+            result = stop_resume.resume(identity, to="codex1")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)

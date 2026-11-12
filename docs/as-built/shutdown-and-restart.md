@@ -75,9 +75,8 @@ A family switch preserves its source when release remains unproved.
 The short form is `resume NAME`, through `scripts/agents/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
-The lookup accepts a short name, a staff id, or a current session id.
-An exact Codex thread name resolves through the shared `session_index.jsonl`.
-A canonical UUID takes priority over a thread name and reads no index.
+The lookup accepts a staff name, a staff id, a launch reference, or a native session id.
+A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
