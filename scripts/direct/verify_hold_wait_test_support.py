@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from scripts.lint.memory_test_support import write_pressure_reading
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
+from scripts.build_queue import placement
 
 import json
 import os
@@ -136,12 +137,14 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                                     continue
                     if stop.is_set():
                         return
-                    if path.exists() and any(root.glob("**/verify-hold.*/waiter")):
+                    queued = (any(root.glob("**/verify-hold.*/placement-*.json.queued"))
+                              or any(root.glob("**/verify-hold.*/waiter")))
+                    if path.exists() and queued:
                         grant_call(path)
                         return
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("registered hold call never published its waiter")
+                        raise TimeoutError("the registered hold call never queued its placement")
                     if isinstance(events, LocalReleaseEvents):
                         # Read every subscribed directory event, including the
                         # nested waiter and the stop marker; production's
@@ -226,7 +229,13 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
-        _ = caller_admission(self, self.root, self.environment)
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+        self.placement_policy: dict[str, str] = {}
+        admission.server.host_probe = lambda key: private_caller_provider(
+            admission, {**self.environment, **self.placement_policy}, key)
+        controls = caller_provider_controls(self, admission)
+        self.provider_observations: list[placement.HostEvidenceKey] = controls.observations
 
     @override
     def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
@@ -322,11 +331,11 @@ exit "$status"
             env={**self.fixture.environment, "TEST_HOLD_DIRECTORY": str(self.fixture.root / "direct-hold")},
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
-    def hold(self, key: str = "hana") -> None:
+    def hold(self, key: str = "hana", *, purpose: str = "render checks") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         holders.mkdir(exist_ok=True)
         now = datetime.now().astimezone().isoformat()
-        _ = (holders / key).write_text(json.dumps({"holder": "hana", "since": now, "for": "render checks", "release_eta": "unknown"}))
+        _ = (holders / key).write_text(json.dumps({"holder": "hana", "since": now, "for": purpose, "release_eta": "unknown"}))
         self.cycle_file.parent.mkdir(parents=True, exist_ok=True)
         _ = (self.cycle_file.parent.parent / "current").write_text(CYCLE_ID)
         cycle: build_hold.HoldCycle = {
@@ -414,21 +423,12 @@ exit "$status"
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
     def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
-        targets = self.fixture.root / "hold-targets.py"
-        _ = targets.write_text(f'''import os
-import runpy
-import sys
-import tempfile
-
-if sys.argv[1] == "eligible":
-    print({runs_on!r} + (" fixture local wait" if {runs_on!r} == "natedev_only" else ""))
-    print("natedev\\teligible\\t-\\t-\\t-")
-    if {runs_on!r} == "any_target":
-        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
-else:
-    runpy.run_path({str(TARGETS)!r}, run_name="__main__")
-''')
-        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
+        targets = "natedev" if runs_on == "natedev_only" else "natedev,mac"
+        settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
+        _ = (self.fixture.root / "build_targets.conf").write_text(
+            f"targets={targets}\nkind.natedev=local\nplatform.natedev=linux\n"
+            + f"kind.mac=ssh\nplatform.mac=macos\nsettings.mac={settings.name}\n")
+        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(TARGETS)
 
     def record_phase(self) -> Path:
         session = self.fixture.root / "unit-run"
@@ -483,6 +483,7 @@ else:
     def count_python_starts(self) -> Path:
         starts = self.fixture.root / "python-starts"
         self.fixture.environment.update({"TEST_PYTHON_STARTS": str(starts), "TEST_REAL_PYTHON": sys.executable})
+        self.fixture.environment["VERIFY_PY_TRACE"] = str(self.fixture.root / "helper-starts")
         self.fixture.write_executable(self.fixture.bin_directory / "python3", '''import json, os, sys
 from pathlib import Path
 with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
@@ -493,10 +494,15 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
 
     def hold_commands(self, starts: Path) -> list[list[str]]:
         commands: list[list[str]] = []
-        for line in starts.read_text().splitlines() if starts.exists() else []:
-            arguments = cast(list[str], json.loads(line))
+        calls = [cast(list[str], json.loads(line))
+                 for line in starts.read_text().splitlines()] if starts.exists() else []
+        trace = Path(self.fixture.environment["VERIFY_PY_TRACE"] + ".calls")
+        if trace.exists():
+            calls.extend(line.split("\t") for line in trace.read_text().splitlines())
+        for arguments in calls:
             if (len(arguments) < 2 or Path(arguments[0]).name not in {"build_targets.py", "build_hold.py"}
-                    or arguments[1] == "eligible"):
+                    or arguments[1] in {"eligible", "constraints", "submitting-session", "source-key",
+                                        "assigned-info", "reserve", "recover-reservation", "release-wait"}):
                 continue
             arguments[0] = Path(arguments[0]).name
             for option, replacement in (("--call-id", "c1"), ("--pid", "<pid>"), ("--cycle-id", CYCLE_ID)):
@@ -529,14 +535,20 @@ from pathlib import Path
 if os.environ.get("TEST_PYTHON_STARTS"):
     with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
-    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
-        output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "call":
-    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
-    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
+        recorder = self.fixture.home / ".claude/scripts/buildlog/record.py"
+        source = recorder.read_text()
+        observation_code = '''
+if sys.argv[1:2] == ["step"]:
+    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
+        output.write(json.dumps({"start": sys.argv[3], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[8:]}) + chr(10))
+if sys.argv[1:2] == ["call"]:
+    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
+    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
+'''
+        _ = recorder.write_text(source.replace('runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")',
+            observation_code + 'runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")'))
         observation = self.fixture.root / "wait-observation"
         self.fixture.environment.update({"CLAUDE_PYTHON": str(observer), "TEST_REAL_PYTHON": sys.executable, "TEST_WAIT_OBSERVATION": str(observation), "TEST_STEP_OBSERVATIONS": str(self.fixture.root / "step-observations")})
         return observation

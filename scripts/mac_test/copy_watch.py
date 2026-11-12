@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Run a Mac copy of a natedev test that is still compiling; the first result wins.
+"""Request queue placement for a copy while a local test still compiles.
 
-verify.sh run_local_test starts this beside a natedev nextest step that may
-still leave for the Mac. It reads the step's process group and log from the
-file run() writes, and registers the call as a copy candidate while cargo
-compiles and nextest has not started its tests. When the Mac is free counting
-copies as busy, the repository's newest candidate starts `offload.py run
---copy`. A Mac failure or pass stops the natedev step; any other copy result
-leaves natedev to finish. The result file tells verify.sh which finished
-first.
+The queue selects the destination and the newest eligible candidate.
+The watcher collects results and stops the losing execution.
+The offload adapter owns the exact provider claim and uncertain cleanup.
 """
 
 from __future__ import annotations
@@ -20,8 +15,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
-import json
+from dataclasses import dataclass, field, replace
 import math
 import os
 from pathlib import Path
@@ -32,14 +26,16 @@ import subprocess
 import tempfile
 import time
 from types import FrameType
-from typing import Literal, TypedDict, cast
+from typing import Literal
 
 
 from scripts.lib import process_group
 from scripts.build_hold import override_guard
-from scripts.mac_test import mac_test, offload
+from scripts.mac_test import claim_state, offload
+from scripts.build_hold.build_hold import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
 from scripts.direct import step_record
+from scripts.build_queue import placement, admission_protocol as wire
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -70,6 +66,8 @@ class CliArguments(argparse.Namespace):
         self.call_id: str = ""
         self.call_started: str = ""
         self.parent_pid: int = 0
+        self.parent_episode: str = ""
+        self.session: str = ""
         self.filter_run: bool = False
         self.nextest_words: list[str] = []
 
@@ -88,6 +86,8 @@ class WatchRequest:
     call_started: float
     filter_run: bool
     nextest_words: tuple[str, ...]
+    parent_episode: str = ""
+    session: claim_state.SubmittingSession = field(default_factory=lambda: NoOwningSession())
 
 
 @dataclass(frozen=True)
@@ -104,13 +104,6 @@ class NoStepInfo:
 
 
 NO_STEP_INFO = NoStepInfo()
-
-
-class CandidateRecord(TypedDict):
-    pid: int
-    proc_start: str
-    call_started: float
-    call_id: str
 
 
 @dataclass(frozen=True)
@@ -252,47 +245,6 @@ def write_text_atomic(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def read_candidate(path: Path) -> CandidateRecord | None:
-    try:
-        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(decoded, dict):
-        return None
-    values = cast(dict[str, object], decoded)
-    pid, proc_start = values.get("pid"), values.get("proc_start")
-    call_started, call_id = values.get("call_started"), values.get("call_id")
-    if not (
-        isinstance(pid, int)
-        and isinstance(proc_start, str)
-        and isinstance(call_started, (int, float))
-        and isinstance(call_id, str)
-    ):
-        return None
-    return {"pid": pid, "proc_start": proc_start, "call_started": float(call_started), "call_id": call_id}
-
-
-def newest_candidate(directory: Path) -> str | None:
-    """The call id of the newest live candidate (latest start, then call id).
-
-    A record whose watcher no longer runs is removed.
-    """
-    newest: CandidateRecord | None = None
-    for path in sorted(directory.glob("*.json")):
-        record = read_candidate(path)
-        if record is None:
-            continue
-        if process_identity.process_start(record["pid"]) != process_identity.Started(record["proc_start"]):
-            path.unlink(missing_ok=True)
-            continue
-        if newest is None or (record["call_started"], record["call_id"]) > (
-            newest["call_started"],
-            newest["call_id"],
-        ):
-            newest = record
-    return newest["call_id"] if newest is not None else None
-
-
 def read_mac_words(path: Path) -> MacWords | None:
     """The runner's result words, read by the rules try_mac_test uses."""
     try:
@@ -325,7 +277,7 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
     return CopyEnded("lost", final=False)
 
 
-def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
+def start_copy(request: WatchRequest, result: Path, assignment_file: Path) -> RunningCopy:
     result.unlink(missing_ok=True)
     command = [
         str(Path(__file__).resolve().parents[1] / "lib/py"), str(request.runner), "run", "--copy",
@@ -334,6 +286,7 @@ def start_copy(request: WatchRequest, result: Path) -> RunningCopy:
         "--call-id", request.call_id,
         "--settings", str(request.settings),
         "--result", str(result),
+        "--assignment-file", str(assignment_file),
     ]
     if request.filter_run:
         command.append("--filter-run")
@@ -402,17 +355,18 @@ class Wakeup:
         _ = (signal_number, frame)
         self.stopped = True
 
-    def sleep(self, seconds: float) -> None:
+    def sleep(self, seconds: float, *, readiness: tuple[int, ...] = ()) -> bool:
         if self.stop_requested:
-            return
+            return False
         # Parent loss sends no signal; neither watch loop may sleep past it.
-        readable, _, _ = select.select([self.read_fd], [], [], min(seconds, 1.0))
-        if readable:
+        readable, _, _ = select.select([self.read_fd, *readiness], [], [], min(seconds, 1.0))
+        if self.read_fd in readable:
             try:
                 while os.read(self.read_fd, 512):
                     pass
             except BlockingIOError:
                 pass
+        return any(descriptor in readiness for descriptor in readable)
 
 
 def note_child(signal_number: int, frame: FrameType | None) -> None:
@@ -444,15 +398,29 @@ def wakeup_on_signals(parent_pid: int) -> Generator[Wakeup, None, None]:
         os.close(write_fd)
 
 
+@dataclass(frozen=True)
+class NoCopyPlacement:
+    """This watcher has no submitted speculative candidate."""
+
+
+@dataclass(frozen=True)
+class QueuedCopyPlacement:
+    request: wire.PlacementRequest
+
+
+@dataclass(frozen=True)
+class WaitingCopyAssignment(QueuedCopyPlacement):
+    """The queue must assign this submitted copy before it can start."""
+
+
+
 class Watch:
     """One call's copy state across ticks."""
 
     def __init__(self, request: WatchRequest, repository: offload.KnownRepository, work: Path) -> None:
         self.request: WatchRequest = request
+        self.repository: offload.KnownRepository = repository
         self.work: Path = work
-        self.candidate: Path = (
-            mac_test.state_paths().directory / "copy_candidates" / repository.name / f"{request.call_id}.json"
-        )
         self.step: StepProgress = StepProgress(NO_STEP_INFO)
         self.copy: RunningCopy | NoCopy = NO_COPY
         self.outcome: CopyOutcome | Literal[""] = ""
@@ -461,6 +429,8 @@ class Watch:
         self.copy_seconds: float = 0.0
         self.poll_s: float = poll_seconds()
         self.next_check: float = 0.0
+        self.placement: NoCopyPlacement | QueuedCopyPlacement = NoCopyPlacement()
+        self.episode_number: int = 0
 
     def report(self, win: CopyWin | NoWin = NO_WIN) -> WatchReport:
         started = self.step.cargo_started
@@ -481,7 +451,15 @@ class Watch:
             return None
         self.copy_seconds += time.monotonic() - copy.started
         self.copy = NO_COPY
-        result = copy_result(read_mac_words(copy.result), status)
+        words = read_mac_words(copy.result)
+        result = copy_result(words, status)
+        if words is not None and words.reason == "source_changed" and isinstance(self.placement, QueuedCopyPlacement):
+            from scripts.build_queue import admission_client
+
+            submitted = self.placement.request
+            _ = admission_client.cancel_placement(wire.CancelPlacement(
+                admission_client.request_id(), submitted.episode, submitted.owner, "copy source changed"))
+            self.placement = NoCopyPlacement()
         copy.result.unlink(missing_ok=True)
         if isinstance(result, CopyWin):
             return result
@@ -506,8 +484,15 @@ class Watch:
         return self.report()
 
     def update_candidate(self) -> bool:
-        """Keep the candidate file in step with the call; true while it is a candidate."""
-        wanted = not self.final and isinstance(self.copy, NoCopy) and self.step.compiling
+        """Submit one speculative episode while its local parent compiles."""
+        from scripts.build_queue import admission_client
+        from scripts.build_targets import build_targets
+        from scripts.direct.step_selection import Pinned
+        from scripts.buildlog import treekey, store
+
+        if isinstance(self.copy, RunningCopy):
+            return False
+        wanted = not self.final and self.step.compiling
         live_step = step_record.read(self.request.call_id)
         if isinstance(live_step, step_record.StepRecord):
             wanted = wanted and step_record.mac_eligible(live_step) and live_step.state not in (
@@ -515,45 +500,80 @@ class Watch:
         elif not isinstance(live_step, step_record.MissingRecord):
             wanted = False
         if not wanted:
-            self.candidate.unlink(missing_ok=True)
-        elif not self.candidate.exists():
+            if isinstance(self.placement, QueuedCopyPlacement):
+                submitted = self.placement.request
+                _ = admission_client.cancel_placement(wire.CancelPlacement(
+                    admission_client.request_id(), submitted.episode, submitted.owner, "copy candidate ended"))
+                self.placement = NoCopyPlacement()
+            return False
+        if isinstance(self.placement, NoCopyPlacement):
             identity = process_identity.process_start(os.getpid())
-            record: CandidateRecord = {
-                "pid": os.getpid(),
-                "proc_start": identity.start if isinstance(identity, process_identity.Started) else "",
-                "call_started": self.request.call_started,
-                "call_id": self.request.call_id,
-            }
-            write_text_atomic(self.candidate, json.dumps(record) + "\n")
-        return wanted
+            measured_key = treekey.tree_key(str(self.request.repo_root))
+            if not isinstance(identity, process_identity.Started):
+                return False
+            source_key = (placement.SourceKeyKnown(measured_key)
+                          if measured_key is not None else placement.SourceKeyUnavailable(f"the source tree key for {self.repository.name} is unavailable"))
+            self.episode_number += 1
+            episode = f"{self.request.call_id}-copy-{os.getpid()}-{self.episode_number}"
+            argv = ("cargo", "nextest", "run", *self.request.nextest_words)
+            now = time.time()
+            local = admission_client.step_request(list(argv), str(self.request.repo_root),
+                wire.Owner(os.getpid(), identity.start), now, "", episode)
+            constraints = build_targets.fixed_placement_constraints(self.request.repo_root, self.request.package,
+                "test", argv, self.request.session, source_key, selection=Pinned("mac"))
+            constraints = replace(constraints, candidates=tuple(candidate for candidate in constraints.candidates
+                                                               if candidate.destination.provider != "local"))
+            request = wire.PlacementRequest(episode,
+                placement.SubmittingOwner(store.host_name(), os.getpid(), identity.start), now,
+                local.profile, constraints, identity=local.identity, run=local.run,
+                prerequisite=placement.TokenNotRequired(),
+                purpose=placement.SpeculativeCopy(self.request.parent_episode, self.request.call_started))
+            self.placement = QueuedCopyPlacement(request)
+        return True
 
     def try_copy(self) -> None:
+        from scripts.build_queue import admission_client
+
         now = time.monotonic()
-        if now < self.next_check:
+        if now < self.next_check or not isinstance(self.placement, QueuedCopyPlacement):
             return
         self.next_check = now + self.poll_s
-        settings, repo_root = self.request.settings, self.request.repo_root
-        if mac_test.free_now(mac_test.state_paths(), settings, repo_root, copy=True) != "free":
+        answer = admission_client.request_placement(self.placement.request)
+        self.placement = (WaitingCopyAssignment(self.placement.request)
+                          if isinstance(answer, wire.PlacementWait) else QueuedCopyPlacement(self.placement.request))
+        if not isinstance(answer, wire.Assignment):
             return
-        if newest_candidate(self.candidate.parent) != self.request.call_id:
-            return
-        self.candidate.unlink(missing_ok=True)
-        self.copy = start_copy(self.request, self.work / "copy.result")
+        assignment_file = self.work / "copy.assignment.json"
+        admission_client.write_assignment(assignment_file, answer)
+        self.copy = start_copy(self.request, self.work / "copy.result", assignment_file)
         self.copy_count += 1
 
     def run(self, wakeup: Wakeup) -> WatchReport:
+        from scripts.buildlog import store
+        from scripts.direct.local_release_wait import LocalReleaseEvents, episode_is_assigned, local_release_waiter
+
         tick = min(1.0, self.poll_s)
-        while not wakeup.stop_requested:
-            self.refresh_step()
-            if isinstance(self.copy, RunningCopy):
-                win = self.finish_copy(self.copy)
-                if win is not None and not wakeup.stop_requested:
-                    return self.take_win(win)
-                if win is not None:
-                    self.outcome = "natedev_won"
-            if self.update_candidate():
-                self.try_copy()
-            wakeup.sleep(tick)
+        state_file = store.root() / "admission/state.json"
+        assignment_event = False
+        with local_release_waiter(state_file.parent, state_file.parent, wake_files=(state_file,)) as events:
+            while not wakeup.stop_requested:
+                events.arm()
+                if (assignment_event and isinstance(self.placement, WaitingCopyAssignment)
+                        and episode_is_assigned(state_file, self.placement.request.episode)):
+                    self.next_check = 0.0
+                self.refresh_step()
+                if isinstance(self.copy, RunningCopy):
+                    win = self.finish_copy(self.copy)
+                    if win is not None and not wakeup.stop_requested:
+                        return self.take_win(win)
+                    if win is not None:
+                        self.outcome = "natedev_won"
+                if self.update_candidate():
+                    self.try_copy()
+                readiness = (events.descriptor,) if isinstance(events, LocalReleaseEvents) else ()
+                assignment_event = wakeup.sleep(tick, readiness=readiness)
+                if assignment_event:
+                    events.wait(0)
         return self.stop()
 
     def stop(self) -> WatchReport:
@@ -574,15 +594,20 @@ class Watch:
         return WatchReport(self.outcome, self.copy_seconds, self.copy_count, natedev_seconds)
 
     def close(self) -> None:
-        self.candidate.unlink(missing_ok=True)
+        from scripts.build_queue import admission_client
+
         if isinstance(self.copy, RunningCopy):
             stop_copy(self.copy)
+        if isinstance(self.placement, QueuedCopyPlacement):
+            submitted = self.placement.request
+            _ = admission_client.cancel_placement(wire.CancelPlacement(
+                admission_client.request_id(), submitted.episode, submitted.owner, "copy watcher ended"))
 
 
 def wait_for_stop(wakeup: Wakeup) -> WatchReport:
     """An unknown repository is never a candidate: wait for verify to end."""
     while not wakeup.stop_requested:
-        wakeup.sleep(60.0)
+        _ = wakeup.sleep(60.0)
     return WatchReport("", 0.0, 0, "")
 
 
@@ -594,6 +619,8 @@ def parser() -> argparse.ArgumentParser:
     _ = root.add_argument("--filter-run", action="store_true")
     _ = root.add_argument("--parent-pid", type=int, required=True)
     _ = root.add_argument("nextest_words", nargs=argparse.REMAINDER)
+    _ = root.add_argument("--parent-episode", default="")
+    _ = root.add_argument("--session", default="")
     return root
 
 
@@ -621,6 +648,8 @@ def request_from_arguments(arguments: CliArguments) -> WatchRequest:
         call_started=epoch_seconds(arguments.call_started),
         filter_run=arguments.filter_run,
         nextest_words=tuple(words),
+        parent_episode=arguments.parent_episode,
+        session=OwningSession(arguments.session) if arguments.session else NoOwningSession(),
     )
 
 

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.test_queue_view import QueueViewFixtureTests, cloud_reading
+from scripts.build_queue.test_queue_view import QueueViewFixtureTests, cloud_reading, with_converted_executions
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, queue_read_fixture, with_waiting, write_memory_config
 from scripts.build_queue.queue_lines import plain
@@ -23,6 +23,20 @@ from scripts.message.unit_labels import UnitLabels
 
 
 class CloudQueueCardTests(unittest.TestCase):
+    def test_converted_cards_name_the_execution_host_and_keep_unavailable_identity_explicit(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+            model = fixture.model()
+            model = replace(model, reading=with_converted_executions(model.reading))
+            for session, host in (("remote-fixture-mac", "fixture-mac"),
+                                  ("remote-fixture-ssh", "fixture-ssh"), ("remote-uncertain", "uncertain-mac")):
+                with self.subTest(session=session):
+                    text = plain(queue_card.render_selection(model, session, 160))
+                    self.assertIn(host, text)
+                    self.assertIn("remote memory is unavailable", text)
+                    if session == "remote-uncertain":
+                        self.assertIn("transport unavailable", text)
+
     def test_cloud_card_reads_progress_from_a_private_service(self) -> None:
         with AdmissionFixture() as fixture:
             sidecar = fixture.root / "cloud.cgroup"

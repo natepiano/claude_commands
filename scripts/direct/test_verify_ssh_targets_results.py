@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 import json
-from typing import cast, override
+from typing import cast
 
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class VerifySshResultsTests(VerifySshTargetsFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.control_admission_clock()
+    def only_attempt(self) -> dict[str, object]:
+        attempts = self.attempts()
+        self.assertEqual(len(attempts), 1,
+                         json.dumps({"attempts": attempts, "events": self.ssh_events()})
+                         + repr(self.admission.server.assignments))
+        return attempts[0]
 
     def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
         self.configure("aws,spare,natedev")
-        result = self.verify("test", "sample", "--no-cache", extra={
-            "TEST_SSH_MODES": '{"aws":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+        with self.spare_after_aws_refusal():
+            result = self.verify("test", "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": '{"aws":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        first, second = self.ssh_events()
+        events = self.ssh_events()
+        self.assertEqual(len(events), 2, json.dumps(events) + repr(self.admission.server.assignments))
+        first, second = events
         self.assertEqual((first["target"], second["target"]), ("aws", "spare"))
         self.assertEqual(first["result_type"], "BusyMacDecline")
         self.assertEqual(first["holder"], "LostRunLeftovers")
@@ -36,7 +41,7 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.configure("aws,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"aws":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("no_tests", "confirmed", "confirmed"))
         self.assertEqual(len(self.local_runs()), 1)
@@ -50,7 +55,7 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.assertEqual(len(self.local_runs()), 1)
         self.assertTrue(self.ssh_events(), result.stdout + result.stderr)
         self.assertTrue(self.attempts(), json.dumps(self.ssh_events()) + result.stdout + result.stderr)
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
                          ("aws", 1, "lost", 100.25))
         self.assertEqual(attempt["repo_identity"], "https://example.com/team/hana")
@@ -83,7 +88,7 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
         self.assertEqual(event["result_type"], "InterruptedTargetRun")
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
                          ("aws", 1, "lost", 100.25))
         local = cast(dict[str, object], json.loads((self.runner_state / "local-step.json").read_text()))
@@ -101,7 +106,7 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
         self.assertEqual(event["result_type"], "InterruptedTargetRun")
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
         self.assertEqual(first.read_text().strip(), "100.25")
         self.assertEqual(len(self.local_runs()), 1)
@@ -114,7 +119,7 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
         self.assertEqual(event["result_type"], "LostMacRun")
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual(attempt["outcome"], "lost")
 
     def test_sigterm_runner_output_preserves_the_sender_interruption_result(self) -> None:
@@ -133,7 +138,7 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         lines = event["remote_output"].splitlines()
         self.assertEqual([line for line in lines if line.startswith("aws_interrupted=")],
                          ["aws_interrupted=fixture-generation"])
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
         self.assertEqual(len(self.local_runs()), 1)
 
@@ -142,7 +147,7 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"aws":"failed"}'})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual(self.ssh_events()[0]["result_type"], "FailedOnTarget")
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("failed", "confirmed", "confirmed"))

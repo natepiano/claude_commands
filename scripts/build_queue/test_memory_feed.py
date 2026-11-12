@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
 import io
@@ -133,6 +134,22 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
             "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+
+    def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
+        baseline = reservation_reading()
+        reading = with_converted_executions(baseline)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        remote = [row for row in page["walk"] if "used" in row and "counted" in row and "reserved" in row and row.get("machine") in
+                  ("fixture-mac", "fixture-ssh", "uncertain-mac")]
+        self.assertEqual(len(remote), 3)
+        self.assertEqual({row.get("machine") for row in remote}, {"fixture-mac", "fixture-ssh", "uncertain-mac"})
+        self.assertTrue(all(row["counted"] == 0 and row["reserved"] == 0 for row in remote))
+        self.assertTrue(all(isinstance(row["used"], admission_records.RunUseUnavailable) for row in remote))
+        uncertain, = [row for row in remote if row.get("machine") == "uncertain-mac"]
+        self.assertIsInstance(uncertain["pid"], admission_records.PidNotRecorded)
+        self.assertEqual(uncertain["state"], "uncertain")
+        self.assertEqual(reading.explanation.room, baseline.explanation.room)
 
     def test_configuration_reads_all_keys_from_the_feed_config(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as read:

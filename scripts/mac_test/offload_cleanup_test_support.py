@@ -49,6 +49,7 @@ class SeededCleanupFixture(OffloadCommandFixture):
         self.environment: dict[str, str] = self.seed.environment.copy()
         self.config: dict[str, str] = self.seed.config.copy()
         self.fixture: CommandFixture = deepcopy(self.seed.fixture)
+        self.start_admission()
         for name in self.gates:
             gate = self.stub_directory / name
             os.mkfifo(gate)

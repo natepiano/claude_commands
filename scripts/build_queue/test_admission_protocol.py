@@ -30,11 +30,53 @@ from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue import placement
-from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
+from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            current = placement_request(fixture)
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(current)))
+            data = cast(dict[str, object], envelope["data"])
+            for field in ("identity", "run", "local", "prerequisite", "purpose"):
+                del data[field]
+            constraints = cast(dict[str, object], data["constraints"])
+            for old_source in ("source-a", ""):
+                with self.subTest(source=old_source):
+                    constraints["source_key"] = old_source
+                    parsed = wire.parse_request(json.dumps(envelope))
+                    assert isinstance(parsed, wire.PlacementRequest)
+                    self.assertIsInstance(parsed.local, wire.LocalAdmissionUnavailable)
+                    self.assertIsInstance(parsed.run, wire.NoRun)
+                    self.assertIsInstance(parsed.prerequisite, placement.TokenNotRequired)
+                    self.assertIsInstance(parsed.purpose, placement.NormalStep)
+                    self.assertEqual(parsed.constraints.source_key, placement.SourceKeyKnown(old_source) if old_source
+                        else placement.SourceKeyUnavailable("older request has no source key"))
+            assignment = placement.PlacementAssignment(current.episode, "older-attempt",
+                current.constraints.candidates[0].destination, current.constraints.source_key,
+                current.owner, current.constraints.session, current.since)
+            claim = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
+                assignment.destination.scope, "older-claim", assignment.episode, assignment.attempt)
+            consume = cast(dict[str, object], json.loads(wire.encode_request(wire.ConsumePermission("older-consume", assignment, claim))))
+            del cast(dict[str, object], consume["data"])["holder"]
+            parsed_consume = wire.parse_request(json.dumps(consume))
+            assert isinstance(parsed_consume, wire.ConsumePermission)
+            self.assertIsInstance(parsed_consume.holder, placement.ClaimHolderUnconfirmed)
+            report = cast(dict[str, object], json.loads(wire.encode_request(wire.ExecutionReport(
+                "older-report", assignment, claim, placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
+            report_data = cast(dict[str, object], report["data"])
+            report_data["outcome"] = ""
+            del report_data["path"]
+            parsed_report = wire.parse_request(json.dumps(report))
+            assert isinstance(parsed_report, wire.ExecutionReport)
+            self.assertIsInstance(parsed_report.evidence, placement.ExecutionEvidenceUnavailable)
+            self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
+            self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
+
 
     def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
         for operation in ("import", "release reply"):
@@ -77,7 +119,7 @@ class ProtocolTests(unittest.TestCase):
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
 
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
-        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_queue.test_placement import placement_request, coordinator_holder
 
         with AdmissionFixture() as fixture:
             request = placement_request(fixture)
@@ -86,22 +128,45 @@ class ProtocolTests(unittest.TestCase):
                 request.constraints.source_key, request.owner, request.constraints.session, request.since)
             claim = placement.ProviderClaimReference("mac", destination.target, destination.scope,
                                                      "claim-a", assignment.episode, assignment.attempt)
-            requests: tuple[wire.Request, ...] = (
+            requests: list[wire.Request] = [
                 request, wire.ClaimFailure("failed", assignment, "busy"),
+                wire.ClaimFailure("foreign-claim", assignment, "busy",
+                    replace(claim, episode="previous-episode", attempt="previous-attempt")),
                 wire.ConsumePermission("consume", assignment, claim),
                 wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
                 wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
                     placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
                 wire.ExecutionReport("report-unavailable", assignment, claim,
                     placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
-            )
+                wire.ConsumePermission("consume-child", assignment, claim, holder=coordinator_holder(assignment)),
+                wire.PrerequisiteReport("token-held", request.episode, request.owner, placement.TokenHeld()),
+                wire.CancelPlacement("cancel", request.episode, request.owner, "caller ended"),
+            ]
+            for prerequisite in (placement.TokenRequired(), placement.TokenHeld(), placement.TokenNotRequired()):
+                requests.append(replace(request, prerequisite=prerequisite))
+            requests.append(replace(request, local=wire.LocalAdmissionUnavailable("old caller")))
+            requests.append(replace(request, purpose=placement.SpeculativeCopy("local-parent", fixture.clock.now())))
+            for outcome, evidence, path in (
+                (placement.AttemptRunning(), placement.ObservedExecution(
+                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
+                    placement.DispatchPathPending("start child runs")),
+                (placement.AttemptCompleted(17), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.PrelaunchRefused("disk"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCancelled("caller ended"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptOutcomeUnavailable("unreachable"),
+                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
+                    placement.DispatchPathPending("start child has no result")),
+            ):
+                requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))
             for message in requests:
                 with self.subTest(message=message):
                     self.assertEqual(wire.parse_request(wire.encode_request(message)), message)
+            local = only_admitted(fixture.server.handle_request(fixture.request()))
             replies: tuple[wire.Reply, ...] = (
                 wire.PlacementWait(request.episode, request.since, 1,
                     (placement.CandidateEligibility(destination, placement.TemporaryExclusion("busy")),)),
                 wire.Assignment(assignment), wire.FirstAuthorization(assignment, claim),
+                wire.LocalPlacementGranted(assignment, local),
                 wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionAvailable()),
                 wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionConsumed(fixture.clock.now())),
                 wire.DispatchStatus(assignment, placement.ClosedAssignment("obsolete"), placement.NoLaunchPermission("closed")),

@@ -335,9 +335,24 @@ run_step_attempt() {
     fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
-        build_hold_wait_local || return $?
+        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+            local hold_status=0
+            build_hold_check_local || hold_status=$?
+            if (( hold_status != 0 )); then
+                source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory "$hold_status"
+                if (( hold_status == 10 )); then return "$LINT_LEFT_QUEUE_STATUS"; fi
+                return "$hold_status"
+            fi
+        else
+            build_hold_wait_local || return $?
+        fi
     fi
-    buildlog_begin "$@" || true
+    if [[ "${BUILDLOG_PLACEMENT_PREPARED:-0}" != 1 ]]; then
+        buildlog_begin "$@" || true
+    fi
+    BUILDLOG_PLACEMENT_PREPARED=0
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
         while :; do
@@ -361,6 +376,11 @@ run_step_attempt() {
                 break
             else
                 status=$?
+            fi
+            if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory 0
+                return "$LINT_LEFT_QUEUE_STATUS"
             fi
             buildlog_release_memory 0
             if [[ "$status" != 10 ]]; then
@@ -642,8 +662,10 @@ nextest_share_end() {
 }
 
 run_nextest() {
-    require_nextest
-    build_hold_wait_local || return $?
+    if [[ "${LINT_QUEUE_PLACEMENT:-0}" != 1 ]]; then
+        require_nextest
+        build_hold_wait_local || return $?
+    fi
 
     local arg arm="" width=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then

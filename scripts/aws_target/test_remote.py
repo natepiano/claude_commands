@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.aws_target import config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
 from scripts.lib import conf, process_start as process_identity
-from scripts.mac_test import linux_runner, mac_test
+from scripts.mac_test import linux_runner, mac_test, offload, claim_state
 
 
 class AdmissionEnvelopeTests(ControlFixture):
@@ -532,18 +532,44 @@ class ClaimReleaseTests(ControlFixture):
         self.paths = mac_test.StatePaths(self.state, "aws", registry_selected=True, platform="linux")
 
     def test_confirmed_stop_releases_only_the_captured_aws_claims_and_is_idempotent(self) -> None:
-        kept = self.claim(self.paths)
-        other = mac_test.StatePaths(self.root / "other", "spare", platform="linux")
-        unrelated = self.claim(other)
-        evidence = mac_test.capture_release_evidence(self.paths, "generation-one", "stopped", self.clock.now)
-        _ = mac_test.release_stopped_claims(self.paths, evidence)
-        _ = mac_test.release_stopped_claims(self.paths, evidence)
-        self.assertFalse(kept.exists())
-        self.assertTrue(unrelated.exists())
-        proof = cast(dict[str, object], json.loads((self.state / "release-evidence" / kept.name).read_text()))
-        self.assertEqual((proof["target"], proof["generation"], proof["state"]),
-                         ("aws", "generation-one", "stopped"))
-        self.assertEqual(cast(dict[str, object], proof["claim"])["remote_host"], "aws-build")
+        for prepared_fence in (False, True):
+            with self.subTest(prepared_fence=prepared_fence):
+                kept = self.claim(self.paths)
+                record = mac_test.read_run(kept)
+                assert not isinstance(record, mac_test.NoRun)
+                identity = claim_state.claim_identity(record)
+                other = mac_test.StatePaths(self.root / "other", "spare", platform="linux")
+                unrelated = self.claim(other)
+                pending = offload.pending_start_path("aws", identity)
+                fence_directory = self.root / offload.start_fence_relative(identity, "aws", scope_key=kept.stem).parent
+                if prepared_fence:
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    _ = pending.write_text("pending")
+                    prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(
+                        identity, "aws", scope_key=kept.stem)], env=dict(os.environ), cwd=self.root,
+                        capture_output=True, text=True, check=False, timeout=5)
+                    self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                evidence = mac_test.capture_release_evidence(self.paths, "generation-one", "stopped", self.clock.now)
+                real_run = subprocess.run
+
+                def release_transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    self.assertEqual((arguments[0], arguments[-2]), ("ssh", "aws-build"))
+                    return real_run(["bash", "-c", arguments[-1]], cwd=self.root, env=dict(os.environ),
+                                    capture_output=True, text=True, check=False, timeout=5)
+
+                with mock.patch.object(subprocess, "run", side_effect=release_transport):
+                    _ = mac_test.release_stopped_claims(self.paths, evidence)
+                    _ = mac_test.release_stopped_claims(self.paths, evidence)
+                self.assertFalse(kept.exists())
+                self.assertTrue(unrelated.exists())
+                proof = cast(dict[str, object], json.loads((self.state / "release-evidence" / kept.name).read_text()))
+                self.assertEqual((proof["target"], proof["generation"], proof["state"]),
+                                 ("aws", "generation-one", "stopped"))
+                self.assertEqual(cast(dict[str, object], proof["claim"])["remote_host"], "aws-build")
+                if prepared_fence:
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(list(fence_directory.iterdir()), [])
 
     def test_stop_evidence_cannot_release_a_replacement_claim_after_restart(self) -> None:
         kept = self.claim(self.paths)

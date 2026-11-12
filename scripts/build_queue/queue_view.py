@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
-from scripts.build_queue import head_facts, queue_evidence, queue_lines
+from scripts.build_queue import head_facts, queue_evidence, queue_lines, placement
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
@@ -252,7 +252,7 @@ def running_builds(model: QueueModel) -> list[RunningBuild]:
         memory = step.measured
         if isinstance(memory, (admission_records.GoneMemory, admission_records.CompilerServiceMemory, admission_records.UnownedSliceMemory)):
             continue
-        key = admission_records.run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else str(index)
+        key = admission_records.execution_group(step, str(index))
         started = step.run.started_at if isinstance(step.run, LiveBuildRun) else step.started_at
         if not started and isinstance(running.admitted_at, float):
             started = running.admitted_at
@@ -542,8 +542,10 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     pids = [queue_evidence.step_pid_text(step) for step in waiting]
     running_pids = [queue_evidence.step_pid_text(row.step) for row in running]
     pid_width = max((len(text) for text in [*pids, *running_pids, *(f"pid {row.owner.pid}" for row in cloud)]), default=5)
-    machine = field(store.host_name()) if running else ""
-    machine_width = max(len("machine"), terminal_width(machine)) if running or cloud else 0
+    machines = [field(admission_records.execution_host(row.step, store.host_name()))
+        + (" ?" if row.step.assignment_host and not isinstance(row.step.execution, placement.ObservedExecution) else "")
+        for row in running]
+    machine_width = max(len("machine"), *(terminal_width(machine) for machine in machines), 3) if running or cloud else 0
     vcpu_width = max(4, len(cpus), max((len(str(item.vcpus)) for item in work.values() if isinstance(item.vcpus, int)), default=0))
     # Reserve the text widths before the pid takes cells from the bars.
     fixed = place_width + step_width + minutes_width + 5
@@ -566,7 +568,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             unit_width -= 1
     names_fit = all(terminal_width(show) <= show_width and terminal_width(unit) <= unit_width
                     for show, unit, _ in all_names)
-    if not cloud and (not names_fit or show_width + unit_width + machine_width + 1 > name_room):
+    if not cloud and not any(row.step.assignment_host for row in running) and (not names_fit or show_width + unit_width + machine_width + 1 > name_room):
         machine_width = 0
     machine_cells = machine_width + 1 if machine_width else 0
     bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells + vcpu_width + 1
@@ -658,8 +660,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         append_row((*identity_columns("run", queue_lines.step_text(row.step, model.names), pair, minutes,
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
-                      *((Span(column(machine, machine_width), "inactive"),) if machine_width else ()),
-                      Span(pad_left(cpus, vcpu_width) + " ", "inactive"),
+                      *((Span(column(machines[index], machine_width), "inactive"),) if machine_width else ()),
+                      Span(pad_left("—" if row.step.assignment_host else cpus, vcpu_width) + " ", "inactive"),
                       Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
     for entry in waiting_builds(model):

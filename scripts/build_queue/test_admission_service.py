@@ -300,6 +300,32 @@ class ReplyPublicationTests(unittest.TestCase):
                 self.assertFalse(server.deferred_requests)
                 self.assertEqual(reader.requests, 1)
 
+    def test_new_placement_coordinator_waits_for_fresh_process_evidence(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, records.MemoryConfig)
+            reader = FixedSystemReader(initial)
+            server.system_reader = reader
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            self.assertNotIn(request.owner.pid, initial.processes)
+            replies = fixture.connect(request).replies()
+            self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies), replies)
+            self.assertEqual(len(replies), 1)
+            self.assertIsInstance(replies[0], wire.PlacementWait)
+            self.assertNotIn(request.episode, server.current_assignments)
+            reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            os.eventfd_write(server.reading_events, 1)
+            server.run_once(0)
+            reply, = fixture.connect(request).replies()
+            self.assertIsInstance(reply, wire.Assignment)
+
     def test_refused_deferred_connection_cannot_admit_on_a_later_read(self) -> None:
         with AdmissionFixture() as fixture:
             server = fixture.server
@@ -1429,7 +1455,9 @@ class ReadingAlertTests(unittest.TestCase):
 class PlacementRestartTests(unittest.TestCase):
     def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
 
         for version in (1, 2):
             with self.subTest(version=version), PlacementFixture() as fixture:
@@ -1454,7 +1482,7 @@ class PlacementRestartTests(unittest.TestCase):
                 pending_assignment = assignment_for(fixture, pending)
                 consumed_assignment = assignment_for(fixture, consumed)
                 claim = adopt_assignment(fixture, consumed, consumed_assignment)
-                consume = wire.ConsumePermission("first-consumption", consumed_assignment, claim)
+                consume = consume_permission("first-consumption", consumed_assignment, claim)
                 self.assertEqual(fixture.server.handle_request(consume),
                                  [wire.FirstAuthorization(consumed_assignment, claim)])
                 positions = fixture.server.places.copy()
@@ -1466,13 +1494,19 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 self.assertEqual({episode: fixture.server.waiters[episode].request for episode in waiters}, waiters)
                 self.assertEqual(assignment_for(fixture, pending), pending_assignment)
-                self.assertEqual(assignment_for(fixture, consumed), consumed_assignment)
+                consumed_reply, = fixture.connect(consumed).replies()
+                self.assertIsInstance(consumed_reply, wire.PlacementWait)
+                saved = fixture.server.assignments[placement.attempt_key(
+                    consumed_assignment.episode, consumed_assignment.attempt)]
+                self.assertEqual(saved.assignment, consumed_assignment)
+                self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                self.assertIsInstance(saved.permission, placement.PermissionConsumed)
                 status, = fixture.server.handle_request(consume)
                 self.assertIsInstance(status, wire.DispatchStatus)
                 assert isinstance(status, wire.DispatchStatus)
                 self.assertIsInstance(status.permission, placement.PermissionConsumed)
                 pending_claim = adopt_assignment(fixture, pending, pending_assignment)
-                self.assertEqual(fixture.server.handle_request(wire.ConsumePermission(
+                self.assertEqual(fixture.server.handle_request(consume_permission(
                     "pending-consumption", pending_assignment, pending_claim)),
                     [wire.FirstAuthorization(pending_assignment, pending_claim)])
 
@@ -5511,7 +5545,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py"):
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+                         "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
                 script = fixture.root / Path(relative).name

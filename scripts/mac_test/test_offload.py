@@ -23,6 +23,8 @@ from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import offload, claim_state
+from scripts.build_queue import admission_client, admission_protocol as wire, placement
+from scripts.build_queue.admission_test_support import caller_admission
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -632,7 +634,30 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(self.root))
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
+        from scripts.build_queue import admission_protocol as wire, placement
+        from scripts.build_queue.admission_test_support import AdmissionFixture
+        from scripts.build_queue import admission_records as records
+        from scripts.build_hold.build_hold import NoOwningSession
+
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
+        fixture = self.enterContext(AdmissionFixture(root=self.root))
+        start = records.process_start_time(os.getpid())
+        assert start is not None
+        local = fixture.request(owner=wire.Owner(os.getpid(), start))
+        target = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("hana"))
+        constraints = placement.PlacementConstraints(placement.SourceKeyUnavailable("the fixture has no tree key"),
+            ("cargo", "nextest", "run"), str(self.root), "hana", NoOwningSession(),
+            (placement.PlacementCandidate(target),), placement.PinnedHost("mac"))
+        request = wire.PlacementRequest(local.episode,
+            placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time),
+            local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
+        fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+            fixture.server.host_evidence_key(request, target), fixture.clock.now(), "", placement.AllowedHost()))
+        assigned, = fixture.server.handle_request(request)
+        self.assertIsInstance(assigned, wire.Assignment)
+        assignment_file = self.root / "probe.assignment"
+        _ = assignment_file.write_text(wire.encode_reply(assigned))
+        _ = self.enterContext(fixture.serving())
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
 
@@ -645,7 +670,8 @@ class OffloadSettingsTests(unittest.TestCase):
             attempt.answer = offload.FreshMacClaim()
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
-                                             "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
+                                             "--package", "hana", "--call-id", "probe-start", "--result", str(destination),
+                                             "--assignment-file", str(assignment_file)]), \
              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
@@ -733,11 +759,18 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_declined(result, "repo")
         self.assertEqual(self.events(), [])
 
-    def test_unreachable_status_sets_backoff_without_a_second_ssh(self) -> None:
+    def test_unreachable_status_sets_backoff_without_a_second_probe(self) -> None:
         self.fixture["probe_status"] = 255
         self.sync_fixture()
         self.assert_declined(self.command(), "unreachable")
-        self.assertEqual(len(self.events_for("ssh")), 1)
+        probe, settlement = self.events_for("ssh")
+        self.assertNotIn("dispatch_start_settled=", probe["args"][-1])
+        self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+        self.assertIn("claim", probe)
+        assert "claim" in probe
+        claim = probe["claim"]
+        identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+        self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
         self.clear_events()
         self.assert_declined(self.command(), "backoff")
@@ -775,7 +808,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertRegex(result.stderr, r"^mac_test: could not reach the Mac: .*0\.1.*\n$")
         self.assertRegex(result.stderr, r"(?i)tim(?:e|ed).*out|limit|finish")
         self.assertTrue((self.stub_directory / "probe-started").exists())
-        self.assertEqual(len(self.events_for("ssh")), 1)
+        probe, settlement = self.events_for("ssh")
+        self.assertNotIn("dispatch_start_settled=", probe["args"][-1])
+        self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+        self.assertIn("claim", probe)
+        assert "claim" in probe
+        claim = probe["claim"]
+        identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+        self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
     def test_probe_without_final_status_declines_as_unreachable(self) -> None:
         self.fixture["probe_lines"] = self.fixture["probe_lines"][:-1]
@@ -783,7 +823,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         result = self.command(separate_stderr=True)
         self.assert_declined(result, "unreachable")
         self.assertEqual(result.stderr, "mac_test: could not reach the Mac: the probe answer could not be read\n")
-        self.assertEqual(len(self.events_for("ssh")), 1)
+        probe, settlement = self.events_for("ssh")
+        self.assertNotIn("dispatch_start_settled=", probe["args"][-1])
+        self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+        self.assertIn("claim", probe)
+        assert "claim" in probe
+        claim = probe["claim"]
+        identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+        self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
     def test_failed_probe_prints_collapsed_ssh_error_before_unreachable_decline(self) -> None:
         self.fixture["probe_status"] = 255
@@ -816,19 +863,31 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  template="mac_test")
         self.config["offload"] = "off"
         self.sync_config()
-        result = self.command(settings=alternate)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assert_wire("passed", "")
-        ssh = self.events_for("ssh")
-        self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
-        self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
-        self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-        remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
-        lint_index = remote_words.index("~/.claude/scripts/lint/lint")
-        self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
-        self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
-        self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
+        request_placement = admission_client.request_placement
+
+        def submit(request: wire.PlacementRequest
+                   ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+            self.assertEqual([candidate.settings for candidate in request.constraints.candidates
+                              if candidate.destination.target == "mac"],
+                             [placement.ExplicitProviderSettings(alternate.resolve())])
+            return request_placement(request)
+
+        for settings in (alternate, alternate.relative_to(self.root)):
+            with self.subTest(settings=settings), mock.patch.object(admission_client, "request_placement", side_effect=submit):
+                self.clear_events()
+                result = self.command(settings=settings, direct_placement=True)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assert_wire("passed", "")
+                ssh = self.events_for("ssh")
+                self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
+                self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
+                self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
+                remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                lint_index = remote_words.index("~/.claude/scripts/lint/lint")
+                self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+                self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
+                self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
+                self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
     def test_low_disk_declines_after_probe(self) -> None:
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
@@ -862,7 +921,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = (self.state_directory / "block.json").write_text(
             json.dumps(block), encoding="utf-8"
         )
-        self.assert_declined(self.command(), "blocked")
+        self.assert_declined(self.command(assigned_adapter=True), "blocked")
         self.assertEqual(self.events(), [])
 
         (self.state_directory / "block.json").unlink()
@@ -876,7 +935,7 @@ class OffloadCommandTests(OffloadCommandFixture):
             str(self.repository),
         )
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
-        busy = self.command()
+        busy = self.command(assigned_adapter=True)
         self.assertEqual(busy.returncode, 75, busy.stdout)
         self.assertTrue(busy.stdout.endswith("mac_test: not running on the Mac (busy)\n"), busy.stdout)
         self.assertIn("busy", busy.stdout)
@@ -892,7 +951,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = (self.state_directory / "block.json").write_text(
             "damaged\n", encoding="utf-8"
         )
-        unreadable = self.command()
+        unreadable = self.command(assigned_adapter=True)
         self.assert_declined(unreadable, "state")
         self.assertIn("state unreadable", unreadable.stdout)
         self.assertIn("block.json", unreadable.stdout)
@@ -909,7 +968,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         path = self.state_directory / "block.json"
         _ = path.write_text(json.dumps(block))
         before = path.read_bytes()
-        result = self.command()
+        result = self.command(assigned_adapter=True)
         self.assert_declined(result, "blocked")
         self.assertIn("blocked by alice: restore CI first", result.stdout)
         self.assertEqual(path.read_bytes(), before)
@@ -919,11 +978,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         claimed = self.state_command("claim", "--pid", str(os.getpid()), "--what", "other tests",
                                      "--worktree", str(self.repository))
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
-        first = self.command(separate_stderr=True)
+        first = self.command(separate_stderr=True, assigned_adapter=True)
         first_wire = self.wire_result()
         self.assertEqual(first.stdout, "mac_test: not running on the Mac (busy)\n")
         self.assertTrue(first.stderr)
-        repeated = self.command(last_decline="busy", separate_stderr=True)
+        repeated = self.command(last_decline="busy", separate_stderr=True, assigned_adapter=True)
         self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (75, "", ""))
         self.assertEqual(repeated.returncode, first.returncode)
         self.assertEqual(self.wire_result()["mac"], first_wire["mac"])
@@ -940,14 +999,14 @@ class OffloadCommandTests(OffloadCommandFixture):
                  "session": None, "showrunner": None, "state": "active",
                  "ci": "not_configured", "free_message": {"kind": "not_needed"}}
         _ = (self.state_directory / "block.json").write_text(json.dumps(block))
-        first = self.command(separate_stderr=True)
-        changed = self.command(last_decline="busy", separate_stderr=True)
+        first = self.command(separate_stderr=True, assigned_adapter=True)
+        changed = self.command(last_decline="busy", separate_stderr=True, assigned_adapter=True)
         self.assertEqual((changed.returncode, changed.stdout, changed.stderr),
                          (first.returncode, first.stdout, first.stderr))
         self.assertEqual(changed.stdout, "mac_test: not running on the Mac (blocked)\n")
         self.assertIn("blocked by alice: restore CI first", changed.stderr)
         self.assert_wire("declined", "blocked")
-        repeated = self.command(last_decline="blocked", separate_stderr=True)
+        repeated = self.command(last_decline="blocked", separate_stderr=True, assigned_adapter=True)
         self.assertEqual((repeated.returncode, repeated.stdout, repeated.stderr), (75, "", ""))
         self.assert_wire("declined", "blocked")
         self.assertEqual(self.events(), [])
@@ -956,7 +1015,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.fixture["rsync_status"] = 23
         self.sync_fixture()
         self.assert_declined(self.command(), "copy")
-        self.assertEqual(len(self.events_for("ssh")), 1)
+        probe, settlement = self.events_for("ssh")
+        self.assertNotIn("dispatch_start_settled=", probe["args"][-1])
+        self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+        self.assertIn("claim", probe)
+        assert "claim" in probe
+        claim = probe["claim"]
+        identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+        self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
         path = self.state_directory / "mirror-busy-hana.until"
@@ -980,12 +1046,27 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.fixture["run_status_reported"] = False
         self.fixture["run_lines"] = [{"stream": "stderr", "text": "copies: /mirror/hana: busy; held by session grep"}]
         self.sync_fixture()
-        result = self.command(runner_options=("--target", "mac"))
+        result = self.command(runner_options=("--target", "mac"), direct_placement=True)
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assert_wire("declined", "busy")
         self.assertNotIn("without a final status", result.stdout)
         self.assertTrue(path.exists())
         self.assertFalse(self.claim_file.exists())
+
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            assigned = [saved for saved in admission.server.assignments.values()
+                        if isinstance(saved.permission, placement.PermissionConsumed)]
+            self.assertTrue(assigned)
+            for saved in assigned:
+                submitted = admission.server.placement_requests[saved.assignment.episode]
+                key = admission.server.host_evidence_key(submitted, saved.assignment.destination)
+                admission.server.publish_host_evidence(admission.server.host_probe(key))
+        _ = admission.run_pass()
+        with admission.loop_turn():
+            self.assertTrue(all(isinstance(admission.server.assignments[placement.attempt_key(
+                saved.assignment.episode, saved.assignment.attempt)].state, placement.ClosedAssignment)
+                for saved in assigned), assigned)
 
     def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
         self.fixture["rsync_status"] = 23
@@ -1001,7 +1082,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_declined(result, "copy: rsync: rsync: destination denied; rsync error: code 23")
         self.assert_claimed_commands()
         self.assertEqual(len(self.events_for("rsync")), 1)
-        self.assertEqual(len(self.events_for("ssh")), 1)
+        probe, settlement = self.events_for("ssh")
+        self.assertNotIn("dispatch_start_settled=", probe["args"][-1])
+        self.assertIn("dispatch_start_settled=", settlement["args"][-1])
+        self.assertIn("claim", probe)
+        assert "claim" in probe
+        claim = probe["claim"]
+        identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+        self.assertIn(offload.pending_start_key(identity), settlement["args"][-1])
 
         _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
         result = self.command(runner_options=("--target", "mac"))
@@ -1332,8 +1420,14 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  ["ssh_control", "rsync_source", "ssh_run"])
                 self.assertEqual(transfers[1], {"operation": "rsync_source", "sent_bytes": sent,
                                                "received_bytes": received, "complete": complete})
+                ssh = self.events_for("ssh")[-1]
+                self.assertIn("claim", ssh)
+                assert "claim" in ssh
+                claim = ssh["claim"]
+                identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
+                marker = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
                 self.assertEqual(transfers[2]["received_bytes"],
-                    len("résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n".encode("utf-8")))
+                    len(("résultat\nanomaly\nmac_exit=0\nmac_cleanup=0 32715571 59\n" + marker).encode("utf-8")))
                 self.assertEqual(attempt["sent_bytes"], sum(entry["sent_bytes"] for entry in transfers))
                 self.assertEqual(attempt["received_bytes"], sum(entry["received_bytes"] for entry in transfers))
                 self.assertIn("résultat\nanomaly\n", answer.stdout)

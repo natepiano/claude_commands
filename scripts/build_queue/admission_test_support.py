@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from dataclasses import replace
 import os
+import json
 from pathlib import Path
 import select
 import signal
@@ -31,6 +32,9 @@ from scripts.lint.memory_test_support import admission_policy_fixture, config_en
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
+from scripts.build_queue import placement
+from scripts.mac_test import claim_state
+from scripts.build_hold.build_hold import NoOwningSession, OwningSession
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib import build_folders
@@ -123,11 +127,12 @@ class ObservedAdmissionServer(service.AdmissionServer):
 
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
-                 check_access: Callable[[str], None], before_admission: Callable[[], None]) -> None:
+                 check_access: Callable[[str], None], before_admission: Callable[[], None],
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
         self.check_access: Callable[[str], None] = check_access
         self.before_admission: Callable[[], None] = before_admission
         self.wake_lock: threading.Lock = threading.Lock()
-        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path)
+        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe)
 
     @override
     def close(self) -> None:
@@ -178,6 +183,11 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def handle_request(self, request: wire.Request,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
         self.check_access("handle_request")
+        if isinstance(request, wire.PlacementRequest) and isinstance(self.proc, TestProcesses):
+            self.before_admission()
+            self.proc.register(wire.Owner(request.owner.pid, request.owner.start_time))
+            if isinstance(request.run, wire.RunIdentity):
+                self.proc.register(wire.Owner(request.run.pid, request.run.start_time))
         if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
             self.before_admission()
             if isinstance(self.proc, TestProcesses):
@@ -395,10 +405,13 @@ class AdmissionFixture(ExitStack):
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
                                          fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn,
-                                         before_admission=self.advance_idle_spacing)
+                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider)
         if start:
             server.start()
         return server
+
+    def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        return placement.HostEvidenceUnavailable(key, self.clock.now(), "the fixture has no provider transport")
 
     def restart(self) -> None:
         self.server.close()
@@ -868,6 +881,186 @@ def admitted_reply(reservation: str = "stem", need: int = GIB, source: str = "ne
 
 
 _caller_services: dict[str, AdmissionFixture] = {}
+PRIVATE_HOST_ALLOWED = placement.AllowedHost()
+
+
+def _register_real_ancestry(fixture: AdmissionFixture, pid: int) -> None:
+    """Copy a real claim holder and its real ancestors below the test process into the private table.
+
+    The service proves a holder descends from its submitting coordinator. A holder
+    started through a launcher sits several processes below that coordinator.
+    """
+    while pid > 1 and pid != os.getpid():
+        start = records.process_start_time(pid)
+        if start is None:
+            return
+        fixture.proc.register(wire.Owner(pid, start))
+        parent = int(Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[1])
+        write_process(fixture.proc.path, pid, parent=parent, start=start)
+        pid = parent
+
+
+def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvidenceKey,
+                              paths: claim_state.StatePaths,
+                              eligibility: placement.HostEligibility = PRIVATE_HOST_ALLOWED) -> placement.FreshHostEvidence:
+    """Read only the fixture's provider records and checked local process identities."""
+    adopted: list[placement.AdoptedProviderClaim] = []
+    cleanup: list[placement.RetainedCleanupClaim] = []
+    with claim_state.locked(paths.lock):
+        claims = claim_state.read_claims(paths)
+    from scripts.mac_test import mac_test
+    from scripts.build_hold import build_hold
+    from scripts.build_targets import build_targets
+
+    holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
+    diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NoProviderDiagnostic()
+    if key.destination.provider == "local":
+        directory = fixture.root / "build-hold"
+        blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory)
+        if not isinstance(blocking, build_targets.NoBlockingHold):
+            eligibility = placement.TemporaryExclusion("blocked")
+            try:
+                _ = uuid.UUID(blocking.key)
+            except ValueError:
+                holder = placement.ResourceHolderUnit(blocking.name)
+            else:
+                holder = placement.ResourceHolderSession(blocking.key)
+    else:
+        block = mac_test.blocking_claim_block(paths, key.session)
+        if not isinstance(block, mac_test.NoMacBlock):
+            eligibility = placement.TemporaryExclusion("blocked")
+        scope = claim_state.target_claim_scope(paths, key.repository)
+        for held in claims:
+            if mac_test.scopes_overlap(held.scope, scope) and mac_test.run_is_live(held.record):
+                if isinstance(eligibility, placement.AllowedHost) and not mac_test.run_is_kept(held.record):
+                    eligibility = placement.TemporaryExclusion("busy")
+                if isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy":
+                    diagnostic = placement.BusyProviderDiagnostic(key.destination.target, held.record["what"], held.record["since"])
+                session_id = held.record.get("holder_session") or held.record["submitting_session"]
+                if session_id:
+                    holder = placement.ResourceHolderSession(session_id)
+                break
+    generation = ""
+    controller = paths.directory / "controller.json"
+    if controller.exists():
+        document = cast(dict[str, object], json.loads(controller.read_text()))
+        generation = str(document.get("generation", ""))
+    for held in claims:
+        record = held.record
+        if "remote_host" not in record:
+            continue
+        reference = placement.ProviderClaimReference(key.destination.provider, key.destination.target,
+            held.scope, record["claim_id"], record["episode"], record["attempt"])
+        if record.get("cleanup_pending", False):
+            cleanup.append(placement.RetainedCleanupClaim(reference, "private cleanup remains unresolved"))
+            continue
+        pid = record["pid"]
+        start = records.process_start_time(pid)
+        if start is not None and start == record["proc_start"]:
+            _register_real_ancestry(fixture, pid)
+        session_id = record["submitting_session"]
+        adopted.append(placement.AdoptedProviderClaim(reference,
+            placement.ClaimHolderIdentity(fixture.server.host, pid, record["proc_start"]),
+            OwningSession(session_id) if session_id else NoOwningSession(),
+            record["remote_host"], record.get("instance_generation", "")))
+    return placement.FreshHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), holder=holder, provider_diagnostic=diagnostic)
+
+
+class CallerProviderControls:
+    """Control private provider evidence without choosing a placement."""
+
+    def __init__(self, fixture: AdmissionFixture) -> None:
+        self.fixture: AdmissionFixture = fixture
+        self.reader: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = fixture.server.host_probe
+        self.hosts: dict[str, placement.HostEligibility] = {}
+        self.starting: dict[str, Path] = {}
+        self.observations: list[placement.HostEvidenceKey] = []
+
+    def read(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        self.observations.append(key)
+        evidence = self.reader(key)
+        supplied = isinstance(evidence, placement.FreshHostEvidence)
+        if not isinstance(evidence, placement.FreshHostEvidence):
+            if key.destination.target not in self.hosts:
+                return evidence
+            evidence = private_provider_evidence(self.fixture, key, self.claim_paths(key.destination.target),
+                                                self.hosts[key.destination.target])
+        elif key.destination.provider == "local":
+            evidence = private_provider_evidence(self.fixture, key, claim_state.StatePaths(self.fixture.root / "local-provider"),
+                                                evidence.eligibility)
+        eligibility = self.hosts.get(key.destination.target, evidence.eligibility) if supplied else evidence.eligibility
+        marker = self.starting.get(key.destination.target)
+        if marker is not None and marker.exists():
+            eligibility = placement.TemporaryExclusion("starting")
+        return replace(evidence, eligibility=eligibility)
+
+    def set_host(self, target: str, eligibility: placement.HostEligibility) -> None:
+        with self.fixture.loop_turn():
+            self.hosts[target] = eligibility
+            for reader in self.fixture.server.host_readers.values():
+                if reader.key.destination.target == target and isinstance(reader.latest, placement.FreshHostEvidence):
+                    self.fixture.server.publish_host_evidence(replace(reader.latest, eligibility=eligibility))
+
+    def advance(self, seconds: float) -> None:
+        with self.fixture.loop_turn():
+            self.fixture.clock.advance(seconds)
+            self.fixture.server.next_pass = self.fixture.clock.monotonic()
+
+    def claim_paths(self, target: str) -> claim_state.StatePaths:
+        directory = (self.fixture.root / "mac-state" if target == "mac" else
+                     self.fixture.root / "home/.local/state/build-targets" / target)
+        return claim_state.StatePaths(directory, target, platform="macos" if target == "mac" else "linux")
+
+    def claims(self, target: str) -> tuple[claim_state.HeldClaim, ...]:
+        paths = self.claim_paths(target)
+        with claim_state.locked(paths.lock):
+            return tuple(claim_state.read_claims(paths))
+
+    def memory_waits(self) -> tuple[wire.Wait, ...]:
+        with self.fixture.loop_turn():
+            return tuple(waiting.last_reply for waiting in self.fixture.server.waiters.values()
+                         if isinstance(waiting.last_reply, wire.Wait))
+
+
+_caller_controls: dict[str, CallerProviderControls] = {}
+
+
+def private_caller_provider(fixture: AdmissionFixture, environment: dict[str, str],
+                            key: placement.HostEvidenceKey) -> placement.HostEvidence:
+    """Read provider controls from private caller files."""
+    eligibility: placement.HostEligibility = placement.AllowedHost()
+    if key.destination.provider != "local":
+        busy = environment.get("TEST_RUNNER_BUSY_UNTIL", "")
+        state = Path(environment.get("TEST_RUNNER_STATE", str(fixture.root / "runner-state")))
+        available = state / "available-gib"
+        attempts = state / "runner-events.jsonl"
+        allow_refusal = environment.get("TEST_PROVIDER_ALLOW_RUNNER_REFUSALS") == "1"
+        if environment.get("TEST_FREE_NOW_ONCE"):
+            allow_refusal = not attempts.exists() or len(attempts.read_text().splitlines()) < 2
+        if available.exists() and float(available.read_text()) == 0:
+            eligibility = placement.TemporaryExclusion("disk")
+        elif busy and not Path(busy).exists() and not allow_refusal:
+            eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_BUSY_REASON", "busy"))
+        elif environment.get("TEST_RUNNER_MAC") == "declined" and not allow_refusal:
+            eligibility = placement.TemporaryExclusion(environment.get("TEST_RUNNER_REASON") or "busy")
+    directory = (fixture.root / "local-provider" if key.destination.provider == "local" else
+                 Path(environment["MAC_TEST_STATE_DIR"]) if key.destination.provider == "mac" else
+                 Path(environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
+    paths = claim_state.StatePaths(directory, key.destination.target,
+        platform="macos" if key.destination.provider == "mac" else "linux")
+    return private_provider_evidence(fixture, key, paths, eligibility)
+
+
+def caller_provider_controls(test: unittest.TestCase, fixture: AdmissionFixture) -> CallerProviderControls:
+    """Share provider controls across the caller fixture and its observers."""
+    key = str(fixture.socket_path)
+    controls = _caller_controls.get(key)
+    if controls is None:
+        controls = CallerProviderControls(fixture)
+        _caller_controls[key] = controls
+        test.addCleanup(_caller_controls.pop, key)
+        fixture.server.host_probe = controls.read
+    return controls
 
 
 def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str, str],
@@ -884,13 +1077,20 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     _caller_services[str(fixture.socket_path)] = fixture
     test.addCleanup(_caller_services.pop, str(fixture.socket_path))
     fixture.clock.epoch = time.time()
+    def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        if key.destination.provider == "local":
+            return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+        return placement.HostEvidenceUnavailable(
+            key, fixture.clock.now(), "the caller fixture has no provider transport")
+
+    fixture.server.host_probe = provider
     launcher = Path.home() / ".claude/scripts/lib/py"
     launcher.parent.mkdir(parents=True, exist_ok=True)
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
     for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
-                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())
     return fixture
