@@ -3488,16 +3488,23 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 5. Tests: start a real child gate on a small fixture, send it SIGTERM, then SIGINT in a second case. Then start a second gate and prove it stops the leftover groups, deletes the folders and applies the rollback. No other guard tests.
 6. Keep every existing test and assertion. Run the merge-gate modules and basedpyright on each changed file.
 
+7. Architect after Phase 219 (folded while the worker ran):
+   - Remove the `merge_gate.rollback_signals()` caller at `scripts/aws_target/gate_box.py:349` and its fake at `test_gate_box.py:153`. Replace the retired-handler exception expectations at `test_merge_gate_suites_resources.py:194,219,256`; keep their token, status and CPU assertions.
+   - `PDEATHSIG` does not reach the test process that `scripts/test_times/module_run.py:595` forks, and SIGKILL skips the cleanup at `:613`. Own the whole descendant set without a handler (for example the module's cgroup scope). Handle parent death before the bootstrap sets `PDEATHSIG`. Cover a descendant that starts a new session.
+   - Record CPU token ownership durably (token read at `merge_gate.py:391`, returned at `:418`), and restore it at the next start. Prove FIFO capacity survives recovery.
+   - Record rollback intent before `git merge` and disarm it before the push at `merge_gate.py:1803`. At recovery, stop owned command groups (`command():534`), take the checkout lock and check the expected HEAD before a reset. Keep the record when recovery fails.
+   - Windows: drop the wakeup-fd plumbing at `:361` if it needs a handler; keep the `try_acquire` mask at `:377`; mask `wait4` with its result save at `:710`; mask start plus ownership publication at `:1427`; mask bounded cleanup at `:1464`.
+
 **Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/production/merge_gate_test_support.py`
-- `scripts/production/test_merge_gate_suites.py` and the merge-gate test module that holds rollback tests
+- `scripts/production/merge_gate.py`, `merge_gate_test_support.py` and the `scripts/production/test_merge_gate*.py` modules
+- `scripts/aws_target/gate_box.py`, `test_gate_box.py`
+- `scripts/test_times/module_run.py`, `test_module_run.py`
 
 **Workers:** 1 writer; every change is in the gate's run path.
 - impl: all files.
 
 **Constraints from prior phases:**
-- Phase 219: the gate's wait loop reaps finished jobs before the time-limit deadline; keep that order.
+- Phase 219: keep the same-vCPU history selection, the no-history states, and reaping finished jobs before the time-limit deadline.
 
 **Acceptance gate:**
 - `grep -n "signal.signal\|defer_signals" scripts/production/merge_gate.py` finds only the child `SIG_DFL` reset in `SUITE_BOOTSTRAP`.
