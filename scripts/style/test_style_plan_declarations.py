@@ -40,7 +40,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertIn(f"waiting {issue}:", output)
         self.assertIn("outside rename not proved", output)
         self.assertIn(f"mapped site {destination}:4", output)
-        self.assertIn("crates/alpha/src/failed.rs", output)
+        self.assertIn("candidates: 3 (body check failed: 3);", output)
         self.assertNotIn("waived", output)
         row, = self.ledger().proposal_findings(issue)
         self.assertEqual((row.finding_id, row.path, row.state), (finding.finding_id, destination, style_ledger.Filed(issue)))

@@ -1114,6 +1114,28 @@ class LedgerTests(CostFixture):
 
 
 class SpotPriceEvidenceTests(CostFixture):
+    def test_regional_reply_selects_the_latest_price_for_each_requested_zone_and_type(self) -> None:
+        first: dict[str, object] = dict(InstanceType='m7a.8xlarge', AvailabilityZone='eu-south-2a',
+            SpotPrice='.3', Timestamp='2026-01-15T00:00:00Z')
+        reply: dict[str, object] = {'SpotPriceHistory': [
+            {**first, 'SpotPrice': '.2', 'Timestamp': '2026-01-15T01:00:00Z'}, first,
+            {**first, 'InstanceType': 'c7a.8xlarge'}, {**first, 'AvailabilityZone': 'eu-south-2b'}]}
+        self.assertEqual(ledger.regional_spot_prices('eu-south-2', reply, ('m7a.8xlarge',), 123), (
+            ledger.RegionalSpotPrice('eu-south-2', 'eu-south-2a', 'm7a.8xlarge', Decimal('.2'), 123),
+            ledger.RegionalSpotPrice('eu-south-2', 'eu-south-2b', 'm7a.8xlarge', Decimal('.3'), 123)))
+
+    def test_regional_reply_rejects_incomplete_pages_and_invalid_prices(self) -> None:
+        first: dict[str, object] = dict(InstanceType='m7a.8xlarge', AvailabilityZone='eu-south-2a',
+            SpotPrice='.3', Timestamp='2026-01-15T00:00:00Z')
+        replies: tuple[dict[str, object], ...] = (
+            {'SpotPriceHistory': [first], 'NextToken': 'next'},
+            *({'SpotPriceHistory': [{**first, 'SpotPrice': price}]} for price in ('-1', 'NaN', 'Infinity')),
+            {'SpotPriceHistory': [{**first, 'Timestamp': 'invalid'}]},
+            {'SpotPriceHistory': [{**first, 'AvailabilityZone': ''}]})
+        for reply in replies:
+            with self.subTest(reply=reply), self.assertRaises(ValueError):
+                _ = ledger.regional_spot_prices('eu-south-2', reply, ('m7a.8xlarge',), 123)
+
     def test_regional_prices_round_trip_without_changing_cost_evidence(self) -> None:
         prices = (ledger.RegionalSpotPrice('us-east-2', 'us-east-2a', 'm7a.8xlarge', Decimal('.425'), 1700000000),)
         self.assertEqual(ledger.read_spot_prices(self.state), ())

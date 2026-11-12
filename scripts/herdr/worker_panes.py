@@ -1364,7 +1364,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:
     path = pane_launch.record_directory() / f"{client.session}.json"
     for pane, entry in pane_launch.read_valid_entries(path).items():
-        owner = record.by_member_reference(entry["session_id"])
+        owner = record.by_member_reference(pane_launch.reference_id(entry))
         if owner is not None and owner.id == row.id and pane_launch.agent_kind(entry) == "codex":
             pane_launch.retire_launch(path, pane, entry)
 

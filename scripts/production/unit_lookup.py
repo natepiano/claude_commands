@@ -189,9 +189,11 @@ class NoSessionShowrunner:
 def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
                        sources: MemberSources) -> MemberFound | NoSessionShowrunner:
     """Follow the newest launch's staff id to its first showrunner."""
+    from scripts.herdr import pane_launch
+
     row = record.by_current_session(session_id)
     launches = [launch for launch in sources.launches
-                if row is not None and record.by_member_reference(launch["session_id"]) == row]
+                if row is not None and record.by_member_reference(pane_launch.reference_id(launch)) == row]
     if not launches:
         return NoSessionShowrunner()
     while row is not None:

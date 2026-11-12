@@ -18,6 +18,7 @@ from scripts.hooks import staff_session_identity
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+from scripts.herdr import pane_launch
 from scripts.agents import pane_record
 
 
@@ -52,9 +53,9 @@ class StaffSessionIdentityTests(StaffTestCase):
             "hook_event_name": "SessionStart", "source": "clear", "session_id": new_id,
             "cwd": str(self.root),
         }
-        launch: dict[str, object] = dict(pane_record.launch(
+        launch: dict[str, object] = dict(pane_launch.retained_launch(pane_record.launch(
             "w1:p1", worker.id, str(self.root), environment, ["claude"],
-        ))
+        ), staff.initial_snapshot()))
         worker = replace(worker, home=staff.SessionHome(Path(environment["CLAUDE_CONFIG_DIR"])))
         launch.update({"pid": os.getpid(), "proc_start": sessions.process_start(os.getpid())})
         panes = pane_record.record_path("agents")
@@ -102,7 +103,7 @@ class StaffSessionIdentityTests(StaffTestCase):
                 retained = case.fixture.launch.copy()
                 retained["pane_id"] = "w1:old"
                 foreign = retained.copy()
-                foreign.update(pane_id="w1:p1", session_id=case.fixture.sibling.id, staff_id=case.fixture.sibling.id,
+                foreign.update(pane_id="w1:p1", staff_id=case.fixture.sibling.id,
                                pid=os.getpid() + 1, proc_start="another process")
                 case.write_json(case.fixture.panes, {"w1:old": retained, "w1:p1": foreign})
                 before = case.staff_file.read_bytes()
@@ -155,7 +156,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         self.record_start()
         launch = pane_record.read("agents")["w1:p1"]
-        self.assertEqual(launch["session_id"], self.fixture.new_id)
+        self.assertEqual(cast(pane_launch.NativePaneLaunch, launch)["session_id"], self.fixture.new_id)
         self.assertEqual(launch.get("pid"), os.getpid())
         self.assertEqual(launch.get("proc_start"), sessions.process_start(os.getpid()))
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -203,7 +204,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         self.assertEqual(staff.by_id(self.fixture.sibling.id), self.fixture.sibling)
         self.assertIsNone(staff.by_current_session(self.fixture.new_id))
         launch = pane_record.read("agents")["w1:p1"]
-        self.assertEqual(launch["session_id"], self.fixture.new_id)
+        self.assertEqual(cast(pane_launch.NativePaneLaunch, launch)["session_id"], self.fixture.new_id)
         self.assertEqual(launch.get("pid"), os.getpid())
         self.assertEqual(launch.get("proc_start"), sessions.process_start(os.getpid()))
         self.assertEqual(pane_record.resume_launch(launch)["session_id"], self.fixture.new_id)
@@ -268,7 +269,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         self.assertEqual(staff.by_id(self.fixture.worker.id), expected)
         self.assertEqual((self.fixture.panes.read_bytes(), self.fixture.panes.stat().st_mtime_ns), before)
         recorded = pane_record.read("agents")["w1:p1"]
-        self.assertEqual(recorded["session_id"], self.fixture.worker.id)
+        self.assertEqual(recorded.get("staff_id"), self.fixture.worker.id)
         self.assertEqual(recorded.get("pid"), os.getpid())
         self.assertEqual(recorded.get("proc_start"), sessions.process_start(os.getpid()))
 
@@ -288,7 +289,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         previous = self.fixture.new_id
         self.record_start()
         recorded = pane_record.read("agents")["w1:p1"]
-        self.assertEqual(recorded["session_id"], self.fixture.worker.id)
+        self.assertEqual(recorded.get("staff_id"), self.fixture.worker.id)
         self.assertEqual(recorded.get("pid"), os.getpid())
         self.fixture.new_id = fixture_runtime_id("second-clear")
         # The SessionEnd observation identifies the actual old id of this process.
@@ -343,7 +344,7 @@ class StaffSessionIdentityTests(StaffTestCase):
         self.record_start()
         self.assertEqual(self.staff_file.read_bytes(), after_first)
         launch = pane_record.read("agents")["w1:p1"]
-        self.assertEqual(launch["session_id"], self.fixture.worker.id)
+        self.assertEqual(launch.get("staff_id"), self.fixture.worker.id)
         self.assertEqual(launch.get("pid"), os.getpid())
         self.assertEqual(launch.get("proc_start"), sessions.process_start(os.getpid()))
         retained = self.fixture.panes.read_bytes(), self.fixture.panes.stat().st_mtime_ns
