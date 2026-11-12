@@ -1241,7 +1241,10 @@ sys.exit(7)
             (5, '', '', 'timeout', False),
             (5, '', '', 'uncoded', False),
             (5, '', 'NOT_APPROVED', '', False))
-        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(re.sub(r'(?m)^regions=.*$', 'regions=us-east-1 us-west-2',
+                                  re.sub(r'(?m)^spot_candidate_regions=.*$',
+                                         'spot_candidate_regions=us-east-2 us-west-2', path.read_text())))
         request_id = 'req-ab12cd34ef56'
         case_id = '9876543210'
         account_id = '123456789012'
