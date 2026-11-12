@@ -230,17 +230,6 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.git("rev-parse", "demo-style-modules"), branch)
         self.assertEqual(ledger.ticket_open(ticket_owner_id("values"))[0]["state"], "assigned")
 
-    def test_modules_reads_blocking_structure_before_scanning_decision_footprints(self) -> None:
-        plan = self.modules_unit()
-        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
-        _ = self.values_unit()
-        _ = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
-        self.sync()
-        _ = self.borrowing_decision(structure, "modules", self.sources[2])
-        with mock.patch.object(style_plan.EditedFiles, "of", side_effect=AssertionError("decision footprint read")):
-            ticket = self.select_for_family("modules", plan)
-        self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
-
     def test_owned_structure_skips_product_reservations_and_refill_is_idempotent(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("read")

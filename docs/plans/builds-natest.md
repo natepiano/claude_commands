@@ -3115,3 +3115,47 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on the file reports 0 errors and 0 warnings.
 - The module leaves no process and no folder behind.
 - aws pairs show a CPU gain; with no gain, the phase lands nothing.
+
+### Phase 167 — The style-plan selection tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `test_style_plan_selection.py`, `test_style_plan_batches.py` and `test_style_plan_structure.py` lose every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** Architect review after Phase 165, findings 1 and 5. Rule 2 (user, 2026-11-07). style-unit go, 2026-11-11: no test kept by name beyond Rule 2; keep the unit-tip fast-forwards in the `test_style_plan_selection.py` fixtures (refill-behind-tip, `74ccb1a37`), without which refill exits 6 or 3.
+
+**Spec:**
+1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (ledgers, tickets, plan docs, Git refs, waits, assignments, checkpoints) or lose work. Remove each other rare-case test.
+3. Keep the unit-tip fast-forwards in the `test_style_plan_selection.py` fixtures (style-unit, `74ccb1a37`). Judge each assertion, not the test name: Phase 165 showed a full returned value can guard harm.
+4. Keep the coverage of ticket selection, batch assignment, plan structure and saved checkpoints.
+5. When a removal leaves a fixture, helper, constant or import with no user, remove it too. A helper in `style_plan_test_support.py` may go only when `grep -rn <name> scripts` finds no other user; 28 style modules import it. Do not change production code.
+6. Do not merge tests into table rows in this phase.
+7. Write `phases/167/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
+8. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Check that another module is the real remaining cover before you cite it.
+9. Run the required checks on the final tree, and name the tested revision in the report.
+
+**Files:**
+- `scripts/style/test_style_plan_selection.py` — 37 tests.
+- `scripts/style/test_style_plan_batches.py` — 19 tests.
+- `scripts/style/test_style_plan_structure.py` — 17 tests.
+- `scripts/style/style_plan_test_support.py` — shared support; cleanup only.
+
+**Workers:** 1 writer; 73 tests in one fixture family, and the support file is the hub.
+- test: all three modules; hub: `style_plan_test_support.py`.
+
+**Constraints from prior phases:**
+- Phase 165: review returned the only removal; its full file-list assertion guarded a busy-file assignment.
+- Phase 159: check where a tested step sits before state writes, not only what the test asserts.
+- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom. Spec item 8 carries this.
+- Phase 156: run the checks on the final tree. Spec item 9 carries this.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.style.test_style_plan_selection scripts.style.test_style_plan_batches scripts.style.test_style_plan_structure` passes.
+- Every other module that imports `style_plan_test_support` passes when the support file changes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- `phases/167/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
