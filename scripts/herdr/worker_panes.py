@@ -1120,11 +1120,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
-                    row = worker_admission.publish(allowed, native).row
-                    lock.bind(row)
                     if policy.settings.kind == "codex":
                         entry = client.codex_launch(identity)
+                        row = worker_admission.publish(allowed, native,
+                            launch_home=pane_launch.config_home(entry, record=record)).row
+                        lock.bind(row)
                         pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
+                    else:
+                        row = worker_admission.publish(allowed, native).row
+                        lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")

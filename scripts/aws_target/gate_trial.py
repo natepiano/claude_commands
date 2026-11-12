@@ -223,7 +223,7 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
             reply = worker.book.reserve_gate(worker.settings_path, ledger.GateReservation(
                 attempt, int(worker.clock()), ledger.instant(request, 'expires'), fallback,
                 Decimal(str(cloud_gate.settings().number('attempt_allowance_usd'))), instance_type=reserved_type))
-            if isinstance(reply, ledger.GateCapReached):
+            if isinstance(reply, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                 raise GateRefused(reply.reason)
             reserved.append(attempt)
     except BaseException:
@@ -249,82 +249,22 @@ def trial_cost(book: ledger.CostLedger, attempts: set[str], settings_path: Path,
     return total, complete
 
 
-@dataclass(frozen=True)
-class UncertainTrialLaunch:
-    attempt: str
-    region: str
-    client_token: str
-    expires: int
-
-
 def cleanup_trial(folder: Path, worker: cloud_gate.GateWorker) -> bool:
-    """Terminate recorded boxes and retain reservations without confirmed cleanup."""
-    paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
-    complete = True
-    deadline = worker.clock() + cloud_gate.settings().number('termination_timeout_s')
-    boxes: list[cloud_gate.GateTermination] = []
-    uncertain: list[UncertainTrialLaunch] = []
-    for path in paths:
-        try:
-            request = cloud_gate.read(path)
-            attempt = ledger.text(request, 'attempt')
-            reservation = next((row for row in worker.book.read_snapshot().gate_reservations
-                                if row.attempt == attempt), None)
-            if reservation is None or isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
-                continue
-            launch_path = path.parent / 'launch.json'
-            launch = cloud_gate.read(launch_path) if launch_path.exists() else {}
-            worker.box_region = str(launch.get('region', reservation.region or worker.api.region))
-            instance = str(launch.get('instance', ''))
-            if not instance and isinstance(reservation.state, ledger.GateRunning):
-                instance = reservation.state.instance_id
-            if not instance and 'arguments' in launch:
-                arguments = ledger.mapping(launch['arguments'])
-                uncertain.append(UncertainTrialLaunch(attempt, worker.box_region,
-                    ledger.text(arguments, 'ClientToken'), ledger.instant(request, 'expires')))
-                continue
-            if instance:
-                boxes.append(cloud_gate.GateTermination(attempt, instance, worker.box_region))
-            else:
-                worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())))
-        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-            print('paired cleanup: ' + str(error), file=sys.stderr)
-            complete = False
-    worker.request_terminations(boxes, deadline)
-    for launch in uncertain:
-        try:
-            remaining = deadline - worker.clock()
-            if remaining <= 0:
-                raise AwsUnavailable('The trial cleanup deadline passed')
-            reply = worker.regional_api(launch.region).call('describe-instances', '--filters',
-                'Name=client-token,Values=' + launch.client_token,
-                timeout_s=min(cloud_gate.settings().number('api_timeout_s'), remaining))
-            instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
-            if instances:
-                found = cloud_gate.GateTermination(launch.attempt, ledger.text(instances[0], 'InstanceId'), launch.region)
-                boxes.append(found)
-                worker.request_terminations([found], deadline)
-            elif worker.clock() < launch.expires:
-                complete = False
-            else:
-                worker.book.resolve_gate(launch.attempt, ledger.GateAbsent(int(worker.clock())))
-        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-            print('paired cleanup: ' + str(error), file=sys.stderr)
-            complete = False
-    return worker.confirm_terminations(boxes, deadline) and complete
+    return cloud_gate.cleanup_folder(folder, worker)
 
 
 def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
     """Clean expired trials before a new trial reserves boxes."""
     unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations
-                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))}
+                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated)) and worker.cleanup_due(row)}
     for previous in sorted(folder.parent.iterdir()):
         if previous == folder or not previous.is_dir():
             continue
-        requests = [cloud_gate.read(path) for path in sorted(previous.glob('*/request.json'))]
-        if (requests and all(ledger.instant(row, 'expires') <= worker.clock() for row in requests)
-                and any(ledger.text(row, 'attempt') in unresolved for row in requests)):
-            _ = cleanup_trial(previous, worker)
+        requests = [(path, cloud_gate.read(path)) for path in sorted(previous.glob('*/request.json'))]
+        if requests and all(ledger.instant(row, 'expires') <= worker.clock() for _, row in requests):
+            due = [path for path, row in requests if ledger.text(row, 'attempt') in unresolved]
+            if due:
+                _ = cloud_gate.cleanup_requests(due, worker)
 
 
 def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -404,7 +344,9 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
             for _process, connection in children:
                 if connection.recv() != 'ready':
                     raise GateRefused('The module has no cloud slot')
-            reserve_trial(worker, requests, record_query)
+            pending = [request for request in requests
+                       if not (folder / ledger.text(request, 'attempt') / 'outcome.json').exists()]
+            reserve_trial(worker, pending, record_query)
             for _process, connection in children:
                 connection.send('launch')
         for process, _connection in children:
