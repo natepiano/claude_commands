@@ -111,12 +111,20 @@ def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profi
 
 def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_progress.CloudProgress:
     """Read the current phase and each module's latest result."""
-    state: cloud_progress.CloudState = 'setup'
+    state: cloud_progress.CloudState = 'setup' if text.strip() else 'requesting'
+    stage = '' if text.strip() else 'launch'
+    modules_started = False
     failed: set[str] = set()
     for line in text.splitlines():
+        named_stage = re.fullmatch(r'(?:\S+ )?stage=(.+)', line)
+        if named_stage and not modules_started:
+            stage = named_stage[1]
+            if stage.startswith('round '):
+                state = 'running'
         start = re.fullmatch(r'Runner: \d+ modules, whole machine, (\d+) CPUs', line)
         if start:
             state, size_vcpus = 'running', int(start[1])
+            stage, modules_started = '', True
         result = re.fullmatch(r'(\S+) exit=(-?\d+) seconds=\d+\.\d+(?: stopped)?', line)
         if result:
             if int(result[2]):
@@ -124,8 +132,8 @@ def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_p
             else:
                 failed.discard(result[1])
         if line == 'Cloud gate: uploading':
-            state = 'uploading'
-    return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at)
+            state, stage = 'uploading', 'uploading'
+    return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at, stage=stage)
 
 
 @dataclass(frozen=True)
@@ -281,6 +289,7 @@ class GateWorker:
                  clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep) -> None:
         self.api = api
         self.box_region = api.region
+        self.box_zone: str = ''
         self.apis: dict[str, AwsCli] = {api.region: api}
         self.book = book
         self.settings_path = settings_path
@@ -299,7 +308,8 @@ class GateWorker:
         counter = log_progress(text)
         if isinstance(counter, progress_profile.ProgressCounter):
             progress_profile.publish_counter(self.sidecar, counter)
-        cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
+        cloud_progress.publish(self.sidecar, replace(log_cloud_progress(text, self.size_vcpus, self.clock()),
+            region=self.box_region, zone=self.box_zone))
 
     def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
         now = int(self.clock())
@@ -470,6 +480,7 @@ class GateWorker:
         launch: dict[str, object] = read(path) if path.exists() else {}
         if launch.get('instance'):
             self.box_region = str(launch.get('region', self.api.region))
+            self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
         variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
@@ -538,7 +549,7 @@ class GateWorker:
             api = self.regional_api(self.box_region)
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock()))
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
             if self.clock() >= ledger.instant(request, 'expires'):
                 reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
@@ -548,6 +559,7 @@ class GateWorker:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
+                    self.box_zone = zone
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             try:
@@ -582,6 +594,7 @@ class GateWorker:
             instance = ledger.text(instances[0], 'InstanceId')
             save(path, {**launch, 'instance': instance})
             self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
+            self.box_zone = zone
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
@@ -591,7 +604,7 @@ class GateWorker:
         row: dict[str, object] = {}
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
+            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock(), stage='launch'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -629,7 +642,8 @@ class GateWorker:
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
+                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock(),
+                    stage='launch', region=self.box_region, zone=self.box_zone))
                 while self.clock() < ledger.instant(request, 'expires'):
                     try:
                         bucket = ledger.text(deployment, 'bucket')
@@ -822,7 +836,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                        else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
             save(current, {'attempt': folder.name, **identity})
             save(folder / 'deployment.json', deployment)
-            cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time()))
+            cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time(), stage='launch'))
             outcome = run_service(repo, folder, request, command, service)
             reservation.status = int(not outcome.run.passed) if isinstance(outcome, CloudCompleted) else 0
             return outcome

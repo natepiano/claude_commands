@@ -610,12 +610,63 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                         + 'Cloud gate: uploading\n')
         with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
             self.assertEqual(self.execute()['status'], 'complete')
-        expected = cloud_progress.CloudProgress('uploading', 16, 1, self.now)
+        expected = cloud_progress.CloudProgress('uploading', 16, 1, self.now,
+            stage='uploading', region='fixture-region', zone='a')
         sidecar = self.folder / 'reservation.cgroup'
         self.assertEqual(cloud_progress.read(sidecar), expected)
         self.assertEqual(publish.call_args_list[-2:], [mock.call(sidecar, expected), mock.call(sidecar, expected)])
         states = [cast(cloud_progress.CloudProgress, call.args[1]).state for call in publish.call_args_list]
-        self.assertEqual(states, ['requesting', 'requesting', 'setup', 'uploading', 'uploading'])
+        self.assertEqual(states, ['requesting', 'requesting', 'requesting', 'uploading', 'uploading'])
+
+    def test_paired_log_uses_the_last_stage_without_changing_merge_failure_counts(self) -> None:
+        boot = ('2026-11-12T13:57:00Z stage=boot\n'
+                '2026-11-12T13:57:01Z stage=tools ready\n'
+                '2026-11-12T13:57:02Z stage=tools checked\n'
+                '2026-11-12T13:57:03Z stage=source ready\n')
+        cases = (
+            (boot, 'setup', 'source ready'),
+            (boot + '2026-11-12T13:57:04Z stage=warm-up base\n', 'setup', 'warm-up base'),
+            (boot + '2026-11-12T13:57:04Z stage=round 2 of 3 base\n', 'running', 'round 2 of 3 base'),
+            (boot + '2026-11-12T13:57:04Z stage=round 2 of 3 base\n2026-11-12T13:57:05Z stage=finish\n',
+             'running', 'finish'),
+        )
+        for log, state, stage in cases:
+            with self.subTest(stage=stage):
+                result = cloud_gate.log_cloud_progress(log, 32, 100)
+                self.assertEqual((result.state, result.stage, result.failed_modules), (state, stage, 0))
+
+    def test_merge_log_clears_stages_after_the_runner_and_keeps_its_counter(self) -> None:
+        log = ('2026-11-12T13:57:00Z stage=tests start\n'
+               'Runner: 3 modules, whole machine, 16 CPUs\n'
+               'fixture/test_one.py exit=1 seconds=1.0\n'
+               'fixture/test_two.py exit=0 seconds=1.0\n'
+               '2026-11-12T13:57:01Z stage=round 2 of 3 base\n')
+        result = cloud_gate.log_cloud_progress(log, 32, 100)
+        self.assertEqual(result, cloud_progress.CloudProgress('running', 16, 1, 100))
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 2, 3))
+        result = cloud_gate.log_cloud_progress(log + 'Cloud gate: uploading\n', 32, 101)
+        self.assertEqual(result, cloud_progress.CloudProgress('uploading', 16, 1, 101, stage='uploading'))
+
+    def test_empty_log_shows_launch_until_the_first_box_stage(self) -> None:
+        self.assertEqual(cloud_gate.log_cloud_progress('', 32, 100),
+                         cloud_progress.CloudProgress('requesting', 32, 0, 100, stage='launch'))
+        self.assertEqual(cloud_gate.log_cloud_progress('2026-11-12T13:57:00Z stage=boot\n', 32, 101),
+                         cloud_progress.CloudProgress('setup', 32, 0, 101, stage='boot'))
+
+    def test_launched_gate_publishes_its_region_and_zone_after_launch(self) -> None:
+        worker, _ = self.steering_fixture()
+        self.fake.refusals = ['InsufficientInstanceCapacity'] * 6
+        self.fake.log = '2026-11-12T13:57:00Z stage=round 2 of 3 base\n'
+        with mock.patch.object(cloud_progress, 'publish', wraps=cloud_progress.publish) as publish:
+            self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        updates = [cast(cloud_progress.CloudProgress, call.args[1]) for call in publish.call_args_list]
+        self.assertTrue(all((row.region, row.zone) == ('', '') for row in updates[:-3]))
+        self.assertEqual(updates[-3], cloud_progress.CloudProgress('requesting', 32, 0, self.now,
+            stage='launch', region='us-west-2', zone='us-west-2a'))
+        self.assertTrue(all((row.region, row.zone, row.stage) == ('us-west-2', 'us-west-2a', 'round 2 of 3 base')
+                            for row in updates[-2:]))
+        saved = cloud_gate.read(self.folder / 'launch.json')
+        self.assertEqual((saved['region'], saved['zone']), ('us-west-2', 'us-west-2a'))
 
     def test_cloud_state_tracks_setup_running_and_capacity_fallback_size(self) -> None:
         self.assertEqual(cloud_gate.log_cloud_progress('Preparing tools\n', 32, 1),
@@ -1851,6 +1902,7 @@ class CloudRouteTests(CostFixture):
             self.assertIsInstance(initial, cloud_progress.CloudProgress)
             assert isinstance(initial, cloud_progress.CloudProgress)
             self.assertEqual(initial.state, 'requesting')
+            self.assertEqual((initial.stage, initial.region, initial.zone), ('launch', '', ''))
             folder = Path(command[command.index('--worker') + 1])
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0

@@ -566,6 +566,27 @@ The installed guest supplies the environment and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
+Each paired run writes a UTC `stage=` line through the shared stage writer.
+Warm-up stages are `warm-up base` and `warm-up changed`.
+Measured stages are `round <r> of <N> <variant>`.
+The guest writes `finish` after the last run.
+It publishes the current stage before each run through the existing per-run log transfer.
+The final transfer includes `finish` and the last result rows.
+These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The upload count and measured result fields remain unchanged.
+
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+The progress record adds `stage`, `region`, and `zone` beside the existing fields.
+Before the first box log line, the state is `requesting` and the stage is `launch`.
+The last UTC `stage=` line supplies the stage text.
+A `round` stage sets the state to `running`.
+Once the merge runner writes `Runner:`, the stage text becomes empty and the existing module counter applies.
+`Cloud gate: uploading` sets the stage text to `uploading`.
+Each log download publishes the progress beside the reservation sidecar in `.cloud.json`.
+After launch, every progress publication includes the launched region and availability zone from the saved variant.
+Before launch, the region and zone are empty.
+Older records default all three new fields to empty strings.
+Older readers ignore these extra fields.
 
 Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
 The module summary gives the median CPU saving across complete pairs.

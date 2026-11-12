@@ -1,6 +1,7 @@
 """Cloud progress uses private files and named missing states."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,42 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import cloud_progress as cloud, progress_profile as progress
+from scripts.build_queue import snapshot_codec as codec
 
 
 class CloudProgressTests(unittest.TestCase):
+    def test_stage_and_location_round_trip_with_the_existing_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sidecar = Path(temporary) / 'gate.cgroup'
+            expected = cloud.CloudProgress('running', 32, 0, 100, stage='round 2 of 3 base',
+                                           region='us-east-2', zone='us-east-2b')
+            cloud.publish(sidecar, expected)
+            self.assertEqual(cloud.read(sidecar), expected)
+
+    def test_older_files_use_empty_defaults_for_the_new_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sidecar = Path(temporary) / 'gate.cgroup'
+            for names in (('stage', 'region', 'zone'), ('region', 'zone')):
+                with self.subTest(missing=names):
+                    record = dict(kind='CloudProgress', state='running', size_vcpus=32, failed_modules=0,
+                                  updated_at=100, stage='round 2 of 3 base', region='us-east-2', zone='us-east-2b')
+                    for name in names:
+                        _ = record.pop(name)
+                    _ = Path(str(sidecar) + '.cloud.json').write_text(json.dumps(record))
+                    self.assertEqual(cloud.read(sidecar), cloud.CloudProgress('running', 32, 0, 100,
+                        stage='' if 'stage' in names else 'round 2 of 3 base'))
+
+    def test_the_previous_field_list_accepts_new_record_fields(self) -> None:
+        @dataclass(frozen=True)
+        class CloudProgress:
+            state: cloud.CloudState
+            size_vcpus: int
+            failed_modules: int
+            updated_at: float
+        record = codec.snapshot_value(cloud.CloudProgress('running', 32, 0, 100, stage='round 2 of 3 base',
+                                                         region='us-east-2', zone='us-east-2b'))
+        self.assertEqual(codec.parse_snapshot_value(record, CloudProgress), CloudProgress('running', 32, 0, 100))
+
     def test_each_state_round_trips_beside_the_existing_module_counter(self) -> None:
         states: tuple[cloud.CloudState, ...] = ("requesting", "setup", "running", "uploading")
         with tempfile.TemporaryDirectory() as temporary:
