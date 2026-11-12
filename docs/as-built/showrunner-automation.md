@@ -59,6 +59,16 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Named states**: every optional or alternative value crossing a reader boundary is a `NamedTuple` union (`FieldPresent | FieldAbsent`, `PushedTip | NotYetPushed`, `EtaFresh | EtaStale | EtaPassed | EtaNone`, and so on), never a string or `None`.
 
+- **Session state.** `showrunners.session_state_dir(<staff id>)` is `~/.local/state/showrunner/<staff id>/session` (`STATE_DIR` in `produce.md`).
+  It holds `showrunner_state.json`, `unit_status/` and `waiting_state/`.
+  A session change, restart, reboot or production rename preserves the staff id folder.
+  Wrapping a production removes that folder.
+  `showrunners.copy_session_state` copies missing scratchpad files through atomic writes and preserves existing files.
+  `update_registration.adopt_moved_state` selects the timer owner's current session through staff.
+  It copies missing state from `/tmp/claude-*/*/<session id>/scratchpad` and writes no prompt file.
+  Registration and the log and question commands call it before their work.
+  Scheduled prompt delivery reads the current owner and document schedule without adopting state.
+
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
 `add_unit.py` runs through `scripts/lib/py`.
