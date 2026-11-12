@@ -420,7 +420,7 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
-                     read: PaneRead | PaneReadUnavailable, *,
+                     read: PaneRead | PaneReadUnavailable, client: herdr.Herdr, *,
                      selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
     workers = record.find(kind="worker", parent=parent)
     selected = [row for row in workers if isinstance(selection, AllWorkers)
@@ -454,15 +454,17 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         if isinstance(read.launches, LaunchRecordsUnavailable):
             states.append(_uncertain(row, read.launches.reason))
             continue
-        recovery = [pane for pane in panes
+        recovery = [pane for pane in pane_launch.reference_panes(
+                    pane_launch.StaffLaunchReference(row.id), record, client, read.launches.entries,
+                    evidence=pane_launch.NativePaneEvidence(panes, scan))
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
                     and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
-        related_unknown = [item for item in scan.unknown if any(
-            _text(pane, "pane_id") == item.pane for pane in recovery)]
+        related_unknown = [item for item in scan.unknown
+                           if launch_owners.get(item.pane) == row.id and item.tab in parent_tabs]
         if related_unknown:
             unknown = related_unknown[0]
-            location = next(pane for pane in recovery if _text(pane, "pane_id") == unknown.pane)
+            location = next(pane for pane in panes if _text(pane, "pane_id") == unknown.pane)
             states.append(ProcessUnknownWorker(row, unknown.pane, _text(location, "terminal_id"), unknown.reason))
         elif len(recovery) > 1:
             states.append(_uncertain(row, "multiple recovery panes"))
@@ -493,7 +495,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
 
 def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
               selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
-    return _parent_evidence(parent, record, _read_panes(record, client), selection=selection)
+    return _parent_evidence(parent, record, _read_panes(record, client), client, selection=selection)
 
 
 class WorkerNotObserved(Enum):
@@ -526,7 +528,7 @@ def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapsh
         return {}
     client = _client()
     read = _read_panes(record, client)
-    return {parent.id: _parent_evidence(parent.id, record, read, selection=selection).states for parent in parents}
+    return {parent.id: _parent_evidence(parent.id, record, read, client, selection=selection).states for parent in parents}
 
 
 def worker_state(observed: WorkerPane) -> Literal["idle", "busy", "unknown"]:
@@ -1120,11 +1122,15 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
-                    row = worker_admission.publish(allowed, native).row
-                    lock.bind(row)
                     if policy.settings.kind == "codex":
                         entry = client.codex_launch(identity)
+                        row = worker_admission.publish(allowed, native,
+                            launch_home=pane_launch.config_home(entry, record=record)).row
+                        lock.bind(row)
                         pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
+                    else:
+                        row = worker_admission.publish(allowed, native).row
+                        lock.bind(row)
                 except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")
@@ -1358,7 +1364,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:
     path = pane_launch.record_directory() / f"{client.session}.json"
     for pane, entry in pane_launch.read_valid_entries(path).items():
-        owner = record.by_member_reference(entry["session_id"])
+        owner = record.by_member_reference(pane_launch.reference_id(entry))
         if owner is not None and owner.id == row.id and pane_launch.agent_kind(entry) == "codex":
             pane_launch.retire_launch(path, pane, entry)
 
@@ -1380,7 +1386,7 @@ def close(parent: StaffId, name: WorkerName, *,
             read = _read_panes(record, client)
             if isinstance(read, PaneReadUnavailable):
                 return _uncertain(row, read.reason)
-            evidence = _parent_evidence(parent, record, read,
+            evidence = _parent_evidence(parent, record, read, client,
                                         selection=SelectedWorkers(frozenset({name.value})))
             observed = next((item for item in evidence.states if item.row.id == row.id), ClosedWorker(row))
             if isinstance(observed, UncertainWorker):

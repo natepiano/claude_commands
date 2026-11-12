@@ -27,7 +27,7 @@ from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.lib import process_group, process_start, conf, berth_board, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
@@ -424,8 +424,8 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
         entry = retained.get(pane["pane_id"])
         retained_identity = ""
         if entry is not None:
-            owner = record.by_member_reference(entry["session_id"])
-            retained_identity = owner.current_session if owner is not None else entry["session_id"]
+            owner = record.by_member_reference(pane_launch.reference_id(entry))
+            retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
         if isinstance(observed, herdr.StoppedConversation) and retained_identity != identity:
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
@@ -480,8 +480,8 @@ def remove_stray_producer(name: str, session: str) -> int:
                 admission_matches = True
             entry = retained.get(pane.pane)
             if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(entry["session_id"])
-                retained_identity = owner.current_session if owner is not None else entry["session_id"]
+                owner = record.by_member_reference(pane_launch.reference_id(entry))
+                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
                 admission_matches = admission_matches or retained_identity == identity
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
@@ -1389,14 +1389,17 @@ class RetiringPane(NamedTuple):
 def retirement_pane(row: staff.StaffRow, record: staff.StaffSnapshot) -> RetiringPane | herdr.NoPane:
     try:
         publication = pane_record.publication_for_session(row.current_session, record=record)
-        if publication is not None:
-            session, identity = publication.path.stem, publication.entry["pane_id"]
-            pane = next((pane for pane in herdr.Herdr(session).panes() if pane["pane_id"] == identity), None)
-            if pane is not None:
-                terminal = pane.get("terminal_id", "")
-                if not terminal:
-                    raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
-                return RetiringPane(session, identity, terminal)
+        session = publication.path.stem if publication is not None else herdr.shared_session()
+        client = herdr.Herdr(session)
+        entries = {publication.entry["pane_id"]: publication.entry} if publication is not None else {}
+        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client, entries)
+        if matches:
+            pane = matches[0]
+            identity = str(pane["pane_id"])
+            terminal = str(pane.get("terminal_id", ""))
+            if not terminal:
+                raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
+            return RetiringPane(session, identity, terminal)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         print(f"anomaly: {row.name}: cannot read its pane: {error}")
     return herdr.NoPane(row.name)
@@ -1593,7 +1596,7 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     saved = unit_config.read_parked(member.row.id, cleanup=False)
     current = unit_config.read(worktree, cleanup=False)
     if isinstance(saved, unit_config.ConfigMissing) and isinstance(current, unit_config.ConfigMissing):
-        raise RecoveryFactsMissing(f"{name}: no .unit.toml in {worktree} or ~/.local/state/staff/units/{member.row.id}.toml; "
+        raise RecoveryFactsMissing(f"{name}: no .unit.toml in {worktree} or {unit_config.parked_path(member.row.id)}; "
                                + "ask the showrunner")
     if isinstance(saved, unit_config.ConfigMissing):
         if isinstance(location, staff.RemovedWorktree) or not isinstance(current, unit_config.UnitConfig):
@@ -1685,7 +1688,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)
     return (marked.claude.session_id == session_id and entry is not None
-            and entry["session_id"] == row.id and session_id == row.current_session)
+            and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
     refused = recovery_refusals(unit)

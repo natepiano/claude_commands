@@ -326,12 +326,28 @@ class UnitWatchdogTests(unittest.TestCase):
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
             return herdr.NativeAgentProcess(herdr.EnvironmentThread(owner["sessionId"]), "fixture-start", {})
 
+        def panes() -> list[herdr.PaneIdentity]:
+            return [{"pane_id": identity, "terminal_id": "terminal-" + identity, "workspace_id": "fixture",
+                     "tab_id": "tab-" + identity, "label": owner["name"], "session_id": identity}
+                    for identity, owner in self.units.items()]
+
+        def process_info(*arguments: str) -> dict[str, object]:
+            identity = arguments[-1]
+            owner = self.units[identity]
+            live = isinstance(self.session_liveness(identity), sessions.LiveSessionProcess)
+            pid = owner["pid"] if live else 998042
+            return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude" if live else "zsh",
+                                          "argv": ["claude"] if live else ["zsh"]}]}}
+
         with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
               patch.object(reader_sessions, "session_liveness", side_effect=reader_liveness),
               patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "native_process", side_effect=native_process),
+              patch.object(herdr.Herdr, "panes", side_effect=panes),
+              patch.object(herdr.Herdr, "result", side_effect=process_info),
               patch.object(pane_record, "seed", return_value=0),
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),
@@ -375,7 +391,7 @@ class UnitWatchdogTests(unittest.TestCase):
             replace(row, current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
             for row in staff.snapshot().rows))
 
-        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
+        def start(tab: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
             self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude2"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
@@ -409,7 +425,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
-        self.assertEqual((entry["session_id"], str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)), (member.id, str(config)))
+        self.assertEqual((entry.get("staff_id"), str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)), (member.id, str(config)))
         self.assertFalse(any(name.startswith("SHOWRUNNER_") for name in entry["environment"]))
         self.die("alpha")
         for minute in (0, 2, 4):
@@ -480,8 +496,9 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.read("shared")["alpha"]
         entry["written_at"] = "2026-10-30T01:00:00+00:00"
         pane_record.write("shared", entry)
-        pane_record.write("shared", {**entry, "pane_id": "new-alpha", "ended": True,
-                                     "written_at": "2026-10-31T01:00:00+00:00"})
+        ended = entry.copy()
+        ended.update(pane_id="new-alpha", ended=True, written_at="2026-10-31T01:00:00+00:00")
+        pane_record.write("shared", ended)
         for minute in (2, 4):
             self.assertEqual(self.pass_at(minute), [])
         self.assertEqual(self.commands, [])
@@ -526,7 +543,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_newest_moved_launch_decides_recovery_account_after_one_tick(self) -> None:
         _ = self.add_unit("alpha")
-        old = pane_record.read("shared")["alpha"]
+        old = pane_record.resume_launch(pane_record.read("shared")["alpha"])
         old["written_at"] = "2026-10-30T01:00:00+00:00"
         pane_record.write("shared", old)
         moved = pane_record.launch("new-alpha", "alpha", old["cwd"],
@@ -587,7 +604,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_queued_recovery_keeps_the_account_of_the_latest_move_launch(self) -> None:
         _ = self.queued_unit()
-        entry = pane_record.read("shared")["alpha"]
+        entry = pane_record.resume_launch(pane_record.read("shared")["alpha"])
         entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
             {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)
@@ -882,7 +899,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = refusal_watch.run(NOW)
         self.assertEqual(len(self.fixture.moves.calls), 1)
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
-        entry = pane_record.read("shared")["alpha"]
+        entry = pane_record.resume_launch(pane_record.read("shared")["alpha"])
         entry = pane_record.launch(entry["pane_id"], entry["session_id"], entry["cwd"],
             {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}, ["claude", "-n", entry["name"]])
         pane_record.write("shared", entry)

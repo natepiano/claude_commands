@@ -271,10 +271,11 @@ def writer_lock() -> Generator[None]:
 
 
 def parked_path(unit: StaffId, *, home: Path | None = None) -> Path:
-    """Park on this machine, independently of the staff record's owner."""
+    """Use private staff state unless the caller selects a home."""
     if not unit or Path(unit).name != unit or unit in (".", ".."):
         raise ConfigRefused(f"invalid staff id for parked configuration: {unit!r}")
-    return (Path.home() if home is None else home) / ".local/state/staff/units" / f"{unit}.toml"
+    directory = home / ".local/state/staff" if home is not None else staff.record_path().parent
+    return directory / "units" / f"{unit}.toml"
 
 
 def _string(fields: dict[str, object], key: str) -> str:

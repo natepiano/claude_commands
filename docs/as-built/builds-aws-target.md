@@ -511,16 +511,32 @@ Cleanup uses one deadline from `termination_timeout_s` for all boxes.
 Each API call uses the time that remains before this deadline.
 The service stop timeout adds twice `api_timeout_s` to this deadline duration.
 Cleanup records confirmed termination in the cost ledger.
-A stale `GateAbsent` update cannot replace confirmed termination or remove its cost.
+Confirmed termination is final for every later ledger outcome.
+Later running, absent, or terminated updates cannot change its end time or cost.
+A worker rejects an ended booking before checking for a launch file.
+The ledger rejects reservations for closed attempt IDs.
+A retry uses a new attempt ID.
 Cleanup resolves reservations without saved launch arguments as `GateAbsent`.
 The module and coordinator also call this cleanup from `finally` blocks.
 Repeated cleanup does not change resolved reservations.
 AWS failures leave reservations unresolved for later recovery.
 Before reservation, the coordinator cleans expired earlier trials with unresolved reservations.
-The sweep preserves live trials and trial folders.
+The sweep checks each attempt's owner and passes only due attempts to cleanup.
+The sweep preserves boxes with live owners, even when another owner in the same expired trial has ended.
+The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
-Merge gate units keep their existing stop behavior.
+Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+The worker installs no signal handler.
+The ledger records each worker's PID, process start identity, and attempt folder.
+Reconciliation preserves live workers and workers whose identity cannot be read.
+Reconciliation terminates expired attempts and attempts whose recorded worker has ended.
+Each worker reconciles before reusing a saved launch.
+A hard kill without a later start can leave the booking open.
+The ledger continues to estimate its cost for the spending cap.
+The AWS expiry function ends the box.
+The next gate or trial start closes the booking after confirmation.
 Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
 The sweep reads no current lifetime setting.
 A lower lifetime setting leaves existing trials' fixed expiries unchanged.
@@ -550,6 +566,27 @@ The installed guest supplies the environment and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
+Each paired run writes a UTC `stage=` line through the shared stage writer.
+Warm-up stages are `warm-up base` and `warm-up changed`.
+Measured stages are `round <r> of <N> <variant>`.
+The guest writes `finish` after the last run.
+It publishes the current stage before each run through the existing per-run log transfer.
+The final transfer includes `finish` and the last result rows.
+These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The upload count and measured result fields remain unchanged.
+
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+The progress record adds `stage`, `region`, and `zone` beside the existing fields.
+Before the first box log line, the state is `requesting` and the stage is `launch`.
+The last UTC `stage=` line supplies the stage text.
+A `round` stage sets the state to `running`.
+Once the merge runner writes `Runner:`, the stage text becomes empty and the existing module counter applies.
+`Cloud gate: uploading` sets the stage text to `uploading`.
+Each log download publishes the progress beside the reservation sidecar in `.cloud.json`.
+After launch, every progress publication includes the launched region and availability zone from the saved variant.
+Before launch, the region and zone are empty.
+Older records default all three new fields to empty strings.
+Older readers ignore these extra fields.
 
 Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
 The module summary gives the median CPU saving across complete pairs.
@@ -566,11 +603,13 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
 
-The controller uses the region order in `cloud_gate.conf`.
+The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The default order is us-east-2, then us-west-2.
+The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+`us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-Within each region, it tries each configured type and each public zone.
+The gate ranks deployed types and public zones by size and expected cost before launch.
+Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after every regional variant refuses.
 Paired trials use the same regional launch and cleanup path.
@@ -630,25 +669,99 @@ Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
 
+European deployment needs account and policy changes before the regional stacks can start.
+Enable `eu-south-2` on the AWS Account page and wait until its status is `ENABLED`.
+See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
+Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before deployment.
+Keep the existing home and US region permissions.
+The runbook gives the preparation steps.
+
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
+The price lock stores the last refresh attempt time.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
+Each read requests all configured gate `instance_types` for Linux/UNIX.
+The controller keeps the latest price for each zone and type.
+It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
+Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
+The price refresh does not change `controller.json`.
+Failed attempts use the same refresh interval.
+The price read remains active when the former builder route is disabled or removed.
+
+A new gate ranks only variants from its deployment.
+Before its first ranking, it reads live Spot prices in parallel from each deployed region.
+Each region receives one Linux/UNIX request for all configured `instance_types`.
+`spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.
+The reader selects the latest price for each deployed zone and type.
+Live rows replace matching hourly rows for this ranking only.
+Failed or slow regions retain their hourly rows.
+The live read never writes `spot-prices.json`.
+`launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
+Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Resumed launches keep the saved ranking and evidence without another live read.
+Available variants precede variants under a capacity cooldown.
+Within each group, larger vCPU sizes precede smaller sizes.
+Types with equal vCPU counts compete on expected gate cost.
+That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
+It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
+`region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
+Missing regions contribute zero extra seconds.
+`gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
+Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
+Without recent durations, it uses `lifetime_minutes`.
+`remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
+Local measurements cover 692 gates with a source bundle, request, and result.
+Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
+The median combined size is 7,107,672 bytes.
+At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+Equal costs keep configured order.
+Missing or stale prices follow fresh prices for the same vCPU count.
+Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+`MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
+Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
+It stops at the first row before the longer of the price-age and cooldown windows.
+The current two-hour window reads 65,536 bytes from a 750,584-byte local history file.
+`launch.json` saves the ranked region, type, subnet, and zone list before the first launch step.
+Resumed launches keep that list and their offset-based ClientToken values.
+Older files with only `variant` retain configured order.
+Refusal handling, regional cost bookings, and the $35 daily and $400 monthly limits remain unchanged.
+
 The prices command prints regional Spot prices without resource identities.
+It reads gate regions, then `spot_candidate_regions`, without duplicates.
+It preserves the configured order within each list.
+`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2` supplies the candidate regions for Spot work and price reads.
+`gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
-`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each configured region.
+`deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
+The price stage of `up` shows this quota for each gate region.
+Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
 A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
-`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
-The default request is 128 vCPUs.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
+The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+All three new keys are in `cloud_gate.conf`.
+Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
 It prints the region, desired value, and request status without request, case, or account identifiers.
 A failed call prints only the AWS error code or Python error class and does not stop other regions.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

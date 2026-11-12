@@ -172,7 +172,7 @@ class PaneWorld(herdr.Herdr):
             self.record(row, pane, family)
 
     def record(self, row: staff.StaffRow, pane: str, family: Literal["claude", "codex"] = "claude") -> None:
-        entry: pane_launch.PaneLaunch = {"staff_id": row.id, "session_id": row.id,
+        entry: pane_launch.CurrentLaunch = {"staff_id": row.id, "session_id": row.id,
             "pane_id": pane, "kind": family, "cwd": str(Path.cwd()), "name": row.name,
             "model": "", "remote_control": False, "environment": {}, "flags_read": True,
             "written_at": datetime.now(timezone.utc).isoformat()}
@@ -270,7 +270,7 @@ class PaneWorld(herdr.Herdr):
         process = self.processes[pid]
         if isinstance(process.identity, herdr.LaunchArgument):
             if not reported:
-                raise ValueError("Codex launch identity is unavailable")
+                raise herdr.CodexPaneStarting(herdr.StartingCodexPane(pid))
             return herdr.NativeAgentProcess(herdr.PaneSessionReport(reported), process.started, process.environment)
         return process
 
@@ -587,12 +587,13 @@ class WorkerPaneTests(StaffTestCase):
                     path = pane_launch.record_directory() / "agents.json"
                     entries = pane_launch.read(path)
                     for row, pane in ((self.parent, "w1:p0"), (stopped, "w1:p2")):
-                        entries[pane]["staff_id"] = row.id
+                        cast(pane_launch.StaffPaneLaunch, entries[pane])["staff_id"] = row.id
                         self.world.locations[pane]["label"] = other.name
                     if publication == "legacy":
                         for row, pane in ((self.parent, "w1:p0"), (stopped, "w1:p2")):
-                            entries[pane]["session_id"] = row.id
-                            del entries[pane]["staff_id"]
+                            entries[pane] = pane_launch.NativePaneLaunch(pane_id=pane, session_id=row.current_session,
+                                cwd=str(self.root), name=row.name, kind="claude", model="", remote_control=False,
+                                environment={}, flags_read=True, written_at=entries[pane]["written_at"])
                     write_text_atomic(path, json.dumps(entries))
                     _ = self.world.foreground.pop("w1:p0", None)
                 record = staff.snapshot()
@@ -666,7 +667,7 @@ class WorkerPaneTests(StaffTestCase):
                 if retained_launch:
                     saved = pane_record.read_strict("TEST-admission")[result.pane]
                     self.assertNotIn("config_dir", saved)
-                    self.assertEqual(saved["session_id"], result.row.id)
+                    self.assertEqual(saved.get("staff_id"), result.row.id)
 
     def test_recovered_worker_admission_completes_the_started_pane_home(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
@@ -688,6 +689,41 @@ class WorkerPaneTests(StaffTestCase):
         saved = pane_record.read_strict("TEST-recovery")["w1:p1"]
         self.assertNotIn("config_dir", saved)
         self.assertEqual(self.world.launches, [])
+
+        for explicit_home in (True, False):
+            with self.subTest(retained_launch=False, explicit_home=explicit_home):
+                identity = staff.native_id(fixture_runtime_id(f"unrecorded-recovery-{explicit_home}"))
+                row = staff.StaffRow(identity, "worker", f"unrecorded-{explicit_home}",
+                                     staff.ReportsTo(self.parent.id), current_session=identity)
+                home = self.root / "process-account" if explicit_home else Path.home() / ".codex"
+                fixture_session(identity, staff.CodexBackend(home))
+                pane = "w1:p2" if explicit_home else "w1:p3"
+                self.world.add(row, pane, family="codex", label=worker_panes.agent_name(self.parent, row.name))
+                process = self.world.processes[self.world.foreground[pane][0]]
+                if explicit_home:
+                    process.environment["CODEX_HOME"] = str(home)
+                self.world.locations[pane]["cwd"] = str(self.root)
+                (pane_launch.record_directory() / f"fixture-{identity}.json").unlink()
+                publications: list[worker_admission.PublishedWorker] = []
+                publish_worker = worker_admission.publish
+
+                def publish(allowed: worker_admission.WorkerStartAllowed, runtime_id: str, *,
+                            launch_home: staff.SessionHome | staff.HomeUnknown = worker_admission.UNKNOWN_LAUNCH_HOME
+                            ) -> worker_admission.PublishedWorker:
+                    published = publish_worker(allowed, runtime_id, launch_home=launch_home)
+                    publications.append(published)
+                    return published
+
+                with patch.object(worker_admission, "publish", side_effect=publish):
+                    result = self.start(row.name, account=accounts.CodexWorkersAccount(
+                        "codex3", self.root / "selected-account"))
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual([item.row.home for item in publications], [staff.SessionHome(home)])
+                self.assertEqual(result.row.home, staff.SessionHome(home))
+                self.assertEqual(staff.by_id(result.row.id), result.row)
+                self.assertEqual(staff.backend(result.row), staff.CodexBackend(home))
+                self.assertEqual(self.world.launches, [])
 
     def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
         name = self.parent.name + "-astra-reviewer"
@@ -3035,6 +3071,18 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertNotEqual(started.pane, pane)
                     self.assertNotIn(pane, self.world.foreground)
                 self.assertEqual(self.world.closed, [])
+
+        for family in ("claude", "codex"):
+            with self.subTest(stale_record=family):
+                missing = self.worker("stale-" + family, family=family)
+                foreign = fixture_member("unit", name="foreign-" + family, parent=self.parent.parent,
+                                         runtime_id=fixture_runtime_id("foreign-" + family))
+                pane = "w1:stale-" + family
+                self.world.add(foreign, pane, family=family)
+                self.world.record(missing, pane, family)
+                self.assertEqual(self.observation(missing), worker_panes.ClosedWorker(missing))
+                self.assertEqual(self.world.closed, [])
+
 
     def test_a_former_native_identity_does_not_prove_the_current_worker_live(self) -> None:
         row = self.worker()

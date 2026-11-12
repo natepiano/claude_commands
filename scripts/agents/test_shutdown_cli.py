@@ -30,7 +30,7 @@ from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import process_group, process_start, atomic_file, conf, unit_runs
@@ -926,15 +926,16 @@ class RetireUnitTests(unittest.TestCase):
                     assert isinstance(row.parent, staff.ReportsTo)
                     other = fixture_member("unit", name="TEST-other", parent=row.parent.id,
                                            runtime_id=fixture_runtime_id("TEST-other"))
-                    replacement = pane_record.launch("w1:p1", other.current_session, str(case.root),
-                                                    {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
+                    observed = pane_record.launch("w1:p1", other.current_session, str(case.root),
+                                                 {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
+                    replacement = pane_launch.retained_launch(observed, staff.snapshot())
                     remove = shutdown.retirement_remove
                     def replace_after_cleanup(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
                         result = remove(unit, settings=settings)
                         case.assertEqual(result, [])
                         case.pane_world.locations["w1:p1"]["terminal_id"] = "TEST-new-terminal"
                         case.pane_world.locations["w1:p1"]["label"] = other.name
-                        pane_record.write("alpha", replacement)
+                        pane_record.write("alpha", observed)
                         return result
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
                           mock.patch.object(process_group, "send_process_group") as send):
@@ -1348,7 +1349,7 @@ class ResumeUnitTests(unittest.TestCase):
                 code, output = self.resume(*flags)
                 self.assertEqual(code, 1, output)
                 self.assertEqual(output, f"alpha: no .unit.toml in {self.worktree} or "
-                                 + f"~/.local/state/staff/units/{row.id}.toml; ask the showrunner\n")
+                                 + f"{unit_config.parked_path(row.id)}; ask the showrunner\n")
                 self.assertFalse(self.worktree.exists())
                 self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
                 self.assertEqual(self.calls, [])
@@ -1397,7 +1398,7 @@ class ResumeUnitTests(unittest.TestCase):
             # that owner's current conversation, which can differ after /clear.
             owner = staff.by_current_session(DIRECTOR)
             entries = [entry for entry in pane_record.launches()
-                       if owner is not None and entry["session_id"] == owner.id]
+                       if owner is not None and entry.get("staff_id") == owner.id]
             return (unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
                                           HerdrPlace("agents", entries[-1]["pane_id"]))
                     if entries else None)

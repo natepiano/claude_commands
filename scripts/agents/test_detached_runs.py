@@ -29,6 +29,7 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import detached_run_process, detached_runs
+from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
@@ -74,6 +75,11 @@ def private_supervisor(test: unittest.TestCase, path: Path) -> int:
     test.assertTrue(select.select([stand_in.stdout], [], [], guard.remaining())[0], "supervisor did not start")
     test.assertEqual(stand_in.stdout.readline(), "ready\n")
     return stand_in.pid
+
+
+def deliver_in_fixture(path: Path) -> int:
+    """Keep fake pane and sender calls inside the test process."""
+    return detached_runs.main(["deliver", str(path)])
 
 
 class DetachedRunsTests(unittest.TestCase):
@@ -131,6 +137,8 @@ class DetachedRunsTests(unittest.TestCase):
             return send.Result("queued", "private fixture")
 
         _ = self.stack.enter_context(patch.object(send, "deliver_worker_text", side_effect=deliver_fixture))
+        _ = self.stack.enter_context(patch.object(detached_runs, "deliver_in_fresh_process",
+                                                 side_effect=deliver_in_fixture))
 
     @override
     def tearDown(self) -> None:
@@ -699,6 +707,35 @@ sys.exit(1)
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
 
+        with self.subTest(delivery="fresh Python process"):
+            startup = self.root / "delivery-startup"
+            startup.mkdir()
+            sender_pid = self.root / "sender-pid"
+            _ = (startup / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
+from scripts.message import send
+from scripts.production import staff
+
+def fake_sender(*arguments, **options):
+    Path(os.environ["FIXTURE_DELIVERY_PID"]).write_text(str(os.getpid()))
+    return send.Result("queued", "private fresh process")
+
+staff.local_snapshot = staff.initial_snapshot
+send.deliver_worker_text = fake_sender
+''')
+            path = self.record([sys.executable, "-c", "pass"])
+            with (patch.dict(os.environ, {
+                    "PYTHONPATH": str(startup) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+                    "FIXTURE_DELIVERY_PID": str(sender_pid),
+                  }),
+                  patch.object(detached_runs, "deliver_in_fresh_process", deliver_in_fresh_process)):
+                record = self.supervise(path)
+            self.assertTrue(sender_pid.is_file(), "The fresh process did not call the fake sender.")
+            self.assertNotEqual(int(sender_pid.read_text()), record["pid"])
+            self.assertNotEqual(int(sender_pid.read_text()), os.getpid())
+            self.assertEqual(record.get("delivery"), "queued: private fresh process")
+
     def test_stop_reason_after_supervisor_completion_preserves_the_saved_result(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])
         writer_progress, writer_finished = Event(), Event()
@@ -989,6 +1026,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         _ = self.enterContext(patch.object(self.fixture.world, "run", input_line))
         _ = self.enterContext(patch.object(send, "_send", holder_notice))
+        _ = self.enterContext(patch.object(detached_runs, "deliver_in_fresh_process",
+                                          side_effect=deliver_in_fixture))
 
     @property
     def run_dir(self) -> Path:
