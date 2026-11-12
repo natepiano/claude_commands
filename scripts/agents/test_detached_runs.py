@@ -663,6 +663,16 @@ sys.exit(1)
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
+    def test_command_receives_the_recorded_staff_owner_without_a_session_environment(self) -> None:
+        command = [sys.executable, "-c", "import os; print(os.environ['BUILDLOG_OWNER_STAFF_ID'])"]
+        path = self.record(command)
+        _ = self.record_worker(WORKER, THREAD_TWO)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
+                                     "BUILDLOG_OWNER_STAFF_ID": "unrelated-owner"}):
+            record = self.supervise(path)
+        self.assertEqual(record.get("exit_code"), 0)
+        self.assertEqual(Path(record["log"]).read_text().strip(), str(self.worker_id))
+
     def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
