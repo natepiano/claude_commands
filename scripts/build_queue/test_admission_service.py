@@ -922,6 +922,53 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 
 class PendingPriorityTests(unittest.TestCase):
+    def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
+        from scripts.message import roster
+        from scripts.production import staff
+
+        producer = staff.StaffRow(staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
+                                 current_session=staff.StaffId("producer-session"))
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "chosen", staff.ReportsTo(producer.id),
+                                 current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "builder", staff.ReportsTo(director.id),
+                               current_session=staff.StaffId("worker-session"))
+        snapshot = staff.StaffSnapshot((producer, director, worker))
+        expected = {"director-session": UnitLabels("chosen", "production", "chosen"),
+                    "worker-session": UnitLabels("builder", "production", "chosen")}
+        with mock.patch.object(staff, "snapshot", return_value=snapshot), \
+                mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
+            self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), \
+                    mock.patch.object(staff, "snapshot", side_effect=OSError("unreadable") if unreadable else None,
+                                      return_value=snapshot), \
+                    mock.patch.object(roster, "unit_labels_for", return_value={**expected,
+                                      "unrecorded": UnitLabels("old", unit="other")}) as fallback:
+                actual = gate.priority_labels(["director-session", "worker-session", "unrecorded"])
+                self.assertEqual(actual, {**expected, "unrecorded": UnitLabels("old", unit="other")})
+                fallback.assert_called_once_with(
+                    ["director-session", "worker-session", "unrecorded"] if unreadable else ["unrecorded"], os.environ)
+
+    def test_explicit_waiter_units_keep_order_without_a_roster_lookup(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            requests = [replace(fixture.request(), identity=wire.Identity("old", "older", "check", "", "other")),
+                        replace(fixture.request(), identity=wire.Identity("new", "newer", "check", "", "chosen"))]
+            for request in requests:
+                _ = fixture.server.handle_request(request)
+            fixture.server.priority = records.QueuePriority(({
+                "unit": "chosen", "why": "urgent", "set_at": fixture.clock.now(), "set_by": "director"},))
+            rows = [(fixture.state_dir / records.waiter_owner(waiting.row), waiting.row)
+                    for waiting in fixture.server.waiters.values()]
+            expected = gate.apply_queue_priority(rows, gate.QueueOrderContext(
+                fixture.server.priority, {"old": UnitLabels("older", unit="other"),
+                                          "new": UnitLabels("newer", unit="chosen")}))
+            with mock.patch.object(gate, "priority_labels", side_effect=AssertionError("roster lookup")):
+                _ = fixture.server.run_pass()
+            assert isinstance(fixture.server.last_inputs, records.QueueInputs)
+            self.assertEqual(fixture.server.last_inputs.ordered,
+                             [(path, records.stored_waiter(row)) for path, row in expected[0]])
+
     def test_runner_retry_cannot_attach_to_a_pending_priority_request(self) -> None:
         with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
             try:
@@ -5499,7 +5546,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 output = io.StringIO()
                 with mock.patch.object(fixture.server, "_handle_request", side_effect=measured), \
                         mock.patch.object(conf, "read", side_effect=configuration), \
-                        mock.patch.object(time, "process_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
+                        mock.patch.object(time, "thread_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
                         redirect_stderr(output):
                     for _ in range(2):
                         self.assertEqual(fixture.server.handle_request(wire.BuildHistoryRequest()), [wire.BuildHistoryReply(0)])
