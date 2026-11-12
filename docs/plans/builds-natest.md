@@ -3350,26 +3350,35 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
 **Depends on:** none
 
+#### As-built
+
+- Checkpoint `90cd75ec3`. `_join_bindings` (`copy_guard.py:797`) builds the `ScalarValue(UnknownArgument(key))` fallback only when a branch lacks the key, in place of the eager `dict.get` default; the values given to `_union` are unchanged (reviewers compared 4,805 and 312 cases with the old code). No test changed; 275 importer tests and all 50 policy tests pass with unchanged counts. aws pairs: `copies/test_copy_guard_sources.py` 28.82 to 19.25 CPU s (9.63 s, 3/3 rounds); `copies/test_copy_guard.py` unchanged. queue reviewed and approved the change; its follow-up suggestion (`_union` linear scan) is Phase 198.
+
+### Phase 198 — The copy-guard policy finds repeated union values by hash, not by a list scan  · status: todo
+**Depends on:** Phase 197
+
 #### Work Order
 
-**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because the Python policy builds a fallback value only when a key is missing, with every policy check kept.
+**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because `_union` finds repeated alternatives with a hashed lookup, with every policy check kept.
 
-**Decision:** queue go via builds, 2026-11-12: one aws paired trial of `copy_guard.py:797` alone (3 pairs, all 50 policy tests kept). Code lands only on a measured gain. Send the change to queue for review before its checkpoint.
+**Decision:** queue review of Phase 197, 2026-11-12: `_union` does a linear `not in` list check over dataclass values; trial it as a separate change. Code lands only on a measured aws gain. Send the change to queue for review before its checkpoint.
 
 **Spec:**
-1. At `scripts/copies/copy_guard.py:797`, build the fallback only when the key is missing (for example `if key not in mapping` before the allocation, in place of an eager `get(key, <new value>)` or `setdefault`). Read the Phase 195 report section for this candidate first.
-2. Keep the result of every lookup the same for every input. Change nothing else in `copy_guard.py`.
-3. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
-4. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. The director runs three aws pairs.
+1. At `scripts/copies/copy_guard.py:787` (`_union`), replace the `not in` scan of the `alternatives` list with a hashed membership check that keeps first-seen order (for example a `dict` used as an ordered set). The value classes are frozen dataclasses; confirm that every alternative type is hashable for every input before you rely on it.
+2. Keep the result the same for every input: the same alternatives in the same order, a single value when only one remains, and `PossibleValues` otherwise. Change nothing else in `copy_guard.py`.
+3. A fast path for branches that hold the same object is allowed when it gives the same result.
+4. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
+5. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. Measure the source module locally before and after. The director runs three aws pairs.
 
 **Files:**
-- `scripts/copies/copy_guard.py` — the lookup at line 797.
+- `scripts/copies/copy_guard.py` — `_union` at line 787.
 
 **Workers:** 1 writer; one small change.
 - impl: all files.
 
 **Constraints from prior phases:**
-- Phase 195: Python policy evaluation 15.8–16.2 CPU s locally; this candidate's bound is 0–9.8 s and includes required work. Not measured as a saving.
+- Phase 197: the fallback allocation change saved 9.63 CPU s in aws pairs; `copies/test_copy_guard_sources.py` now has a median of 19.25 CPU s on m7a.8xlarge.
+- Phase 195: policy evaluation is most of the module's CPU; the scope traversal candidate at `copy_guard.py:900,1124` has a bound of 0–1.8 s.
 
 **State:** none.
 
