@@ -23,6 +23,7 @@ from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.agents import detached_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.build_hold.override_guard import require_checkout
 
@@ -120,6 +121,8 @@ class HoldEnforcerTests(unittest.TestCase):
         ))
 
     def test_drain_stops_waiting_run_waits_for_working_run_and_releases_owner_once(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("producer", name="holder")
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="waiting-owner")
         _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
         _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))

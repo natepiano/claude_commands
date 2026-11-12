@@ -266,23 +266,48 @@ else:
                     print('Production boot stages: ' + ' -> '.join(stages))
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
-        first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3)
-        second = gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'passed')
+        first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,
+                                   started_at=10, ended_at=12)
+        second = gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'passed', started_at=13, ended_at=14)
         run = gate.GateRun((second,), 4, 3, executions=(first, second))
         self.assertEqual(gate_box.decode_run(gate_box.encode_run(run)), run)
         self.assertEqual([job.output for job in gate_box.execution_records(gate_box.decode_run(gate_box.encode_run(run)))],
                          ['failed', 'passed'])
-        record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'remote-host', 0, 4, 'merge-gate')
+        executions = gate_box.execution_records(gate_box.decode_run(gate_box.encode_run(run)))
+        self.assertEqual([(job.started_at, job.ended_at) for job in executions], [(10, 12), (13, 14)])
+        record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'remote-host', 9, 15, 'merge-gate')
         self.assertEqual((record['kind'], record['host'], record['status']), ('gate_run', 'remote-host', 0))
         self.assertEqual(len(ledger.rows(record, 'modules')), 2)
+        self.assertEqual([(row['started_at'], row['ended_at']) for row in ledger.rows(record, 'modules')],
+                         [('1970-01-01T00:00:10.000Z', '1970-01-01T00:00:12.000Z'),
+                          ('1970-01-01T00:00:13.000Z', '1970-01-01T00:00:14.000Z')])
+        with self.subTest(recorded_times=False):
+            legacy = gate_box.encode_run(run)
+            for key in ('jobs', 'executions'):
+                for job in ledger.rows(legacy, key):
+                    del job['started_at']
+                    del job['ended_at']
+            decoded = gate_box.decode_run(legacy)
+            self.assertEqual([(job.started_at, job.ended_at) for job in decoded.jobs], [(None, None)])
+            self.assertEqual([(job.started_at, job.ended_at) for job in gate_box.execution_records(decoded)],
+                             [(None, None), (None, None)])
+            self.assertEqual(gate_box.decode_run(gate_box.encode_run(decoded)), decoded)
+            legacy_record = gate_box.completion_record(
+                decoded, 'legacy', 'commit', 'tree', 'remote-host', 9, 15, 'merge-gate')
+            for module in ledger.rows(legacy_record, 'modules'):
+                self.assertNotIn('started_at', module)
+                self.assertNotIn('ended_at', module)
 
     def test_result_rejects_missing_or_invalid_status_and_metrics(self) -> None:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, ''),), 1, 1)
         for field, value in (('returncode', False), ('seconds', -1), ('seconds', float('nan')),
-                             ('kind', 'UNKNOWN'), ('restart', 'other')):
+                             ('kind', 'UNKNOWN'), ('restart', 'other'),
+                             ('started_at', -1), ('started_at', float('nan')),
+                             ('ended_at', -1), ('ended_at', float('nan'))):
             with self.subTest(field=field, value=value):
                 row = gate_box.encode_run(run)
-                ledger.rows(row, 'jobs')[0][field] = value
+                job = ledger.rows(row, 'jobs')[0]
+                job[field] = value
                 with self.assertRaises((ValueError, KeyError)):
                     _ = gate_box.decode_run(row)
         with self.assertRaises(KeyError):

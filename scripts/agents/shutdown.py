@@ -1064,10 +1064,9 @@ def retirement_live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]
 def retirement_runs_of(owner: staff.StaffRow, record: staff.StaffSnapshot) -> list[Path]:
     """Read run ownership through the staff row's session identities."""
     found: list[Path] = []
-    for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
-        for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
-                found.append(folder)
+    for folder in unit_runs.run_folders(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
+        if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
+            found.append(folder)
     return found
 
 def retirement_session_of(pid: int) -> int:

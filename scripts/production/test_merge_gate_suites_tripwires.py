@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+import time
 from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
@@ -49,11 +50,16 @@ class MergeGateTripwiresTests(GateSuitesFixture):
             {"reading": "/proc/pressure/memory", "argv": ["python3", "queue.py", "two words"], "pid": 456},
         ]
         self.write(root / "live-memory-reads.jsonl", "".join(json.dumps(record) + "\n" for record in records))
+        began = time.time()
         job = merge_gate.start_gate_job(
             "hooks", Path("test_memory_reader.py"), [sys.executable, "-c", "print('module passed')"],
             self.checkout, self.environment, root / "output.log")
         status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
         result = merge_gate.finish_gate_job(job, status)
+        self.assertLessEqual(began, result.started_at)
+        self.assertEqual(result.started_at, job.started_at)
+        self.assertLessEqual(result.started_at, result.ended_at)
+        self.assertLessEqual(result.ended_at, time.time())
         self.assertEqual(status, 0)
         self.assertEqual(result.returncode, 1)
         self.assertTrue(result.tripwire_tripped)

@@ -437,6 +437,12 @@ An unknown ACCOUNT prints one error and returns status 2 before any stop.
 Without ACCOUNT, the existing selection and role accounts apply.
 
 `--only ID[,ID...]` also limits `--all`; ACCOUNT and `--only` must both match.
+An `--only` run observes only the requested rows as restart candidates.
+It judges workers only for selected worker rows and their parents.
+It retains incomplete evidence and anomaly lines for a selected worker.
+It skips the scan for live sessions without staff rows.
+The shared pane read still supplies complete identity evidence.
+A run without `--only` keeps the existing observations.
 If a stop includes the caller, restart continues in a detached process before the first stop.
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.

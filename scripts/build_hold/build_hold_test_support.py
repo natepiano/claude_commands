@@ -119,6 +119,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         (cls.seed / "proc").mkdir(parents=True)
         (cls.seed / "child-lifetime").mkdir()
         _ = (cls.seed / "child-lifetime/sitecustomize.py").write_text(CHILD_LIFETIME)
+        _ = (cls.seed / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         (cls.seed / "tools").mkdir()
         systemctl = cls.seed / "tools/systemctl"
         _ = systemctl.write_text("#!/bin/sh\nexit 0\n")

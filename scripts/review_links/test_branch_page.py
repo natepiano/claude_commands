@@ -227,6 +227,7 @@ class BranchPageTests(unittest.TestCase):
                 form = BranchForm()
                 content = branch_page.render(page).decode("utf-8")
                 form.feed(content)
+                content_text = re.sub(r"<[^>]*>", "", content)
                 self.assertEqual(set(form.checked), expected)
                 for row in rows:
                     source = f"origin/{row.name}" if live_directory == "remote-main" else row.name
@@ -236,7 +237,7 @@ class BranchPageTests(unittest.TestCase):
                     self.assertEqual(row.commit_date, fixture.command("show", "-s", "--format=%cI", source))
                     self.assertEqual(row.merge_date, fixture.command("show", "-s", "--format=%cI", row.merge))
                     self.assertIn(row.merge[:12], content)
-                    self.assertIn(row.merge_date, content)
+                    self.assertIn(row.merge_date, content_text)
                     if row.name == "TEST-active<&":
                         current_branch = fixture.command("-C", str(fixture.root / "active"), "branch", "--show-current")
                         self.assertNotEqual(row.name, current_branch)
@@ -255,6 +256,7 @@ class BranchPageTests(unittest.TestCase):
                 all_rows = BranchForm()
                 full_content = branch_page.render(fixture.page()).decode("utf-8")
                 all_rows.feed(full_content)
+                full_content_text = re.sub(r"<[^>]*>", "", full_content)
                 self.assertEqual(all_rows.checked, [row.name for row in listing.rows])
                 self.assertIn(f"Merged, no owner recorded (10 of {len(eligible)})", full_content)
                 self.assertNotIn("TEST-production", all_rows.offered)
@@ -263,23 +265,28 @@ class BranchPageTests(unittest.TestCase):
                 for row in unowned:
                     self.assertEqual(row.commit_date, fixture.command("show", "-s", "--format=%cI", row.name))
                     self.assertEqual(row.merge, fixture.merges[row.name])
-                    self.assertIn(row.commit_date, full_content)
+                    self.assertIn(row.commit_date, full_content_text)
                     self.assertIn(row.merge[:12], full_content)
-                    self.assertIn(row.merge_date, full_content)
+                    self.assertIn(row.merge_date, full_content_text)
                 for date_row in (rows[0], unowned[0]):
-                    for commit_date, merge_date, date_class in (
-                        ("2026-11-11T12:00:00+00:00", "2026-11-11T12:00:00+00:00", "date-in-order"),
-                        ("2026-11-11T14:00:00+03:00", "2026-11-11T12:00:00+00:00", "date-in-order"),
-                        ("2026-11-11T11:30:00-02:00", "2026-11-11T12:00:00+00:00", "date-out-of-order"),
+                    for commit_date, merge_date, commit_markup, merge_markup in (
+                        ("2026-11-11T12:00:00+00:00", "2026-11-11T12:00:00+00:00",
+                         '<strong class="date-in-order">2026-11-11</strong>T12:00:00+00:00',
+                         '<strong class="date-in-order">2026-11-11</strong>T12:00:00+00:00'),
+                        ("2026-11-11T14:00:00+03:00", "2026-11-11T12:00:00+00:00",
+                         '<strong class="date-in-order">2026-11-11</strong>T14:00:00+03:00',
+                         '<strong class="date-in-order">2026-11-11</strong>T12:00:00+00:00'),
+                        ("2026-11-11T11:30:00-02:00", "2026-11-11T12:00:00+00:00",
+                         '<strong class="date-out-of-order">2026-11-11</strong>T11:30:00-02:00',
+                         '<strong class="date-out-of-order">2026-11-11</strong>T12:00:00+00:00'),
                     ):
                         with self.subTest(section=date_row.section, commit_date=commit_date, merge_date=merge_date):
                             dated_row = replace(date_row, commit_date=commit_date, merge_date=merge_date)
                             dated_page = branch_page.BranchPage(fixture.repository, (dated_row,), "test-token", fixture.publisher, fixture.root,
                                                                int(isinstance(dated_row, branch_page.MergedUnownedBranch)))
                             dated_content = branch_page.render(dated_page).decode("utf-8")
-                            self.assertIn(f'Last commit: <strong class="{date_class}">{commit_date}</strong>', dated_content)
-                            self.assertIn(f'Merged into main: {dated_row.merge[:12]} · '
-                                          + f'<strong class="{date_class}">{merge_date}</strong>', dated_content)
+                            self.assertIn(f'Last commit: {commit_markup}', dated_content)
+                            self.assertIn(f'Merged into main: {dated_row.merge[:12]} · {merge_markup}', dated_content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
         for state in ("unchanged", "advanced"):

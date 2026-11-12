@@ -35,6 +35,22 @@ These logs have no pruning job.
 They remain until someone removes them.
 Older records without a `log` field have SQL NULL in that column.
 
+## Module start and end times
+
+Each executed module attempt records its wall-clock start and end in UTC ISO format.
+`gate_modules.module_started_at` and `gate_modules.module_ended_at` hold those times.
+`gate_modules.started_at` remains the gate run's start for existing keys and window queries.
+Older records have NULL module times because they did not record them.
+Results from older cloud boxes can omit these times.
+Jobs that never start also omit them.
+Index schema 40 rebuilds from the JSON lines without changing them.
+
+Order the latest run's module attempts with this query:
+
+```sh
+buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
+```
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.

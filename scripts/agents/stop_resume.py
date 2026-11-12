@@ -21,7 +21,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
@@ -189,10 +189,13 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
     if threads:
         codex = herdr.codex_conversations()
         named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
+    membership = staff.initial_snapshot()
     for daemon in codex_daemon.read_daemons(os.environ):
         if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
             raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")
-        named.extend((row.thread_id, ()) for row in daemon.sessions if row.name == name)
+        named.extend((row.thread_id, ()) for row in daemon.sessions
+                     if (member := membership.by_current_session(row.thread_id)) is not None
+                     and member.kind == "producer" and member.name == name)
     for identity, pids in named:
         places = [pane["pane_id"] for pane in panes if pane["session_id"] == identity]
         if not places:
@@ -267,6 +270,9 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
         key = "CLAUDE_CONFIG_DIR" if observed.kind == "claude" else "CODEX_HOME"
         entry["config_dir"] = native.environment.get(key) or str(Path.home() / (".claude" if observed.kind == "claude" else ".codex"))
         entry.update(pid=pid, proc_start=native.started)
+        place = herdr.herdr_place_of(pid)
+        if isinstance(place, herdr.HerdrPlace):
+            herdr.forget_pane_evidence(place.session, place.pane)
         if herdr.native_process(pid, observed.kind) != native:
             raise ValueError("producer process changed before adoption")
         return entry
@@ -791,7 +797,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         client = herdr.Herdr(herdr.shared_session())
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(restart.stop_row, item.row, client,
+            futures = [(item, pool.submit(copy_context().run, restart.stop_row, item.row, client,
                 deadline=deadline, **shared)) for item in live]
             for item, future in futures:
                 if not future.result():

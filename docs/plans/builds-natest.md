@@ -22,7 +22,7 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 1. At each phase start, read the merge gate's slowdown warnings; natest-unit owns them. A warned module goes to `builds-natest-next.md`.
 2. At each phase end, re-sort with `show.py top`, which ranks by median CPU. Before the last todo phase starts, add a speed phase for the top live module that no phase holds.
 3. `builds-natest-next.md` lists each module with a reported floor. A gate median CPU 20% above a floor starts an investigation. A floor from before 2026-11-06 is a wall floor. It does not hold a module back when the module's CPU rank calls it and direct calls were not tried.
-4. When no live module has a median CPU over 30 s, the plan holds and tells the showrunner; it does not close.
+4. No CPU stop rule holds the plan. Select each phase by measured removable CPU, and keep owner holds.
 
 ## Delegation Context
 
@@ -1268,7 +1268,6 @@ Measure: `direct/test_verify_mac_arguments.py` gives 40.353 CPU s, 1,936 process
 
 **Ruled out:** moving the SSH cases in this phase with no CPU gain. The worktree keeps that first step for Phase 66, which keeps a move only if it cuts CPU or another proof needs it.
 
-
 ### Phase 62 — A test runner ends each process its tests leave  · status: done
 **Depends on:** none
 
@@ -2195,7 +2194,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/test_times/test_show.py` — the limit, the sum, the footnote values and the history filters, in three existing tests
 - `commands/test_times.md` — the `top` description
 
-
 ### Phase 111 — A targeted test runs only what the unit's own change can reach  · status: done
 
 #### As-built
@@ -2220,7 +2218,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - The import closure in place of the same-folder rule: replay selects more modules (596 against 426 on one 39-file run).
 
-
 ### Phase 112 — A targeted test skips folder neighbors that do not name the changed file  · status: done
 
 #### As-built
@@ -2243,7 +2240,6 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 **Ruled out:**
 - A measured per-module file map: the name check keeps nearly the same gain with much less work.
 - Config selection by changed key: replay gain is small (590 to 569 CPU s), because `scripts/lint/sweep.py` alone reaches 477 test modules by imports.
-
 
 ### Phase 113 — A private admission server costs less to start and to keep running  · status: done
 
@@ -3051,3 +3047,228 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `f8b27fda5`. Rule 2 removes `test_example_without_a_manifest_has_no_step` from `test_merge_checkpoint.py`: a missing crate manifest gives a visible failure before publication. The three modules go from 53 to 52 tests. The history and batch modules keep all their tests; each guards saved completion records or the checkpoints that lifecycle and CI decisions use.
 - The merge checkpoint family review is complete (Phases 159 and 162).
+
+### Phase 163 — The parallel ETA tests start fewer Python interpreters  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `a9b62f887`. The two parallel ETA tests in `production/test_waiting.py` start 12 forked children behind a barrier (`eta_request_processes`, line 653) in place of 12 fresh `waiting.py` interpreters. Each child runs the real handler with its own output capture and leads its own process group; cleanup kills each group. aws pairs: 27.59 to 14.61 CPU s (12.98 s, 47%); 34 tests pass.
+- Profile of one fresh child: imports 0.49 CPU s, live unit lookup 0.15 s, state work under 0.001 s.
+
+**Gotchas:** `process.kill()` on a forked child leaves its Git children alive; give each child its own process group and kill the group through `send_process_group` (`scripts/lib/process_group.py`). `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`; fix `04a1f121b` after chain372 went red.
+
+### Phase 164 — Measure the shared style Git work in three style modules  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `4f1e3e7f2`. A read-only measurement at `fe38cb50e`: style_sync 70 tests 21.9 CPU s, bulk_run 108 tests 38.7, crate_run 96 tests 40.8. Three changes can remove at most 2.97 CPU s across the three modules. style-unit takes the `ledger_location` single query and a narrow immutable-read change (no cache across ledger handles).
+- Report: `phases/164/style_git_report.md` in the unit session. Next item 6b holds the costs and owners.
+
+### Phase 165 — The style-plan recovery tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `7d9c833bb`. No test removed from `test_style_plan_recovery.py` (26) or `test_style_plan_checkpoint_refill.py` (16). Review returned `test_edited_files_of_a_read_ticket_reads_no_synced_tip`: its full file-list assertion stops a refill that assigns a two-file ticket while its second file is busy.
+
+**Gotchas:** judge each assertion, not the test name; a full returned value can guard harm.
+
+### Phase 166 — The bulk run tests build their workspace once for each class and the admission window test costs less  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `ce820d5f5`. `WorkspaceRunTests` in `style/test_bulk_run.py` builds its two-crate workspace commit once in `setUpClass` on the class seed; each test copies the seed and runs `git update-index --refresh`. The admission window test copies the prepared root once and restores it before each of its four cases. All 108 tests and 600 assertions stay. aws pairs: 45.12 to 43.85 CPU s (1.27 s).
+
+**Gotchas:** the local measure (44.3 to 30.6 CPU s) overstated the saving tenfold; only aws pairs decide. A spot instance termination can end an aws trial after one round; run it again.
+
+### Phase 167 — The style-plan selection tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `8d1005406`. Rule 2 on `test_style_plan_selection.py`, `test_style_plan_batches.py` and `test_style_plan_structure.py`: 73 to 72 tests. Removed `test_modules_reads_blocking_structure_before_scanning_decision_footprints` (read order only); `test_modules_reads_blocking_structure_before_approved_decisions` keeps the saved-ticket check. Both reviews approved the 32 kept rare cases. The family is at its floor.
+
+### Phase 168 — Measure the forked-process candidates for repeated Python starts  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `fe4c134c2`. Read-only. Forked children can remove at most 4.68 CPU s across the six fork candidates, all test-only; the two `test_change_review.py` candidates (2.50 s) are under the sdlc hold. Entry imports: ci_points 0.50 s, change_review 0.22 s, detached_runs 0.14 s, agents_log 0.02 s. Lock waits cost almost no CPU. Results are in next item 6b.
+
+### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 27 tests (about 1.3 CPU s); the report named 28, but one test changes its base before it freezes. copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
+
+### Phase 170 — The four unheld lock-contention tests use forked children  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** four tests that start fresh Python children for lock contention start forked children instead. Every test, assertion, real handler and contention boundary stays.
+
+**Decision:** Architect review after Phase 168, finding 1 (next item 6b, phase 1). Phase 168 ceiling: 2.18 CPU s. sdlc go, 2026-11-11: the three files are free.
+
+**Spec:**
+1. Convert these tests to forked children that call the real handler or `main` (the Phase 163 pattern, `scripts/production/test_waiting.py` `eta_request_processes`):
+   - `scripts/production/test_ci_points.py:1009`, `test_simultaneous_watch_calls_claim_only_one_first_alert`: 2 children; both reach the held review lock; one alert and one log record.
+   - `scripts/agents/test_detached_runs.py:381`, `test_parallel_starts_cannot_exceed_one_configured_place`: 4 children; real admission lock; statuses `[0, 4, 4, 4]`; one saved run.
+   - `scripts/usage/test_agents_log.py:343`, `test_concurrent_default_registration_writes_one_assignment_and_returns_one_true`: 6 children; one returns true; one saved assignment.
+   - `scripts/usage/test_agents_log.py:530`, `test_concurrent_processes_append_complete_json_lines`: 4 children; 80 complete records.
+2. In each child: call `os.setpgid(0, 0)`, close inherited parent lock descriptors before the contention starts, and keep the intended child patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor). Do not let a child depend on an unrelated parent patch.
+3. Give each child its own output capture. In cleanup, kill each group through `send_process_group` (`scripts/lib/process_group.py`), join the child and close every descriptor. Never call `os.killpg` directly.
+4. Keep every existing assertion. Use no threads.
+5. If a child cannot keep its boundary in a fork, leave that test as it is and say why.
+
+**Files:**
+- `scripts/production/test_ci_points.py` — item 1, CI watch.
+- `scripts/agents/test_detached_runs.py` — item 1, admission.
+- `scripts/usage/test_agents_log.py` — item 1, registration and append.
+
+**Workers:** 1 writer; one pattern across three files.
+- impl4: all three files.
+
+**Constraints from prior phases:**
+- Phase 163: the fork pattern and its process-group cleanup; `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`.
+- Phase 168: lock waits cost almost no CPU; the saving is interpreter start and entry imports.
+- Phase 166: local CPU numbers are a guide only; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_ci_points scripts.agents.test_detached_runs scripts.usage.test_agents_log scripts.lib.test_process_group_sources` passes three times with 126 tests in the three modules.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- No process or folder stays behind.
+- Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
+
+### Phase 171 — The crate run tests share one default frozen state  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `e870b2059`. `test_crate_run.py` builds one default frozen state for each class in a `tempfile.TemporaryDirectory`; 27 prerequisite tests copy it and rebuild ownership and locks. `test_moved_destination_clean_overlap_is_merged_and_reproved` keeps the real freeze: it changes the base first. All 96 tests and 587 assertions stay. aws CPU: 59.32 to 58.44 s (0.89 s). The three judgment continuations (`test_crate_run.py:970`) stay unseeded.
+
+### Phase 172 — The Pushover notice tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `fc3900f9b`. Rule 2 on `notify/test_pushover.py`: 86 to 86 tests. Each rare case guards delivery, saved send records, status or private data. The family is at its floor.
+
+### Phase 173 — The test-time trend shows the booked cost of each aws gate  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `8c7e63ab5`. `show.py` `gate_costs()` adds `ledger.gate_allowance(row).usd` to the box-hour cost. `read_snapshot()` already decodes `booked_allowance`, so no `priced_snapshot` call is needed. `TREND_CACHE_VERSION` is 4, so each cached day is priced again once. The trend cost tests carry booked allowances that differ from `allowance_usd`.
+
+### Phase 174 — Rank the test work by gate seconds saved per work hour  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report ranks the candidate test speed work by gate seconds saved per work hour, with shared per-module costs measured. No code changes.
+
+**Decision:** builds showrunner item 80, from the user, 2026-11-11: aim at the largest gate-time saving per work hour. dwight measured a median full gate of 197 s and 4,663 CPU s on 32 vCPUs; the slowest 12 modules use 11% of CPU and about 746 others use 89%. Earlier shared changes saved 38.7, 49, 42 and 127 CPU s per gate; single-module phases save 1–13 CPU s. Read-only.
+
+**Spec:**
+1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only (`file:...?mode=ro`), tables `gate_runs` and `gate_modules`. Use passed cloud full gates (`host != 'natedev'`, `selection = 'full'`, `status = 0`) since 2026-11-08. Record the gate count and the database file.
+2. Gate shape. Use the method of `~/rust/hanadocs/dwight/tools/m.py`: wall, CPU, slots, time to the first module, time after the last module start, and the modules that end last. Say whether gate wall time follows total CPU over the slots or the tail.
+3. Fixed cost per module. Measure about 20 small modules across suites with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 5 --commands 10`. Split the cost into interpreter start, the `module_run.py` supervisor, package bootstrap, shared support imports and test setup. Use `python3 -X importtime` to attribute import CPU to shared modules. Multiply by the gate module count for a gate estimate, labelled as an estimate.
+4. Shared support. Rank shared fixtures and support modules by the number of gate modules that use them times their measured CPU. Name the top 10, with file, line and owner.
+5. Scheduling. Find where the gate orders modules (file and line). Estimate the wall time saved by longest-first order or by splitting the tail modules.
+6. Find the source of the earlier shared savings (38.7, 49, 42 and 127 CPU s) in `git log` where you can, and say what kind of change each was.
+7. For each candidate give: measured cost (gate CPU s and gate wall s), estimated saving, estimated work hours, gate seconds saved per work hour, owner, and a measured or estimated label on each number. Include the open single-module work from next item 6b for comparison.
+8. Write the report to `phases/174/gate_value_ranking.md` in the session folder. Change no repository file. Delete saved run output after you read it.
+
+**Files:**
+- `phases/174/gate_value_ranking.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl3: the report.
+
+**Constraints from prior phases:**
+- Phase 166: local CPU numbers overstate; only aws pairs decide a saving. Keep measured costs separate from estimated savings.
+- Phase 168: entry imports cost 0.02–0.50 s per child; lock waits cost almost no CPU.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives the gate shape, the fixed cost per module by part, the top 10 shared costs with owners, the scheduling estimate, and the ranked table with measured and estimated labels.
+- `git status` shows no change from the researcher.
+
+### Phase 175 — Check whether affected-only merge gates would have caught the recorded failures  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a report says, for each failed cloud merge gate since 2026-11-08, whether the affected-test selection for that merge includes each recorded failing module. Analysis only: no aws cost and no gate-policy change.
+
+**Decision:** builds showrunner item 82, from the user, 2026-11-11. dwight found 523 full gates on 489 trees since 11-08; 62 failed on 42 trees; only one failed tree also has an affected run (`~/rust/hanadocs/dwight/tools/n.py`). Read-only.
+
+**Spec:**
+1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only, tables `gate_runs` and `gate_modules`. List cloud `merge-gate` runs since 2026-11-08, the failed runs and their distinct trees. Record the database file and the counts.
+2. Find the affected-test selection that `targeted-test` uses (`scripts/production/merge_gate.py` and its callers). Explain the algorithm and the base it compares the merge result against, with file and line.
+3. For each failed tree, find the merge commit and its base in the local repository objects. Run the selection code in process on the changed files; run no tests. When the selection needs the tree at that commit, use `python3 ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit <C> -- <cmd>`. Do not fetch with a ref write; use `git fetch --no-write-fetch-head` only when an object is absent.
+4. Compare each recorded failing module with the selection. Put each failed tree in one class: all failures selected, partial coverage, no failure selected, no failing module recorded (infrastructure or abort), or missing evidence (commit absent or no module records).
+5. Mark each tree that also passed a full gate as a test that fails only sometimes, apart from trees that never passed. Name the infrastructure cause from the records where you can.
+6. List the missed modules, the failed trees with no selected failure, and the trees with partial coverage.
+7. State the limit: selection coverage does not prove that an affected run would reproduce a failure.
+8. Write the report to `phases/175/affected_gate_report.md` in the session folder. Change no repository file. Start no gate and no aws work.
+
+**Files:**
+- `phases/175/affected_gate_report.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- test: the report.
+
+**Constraints from prior phases:** none.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report explains the selection and its base, classifies every failed tree, and lists missed modules, uncovered trees and partial trees.
+- `git status` shows no change from the researcher.
+
+### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
+**Depends on:** Phase 175
+
+#### Work Order
+
+**Goal:** the affected-test selection includes the 12 failing modules that Phase 175 found missed, through general rules, and it drops no module it selects today.
+
+**Decision:** builds showrunner, 2026-11-11 (item 82 follow-up): always select the whole-repository audit modules and link fixture config reads; full merge gates do not change. sdlc go, 2026-11-11: `affected_modules.py` and `test_affected_modules.py` are free; the selector may add modules but never drop one that a full gate runs today.
+
+**Spec:**
+1. For each of the 12 replay misses and the 3 observed targeted-run misses in `phases/175/affected_gate_report.md` (session folder), find why `select_affected` did not select it. Use the Phase 175 replay inputs (`reconstructed_bases.json`, `refined_replay_commands.json`, `select_refined.py`). Write one row per module: the changed files, the missing link, and the rule that closes it.
+2. Whole-repository checks. A test module that scans the source tree (source audits, import inventories, file counts) is selected whenever a file of the kind it scans changes. Detect these modules from code or recorded evidence; a hand list is the last choice. If a list is needed, put it in `config/merge_gate.conf` with the reason on each entry, and read it through the config owner.
+3. Fixture config reads. A test whose fixture copies or reads a repository config file (for example the build_hold target list) is selected when that config file changes. Find why the existing config-read rule (Phase 127) missed these reads and fix the cause.
+4. Fix each other miss at its cause when a general rule exists. When a miss has no general rule, say so in the reply; do not add a special case for one module.
+5. The selector only adds modules. Prove it: for every replay in `phases/175/refined-selections`, the new selection contains the old selection. Report the added module count for each replay (median and largest) and the 15 misses now selected.
+6. Add rows to the existing tests in `scripts/production/test_affected_modules.py`. Add a new test only when no existing test can carry the case. Each new rule has one test that fails on the old code.
+7. Keep the full-suite fallback when no base exists or the graph fails (`affected_modules.py:507-508,566-567`). Change no gate policy.
+
+**Files:**
+- `scripts/production/affected_modules.py` — `select_affected`, lines 519–564, and the read rules.
+- `scripts/production/test_affected_modules.py` — 35 tests.
+- `config/merge_gate.conf` — only if spec item 2 needs a list.
+
+**Workers:** 1 writer; the selector and its tests are one unit.
+- test: all files.
+
+**Constraints from prior phases:**
+- Phase 175: the selector compares HEAD and dirty paths with the candidate base that has the fewest changed paths. Read evidence comes from the newest complete full gate.
+- Phases 116, 123, 127, 130 and 131 added the text, script-call, config-read, folder-scan and folder-content rules. Reuse them; do not add a parallel rule.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_affected_modules` passes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- The replay check shows each new selection contains the old one, and names the misses now selected.
+- Two blind reviews.

@@ -59,6 +59,16 @@ Resume restores the folder from the merge branch and resumes `current_session`.
 
 - **Named states**: every optional or alternative value crossing a reader boundary is a `NamedTuple` union (`FieldPresent | FieldAbsent`, `PushedTip | NotYetPushed`, `EtaFresh | EtaStale | EtaPassed | EtaNone`, and so on), never a string or `None`.
 
+- **Session state.** `showrunners.session_state_dir(<staff id>)` is `~/.local/state/showrunner/<staff id>/session` (`STATE_DIR` in `produce.md`).
+  It holds `showrunner_state.json`, `unit_status/` and `waiting_state/`.
+  A session change, restart, reboot or production rename preserves the staff id folder.
+  Wrapping a production removes that folder.
+  `showrunners.copy_session_state` copies missing scratchpad files through atomic writes and preserves existing files.
+  `update_registration.adopt_moved_state` selects the timer owner's current session through staff.
+  It copies missing state from `/tmp/claude-*/*/<session id>/scratchpad` and writes no prompt file.
+  Registration and the log and question commands call it before their work.
+  Scheduled prompt delivery reads the current owner and document schedule without adopting state.
+
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
 `add_unit.py` runs through `scripts/lib/py`.
@@ -722,9 +732,14 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   - **`record <report>`.** The watcher runs it on `Nightly proposal ready: <path>`; the night is the report's folder name. It appends the proposal (`# <title>`, `**Target:**`, `**Gain per week:**`) and each item under `**Also found:**` or `**Noted:**`: a `- ` or numbered line, whose bold lead is its title and whose closing tag is its gain. A paragraph closes the item list, so a list of what was denied that night is no candidate. A line whose start (`- <night> <area>: <title>`) the ledger already holds is not written again: a second run adds nothing, and a decided line keeps its outcome. A report with no title or target exits 1 and writes nothing.
   - **Earlier lines.** Before 2026-10-12 a smaller item's outcome was written on its night's line as `; from Also found: <title> — <outcome>`. Those stay as written; every item still open then got a line of its own.
 
-- **Queued messages.** `send.py` keeps a message that did not arrive in `STATE/queue/session-<Claude session id>.jsonl` when a live session answers to the recipient (`sessions.addressed`: `uds:` socket, name now, or a name it alone once had), and under the name as given when none does, which the `QUEUED` line then says; a `session:<id>` address is always kept under `session-<id>`. A delivered keyed send removes its queued copy, and `send.py retire --to --from --key` removes that key's messages and the sender's unkeyed ones (`/shutdown` uses both). `send.py pending` (no name: the caller's session; or a name) reads the session's file, the files of its name now and its socket, and those of its former names that no live session has now, so what was kept under a name before 2026-10-08 is still found.
+- **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
+  Unit names also accept the form from `copies.unit_owner`.
+  Morty uses its staff row when present.
+  Without that row, `send.py` matches Morty's configured `MORTY_NATIVE_ID` against native transport addresses.
+  Postmaster replies use explicit session addresses.
+  `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.
 
-- **Not moved.** Queued messages and natedev holds need no move: both are keyed by the Claude session id (**Queued messages** above; a hold file is named by its holder's session id, `docs/as-built/build-targets.md`). Stall-watch stretch files written under old names are left behind, and each unit starts a new stretch.
+- **Not moved.** Native session queues and natedev holds retain their session ID keys. Staff-name queues need the one-off conversion described above. Old stall-watch files remain under their original names. Each unit starts a new stretch.
 
 ### Waits, renames and alerts: `waiting.py`
 
