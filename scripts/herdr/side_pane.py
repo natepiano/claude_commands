@@ -8,7 +8,6 @@ except FileNotFoundError:
 import argparse
 import os
 import signal
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,7 @@ from scripts.lib import conf, nix_env
 from scripts.production import staff
 from scripts.agents import stop_resume
 
-SideCommand = Literal["open", "send", "close"]
+SideCommand = Literal["send", "close"]
 
 
 class SidePaneRefused(ValueError):
@@ -270,11 +269,9 @@ def close(label: str) -> ClosedSidePane | SidePaneCloseUnavailable:
 
 @final
 class Arguments(argparse.Namespace):
-    command: SideCommand = "open"
+    command: SideCommand = "send"
     label: str = ""
-    question_file: str = ""
     message_file: str = ""
-    cwd: str = ""
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -283,21 +280,11 @@ def main(arguments: list[str] | None = None) -> int:
     for command in cast(tuple[SideCommand, ...], get_args(SideCommand)):
         subcommand = commands.add_parser(command)
         _ = subcommand.add_argument("label")
-        if command == "open":
-            _ = subcommand.add_argument("--question-file", default="")
-            _ = subcommand.add_argument("--cwd", default=str(Path.cwd()))
-        elif command == "send":
+        if command == "send":
             _ = subcommand.add_argument("--message-file", required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
-        if args.command == "open":
-            command = ["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
-                       "--role", "implement", "--target", "consultation-pane", "--policy", "friend",
-                       "--new-worker", args.label, "--cwd", args.cwd]
-            if args.question_file:
-                command += ["--prompt", args.question_file]
-            return subprocess.run(command, check=False).returncode
-        elif args.command == "send":
+        if args.command == "send":
             result = send(args.label, Path(args.message_file).read_text())
         else:
             result = close(args.label)
