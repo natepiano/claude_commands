@@ -597,6 +597,9 @@ def _after_unconfirmed_stop(row: staff.StaffRow, before: herdr.CodexConversation
     unknown: list[str] = []
     for pid in pids:
         try:
+            place = herdr.herdr_place_of(pid)
+            if isinstance(place, herdr.HerdrPlace):
+                herdr.forget_pane_evidence(place.session, place.pane)
             process = herdr.native_process(pid, kind)
             if process.current_identity != identity:
                 raise ValueError(f"pid {pid}: current conversation differs; original generation is unknown")
@@ -606,6 +609,9 @@ def _after_unconfirmed_stop(row: staff.StaffRow, before: herdr.CodexConversation
             elif isinstance(state, sessions.SessionLivenessUnknown):
                 raise OSError(state.reason)
             else:
+                place = herdr.herdr_place_of(pid)
+                if isinstance(place, herdr.HerdrPlace):
+                    herdr.forget_pane_evidence(place.session, place.pane)
                 current = herdr.native_process(pid, kind)
                 if current.started != process.started and current.current_identity != identity:
                     continue
@@ -634,6 +640,7 @@ def stop_all(*, dry_run: bool = False) -> int:
     return restart(stop_all=True, dry_run=dry_run, after_stop=AfterStop.KEEP_STOPPED)
 
 
+@herdr.pane_evidence_run()
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
             after_stop: AfterStop = AfterStop.RESTART,

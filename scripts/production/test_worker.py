@@ -406,16 +406,33 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(state.row, self.fixture.world)
-        record = staff.snapshot()
-        runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
-        with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
-              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
-              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
-        self.assertEqual(active.call_count, 2)
-        self.assertEqual(searches.call_count, 0)
-        self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id):
+                    _ = self.fixture.world.stop(row, self.fixture.world)
+                pane = "w1:p-unread"
+                self.fixture.world.locations[pane] = {"pane_id": pane, "terminal_id": "unread-terminal",
+                    "workspace_id": "w1", "tab_id": "w1:t1", "label": "unread"}
+                if unknown:
+                    self.fixture.world.unknown[pane] = "private process facts are unavailable"
+                else:
+                    del self.fixture.world.locations[pane]
+                before = self.fixture.world.process_reads.count(pane)
+                with redirect_stderr(io.StringIO()) as errors:
+                    record = staff.snapshot()
+                    runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
+                    with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
+                          patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
+                          patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
+                    self.assertEqual(active.call_count, 2)
+                    self.assertEqual(searches.call_count, 0)
+                    self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+                if unknown:
+                    self.assertEqual(self.fixture.world.process_reads.count(pane) - before, 1)
+                    self.assertEqual(sum("pane evidence is unknown" in line
+                                         for line in errors.getvalue().splitlines()), 1)
 
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=False)

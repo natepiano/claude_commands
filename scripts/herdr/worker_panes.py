@@ -914,6 +914,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
     return herdr.SplitPane(ordered[-1], "down", ratio, label)
 
 
+@herdr.pane_evidence_run()
 def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | WorkerRoleUnavailable, *,
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
@@ -1108,6 +1109,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(prepared, nix_env.Refused):
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(prepared))
     if isinstance(current, OpenWorker) and not switching:
+        herdr.forget_pane_evidence(client.session, current.pane)
         if not _stop_row(current.row, client, deadline=deadline):
             return _uncertain(current.row, "agent stop is incomplete; pane retained")
         current = StoppedWorker(current.row, current.pane, current.terminal)
@@ -1252,6 +1254,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launched = launches[-1]
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane())
+    herdr.forget_pane_evidence(client.session, launched.pane)
     fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
@@ -1268,6 +1271,7 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
+@herdr.pane_evidence_run()
 def close(parent: StaffId, name: WorkerName, *,
           lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
     with ExitStack() as operations:

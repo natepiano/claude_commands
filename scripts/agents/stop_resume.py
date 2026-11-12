@@ -21,7 +21,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
@@ -267,6 +267,9 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
         key = "CLAUDE_CONFIG_DIR" if observed.kind == "claude" else "CODEX_HOME"
         entry["config_dir"] = native.environment.get(key) or str(Path.home() / (".claude" if observed.kind == "claude" else ".codex"))
         entry.update(pid=pid, proc_start=native.started)
+        place = herdr.herdr_place_of(pid)
+        if isinstance(place, herdr.HerdrPlace):
+            herdr.forget_pane_evidence(place.session, place.pane)
         if herdr.native_process(pid, observed.kind) != native:
             raise ValueError("producer process changed before adoption")
         return entry
@@ -791,7 +794,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         client = herdr.Herdr(herdr.shared_session())
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(restart.stop_row, item.row, client,
+            futures = [(item, pool.submit(copy_context().run, restart.stop_row, item.row, client,
                 deadline=deadline, **shared)) for item in live]
             for item, future in futures:
                 if not future.result():
