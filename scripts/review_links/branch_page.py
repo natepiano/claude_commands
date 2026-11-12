@@ -14,9 +14,8 @@ import secrets
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import parse_qs, urlsplit
@@ -32,6 +31,8 @@ from scripts.review_links import change_page, review_link
 MANIFEST = ".review-link-branches.json"
 PAGE_NAME = "branches.html"
 KEPT = ".branch-page-kept.json"
+USED = ".review-link-branches.used"
+SUBMITTED = "This page was submitted. The new link comes by message."
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,8 @@ class BranchPage:
     repository: Path
     rows: tuple[MergedUnitBranch | MergedUnownedBranch, ...]
     token: str
+    publisher: staff.StaffId
+    folder: Path
     unowned_total: int = 0
 
 
@@ -94,8 +97,21 @@ class DeleteResult:
     message: str
 
 
-class InitialSelection(Enum):
-    ALL = "Select every branch on a new page"
+@dataclass(frozen=True)
+class BranchDeletion:
+    page: BranchPage
+    selected: tuple[str, ...]
+    publisher_name: str
+
+
+@dataclass(frozen=True)
+class PublishedBranchPage:
+    url: str
+    page: BranchPage
+
+
+class PageSubmitted(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -358,9 +374,10 @@ def page_at(root: Path, request_path: str) -> BranchPage:
     if not isinstance(value, dict):
         raise ValueError("invalid branch manifest")
     fields = cast(dict[str, object], value)
-    repository, token, raw_rows, unowned_total = (fields.get(key) for key in
-                                                 ("repository", "token", "rows", "unowned_total"))
-    if not (set(fields) == {"repository", "token", "rows", "unowned_total"}
+    repository, token, raw_rows, unowned_total, publisher = (fields.get(key) for key in
+                                                 ("repository", "token", "rows", "unowned_total", "publisher"))
+    if not (set(fields) == {"repository", "token", "rows", "unowned_total", "publisher"}
+            and isinstance(publisher, str) and publisher
             and type(unowned_total) is int and unowned_total >= 0
             and isinstance(repository, str) and Path(repository).is_absolute()
             and isinstance(token, str) and token and isinstance(raw_rows, list)):
@@ -398,11 +415,17 @@ def page_at(root: Path, request_path: str) -> BranchPage:
         raise ValueError("invalid no-owner branch count")
     kept = kept_branches()
     available = tuple(row for row in rows if not isinstance(row, MergedUnownedBranch) or row.name not in kept)
-    return BranchPage(Path(repository), available, token, unowned_total - (len(rows) - len(available)))
+    if (folder / USED).exists():
+        raise PageSubmitted(SUBMITTED)
+    return BranchPage(Path(repository), available, token, staff.StaffId(publisher), folder,
+                      unowned_total - (len(rows) - len(available)))
 
 
-def render(page: BranchPage, results: tuple[DeleteResult, ...] = (), *,
-           selected: frozenset[str] | InitialSelection = InitialSelection.ALL) -> bytes:
+def render_date(value: str, date_class: str) -> str:
+    return f'<strong class="{date_class}">{html.escape(value[:10])}</strong>{html.escape(value[10:])}'
+
+
+def render(page: BranchPage) -> bytes:
     unit_rows: list[str] = []
     unowned_rows: list[str] = []
     for row in page.rows:
@@ -413,14 +436,12 @@ def render(page: BranchPage, results: tuple[DeleteResult, ...] = (), *,
                            if isinstance(row.unit_status, ActiveUnitBranch) else "not active")
             owner = f"Unit: {html.escape(row.unit)} — {unit_status}\n"
         rows = unit_rows if isinstance(row, MergedUnitBranch) else unowned_rows
-        checked = " checked" if isinstance(selected, InitialSelection) or row.name in selected else ""
-        rows.append(f'''<section><label><input type="checkbox" name="branch" value="{name}"{checked}>
-<strong>{name}</strong></label><p>{owner}Last commit: {html.escape(row.commit_date)}
-Merged into main: {html.escape(row.merge[:12])} · {html.escape(row.merge_date)}</p></section>''')
-    notices = "".join(f"<li>{html.escape(result.name)}: {html.escape(result.message)}</li>" for result in results)
+        dates_in_order = datetime.fromisoformat(row.commit_date) <= datetime.fromisoformat(row.merge_date)
+        date_class = "date-in-order" if dates_in_order else "date-out-of-order"
+        rows.append(f'''<section><label><input type="checkbox" name="branch" value="{name}" checked>
+<strong>{name}</strong></label><p>{owner}Last commit: {render_date(row.commit_date, date_class)}
+Merged into main: {html.escape(row.merge[:12])} · {render_date(row.merge_date, date_class)}</p></section>''')
     content = '<h1>Branches to delete</h1>'
-    if results:
-        content += f'<h2>Delete results</h2><ul role="status">{notices}</ul>'
     if page.rows:
         unowned_heading = f"Merged, no owner recorded ({len(unowned_rows)} of {page.unowned_total})"
         content += f'''<p>Clear each branch that you want to keep.</p>
@@ -428,11 +449,17 @@ Merged into main: {html.escape(row.merge[:12])} · {html.escape(row.merge_date)}
 {"".join(unit_rows)}<h2>{unowned_heading}</h2>{"".join(unowned_rows)}<button>Delete</button></form>'''
     else:
         content += "<p>No branches are available to delete.</p>"
-    return change_page.document(content).replace(b"<title>Changes to review</title>",
-                                                b"<title>Branches to delete</title>", 1)
+    styles = b"""
+:root{--date-in-order:#166534;--date-out-of-order:#b91c1c}
+@media(prefers-color-scheme:dark){:root{--date-in-order:#86efac;--date-out-of-order:#fca5a5}}
+.date-in-order{color:var(--date-in-order)}
+.date-out-of-order{color:var(--date-out-of-order)}
+"""
+    return (change_page.document(content).replace(b"</style>", styles + b"</style>", 1)
+            .replace(b"<title>Changes to review</title>", b"<title>Branches to delete</title>", 1))
 
 
-def submit(page: BranchPage, body: str) -> tuple[DeleteResult, ...]:
+def submit(page: BranchPage, body: str) -> BranchDeletion:
     fields = parse_qs(body, keep_blank_values=True)
     if fields.get("token") != [page.token]:
         raise ValueError("invalid branch form token")
@@ -440,6 +467,9 @@ def submit(page: BranchPage, body: str) -> tuple[DeleteResult, ...]:
     listed = {row.name: row for row in page.rows}
     if any(name not in listed for name in selected):
         raise ValueError("the selection contains a branch outside this page")
+    publisher = staff.snapshot().by_id(page.publisher)
+    if publisher is None:
+        raise ValueError(f"no staff record for publisher {page.publisher}")
     unchecked = {row.name for row in page.rows if isinstance(row, MergedUnownedBranch) and row.name not in selected}
     if unchecked:
         root = review_link.review_root()
@@ -447,10 +477,14 @@ def submit(page: BranchPage, body: str) -> tuple[DeleteResult, ...]:
         with file_lock.exclusive(root / (KEPT + ".lock")):
             kept = kept_branches() | unchecked
             atomic_file.write_bytes_atomic(root / KEPT, json.dumps(sorted(kept)).encode("utf-8"), mode=0o600)
+    return BranchDeletion(page, selected, publisher.name)
+
+
+def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
     results: list[DeleteResult] = []
-    for name in selected:
+    for name in deletion.selected:
         try:
-            result = git(page.repository, "push", "origin", "--delete", "--", name)
+            result = git(deletion.page.repository, "push", "origin", "--delete", "--", name)
             message = "deleted" if result.returncode == 0 else failure_detail(result)
             results.append(DeleteResult(name, message))
         except OSError as error:
@@ -458,19 +492,49 @@ def submit(page: BranchPage, body: str) -> tuple[DeleteResult, ...]:
     return tuple(results)
 
 
+def deliver(deletion: BranchDeletion) -> None:
+    results = delete_selected(deletion)
+    lines = [f"{result.name}: {' '.join(result.message.splitlines())}" for result in results]
+    try:
+        published = publish_for(deletion.page.repository, deletion.page.publisher)
+        if published.page.rows:
+            shown = sum(isinstance(row, MergedUnownedBranch) for row in published.page.rows)
+            lines.append(f"Next page: {published.url} ({shown} of {published.page.unowned_total} no-owner branches)")
+        else:
+            lines.append("No branches remain to delete.")
+    except (OSError, ValueError, subprocess.SubprocessError, staff.StaffRefused, Refusal) as error:
+        lines.append("Next page failed: " + " ".join(str(error).splitlines()))
+    change_page.send_to_staff(deletion.page.publisher, change_page.SENDER, "\n".join(lines))
+    mark = deletion.page.folder / USED
+    try:
+        atomic_file.write_bytes_atomic(mark, b"submitted\n", mode=0o600)
+    except OSError:
+        mark.unlink(missing_ok=True)
+        raise
+
+
 def publish(repository: Path) -> str:
+    publisher = staff.snapshot().by_current_session(staff.caller_identity())
+    if publisher is None:
+        raise ValueError("the current session has no staff row")
+    return publish_for(repository, publisher.id).url
+
+
+def publish_for(repository: Path, publisher: staff.StaffId) -> PublishedBranchPage:
     listing = list_branches(repository, staff.snapshot(), history_roots())
-    page = BranchPage(repository.resolve(), listing.rows, secrets.token_urlsafe(), listing.unowned_total)
     root = review_link.review_root()
     with tempfile.TemporaryDirectory(prefix="review-branches-") as temporary:
+        page = BranchPage(repository.resolve(), listing.rows, secrets.token_urlsafe(), publisher,
+                          Path(temporary), listing.unowned_total)
         source = Path(temporary) / PAGE_NAME
         _ = source.write_bytes(render(page))
         url = review_link.snapshot_at(root, [source], new=True)[0]
     folder = root / urlsplit(url).path.split("/")[1]
+    page = replace(page, folder=folder)
     manifest = {"repository": str(page.repository), "rows": [asdict(row) for row in page.rows],
-                "token": page.token, "unowned_total": page.unowned_total}
+                "token": page.token, "unowned_total": page.unowned_total, "publisher": page.publisher}
     atomic_file.write_bytes_atomic(folder / MANIFEST, json.dumps(manifest).encode("utf-8"), mode=0o600)
-    return url
+    return PublishedBranchPage(url, page)
 
 
 def main(arguments: list[str]) -> int:

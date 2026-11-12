@@ -160,7 +160,17 @@ Every Claude launch writes trust before starting Claude. The target account does
 
 The CLI takes `read|type|keys|where` and either `unit <showrunner name> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
-These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
+These consumers use this path:
+
+1. Effort changes through `unit_effort.py`, showrunner promotion, and relays.
+2. The stall watch and `unit_status.sh`, each with 400 joined lines.
+3. Shutdown screen checks through `restart_support._screen`, with 60 lines, and the Remote Control fixer.
+
+`restart_support._screen` checks the registry session identity at the unit's pid before resolving its pane.
+A mismatch returns `ScreenUnreadable("session registry identity changed")`.
+`remote_control.py` finds the newly registered pid's pane through `record_place`.
+It confirms process identity and idle state.
+It then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
 ### Worker questions
 

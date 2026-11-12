@@ -794,7 +794,7 @@ def _union(values: list[PythonValue]) -> PythonValue:
 
 def _join_bindings(target: dict[str, PythonValue], branches: list[dict[str, PythonValue]]) -> None:
     for key in {key for branch in branches for key in branch}:
-        target[key] = _union([branch.get(key, ScalarValue(UnknownArgument(key))) for branch in branches])
+        target[key] = _union([branch[key] if key in branch else ScalarValue(UnknownArgument(key)) for branch in branches])
 
 
 def _import_value(name: str) -> ModuleBinding | KnownGitFunction | ScalarValue:

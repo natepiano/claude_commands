@@ -318,19 +318,60 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket())
 
     def test_refill_starts_the_selected_decision_when_only_the_lockfile_changes(self) -> None:
-        rule = self.rule("read")
-        self.sync()
-        issue = self.approved_decision(rule, self.sources[:1], "rename")
-        self.write("Cargo.lock", "# incoming lockfile update\n")
-        _ = self.commit()
-        with mock.patch.object(style_proposals, "proposal_command") as start:
-            code, output, errors = self.run_next()
-        self.assertEqual(code, 0, errors + output)
-        start.assert_called_once()
-        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
-        self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
-                         ("proposal", str(issue), list(self.sources[:1]), self.tip))
-        self.assertEqual(self.sync_wait_rows(), [])
+        _ = self.doCleanups()
+        for change in ("lockfile", "recorded need"):
+            with self.subTest(change=change):
+                case = StylePlanTests()
+                case.setUp()
+                try:
+                    rule = case.rule("read")
+                    case.sync()
+                    issue = case.approved_decision(rule, case.sources[:1],
+                                                   "restructure" if change == "recorded need" else "rename")
+                    ledger = case.ledger()
+                    finding, = ledger.proposal_findings(issue)
+                    need = case.sources[2]
+                    busy: tuple[str, ...] = ()
+                    if change == "recorded need":
+                        ledger.ticket_add("7001", ticket_owner_id("names"), "proposal", "names", "crates/alpha",
+                                          [finding.path], [rule], proposal=str(issue), finding_ids=(finding.finding_id,))
+                        ledger.finding_need(finding.finding_id, need)
+                        ledger.finding_need(finding.finding_id, finding.path)
+                        edits = style_plan.EditedFiles(case.repo, ledger, style_plan.NoUnitBranch())
+                        footprint = edits.of(finding)
+                        self.assertEqual((footprint[0], footprint[-1], footprint.count(finding.path)), (finding.path, need, 1))
+                        self.assertIn(need, edits.of_ticket(ledger.ticket_get("7001")))
+                        ledger.ticket_drop("7001")
+                        self.assertEqual(ledger.finding_needs(finding.finding_id), tuple(sorted((finding.path, need))))
+                        ledger.record(rule=rule, path=finding.path, commit=case.tip, verdict="held", detail="",
+                                      ticket="outside", worker="test", rule_blob=finding.rule_blob,
+                                      input_scope=style_ledger.DeclaredInputScope.RULE)
+                        for path in case.sources[1:]:
+                            case.record(rule, path, case.tip)
+                        busy = (need,)
+                    else:
+                        case.write("Cargo.lock", "# incoming lockfile update\n")
+                        _ = case.commit()
+                    with (mock.patch.object(berth_board, "read_board", return_value=case.board(*busy)),
+                          mock.patch.object(style_proposals, "proposal_command") as start):
+                        code, output, errors = case.run_next()
+                    if change == "recorded need":
+                        start.assert_not_called()
+                        self.assertEqual(code, 3, output + errors)
+                        self.assertEqual(errors, "")
+                        self.assertIn(f"waiting {issue}: {finding.path} edits {need}, busy (1 finding)\n", output)
+                        self.assertEqual(case.count_tickets(), 1)
+                        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
+                        self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
+                    else:
+                        self.assertEqual(code, 0, errors + output)
+                        start.assert_called_once()
+                        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
+                        self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
+                                         ("proposal", str(issue), list(case.sources[:1]), case.tip))
+                        self.assertEqual(case.sync_wait_rows(), [])
+                finally:
+                    case.doCleanups()
 
     def test_refill_holds_a_rename_when_main_adds_a_reference(self) -> None:
         rule = self.rule("read")

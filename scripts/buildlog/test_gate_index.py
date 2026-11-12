@@ -34,6 +34,7 @@ STARTED = "2026-11-03T12:00:00.000Z"
 def fixture_run() -> GateRun:
     final_attempt: ModuleRun = {
         "suite": "scripts", "module": "test_shared.py", "attempt": 2,
+        "started_at": "2026-11-03T12:00:02.000Z", "ended_at": "2026-11-03T12:00:06.000Z",
         "restart": "", "times_missing": "", "wall_s": 4.0, "cpu_s": 3.0,
         "log": "",
         "peak_mib": 25.0, "status": 1, "tests_run": 7, "failures": 1,
@@ -125,7 +126,8 @@ class GateIndexTests(unittest.TestCase):
         child: Record = {**common, "run_id": "gate-one"}
         expected_suites = [{**suite, **child} for suite in run["suites"]]
         self.assertCountEqual(table_rows("gate_suites"), expected_suites)
-        expected_modules = [{**{key: value for key, value in module.items() if key != "tests"}, **child}
+        expected_modules = [{**{key: value for key, value in module.items() if key not in {"tests", "started_at", "ended_at"}}, **child,
+                             "module_started_at": module.get("started_at"), "module_ended_at": module.get("ended_at")}
                             for module in run["modules"]]
         self.assertCountEqual(table_rows("gate_modules"), expected_modules)
         expected_tests: list[Record] = []
@@ -153,6 +155,8 @@ class GateIndexTests(unittest.TestCase):
         del entry["step"]
         for module in cast(list[Record], entry["modules"]):
             del module["log"]
+            del module["started_at"]
+            del module["ended_at"]
         _ = path.write_bytes(encode(entry))
         original = path.read_bytes()
         self.assertEqual(index.update(), 1)
@@ -161,6 +165,8 @@ class GateIndexTests(unittest.TestCase):
         self.assertEqual(rows("SELECT log FROM gate_modules"), [(None,)] * len(fixture_run()["modules"]))
         self.assertEqual(rows("SELECT tests_run FROM gate_modules WHERE suite = ? AND attempt = ?"
                               + " AND module = ?", "scripts", 2, "test_shared.py"), [(7,)])
+        self.assertEqual(rows("SELECT started_at, module_started_at, module_ended_at FROM gate_modules"),
+                         [(STARTED, None, None)] * len(fixture_run()["modules"]))
         self.assertEqual(path.read_bytes(), original)
 
     def test_query_recovers_failure_log_paths_after_an_index_rebuild(self) -> None:

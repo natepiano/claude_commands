@@ -32,6 +32,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
@@ -405,16 +406,33 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(state.row, self.fixture.world)
-        record = staff.snapshot()
-        runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
-        with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
-              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
-              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
-        self.assertEqual(active.call_count, 2)
-        self.assertEqual(searches.call_count, 0)
-        self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id):
+                    _ = self.fixture.world.stop(row, self.fixture.world)
+                pane = "w1:p-unread"
+                self.fixture.world.locations[pane] = {"pane_id": pane, "terminal_id": "unread-terminal",
+                    "workspace_id": "w1", "tab_id": "w1:t1", "label": "unread"}
+                if unknown:
+                    self.fixture.world.unknown[pane] = "private process facts are unavailable"
+                else:
+                    del self.fixture.world.locations[pane]
+                before = self.fixture.world.process_reads.count(pane)
+                with redirect_stderr(io.StringIO()) as errors:
+                    record = staff.snapshot()
+                    runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
+                    with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
+                          patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
+                          patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
+                    self.assertEqual(active.call_count, 2)
+                    self.assertEqual(searches.call_count, 0)
+                    self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+                if unknown:
+                    self.assertEqual(self.fixture.world.process_reads.count(pane) - before, 1)
+                    self.assertEqual(sum("pane evidence is unknown" in line
+                                         for line in errors.getvalue().splitlines()), 1)
 
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=False)
@@ -940,6 +958,29 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(self.agent.compactions, expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
                 self.agent.compactions.clear()
+
+        with self.subTest(storage="compressed"):
+            self.agent.compact_error = ""
+            current = self.opened("impl-compact-saved")
+            backend = staff.backend(current.row)
+            assert isinstance(backend, staff.CodexBackend)
+            source = worker_admission.transcript_source(current.row, backend)
+            with source.open("a") as stream:
+                _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+            content = source.read_bytes()
+            _ = compressed_copy(source)
+            before = len(self.agent.submitted)
+
+            def resume_transcript() -> None:
+                atomic_file.write_bytes_atomic(source, content)
+
+            with patch.object(staff, "backend", return_value=backend):
+                result = worker.dispatch_turn(self.fixture.parent.id, current, self.fixture.world,
+                    "End your final reply with DONE compressed-dispatch", "compressed-dispatch",
+                    run=self.run_dir, on_submission=resume_transcript)
+            self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+            self.assertEqual(self.agent.compactions, [(current.pane, before)])
 
     def test_long_dispatch_waits_without_submitting_again(self) -> None:
         self.agent.finish_after = 3
@@ -2678,6 +2719,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_list_waiting_on_uses_live_detached_run_labels_only(self) -> None:
         opened = self.opened("impl")
         other = self.opened("test", "test")
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        self.fixture.dispatch(opened.row, "impl")
         run = worker_panes.worker_run(opened.row, record=staff.snapshot())
         directory = run / worker_lifecycle.DETACHED_RUNS_DIR
         for run_id, name, status, pid, label in (
@@ -2687,18 +2730,45 @@ class WorkerCommandTests(unittest.TestCase):
                 ("dead", opened.row.name, "running", 102, "TEST dead"),
                 ("other", "another-worker", "running", 101, "TEST other worker")):
             atomic_file.write_text_atomic(directory / (run_id + ".json"), json.dumps({
-                "run_id": run_id, "worker": name, "status": status, "pid": pid, "label": label}))
-        def supervises(pid: int, _path: Path) -> bool:
-            return pid == 101
-        with patch.object(detached_run_process, "supervises", side_effect=supervises):
-            for scope in ((), ("--all-parents",)):
-                with self.subTest(scope=scope):
-                    code, rows, errors = self.text_command("list", *scope)
-                    self.assertEqual(code, 0, errors)
-                    self.assertEqual(len(rows), 2)
-                    cells = {row[1]: row for row in rows}
-                    self.assertEqual(cells[opened.row.name][-1], "TEST suite, TEST build continued")
-                    self.assertEqual(cells[other.row.name][-1], "-")
+                "run_id": run_id, "worker": name,
+                "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
+                "status": status, "pid": pid, "label": label}))
+        for alive, hold, expected, location in ((True, "", "busy", "known"), (False, "", "idle", "known"),
+                (True, "pause", "paused", "known"), (True, "exit", "exited", "known"),
+                (True, "", "busy", "saved dispatch")):
+            if location == "saved dispatch":
+                outside = self.fixture.root / "private" / "saved-dispatch"
+                outside.mkdir(parents=True)
+                atomic_file.write_text_atomic(outside / "progress_history_state.json",
+                    (self.run_dir / "progress_history_state.json").read_text())
+                self.run_dir = outside
+                _ = staff.set_hold(opened.row.id, staff.Active())
+                self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+                self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+                saved_directory = outside / worker_lifecycle.DETACHED_RUNS_DIR
+                saved_directory.mkdir()
+                for path in directory.glob("*.json"):
+                    _ = path.replace(saved_directory / path.name)
+                directory = saved_directory
+            _ = staff.set_hold(opened.row.id, staff.Exited("TEST", "TEST", "Exit the worker.") if hold == "exit"
+                               else staff.Paused("TEST", "TEST", "Hold the worker.") if hold == "pause" else staff.Active())
+            def supervises(pid: int, path: Path) -> bool:
+                del path
+                return alive and pid == 101
+            with patch.object(detached_run_process, "supervises", side_effect=supervises):
+                for scope in ((), ("--all-parents",)):
+                    with (self.subTest(alive=alive, hold=hold, scope=scope, location=location),
+                          patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
+                          patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
+                        code, rows, errors = self.text_command("list", *scope)
+                        self.assertEqual(code, 0, errors)
+                        self.assertEqual(len(rows), 2)
+                        cells = {row[1]: row for row in rows}
+                        self.assertEqual(cells[opened.row.name][-1], "TEST suite, TEST build continued" if alive else "-")
+                        self.assertEqual(cells[other.row.name][-1], "-")
+                        self.assertEqual(cells[opened.row.name][5], expected)
+                        for path in directory.glob("*.json"):
+                            self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), 1, str(path))
 
     def test_list_all_sorts_open_panes_first_and_preserves_each_group_order(self) -> None:
         closed = [self.fixture.worker(name) for name in ("alpha", "gamma")]

@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+from decimal import Decimal
 from io import StringIO
 import json
 import os
 import pathlib
 import shlex
+import shutil
 import signal
 import sqlite3
 from pathlib import Path
@@ -22,10 +24,13 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, gate_trial as trial, ledger
+from scripts.aws_target import admin_secrets, cloud_gate, gate_trial as trial, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment
+from scripts.lib.process_group import send_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -335,26 +340,445 @@ class Sample(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('clone_url=https://github.com/natepiano/claude_commands.git',
                                                    'clone_url=' + str(self.origin)))
 
+    def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
+        now = 1700000000
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now - 3600,
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(now - 3600, 'stopped', 'fixture'))
+        _ = book.reserve_gate(self.settings, ledger.GateReservation(
+            'race', now - 3600, now - 1, Decimal('.8'), Decimal('.02')))
+        current = self.state / 'paired-trials' / 'current'
+        previous = current.parent / 'expired' / 'race'
+        current.mkdir(parents=True)
+        previous.mkdir(parents=True)
+        cloud_gate.save(previous / 'request.json', {'attempt': 'race', 'expires': now - 1})
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1), book, self.settings,
+            current / 'reservation', clock=lambda: now)
+        resolve = book.resolve_gate
+        confirmed = ledger.GateTerminated(now - 2, 'i-race')
+        costs: list[Decimal] = []
+        def racing_resolve(attempt: str, outcome: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated,
+                           *, instance_type: str = '') -> None:
+            self.assertIsInstance(outcome, ledger.GateAbsent)
+            resolve(attempt, confirmed)
+            costs.append(trial.trial_cost(book, {attempt}, self.settings, now)[0])
+            resolve(attempt, outcome, instance_type=instance_type)
+        with (mock.patch.object(book, 'resolve_gate', side_effect=racing_resolve),
+              mock.patch.object(worker.api, 'call', side_effect=AssertionError('unexpected AWS call'))):
+            trial.sweep_trial_resources(current, worker)
+        self.assertEqual(book.read_snapshot().gate_reservations[0].state, confirmed)
+        self.assertGreater(costs[0], Decimal(0))
+        self.assertEqual(trial.trial_cost(book, {'race'}, self.settings, now), (costs[0], True))
+
     def request(self, modules: tuple[str, ...] = ('fixture/test_sample.py',), rounds: int = 3) -> trial.PairedTrialRequest:
-        return trial.pushed_request(self.repo, self.base, self.changed, modules, rounds)
+        return trial.trial_request(self.repo, self.base, self.changed, modules, rounds)
 
     def sample(self, variant: str, number: int, cpu: float) -> dict[str, object]:
         return {'module': 'fixture/test_sample.py', 'variant': variant, 'round': number, 'cpu_s': cpu,
                 'peak_mib': 12.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
                 'instance_type': 'm7a.8xlarge', 'box': 'i-fixture'}
 
+    def remote_branches(self) -> dict[str, str]:
+        rows = trial.checked_git(self.origin, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/')
+        return dict(row.split() for row in rows.splitlines())
+
+    def invoke_trial(self) -> int:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
+        return trial.paired_main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                                  '--modules', 'fixture/test_sample.py'], self.state)
+
     def test_pushed_refs_and_modules_do_not_change_checkout(self) -> None:
-        before = trial.checked_git(self.repo, 'show-ref')
-        request = self.request()
-        self.assertEqual(request.base.commit, self.base)
-        self.assertEqual(request.changed.commit, self.changed)
-        self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
-        self.assertEqual(trial.checked_git(self.repo, 'status', '--porcelain'), '')
         _ = (self.repo / 'private').write_text('local only')
         _ = trial.checked_git(self.repo, 'add', '.')
         _ = trial.checked_git(self.repo, 'commit', '-qm', 'Local fixture')
-        with self.assertRaises((ValueError, subprocess.SubprocessError)):
-            _ = trial.pushed_request(self.repo, self.base, 'HEAD', request.modules, 3)
+        self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
+        self.assertNotIn(self.changed, self.remote_branches().values())
+        _ = (self.repo / 'change').write_text('staged edit')
+        _ = trial.checked_git(self.repo, 'add', 'change')
+        _ = (self.repo / 'change').write_text('unstaged edit')
+        _ = (self.repo / 'untracked').write_text('untracked')
+        before = trial.checked_git(self.repo, 'show-ref')
+        status = trial.checked_git(self.repo, 'status', '--porcelain')
+        index = (self.repo / '.git/index').read_bytes()
+        branches = self.remote_branches()
+        request = self.request()
+        self.assertEqual(request.base.commit, self.base)
+        self.assertEqual(request.changed.commit, self.changed)
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            folder = next((self.state / 'paired-trials').iterdir())
+            expires = 1700000000 + cloud_gate.settings().whole('lifetime_minutes') * 60
+            request_path = next(folder.glob('*/request.json'))
+            self.assertEqual(cloud_gate.read(request_path)['expires'], expires)
+            self.assertEqual(self.remote_branches(), {**branches,
+                f'refs/heads/gate-trial-{expires}-{folder.name}-base': self.base,
+                f'refs/heads/gate-trial-{expires}-{folder.name}-changed': self.changed})
+            self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
+            self.assertEqual(trial.checked_git(self.repo, 'status', '--porcelain'), status)
+            return 0
+
+        with (mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(time, 'time', return_value=1700000000)):
+            self.assertEqual(self.invoke_trial(), 0)
+        self.assertEqual(self.remote_branches(), branches)
+        self.assertEqual(trial.checked_git(self.repo, 'show-ref'), before)
+        self.assertEqual(trial.checked_git(self.repo, 'status', '--porcelain'), status)
+        self.assertEqual((self.repo / '.git/index').read_bytes(), index)
+
+    def test_rerun_pushes_unique_branches_without_force_and_cleans_pass_or_failure(self) -> None:
+        config = self.root / 'cloud_gate.conf'
+        _ = config.write_text(config.read_text().replace('trial_branch_prefix=gate-trial', 'trial_branch_prefix=fixture-trial'))
+        branches = self.remote_branches()
+        names: list[set[str]] = []
+        statuses = iter((0, 7))
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            remote = self.remote_branches()
+            names.append(set(remote) - set(branches))
+            self.assertEqual(len(names[-1]), 2)
+            self.assertTrue(all(name.startswith('refs/heads/fixture-trial-') for name in names[-1]))
+            self.assertEqual({remote[name] for name in names[-1]}, {self.base, self.changed})
+            return next(statuses)
+
+        with (mock.patch.object(trial, 'checked_git', wraps=trial.checked_git) as git,
+              mock.patch.object(trial, 'paired_service', side_effect=service)):
+            for expected in (0, 7):
+                self.assertEqual(self.invoke_trial(), expected)
+                self.assertEqual(self.remote_branches(), branches)
+        self.assertTrue(names[0].isdisjoint(names[1]))
+        pushes = [call.args[1:] for call in git.call_args_list if call.args[1] == 'push' and '--delete' not in call.args]
+        self.assertEqual(len(pushes), 4)
+        for arguments in pushes:
+            self.assertEqual(arguments[1], str(self.origin))
+            self.assertNotIn('-f', arguments)
+            self.assertNotIn('--force', arguments)
+            self.assertFalse(cast(str, arguments[2]).startswith('+'))
+        listings = [call.args for call in git.call_args_list if call.args[1] == 'ls-remote']
+        self.assertEqual(len(listings), 4)
+        self.assertTrue(all(cast(str, arguments[-1]).startswith('refs/heads/fixture-trial-') for arguments in listings))
+
+    def test_paired_main_never_installs_a_signal_handler(self) -> None:
+        handlers = {number: signal.getsignal(number) for number in trial.TRIAL_SIGNALS}
+        git = trial.checked_git
+        observations: list[str] = []
+
+        def check_handlers(label: str) -> None:
+            self.assertEqual({number: signal.getsignal(number) for number in trial.TRIAL_SIGNALS}, handlers)
+            observations.append(label)
+
+        def inspect_git(repo: Path, *arguments: str) -> str:
+            check_handlers(arguments[0])
+            return git(repo, *arguments)
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            check_handlers('service')
+            return 0
+
+        with (mock.patch.object(trial, 'checked_git', side_effect=inspect_git),
+              mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(signal, 'signal', side_effect=AssertionError('signal handler installation'))):
+            self.assertEqual(self.invoke_trial(), 0)
+        check_handlers('finished')
+        self.assertIn('push', observations)
+        self.assertIn('service', observations)
+
+    def test_start_sweep_deletes_only_expired_trial_branches(self) -> None:
+        now = 1700000000
+        old = now - 1
+        expired = {f'gate-trial-{old}-' + 'a' * 32 + '-' + variant for variant in ('base', 'changed')}
+        preserved = {
+            f'gate-trial-{now + 1}-' + 'b' * 32 + '-base',
+            f'gate-trial-{now}-' + 'c' * 32 + '-changed',
+            f'gate-trial-{now + 60}-' + 'd' * 32 + '-base',
+            'gate-trial-not-an-epoch-' + 'e' * 32 + '-base',
+            f'gate-trial-{old}-invalid-base',
+            f'gate-trial-{old}-' + 'f' * 32 + '-other',
+            f'gate-trial-{old}-' + 'f' * 32 + '-base-extra',
+            f'other-trial-{old}-' + 'a' * 32 + '-base',
+            'unrelated-work',
+        }
+        for name in expired | preserved:
+            _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':refs/heads/' + name)
+        before = self.remote_branches()
+        expected = {ref: commit for ref, commit in before.items() if ref.removeprefix('refs/heads/') not in expired}
+
+        def service(_command: Sequence[str], _unit: str) -> int:
+            remote = self.remote_branches()
+            self.assertEqual({ref: commit for ref, commit in remote.items() if ref in before}, expected)
+            self.assertEqual(len(set(remote) - set(before)), 2)
+            return 0
+
+        with (mock.patch.object(trial, 'paired_service', side_effect=service),
+              mock.patch.object(time, 'time', return_value=now),
+              mock.patch.object(trial, 'checked_git', wraps=trial.checked_git) as git):
+            self.assertEqual(self.invoke_trial(), 0)
+        self.assertEqual(self.remote_branches(), expected)
+        listings = [call.args for call in git.call_args_list if call.args[1] == 'ls-remote']
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(listings[0][-1], 'refs/heads/gate-trial-*')
+
+    def test_lower_lifetime_keeps_live_trial_branches(self) -> None:
+        now = 1700000000
+        before = self.remote_branches()
+        config = self.root / 'cloud_gate.conf'
+        lifetime = cloud_gate.settings().whole('lifetime_minutes')
+        self.assertGreater(lifetime, 2)
+
+        def first_service(_command: Sequence[str], _unit: str) -> int:
+            live = self.remote_branches()
+            self.assertEqual(len(set(live) - set(before)), 2)
+            folder = next((self.state / 'paired-trials').iterdir())
+            request = cloud_gate.read(next(folder.glob('*/request.json')))
+            self.assertEqual(request['expires'], now + lifetime * 60)
+            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
+
+            def second_service(_command: Sequence[str], _unit: str) -> int:
+                remote = self.remote_branches()
+                self.assertEqual({ref: commit for ref, commit in remote.items() if ref in live}, live)
+                self.assertEqual(len(set(remote) - set(live)), 2)
+                return 0
+
+            with (mock.patch.object(time, 'time', return_value=now + 120),
+                  mock.patch.object(trial, 'paired_service', side_effect=second_service)):
+                self.assertEqual(self.invoke_trial(), 0)
+            self.assertEqual(self.remote_branches(), live)
+            return 0
+
+        with (mock.patch.object(time, 'time', return_value=now),
+              mock.patch.object(trial, 'paired_service', side_effect=first_service)):
+            self.assertEqual(self.invoke_trial(), 0)
+        self.assertEqual(self.remote_branches(), before)
+
+    def test_start_sweep_failure_reports_once_and_continues(self) -> None:
+        now = 1700000000
+        old = now - 1
+        branch = f'refs/heads/gate-trial-{old}-' + 'a' * 32 + '-base'
+        _ = trial.checked_git(self.repo, 'push', str(self.origin), self.base + ':' + branch)
+        before = self.remote_branches()
+        git = trial.checked_git
+        for failure in ('list', 'delete'):
+            with self.subTest(failure=failure):
+                def refuse_sweep(repo: Path, *arguments: str) -> str:
+                    listing = arguments[0] == 'ls-remote' and arguments[-1] == 'refs/heads/gate-trial-*'
+                    deleting = arguments[0] == 'push' and '--delete' in arguments and arguments[-1] == branch
+                    if (failure == 'list' and listing) or (failure == 'delete' and deleting):
+                        raise subprocess.CalledProcessError(1, ['git', *arguments])
+                    return git(repo, *arguments)
+
+                errors = StringIO()
+                with (mock.patch.object(trial, 'checked_git', side_effect=refuse_sweep),
+                      mock.patch.object(time, 'time', return_value=now),
+                      mock.patch.object(trial, 'paired_service', return_value=0) as service,
+                      redirect_stderr(errors)):
+                    self.assertEqual(self.invoke_trial(), 0)
+                service.assert_called_once()
+                self.assertEqual(errors.getvalue().splitlines(), ['paired trial: could not sweep old branches for gate-trial'])
+                self.assertEqual(self.remote_branches(), before)
+
+    def test_interrupted_service_deletes_both_trial_branches(self) -> None:
+        service = trial.paired_service
+        branches = self.remote_branches()
+        for number in (signal.SIGINT,):
+            with self.subTest(signal=number):
+                def stop_terminal(_command: Sequence[str]) -> None:
+                    signal.raise_signal(number)
+
+                def interrupted(command: Sequence[str], unit: str) -> int:
+                    self.assertEqual(len(set(self.remote_branches()) - set(branches)), 2)
+                    with (mock.patch.object(subprocess, 'call', side_effect=stop_terminal),
+                          mock.patch.object(subprocess, 'run') as stop):
+                        result = service(command, unit)
+                        stop.assert_called_once_with(['systemctl', '--user', 'stop', unit], check=False)
+                        return result
+
+                with mock.patch.object(trial, 'paired_service', side_effect=interrupted):
+                    self.assertEqual(self.invoke_trial(), 1)
+                self.assertEqual(self.remote_branches(), branches)
+
+    def test_setup_failure_deletes_only_branches_already_pushed(self) -> None:
+        git = trial.checked_git
+        branches = self.remote_branches()
+        for fail_after in (0, 1, 2):
+            with self.subTest(pushed=fail_after):
+                pushed: list[str] = []
+
+                def fail_push(repo: Path, *arguments: str) -> str:
+                    if arguments[0] == 'push' and '--delete' not in arguments:
+                        if len(pushed) == fail_after:
+                            raise subprocess.CalledProcessError(1, ['git', *arguments])
+                        reply = git(repo, *arguments)
+                        pushed.append(arguments[-1])
+                        return reply
+                    return git(repo, *arguments)
+
+                output = StringIO()
+                with (mock.patch.object(trial, 'checked_git', side_effect=fail_push),
+                      mock.patch.object(cloud_gate, 'service_command', side_effect=ValueError('fixture setup failure')),
+                      mock.patch.object(trial, 'paired_service') as service,
+                      redirect_stdout(output), redirect_stderr(StringIO())):
+                    self.assertEqual(self.invoke_trial(), 1)
+                service.assert_not_called()
+                self.assertEqual(len(pushed), fail_after)
+                self.assertEqual(self.remote_branches(), branches)
+
+    def test_accepted_push_with_client_error_is_deleted(self) -> None:
+        git = trial.checked_git
+        branches = self.remote_branches()
+        accepted: list[str] = []
+
+        def fail_after_acceptance(repo: Path, *arguments: str) -> str:
+            reply = git(repo, *arguments)
+            if arguments[0] == 'push' and '--delete' not in arguments:
+                accepted.append(arguments[-1])
+                raise subprocess.CalledProcessError(1, ['git', *arguments])
+            return reply
+
+        with (mock.patch.object(trial, 'checked_git', side_effect=fail_after_acceptance),
+              mock.patch.object(trial, 'paired_service') as service,
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(self.invoke_trial(), 1)
+        self.assertEqual(len(accepted), 1)
+        service.assert_not_called()
+        self.assertEqual(self.remote_branches(), branches)
+
+    def test_cleanup_list_failure_names_trial_once_and_keeps_status(self) -> None:
+        git = trial.checked_git
+        for status in (0, 7):
+            with self.subTest(status=status):
+                listings: list[str] = []
+
+                def refuse_listing(repo: Path, *arguments: str) -> str:
+                    if arguments[0] == 'ls-remote' and arguments[-1] != 'refs/heads/gate-trial-*':
+                        listings.append(arguments[-1])
+                        raise subprocess.CalledProcessError(1, ['git', *arguments])
+                    return git(repo, *arguments)
+
+                errors = StringIO()
+                with (mock.patch.object(trial, 'checked_git', side_effect=refuse_listing),
+                      mock.patch.object(trial, 'paired_service', return_value=status), redirect_stderr(errors)):
+                    self.assertEqual(self.invoke_trial(), status)
+                self.assertEqual(len(listings), 1)
+                name = listings[0].removeprefix('refs/heads/gate-trial-').removesuffix('-*')
+                _epoch, _separator, trial_id = name.partition('-')
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    'paired trial: could not list branches for trial ' + trial_id])
+                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + name + '-base'], self.base)
+                self.assertEqual(self.remote_branches()['refs/heads/gate-trial-' + name + '-changed'], self.changed)
+
+    def stalled_network_trial(self, *, interrupt: bool) -> None:
+        git = shutil.which('git')
+        assert git is not None
+        tools = self.root / 'network-tools'
+        tools.mkdir()
+        pids = self.root / 'git-processes.json'
+        fake = tools / 'git'
+        _ = fake.write_text(f'''#!{sys.executable}
+import json, os, pathlib, signal, subprocess, sys
+arguments = sys.argv[1:]
+if 'push' in arguments and '--delete' not in arguments:
+    subprocess.run([{git!r}, *arguments], check=True)
+    child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])
+    blocked = sorted(int(number) for number in signal.pthread_sigmask(signal.SIG_BLOCK, []))
+    pathlib.Path({str(pids)!r}).write_text(json.dumps(dict(group=os.getpid(), child=child.pid, blocked=blocked)))
+    if {interrupt!r}:
+        os.kill(os.getppid(), signal.SIGINT)
+    signal.pause()
+os.execv({git!r}, [{git!r}, *arguments])
+''')
+        fake.chmod(0o700)
+        config = self.root / 'cloud_gate.conf'
+        _ = config.write_text(config.read_text().replace('git_network_timeout_s=60', 'git_network_timeout_s=2'))
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
+        branches = self.remote_branches()
+        script = '''import ctypes, json, os, signal, sys
+from pathlib import Path
+from unittest import mock
+from scripts.aws_target import gate_trial
+from scripts.lib.process_group import send_process_group
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+repo, base, changed, state, settings, pids = sys.argv[1:]
+with (mock.patch.object(gate_trial, 'account_settings_path', return_value=Path(settings)),
+      mock.patch.object(gate_trial, 'paired_service', side_effect=AssertionError('unexpected service'))):
+    status = gate_trial.paired_main(['--repo', repo, '--base', base, '--changed', changed,
+                                   '--modules', 'fixture/test_sample.py'], Path(state))
+assert status == 1
+processes = json.loads(Path(pids).read_text())
+assert signal.SIGINT not in processes['blocked']
+assert os.waitpid(processes['child'], 0)[0] == processes['child']
+try:
+    send_process_group(processes['group'], 0)
+except ProcessLookupError:
+    pass
+else:
+    raise AssertionError('Git process group survived')
+'''
+        try:
+            reply = subprocess.run([sys.executable, '-c', script, str(self.repo), self.base, self.changed,
+                                    str(self.state), str(self.settings), str(pids)], capture_output=True, text=True,
+                                   env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH']},
+                                   timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(reply.returncode, 0, reply.stderr)
+            if not interrupt:
+                self.assertIn('timed out', reply.stderr)
+            self.assertEqual(self.remote_branches(), branches)
+        finally:
+            if pids.exists():
+                processes = ledger.mapping(cast(object, json.loads(pids.read_text())))
+                try:
+                    send_process_group(processes['group'], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'The test requires a Linux child subreaper')
+    def test_hung_push_kills_its_process_group_and_cleans_remote_branch(self) -> None:
+        self.stalled_network_trial(interrupt=False)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'The test requires a Linux child subreaper')
+    def test_keyboard_interrupt_during_push_kills_its_process_group_and_cleans_remote_branch(self) -> None:
+        self.stalled_network_trial(interrupt=True)
+
+    def test_keyboard_interrupt_after_first_push_deletes_the_pushed_branch(self) -> None:
+        git = trial.checked_git
+        branches = self.remote_branches()
+        pushed: list[str] = []
+
+        def interrupt_push(repo: Path, *arguments: str) -> str:
+            reply = git(repo, *arguments)
+            if arguments[0] == 'push' and '--delete' not in arguments:
+                pushed.append(arguments[-1])
+                raise KeyboardInterrupt
+            return reply
+
+        with (mock.patch.object(trial, 'checked_git', side_effect=interrupt_push),
+              mock.patch.object(trial, 'paired_service') as service,
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(self.invoke_trial(), 1)
+        self.assertEqual(len(pushed), 1)
+        service.assert_not_called()
+        self.assertEqual(self.remote_branches(), branches)
+
+    def test_delete_failure_names_branch_once_and_keeps_trial_status(self) -> None:
+        git = trial.checked_git
+        for status in (0, 7):
+            with self.subTest(status=status):
+                branches = self.remote_branches()
+                refused: list[str] = []
+
+                def refuse_delete(repo: Path, *arguments: str) -> str:
+                    if arguments[0] == 'push' and '--delete' in arguments and arguments[-1].endswith('-base'):
+                        refused.append(arguments[-1])
+                        raise subprocess.CalledProcessError(1, ['git', *arguments])
+                    return git(repo, *arguments)
+
+                errors = StringIO()
+                with (mock.patch.object(trial, 'checked_git', side_effect=refuse_delete),
+                      mock.patch.object(trial, 'paired_service', return_value=status), redirect_stderr(errors)):
+                    self.assertEqual(self.invoke_trial(), status)
+                self.assertEqual(len(refused), 1)
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    'paired trial: could not delete branch ' + refused[0].removeprefix('refs/heads/')])
+                self.assertEqual(self.remote_branches(), {**branches, refused[0]: self.base})
 
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):
@@ -463,9 +887,17 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue()), {'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True})
 
-    def test_terminal_signals_stop_the_owning_service(self) -> None:
+    def test_terminal_exception_stops_the_owning_service(self) -> None:
+        with (mock.patch.object(subprocess, 'call', side_effect=OSError('fixture')),
+              mock.patch.object(subprocess, 'run') as stop,
+              mock.patch.object(signal, 'signal', side_effect=AssertionError('handler'))):
+            with self.assertRaises(OSError):
+                _ = trial.paired_service(['fixture'], 'fixture-unit')
+        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+
+    def test_terminal_interrupt_stops_the_owning_service(self) -> None:
         from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
 from scripts.aws_target import gate_trial

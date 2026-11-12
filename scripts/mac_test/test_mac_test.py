@@ -1629,6 +1629,30 @@ for arguments in (
         _ = self.command("unblock", "--holder", "alice")
         self.assertEqual(len(self.hold_events(2)), 2)
 
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            member = fixture_member("producer", name="before-rename")
+            result = self.command("block", "--holder", member.id, "--for", "staff hold")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.block_state()["holder"], member.id)
+            member = staff.rename(member.id, "after-rename")
+            status = self.command("status")
+            self.assertIn("blocked by after-rename since ", status.stdout)
+            self.assertNotIn(member.id, status.stdout)
+            self.assertEqual(mac_test.delivery_target(mac_test.HolderQueue(member.id)), member.id)
+            self.assertEqual(mac_test.delivery_target(mac_test.RecordedSession("old-conversation", member.id)), member.id)
+            staff_path = self.root / "staff.json"
+            saved_staff = staff_path.read_bytes()
+            try:
+                _ = staff_path.write_text("{broken")
+                status = self.command("status")
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertIn(f"blocked by {member.id} since ", status.stdout)
+            finally:
+                _ = staff_path.write_bytes(saved_staff)
+            result = self.command("unblock", "--holder", member.id)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((self.state_directory / "block.json").exists())
+
     def test_pending_block_records_begin_before_it_becomes_active(self) -> None:
         result = self.command("claim", "--pid", str(os.getpid()), "--what", "local tests", "--worktree", str(self.root))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

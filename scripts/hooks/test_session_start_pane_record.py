@@ -12,6 +12,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.hooks import staff_session_identity
+from scripts.herdr import pane_launch
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
 from scripts.agents import pane_record
@@ -65,7 +66,7 @@ class SessionStartPaneRecordTests(StaffTestCase):
         with mock.patch.object(staff_session_identity, 'handle', wraps=staff_session_identity.handle) as handle:
             self.record_start(['claude', '--model', 'sonnet'], session_id)
         handle.assert_called_once()
-        entry = pane_record.read_strict('agents')['w16:p3']
+        entry = cast(pane_launch.NativePaneLaunch, pane_record.read_strict('agents')['w16:p3'])
         self.assertEqual(entry['session_id'], session_id)
         self.assertEqual(entry['cwd'], str(self.root))
         self.assertEqual(entry['model'], 'sonnet')

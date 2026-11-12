@@ -1125,7 +1125,8 @@ def approved_ticket(
         if not decision_approves(decision, selected_rules, crate):
             raise style_ledger.LedgerError("proposal approval or filed findings changed")
     moves = approved_file_renames(findings)
-    allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
+    allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves}
+                        | {path for finding in findings for path in ledger.finding_needs(finding.finding_id)})
     return ApprovedTicket(findings, moves, allowed)
 
 
@@ -1429,7 +1430,7 @@ def gate_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, source_
         return format_check(repo)
     approved = approved_ticket(ledger, ticket_id, origin)
     findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
-    # A widened path is allowed as it is; the rename and move checks below do not read it.
+    # Widened paths and recorded needs permit edits without the reference checks for outside files.
     outside = changed_files(repo) - allowed - set(origin.widened)
     pairs = approved_rename_pairs(findings)
     bindings = binding_pairs(findings)
@@ -1928,6 +1929,7 @@ class ReadWindow:
 
 
 _NO_READ_WINDOWS: Mapping[str, tuple[ReadWindow, ...]] = MappingProxyType({})
+_NO_FINDING_NEEDS: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 
 
 def read_windows(text: str) -> tuple[ReadWindow, ...]:
@@ -2051,7 +2053,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                crate_targets: CrateTargets = CrateTargets.LIBRARY,
                proposal_cells: tuple[style_ledger.ProposalCell, ...] = (),
                waived_findings: tuple[style_ledger.HeldFinding, ...] = (),
-               review_scope: ReviewScope = ReviewScope.PRODUCTION) -> str:
+               review_scope: ReviewScope = ReviewScope.PRODUCTION,
+               needs_by_finding: Mapping[str, tuple[str, ...]] = _NO_FINDING_NEEDS) -> str:
     ticket_id = ticket["id"]
     number = ticket_id
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -2104,6 +2107,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         files.append(line)
     # A path that `widen` added is the ticket's work too; the line names who added it and why.
     files.extend(f"- {style_ledger.widened_line(widened)}" for widened in ticket["widened"])
+    needed_by: dict[str, list[str]] = {}
+    for finding_id, paths in needs_by_finding.items():
+        for path in paths:
+            if path not in ticket["files"]:
+                needed_by.setdefault(path, []).append(finding_id)
+    files.extend(f"- `{path}` — needed by finding {', '.join(identities)}" for path, identities in needed_by.items())
     authorization = (
         f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
         + "Read the issue for its sites and before/after changes. " + style_ledger.FINDING_REPLACEMENT_GUIDANCE
@@ -2209,7 +2218,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
-        *([f"When a finding's file, or a file its change edits, is reserved, unmerged or dirty, yield the finding's file with "
+        *(["Record each reserved, unmerged or dirty file that the finding needs outside this ticket. Use "
+           + "`style_ledger.py held need --repo . --finding <finding id> --path <file>`.",
+           f"When a finding's file, or a file its change edits, is reserved, unmerged or dirty, yield the finding's file with "
            + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: its findings stay filed for a "
            + "later ticket, and the gate skips them."] if approved else []),
         (("Apply the approved findings. "
@@ -2308,7 +2319,9 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
             atomic_write(path, pinned.text)
     waived = _waived_ticket_findings(ledger, ticket, rule_paths)
     review = ticket_review_scope(ledger.repo, ticket, held) if ticket["kind"] == "proposal" else ReviewScope.PRODUCTION
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived, review)
+    needs_by_finding = {identity: ledger.finding_needs(identity) for identity in ticket["finding_ids"]}
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived, review,
+                       needs_by_finding=needs_by_finding)
     if any(match.group("id") == ticket["id"] and "status: todo" not in match.group(0).splitlines()[0]
            for match in PHASE.finditer(text)):
         return
@@ -2358,18 +2371,19 @@ def made_before_decisions(ticket_id: str) -> str:
 
 
 class EditedFiles:
-    """The files that each approved finding's change edits, as the gate lets it edit them, read once per refill at the
-    synced tip and at the unit base, so a reference that the unit's branch added after the sync counts. The tip is read
-    on first use, so a refill that needs no footprint reads no tip.
+    """The computed and recorded edit paths of each approved finding.
 
-    A file rename edits its own file, its new file and each Rust file whose module sites `renamed_text` renames at
-    either commit; a file that names the old module but that `renamed_text` cannot read, or whose `path` attribute it
-    cannot read with certainty, counts as edited, and the second makes the finding wait (`uncertain`). A qualified
-    rename edits its own file and each `.rs` and `.md` file that holds its old name as a word at either commit, the
-    files `approved_reference_file` can take. A restructure of a `.rs` file edits its own file and each Rust file whose
-    `mod` line or `#[path]` string declares it at either commit, as a move of a test file into its owner removes the
-    owner's declaration; a file that names the module but that the scan cannot read, or whose `path` attribute it cannot
-    read with certainty, counts as edited. Any other finding edits its own file only.
+    Read computed paths once per refill at the synced tip and the unit base.
+    Read the tip on first use.
+    A file rename includes its own file, its new file and Rust files with module sites that `renamed_text` changes.
+    Unreadable references count as edited.
+    Uncertain `path` attributes also make the finding wait.
+    A qualified rename includes its own file and Rust or Markdown files that hold the old name as a word.
+    A restructure includes its own Rust file and files whose `mod` lines or `#[path]` strings declare it.
+    Unreadable declarations count as edited.
+    Other findings include their own file.
+    Append recorded need paths for every finding.
+    Recorded needs also extend the gate's edit approval.
     """
 
     def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
@@ -2384,22 +2398,24 @@ class EditedFiles:
         self.readings: dict[FileRename, tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]] = {}
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
-        """The finding's own file first, then each other file its change edits."""
+        """Return computed files first, then recorded need paths, without duplicates."""
         moved = file_rename(finding.kind, finding.path, finding.after)
+        pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(moved, FileRename):
             edited = (path for path, renamed in self.module_readings(moved)
                       if not isinstance(renamed, RenamedText) or renamed.module_sites)
-            return tuple(dict.fromkeys((finding.path, moved.new, *edited)))
-        pair = approved_rename(finding.kind, finding.before, finding.after)
-        if isinstance(pair, ApprovedRename):
+            computed = (finding.path, moved.new, *edited)
+        elif isinstance(pair, ApprovedRename):
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
-            return (finding.path, *dict.fromkeys(named_files))
-        if finding.kind == "restructure" and finding.path.endswith(".rs"):
+            computed = (finding.path, *named_files)
+        elif finding.kind == "restructure" and finding.path.endswith(".rs"):
             owners = (path for path, text in self.declaring(module_name(finding.path))
                       if path != finding.path and declares_module(self.repo, path, text, finding.path))
-            return (finding.path, *dict.fromkeys(owners))
-        return (finding.path,)
+            computed = (finding.path, *owners)
+        else:
+            computed = (finding.path,)
+        return tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """For a file rename, each file at either commit that names the old module and has a `path` word the rename gate
@@ -3218,8 +3234,8 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
             "Type Design Contract: ~/.claude/docs/type_design.md applies to the code you change.\n"
             "Edit only the listed paths.\n"
             "Run no git add, commit, stash, reset or checkout.\n"
-            "Start no detached run you will not wait on.\n"
-            "Finish your summary before you end your turn.\n\n"
+            "After you start a detached run, end your turn. Its result arrives as your next message.\n"
+            "Write your summary after the last result arrives.\n\n"
         )
         atomic_write(prompt, (header + match.group(0)).encode())
     paths = directory / "ticket-paths.txt"

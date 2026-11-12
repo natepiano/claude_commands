@@ -25,6 +25,7 @@ from typing import Literal, TypeGuard, TypedDict, cast
 from scripts.lib import conf
 
 from scripts.message import sessions  # noqa: E402
+from scripts.production import staff
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 RELAY_ONLY_SENDERS = frozenset({"shutdown"})
@@ -208,9 +209,18 @@ def new_entry_id() -> str:
     return uuid.uuid4().hex
 
 
-def reply_destination(sender: str, live: list[sessions.SessionRecord]) -> ReplyDestination:
-    matches = [session for session in live if session["name"] == sender]
-    return ReplyToSession(matches[0]["sessionId"]) if len(matches) == 1 else ReplyUnroutable()
+def reply_destination(sender: str, live: list[sessions.SessionRecord], *,
+                      membership: staff.StaffSnapshot | None = None) -> ReplyDestination:
+    """Select a reply through a fixed staff ID or an explicit session address."""
+    if sender.startswith("session:"):
+        identity = sender.removeprefix("session:")
+    elif sender.startswith("staff:"):
+        record = staff.snapshot() if membership is None else membership
+        member = record.by_id(staff.StaffId(sender.removeprefix("staff:")))
+        identity = member.current_session if member is not None else ""
+    else:
+        return ReplyUnroutable()
+    return ReplyToSession(identity) if identity and any(item["sessionId"] == identity for item in live) else ReplyUnroutable()
 
 
 def wire_entry(entry_id: str, session: sessions.SessionRecord, sender: str,
@@ -363,6 +373,7 @@ def no_key_resolution(result: Delivered | RelayRequired) -> None:
 
 def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id: str,
             text: str, live: list[sessions.SessionRecord], *, deadline: float = inf,
+            reply_identity: str = "", membership: staff.StaffSnapshot | None = None,
             publish: Callable[[Path, Path], bool] = publish_entry,
             resolve: Callable[[Delivered | RelayRequired], None] = no_key_resolution) -> Attempt:
     started = time.monotonic()
@@ -378,7 +389,7 @@ def attempt(state: Path, session: sessions.SessionRecord, sender: str, entry_id:
     grace = claim_grace_seconds()
     interval = poll_seconds()
     wait_deadline = min(time.monotonic() + wait, deadline)
-    entry = wire_entry(entry_id, session, sender, reply_destination(sender, live), text,
+    entry = wire_entry(entry_id, session, sender, reply_destination(reply_identity, live, membership=membership), text,
                        int(time.time() * 1000) + int(wait * 1000))
     temporary = root / "outbox" / f".{entry_id}.json.tmp"
     result: Attempt | ResultPending = ResultPending()

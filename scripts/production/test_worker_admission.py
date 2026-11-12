@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.agents import worker_lifecycle
 from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import claude_worker
 from scripts.message import sessions
@@ -298,8 +299,8 @@ class FamilyHandoffTests(StaffTestCase):
 
     def test_both_formats_keep_complete_histories_and_report_malformed_records_once(self) -> None:
         for family in ("claude", "codex"):
-            for malformed in (False, True):
-                with self.subTest(family=family, malformed=malformed):
+            for malformed, compressed in ((False, False), (False, True), (True, False), (True, True)):
+                with self.subTest(family=family, malformed=malformed, compressed=compressed):
                     allowed, source, evidence = self.source(family, turns=90 if not malformed else 3,
                                                             malformed=malformed)
                     assert isinstance(allowed.slot, worker_admission.ExistingWorkerSlot)
@@ -310,7 +311,8 @@ class FamilyHandoffTests(StaffTestCase):
                         for call in calls:
                             _ = transcript.write(json.dumps({"type": "response_item", "payload": {
                                 "type": "custom_tool_call", "name": "exec", "input": call}}) + "\n")
-                    before = source.read_bytes(), self.staff_file.read_bytes()
+                    stored = compressed_copy(source) if compressed else source
+                    before = stored.read_bytes(), self.staff_file.read_bytes()
                     with redirect_stderr(io.StringIO()) as errors:
                         handoff = worker_admission.extract_transcript(allowed.slot.row, allowed.run,
                             staff.ClaudeBackend() if family == "claude" else staff.CodexBackend(self.root / "codex"))
@@ -329,10 +331,29 @@ class FamilyHandoffTests(StaffTestCase):
                     prompt = handoff.opening()
                     self.assertLess(prompt.index(str(handoff.extract)), prompt.index(str(source)))
                     self.assertIn("only when the extract does not answer", prompt)
-                    self.assertEqual((source.read_bytes(), self.staff_file.read_bytes()), before)
+                    if compressed:
+                        self.assertEqual((stored.read_bytes(), self.staff_file.read_bytes()), before)
+                    else:
+                        self.assertEqual((source.read_bytes(), self.staff_file.read_bytes()), before)
                     self.assertEqual(len(errors.getvalue().splitlines()), int(malformed), errors.getvalue())
                     if malformed:
                         self.assertIn(allowed.name, errors.getvalue())
+
+    def test_codex_source_uses_the_newest_saved_transcript_mtime(self) -> None:
+        identity = fixture_runtime_id("archived-source")
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                home = self.root / f"source-{compressed}"
+                older = home / "sessions" / f"rollout-{identity}.jsonl"
+                newer = home / "archived_sessions" / f"rollout-{identity}.jsonl"
+                for path, message, timestamp in ((older, "Old assignment", 1), (newer, "Saved assignment", 2)):
+                    write_text_atomic(path, json.dumps({"type": "event_msg", "payload": {
+                        "type": "user_message", "message": message}}) + "\n")
+                    os.utime(path, (timestamp, timestamp))
+                stored = compressed_copy(newer) if compressed else newer
+                source = worker_admission.codex_transcript_source(identity, home)
+                self.assertEqual(source, stored)
+                self.assertEqual(list(worker_admission.transcript_entries(source, set())), ["user:\nSaved assignment"])
 
     def test_unavailable_transcript_reports_one_anomaly(self) -> None:
         allowed, source, _ = self.source("claude")

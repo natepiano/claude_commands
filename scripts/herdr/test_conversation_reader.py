@@ -171,7 +171,7 @@ class ConversationReaderTests(StaffTestCase):
         for pid in (998071, 998072):
             self.codex(pane=False, arguments=["codex"], environment={"CODEX_HOME": str(home)}, pid=pid)
         read = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "socket"), [
-            codex_daemon.DaemonSession(identity, "test-client", str(self.root), "idle")
+            codex_daemon.DaemonSession(identity, str(self.root), "idle")
             for identity in (self.identity, self.launched)])
         with patch.object(codex_daemon, "read_daemons", return_value=[read]) as reader:
             snapshot = herdr.codex_conversations()

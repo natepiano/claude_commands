@@ -1012,3 +1012,104 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Files:**
 - `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
 - `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
+
+### Phase 50 — Gate records hold each module's start and end time · status: done
+
+#### As-built
+
+- Each gate module run records its wall-clock start and end. `start_gate_job` sets `RunningGateJob.started_at`; `finish_gate_job` passes it on and sets `ended_at`. A hold restart keeps both times.
+- `GateJobResult` and `gate_record.Execution` carry `started_at` and `ended_at` as keyword-only `float | None`. `None` means "not recorded": a job that never started, or a result from a box that runs an older tree.
+- `gate_record.module_runs` writes `started_at` and `ended_at` as UTC ISO text (`store.utc_iso`) only when recorded. `ModuleRun` marks both keys `NotRequired`.
+- The cloud transfer keeps the times. `gate_box.encode_run` leaves out an unknown time. The decoder accepts a row with no times and refuses a negative or non-finite time.
+- `buildlog` schema 40 adds `gate_modules.module_started_at` and `module_ended_at` (TEXT). Older records give NULL. `gate_runs.started_at` is still the run start.
+- `docs/as-built/merge-gate-and-test-speed.md` has a "Module start and end times" section with the ordering query.
+
+**Files:**
+- `scripts/production/merge_gate.py` — `GateJobResult`, `RunningGateJob`, `start_gate_job`, `finish_gate_job`, `record_gate_run`.
+- `scripts/test_times/gate_record.py` — `ModuleRun`, `Execution`, `module_runs`.
+- `scripts/aws_target/gate_box.py` — `encode_run`, the job decoder, `execution_records`.
+- `scripts/buildlog/index.py` — `SCHEMA_VERSION`, `GATE_MODULE_COLUMNS`, `add_gate_run`.
+- `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
+
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: done
+
+#### As-built
+
+- `gate_record.py` has two frozen dataclasses. `WallClockSpan(started_at, ended_at)` holds the wall-clock epoch seconds of one module attempt. `WallClockNotRecorded(reason)` means the attempt has no recorded span.
+- `gate_record.Execution` and `merge_gate.GateJobResult` hold one keyword field `wall_clock: WallClockSpan | WallClockNotRecorded`. The defaults are `WallClockNotRecorded("not recorded")` and `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets a `WallClockSpan`; `RunningGateJob.started_at` stays a `float`.
+- `module_runs` writes `started_at` and `ended_at` only for a span. The JSON record and the `buildlog` columns do not change.
+- The cloud wire format does not change. `gate_box.encode_job` writes the top-level `started_at` and `ended_at` keys only for a span. The decoder gives a span for both keys, `WallClockNotRecorded("box result has no module times")` for none, and `WallClockNotRecorded("box result has only one module time")` for one. A row with one time keeps its job status and gate result. A negative or non-finite time is still refused.
+- `docs/as-built/merge-gate-and-test-speed.md` says that a cloud row with only one of the two times records neither.
+- A separate main fix (0236b558e) narrowed the Phase 50 test times. A merge of it with this phase conflicts in `test_merge_gate_suites_tripwires.py`; keep this phase's side.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `WallClockSpan`, `WallClockNotRecorded`, `Execution`, `module_runs`.
+- `scripts/production/merge_gate.py` — `GateJobResult`, `finish_gate_job`, `record_gate_run`.
+- `scripts/aws_target/gate_box.py` — `encode_job`, the job decoder, `execution_records`.
+- `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py` — the tests, with half-timed cloud rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — partial cloud times.
+
+### Phase 52 — The 10-minute disk job reads almost nothing · status: done
+
+#### As-built
+
+- `disk.snapshot()` walks the build folders only when there is no full previous snapshot (none, or an old shape), or when the last walk is at least `DISK_WALK_MINUTES` old **and** the current hour in the user's zone (`scripts.lib.user_zone.user_zone()`) is `DISK_WALK_HOUR`.
+- Every other run refreshes only free and used space: `/` and each `filesystems` row through `filesystem.filesystem_usage`. A path that fails keeps its old row. It refreshes `floor` and sets `capacity_measured_at`. It keeps `rows`, the outside data, `measured_at`, `previous_measured_at` and `output_unavailable`. It calls no walk function. A whole `buildlog disk` refresh took 0.17-0.28 s on a copy of the live `disk.json`.
+- A full walk sets `capacity_measured_at` equal to `measured_at`. `sweep.read_disk_measurement` still reads the walk time, so folder growth spans walks.
+- `report.disk_section` names both times when they differ: `Folder sizes measured by the buildlog disk job at {walk}; free and used space at {capacity}: allocated blocks, each hard-linked file once.` Without the key, or with equal times, it keeps the one-time line.
+- `config/buildlog.conf`: `DISK_WALK_MINUTES=1200` (below a day, so drift never skips the daily walk) and `DISK_WALK_HOUR=3` (the builds showrunner, 2026-11-12: a walk at a random daytime minute makes the keyboard stick).
+- natedev's IO scheduler is `none`, so `ionice` has no effect; the interval and the quiet hour are the fix.
+- With a daily walk, floor-crossing alerts drop folder choices after 15 minutes (`sweep_snapshot_max_age_seconds=900`). Phase 53 holds the fix.
+
+**Files:**
+- `config/buildlog.conf` — `DISK_WALK_MINUTES`, `DISK_WALK_HOUR`.
+- `scripts/buildlog/disk.py` — `snapshot()`, `capacity_measured_at` in `DiskSnapshot` and `MeasuredDiskSnapshot`.
+- `scripts/buildlog/report.py` — the `disk_section` closing line.
+- `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
+
+### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: todo
+
+Found by the Phase 52 reviews (finding F001, routed here).
+
+**Pending decision: raise `sweep_snapshot_max_age_seconds` from 900 to 100800**
+
+Actual problem:
+`scripts/lint/sweep.py` `folder_choices` (line 3316) offers folders in a floor-crossing alert only when the last folder walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders, and `disk_measurement_lines` (line 3150) marks the measurement "stale".
+
+What exists now:
+- `config/lint.conf`: `sweep_snapshot_max_age_seconds=900`.
+- `buildlog disk` walks once a day in the 03:00 hour (user's zone) and refreshes only free and used space at other times.
+- Two walks can be more than 25 hours apart: on the day clocks go back, 03:08 EDT to 03:10 EST the next day is 90,120 seconds, and a walk takes about 8 minutes.
+
+What should change:
+- Raise the value to 100800 (28 hours) through `/tune`. Then "stale" means a missed daily walk, with room for the clock change, timer drift and the walk time.
+
+Recommendation:
+Raise it to 100800. A changed config value needs the user's go. Sent to the builds showrunner 2026-11-12.
+
+#### Work Order
+
+**Goal:** A floor-crossing alert offers folder choices from the last daily disk walk, and calls the measurement stale only when a daily walk was missed.
+
+**Spec:**
+- `config/lint.conf`: set `sweep_snapshot_max_age_seconds` to the approved value through `/tune`. Update its Basis line: the disk walk runs once a day (Phase 52), and the value covers a 25-hour day plus timer drift and the walk time.
+- Folder freshness stays on `measured_at` (the walk time). `capacity_measured_at` does not make folder sizes fresh. No code change in `sweep.py` is expected.
+- `docs/as-built/build-followups.md` **Measuring** paragraph: say that `snapshot()` walks only when no full previous snapshot exists, or when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` (user's zone). Other runs refresh free and used space only and set `capacity_measured_at`. Add the two-time report line beside the one-time example.
+- Add rows to the existing tests in `scripts/lint/test_sweep.py` (do not add a new test):
+  - in `test_unavailable_crossing_measurement_names_no_folder`'s neighbor that checks offered choices: a measurement 26 hours old under the approved limit offers its folders;
+  - a measurement older than the limit offers none and says "stale".
+
+**Files:**
+- `config/lint.conf`
+- `scripts/lint/test_sweep.py`
+- `docs/as-built/build-followups.md`
+
+**Workers:** `1 writer`
+- writer: the config value and the sweep test rows.
+
+**State:** none.
+
+**Acceptance gate:**
+- `scripts.lint.test_sweep` passes, with the two new rows.
+- `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.

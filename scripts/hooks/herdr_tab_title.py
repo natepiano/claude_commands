@@ -20,6 +20,7 @@ from scripts.herdr import herdr_types  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff
 from scripts.agents import pane_record
+from scripts.herdr import pane_launch
 
 
 class StopPayload(TypedDict, total=False):
@@ -43,11 +44,11 @@ def _clear_handoff_pending(session_id: str, shared: str, pane: str, record: staf
         entry = pane_record.read_strict(shared).get(pane)
     except (OSError, ValueError):
         return False
-    if entry is None or entry["session_id"] == session_id or entry.get("ended"):
+    if entry is None or pane_launch.reference_id(entry) == session_id or entry.get("ended"):
         return False
     pid, started = entry.get("pid"), entry.get("proc_start")
     if (not isinstance(pid, int) or isinstance(pid, bool) or not started
-            or record.by_member_reference(entry["session_id"]) is None):
+            or record.by_member_reference(pane_launch.reference_id(entry)) is None):
         return False
     for path in sessions.sessions_dir().glob("*.json"):
         current = sessions.read_session(path)

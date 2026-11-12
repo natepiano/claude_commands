@@ -238,7 +238,7 @@ def registered_showrunners(
         live = sessions_by_id.get(row.current_session)
         registered.append(showrunners.Showrunner(
             name=row.name,
-            session=live["name"] if live is not None else "",
+            session=row.name if live is not None else "",
             socket=live["messagingSocketPath"] if live is not None else "",
             doc=str(doc.path),
             zone=timer.zone if isinstance(timer, showrunners.TimerRegistration) else user_zone_name()))
@@ -312,7 +312,7 @@ def production_places(
         name = parent.name
         owner = by_id.get(parent.current_session)
         relationship: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(name, owner["name"], f"session:{parent.current_session}")
+            UnderShowrunner(name, parent.name, f"session:{parent.current_session}")
             if owner is not None else ProductionWithoutRunningShowrunner(name))
         places[identity] = ProductionPlace(relationship, DirectsUnit(row.name))
     return places
@@ -339,8 +339,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             if (parent := record.parent_of(row)) is not None}
         places = production_places(records, set(directors), diagnostics,
                                    record=record, resolver=resolver)
-        # Label readers stay silent and retain each session's recorded name.
-        names: dict[str, str] = {item["sessionId"]: item["name"] for item in records}
+        # Read names from staff for the native sessions in this registry.
+        names: dict[str, str] = {
+            item["sessionId"]: member.name if (member := record.by_current_session(item["sessionId"])) is not None else ""
+            for item in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():
             showrunner: ShowrunnerRelationship = NoShowrunner()
