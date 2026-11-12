@@ -326,12 +326,28 @@ class UnitWatchdogTests(unittest.TestCase):
             owner = next(entry for entry in self.fixture.live if entry["pid"] == pid)
             return herdr.NativeAgentProcess(herdr.EnvironmentThread(owner["sessionId"]), "fixture-start", {})
 
+        def panes() -> list[herdr.PaneIdentity]:
+            return [{"pane_id": identity, "terminal_id": "terminal-" + identity, "workspace_id": "fixture",
+                     "tab_id": "tab-" + identity, "label": owner["name"], "session_id": identity}
+                    for identity, owner in self.units.items()]
+
+        def process_info(*arguments: str) -> dict[str, object]:
+            identity = arguments[-1]
+            owner = self.units[identity]
+            live = isinstance(self.session_liveness(identity), sessions.LiveSessionProcess)
+            pid = owner["pid"] if live else 998042
+            return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "claude" if live else "zsh",
+                                          "argv": ["claude"] if live else ["zsh"]}]}}
+
         with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               patch.object(herdr, "_PLATFORM", "linux"),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
               patch.object(reader_sessions, "session_liveness", side_effect=reader_liveness),
               patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "native_process", side_effect=native_process),
+              patch.object(herdr.Herdr, "panes", side_effect=panes),
+              patch.object(herdr.Herdr, "result", side_effect=process_info),
               patch.object(pane_record, "seed", return_value=0),
               patch.object(stop_resume, "_tab_of", side_effect=tab),
               patch.object(sessions, "process_start", return_value="fixture-start"),

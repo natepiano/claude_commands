@@ -272,17 +272,24 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
              codex: herdr.CodexConversations | None = None) -> bool:
     with operation_deadline.within(deadline):
         try:
-            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            record = staff.initial_snapshot()
+            if record.by_id(row.id) is None:
+                record = staff.StaffSnapshot((*record.rows, row))
+            panes = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client,
+                pane_record.read(client.session))
+            if not panes and any(pane["session_id"] == row.current_session for pane in client.panes()):
+                raise herdr_types.HerdrFailure(f"would signal a process that does not run session {row.current_session}",
+                                               "wrong_target")
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained; no signal sent")
                 return False
             if panes and not herdr.check_target(str(row.current_session), action="signal",
-                    place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
-                    terminal=panes[0].get("terminal_id", ""), client=client):
+                    place=herdr.HerdrPlace(client.session, str(panes[0]["pane_id"])),
+                    terminal=str(panes[0].get("terminal_id", "")), client=client):
                 return False
             if panes:
                 # End the restore entry before the signal, so no restore revives the stopped session.
-                pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
+                pane_record.end(client.session, str(panes[0]["pane_id"]), str(row.current_session),
                                 record=staff.StaffSnapshot((row,)))
         except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
@@ -475,19 +482,27 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
         target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
+        source_client = client
         try:
-            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session] if row.kind != "producer" else []
+            if publication is not None and publication.path != pane_record.record_path(client.session):
+                source_client = herdr.Herdr(publication.path.stem)
+            entries = ({original["pane_id"]: original} if original is not None else {})
+            locations = [dict(pane) for pane in source_client.panes()]
+            evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(record, locations))
+            panes = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, source_client,
+                                                entries, evidence=evidence)
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained")
-            elif panes and (original is None or original["cwd"] == str(folder)):
-                target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
-            elif (row.kind != "producer" and not panes and publication is not None
-                    and publication.path == pane_record.record_path(client.session)
-                    and publication.entry["cwd"] == str(folder)):
-                retained = next((pane for pane in client.panes() if pane["pane_id"] == publication.entry["pane_id"]), None)
-                if (retained is not None and (terminal := retained.get("terminal_id", ""))
-                        and isinstance(client.pane_activity(retained["pane_id"]), herdr.PaneAtShell)):
-                    target = herdr.ExistingPane(retained["pane_id"], terminal)
+            elif panes:
+                pane = panes[0]
+                source_pane = pane_launch.ResumeSourcePane(str(pane["pane_id"]))
+                if (row.kind != "producer" and source_client.session == client.session
+                        and (original is None or original["cwd"] == str(folder))
+                        and pane.get("terminal_id")
+                        and (pane in evidence.scan.found.get(row.id, ())
+                             or isinstance(client.pane_activity(str(pane["pane_id"])), herdr.PaneAtShell))):
+                    target = herdr.ExistingPane(str(pane["pane_id"]), str(pane["terminal_id"]))
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
@@ -561,13 +576,14 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if (publication is not None and original is not None and projected is not None
                 and (publication.path != path or result.pane != original["pane_id"])):
             try:
-                source_client = client if publication.path == path else herdr.Herdr(publication.path.stem)
-                if not pane_holds_other_work(source_client, original["pane_id"], str(row.current_session)):
+                if (isinstance(source_pane, pane_launch.ResumeSourceAbsent)
+                        or not pane_holds_other_work(source_client, source_pane.pane, str(row.current_session))):
                     completed = expectation.expected_launch(projected) if row.kind == "producer" else projected
                     pane_launch.finish_restore(publication.path, original,
                                                pane_launch.resume_attempt(path, result.pane),
                                                names.resume_proof(original, completed), close=client.close_tab_confirmed,
-                                               destination=path, close_source=source_client.close_tab_confirmed)
+                                               destination=path, close_source=source_client.close_tab_confirmed,
+                                               source_pane=source_pane)
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 _anomaly(row, error)
         try:
@@ -588,23 +604,20 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
 
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
     try:
-        panes = client.panes()
-        launches = {entry["session_id"]: entry for entry in sorted(pane_record.launches(), key=lambda entry: entry["written_at"])}
-        pane_ids = {pane["pane_id"] for pane in panes}
-        found: list[tuple[staff.StaffRow, str]] = []
-        for row in rows:
-            matches = [pane["pane_id"] for pane in panes if pane["session_id"] == row.current_session]
-            if matches:
-                found.extend((row, pane) for pane in matches)
-                continue
-            entry = max((launches[reference] for reference in (str(row.id), str(row.current_session)) if reference in launches),
-                        key=lambda entry: entry["written_at"], default=None)
-            if entry is not None and entry["pane_id"] in pane_ids:
-                found.append((row, entry["pane_id"]))
-        missing = [row for row in rows if row.kind == "producer" and not any(item.id == row.id for item, _pane in found)]
-        if missing:
-            scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
-            found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))
+        entries = pane_record.read(client.session)
+        record = staff.initial_snapshot()
+        record = staff.StaffSnapshot((*record.rows, *(row for row in rows if record.by_id(row.id) is None)))
+        with herdr.pane_evidence_run():
+            panes = [dict(pane) for pane in client.panes()]
+            evidence = pane_launch.NativePaneEvidence(panes, client.scan_row_panes(record, panes))
+            found: list[tuple[staff.StaffRow, str]] = []
+            for row in rows:
+                reference = pane_launch.StaffLaunchReference(row.id)
+                newest = max((entry for entry in entries.values() if pane_launch.launch_reference(entry, record) == reference),
+                             key=lambda entry: entry["written_at"], default=None)
+                retained = {newest["pane_id"]: newest} if newest is not None else {}
+                found.extend((row, str(pane["pane_id"])) for pane in pane_launch.reference_panes(
+                    reference, record, client, retained, evidence=evidence))
         return found
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)

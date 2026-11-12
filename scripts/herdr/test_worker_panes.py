@@ -3071,6 +3071,18 @@ class WorkerPaneTests(StaffTestCase):
                     self.assertNotIn(pane, self.world.foreground)
                 self.assertEqual(self.world.closed, [])
 
+        for family in ("claude", "codex"):
+            with self.subTest(stale_record=family):
+                missing = self.worker("stale-" + family, family=family)
+                foreign = fixture_member("unit", name="foreign-" + family, parent=self.parent.parent,
+                                         runtime_id=fixture_runtime_id("foreign-" + family))
+                pane = "w1:stale-" + family
+                self.world.add(foreign, pane, family=family)
+                self.world.record(missing, pane, family)
+                self.assertEqual(self.observation(missing), worker_panes.ClosedWorker(missing))
+                self.assertEqual(self.world.closed, [])
+
+
     def test_a_former_native_identity_does_not_prove_the_current_worker_live(self) -> None:
         row = self.worker()
         self.world.add(row, "w1:p1")

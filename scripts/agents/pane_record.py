@@ -200,17 +200,14 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
 def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | None:
     """A pane's retained launch is evidence only for that exact conversation."""
     entries = read(place.session)
-    exact = pane_launch.matching_launch(entries, place, session_id)
-    if exact is not None:
-        return exact
+    retained = pane_launch.matching_launch(entries, place, session_id)
+    if retained is None:
+        return None
     from scripts.production import staff
 
     owner = staff.initial_snapshot().by_current_session(session_id)
     if owner is None:
-        return None
-    retained = pane_launch.matching_launch(entries, place, owner.id)
-    if retained is None:
-        return None
+        return retained
     projected = retained.copy()
     projected["session_id"] = session_id
     return projected

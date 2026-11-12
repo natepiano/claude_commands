@@ -142,6 +142,95 @@ def launch_reference(entry: Mapping[str, object], record: staff.StaffSnapshot) -
     return StaffLaunchReference(owner.id) if owner is not None else NativeLaunchReference(str(entry.get("session_id", "")))
 
 
+class UnknownNativePane(Protocol):
+    @property
+    def pane(self) -> str: ...
+
+
+class NativePaneScan(Protocol):
+    @property
+    def found(self) -> Mapping[staff.StaffId, Sequence[Mapping[str, object]]]: ...
+    @property
+    def unknown(self) -> Sequence[UnknownNativePane]: ...
+
+
+class NativePaneServer(Protocol):
+    session: str
+    def panes(self) -> Sequence[Mapping[str, object]]: ...
+    def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> NativePaneScan: ...
+    def pane_activity(self, pane: str) -> object: ...
+    def result(self, *arguments: str) -> dict[str, object]: ...
+
+
+@dataclass(frozen=True)
+class NativePaneEvidence:
+    """The current server panes and their decoded native owners."""
+
+    panes: Sequence[Mapping[str, object]]
+    scan: NativePaneScan
+
+
+class ReadNativePanes(Enum):
+    CURRENT = "read the current native processes"
+
+
+def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
+                    record: staff.StaffSnapshot, client: NativePaneServer,
+                    entries: Mapping[str, PaneLaunch], *,
+                    evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT) -> list[dict[str, object]]:
+    """Select the current native pane, or its retained shell after the process stops."""
+    if isinstance(evidence, ReadNativePanes):
+        panes = [dict(pane) for pane in client.panes()]
+        evidence = NativePaneEvidence(panes, client.scan_row_panes(record, panes))
+    unknown = {item.pane for item in evidence.scan.unknown}
+    if isinstance(reference, StaffLaunchReference):
+        owner = record.rows_by_id[reference.id]
+        matches = evidence.scan.found.get(owner.id, ())
+    else:
+        matches = [pane for pane in evidence.panes if str(pane["pane_id"]) not in unknown
+                   and reference.session in _pane_native_sessions(client, pane)]
+    if matches:
+        return [dict(pane) for pane in matches]
+    retained = {pane for pane, entry in entries.items() if launch_reference(entry, record) == reference
+                or isinstance(reference, NativeLaunchReference) and entry["session_id"] == reference.session}
+    occupied = {str(pane["pane_id"]) for matches in evidence.scan.found.values() for pane in matches}
+    candidates = [pane for pane in evidence.panes
+                  if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
+                  and str(pane["pane_id"]) not in unknown]
+    if isinstance(reference, StaffLaunchReference):
+        return [dict(pane) for pane in candidates
+                if _retained_native_owner(client, pane, record.rows_by_id[reference.id], record)]
+    return [dict(pane) for pane in candidates if not any(record.by_member_reference(identity) is not None
+            for identity in _pane_native_sessions(client, pane))]
+
+
+class NativePaneDecoder(Protocol):
+    def is_codex_process(self, arguments: Sequence[str]) -> bool: ...
+    def is_claude_process(self, arguments: Sequence[str]) -> bool: ...
+    def pane_native_process(self, info: dict[str, object], kind: str,
+                            pane: Mapping[str, object]) -> CurrentProcessEvidence: ...
+
+
+def _pane_native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
+    info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
+    decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
+    identities: set[str] = set()
+    for process in cast(list[dict[str, object]], info.get("foreground_processes", [])):
+        arguments = cast(list[str], process.get("argv", []))
+        kind = "codex" if decoder.is_codex_process(arguments) else "claude" if decoder.is_claude_process(arguments) else ""
+        if kind:
+            identities.add(decoder.pane_native_process(info, kind, pane).current_identity)
+    return identities
+
+
+def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
+                           owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    """Keep the retained pane unless another staffed owner runs there."""
+    return all(current is None or current.id == owner.id
+               for identity in _pane_native_sessions(client, pane)
+               for current in (record.by_member_reference(identity),))
+
+
 def current_launch(entry: PaneLaunch, record: staff.StaffSnapshot) -> PaneLaunch:
     """Combine retained launch options with the current staff facts."""
     reference = launch_reference(entry, record)
@@ -399,7 +488,15 @@ def read_valid_entries(path: Path, *, record: staff.StaffSnapshot | None = None)
 
 
 def matching_launch(entries: Mapping[str, PaneLaunch], place: HerdrPlace, session_id: str) -> PaneLaunch | None:
+    record = staff.initial_snapshot()
+    owner = record.by_member_reference(session_id)
     entry = entries.get(place.pane)
+    if owner is not None:
+        reference = StaffLaunchReference(owner.id)
+        if entry is not None and launch_reference(entry, record) != reference:
+            return None
+        return max((entry for entry in entries.values() if launch_reference(entry, record) == reference),
+                   key=lambda entry: entry["written_at"], default=None)
     if entry is None or entry.get("pane_id") != place.pane or entry.get("session_id") != session_id:
         return None
     return entry
@@ -659,6 +756,17 @@ class ResumeRecord(Enum):
     SOURCE = "source record"
 
 
+@dataclass(frozen=True)
+class ResumeSourcePane:
+    """The operation located this source pane before the replacement launch."""
+
+    pane: str
+
+
+class ResumeSourceAbsent(Enum):
+    CURRENT = "the operation found no source pane"
+
+
 def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
     """Capture the exact publication before identity checks or cleanup."""
     entry = read_strict(path).get(pane_id)
@@ -706,28 +814,33 @@ def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: PreparedAccountMove, *, close: Callable[[str], bool],
                    destination: Path | ResumeRecord = ResumeRecord.SOURCE,
-                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication: ...
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE,
+                   source_pane: ResumeSourcePane | ResumeSourceAbsent | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication: ...
 
 
 @overload
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: VerifiedResume | FailedResume, *, close: Callable[[str], bool],
                    destination: Path | ResumeRecord = ResumeRecord.SOURCE,
-                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> None: ...
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE,
+                   source_pane: ResumeSourcePane | ResumeSourceAbsent | ResumeRecord = ResumeRecord.SOURCE) -> None: ...
 
 
 def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                    outcome: VerifiedResume | FailedResume | PreparedAccountMove, *,
                    close: Callable[[str], bool],
                    destination: Path | ResumeRecord = ResumeRecord.SOURCE,
-                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication | None:
+                   close_source: Callable[[str], bool] | ResumeRecord = ResumeRecord.SOURCE,
+                   source_pane: ResumeSourcePane | ResumeSourceAbsent | ResumeRecord = ResumeRecord.SOURCE) -> LaunchPublication | None:
     """Keep one proved launch, or retire a failed attempt after confirmed closure.
 
     The close callback must confirm that the selected tab is closed.
     A same-pane resume keeps its pane on success and failure.
     """
     destination_path = destination if isinstance(destination, Path) else path
-    same_pane = path == destination_path and original["pane_id"] == attempt.pane_id
+    source = source_pane.pane if isinstance(source_pane, ResumeSourcePane) else (
+        original["pane_id"] if isinstance(source_pane, ResumeRecord) else "")
+    same_pane = path == destination_path and source == attempt.pane_id
     if isinstance(outcome, PreparedAccountMove):
         if not same_pane:
             raise ValueError("an account move requires its original retained pane")
@@ -767,20 +880,21 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                     replacement["ended"] = False
                     save(destination_path, entries)
                 return
-            source = read_strict(path).get(original["pane_id"])
-            if source is None and replacement.get("producer_binding", False):
+            source_entry = read_strict(path).get(original["pane_id"])
+            if source_entry is None and replacement.get("producer_binding", False):
                 retained = ResumeAttempt(attempt.pane_id, replacement.copy())
-            elif source != original:
+            elif source_entry != original:
                 raise ValueError(f"{original['pane_id']}: retained launch changed before replacement")
             else:
                 retained = ResumeAttempt(attempt.pane_id, replacement.copy())
     except (OSError, ValueError):
         committed = read(destination_path).get(attempt.pane_id)
         if committed is None or not committed.get("producer_binding", False):
-            finish_restore(path, original, attempt, FailedResume(), close=close, destination=destination_path)
+            finish_restore(path, original, attempt, FailedResume(), close=close, destination=destination_path,
+                           source_pane=source_pane)
         raise
     source_close = close if isinstance(close_source, ResumeRecord) else close_source
-    if source_close(original["pane_id"]) is not True:
+    if source and source_close(source) is not True:
         return
     if destination_path == path:
         retire_launch(path, original["pane_id"], original, replacement=retained)

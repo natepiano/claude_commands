@@ -1945,6 +1945,12 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_restart_all_dry_run_lists_every_live_row_with_its_tab_position(self) -> None:
+        def shell_result(*arguments: str) -> dict[str, object]:
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": {"shell_pid": 990090, "foreground_process_group_id": 990090,
+                    "foreground_processes": [{"pid": 990090, "name": "zsh", "argv": ["zsh"]}]}}
+            return self.layout_result(*arguments)
+
         self.rows = (replace(self.rows[0], name="unit"),
             replace(self.rows[1], kind="worker", name="codex-worker", parent=staff.ReportsTo(self.rows[0].id),
                     worktree=staff.WORKTREE_UNFILLED),
@@ -1963,6 +1969,8 @@ class RestartTests(RestartTestCase):
                                side_effect=herdr_types.HerdrFailure("socket unavailable") if unavailable else None),
                   patch.object(herdr, "saved_layout", return_value=layout),
                   patch.object(self, "workspace_label", label),
+                  (patch.object(herdr.Herdr, "result", side_effect=shell_result)
+                   if identity is None else nullcontext()),
                   redirect_stderr(io.StringIO()) as errors,
                   patch.object(staff, "row_operation") as lock, patch.object(herdr, "_write_layout") as write,
                   patch.object(herdr.Herdr, "save_layout") as save, redirect_stdout(io.StringIO()) as output):
@@ -1982,6 +1990,12 @@ class RestartTests(RestartTestCase):
                 staff.StaffSnapshot(self.rows)), (remote.local_machine(), self.root / "own"))
 
     def test_codex_dry_run_uses_the_newest_pane_record_and_reports_rows_without_a_tab(self) -> None:
+        def shell_result(*arguments: str) -> dict[str, object]:
+            if arguments[:2] == ("pane", "process-info"):
+                return {"process_info": {"shell_pid": 990090, "foreground_process_group_id": 990090,
+                    "foreground_processes": [{"pid": 990090, "name": "zsh", "argv": ["zsh"]}]}}
+            return self.layout_result(*arguments)
+
         self.rows = (replace(self.rows[0], kind="producer", name="morty"), *self.rows[1:])
         row = self.rows[0]
         older: pane_record.PaneLaunch = {"kind": "codex", "pane_id": "w1:p2", "session_id": str(row.id),
@@ -1995,10 +2009,11 @@ class RestartTests(RestartTestCase):
                   patch.object(restart, "live_rows", return_value=list(self.rows)),
                   patch.object(herdr.Herdr, "panes", return_value=[{**pane, "session_id": None} for pane in self.panes()]),
                   patch.object(herdr, "saved_layout", return_value={"at": 1, "workspaces": []}),
-                  patch.object(pane_record, "launches", return_value=[newest, older]) as launches,
+                  patch.object(pane_record, "read", return_value={newest["pane_id"]: newest, older["pane_id"]: older}) as launches,
+                  patch.object(herdr.Herdr, "result", side_effect=shell_result),
                   redirect_stdout(io.StringIO()) as output):
                 self.assertEqual(restart.restart(stop_all=True, dry_run=True), 0)
-            launches.assert_called_once_with()
+            launches.assert_called_once_with("agents")
             self.assertEqual(output.getvalue().splitlines(), [
                 f"{row.name}: {row.id}, producer, workspace live, tab 1 ({row.name})",
                 *[f"{other.name}: {other.id}, {other.kind}, no tab" for other in self.rows[1:]]])
@@ -2010,10 +2025,50 @@ class RestartTests(RestartTestCase):
             "remote_control": False, "environment": {}, "flags_read": True, "written_at": "2"}
         older = entry.copy()
         older.update(pane_id="w1:p1", written_at="1")
-        with patch.object(pane_record, "launches", return_value=[entry, older]):
+        with patch.object(pane_record, "read", return_value={entry["pane_id"]: entry, older["pane_id"]: older}):
             self.assertEqual(restart.row_panes([row], herdr.Herdr("agents")), [(row, "w1:p0")])
-            with patch.object(herdr.Herdr, "panes", return_value=[{**pane, "session_id": None} for pane in self.panes()]):
+            with (patch.object(herdr.Herdr, "panes", return_value=[{**pane, "session_id": None} for pane in self.panes()]),
+                  patch.object(herdr.Herdr, "result", return_value={"process_info": {"shell_pid": 990090,
+                      "foreground_process_group_id": 990090,
+                      "foreground_processes": [{"pid": 990090, "name": "zsh", "argv": ["zsh"]}]}})):
                 self.assertEqual(restart.row_panes([row], herdr.Herdr("agents")), [])
+
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from dataclasses import replace
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        with (self.subTest(record="reused pane"),
+              patch.object(case.world, "panes", side_effect=lambda: READ_PANES(case.world))):
+            self.assertEqual(restart.row_panes([owner], case.world), [(owner, "w1:p7")])
+
+        case.world.end_agent("w1:p7")
+        case.world.record(owner, "w1:p7")
+        retained = pane_record.read("agents")["w1:p7"].copy()
+        retained["written_at"] = "2026-11-12T00:00:00+00:00"
+        pane_record.save("agents", {"w1:p7": retained})
+        other = retained.copy()
+        other.update(staff_id=foreign.id, session_id=foreign.current_session,
+                     written_at="2026-11-12T01:00:00+00:00")
+        pane_record.save("other", {"w1:p7": other})
+        with (self.subTest(record="another server reuses the pane id"),
+              patch.object(case.world, "panes", side_effect=lambda: READ_PANES(case.world))):
+            self.assertEqual(restart.row_panes([owner], case.world), [(owner, "w1:p7")])
+
 
     def test_restart_lock_refusal_leaves_the_record_unchanged(self) -> None:
         reference = str(self.rows[0].id)
@@ -2844,6 +2899,20 @@ class RestartTests(RestartTestCase):
         self.assertEqual(self.launches, [])
         self.assertIn("would signal a process that does not run session", errors.getvalue())
 
+        foreign = replace(self.rows[1], current_session=staff.StaffId("another-conversation"))
+        record = staff.StaffSnapshot((self.rows[0], foreign, *self.rows[2:]))
+        with (self.subTest(owner="staffed foreign process with a stale report"),
+              patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.EnvironmentThread(foreign.current_session), "fixture-start", {})),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(pane_record, "end") as ended,
+              patch.object(stop_resume, "stop") as stopped,
+              redirect_stderr(io.StringIO())):
+            self.assertFalse(restart.stop_row(self.rows[0], herdr.Herdr("agents")))
+        stopped.assert_not_called()
+        ended.assert_not_called()
+
     def retained_director(self, session: str = "agents") -> pane_launch.LaunchPublication:
         row = self.rows[0]
         entry: pane_record.PaneLaunch = {"kind": "claude", "pane_id": "w1:p0", "session_id": str(row.id),
@@ -2907,7 +2976,13 @@ class RestartTests(RestartTestCase):
                       patch.object(herdr.Herdr, "panes", return_value=[pane]),
                       patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                           "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
-                      patch.object(herdr.Herdr, "pane_activity", return_value=activity)):
+                      patch.object(herdr.Herdr, "pane_activity", return_value=activity),
+                      patch.object(herdr.Herdr, "result", return_value={"process_info": {"shell_pid": 990090,
+                          "foreground_process_group_id": 990091 if isinstance(activity, herdr.PaneRunning) else 990090,
+                          "foreground_processes": [{"pid": 990091 if isinstance(activity, herdr.PaneRunning) else 990090,
+                              "name": "vim" if isinstance(activity, herdr.PaneRunning) else "zsh",
+                              "argv": ["vim"] if isinstance(activity, herdr.PaneRunning) else ["zsh"]}]}})):
+
                     _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))
                 self.assertEqual(launch.call_args.args[1], destination)
 

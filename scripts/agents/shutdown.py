@@ -27,7 +27,7 @@ from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.lib import process_group, process_start, conf, berth_board, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
@@ -1389,14 +1389,17 @@ class RetiringPane(NamedTuple):
 def retirement_pane(row: staff.StaffRow, record: staff.StaffSnapshot) -> RetiringPane | herdr.NoPane:
     try:
         publication = pane_record.publication_for_session(row.current_session, record=record)
-        if publication is not None:
-            session, identity = publication.path.stem, publication.entry["pane_id"]
-            pane = next((pane for pane in herdr.Herdr(session).panes() if pane["pane_id"] == identity), None)
-            if pane is not None:
-                terminal = pane.get("terminal_id", "")
-                if not terminal:
-                    raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
-                return RetiringPane(session, identity, terminal)
+        session = publication.path.stem if publication is not None else herdr.shared_session()
+        client = herdr.Herdr(session)
+        entries = {publication.entry["pane_id"]: publication.entry} if publication is not None else {}
+        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client, entries)
+        if matches:
+            pane = matches[0]
+            identity = str(pane["pane_id"])
+            terminal = str(pane.get("terminal_id", ""))
+            if not terminal:
+                raise ValueError(f"{session}:{identity}: terminal identity is unavailable")
+            return RetiringPane(session, identity, terminal)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         print(f"anomaly: {row.name}: cannot read its pane: {error}")
     return herdr.NoPane(row.name)
