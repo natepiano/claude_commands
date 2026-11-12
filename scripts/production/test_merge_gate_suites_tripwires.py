@@ -56,10 +56,13 @@ class MergeGateTripwiresTests(GateSuitesFixture):
             self.checkout, self.environment, root / "output.log")
         status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
         result = merge_gate.finish_gate_job(job, status)
-        self.assertLessEqual(began, result.started_at)
-        self.assertEqual(result.started_at, job.started_at)
-        self.assertLessEqual(result.started_at, result.ended_at)
-        self.assertLessEqual(result.ended_at, time.time())
+        started_at, ended_at = result.started_at, result.ended_at
+        if started_at is None or ended_at is None:
+            self.fail("the finished job has no recorded start and end time")
+        self.assertLessEqual(began, started_at)
+        self.assertEqual(started_at, job.started_at)
+        self.assertLessEqual(started_at, ended_at)
+        self.assertLessEqual(ended_at, time.time())
         self.assertEqual(status, 0)
         self.assertEqual(result.returncode, 1)
         self.assertTrue(result.tripwire_tripped)
