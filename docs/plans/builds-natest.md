@@ -3373,7 +3373,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report gives measured CPU per caller and each combinable query with bound, file, line and owner.
 - No repository file changes.
 
-### Phase 201 — Record-content tests call the recorder in process  · status: todo
+### Phase 201 — Record-content tests call the recorder in process  · status: done
 **Depends on:** none
 
 #### Work Order

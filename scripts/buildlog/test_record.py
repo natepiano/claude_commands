@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for record.py, run as invoke.sh and verify.sh run it: a subprocess, BUILDLOG_DIR on a temporary root."""
+"""Test record contents in process and keep real CLI entry cases on temporary roots."""
 
 from __future__ import annotations
 
 from functools import cached_property
 from contextlib import closing
 import gzip
+import io
 import json
 import os
 import re
@@ -39,6 +40,7 @@ from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 SCRIPT = Path(__file__).with_name("record.py")
 CONTEXT_SCRIPT = SCRIPT.with_name("step_context.py")
@@ -167,8 +169,20 @@ class RecordTests(unittest.TestCase):
     def record(
         self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
     ) -> subprocess.CompletedProcess[str]:
+        if process_boundary_for_case(self):
+            return self.record_process(*args, cwd=cwd, extra=extra, input=input)
+        module = step_context if args and args[0] == "step-context" else recorder
+        arguments = list(args)
+        with mock.patch.object(recorder, "detach"), mock.patch.object(sys, "stdin", io.StringIO(input)):
+            return invoke_cli(module, lambda: module.main(arguments), arguments,
+                              self.environment(**(extra or {})), cwd or self.repo)
+
+    def record_process(
+        self, *args: str, cwd: Path | None = None, extra: dict[str, str] | None = None, input: str = ""
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT.resolve().parents[1] / "lib/py"), str(CONTEXT_SCRIPT if args[0] == "step-context" else SCRIPT), *args],
+            [str(SCRIPT.resolve().parents[1] / "lib/py"),
+             str(CONTEXT_SCRIPT if args and args[0] == "step-context" else SCRIPT), *args],
             cwd=cwd or self.repo,
             input=input,
             env=self.environment(**(extra or {})),
@@ -282,6 +296,10 @@ class RecordTests(unittest.TestCase):
                 lines = result.stdout.splitlines()
                 self.assertEqual(len(lines), 2, result.stdout + result.stderr)
                 self.assertEqual(lines[1], str(workspace / "target"))
+        result = self.record_process(cwd=workspace)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("record.py step STATUS START END TTY LOG PEAK ARGV...", result.stderr)
 
     def folder_context(self, argv: list[str], *, extra: dict[str, str] | None = None,
                        cwd: Path | None = None, metadata: str = "") -> str:
@@ -393,6 +411,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(self.resolved_folder(argv), "/x")
         _ = self.assert_folder_record(argv, "/x")
 
+    @process_boundary
     def test_changed_target_environment_rejects_the_callers_metadata(self) -> None:
         _ = (self.repo / "Cargo.toml").write_text('[workspace]\n')
         metadata = json.dumps({"workspace_root": str(self.repo), "target_directory": "/stale"})
@@ -649,6 +668,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         _ = path.write_text("123456\n")
         return path
 
+    @process_boundary
     def test_step_record_fields(self) -> None:
         handoff, peak = self.handoff(), self.peak_file()
         record = self.step(1, "0", str(handoff), str(peak), NEXTEST, {"BUILDLOG_CALL_ID": CALL_ID})
