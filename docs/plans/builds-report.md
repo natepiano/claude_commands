@@ -1132,49 +1132,32 @@ From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is reso
 
 ### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
 
-From builds (not the user), 2026-11-12: go on this phase. "Put the 2 h limit and the fall size in config as new keys. Start the walk only on an unnamed fall beyond cache growth. Land order when green."
+From builds (not the user), 2026-11-12: put the 2 h limit and the fall size in config as new keys; start the walk only on an unnamed fall beyond cache growth.
 
-Problem: after Phase 52 the folder walk runs once a day. The 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall: the last walk was at 10:15, so the fall came after it.
+Problem: after Phase 52 the folder walk runs once a day, so the 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall.
 
-#### Work Order
+#### As-built
 
-**Goal:** A large disk fall that no folder walk explains starts one walk, and a follow-up alert names the folders that grew.
-
-**Spec:**
-- New keys in `config/lint.conf`, each with a comment and type line like its neighbors:
-  - `sweep_walk_request_fall_bytes=10737418240` (`# whole: 1..`): the unnamed fall beyond build-cache growth that requests a walk.
-  - `sweep_walk_request_interval_seconds=7200` (`# range: 0..`): no request when the last walk is younger than this.
-- `scripts/buildlog/store.py`: `DISK_WALK_REQUEST_NAME = "disk-walk-request.json"` beside `DISK_NAME`.
-- The request file is JSON: `requested_at` (UTC ISO), `alert_at` (UTC ISO, the floor sweep time), `unnamed_bytes` (int). Use a `TypedDict`. Write it atomically (tmp file and rename).
-- `scripts/lint/sweep.py`, natedev floor accounting only (not `MacFloor`), where `free_fall` and `cache_growth` are computed with a valid previous floor record:
-  - The unnamed fall is `free_fall - cache_growth` minus the part the walk explains. When the last walk is at or before the previous floor record, nothing is explained. Otherwise use the walk's `outside_cache_growth_bytes`, the same arithmetic as `disk_measurement_lines`. Share one helper; do not copy the arithmetic.
-  - Write a request when the unnamed fall is greater than `sweep_walk_request_fall_bytes`, no request file exists, and the last walk (`measured_at`) is at least `sweep_walk_request_interval_seconds` old.
-  - Each floor sweep: when a request file exists and the disk snapshot's `measured_at` is later than its `requested_at`, send one follow-up through `send_floor_alert`. It says "Folder walk for the <alert_at> fall:" and then the `disk_measurement_lines` growth lines. Delete the request file only after the send is accepted.
-  - An unreadable request file: print one stderr line and leave it. Write no request while it exists.
-- `scripts/buildlog/disk.py` `snapshot()`: also walk when a request file exists and its `requested_at` is later than the previous snapshot's `measured_at`. Never delete the request file. Keep the 03:00 daily walk.
-- Do not change `buildlog-disk.timer` or its service.
-- `docs/as-built/build-followups.md` **Measuring** paragraph: one sentence on the walk request.
-- Tests (add rows to existing tests where they fit):
-  - `scripts/buildlog/test_disk.py`: a newer request walks; an older request refreshes only; no request keeps the current rule.
-  - `scripts/lint/test_sweep.py`: an unnamed fall over the key writes a request; a fall the walk explains writes none; a walk younger than the interval writes none; an existing request writes no second one; a completed walk sends one follow-up and deletes the file; a refused send keeps the file.
+- New keys in `config/lint.conf`: `sweep_walk_request_fall_bytes=10737418240` and `sweep_walk_request_interval_seconds=7200`.
+- `store.py`: `DISK_WALK_REQUEST_NAME`, the `DiskWalkRequest` TypedDict (`requested_at`, `alert_at`, `unnamed_bytes`), `DiskWalkRequestState` (`ABSENT`, `UNREADABLE`), `read_disk_walk_request` and an atomic `write_disk_walk_request`.
+- `sweep.py` `unnamed_disk_fall` holds the fall arithmetic that `disk_measurement_lines` also uses.
+- The natedev floor pass writes a request when all of these are true:
+  - the previous floor record is recent, with the same build holds and filesystem (the checks the growth alert uses, computed once);
+  - no request file exists;
+  - the unnamed fall is over `sweep_walk_request_fall_bytes`;
+  - the last walk is at least `sweep_walk_request_interval_seconds` old.
+- `disk.py` `snapshot()` walks when the request's `requested_at` is later than the previous `measured_at`. The 03:00 daily walk stays.
+- `finish_disk_walk_request` sends "Folder walk for the <alert_at> fall:" with the growth lines through `send_floor_alert`. It deletes the request only after the send is accepted. It runs only on a natedev root-scope sweep.
+- An unreadable request file prints one stderr line and blocks a new request.
+- Review: F001 (blocker) — a changed build hold could request a walk with no free-space change; fixed by the shared checks above.
 
 **Files:**
-- `config/lint.conf`
-- `scripts/buildlog/store.py`
-- `scripts/buildlog/disk.py`
-- `scripts/buildlog/test_disk.py`
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
-- `docs/as-built/build-followups.md`
-
-**Workers:** `1 writer`
-- writer: all files.
-
-**State:** `<store.root()>/disk-walk-request.json`, written by the floor sweep and deleted by it after the follow-up is sent.
-
-**Acceptance gate:**
-- `scripts.buildlog.test_disk` and `scripts.lint.test_sweep` pass.
-- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
+- `config/lint.conf` — the two keys.
+- `scripts/buildlog/store.py` — the request file types and I/O.
+- `scripts/buildlog/disk.py` — the request walk.
+- `scripts/lint/sweep.py` — `unnamed_disk_fall`, the request gate, `finish_disk_walk_request`.
+- `scripts/buildlog/test_disk.py`, `scripts/lint/test_sweep.py` — request, no-request and follow-up rows.
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
 
 ### Phase 56 — Old buildlog indexes go by change time only · status: done
 
