@@ -1262,7 +1262,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         """Seed item rows that predate folding during held add."""
         blob = self.blob(rule)
         rows = tuple(
-            (hashlib.sha256(json.dumps((rule, path, line, text, blob), separators=(",", ":")).encode()).hexdigest()[:16],
+            (style_ledger._finding_id((rule, path, line, text, blob)),  # pyright: ignore[reportPrivateUsage]
              rule, path, line, text, before, after, blob, anchor)
             for line, text, before, after in items
         )
@@ -1370,6 +1370,8 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 ("render/mod.rs", "#[cfg(test)] mod word_contrast_tests;", "render/word_contrast_tests.rs"),
                 ("census/worker_dispatch/mod.rs", "#[cfg(test)] mod prompt_opening_tests;",
                  "census/worker_dispatch/prompt_opening_tests.rs"),
+                ("census/scan/census.rs", '#[cfg(test)] #[path = "census_tests.rs"] mod tests;',
+                 "census/scan/census_tests.rs"),
                 ("owner.rs", "#[cfg(test)] mod plain_tests;", "owner/plain_tests.rs"),
                 ("lib.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs"),
                 ("main.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs")):
@@ -1380,7 +1382,9 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     rule = case.rule("test-move-forms", "tier: D\nfamily: modules\ninput_scope: file\n")
                     root = "crates/alpha/src/"
                     case.write(root + "lib.rs", "mod census;\nmod render;\nmod owner;\n")
-                    case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n")
+                    case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n"
+                               + '#[cfg(\n    feature = "scan"\n)]\npub(crate) mod scan;\n')
+                    case.write(root + "census/scan/mod.rs", '#![cfg(\n    feature = "scan"\n)]\npub(crate) mod census;\n')
                     if parent == "main.rs":
                         _ = (case.repo / root / "lib.rs").unlink()
                     case.write(root + parent, declaration + "\n")

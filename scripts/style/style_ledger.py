@@ -731,7 +731,8 @@ def sibling_test_file_destinations(sources: style_footprint.RevisionTree) -> dic
             crate = sources.crate(file)
             module = style_footprint.file_module(file, crate, sources)
             if (isinstance(module, style_footprint.OutsideCrate)
-                    or style_footprint.module_chain(module, sources, crate, {}) is not None):
+                    or style_footprint.module_chain(
+                        module, sources, crate, {}, conditions=style_footprint.ModulePathConditions.ALLOW_CFG) is not None):
                 continue
             parent = PurePosixPath(file)
             for item in modules:
