@@ -43,6 +43,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
 NATIVE_PANE_CLIENT = herdr.Herdr
+NATIVE_PROCESS_ENVIRONMENT = herdr.process_environment
 
 
 class RenameDisplays:
@@ -222,6 +223,8 @@ class FolderMoveBackend:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
 
     def environment(self, pid: int) -> dict[str, str]:
+        if pid != self.pid:
+            return NATIVE_PROCESS_ENVIRONMENT(pid)
         self.fixture.assertEqual(pid, self.pid)
         return ({"CLAUDE_CONFIG_DIR": str(self.config)} if self.kind == "claude" else
                 {"CODEX_HOME": str(self.config), "CODEX_THREAD_ID": self.fixture.owner.current_session})

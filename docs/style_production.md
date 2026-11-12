@@ -705,6 +705,11 @@ finding touches, rerun the gate, and leave dropped cells stale for later work.
 Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
 --id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
 findings on it, leaving its cells for later work.
+Before a proposal yield or drop, record each reserved, unmerged or dirty file outside the ticket that the change needs.
+Use `style_ledger.py ticket need --repo <unit-worktree> --id <ticket> --finding <finding-id> --path <file>`.
+The need stays with the finding, so refill waits while that file is busy.
+This record does not approve an edit to that file.
+
 A proposal ticket yields the file of a finding whose file, or a file its change
 edits, is blocked. Its findings at that file stay filed under their decision with
 no build ticket, and the ticket no longer lists them. The gate and `ticket merge`

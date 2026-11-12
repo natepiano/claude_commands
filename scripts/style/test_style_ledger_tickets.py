@@ -2360,6 +2360,20 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         kept, freed, issue = self.yield_proposal((self.sources[3], "rename", "Outcome::Old", "Outcome::New"),
                                                  (self.sources[1], "rename", "Shape::Round", "Shape::Square"))
         ledger = self.ledger()
+        need = "crates/tui_pane/src/lib.rs"
+        ticket_before = ledger.ticket_get("7001")
+        findings_before = ledger.named_held((kept, freed))
+        self.assertEqual(self.cli("ticket", "need", "--id", "7001", "--finding", freed, "--path", need).stdout, "")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            needs_before = cast(list[tuple[str, str, str]], connection.execute("SELECT * FROM finding_needs").fetchall())
+        self.assertEqual(self.cli("ticket", "need", "--id", "7001", "--finding", freed, "--path", need).stdout, "")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM finding_needs").fetchall(), needs_before)
+        self.assertEqual(ledger.ticket_get("7001"), ticket_before)
+        self.assertEqual(ledger.named_held((kept, freed)), findings_before)
+        refused = self.cli("ticket", "need", "--id", "7001", "--finding", "not-held", "--path", need, success=False)
+        self.assertEqual(refused.stderr.strip(), "style_ledger: 7001: the ticket does not hold finding not-held")
+        self.assertIn(need, ledger.pipeline_footprint(ticket_before, frozenset({ledger.synced_commit()})))
         refused = self.cli("ticket", "yield", "--id", "7001", "--path", self.sources[0], success=False)
         self.assertEqual(refused.stderr.strip(), f"style_ledger: 7001: no finding of the ticket is at {self.sources[0]}")
         yielded = self.cli("ticket", "yield", "--id", "7001", "--path", self.sources[1])
@@ -2367,6 +2381,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual(findings[freed].state, style_ledger.Filed(issue))
         self.assertEqual(findings[freed].build_ticket, style_ledger.NoBuildTicket())
+        self.assertEqual(ledger.finding_needs(freed), (need,))
         self.assertEqual(findings[kept].build_ticket, style_ledger.BuildTicket("7001"))
         ticket = ledger.ticket_open(ticket_owner_id("proposal"))[0]
         self.assertEqual(ticket["finding_ids"], [kept])
@@ -2387,6 +2402,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("7002", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", [self.sources[1]],
                           [findings[freed].rule], proposal=str(issue), finding_ids=(freed,))
         self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[1].build_ticket, style_ledger.BuildTicket("7002"))
+        self.assertIn(need, ledger.pipeline_footprint(ledger.ticket_get("7002"), frozenset({checkpoint})))
 
     def test_a_proposal_yield_frees_a_file_rename_beside_an_independent_one_in_its_crate(self) -> None:
         # Mounts inside alpha, also through an inline module's folder, and one from beta to a file of no finding's
