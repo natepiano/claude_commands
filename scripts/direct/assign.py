@@ -119,7 +119,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--operation", type=AssignmentOperation, choices=tuple(AssignmentOperation),
                             default=AssignmentOperation.DISPATCH)
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
-    _ = parser.add_argument("--policy", choices=("friend", "astra-reviewer", "astra-designer"), default="")
+    _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
     _ = parser.add_argument("--parent", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
@@ -144,7 +144,7 @@ def parse_arguments() -> Arguments:
         parser.error("--policy is required for this target")
     if args.target == "consultation-pane" and not args.new_worker:
         parser.error("consultation-pane requires --new-worker")
-    if args.target == "durable-design-role" and (not args.parent or args.policy == "friend"):
+    if args.target == "durable-design-role" and not args.parent:
         parser.error("durable-design-role requires --parent and an Astra policy")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
@@ -558,14 +558,10 @@ def require_live_director() -> None:
 def pane_policy(name: str, *, model: str = "", effort: str = "") -> worker_panes.LaunchPolicy:
     """Resolve one explicit launch policy and its model overrides."""
     try:
-        if name == "friend":
-            task = "ask_a_friend.consultation"
-            policy = worker_panes.worker_policy(models_registry.launch_settings("ask_a_friend", "consultation"))
-        else:
-            if name not in ("astra-reviewer", "astra-designer"):
-                refuse(f"unknown pane policy: {name}")
-            task = "design_roles." + name.removeprefix("astra-")
-            policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
+        if name not in ("astra-reviewer", "astra-designer"):
+            refuse(f"unknown pane policy: {name}")
+        task = "design_roles." + name.removeprefix("astra-")
+        policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
         if model or effort:
             family, selected_model, selected_effort, tier = resolve_model(
                 Arguments(model=model, effort=effort), task, dict(os.environ))

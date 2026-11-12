@@ -40,7 +40,7 @@
 
 **Binds later work:** Remove /ask_a_friend follows the seven steps and the five classes. Amend /remove_command edits this file.
 
-### Phase 2 — Remove /ask_a_friend  · status: todo
+### Phase 2 — Remove /ask_a_friend  · status: done
 
 #### Work Order
 
@@ -82,6 +82,8 @@ Step 6 sends the morty notice after the director commits; the worker writes its 
 **Spec:**
 
 Fold phase 2's lessons into `commands/remove_command.md`: missed spellings, missed places, classes that did not fit, the order that worked, and what the verification needed. Keep it a prompt; add a script only if phase 2 shows a step that a prompt cannot do well.
+
+Add the showrunner's rule (sdlc, 2026-11-12): a dead reference in another unit's file needs no go. Delete it, then send the showrunner one line that names the file. Ask the owner first only for a change to live behavior in that file.
 
 **Files:**
 - `commands/remove_command.md` — amended steps.

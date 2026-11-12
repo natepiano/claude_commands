@@ -548,7 +548,6 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         self.assertEqual((routing[0]["fallback_at"], routing[0]["moved"], routing[0]["why"]),
                          (stamp, ["direct", "design_roles"], "auto: rerun-entry"))
         self.assertEqual(routing[0].get("claude_account"), "claude4")
-        self.assertEqual(self.read_assignments()["ask_a_friend"], "caller")
 
     def test_failed_restore_keeps_only_failed_keys_for_the_next_pass(self) -> None:
         class Killed(BaseException):

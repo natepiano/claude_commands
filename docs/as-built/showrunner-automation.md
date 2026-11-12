@@ -506,10 +506,10 @@ Wind-down projection keys and count timer commands use staff IDs.
 Count timers resolve the current session through staff when they fire.
 Wind-down starts clear projection state; this change adds no conversion.
 Worker completion notices resolve the director's staff ID after the worker lock releases.
-Friend waits use the native process and the last transcript prompt's reply address.
+Consultation waits use the native process and the last transcript prompt's reply address.
 Consultations need no staff row.
 Unrelated panes with another agent kind do not stop the hook.
-Pane labels do not identify a friend.
+Pane labels do not identify a consultation.
 
 - **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
   `config/user_zone.conf` supplies the configured zone.
