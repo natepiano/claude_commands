@@ -482,6 +482,22 @@ class SessionLaunchTests(RestartTestCase):
                       patch.dict(os.environ, {"CODEX_HOME": str(home)})):
                     self.assertEqual(restart.session_launch(identity, "current-name"),
                                      ("codex", {"CODEX_HOME": str(home)}, ["resume", identity]))
+        numbered = root / ".codex2"
+        saved = numbered / "sessions" / f"rollout-{identity}.jsonl"
+        write_text_atomic(saved, "{}\n")
+        alias = root / ".codex7"
+        alias.symlink_to(numbered, target_is_directory=True)
+        with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
+              patch("scripts.agents.restart.sessions.config_dirs", return_value=[]),
+              patch.dict(os.environ, {"HOME": str(root), "CODEX_HOME": str(alias)})):
+            self.assertEqual(restart.session_launch(identity, "current-name"),
+                             ("codex", {"CODEX_HOME": str(alias)}, ["resume", identity]))
+            with patch.dict(os.environ, {"CODEX_HOME": ""}):
+                self.assertEqual(restart.session_launch(identity, "current-name"),
+                                 ("codex", {"CODEX_HOME": str(home)}, ["resume", identity]))
+                source.with_suffix(source.suffix + ".zst").unlink()
+                self.assertEqual(restart.session_launch(identity, "current-name"),
+                                 ("codex", {"CODEX_HOME": str(numbered)}, ["resume", identity]))
 
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
