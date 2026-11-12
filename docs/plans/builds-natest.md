@@ -3383,3 +3383,101 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - `_tip` in `scripts/style/style_ledger.py` reads the commit and its tree with one `git rev-parse --end-of-options <c>^{commit} <c>^{tree}` call; it used two. A reply that is not the echoed marker and two object ids (40 or 64 hex) raises `GitReadFailed` with status 0, so a revision range keeps a typed failure; missing, non-commit and ambiguous names keep status 128. `test_tree_entries_share_commit_and_bare_tree_inventory` in `scripts/style/test_style_ledger.py` gets four rows (missing, tree id, ambiguous prefix with SHA-1 and SHA-256 input pairs, range). By builds' order, `scripts/production/test_add_unit.py` sets `HERDR_BIN=/nonexistent/herdr` in `test_resume_uses_the_renamed_native_owner_for_arguments_and_tab`; that test raised `HerdrMissing` on a host without herdr (the aws box) since it came in (`c8dec492b`). aws pairs, 3 rounds: `style/test_style_ledger.py` 13.32 → 12.53, `style/test_style_ledger_findings.py` 27.20 → 26.20, `style/test_style_ledger_tickets.py` 23.22 → 22.37 CPU s (2.68 s saved); `test_add_unit` passes on the aws box. style approved through sdlc. Checkpoint `72252ade3`.
+
+### Phase 210 — Usage report tests call the report in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/usage/test_usage_report.py` call the usage report's `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain. `agents/test_restart.py` passes on a host without herdr.
+
+**Decision:** builds showrunner, 2026-11-12: order usage_report, escalate, showrunners. Owner go: sdlc showrunner (owner of these files), 2026-11-12, for usage_report, escalate, showrunners, the add_unit and assign resolvers and the test_restart HERDR_BIN line; no queued sdlc item touches them. Land only on a measured aws gain.
+
+**Spec:**
+1. Read the content-call candidate rows in `docs/plans/builds-natest-next.md` item 6 and the Phase 201–204 as-builts.
+2. In `report` (`test_usage_report.py:114`), call the report through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with the same environment, cwd and arguments. Keep the real parser, handlers and child commands. `report_script` (line 120) runs `-c <script>`: convert a caller only when its script patches something and then calls the report's `main`; keep the others as real starts.
+3. Keep at least one real process start that proves the CLI entry, cold imports and exit code. Keep the SQLite snapshot checks at line 386 and every timeout and signal check in a real process.
+4. Keep every test and assertion. Add no new general adapter.
+5. In `RestartTestCase.setUp` (`scripts/agents/test_restart.py:76`), bind a private `HERDR_BIN` (for example `/nonexistent/herdr`) so `Herdr(...)` at line 209 no longer needs herdr on PATH. Keep the fake-CLI override at line 827. Prove the module passes with herdr hidden, and errors before the change.
+6. Run the module and every module that imports the report, `agents/test_restart.py`, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after; report Python starts.
+
+**Files:**
+- `scripts/usage/test_usage_report.py` — `report`, `report_script`.
+- `scripts/agents/test_restart.py` — `RestartTestCase.setUp`, one environment line.
+
+**Workers:** 1 writer; two test modules.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 202 F001: a recorder that runs in a thread calls its main directly, not through `invoke_cli`.
+- Census: 74 starts, 15.615 local CPU s; upper bound, not a saving.
+
+**State:** none.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain before land; `agents/test_restart.py` passes on the aws box.
+
+### Phase 211 — Escalation tests call the escalation command in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/message/test_escalate.py` call `escalate.main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** builds showrunner, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12. Land only on a measured aws gain.
+
+**Spec:**
+1. In `run_script` (`test_escalate.py:83`), call `escalate.main` through `invoke_cli` with `self.environment` plus the call's environment.
+2. Bind `STATE`, `SEND` and `NOTIFIER` (`escalate.py:50-53`) from that environment for each call; restore them after it.
+3. Keep real process starts where a test proves the minute tick, a detached child, a signal or a timeout.
+4. Keep every test and assertion. Add no new general adapter.
+5. Run the module and every module that imports `escalate`, and basedpyright on each changed file.
+6. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/message/test_escalate.py` — `run_script`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Census: 57 starts, 9.137 local CPU s; upper bound.
+
+**State:** none.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain before land.
+
+### Phase 212 — Showrunners tests call the showrunners command in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/production/test_showrunners.py` call `showrunners.main` in process through `invoke_cli(..., production_state=True)`, and aws pairs show a CPU gain.
+
+**Decision:** builds showrunner, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12. Land only on a measured aws gain.
+
+**Spec:**
+1. In `cli` (`test_showrunners.py:190`), call `showrunners.main` through `invoke_cli` with `production_state=True` and `self.environment(pane, caller)`.
+2. Keep real process starts where a test proves a pane, a session id from the environment, a signal or a publication race.
+3. Keep every test and assertion. Add no new general adapter.
+4. Run the module and every module that imports `showrunners`, and basedpyright on each changed file.
+5. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/production/test_showrunners.py` — `cli`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Census: 28 starts, 3.728 local CPU s; upper bound.
+
+**State:** none.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain before land.
