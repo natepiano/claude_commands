@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from functools import partial
 from importlib import import_module
-from typing import TYPE_CHECKING, Literal, cast, final
+from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
@@ -541,6 +541,36 @@ def worker_labelled_pane(panes: Sequence[Mapping[str, object]], tab: str,
     return herdr.NoPane(name)
 
 
+def worker_fallback_run(parent: staff.StaffRow) -> Path:
+    """Use the inherited run or the parent's local worker directory."""
+    current = unit_runs.environ("RUN_DIR")
+    return Path(current) if current else unit_runs.state_dir() / "staff" / "workers" / parent.id
+
+
+def _worker_run_scan(record: staff.StaffSnapshot) -> dict[str, list[str]]:
+    """Read the launcher's run roots once for all parent sessions."""
+    design_root = cast(Callable[[], Path], import_module("scripts.astra.design_roles").state_root)()
+    return unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record,
+                                     additional_roots=(unit_runs.ASTRA_RUN_ROOT, design_root))
+
+
+def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRunDirectories:
+    """Resolve each worker through the launcher and retain its candidate directories."""
+    workers = record.find(kind="worker")
+    if not workers:
+        return unit_runs.LauncherRunDirectories({}, {})
+    scanned = _worker_run_scan(record)
+    found: dict[StaffId, tuple[Path, ...]] = {}
+    for row in workers:
+        parent = record.parent_of(row) or row
+        selected = worker_run(row, record=record, scanned=scanned)
+        held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+        recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
+        found[row.id] = tuple(dict.fromkeys((selected, *(Path(directory) for directory in held),
+                                            *recorded, worker_fallback_run(parent))))
+    return unit_runs.LauncherRunDirectories(found, scanned)
+
+
 def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
@@ -554,14 +584,11 @@ def worker_run(member: staff.StaffRow, *,
             return dispatched.directory
         record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
         parent = record.parent_of(member) or member
-    runs = unit_runs.held(str(parent.current_session), os.environ.get("ROSTER_RUN_ROOT"), record=record, scanned=scanned)
     if scanned is None:
-        design_root = cast(Callable[[], Path], import_module("scripts.astra.design_roles").state_root)()
-        runs = list(dict.fromkeys((*runs,
-            *unit_runs.held(str(parent.current_session), unit_runs.ASTRA_RUN_ROOT, record=record),
-            *unit_runs.held(str(parent.current_session), design_root, record=record))))
-    fallback = (Path(runs[0]) if runs else Path(unit_runs.environ("RUN_DIR")) if unit_runs.environ("RUN_DIR")
-                else unit_runs.state_dir() / "staff" / "workers" / parent.id)
+        record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+        scanned = _worker_run_scan(record)
+    runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+    fallback = Path(runs[0]) if runs else worker_fallback_run(parent)
     if member.kind == "worker":
         candidates = dict.fromkeys((*(Path(run) for run in runs), fallback))
         passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run))]
@@ -669,16 +696,30 @@ def check_worker_lock(row: staff.StaffRow,
     return CloseAllowed()
 
 
+class RunningDetachedWorkers(Protocol):
+    @property
+    def staff_ids(self) -> frozenset[staff.StaffId]: ...
+
+
+class DetachedWorkAtUse(Enum):
+    READ = "read detached runs for this worker"
+
+
 def worker_dispatch_state(row: staff.StaffRow, run: Path,
-                          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> WorkerDispatchState:
+                          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
+                          detached: RunningDetachedWorkers | DetachedWorkAtUse = DetachedWorkAtUse.READ) -> WorkerDispatchState:
     """Classify the pass through its status, worker lock, submission, and detached runs."""
     from scripts.direct import progress_history
 
     locked = check_worker_lock(row, lock)
     if isinstance(locked, Kept):
         return DispatchHoldsWorker(locked.blocker)
-    live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
-    if live_runs(run / "detached_runs", row.name):
+    if isinstance(detached, DetachedWorkAtUse):
+        live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
+        live = bool(live_runs(run / "detached_runs", row.name))
+    else:
+        live = row.id in detached.staff_ids
+    if live:
         return DispatchHoldsWorker("a detached run is live")
     passed = worker_pass(row, run)
     if passed:

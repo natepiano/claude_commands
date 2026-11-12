@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+from decimal import Decimal
 from io import StringIO
 import json
 import os
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, cloud_gate, gate_trial as trial, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment
 from scripts.lib.process_group import send_process_group
@@ -338,6 +340,37 @@ class Sample(unittest.TestCase):
         _ = path.write_text(path.read_text().replace('clone_url=https://github.com/natepiano/claude_commands.git',
                                                    'clone_url=' + str(self.origin)))
 
+    def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
+        now = 1700000000
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now - 3600,
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        book.observe(ledger.InstanceObservation(now - 3600, 'stopped', 'fixture'))
+        _ = book.reserve_gate(self.settings, ledger.GateReservation(
+            'race', now - 3600, now - 1, Decimal('.8'), Decimal('.02')))
+        current = self.state / 'paired-trials' / 'current'
+        previous = current.parent / 'expired' / 'race'
+        current.mkdir(parents=True)
+        previous.mkdir(parents=True)
+        cloud_gate.save(previous / 'request.json', {'attempt': 'race', 'expires': now - 1})
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1), book, self.settings,
+            current / 'reservation', clock=lambda: now)
+        resolve = book.resolve_gate
+        confirmed = ledger.GateTerminated(now - 2, 'i-race')
+        costs: list[Decimal] = []
+        def racing_resolve(attempt: str, outcome: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated,
+                           *, instance_type: str = '') -> None:
+            self.assertIsInstance(outcome, ledger.GateAbsent)
+            resolve(attempt, confirmed)
+            costs.append(trial.trial_cost(book, {attempt}, self.settings, now)[0])
+            resolve(attempt, outcome, instance_type=instance_type)
+        with (mock.patch.object(book, 'resolve_gate', side_effect=racing_resolve),
+              mock.patch.object(worker.api, 'call', side_effect=AssertionError('unexpected AWS call'))):
+            trial.sweep_trial_resources(current, worker)
+        self.assertEqual(book.read_snapshot().gate_reservations[0].state, confirmed)
+        self.assertGreater(costs[0], Decimal(0))
+        self.assertEqual(trial.trial_cost(book, {'race'}, self.settings, now), (costs[0], True))
+
     def request(self, modules: tuple[str, ...] = ('fixture/test_sample.py',), rounds: int = 3) -> trial.PairedTrialRequest:
         return trial.trial_request(self.repo, self.base, self.changed, modules, rounds)
 
@@ -543,10 +576,10 @@ class Sample(unittest.TestCase):
                 self.assertEqual(errors.getvalue().splitlines(), ['paired trial: could not sweep old branches for gate-trial'])
                 self.assertEqual(self.remote_branches(), before)
 
-    def test_signal_stopped_service_deletes_both_trial_branches(self) -> None:
+    def test_interrupted_service_deletes_both_trial_branches(self) -> None:
         service = trial.paired_service
         branches = self.remote_branches()
-        for number in trial.TRIAL_SIGNALS:
+        for number in (signal.SIGINT,):
             with self.subTest(signal=number):
                 def stop_terminal(_command: Sequence[str]) -> None:
                     signal.raise_signal(number)
@@ -854,9 +887,17 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue()), {'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True})
 
-    def test_terminal_signals_stop_the_owning_service(self) -> None:
+    def test_terminal_exception_stops_the_owning_service(self) -> None:
+        with (mock.patch.object(subprocess, 'call', side_effect=OSError('fixture')),
+              mock.patch.object(subprocess, 'run') as stop,
+              mock.patch.object(signal, 'signal', side_effect=AssertionError('handler'))):
+            with self.assertRaises(OSError):
+                _ = trial.paired_service(['fixture'], 'fixture-unit')
+        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+
+    def test_terminal_interrupt_stops_the_owning_service(self) -> None:
         from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
 from scripts.aws_target import gate_trial

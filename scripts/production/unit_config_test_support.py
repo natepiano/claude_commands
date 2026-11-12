@@ -57,7 +57,7 @@ class UnitConfigFixture(unittest.TestCase):
                                       unit_config.AppPort(8123), ("nightly-review", "build-check"))
 
     def retirement(self) -> unit_config.RetiredSession:
-        return unit_config.RetiredSession("2026-10-31", "session-before-retire", unit_config.Branch("feature/worker"))
+        return unit_config.RetiredSession("2026-10-31", "session-before-retire")
 
     def park_config(self) -> None:
         _ = unit_config.write(self.worktree, self.config())

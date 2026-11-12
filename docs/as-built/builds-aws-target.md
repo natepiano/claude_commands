@@ -498,8 +498,29 @@ The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed`
 The expires field records the trial's fixed expiry epoch in seconds.
 The trial folder's UUID supplies the id; `trial_branch_prefix` configures the prefix.
 At trial end, cleanup lists the trial's remote branch namespace and deletes each branch, including after errors and Ctrl-C.
-`paired_main` installs no signal handler.
-SIGTERM or SIGHUP can skip this cleanup.
+The trial installs no signal handler.
+Ctrl-C and terminal command exceptions stop the paired service.
+SIGTERM or SIGHUP to the terminal can skip branch cleanup.
+The separate trial service then runs to its normal end and cleans its boxes.
+The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+After a service stop, systemd runs this cleanup after killing the coordinator and its children.
+Cleanup requests termination for all recorded boxes before searching uncertain launches.
+Cleanup requests termination for each discovered box before the next search.
+Cleanup checks final states after these requests.
+Cleanup uses one deadline from `termination_timeout_s` for all boxes.
+Each API call uses the time that remains before this deadline.
+The service stop timeout adds twice `api_timeout_s` to this deadline duration.
+Cleanup records confirmed termination in the cost ledger.
+A stale `GateAbsent` update cannot replace confirmed termination or remove its cost.
+Cleanup resolves reservations without saved launch arguments as `GateAbsent`.
+The module and coordinator also call this cleanup from `finally` blocks.
+Repeated cleanup does not change resolved reservations.
+AWS failures leave reservations unresolved for later recovery.
+Before reservation, the coordinator cleans expired earlier trials with unresolved reservations.
+The sweep preserves live trials and trial folders.
+Guest expiry and the AWS expiry function remain independent termination controls.
+AWS failures can delay termination beyond the configured expiry and confirmation timeout.
+Merge gate units keep their existing stop behavior.
 Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
 The sweep reads no current lifetime setting.
 A lower lifetime setting leaves existing trials' fixed expiries unchanged.

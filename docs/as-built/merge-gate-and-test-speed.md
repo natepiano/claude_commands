@@ -405,7 +405,8 @@ Types, admission, isolated reruns, and later merge checks keep their existing be
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
-Each exit sends `nightly.result`, or `nightly.not_run` when the checks could not start.
+Each green exit sends `nightly.result`.
+An exit before the checks start sends `nightly.not_run`.
 The result names the branch, finish time, type result and full test result.
 The failure text names the reason on one line within the message limit.
 Both pushes use need `note` and the key `nightly-result`.
@@ -413,7 +414,7 @@ The result requires no action. The failure text includes an action.
 The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
 Silence keeps only the newest push on that key and delivers it when silence ends.
 The gate reads `nightly_result_push` and `nightly_result_modules` from `config/merge_gate.conf` at use.
-`nightly_result_push=off` disables both texts. The default is `on`.
+`nightly_result_push=off` disables all nightly result pushes. The default is `on`.
 `nightly_result_modules=8` limits the failed test modules named before `and N more`.
 A push failure does not change the gate result, marker or showrunner notice.
 A run that never reaches merge_gate.py sends no push unless the timer script sends one.
@@ -427,9 +428,39 @@ The marker records the tree, UTC time and failed modules.
 While the marker exists, every merge gate runs all modules until a merge gate passes.
 An unreadable marker also requires all modules in a merge gate.
 A failure of only the type check removes an existing marker and does not require full test runs.
-Every red nightly tells the production's showrunner through the existing messaging path.
+Every red nightly waits for the result lock before it saves its result.
+It then notifies the production owner through the existing messaging path.
+`nightly_owner` selects the owner for both the standing checkout and the notice.
+The gate sends no red result push.
+`${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
+The record holds the branch, tree, finish time, failure lines, receipt time, assignment, and push acceptance.
+The receipt time records successful delivery to the production owner.
+An unconfirmed notice keeps its receipt state empty.
+The notice names the failed test files and includes the result ID.
+After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
+The command requires a unit director under sdlc.
+`UNIT` accepts the staff ID or the unit name.
+The command confirms receipt if the original notice has no delivery confirmation.
+It saves the assignment before it sends `nightly.assigned`.
+The push places the receipt and assignment status before the failure list.
+The phone retains that status when it truncates a long failure list.
+A rerun prints `unchanged` after the sender accepts the push.
+`merge_gate.py nightly-check` sends `nightly.unassigned` when an unassigned result reaches its deadline.
+`nightly_assign_minutes=30` sets that deadline in `config/merge_gate.conf`.
+The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
+It checks results before it restores terminal sessions.
+The fallback push states that sdlc has not assigned the fix yet.
+It reports an unconfirmed receipt when the sdlc notice failed.
+Assignment and fallback use the same file lock and push acceptance state.
+An assignment after a fallback push records the unit without another push.
+A failed send keeps the result pending for the next periodic check.
+Each red result uses the key `nightly-result:<id>`.
+The sender suppresses a second accepted push for the complete `datetime` range.
+This also prevents another push when the gate cannot save its acceptance state.
+Silence retains each red result separately.
+Green and not-run pushes keep the existing `nightly-result` key.
 The type-failure notice includes the first 20 diagnostic lines, the count of omitted lines, and the checker summary.
-Without a calling session, the gate finds the registered production for the merge branch.
+Without a calling session, the gate finds the registered production for the merge branch to select its standing checkout.
 `--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 

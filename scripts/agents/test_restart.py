@@ -2620,7 +2620,8 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED,
+                      current_session=staff.StaffId(str(uuid5(NAMESPACE_URL, "codex-resume-without-rollout"))))
         self.rows = (row,)
         self.running.clear()
         pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",

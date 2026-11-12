@@ -30,6 +30,13 @@ def upkeep() -> None:
     from scripts.accounts import accounts
     from scripts.agents import stop_resume
     from scripts.herdr import detection_rules, herdr
+    from scripts.production import merge_gate
+    from scripts.production.gate_modules import GateRefused
+
+    try:
+        _ = merge_gate.check_nightly_assignments()
+    except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
 
     cadence = _cadence()
     deadline = min(time.monotonic() + cadence.timeout_seconds,
