@@ -3159,3 +3159,71 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on each changed file reports 0 errors and 0 warnings.
 - `phases/167/removed_tests.md` lists every removed test with its reason, and the counts.
 - Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 168 — Measure the forked-process candidates for repeated Python starts  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report says, for each fork candidate, how much CPU its fresh interpreters cost and how much a forked child could remove. No code changes.
+
+**Decision:** Architect review after Phase 165, finding 2 (next item 6b, phase 1). Read-only; a production change goes to its owner as a proposal.
+
+**Spec:**
+1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10` on `usage/test_agents_log.py`, `agents/test_detached_runs.py`, `production/test_ci_points.py` and `production/test_change_review.py`. Record the revision and the test counts.
+2. For each candidate test in the next item 6b fork table (`scripts/usage/test_agents_log.py:343,530`, `scripts/agents/test_detached_runs.py:381`, `scripts/production/test_ci_points.py:1009`, `scripts/production/test_change_review.py:1356,1636`), measure the test CPU. Separate interpreter start and imports, handler work, and synchronization waits.
+3. Do not use Phase 163's 0.49 s import cost as an estimate. Measure the import cost of each child's entry module.
+4. For each candidate, give the removable CPU from a forked child, with file and line, and the boundary the test must keep (the table's last column).
+5. Name each candidate where a fork cannot keep the boundary: for example, a child that must load a fresh module state or a real entry point.
+6. Rank the candidates by removable CPU. Mark each one test-only or production, and name the owner of each production change.
+7. Write the report to `phases/168/fork_candidates_report.md` in the session folder. Change no repository file.
+
+**Files:**
+- `phases/168/fork_candidates_report.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl4: the report.
+
+**Constraints from prior phases:**
+- Phase 163: the forked children in `test_waiting.py` use `os.setpgid(0, 0)` in the child and `os.killpg` in cleanup, close inherited lock descriptors, and capture output for each child. aws CPU fell from 27.59 to 14.61 s.
+- Keep cold-import tests such as `scripts/buildlog/test_repo_root_imports.py:40,84` on fresh interpreters.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives per-module CPU, the per-candidate split (start and imports, handler, waits), and the removable CPU for each candidate.
+- `git status` shows no change from the researcher.
+
+### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report says how much CPU `test_crate_run.py` spends to prepare crate copies, and which part a test fixture or a production change could remove. No code changes.
+
+**Decision:** Architect review after Phase 165, finding 3 (next item 6b, phase 2). Read-only. natest owns fixture candidates; copies-unit owns production synchronization proposals; style-unit owns `crate_run.py`.
+
+**Spec:**
+1. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 15 --commands 15` on `style/test_crate_run.py`. Record the revision and the test count.
+2. Attribute the copy work to its callers: `copies.py:763,936` (fetch), `copies.py:803` (clone), `copies.py:450,469,760` (commit resolution, remote discovery, remote HEAD deletion), and the `freeze()` setup at `test_crate_run.py:205`.
+3. For each test, mark whether copy creation is part of the tested behavior or only a prerequisite. Use an assertion map: which assertion reads copy state.
+4. For prerequisite-only tests, give the CPU a private seed could remove. Start from the project seed at `test_crate_run.py:105` and a frozen-state seed for continuation tests. Keep live ownership and locks built per test.
+5. Keep the validation checkouts and stale-candidate proofs (`crate_run.py:1123,1392`; `test_crate_run.py:1017,2288`).
+6. For each proposed change, give the removable CPU, with file and line. Mark each one test-only or production, and name the owner.
+7. Write the report to `phases/169/crate_copy_report.md` in the session folder. Change no repository file.
+
+**Files:**
+- `phases/169/crate_copy_report.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl3: the report.
+
+**Constraints from prior phases:**
+- Phase 164: in crate_run, fetch and clone cost 7.80 child CPU s, and commit resolution, remote discovery and remote HEAD deletion cost 3.19 s. Keep measured costs separate from estimated savings.
+- Phase 153: `CargoProjectTests` builds the project seed once for each class.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives the module CPU, the copy work by caller with file and line, the assertion map, and the removable CPU for each proposed change.
+- `git status` shows no change from the researcher.

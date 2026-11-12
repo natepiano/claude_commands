@@ -41,6 +41,19 @@ Fork candidates (separate processes for contention; no fresh interpreter needed)
 
 In each child, close inherited parent lock descriptors before the contention starts. Keep separate output capture, child environments, intended patches and process-group cleanup. Keep cold-import tests such as `scripts/buildlog/test_repo_root_imports.py:40,84` on fresh interpreters.
 
+Phase 168 measured the six fork candidates at `8d1005406` (estimate = children × (child start + entry import); fork, barrier and cleanup costs not subtracted). All six are test-only changes:
+
+| Candidate | Removable CPU s | Owner |
+| --- | ---: | --- |
+| `test_change_review.py:1636`, eight adds | 1.994 | natest; sdlc hold |
+| `test_ci_points.py:1009`, CI watch | 1.025 | natest |
+| `test_detached_runs.py:381`, admission | 0.770 | natest |
+| `test_change_review.py:1356`, readiness | 0.501 | natest; sdlc hold |
+| `test_agents_log.py:343`, registration | 0.241 | natest |
+| `test_agents_log.py:530`, append | 0.147 | natest |
+
+Entry imports: ci_points 0.50 s, change_review 0.22 s, detached_runs 0.14 s, agents_log 0.02 s. Lock waits cost almost no CPU. A fork child must close the parent's lock descriptors, keep its own patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor) and not inherit unrelated parent patches. The readiness test shows no held-lock wait today; a fork version needs a deterministic readiness event to prove contention.
+
 Phase 164 measured the shared style Git work at `fe38cb50e` (style_sync 70 tests 21.9 CPU s, bulk_run 108 tests 38.7, crate_run 96 tests 40.8). Shared ledger reads are not a large lever: the three proposals together can remove at most 2.97 CPU s across the three modules.
 - Proposals to style-unit (production): reuse immutable ledger reads within one operation (1.50 s), and combine the two `ledger_location` queries at `style_ledger.py:7782,7783` into one (0.79 s).
 - Test-only candidate: build the full bulk workspace extension (`test_bulk_run.py:358-365`, four Git calls in each of 96 tests) once for each class (0.68 s).
