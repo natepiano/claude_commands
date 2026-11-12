@@ -3151,7 +3151,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### As-built
 
-- Checkpoint `c6a39ab84`. `affected_modules.py` adds rooted source scans, fixture config reads and named paths to targeted-run selection. Scan evidence stays inside the called function and its root, and keeps the scan folder and recursion mode. An unresolved root or pattern selects at any depth under the repository root. An absolute literal under the repository root is a repository path. 55 replays keep every old selection. Of 12 historical misses, 5 are caught, 3 cannot be replayed and 4 remain; builds accepted each (general import closure ruled out; `test_scratch_guard` and `test_quota_alert_delivery` not caused by the change; `test_merge_checkpoint_batch` closes in Phase 189). Added modules per targeted run: median 290, largest 478 (source scan 241). Four repair rounds; the last two fixed regressions only. Full merge gates unchanged.
+- Checkpoint `c6a39ab84`. `affected_modules.py` adds rooted source scans, fixture config reads and named paths to targeted-run selection. Scan evidence stays inside the called function and its root, and keeps the scan folder and recursion mode. An unresolved root or pattern selects at any depth under the repository root. An absolute literal under the repository root is a repository path. 55 replays keep every old selection. Of 12 replayable historical misses, 8 are caught and 4 remain; 3 more sit on trees whose commits are gone and stay unverified; builds accepted each (general import closure ruled out; `test_scratch_guard` and `test_quota_alert_delivery` not caused by the change; `test_merge_checkpoint_batch` closes in Phase 189). Added modules per targeted run: median 290, largest 478 (source scan 241). Four repair rounds; the last two fixed regressions only. Full merge gates unchanged.
 
 ### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: done
 **Depends on:** none
@@ -3309,3 +3309,32 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
 - basedpyright reports 0 errors and 0 warnings on the changed files.
 - The replay keeps containment for all 55 runs and shows the added median before and after.
+
+### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A report names the target-command work that repeats inside `test_verify_wait_holder.py`, `test_verify_mac_only.py` and `test_verify_ssh_targets_routing.py`, with the removable part kept apart from the required part.
+
+**Decision:** architect after Phase 187 (next items order step 2). natest measures; verify-unit owns any production design. Keep every check, full entry, reservation, live probe, lock and release.
+
+**Spec:**
+1. For each module, run `module_cost.py --tests 10 --commands 10`. Count the `build_targets.py` and `verify.sh` target-metadata calls per test, with their arguments.
+2. Trace the calls through `verify.sh:783,2395` and the `build_targets.py` eligibility and reservation handlers. Mark each repeated call as an immutable read (same input, same output in one test) or required work.
+3. Estimate removable CPU from the immutable repeats only. Keep estimates apart from measurements. Phase 177 measured 8.019, 8.658 and 8.156 target-command CPU s; 0–24.833 s is a gross ceiling.
+4. Name the smallest owner change (a file and function in verify's code) that removes the repeats, and the test-side change, if any, that natest can make alone.
+
+**Files:**
+- `phases/190/target_command_report.md` — in the session folder.
+
+**Workers:** 1 researcher; one report.
+- impl: the measurement and the report.
+
+**Constraints from prior phases:**
+- Phases 181, 183 and 185 saved 1.37, 0.71 and about 2.7 CPU s in aws pairs. Phase 186 (fixed-reply Cargo installer) is open on the shared verify fixtures; local CPU can be high while its runs go. Report counts first; CPU is a guide only, and aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report has per-module call counts, the immutable-repeat list with file and line, the CPU estimate range and the owner proposal.
