@@ -219,6 +219,29 @@ class LedgerTests(CostFixture):
                                          instance_type='m7a.8xlarge', region='us-east-2')
         self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
 
+    def test_reservation_rejects_closed_attempt_ids(self) -> None:
+        request = self.allowance_gate()
+        for outcome in (ledger.GateAbsent(request.expires), ledger.GateTerminated(request.expires, 'i-allowance')):
+            with self.subTest(outcome=outcome):
+                self.book.resolve_gate(request.attempt, outcome)
+                before = self.book.path.read_bytes()
+                self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateAttemptEnded)
+                self.assertEqual(self.book.path.read_bytes(), before)
+
+    def test_confirmed_termination_preserves_its_end_and_cost_for_every_later_outcome(self) -> None:
+        request = self.allowance_gate()
+        ended = ledger.GateTerminated(request.expires, 'i-allowance')
+        self.book.resolve_gate(request.attempt, ended)
+        before = self.book.path.read_bytes()
+        cost = gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120)
+        self.assertGreater(cost[0], Decimal(0))
+        for outcome in (ledger.GateRunning('i-other'), ledger.GateTerminated(request.expires + 60, 'i-other'),
+                        ledger.GateTerminated(request.expires - 60, 'i-allowance'), ledger.GateAbsent(request.expires + 60)):
+            with self.subTest(outcome=outcome):
+                self.book.resolve_gate(request.attempt, outcome, instance_type='m7a.4xlarge')
+                self.assertEqual(self.book.path.read_bytes(), before)
+                self.assertEqual(gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 120), cost)
+
     def test_stale_absence_preserves_confirmed_termination_and_cost(self) -> None:
         request = self.allowance_gate()
         ended = ledger.GateTerminated(request.expires, 'i-allowance')

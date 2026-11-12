@@ -1826,6 +1826,7 @@ class Herdr:
         """Match native sessions and report each incomplete observation once."""
         found: dict[staff.StaffId, list[dict[str, object]]] = {}
         unknown: list[UnknownPane] = []
+        launches: dict[str, pane_launch.PaneLaunch] | None = None
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
             sessions = self._row_pane_sessions(pane, run)
@@ -1833,6 +1834,16 @@ class Herdr:
                 reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
+                if isinstance(sessions, PaneSessionsUnknown):
+                    if launches is None:
+                        try:
+                            launches = pane_launch.read_strict(pane_launch.record_directory() / f"{self.session}.json")
+                        except (OSError, ValueError):
+                            launches = {}
+                    launch = launches.get(unread.pane)
+                    member = launch.get("staff_id", "") if launch is not None else ""
+                    if member and member not in record.rows_by_id:
+                        continue
                 notice = (self.session, unread.pane, unread.reason)
                 with run.lock:
                     if notice in run.reported:
