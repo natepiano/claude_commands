@@ -3205,7 +3205,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.
 
-### Phase 180 — Collect line coverage overlap across scripts/direct  · status: todo
+### Phase 180 — Collect line coverage overlap across scripts/direct  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3237,7 +3237,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report and JSON exist, with candidates and unknown coverage in separate tables.
 - `git status` shows no change from the collection.
 
-### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: todo
+### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3326,7 +3326,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Spec:**
 1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_mac_only.py`. Name where the CPU goes: full `verify.sh` entries, `build_targets.py` children, stubs, fixture setup and the leak check.
 2. Map each test's assertions to the code they prove. Policy, eligibility and forwarding-name checks may move to calls of the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) when the decision is in one function. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
-3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit):
+3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit). "Keep" means no move away from the boundary at the phase base: a check that uses a direct result call at the base keeps that call and gets no new full entry.
    1. Signals: `test_int_during_long_busy_poll_stops_every_child` and `test_term_during_busy_wait_stops_every_child`; each still proves that no child outlives `verify.sh`.
    2. The Mac-only guarantee: `test_busy_then_pass_never_runs_on_natedev`, `test_runner_refusals_never_fall_back_or_retry` and `test_missing_runner_refuses_instead_of_running_locally`; each proves that no local cargo run starts.
    3. Environment wiring: `test_readonly_exports_reach_runner_without_shell_assignment` and `test_forwarded_environment_uses_callers_values_despite_shell_bindings`.
@@ -3356,3 +3356,38 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - After a fixture change, every importer of `verify_mac_offload_test_support.py` passes.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: todo
+**Depends on:** Phase 180
+
+#### Work Order
+
+**Goal:** A repeat of the Phase 180 folder collection over `scripts/direct` gives known coverage for the tests whose only unknown cause is a child from another test, and reports the overlap candidates.
+
+**Decision:** user via builds, 2026-11-11 (item 80, approval 2): the folder collection is approved. Phase 180 ran it and got 0 known of 1,558 tests, from a collector defect. The repair and one repeat run finish that approval. Candidates are not removal approvals. No test removal or coverage reduction is approved.
+
+**Spec:**
+1. Find the cause. In the Phase 180 run, every test has the cause `child outlived its test`. 618 tests have only that cause. `child_causes` in `scripts/test_times/coverage_overlap.py` uses `math.inf` as the end of a launch with no recorded end. Then that launch is "alive" at the start of every later test in the run. `LineCollector.poll_children` in `scripts/test_times/line_collector.py` records an end only when a held `Popen` returns from `poll()`. Name the launches that have no end in a folder run, and say why (still running, not held, mocked, or other).
+2. Repair the cause in the collector. Do not hide it in the report. A child that still runs at a later test start stays a valid cause for that test. A child with no evidence that it ran at that time is not a cause. Keep each other cause rule as it is.
+3. Add rows to `scripts/test_times/test_coverage_overlap.py` for the defect: one launch with no seen exit, followed by later tests in other modules. Prove the rows fail on the old code.
+4. Run the folder collection again, as in Phase 180 Spec items 1-3, at the new commit, with `COVERAGE_OUT` in `phases/184/`. Report as in Phase 180 Spec items 4-5, plus the count of tests that changed from unknown to known.
+
+**Files:**
+- `scripts/test_times/coverage_overlap.py` — launch end rules in `child_causes`.
+- `scripts/test_times/line_collector.py` — child end records, if the cause is there.
+- `scripts/test_times/test_coverage_overlap.py` — new rows for the defect.
+- `phases/184/coverage_overlap_report.md`, `phases/184/coverage_overlap.json` — in the session folder.
+
+**Workers:** 1 writer; the collector and its tests share one cause and cannot split.
+- impl: the cause, the repair, the new rows and the repeat run.
+
+**Constraints from prior phases:**
+- Phase 180: 207 modules, 1,558 tests, all passed; collector CPU 1,711 s, wall 43.5 min; 0 known, 0 candidates; cause counts Bash 729, Cargo 68, Git 361, ps 167, forks 146; every test has `child outlived its test`.
+- Phase 179: three sampled modules gave 5 of 21 tests unknown. The defect shows only in a long run.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
+- The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
