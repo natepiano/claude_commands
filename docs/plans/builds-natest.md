@@ -3229,45 +3229,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 183 — The Mac-only tests call the real verify.sh functions where the decision is in one function, and keep the full entries verify named  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_mac_only.py`, the second slowest gate module (41.7 CPU s median), costs less CPU with the same 18 tests and every assertion.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check and the keep-coverage rule; no test removal. verify-unit go, 2026-11-11, for the module and `verify_mac_offload_test_support.py`, with the keeps in Spec 3. 68 modules import that fixture: a fixture change keeps every importer's results, and aws pairs show no loss in them.
-
-**Spec:**
-1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_mac_only.py`. Name where the CPU goes: full `verify.sh` entries, `build_targets.py` children, stubs, fixture setup and the leak check.
-2. Map each test's assertions to the code they prove. Policy, eligibility and forwarding-name checks may move to calls of the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) when the decision is in one function. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
-3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit). "Keep" means no move away from the boundary at the phase base: a check that uses a direct result call at the base keeps that call and gets no new full entry.
-   1. Signals: `test_int_during_long_busy_poll_stops_every_child` and `test_term_during_busy_wait_stops_every_child`; each still proves that no child outlives `verify.sh`.
-   2. The Mac-only guarantee: `test_busy_then_pass_never_runs_on_natedev`, `test_runner_refusals_never_fall_back_or_retry` and `test_missing_runner_refuses_instead_of_running_locally`; each proves that no local cargo run starts.
-   3. Environment wiring: `test_readonly_exports_reach_runner_without_shell_assignment` and `test_forwarded_environment_uses_callers_values_despite_shell_bindings`.
-   4. Cache: `test_current_eligibility_refuses_even_with_a_cached_mac_pass`, with the cache on disk.
-   5. The leak check: `test_fixture_reports_and_reaps_a_marked_process_that_outlives_the_test`, and `assert_nothing_outlives` on every test (`verify_mac_offload_test_support.py:1159`).
-   6. Exact text: each refusal and decline line that a test asserts now, and the runner exit status passed through (`test_mac_failure_keeps_runner_status`).
-4. Keep all 18 tests and every assertion. Change no production code. A missing callable boundary goes to verify-unit as a proposal; do not copy the decision into a fixture.
-5. `scripts/direct/verify_mac_offload_test_support.py` serves 68 modules: change it only when every importer keeps its results; run every importer after a change.
-6. Measure after with the same command. The director runs three aws pairs on this module and, after a fixture change, on a sample of importers; only aws pairs decide.
-
-**Files:**
-- `scripts/direct/test_verify_mac_only.py` — 18 tests in one class.
-- `scripts/direct/verify_mac_offload_test_support.py` — shared fixture for 68 modules; read first, edit only under Spec 5.
-
-**Workers:** 1 writer; one module and its fixture cannot split.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 157: removed two full `verify.sh` starts and one redundant cleanup scan; aws pairs 38.31 to 36.18 CPU s.
-- Phase 177: this module makes 62 `build_targets.py` starts (8.7 CPU s) in the census sample.
-- Phase 181: the same method on `test_verify_wait_holder.py`.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.direct.test_verify_mac_only` passes three times with 18 tests.
-- After a fixture change, every importer of `verify_mac_offload_test_support.py` passes.
-- basedpyright on each changed Python file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+- Checkpoint `8fe4448ec`. In `test_verify_mac_only.py` three tests call the real policy, eligibility and result functions in place of a full `verify.sh` entry; full entries 23 to 20. 18 tests and 115 assertions kept. Fixture unchanged. The verify keeps stay at their base boundary (signals, the Mac-only guarantee, environment wiring, the cached-pass refusal, the leak check, exact text, runner status 42). aws pairs saved 0.71 CPU s. Round 0 added 14 full entries (local CPU 33.8 to 50.9) because "keep" did not name the base boundary; Spec 3 now names it. The full entries verify named hold the rest of the cost; the next gain is a shared fixture change (next item 0).
 
 ### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: done
 **Depends on:** Phase 180
