@@ -335,8 +335,8 @@ class StylePlanTests(StylePlanFixture):
                     if change == "recorded need":
                         ledger.ticket_add("7001", ticket_owner_id("names"), "proposal", "names", "crates/alpha",
                                           [finding.path], [rule], proposal=str(issue), finding_ids=(finding.finding_id,))
-                        ledger.ticket_need("7001", finding.finding_id, need)
-                        ledger.ticket_need("7001", finding.finding_id, finding.path)
+                        ledger.finding_need(finding.finding_id, need)
+                        ledger.finding_need(finding.finding_id, finding.path)
                         edits = style_plan.EditedFiles(case.repo, ledger, style_plan.NoUnitBranch())
                         footprint = edits.of(finding)
                         self.assertEqual((footprint[0], footprint[-1], footprint.count(finding.path)), (finding.path, need, 1))
