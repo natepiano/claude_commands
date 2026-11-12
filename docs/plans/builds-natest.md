@@ -3104,7 +3104,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 27 tests (about 1.3 CPU s); the report named 28, but one test changes its base before it freezes. copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
 
-### Phase 170 — The four unheld lock-contention tests use forked children  · status: todo
+### Phase 170 — The four unheld lock-contention tests use forked children  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3366,5 +3366,84 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - `python3 -m unittest scripts.direct.test_verify_wait_holder` passes three times with 27 tests.
 - Every importer of a changed fixture passes.
+- basedpyright on each changed Python file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 182 — Review launches start the recorder fewer times, with the same pass records  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the review launcher tests cost less CPU because `review.sh` starts `progress_history.py` fewer times, with the same records, output and checks.
+
+**Decision:** sdlc go via builds, 2026-11-11: one bounded trial of recorder reuse in `review.sh`, run by natest. Paired aws runs decide: a measured saving ships to sdlc, which lands it; no saving drops it. Queue: behind the slow `verify.sh` tests, unless a writer is free with no verify module ready.
+
+**Spec:**
+1. Measure first, on a temporary copy, how much CPU each `review.sh` recorder start costs in the four observed modules: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_review_launcher.py direct/test_review_launcher_trees.py direct/test_review_launcher_style.py direct/test_assign_claude_follow.py`. If the recorder starts are not a measurable part of the module CPU, stop and report; change nothing.
+2. `review.sh` calls the recorder at `scripts/direct/review.sh:167` (`check-launch`), `:258` (`start-pass`) and `:376` (`finish-pass`). Find the smallest change that removes starts in a real launch: for example, one recorder command that does `check-launch` and `start-pass` together when nothing between them needs the gap, or one reused recorder process for the launch. Pick the simplest that keeps every item in Spec 3.
+3. Keep: the real launcher; caller identity (`UNIT_PASS_OWNER=launcher`, director and worker thread ids); pass ownership; stderr and exit status on each failure path; `write_review_status` values; the UX lens rule that records no pass; the completion checks. Every test and assertion stays.
+4. A new recorder command lives in `scripts/direct/progress_history.py` with its own rows in its existing tests. One owner switches all callers: change every caller of a replaced command sequence in the same change. Add no re-export shim.
+5. Change no test only to make it faster. Tests change only where the command sequence they assert changes.
+6. Measure after with the same command. The director runs three aws pairs; only aws pairs decide.
+
+**Files:**
+- `scripts/direct/review.sh` — the recorder calls at :167, :258 and :376.
+- `scripts/direct/progress_history.py` — the recorder; a combined command, if the design needs one.
+- `scripts/direct/test_progress_history.py` — rows for a new command.
+- `scripts/direct/test_review_launcher.py` — read; edit only where the asserted command sequence changes.
+
+**Workers:** 1 writer; one launcher and its recorder cannot split.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 177: 390 recorder starts cost 98.9 CPU s in the sample; the four review-launcher modules hold 150 starts and 46.2 CPU s. The saving ceiling is 0–76.7 CPU s per gate (estimate).
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest` passes for every `scripts/direct/test_review_launcher*.py` module, `scripts.direct.test_assign_claude_follow` and `scripts.direct.test_progress_history`, with unchanged test counts.
+- basedpyright on each changed Python file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 183 — The Mac-only tests call the real verify.sh functions where the decision is in one function, and keep the full entries verify named  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_mac_only.py`, the second slowest gate module (41.7 CPU s median), costs less CPU with the same 18 tests and every assertion.
+
+**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check and the keep-coverage rule; no test removal. verify-unit go, 2026-11-11, for the module and `verify_mac_offload_test_support.py`, with the keeps in Spec 3. 68 modules import that fixture: a fixture change keeps every importer's results, and aws pairs show no loss in them.
+
+**Spec:**
+1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_mac_only.py`. Name where the CPU goes: full `verify.sh` entries, `build_targets.py` children, stubs, fixture setup and the leak check.
+2. Map each test's assertions to the code they prove. Policy, eligibility and forwarding-name checks may move to calls of the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) when the decision is in one function. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
+3. Keep as full `verify.sh` entries, with a real process and real signals (verify-unit):
+   1. Signals: `test_int_during_long_busy_poll_stops_every_child` and `test_term_during_busy_wait_stops_every_child`; each still proves that no child outlives `verify.sh`.
+   2. The Mac-only guarantee: `test_busy_then_pass_never_runs_on_natedev`, `test_runner_refusals_never_fall_back_or_retry` and `test_missing_runner_refuses_instead_of_running_locally`; each proves that no local cargo run starts.
+   3. Environment wiring: `test_readonly_exports_reach_runner_without_shell_assignment` and `test_forwarded_environment_uses_callers_values_despite_shell_bindings`.
+   4. Cache: `test_current_eligibility_refuses_even_with_a_cached_mac_pass`, with the cache on disk.
+   5. The leak check: `test_fixture_reports_and_reaps_a_marked_process_that_outlives_the_test`, and `assert_nothing_outlives` on every test (`verify_mac_offload_test_support.py:1159`).
+   6. Exact text: each refusal and decline line that a test asserts now, and the runner exit status passed through (`test_mac_failure_keeps_runner_status`).
+4. Keep all 18 tests and every assertion. Change no production code. A missing callable boundary goes to verify-unit as a proposal; do not copy the decision into a fixture.
+5. `scripts/direct/verify_mac_offload_test_support.py` serves 68 modules: change it only when every importer keeps its results; run every importer after a change.
+6. Measure after with the same command. The director runs three aws pairs on this module and, after a fixture change, on a sample of importers; only aws pairs decide.
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py` — 18 tests in one class.
+- `scripts/direct/verify_mac_offload_test_support.py` — shared fixture for 68 modules; read first, edit only under Spec 5.
+
+**Workers:** 1 writer; one module and its fixture cannot split.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 157: removed two full `verify.sh` starts and one redundant cleanup scan; aws pairs 38.31 to 36.18 CPU s.
+- Phase 177: this module makes 62 `build_targets.py` starts (8.7 CPU s) in the census sample.
+- Phase 181: the same method on `test_verify_wait_holder.py`.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.direct.test_verify_mac_only` passes three times with 18 tests.
+- After a fixture change, every importer of `verify_mac_offload_test_support.py` passes.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
