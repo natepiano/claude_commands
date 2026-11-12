@@ -138,7 +138,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
             snapshot = staff.StaffSnapshot(tuple(rows))
 
             def timer(row: staff.StaffRow, record: staff.StaffSnapshot) -> showrunners.TimerRegistration:
@@ -218,7 +218,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=staff.LiveDoc(remote.local_machine(), document)))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name, staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
                 timer_path = timers / f"showrunner-{owner_id}"
                 timer_path.mkdir(parents=True)
                 _ = (timer_path / "conf").write_text(
@@ -264,7 +264,7 @@ class FileOnlyLabelTests(unittest.TestCase):
                                           current_session=owner_id, doc=document_state))
                 unit_id = staff.StaffId(fixture_runtime_id(name + "-unit"))
                 rows.append(staff.StaffRow(unit_id, "unit", name + "-child", staff.ReportsTo(owner_id), current_session=unit_id,
-                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name)))
+                                          worktree=staff.PresentWorktree(remote.local_machine(), root / name), unit_type=staff.UnitDetails("direct")))
             snapshot = staff.StaffSnapshot(tuple(rows))
             problems: list[str] = []
             with (mock.patch.object(showrunners, "timer_for", return_value=showrunners.NoTimer("private fixture")),

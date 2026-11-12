@@ -179,7 +179,8 @@ class RefusalWatchTests(unittest.TestCase):
             return record
         return staff.StaffSnapshot(tuple(staff.StaffRow(
             staff.StaffId(owner["session_id"]), owner["kind"], owner["name"], staff.StaffRoot(),
-            current_session=staff.StaffId(owner["session_id"]))
+            current_session=staff.StaffId(owner["session_id"]),
+            unit_type=staff.UnitDetails("direct") if owner["kind"] == "unit" else staff.NotUnit())
             for owner in self.owners if owner["kind"] in ("unit", "showrunner")))
 
     def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:

@@ -30,8 +30,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 Read `~/.claude/docs/direct/held_astra_roles.md` in full when the run holds an Astra role.
 </HeldAstraRoles>
 
-At startup or restart, a header `**Standing:** style_plan.py` runs
-<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+After restart, compaction, move, or rename, apply <RestartTakeover/> before new dispatches.
 
 State:
 
@@ -82,6 +81,7 @@ it:
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
 | <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
+| <RestartTakeover/> | `docs/direct/restart_takeover.md` | — |
 | <PhaseChecks/> | `docs/direct/phase_checks.md` | — |
 | <StyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
@@ -102,7 +102,6 @@ it:
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
-| <StandingPlanRefill/> | `docs/direct/standing_plan_refill.md` | — |
 | <BerthDecisions/> | `docs/direct/berth_decisions.md` | — |
 | <CodexDispatchWait/> | `docs/direct/codex_dispatch_wait.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
@@ -160,7 +159,8 @@ An idle worker's next assign opens its conversation on the current role account.
 A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
-A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
+A completed restore or move rerun prints `unchanged` and exits 0 without a restart notice.
+Restore also lists completed results under <RestartTakeover/>.
 An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
 Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
 
@@ -694,9 +694,6 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
-Standing plans skip this tag entirely: their excluded plan and pinned files
-are never staged, and no shrink commit or notice is sent.
-
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -766,10 +763,8 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, a plan whose header carries
-`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
-the next phase or close the plan. If no
-todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
+At <PhaseEnd/>'s next boundary, choose the next phase or close the plan.
+If no todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
 For `next N`, decrement after completion and clear at zero. For `through X`,
@@ -785,10 +780,6 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
-
-<StandingPlanRefill>
-Read `~/.claude/docs/direct/standing_plan_refill.md` in full when the plan header has `**Standing:**`.
-</StandingPlanRefill>
 
 <FinalGateCommit>
 Read `~/.claude/docs/direct/final_gate_commit.md` in full at the final gate or when a `single` task finishes.

@@ -241,7 +241,7 @@ class FolderMoveFixture(StaffTestCase):
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
         staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
-        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"), unit_type=staff.UnitDetails("direct"))
 
     @override
     def setUp(self) -> None:
