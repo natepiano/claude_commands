@@ -48,6 +48,16 @@ TASK_WIDTH = 80
 RunEventsReader = Callable[[Path], list[dict[str, object]]]
 
 
+class ProgressState(NamedTuple):
+    square: str
+    label: str
+
+
+PROGRESS_DONE = ProgressState("🟩", "done")
+PROGRESS_OPEN = ProgressState("🟨", "open")
+PROGRESS_NOT_STARTED = ProgressState("⬜", "not started")
+
+
 WORK_EVENT = re.compile(r'"event_type"\s*:\s*"([^"\\]+)"')
 WORK_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "run_finished", "pass_started", "pass_finished",
                          "activity_started", "activity_finished"))
@@ -120,8 +130,15 @@ def progress_cell(record: object) -> str:
     cells: list[str] = []
     for index in range(size):
         states = {row.get("status") for row in rows[index * len(rows) // size:(index + 1) * len(rows) // size]}
-        cells.append("🟨" if states & {"running", "open"} else "⬜" if "todo" in states else "🟩")
+        progress = PROGRESS_OPEN if states & {"running", "open"} else PROGRESS_NOT_STARTED if "todo" in states else PROGRESS_DONE
+        cells.append(progress.square)
     return "".join(cells)
+
+
+def progress_legend() -> str:
+    """Describe the squares in the Progress bar."""
+    return "Progress: " + " · ".join(f"{state.square} {state.label}" for state in (
+        PROGRESS_DONE, PROGRESS_OPEN, PROGRESS_NOT_STARTED))
 
 
 def elapsed_text(seconds: float) -> str:
@@ -503,14 +520,23 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                  eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
                  eta_plan_cell(progress_record, now=now, zone=zone), workers, other, queued)
         table_rows.append(cells)
+    workers_heading = worker_heading()
     headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "Notes", "ETA Next",
-               *(("ETA Plan",) if show_plan_eta else ()), worker_heading(), "Non-Phase Work", "Queued")
-    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
-    plan_column = headers.index("ETA Next") + 1
-    for cells in table_rows:
-        if not show_plan_eta:
-            cells = cells[:plan_column] + cells[plan_column + 1:]
-        lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
+               "ETA Plan", workers_heading, "Non-Phase Work", "Queued")
+    if not show_plan_eta:
+        plan_column = headers.index("ETA Plan")
+        headers = headers[:plan_column] + headers[plan_column + 1:]
+        table_rows = [cells[:plan_column] + cells[plan_column + 1:] for cells in table_rows]
+    progress_column = 3 if machines else 2
+    show_progress = any(cells[progress_column] != display_cells.NONE for cells in table_rows)
+    headers, table_rows = display_cells.fitted(
+        headers, table_rows, cuttable=(len(headers) - 1, len(headers) - 2, len(headers) - 3, 5 if machines else 4),
+        columns=conf.read_or_repository("production").whole("units_table_columns"))
+    lines = ["| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
+             "| " + " | ".join(("---",) * len(headers)) + " |"]
+    lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
+    if show_progress:
+        lines.extend(("", progress_legend()))
     return "\n".join(lines)
 
 

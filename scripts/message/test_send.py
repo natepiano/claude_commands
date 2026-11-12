@@ -1125,7 +1125,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as transport:
             self.assertEqual(send.send(local_options(["--to", "resources", "--text", "hello"])).outcome, "sent")
         snapshots.assert_called_once_with()
-        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, registry=registry)
+        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, registry=registry,
+                                          participants=roster.MessageParticipants(frozenset(("resources-current",))))
 
     def daemon_owner(self) -> codex_daemon.CodexDaemon:
         home = self.root / ".codex2"
@@ -5302,8 +5303,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
 
     def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
-                   registry: sessions.RegistryRead) -> roster.Roster:
-        del registry
+                   registry: sessions.RegistryRead,
+                   participants: roster.AllRosterSessions | roster.MessageParticipants) -> roster.Roster:
+        del registry, participants
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
         return self.local

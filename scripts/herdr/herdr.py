@@ -1510,13 +1510,13 @@ class Herdr:
         return panes
 
     def tab_sessions(self) -> list[TabSession]:
-        """Read labelled panes with workspace names and their last known conversation ids."""
+        """Read pane conversations and retain their display names."""
         panes = self.panes()
         spaces = {json_text(space.get("workspace_id"), "herdr workspace id"):
                   "" if space.get("label") is None else json_text(space["label"], "herdr workspace label")
                   for space in self.listed("workspace")}
-        return [TabSession(pane["pane_id"], label, spaces.get(pane["workspace_id"], ""), pane["session_id"])
-                for pane in panes if (label := pane.get("label")) is not None]
+        return [TabSession(pane["pane_id"], pane.get("label") or "", spaces.get(pane["workspace_id"], ""), pane["session_id"])
+                for pane in panes]
 
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
         """Describe whether the pane is at its shell or running foreground work."""
@@ -3819,12 +3819,13 @@ def codex_resume_thread(pid: int) -> str:
         return launch.id
     if isinstance(launch, (StartingCodexPane, CodexWrapperPending)):
         raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
-    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+    raise ValueError(launch.reason)
 
 
 def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | CodexLaunchIdentityUnknown:
     """Classify the launch arguments without requiring a conversation identity."""
-    unknown = CodexLaunchIdentityUnknown(f"pid {pid}: Codex launch identity is unavailable")
+    unavailable = f"pid {pid}: Codex launch identity is unavailable"
+    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: arguments unreadable")
     if _platform() == "darwin":
         process = next((process for process in _darwin_processes() if process.pid == pid), None)
         if process is None or isinstance(process.arguments, UnreadableProcessArguments):
@@ -3849,8 +3850,10 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
             if option in value_options:
                 if not option_value or option_value.startswith("-"):
                     fresh = False
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has a missing or dash value")
                 if option in {"-c", "--config"} and "=" not in option_value:
                     fresh = False
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has no =")
             elif option == "--":
                 return StartingCodexPane(pid) if fresh else unknown
             elif not option.startswith("-"):
@@ -3858,22 +3861,24 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
                     try:
                         return LaunchArgument(staff.native_id(next(options, "")))
                     except staff.StaffRefused:
-                        return unknown
+                        return CodexLaunchIdentityUnknown(f"{unavailable}: bad resume id")
                 if option in {"exec", "e", "review", "fork", "login", "logout", "mcp", "mcp-server",
                               "app-server", "app", "completion", "sandbox", "debug", "apply", "a",
                               "cloud", "features", "help"}:
-                    return unknown
+                    return CodexLaunchIdentityUnknown(f"{unavailable}: subcommand {option}")
                 return StartingCodexPane(pid) if fresh else unknown
             elif option in {"--no-daemon", "--no-alt-screen", "--full-auto", "--search", "--oss",
                             "--dangerously-bypass-approvals-and-sandbox"}:
                 continue
             else:
                 fresh = False
+                name = option_name if option_name.startswith("--") else option_name[:2]
+                unknown = CodexLaunchIdentityUnknown(f"{unavailable}: unknown option {name}")
         else:
             if fresh:
                 return StartingCodexPane(pid)
     else:
-        return CodexWrapperPending(unknown.reason)
+        return CodexWrapperPending(unavailable)
     return unknown
 
 

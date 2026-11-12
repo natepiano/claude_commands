@@ -7719,12 +7719,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_busy_move_keeps_the_pane_and_conversation_and_rerun_changes_nothing(self) -> None:
         row = self.worker()
+        row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude1"))
         _ = self.fixture.worker_run("a-first", "unit", self.owner.current_session, director_run=True,
             passes=({"worker_name": row.name, "kind": "review", "status": "active", "started_at": 0,
                      "instance_id": "old-dispatch", "launcher_command": ["assign.sh", "--old"]},))
         self.run_dir = self.fixture.worker_run("z-own", "unit", self.owner.current_session)
         self.dispatch(row)
-        before = self.fixture.staff_state()
+        before = staff.snapshot()
         result = self.move("claude2", why="quota")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
@@ -7734,6 +7735,12 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertIn("moved from claude1 to claude2", prompt[-1])
         self.assertEqual(self.target_check.call_args.args[0], row.current_session)
         self.assertEqual(cast(herdr.HerdrPlace, self.target_check.call_args.kwargs["place"]).pane, "w1:p1")
+        moved = staff.by_id(row.id)
+        assert moved is not None
+        self.assertEqual(moved.home, staff.SessionHome(self.root / ".claude2"))
+        self.assertEqual(tuple(replace(member, home=row.home) if member.id == row.id else member
+                               for member in staff.snapshot().rows), before.rows)
+        after_move = self.fixture.staff_state()
         journal = moves.store_file().read_bytes()
         with patch.object(moves, "append_move", wraps=moves.append_move) as append:
             rerun = self.move("claude2")
@@ -7741,7 +7748,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(rerun.returncode, 0)
         self.assertEqual(moves.store_file().read_bytes(), journal)
         self.assertEqual(len(self.world.launches), 1)
-        self.assertEqual(self.fixture.staff_state(), before)
+        self.assertEqual(self.fixture.staff_state(), after_move)
         self.assertEqual(self.world.closed, [])
         self.assertIn("w1:p0", self.world.foreground)
         self.assertEqual([item["kind"] for item in moves.read_moves()], ["requested", "confirmed"])

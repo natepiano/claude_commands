@@ -3412,9 +3412,22 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     running = sessions.running_records(registry)
     if reads_registry:
         membership = replace(membership, running_sessions=frozenset(record["sessionId"] for record in running))
-    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry) if needs_recipient_roster or needs_sender_roster
-                else roster.Roster([], []))
     records = [record for record in running if sessions.messaging_socket_exists(record)]
+    stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
+    participants: roster.AllRosterSessions | roster.MessageParticipants = roster.AllRosterSessions()
+    if needs_recipient_roster and not options.to.startswith(("uds:", "worker:", "codex:")):
+        local_member = resolve_staff_recipient(options.to, membership, records=records)
+        if (isinstance(local_member, staff.StaffRow) and local_member.kind != "worker"
+                and sessions.addressed(f"session:{local_member.current_session}", records, membership=membership) is not None):
+            identities = {str(local_member.current_session)}
+            if isinstance(stamp, ClaudeSender):
+                identities.add(stamp.session_id)
+            elif isinstance(stamp, CodexSender):
+                identities.add(stamp.thread_id)
+            participants = roster.MessageParticipants(frozenset(identities))
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership, registry=registry,
+                             participants=participants) if needs_recipient_roster or needs_sender_roster
+                else roster.Roster([], []))
     route: DeliveryRoute
     if options.to == USER:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
@@ -3449,7 +3462,6 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         options = options._replace(answerable=True)
     emergency = options.to == USER and options.need == "blocked"
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
-    stamp = (options.sender_origin.stamp if isinstance(options.sender_origin, ForwardedSender) else sender_stamp())
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
     if sender.casefold() == "morty" and not morty_stamp(stamp):
