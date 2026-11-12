@@ -82,20 +82,29 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(content, 'sha256').hexdigest()
 
 
-def checked(arguments: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ) -> str:
+def checked(arguments: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ,
+            timeout: float | None = None) -> str:
     result = subprocess.run(arguments, cwd=cwd, env=environment, check=True,
-                            stdout=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, text=True, timeout=timeout)
     return result.stdout.strip()
 
 
-def hardware_vulkan(payload: str) -> tuple[str, ...]:
-    """Accept hardware adapters only, including hosts with several devices."""
-    devices = cast(list[str], re.findall(r'deviceType\s*=\s*(\S+)', payload))
-    if not devices or any(value not in ('PHYSICAL_DEVICE_TYPE_DISCRETE_GPU',
-                                       'PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU',
-                                       'PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU') for value in devices):
-        raise ValueError('The trial needs a hardware Vulkan adapter; CPU adapters are refused')
-    return tuple(cast(list[str], re.findall(r'deviceName\s*=\s*(.+)', payload)))
+def hardware_vulkan(payload: str) -> tuple[dict[str, str], ...]:
+    """Require a hardware GPU and record all adapter names and types."""
+    adapters: list[dict[str, str]] = []
+    for line in payload.splitlines():
+        key, separator, value = line.partition('=')
+        if not separator:
+            continue
+        if key.strip() == 'deviceType':
+            adapters.append({'type': value.strip(), 'name': ''})
+        elif key.strip() == 'deviceName' and adapters:
+            adapters[-1]['name'] = value.strip()
+    if not any(adapter['type'] in ('PHYSICAL_DEVICE_TYPE_DISCRETE_GPU',
+                                   'PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU',
+                                   'PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU') for adapter in adapters):
+        raise ValueError('The trial needs at least one hardware Vulkan adapter')
+    return tuple(adapters)
 
 
 def trial_environment() -> dict[str, str]:
@@ -111,14 +120,61 @@ def trial_environment() -> dict[str, str]:
     return environment
 
 
+def preflight(source: Path, environment: Mapping[str, str]) -> dict[str, str]:
+    """Check external tools before admission without building the Rust toolchain."""
+    timeout = conf.read_or_repository('aws_target').number('gpu_size_trial_preflight_timeout_s')
+    tools: dict[str, str] = {}
+    specifications = (
+        ('git', False, ('--version',)),
+        ('nix', False, ('--version',)),
+        ('nix-store', False, ('--version',)),
+        ('python', False, ('--version',)),
+        ('sh', True, ('-c', ':')),
+        ('cargo', True, ('--version',)),
+        ('rustc', True, ('--version',)),
+        ('rustdoc', True, ('--version',)),
+        ('cargo-nextest', True, ('--version',)),
+        ('zstd', True, ('--version',)),
+        ('vulkaninfo', True, ('--summary',)),
+    )
+    for name, in_shell, arguments in specifications:
+        context = name + (' in the dev shell' if in_shell else '')
+        try:
+            prefix = [tools['nix'], 'develop', '--no-write-lock-file', '.#default', '-c'] if in_shell else []
+            if name == 'vulkaninfo':
+                tools['vulkan_tools'] = checked(
+                    [tools['nix'], 'build', '--no-link', '--print-out-paths', '--inputs-from',
+                     str(source), 'nixpkgs#vulkan-tools'], source, environment=environment, timeout=timeout)
+                if not re.fullmatch(r'/nix/store/[A-Za-z0-9+._?-]+', tools['vulkan_tools']):
+                    raise ValueError('vulkan-tools must resolve to one Nix store path')
+                path = tools['vulkan_tools'] + '/bin/vulkaninfo'
+            elif in_shell:
+                path = checked([*prefix, 'sh', '-c', 'command -v "$1"', 'gpu-trial-preflight', name],
+                               source, environment=environment, timeout=timeout)
+            else:
+                path = sys.executable if name == 'python' else shutil.which(name, path=environment.get('PATH'))
+            if not path:
+                raise ValueError('The tool is missing')
+            tools[name] = path
+            payload = checked([*prefix, path, *arguments], source, environment=environment, timeout=timeout)
+            if name == 'vulkaninfo':
+                _ = hardware_vulkan(payload)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise ValueError(f'GPU trial preflight failed for {context}: {error}') from error
+    return tools
+
+
 def prepare(repo: Path, commit: str, folder: Path) -> None:
-    """Admit the complete local preparation as one supervised program."""
+    """Check external tools, then admit the local preparation worker."""
     limits = settings()
     resolved = checked(['git', 'rev-parse', '--verify', commit + '^{commit}'], repo)
     if not re.fullmatch('[0-9a-f]{40}', resolved):
         raise ValueError('The trial needs a resolved Git commit')
     folder.mkdir(parents=True, exist_ok=False)
+    source = export_source(repo, resolved, folder)
+    tools = preflight(source, trial_environment())
     write_json(folder / 'request.json', {'repo': str(repo), 'commit': resolved,
+                                       'tools': tools,
                                        'limits': {**asdict(limits),
                                                   'limit_usd': str(limits.limit_usd),
                                                   'box_extra_usd': str(limits.box_extra_usd),
@@ -175,7 +231,7 @@ def nix_toolchain(folder: Path, source: Path, environment: Mapping[str, str]) ->
         + 'name = "gpu-trial-toolchain"; paths = [ pkgs.rustc pkgs.cargo ]; }; '
         + 'chosen = hana.packages.x86_64-linux.rust-toolchain or (hana.packages.x86_64-linux.toolchain or fallback); '
         + 'in pkgs.symlinkJoin { name = "gpu-trial-toolchain-with-nextest"; paths = [ chosen pkgs.cargo-nextest ]; }')
-    toolchain = checked(['nix', 'build', '--impure', '--out-link', str(folder / 'toolchain-profile'),
+    toolchain = checked([environment.get('GPU_TRIAL_NIX', 'nix'), 'build', '--impure', '--out-link', str(folder / 'toolchain-profile'),
                          '--print-out-paths', '--expr', expression], folder,
                         environment=environment)
     if not re.fullmatch(r'/nix/store/[A-Za-z0-9+._?-]+', toolchain):
@@ -191,10 +247,12 @@ def nix_toolchain(folder: Path, source: Path, environment: Mapping[str, str]) ->
 
 def build_system(folder: Path, source: Path, environment: Mapping[str, str], toolchain: str) -> str:
     """Build the GPU system from the deployment host's locked nixpkgs input."""
-    nixpkgs = checked(['nix', 'eval', '--impure', '--raw', '--expr',
-                      '(builtins.getFlake "path:/etc/nixos").inputs.nixpkgs.outPath'], folder)
+    nix = environment.get('GPU_TRIAL_NIX', 'nix')
+    nix_store = environment.get('GPU_TRIAL_NIX_STORE', 'nix-store')
+    nixpkgs = checked([nix, 'eval', '--impure', '--raw', '--expr',
+                      '(builtins.getFlake "path:/etc/nixos").inputs.nixpkgs.outPath'], folder, environment=environment)
     runtime = folder / 'runtime-profile'
-    shell = checked(['nix', 'print-dev-env', '--no-write-lock-file', '--profile', str(runtime), '.#default'], source,
+    shell = checked([nix, 'print-dev-env', '--no-write-lock-file', '--profile', str(runtime), '.#default'], source,
                     environment=environment)
     _ = (folder / 'runtime.env').write_text(shell + '\n')
     module = folder / 'gpu-trial.nix'
@@ -204,12 +262,13 @@ def build_system(folder: Path, source: Path, environment: Mapping[str, str], too
                   + '(import (builtins.toPath ' + nix_string(str(module)) + ') { runtimeRoots = [ (builtins.toPath '
                   + nix_string(str(runtime.resolve())) + ') ]; toolchain = builtins.toPath '
                   + nix_string(toolchain) + '; }) ]; }).config.system.build.toplevel')
-    system = checked(['nix', 'build', '--impure', '--out-link', str(folder / 'system-profile'),
+    system = checked([nix, 'build', '--impure', '--out-link', str(folder / 'system-profile'),
                       '--print-out-paths', '--expr', expression], folder,
                      environment=environment)
-    roots = checked(['nix-store', '--query', '--requisites', system, str(runtime.resolve()), toolchain], folder).splitlines()
+    roots = checked([nix_store, '--query', '--requisites', system, str(runtime.resolve()), toolchain], folder,
+                    environment=environment).splitlines()
     with (folder / 'closure.export').open('wb') as output:
-        _ = subprocess.run(['nix-store', '--export', *sorted(set(roots))], stdout=output, check=True)
+        _ = subprocess.run([nix_store, '--export', *sorted(set(roots))], stdout=output, check=True, env=environment)
     write_json(folder / 'closure.json', {'system': system, 'toolchain': toolchain,
                                         'nixpkgs': nixpkgs, 'roots': roots})
     return system
@@ -219,7 +278,7 @@ def cache_dependencies(folder: Path, source: Path, environment: Mapping[str, str
     destination = folder / 'cargo-home'
     destination.mkdir()
     online = {**environment, 'CARGO_HOME': str(destination), 'CARGO_NET_OFFLINE': 'false'}
-    _ = checked(['nix', 'develop', '--no-write-lock-file', '.#default', '-c',
+    _ = checked([environment.get('GPU_TRIAL_NIX', 'nix'), 'develop', '--no-write-lock-file', '.#default', '-c',
                  environment['GPU_TRIAL_CARGO'], 'fetch', '--locked'], source, environment=online)
     _ = (destination / 'config.toml').write_text('[net]\noffline = true\n')
 
@@ -258,10 +317,11 @@ def no_publish(_run: Path) -> None:
 
 def measure_machine(folder: Path, machine: str, source: Path, environment: Mapping[str, str], *,
                     prefix: Sequence[str] = ('nix', 'develop', '--no-write-lock-file', '.#default', '-c'),
+                    vulkaninfo: str = 'vulkaninfo',
                     publish: Callable[[Path], None] = no_publish) -> None:
     destination = folder / 'machines' / machine
     destination.mkdir(parents=True, exist_ok=False)
-    payload = checked([*prefix, 'vulkaninfo', '--summary'], source, environment=environment)
+    payload = checked([*prefix, vulkaninfo, '--summary'], source, environment=environment)
     adapters = hardware_vulkan(payload)
     _ = (destination / 'vulkan.txt').write_text(payload + '\n')
     write_json(destination / 'machine.json', {'adapters': adapters, 'commit': read_json(folder / 'request.json')['commit'],
@@ -294,16 +354,23 @@ def measure_machine(folder: Path, machine: str, source: Path, environment: Mappi
 def prepare_worker(folder: Path) -> None:
     request = read_json(folder / 'request.json')
     repo, commit = Path(str(request['repo'])), str(request['commit'])
+    tools = {name: str(path) for name, path in mapping(request['tools']).items()}
     environment = trial_environment()
-    source = export_source(repo, commit, folder)
+    environment.update(GPU_TRIAL_NIX=tools['nix'], GPU_TRIAL_NIX_STORE=tools['nix-store'])
+    environment['PATH'] = os.pathsep.join(dict.fromkeys(
+        [str(Path(path).parent) for name, path in tools.items() if name != 'vulkan_tools']
+        + [environment.get('PATH', '')]))
+    source = folder / 'source'
     toolchain = nix_toolchain(folder, source, environment)
     environment.update(GPU_TRIAL_CARGO=toolchain + '/bin/cargo', CARGO=toolchain + '/bin/cargo',
                        RUSTC=toolchain + '/bin/rustc', RUSTDOC=toolchain + '/bin/rustdoc', PATH=toolchain + '/bin:' + environment.get('PATH', ''))
     cache_dependencies(folder, source, environment)
     environment['CARGO_HOME'] = str(folder / 'cargo-home')
-    prefix = ['nix', 'develop', '--no-write-lock-file', '.#default', '-c']
-    # Refuse software Vulkan before the expensive archive build.
-    _ = hardware_vulkan(checked([*prefix, 'vulkaninfo', '--summary'], source, environment=environment))
+    prefix = [tools['nix'], 'develop', '--no-write-lock-file', '.#default', '-c']
+    vulkan_tools = tools['vulkan_tools']
+    vulkaninfo = tools['vulkaninfo']
+    # Require a hardware GPU before the expensive archive build.
+    _ = hardware_vulkan(checked([*prefix, vulkaninfo, '--summary'], source, environment=environment))
     archive = folder / 'hana-tests.tar.zst'
     _ = checked([*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'archive', '--profile', 'ci', '--locked',
                  '--workspace', '--all-features', '--tests', '--archive-file', str(archive)],
@@ -314,8 +381,8 @@ def prepare_worker(folder: Path) -> None:
                       '--message-format', 'json'], source, environment=environment)
     write_json(folder / 'inventory.json', {'tests': inventory(mapping(cast(object, json.loads(listed))))})
     manifest: dict[str, object] = {'schema': 2, 'toolchain_source': 'nix', 'trial': folder.name, 'commit': commit,
-        'tree': checked(['git', 'rev-parse', commit + '^{tree}'], repo),
-        'created': datetime.now(UTC).isoformat(), 'system': system, 'toolchain': toolchain,
+        'tree': checked([tools['git'], 'rev-parse', commit + '^{tree}'], repo, environment=environment),
+        'created': datetime.now(UTC).isoformat(), 'system': system, 'toolchain': toolchain, 'vulkan_tools': vulkan_tools,
         'rustc': checked([*prefix, environment['RUSTC'], '-Vv'], source, environment=environment),
         'nextest': checked([*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', '--version'], source, environment=environment),
         'limits': request['limits'], 'state': 'preparing',
@@ -324,7 +391,7 @@ def prepare_worker(folder: Path) -> None:
             'gpu_trial_wrapper.py', 'inventory.json')},
         'locks': {name: digest(source / name) for name in ('Cargo.lock', 'flake.lock')}}
     write_json(folder / 'manifest.json', manifest)
-    measure_machine(folder, 'natedev', source, environment)
+    measure_machine(folder, 'natedev', source, environment, prefix=prefix, vulkaninfo=vulkaninfo)
     manifest['state'] = 'prepared'
     write_json(folder / 'manifest.json', manifest)
 
