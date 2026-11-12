@@ -15,11 +15,13 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from unittest.mock import patch
 
 from scripts.production import ci_points
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -996,59 +998,52 @@ PY
 
     def test_simultaneous_watch_calls_claim_only_one_first_alert(self) -> None:
         _ = (self.stub_state / "watch-three").touch()
-        program = """import fcntl, os, runpy, sys
-ready = int(sys.argv.pop(1))
-sys.argv.pop(0)
-original = fcntl.flock
-def observed_lock(fd, operation):
-    if operation == fcntl.LOCK_EX:
-        try:
-            original(fd, operation | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.write(ready, b'blocked')
-        else:
-            raise RuntimeError('expected the parent to hold the review lock')
-        # Observe only the initial contention; later locks use their real path.
-        fcntl.flock = original
-    return original(fd, operation)
-fcntl.flock = observed_lock
-runpy.run_path(sys.argv[0], run_name='__main__')
-"""
         self.state.mkdir(exist_ok=True)
-        processes: list[subprocess.Popen[str]] = []
-        readiness: list[int] = []
-        try:
-            with (self.state / "review_watch.lock").open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                for _ in range(2):
-                    read_ready, write_ready = os.pipe()
-                    readiness.append(read_ready)
+
+        def watch(announcement: int) -> int:
+            original = fcntl.flock
+
+            def observed_lock(fd: int, operation: int) -> None:
+                if operation == fcntl.LOCK_EX:
                     try:
-                        processes.append(subprocess.Popen(
-                            [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
-                             "watch", "--production", "example", "--state-dir", str(self.state)],
-                            cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        ))
-                    finally:
-                        os.close(write_ready)
-                for fd, process in zip(readiness, processes, strict=True):
-                    readable, _, _ = select.select([fd], [], [], 300)
-                    self.assertEqual(readable, [fd], "watch never reached the held lock")
-                    if os.read(fd, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.fail("watch exited before observing the review lock: " + stdout + stderr)
-                self.assertTrue(all(process.poll() is None for process in processes))
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                results = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            for fd in readiness:
-                os.close(fd)
-        self.assertTrue(all(process.returncode == 0 for process in processes), results)
+                        original(fd, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _ = os.write(announcement, b"blocked")
+                        os.close(announcement)
+                    else:
+                        raise RuntimeError("The parent must hold the review lock.")
+                    # Observe the first wait. Later locks use the real function.
+                    fcntl.flock = original
+                original(fd, operation)
+
+            with (patch.dict(os.environ, self.env, clear=True),
+                  patch.object(sys, "argv", [str(SCRIPT), "watch", "--production", "example",
+                                            "--state-dir", str(self.state)]),
+                  patch.object(fcntl, "flock", observed_lock)):
+                os.chdir(self.checkout)
+                return ci_points.main()
+
+        with ForkChildren() as children, (self.state / "review_watch.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            processes: list[ForkChild] = []
+            readiness: list[int] = []
+            for _ in range(2):
+                read_ready, write_ready = children.pipe()
+                processes.append(children.start(
+                    lambda write_ready=write_ready: watch(write_ready),
+                    close_fds=(lock.fileno(),), pass_fds=(write_ready,)))
+                readiness.append(read_ready)
+            for fd, process in zip(readiness, processes, strict=True):
+                readable, _, _ = select.select([fd], [], [], 300)
+                self.assertEqual(readable, [fd], "watch never reached the held lock")
+                if os.read(fd, 7) != b"blocked":
+                    result = process.result()
+                    self.fail("watch exited before observing the review lock: " + result.stdout + result.stderr)
+            self.assertTrue(all(process.is_alive() for process in processes))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            completed = [process.result() for process in processes]
+        results = [(process.stdout, process.stderr) for process in completed]
+        self.assertTrue(all(process.returncode == 0 for process in completed), results)
         self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
         self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)

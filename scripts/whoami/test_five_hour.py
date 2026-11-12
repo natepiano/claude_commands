@@ -22,7 +22,7 @@ from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from scripts.whoami import five_hour
 from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
-from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
+from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member, fixture_runtime_id
 
 from scripts.message import escalate  # five_hour puts scripts/message on the path
 from scripts.whoami import quota_alert
@@ -37,7 +37,9 @@ RESETS = NOW.replace(hour=21)
 CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
 }))
-SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", name="show", zone="America/Los_Angeles", doc="")]
+SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", name="hana", zone="America/Los_Angeles", doc="")]
+NATE_ID = fixture_runtime_id("producer::natedev")
+RUNNER_ID = fixture_runtime_id("showrunner::hana")
 CLAUDE_LOGIN = "claude-fixture@example.invalid"
 
 
@@ -58,12 +60,15 @@ class WatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sent = []
         self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.state / "staff.json", {}))
+        _ = fixture_member("producer", name="natedev", runtime_id=NATE_ID)
+        _ = fixture_member("showrunner", name="hana", runtime_id=RUNNER_ID)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.state), "AGENT_NOTES_DIR": str(self.state)})))
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.state))
 
         def relay(recipient: str, text: str, key: str | None) -> str | None:
             self.sent.append((recipient, text, key))
-            return "QUEUED: no live session" if recipient == "hana" else None
+            return "QUEUED: no live session" if recipient == RUNNER_ID else None
 
         def config() -> Config:
             return CONFIG
@@ -72,7 +77,7 @@ class WatchTests(unittest.TestCase):
             return None
 
         def showrunners() -> list[Showrunner]:
-            return SHOWRUNNERS
+            return [Showrunner(session="hana", socket="/hana.sock", name="hana", zone="America/Los_Angeles", doc="")]
 
         for module, name, stand_in in ((five_hour, "relay", relay), (five_hour, "load_config", config),
                                        (quota_alert, "registered_showrunners", showrunners),
@@ -107,7 +112,7 @@ class WatchTests(unittest.TestCase):
                 self.assertFalse(any("back above" in line for line in lines))
                 self.assertEqual(five_hour.notice_path(claude_notice_key(login)).read_text(), "claude3")
             self.assertCountEqual([(recipient, key) for recipient, _, key in self.sent],
-                                  [("natedev", "5-hour claude3"), ("hana", "5-hour claude3")])
+                                  [(NATE_ID, "5-hour claude3"), (RUNNER_ID, "5-hour claude3")])
             self.assertTrue(all(text.startswith("5-hour limit: claude3 has 18% of its 5-hour limit left;")
                                 for _, text, _ in self.sent))
             self.assertFalse(five_hour.notice_path(claude_notice_key("high@example.invalid")).exists())
@@ -120,7 +125,7 @@ class WatchTests(unittest.TestCase):
                              ["5-hour limit: claude3 18% left -> natedev", "5-hour limit: claude3 18% left -> hana"])
             self.assertEqual(self.watch([low, high]), [])
         self.assertCountEqual([(recipient, key) for recipient, _, key in self.sent],
-                              [("natedev", "5-hour claude3"), ("hana", "5-hour claude3")] * 2)
+                              [(NATE_ID, "5-hour claude3"), (RUNNER_ID, "5-hour claude3")] * 2)
         self.assertEqual(five_hour.notice_path(claude_notice_key("low@example.invalid")).read_text(), "claude3")
 
     def test_claude_notice_without_a_matching_note_never_discloses_the_login(self) -> None:
@@ -152,7 +157,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(lines, ["5-hour limit: Claude 18% left -> natedev",
                                  "5-hour limit: Claude 18% left -> hana: NOT sent: QUEUED: no live session"])
         self.assertEqual([(name, key) for name, _, key in self.sent],
-                         [("natedev", "5-hour Claude"), ("hana", "5-hour Claude")])
+                         [(NATE_ID, "5-hour Claude"), (RUNNER_ID, "5-hour Claude")])
         self.assertEqual(self.sent[0][1],
                          "5-hour limit: Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.\n"
                          + "Tell the user in one line and change nothing else.\n"
@@ -162,7 +167,7 @@ class WatchTests(unittest.TestCase):
         with patch.object(five_hour, "relay", side_effect=self.successful_relay):
             retried = self.watch([report("Claude", 90)])
         self.assertEqual(retried, ["5-hour limit: Claude 10% left -> hana"])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID, RUNNER_ID])
         self.assertEqual(len(self.sent), 3)
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
         self.assertEqual(self.watch([report("Claude", 90)]), [])
@@ -175,28 +180,28 @@ class WatchTests(unittest.TestCase):
             self.successful_relay(recipient, text, key)
             recoveries.append(self.watch([report("Claude", 3)]))
 
-        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+        with (patch.object(five_hour, "recipients", return_value=[NATE_ID]),
               patch.object(five_hour, "relay", side_effect=relay)):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev"])
         self.assertEqual(len(recoveries), 1)
         self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
-        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+        with (patch.object(five_hour, "recipients", return_value=[NATE_ID]),
               patch.object(five_hour, "relay", side_effect=self.successful_relay)):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev"])
             self.assertEqual(self.watch([report("Claude", 90)]), [])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "natedev"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, NATE_ID])
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
 
     def test_repeated_failed_relay_retries_only_the_recipient_still_owed(self) -> None:
         for _ in range(3):
             _ = self.watch([report("Claude", 90)])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana", "hana"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID, RUNNER_ID, RUNNER_ID])
         self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
         with patch.object(five_hour, "relay", side_effect=self.successful_relay):
             self.assertEqual(self.watch([report("Claude", 90)]), ["5-hour limit: Claude 10% left -> hana"])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "hana", "hana", "hana"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID, RUNNER_ID, RUNNER_ID, RUNNER_ID])
         self.assertEqual(self.watch([report("Claude", 90)]), [])
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
 
@@ -205,18 +210,18 @@ class WatchTests(unittest.TestCase):
             pass
 
         def relay(recipient: str, text: str, key: str | None) -> None:
-            if recipient == "hana":
+            if recipient == RUNNER_ID:
                 raise Killed()
             self.successful_relay(recipient, text, key)
 
         with patch.object(five_hour, "relay", side_effect=relay):
             with self.assertRaises(Killed):
                 _ = self.watch([report("Claude", 90)])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID])
         self.assertFalse(five_hour.notice_path(claude_notice_key()).exists())
         with patch.object(five_hour, "relay", side_effect=self.successful_relay):
             self.assertEqual(self.watch([report("Claude", 90)]), ["5-hour limit: Claude 10% left -> hana"])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID])
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
 
     def test_recovery_clears_partial_delivery_for_the_next_low_spell(self) -> None:
@@ -225,7 +230,7 @@ class WatchTests(unittest.TestCase):
         with patch.object(five_hour, "relay", side_effect=self.successful_relay):
             self.assertEqual(self.watch([report("Claude", 90)]),
                              ["5-hour limit: Claude 10% left -> natedev", "5-hour limit: Claude 10% left -> hana"])
-        self.assertEqual([name for name, _, _ in self.sent], ["natedev", "hana", "natedev", "hana"])
+        self.assertEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID, NATE_ID, RUNNER_ID])
         self.assertEqual(five_hour.notice_path(claude_notice_key()).read_text(), "Claude")
 
     def test_interrupted_recovery_ends_the_previous_spell_after_a_stopped_finish(self) -> None:
@@ -251,7 +256,7 @@ class WatchTests(unittest.TestCase):
                         _ = self.watch([report("Claude", 90)])
                 self.assertEqual(marker.read_text(), "Claude")
                 self.assertTrue(pending.exists())
-                self.assertCountEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+                self.assertCountEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID])
                 self.assertEqual(self.watch([report("Claude", 90)]), [])
 
                 def stop_recovery_cleanup(path: Path, missing_ok: bool = False) -> None:
@@ -266,7 +271,7 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(self.watch([report("Claude", 90)]),
                                  ["5-hour limit: Claude 10% left -> natedev", "5-hour limit: Claude 10% left -> hana"])
                 self.assertEqual(self.watch([report("Claude", 90)]), [])
-                self.assertCountEqual([name for name, _, _ in self.sent], ["natedev", "hana"])
+                self.assertCountEqual([name for name, _, _ in self.sent], [NATE_ID, RUNNER_ID])
                 self.assertEqual(marker.read_text(), "Claude")
                 self.assertFalse(pending.exists())
 
@@ -292,7 +297,7 @@ class WatchTests(unittest.TestCase):
             self.sent.append((recipient, text, key))
             concurrent.append(self.watch([report("Claude", 90)]))
 
-        with (patch.object(five_hour, "recipients", return_value=["natedev"]),
+        with (patch.object(five_hour, "recipients", return_value=[NATE_ID]),
               patch.object(five_hour, "relay", side_effect=relay),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(self.watch([report("Claude", 90)]),
@@ -381,6 +386,7 @@ class AccountHoldTests(unittest.TestCase):
         _ = self.enterContext(patch.object(escalate, "schedule"))
         _ = self.enterContext(patch.object(escalate, "load_settings", return_value=CONFIG))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("producer", name="natedev", runtime_id=NATE_ID)
         document = self.root / "show-production.md"
         _ = document.write_text("# Show production\n", encoding="utf-8")
         _ = recorded_showrunner("hana", document)

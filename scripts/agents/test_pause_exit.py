@@ -18,7 +18,7 @@ from scripts.message import sessions
 from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member, fixture_session
 from scripts.agents import pane_record, restart_support, shutdown, stop_resume, remote
 from scripts.agents.stop_resume import stop as stop_session
 from scripts.agents.stop_results import ClaudeStartState, StopResult
@@ -30,6 +30,7 @@ class PauseExitTests(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.child, self.stop_workers, self.stop_director, self.start, self.send
+        fixture_session(self.unit.current_session, staff.ClaudeBackend())
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=str(self.owner.current_session)))
         _ = self.enterContext(mock.patch.object(stop_resume, "_pane_environment", return_value=([], {})))
         def tab(session: str) -> herdr.TabSession | stop_resume.SessionNotFound:

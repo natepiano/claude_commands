@@ -14,7 +14,9 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.direct import verify_mac_offload_test_support
-from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
+from scripts.direct.verify_mac_offload_test_support import (
+    CARGO_STUB, SLEEP_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
+)
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -110,6 +112,71 @@ try_reserved_target
                  "MAC_FETCH": fetch, "MAC_FETCH_GIVEN": "1" if fetch else "0", **extra},
             text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def routing_result(self) -> subprocess.CompletedProcess[str]:
+        """Use the real eligibility and routing functions with private records."""
+        functions = shell_functions(
+            VERIFY, "initialize_step_record", "remove_step_record", "phase_wait_start",
+            "phase_wait_holder_flags", "phase_wait_target_busy",
+        )
+        return self.call_mac_functions(functions + r'''
+MAC_ONLY=1 MAC_REASON="needs macOS"
+STEP_RECORD_SCRIPT=$TEST_REAL_DIRECT/step_record.py
+STEP_RECORD_PATH="" STEP_STATE_PATH=""
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy)$'
+trap 'remove_step_record; finish_tree_watch; finish_hold_wait; release_token' EXIT
+initialize_step_record
+route_test
+''')
+
+    def test_fixed_cargo_replies_match_python_events(self) -> None:
+        reference = self.bin_directory / "cargo-reference"
+        self.write_executable(reference, CARGO_STUB)
+        cargo = self.bin_directory / "cargo"
+        install_fixed_cargo(cargo)
+        token = Path(self.environment["TEST_TOKEN_RECORD"])
+        token.parent.mkdir(parents=True, exist_ok=True)
+        for token_held in (False, True):
+            if token_held:
+                _ = token.write_text("owned\n")
+            else:
+                token.unlink(missing_ok=True)
+            for arguments in (
+                ("check", "with space", 'double"quote', "back\\slash", ""),
+                ("check", "with space", 'double"quote', "back\\slash", "é", ""),
+                ("metadata", "--format-version", "1"),
+                ("mend", "--version"), ("+nightly", "fmt", "--version"),
+                ("clippy", "--version"), ("nextest", "--version"),
+            ):
+                with self.subTest(arguments=arguments, token_held=token_held):
+                    events: list[bytes] = []
+                    replies: list[subprocess.CompletedProcess[bytes]] = []
+                    for executable in (reference, cargo):
+                        self.cargo_events_path.unlink(missing_ok=True)
+                        replies.append(subprocess.run(
+                            [str(executable), *arguments], env=self.environment,
+                            capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                        ))
+                        events.append(self.cargo_events_path.read_bytes() if self.cargo_events_path.exists() else b"")
+                    self.assertEqual(events[1], events[0])
+                    self.assertEqual(replies[1].returncode, replies[0].returncode)
+                    self.assertEqual(replies[1].stdout, replies[0].stdout)
+                    self.assertEqual(replies[1].stderr, replies[0].stderr)
+                    if arguments[0] == "metadata":
+                        self.assertEqual(replies[1].stdout, (self.environment["TEST_METADATA"] + "\n").encode())
+                    elif arguments in (("mend", "--version"), ("+nightly", "fmt", "--version"), ("clippy", "--version")):
+                        self.assertEqual(events[1], b"")
+                    if events[1]:
+                        self.assertEqual(cast(dict[str, object], json.loads(events[1]))["token_held"], token_held)
+
+        for executable in (reference, cargo):
+            with self.subTest(executable=executable.name, event_output="/dev/full"):
+                result = subprocess.run(
+                    [str(executable), "metadata", "--format-version", "1"],
+                    env={**self.environment, "TEST_CARGO_EVENTS": "/dev/full"},
+                    capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
@@ -212,7 +279,7 @@ try_reserved_target
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
 
     def test_policy_refusals_start_nothing(self) -> None:
-        result = self.verify("test", "sample", "--env", "SHOTS")
+        result, = self.parser_results([("test", "sample", "--env", "SHOTS")])
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stderr, 'verify.sh: --env and --fetch need --mac "<why>".\n')
         self.assertEqual(self.runner_events(), [])
@@ -295,7 +362,7 @@ try_reserved_target
 
     def test_eligibility_refuses_before_runner_and_records_decline(self) -> None:
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
-        result = self.verify("test", "sample", "--mac", "needs macOS")
+        result = self.routing_result()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
         self.assertEqual(self.runner_events(), [])
@@ -346,8 +413,8 @@ try_reserved_target
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        result = self.verify("test", "sample", "--mac", "why", extra={
-            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        result = self.routing_result()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(self.local_runs(), [])

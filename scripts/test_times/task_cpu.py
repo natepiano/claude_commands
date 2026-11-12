@@ -58,9 +58,9 @@ def command_name(arguments: Sequence[str]) -> str:
 
 def task_ids(pid: int) -> tuple[int, int]:
     """Return a task's thread group id and its parent process id."""
-    lines = Path(f"/proc/{pid}/status").read_text().splitlines()
-    tgid = int(next(line.split()[1] for line in lines if line.startswith("Tgid:")))
-    parent = int(next(line.split()[1] for line in lines if line.startswith("PPid:")))
+    lines = Path(f"/proc/{pid}/status").read_bytes().splitlines()
+    tgid = int(next(line.split()[1] for line in lines if line.startswith(b"Tgid:")))
+    parent = int(next(line.split()[1] for line in lines if line.startswith(b"PPid:")))
     return tgid, parent
 
 

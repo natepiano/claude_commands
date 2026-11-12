@@ -6,6 +6,7 @@ import math
 import os
 import signal
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, override
 from unittest.mock import patch
@@ -75,6 +76,17 @@ class SidePaneTests(StaffTestCase):
         self.launch_limits.append(timeout_ms)
         result = self.world.launch(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
                                    agent=agent, reported_unknown=reported_unknown)
+        if kind == "claude":
+            pid = self.world.foreground[result.pane][0]
+            process = self.world.processes[pid]
+            path = pane_launch.record_directory() / f"{name}.json"
+            entry: pane_launch.PaneLaunch = {"kind": "claude", "pane_id": result.pane,
+                "session_id": process.current_identity, "pid": pid, "proc_start": process.started,
+                "config_dir": prepared.env.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"),
+                "cwd": str(prepared.directory),
+                "name": agent, "model": "fixture", "remote_control": False,
+                "environment": {}, "flags_read": True, "written_at": process.started}
+            pane_launch.save(path, {**pane_launch.read(path), result.pane: entry}, record=staff.StaffSnapshot(()))
         if self.launch_interrupt == "agent":
             self.launch_interrupt = ""
             raise OSError("lost launch acknowledgement")
@@ -120,6 +132,48 @@ class SidePaneTests(StaffTestCase):
                     self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "bypassPermissions")
                 self.assertNotIn("read-only", arguments)
                 self.assertNotIn("plan", arguments)
+
+        for family in ("claude", "codex"):
+            for conflict in ("launch session", "staffed native owner", "staffed shell"):
+                with self.subTest(family=family, conflict=conflict):
+                    case = SidePaneTests()
+                    case.setUp()
+                    try:
+                        case.caller(family)
+                        label = "worker-policy-" + family
+                        case.world.locations["w1:p8"] = {"pane_id": "w1:p8", "terminal_id": "foreign-terminal",
+                            "tab_id": "w1:t1", "workspace_id": "w1", "label": label}
+                        case.world.layouts["w1:t1"] = {"type": "split", "direction": "right", "ratio": 0.5,
+                            "first": {"type": "pane", "pane_id": "w1:p0"},
+                            "second": {"type": "pane", "pane_id": "w1:p8"}}
+                        foreign = fixture_runtime_id("foreign-consultation")
+                        case.world.activate(foreign, "w1:p8", family)
+                        if conflict == "staffed native owner":
+                            _ = fixture_member("showrunner", name="other", runtime_id=foreign)
+                        elif conflict == "staffed shell":
+                            owner = fixture_member("showrunner", name="other", runtime_id=foreign)
+                            entry = pane_launch.launch("w1:p8", owner.id,
+                                str(case.root), {}, [family], kind=family)
+                            pane_launch.write(pane_launch.record_directory() / "agents.json", entry)
+                            del case.world.foreground["w1:p8"]
+                        else:
+                            entry = pane_launch.launch("w1:p8", fixture_runtime_id("old-consultation"),
+                                str(case.root), {}, [family], kind=family)
+                            pane_launch.write(pane_launch.record_directory() / "agents.json", entry)
+                        before = len(case.world.commands)
+                        self.assertIsInstance(side_pane.send(label, "Do not send to the other process."),
+                                              side_pane.AbsentSidePane)
+                        self.assertEqual(case.world.commands[before:], [])
+                        self.assertIsInstance(side_pane.close(label), side_pane.ClosedSidePane)
+                        self.assertEqual(case.signals, [])
+                        self.assertIn("w1:p8", case.world.locations)
+                        opened = side_pane.open(label, assign.pane_policy("friend"), cwd=case.root)
+                        self.assertIsInstance(opened, side_pane.OpenSidePane)
+                        assert isinstance(opened, side_pane.OpenSidePane)
+                        self.assertNotEqual(opened.pane, "w1:p8")
+                        self.assertEqual(case.world.requests[-1][0], family)
+                    finally:
+                        case.doCleanups()
 
     def test_claude_side_pane_ignores_the_codex_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
@@ -315,6 +369,41 @@ class SidePaneTests(StaffTestCase):
         self.assertIn(first.pane, self.world.locations)
         self.assertEqual(self.world.closed, [(second.pane, second.terminal)])
 
+        with self.subTest(evidence="two Claude processes without a launch record"):
+            case = SidePaneTests()
+            case.setUp()
+            try:
+                first = case.start("unknown")
+                path = pane_launch.record_directory() / "agents.json"
+                pane_launch.save(path, {}, record=staff.StaffSnapshot(()))
+                processes = [case.world.foreground[first.pane]]
+                case.world.activate(fixture_runtime_id("other-consultation"), first.pane, "claude")
+                processes.append(case.world.foreground[first.pane])
+                read = case.world.result
+
+                def ambiguous(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    result = read(*arguments, deadline=deadline)
+                    if arguments == ("pane", "process-info", "--pane", first.pane):
+                        info = herdr.json_object(result["process_info"], "fixture processes")
+                        return {"process_info": {**info, "foreground_processes": [
+                            {"pid": pid, "name": name, "argv": argv} for pid, name, argv in processes]}}
+                    return result
+
+                before = case.world.commands.copy()
+                with (patch.object(case.world, "result", side_effect=ambiguous),
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertIsInstance(side_pane.send("unknown", "Keep this prompt private."),
+                                          side_pane.UnknownSidePane)
+                self.assertEqual(case.world.commands, before)
+                self.assertEqual(errors.getvalue().splitlines(), [
+                    f"herdr agents:{first.pane}: expected one foreground claude process, found 2; pane retained"])
+                self.assertIn(first.pane, case.world.locations)
+                second = case.start("known")
+                self.assertEqual(case.command("close", "known")[0], 0)
+                self.assertEqual(case.world.closed, [(second.pane, second.terminal)])
+            finally:
+                case.doCleanups()
+
     def test_close_retains_a_terminal_that_moves_after_the_stop(self) -> None:
         result = self.start()
         send_signal = self.world.signal
@@ -429,6 +518,9 @@ class SidePaneTests(StaffTestCase):
     def test_codex_record_retires_only_after_a_confirmed_close(self) -> None:
         self.caller("codex")
         result = self.start()
+        pid = self.world.foreground[result.pane][0]
+        process = self.world.processes[pid]
+        self.world.processes[pid] = replace(process, identity=herdr.PaneSessionReport(process.identity.id))
         path = pane_launch.record_directory() / "agents.json"
         entry: pane_launch.PaneLaunch = {"kind": "codex", "pane_id": result.pane,
             "session_id": self.world.processes[self.world.foreground[result.pane][0]].identity.id, "config_dir": str(self.root / "codex"),

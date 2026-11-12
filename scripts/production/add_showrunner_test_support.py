@@ -400,6 +400,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
                 "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": production_name}]}})),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})

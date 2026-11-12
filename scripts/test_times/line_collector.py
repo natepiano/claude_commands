@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import atexit
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+from functools import wraps
 import inspect
 import importlib.util
 import json
@@ -13,7 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
+from time import monotonic
 import threading
 from types import CodeType
 from typing import Literal, TypedDict, cast
@@ -45,12 +47,14 @@ class ActiveTest:
     pid: int = field(default_factory=os.getpid)
     fork_parent_pid: int = 0
     launches: list[ChildLaunch] = field(default_factory=list)
-    started: float = field(default_factory=time.monotonic)
+    started: float = field(default_factory=monotonic)
     stopped: float = 0.0
     launch_id: str = field(default_factory=lambda: os.environ.get("NATEST_COVERAGE_LAUNCH", ""))
     report_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     causes: set[str] = field(default_factory=set)
     initial_threads: set[threading.Thread] = field(default_factory=set)
+    live_children_at_start: set[str] = field(default_factory=set)
+    live_children_at_stop: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,13 @@ class PendingPopen:
 
     launch: ChildLaunch
     process: subprocess.Popen[bytes] | subprocess.Popen[str]
+
+
+@dataclass(frozen=True)
+class PendingSpawn:
+    """Link an audited spawn to the PID returned by its call."""
+
+    launch_id: str
 
 
 class ChildReport(TypedDict):
@@ -221,13 +232,15 @@ def child_event(event: str, arguments: tuple[object, ...]) -> None:
     elif environment is None:
         os.environ["NATEST_COVERAGE_LAUNCH"] = launch_id
     launch: ChildLaunch = {"launch_id": launch_id, "program": Path(executable).name, "kind": kind,
-                           "started": time.monotonic(), "owner": collector.launch_owner()}
+                           "started": monotonic(), "owner": collector.launch_owner()}
     if event == "subprocess.Popen":
         process = stack_popen()
         if isinstance(process, POPEN_CLASS):
             _popen_arguments.pending = PendingPopen(launch, process)
         return
     collector.record_launch(launch)
+    if event == "os.posix_spawn":
+        _popen_arguments.spawn = PendingSpawn(launch_id)
     if event == "os.exec":
         sys.monitoring.restart_events()
         collector.write_snapshot(exec_launch_id=launch_id)
@@ -246,6 +259,7 @@ class LineCollector:
         self.is_test_code: Callable[[Path], bool] = source_classifier()
         self.tool: MonitoringTool | NoMonitoringTool = NoMonitoringTool()
         self.report_directory: Path | NoChildReports = NoChildReports()
+        self.process_calls: ExitStack = ExitStack()
         self.reset_process_state()
 
     def reset_process_state(self) -> None:
@@ -256,6 +270,7 @@ class LineCollector:
         self.completed: dict[str, ActiveTest] = {}
         self.shared_launches: list[ChildLaunch] = []
         self.held: dict[str, subprocess.Popen[bytes] | subprocess.Popen[str]] = {}
+        self.unheld_children: dict[int, str] = {}
         self.ends: dict[str, float] = {}
         self.pending_exec: str = ""
         _popen_arguments.pending = NoChildProcess()
@@ -283,7 +298,7 @@ class LineCollector:
         return self.sources[filename]
 
     def discard_launch(self, launch_id: str) -> None:
-        """Remove an exec launch that failed."""
+        """Remove a launch whose process call failed."""
         self.shared_launches = [launch for launch in self.shared_launches if launch["launch_id"] != launch_id]
         records = list(self.completed.values())
         if isinstance(self.active, ActiveTest):
@@ -300,12 +315,46 @@ class LineCollector:
             self.held[pending.launch["launch_id"]] = pending.process
             _popen_arguments.pending = NoChildProcess()
 
-    def poll_children(self) -> None:
-        """Record the first boundary that observes each child's exit."""
+    def observe_spawn[**P](self, spawn: Callable[P, int]) -> Callable[P, int]:
+        @wraps(spawn)
+        def call(*args: P.args, **kwargs: P.kwargs) -> int:
+            if _collector is not self:
+                return spawn(*args, **kwargs)
+            previous: object = getattr(_popen_arguments, "spawn", NoChildProcess())
+            _popen_arguments.spawn = NoChildProcess()
+            try:
+                try:
+                    pid = spawn(*args, **kwargs)
+                except BaseException:
+                    pending: object = getattr(_popen_arguments, "spawn", NoChildProcess())
+                    if isinstance(pending, PendingSpawn):
+                        self.discard_launch(pending.launch_id)
+                    raise
+                pending = getattr(_popen_arguments, "spawn", NoChildProcess())
+                if isinstance(pending, PendingSpawn):
+                    self.unheld_children[pid] = pending.launch_id
+                return pid
+            finally:
+                _popen_arguments.spawn = previous
+        return call
+
+    def observe_waitpid[**P](self, waitpid: Callable[P, tuple[int, int]]) -> Callable[P, tuple[int, int]]:
+        @wraps(waitpid)
+        def call(*args: P.args, **kwargs: P.kwargs) -> tuple[int, int]:
+            pid, status = waitpid(*args, **kwargs)
+            if (_collector is self and pid in self.unheld_children
+                    and (os.WIFEXITED(status) or os.WIFSIGNALED(status))):
+                self.ends[self.unheld_children.pop(pid)] = monotonic()
+            return pid, status
+        return call
+
+    def poll_children(self) -> set[str]:
+        """Record exits and return the children seen alive at this boundary."""
         for launch_id, process in list(self.held.items()):
             if process.poll() is not None:
-                self.ends[launch_id] = time.monotonic()
+                self.ends[launch_id] = monotonic()
                 del self.held[launch_id]
+        return set(self.held)
 
     def exec_failed(self, *event: object) -> None:
         """Cancel a pending exec when Python raises its failure."""
@@ -319,7 +368,7 @@ class LineCollector:
     def write_snapshot(self, exec_launch_id: str = "") -> None:
         """Write child evidence without stopping collection."""
         if isinstance(self.active, ActiveTest) and isinstance(self.report_directory, Path):
-            self.poll_children()
+            _ = self.poll_children()
             self.save_report(self.active, completed=False, exec_launch_id=exec_launch_id)
 
     def line(self, code: CodeType, line: int) -> object:
@@ -362,6 +411,15 @@ class LineCollector:
             sys.monitoring.set_local_events(self.tool.tool_id, POPEN_INIT,
                                             sys.monitoring.events.PY_RETURN)
             sys.monitoring.set_events(self.tool.tool_id, sys.monitoring.events.LINE)
+            for name in ("posix_spawn", "posix_spawnp"):
+                if hasattr(os, name):
+                    spawn = cast(Callable[..., int], getattr(os, name))
+                    _ = self.process_calls.callback(setattr, os, name, spawn)
+                    setattr(os, name, self.observe_spawn(spawn))
+            if hasattr(os, "waitpid"):
+                waitpid = os.waitpid
+                _ = self.process_calls.callback(setattr, os, "waitpid", waitpid)
+                os.waitpid = self.observe_waitpid(waitpid)
         except BaseException:
             self.stop()
             raise
@@ -371,6 +429,7 @@ class LineCollector:
         self.active = NoActiveTest()
         if _collector is self:
             _collector = NoCollector()
+        self.process_calls.close()
         if isinstance(self.tool, MonitoringTool):
             sys.monitoring.set_events(self.tool.tool_id, 0)
             sys.monitoring.set_local_events(self.tool.tool_id, POPEN_INIT, 0)
@@ -384,14 +443,14 @@ class LineCollector:
         return set(threading.enumerate()) - {self.runner_thread}
 
     def start_test(self, test_id: str) -> None:
-        self.poll_children()
+        live_children = self.poll_children()
         sys.monitoring.restart_events()
-        self.active = ActiveTest(test_id, initial_threads=self.other_threads())
+        self.active = ActiveTest(test_id, initial_threads=self.other_threads(), live_children_at_start=live_children)
 
     def stop_test(self) -> None:
         if isinstance(self.active, ActiveTest):
-            self.poll_children()
-            self.active.stopped = time.monotonic()
+            self.active.live_children_at_stop = self.poll_children()
+            self.active.stopped = monotonic()
             if self.other_threads() - self.active.initial_threads:
                 self.active.causes.add("thread outlived its test")
             self.completed[self.active.test_id] = self.active
@@ -404,7 +463,7 @@ class LineCollector:
                                "lines": list(active.lines), "forks": active.forks,
                                "fork_parent_pid": active.fork_parent_pid,
                                "launches": active.launches + self.shared_launches,
-                               "exited": time.monotonic(), "launch_id": active.launch_id,
+                               "exited": monotonic(), "launch_id": active.launch_id,
                                "ends": dict(self.ends), "collector_id": self.collector_id,
                                "completed": completed, "exec_launch_id": exec_launch_id,
                                "causes": list(active.causes)}

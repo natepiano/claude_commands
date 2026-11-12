@@ -154,6 +154,8 @@ class TurnEndTests(unittest.TestCase):
                 if close == "working":
                     self.case.fixture.world.locations[pane]["agent_status"] = "working"
                 if close == "setup":
+                    if family == "claude":
+                        self.case.fixture.world.record(row, pane)
                     self.case.fixture.world.foreground[pane] = (998598, "direnv", ["direnv", "export", "zsh"])
                 elif close == "outside":
                     self.case.fixture.world.remove_leaf(pane)
@@ -554,6 +556,8 @@ class TurnEndTests(unittest.TestCase):
         process = self.case.fixture.world.processes[pid]
         self.case.fixture.world.processes[pid] = replace(process, identity=herdr.PaneSessionReport(process.identity.id))
         self.case.fixture.world.locations[friend.pane]["agent_status"] = "working"
+        self.assertIsNone(staff.snapshot().by_current_session(process.identity.id))
+        self.case.fixture.world.locations[friend.pane]["label"] = "unrelated pane label"
         for address, expected in (("codex:another-worker", turn_end.TurnOutcome.NO_DONE),
                                   (f"codex:{row.current_session}", turn_end.TurnOutcome.WAITING_ON_FRIEND)):
             with self.subTest(recipient=address):
@@ -642,6 +646,14 @@ class TurnEndTests(unittest.TestCase):
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 event = turn_end.EventKind.TURN_END
+                if name == "question":
+                    _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+                    with patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CODEX_THREAD_ID": str(row.current_session)}):
+                        unrelated = side_pane.open("unrelated", worker_panes.launch_policy("impl"), cwd=self.case.fixture.root)
+                    self.assertIsInstance(unrelated, side_pane.OpenSidePane)
+                    assert isinstance(unrelated, side_pane.OpenSidePane)
+                    self.case.fixture.world.locations[unrelated.pane]["agent_status"] = "working"
+                    _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
                 if name == "subagent":
                     assert isinstance(active, progress_history.ActiveDispatch)
                     backend = staff.backend(row)
@@ -662,6 +674,18 @@ class TurnEndTests(unittest.TestCase):
                 self.case.agent.without_done = False
                 self.case.agent.complete(pane)
                 self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+
+        decision = turn_end._prepare_notice("worker", self.case.fixture.parent, self.case.run_dir,  # pyright: ignore[reportPrivateUsage]
+            {"worker_id": str(row.id)}, "retarget-proof", turn_end.TurnOutcome.NO_DONE,
+            self.case.reply, "question", "")
+        current = staff.native_id("019b3a40-4250-7000-8000-000000009101")
+        _ = staff.rename(self.case.fixture.parent.id, "renamed-director")
+        _ = staff.update_current_session(self.case.fixture.parent.current_session, current)
+        with (patch.object(send, "send", return_value=send.Result("sent", "private")) as notice,
+              patch.object(progress_history, "record_dispatch_notice")):
+            decision.send_notice()
+        delivered = cast(send.Options, notice.call_args.args[0])
+        self.assertEqual(delivered.to, "session:" + current)
 
     def test_a_failed_notice_recovers_the_completed_pass_without_another_close(self) -> None:
         result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.case.prompt,

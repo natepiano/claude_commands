@@ -203,7 +203,7 @@ Its subject is `Merge <unit> phase <N> as-built (<short>) into <branch>`.
 `Promote: none` and an absent field both mean `NoPromotion`.
 Each local Promote checkout must exist before the command pushes.
 
-- **Origin ancestry:** The checkpoint must occur on an origin branch. The command fetches and checks the unit's Branch first. If necessary, it fetches all origin heads and prunes stale tracking refs. This also applies when the checkout normally fetches one branch. The ancestry line names the containing branch. Without a containing branch, the result stays `commit is not on origin`. Scope, conflict checks, and merging use the submitted checkpoint hash. The overlap report checks other units' branches and dirty worktrees. It excludes the submitting unit.
+- **Origin ancestry:** The checkpoint must occur on an origin branch. The command fetches and checks the unit's Branch first. If necessary, it fetches all origin heads. Machine-readable fetch output identifies current origin refs. Stale tracking refs cannot certify a checkpoint. Neither ancestry checks nor worktree cleanup prune shared refs. This also applies when the checkout normally fetches one branch. The ancestry line names the containing branch. Without a containing branch, the result stays `commit is not on origin`. Scope, conflict checks, and merging use the submitted checkpoint hash. The overlap report checks other units' branches and dirty worktrees. It excludes the submitting unit. Push preparation, publication, batch preparation, and promotion fetch explicit refspecs before they read full origin ref names.
 - **Inputs:** The showrunner staff row supplies the production name and document path. Unit staff rows supply the worktrees. `.unit.toml` supplies each plan. The document supplies `Merge branch`, `Showrunner checkout`, `Log`, and `Merge tests`. It also supplies `Known flakes` and `Known flaky tests`. Flakes name packages. Flaky tests use the form `` `<path::test>`, `<path::test>` ``. `Push` selects `validate_and_push` by default, or `git`. `Promote` accepts `<checkout>[, mac <path>]`. Its type is `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`.
 
 - **Input rules.** A code checkpoint needs a `--review-trial` line and a one-line `--delivers`; a shrink refuses `--delivers`.
@@ -494,6 +494,22 @@ The report renderer, report schedule, child report rows, and report interval com
 `unit_status.py` owns the shared unit-status parser.
 `update_registration.py` owns question types, reading, and due filtering.
 Registration retains a stopped timer for discovery and session ownership.
+
+Timer folders and targets retain the showrunner's fixed staff ID.
+Discovery uses the staff row's current session and current name.
+Registry names do not affect registration or discovery.
+The herdr session list classifies showrunner panes through native session identity and the owning staff ID.
+Quota notices retain staff IDs for named recipients.
+Current staff names resolve at notice creation; former names do not resolve.
+Explicit `session:` and `uds:` recipients retain their native addresses.
+Wind-down projection keys and count timer commands use staff IDs.
+Count timers resolve the current session through staff when they fire.
+Wind-down starts clear projection state; this change adds no conversion.
+Worker completion notices resolve the director's staff ID after the worker lock releases.
+Friend waits use the native process and the last transcript prompt's reply address.
+Consultations need no staff row.
+Unrelated panes with another agent kind do not stop the hook.
+Pane labels do not identify a friend.
 
 - **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
   `config/user_zone.conf` supplies the configured zone.
