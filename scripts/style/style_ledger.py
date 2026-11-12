@@ -1936,8 +1936,13 @@ def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
 
 
 def _tip(repo: Path, commit: str) -> RepositoryTip:
-    commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
-    tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
+    command = ("git", "-C", str(repo), "rev-parse", "--end-of-options",
+               f"{commit}^{{commit}}", f"{commit}^{{tree}}")
+    reply = run_git(command).stdout.decode(errors="replace").splitlines()
+    if (len(reply) != 3 or reply[0] != "--end-of-options"
+            or any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None for object_id in reply[1:])):
+        raise GitReadFailed(command, 0, f"{commit}: invalid Git response")
+    commit, tree = reply[1:]
     entries = tree_entries(repo, commit)
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")

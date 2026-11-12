@@ -24,6 +24,7 @@ from scripts.production import staff, session_staff, unit_lookup
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.proposal_issue import ApprovedDecision, decision_answer
 from scripts.direct import plan_history
+from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 DECISION_FOLDER = Path()
@@ -302,8 +303,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
         open_steps = steps.result()
     machines = display_cells.machine_column([unit.machine for unit in units])
     headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Ticket", "Step", "ETA", "Findings built", "Last 24 h", "Findings left")
-    lines = ["| " + " | ".join(headers) + " |",
-             "| " + " | ".join(("---",) * (len(headers) - 3) + ("---:",) * 3) + " |"]
+    table_rows: list[tuple[str, ...]] = []
     for index, unit in enumerate(units):
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         owned = [snapshot.counts.get(family, FamilyCounts()) for family in config.assignment(unit.unit).families]
@@ -320,7 +320,15 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *, doc: 
         cells = (holder.name if holder is not None else unit.unit, unit.status, *((machines[index],) if machines else ()), ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
                  format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
                  f"{counts.built:,}", f"{counts.recent:,}", left)
-        lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
+        table_rows.append(cells)
+    ticket_column = 3 if machines else 2
+    headers, table_rows = display_cells.fitted(
+        headers, table_rows, cuttable=(ticket_column + 1, ticket_column),
+        columns=conf.read_or_repository("production").whole("units_table_columns"))
+    number_headers = ("Findings built", "Last 24 h", "Findings left")
+    lines = ["| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
+             "| " + " | ".join("---:" if header in number_headers else "---" for header in headers) + " |"]
+    lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
     all_counts = [counts for snapshot in snapshots.values() for counts in snapshot.counts.values()]
     totals = FamilyCounts(sum(counts.built for counts in all_counts), sum(counts.left for counts in all_counts),
                           sum(counts.recent for counts in all_counts),

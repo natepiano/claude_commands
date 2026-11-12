@@ -1027,3 +1027,18 @@ Rust-analyzer startup passes its active exception through the shared queue bound
 `LINT_CONFIG_FILE` selects the config file.
 The shared test helper replaces the queue boundary for direct calls and CLI child processes.
 Tests retain their private Cargo and rust-analyzer programs without a real queue place.
+
+### Crate copy lifetime
+
+Each identified crate run removes a crate's editable copy when the crate becomes `INTEGRATED` or `ABANDONED`.
+Other crates in the run can remain open.
+This rule covers native copies and adopted copies linked to the run.
+The removal uses `copies.workspace_removal_guard` after the worker locks close.
+The run keeps its lock through removal.
+`HeldCrateRunLock` passes that ownership to the guard without acquiring the lock again.
+Other callers use `AcquireCrateRunLock` to acquire the lock before removal.
+The guard reads the state of the crate that owns the copy.
+`complete_run` also removes remaining terminal copies after a crash and ends their task records.
+A terminal resume returns without creating a copy.
+Integrated result validation reads the canonical Git objects, which already hold the imported commit.
+Later crate integration, resume, import, and refusal publication do not need a terminal crate's copy.

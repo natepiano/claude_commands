@@ -239,6 +239,17 @@ class WorkerResumeTests(unittest.TestCase):
 @final
 class StopResumeTests(unittest.TestCase):
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
+        for shown in (None, "old-producer-title"):
+            with self.subTest(native_title=shown), producer_first_fixture("claude") as world:
+                member = fixture_member("producer", name="dwight", runtime_id=world.identity)
+                world.active = True
+                world.environment = {"CLAUDE_CONFIG_DIR": str(world.home)}
+                world.case.client.rows.append({"pane_id": world.pane, "terminal_id": "native-terminal",
+                    "workspace_id": "w1", "tab_id": "native-tab", "label": shown})
+                world.case.client.native_ids[world.pane] = world.identity
+                self.assertEqual(stop_resume.producer_conflicts(member.name, world.case.client),
+                                 [(world.identity, world.pane)])
+
         cases: tuple[tuple[Literal["claude", "codex"], bool, str, bool], ...] = (
             ("claude", False, "opus", False), ("codex", False, "gpt-test", False), ("claude", True, "opus", False),
             ("claude", False, "claude-opus-producer-fixture", False),
@@ -310,7 +321,8 @@ class StopResumeTests(unittest.TestCase):
 
                         def second_process(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
                             if arguments == ("pane", "process-info", "--pane", "w1:p4"):
-                                return {"process_info": {"foreground_processes": [{"pid": 457, "argv": ["claude"]}]}}
+                                return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": 457,
+                                    "foreground_processes": [{"pid": 457, "argv": ["claude"]}]}}
                             return original_result(*arguments, deadline=deadline)
 
                         _ = case.enterContext(patch.object(case.client, "result", side_effect=second_process))
@@ -330,8 +342,22 @@ class StopResumeTests(unittest.TestCase):
                 if location in ("registry", "codex-index", "codex-account-index"):
                     self.assertEqual(stop_resume.producer_conflicts("dwight", case.client), [])
                 if location in ("registry", "codex-index", "codex-account-index", "two-live"):
-                    # A pane label can still prove an unregistered producer conflict.
+                    # The native launch record identifies the producer before staff admission.
                     case.client.rows[-2 if location == "two-live" else -1]["label"] = "dwight"
+                entry = pane_launch.launch(world.pane, world.identity, str(world.folder), world.environment,
+                    [kind, "-n", "dwight"], kind=kind)
+                pane_record.write("agents", entry)
+                if location == "two-live":
+                    second = fixture_runtime_id("second-live-dwight")
+                    entry = pane_launch.launch("w1:p4", second, str(world.folder), world.environment,
+                        ["claude", "-n", "dwight"], kind="claude")
+                    pane_record.write("agents", entry)
+                    native_process = herdr.native_process
+                    def second_native(pid: int, family: str, reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+                        if pid == 457:
+                            return herdr.NativeAgentProcess(herdr.EnvironmentThread(second), "generation-1", world.environment)
+                        return native_process(pid, family, reported)
+                    _ = case.enterContext(patch.object(herdr, "native_process", side_effect=second_native))
                 result = stop_resume.resume("dwight")
                 if location == "two-live":
                     self.assertIsInstance(result, stop_resume.ResumeFailed, result)
@@ -419,6 +445,9 @@ class StopResumeTests(unittest.TestCase):
                     world.case.client.rows.append({"pane_id": world.pane, "terminal_id": "replacement-terminal",
                         "tab_id": "replacement-tab", "workspace_id": "w1", "label": "dwight",
                         "agent_session": {"kind": "id", "value": world.identity}})
+                    replacement = pane_launch.launch(world.pane, world.identity, str(world.folder), world.environment,
+                        ["claude", "-n", "dwight"], kind="claude")
+                    pane_record.write("agents", replacement)
                 if stage in lost_stages:
                     world.active = False
                     _ = world.case.client.native_ids.pop(world.pane, None)
@@ -1345,7 +1374,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(launched["session_id"], identity)
         self.assertEqual(launched["environment"]["CLAUDE_CODE_SESSION_ID"], identity)
 
-    def test_own_pane_resume_by_old_tab_label_keeps_the_fixed_staff_reference(self) -> None:
+    def test_resume_after_a_rename_keeps_the_fixed_staff_reference(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "renamed-alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(identity))
@@ -1356,7 +1385,7 @@ class StopResumeTests(unittest.TestCase):
               patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
               patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
             with self.assertRaises(SystemExit):
-                _ = stop_resume.resume("alpha")
+                _ = stop_resume.resume(row.name)
         self.assertEqual(pane_record.read("agents")["w1:p2"].get("staff_id"), row.id)
         execute.assert_called_once()
         launched = cast(pane_launch.CurrentLaunch, execute.call_args.args[1])
@@ -1816,6 +1845,8 @@ class StopResumeTests(unittest.TestCase):
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
         row = staff.StaffRow(fixed, "producer", "row-name", staff.StaffRoot(), current_session=current)
+        foreign = staff.StaffRow(staff.StaffId("foreign-owner"), "producer", "another-production", staff.STAFF_ROOT,
+                                 current_session=staff.StaffId("foreign-native"))
         retained = {**self.client.rows[0], "agent_session": {"kind": "none"}}
         self.publish_new_launch = True
 
@@ -1843,6 +1874,9 @@ class StopResumeTests(unittest.TestCase):
                               family=family, stale=stale, caller=caller):
                 _ = write_registry(self.root / "configuration/models.conf", {"producers": {
                     row.name: "codex:gpt-test:high" if family == "codex" else "claude:opus:max"}}, update=True)
+                foreign_source = workspace == "morty" and shell and not cross
+                foreign_live = foreign_source
+                operation_record = staff.StaffSnapshot((row, foreign)) if foreign_live else staff.StaffSnapshot((row,))
                 variable = "CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"
                 source_home = self.root / (".codex1" if family == "codex" else ".claude3")
                 target_home = self.root / (".codex2" if family == "codex" else ".claude4" if stale else ".claude3")
@@ -1883,6 +1917,9 @@ class StopResumeTests(unittest.TestCase):
                     self.client.rows.append({"pane_id": "w1:p3", "tab_id": "w1:t9", "label": "other work",
                                              "workspace_id": "w1", "agent_session": {"kind": "none"}})
                 def layout(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments == ("pane", "process-info", "--pane", "w1:p2") and foreign_live:
+                        return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": 457,
+                            "foreground_processes": [{"pid": 457, "argv": ["claude"]}]}}
                     if arguments[:2] == ("workspace", "list"):
                         return {"workspaces": [{"workspace_id": "w1", "label": workspace},
                                                 {"workspace_id": "w2", "label": "producers"}]}
@@ -1908,6 +1945,8 @@ class StopResumeTests(unittest.TestCase):
                 def activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
                     return herdr.PaneRunning(commands) if pane == "w1:p2" and commands else herdr.PaneAtShell()
                 def start(*arguments: str) -> str:
+                    nonlocal foreign_live
+                    foreign_live = False
                     self.assertEqual(self.client.closed, [])
                     self.assertEqual(arguments[:2], ("pane", "run"))
                     return ""
@@ -1918,10 +1957,14 @@ class StopResumeTests(unittest.TestCase):
                         {"HERDR_PANE_ID": "w2:p1", "HERDR_SESSION": "agents", variable: str(target_home)})
                 def observe_native(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
                     del reported
+                    if pid == 457:
+                        return herdr.NativeAgentProcess(herdr.EnvironmentThread(str(foreign.current_session)), "generation-1", {})
                     return native(pid, kind)
                 def launch(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                            prepared: herdr.PreparedAgentEnvironment, kind: Literal["claude", "codex"], arguments: list[str],
                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str, client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> herdr.AgentLaunched:
+                    nonlocal foreign_live
+                    foreign_live = False
                     _ = client
                     del opening, timeout
                     self.assertIsInstance(destination, herdr.ExistingPane)
@@ -1941,7 +1984,7 @@ class StopResumeTests(unittest.TestCase):
                             else herdr.StoppedConversation())
                 close = (patch.object(self.client, "close_tab_confirmed", return_value=False)
                          if refuse_close else nullcontext())
-                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                with (patch.object(staff, "initial_snapshot", return_value=operation_record),
                       patch.object(herdr, "Herdr", side_effect=client_for),
                       patch.object(source, "close_tab_confirmed", side_effect=close_source),
                       patch.object(herdr, "native_process", side_effect=observe_native), close,
@@ -1960,7 +2003,7 @@ class StopResumeTests(unittest.TestCase):
                     if caller is ResumeCaller.TARGET_PANE:
                         with self.assertRaises(SystemExit):
                             _ = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
-                                                         names=LaunchNames(staff.StaffSnapshot((row,))))
+                                                         names=LaunchNames(operation_record))
                         execute.assert_called_once()
                         target = cast(herdr.TabSession, execute.call_args.args[0])
                         resumed = cast(pane_launch.CurrentLaunch, execute.call_args.args[1])
@@ -1975,7 +2018,7 @@ class StopResumeTests(unittest.TestCase):
                         continue
                     result = stop_resume._resume_once(str(current), why="recovery",  # pyright: ignore[reportPrivateUsage]
                                                      to=target_home.name.removeprefix(".") if stale else None,
-                                                     names=LaunchNames(staff.StaffSnapshot((row,))))
+                                                     names=LaunchNames(operation_record))
                     if not shell or refuse_close:
                         second = stop_resume.resume(row.name)
                         self.assertIsInstance(second, stop_resume.ClaudeUp)
@@ -2000,7 +2043,7 @@ class StopResumeTests(unittest.TestCase):
                     opened.assert_not_called()
                 else:
                     opened.assert_called_once()
-                self.assertEqual(self.client.closed, [self.entry["pane_id"]] if not valid and shell and not refuse_close and not cross else [])
+                self.assertEqual(self.client.closed, [self.entry["pane_id"]] if not valid and shell and not refuse_close and not cross and not foreign_source else [])
                 self.assertEqual(list(pane_record.read("agents")), [self.entry["pane_id"], expected] if cross else [expected])
                 if stale:
                     self.assertTrue(pane_record.read("agents")[expected].get("producer_binding", False))
@@ -2845,13 +2888,27 @@ class StopResumeTests(unittest.TestCase):
     def test_a_new_session_herdr_has_no_id_for_is_found_through_the_launches_read_first(self) -> None:
         self.client.rows[0]["agent_session"] = None
         pane_record.record_path("agents").unlink()
+        member = fixture_member("producer", name="alpha", runtime_id=self.entry["session_id"],
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        _ = staff.set_home(member.id, staff.SessionHome(self.root / ".claude3"))
+        self.client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 123,
+            "foreground_processes": [{"pid": 123, "argv": ["claude"]}]}
         def seed(_session: str, *, select: Callable[[herdr.PaneIdentity], bool]) -> int:
             self.assertEqual({pane["pane_id"] for pane in self.client.panes() if select(pane)}, {"w1:p2"})
             pane_record.write("agents", self.entry)
+            self.client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 998042,
+                "foreground_processes": [{"pid": 998042, "argv": ["zsh"]}]}
             return 0
+        unrelated = pane_launch.launch("w9:p9", fixture_runtime_id("unrelated-seed"), str(self.root), {}, ["claude", "-n", "unrelated"])
+        pane_record.save("agents", {"w9:p9": unrelated})
         self.seed.side_effect = seed
-        self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="limit"),
-                         [stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4")])
+        def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[:2] == ("workspace", "list"):
+                return {"workspaces": [{"workspace_id": "w1", "label": "producers"}]}
+            return self.pane_result(*arguments, deadline=deadline)
+        with patch.object(self.client, "result", side_effect=read):
+            self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="limit"),
+                             [stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude4")])
 
     def test_launches_are_read_while_claude_runs_before_any_stop(self) -> None:
         order: list[str] = []
@@ -3391,7 +3448,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop_resume.stop("empty"), stop_resume.SessionNotFound("empty"))
         self.client.rows.append({"pane_id": "w1:p5", "label": "alpha", "workspace_id": "w1",
                                  "agent_session": {"kind": "id", "value": "sid-other"}})
-        self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed("alpha", "alpha: several tabs match"))
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.NotRunning("019b3a40-4250-7000-8000-000000000102"))
         self.kill.assert_not_called()
         self.start.assert_not_called()
@@ -3826,6 +3883,11 @@ class StopResumeTests(unittest.TestCase):
     def test_saved_entry_never_selects_a_different_live_conversation(self) -> None:
         self.client.rows[0]["agent_session"] = {"kind": "id", "value": "another-live-session"}
         self.live.return_value = sessions.LiveSessionProcess(789)
+        self.client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 789,
+            "foreground_processes": [{"pid": 789, "argv": ["claude"]}]}
+        _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+            herdr.EnvironmentThread("another-live-session"), "generation-1", {})))
+        _ = self.enterContext(patch.object(self.client, "result", side_effect=self.client_result))
         self.assertEqual(stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="maintenance"), stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "unknown name"))
         self.assertEqual(stop_resume.stop("019b3a40-4250-7000-8000-000000000102"), stop_resume.SessionNotFound("019b3a40-4250-7000-8000-000000000102"))
         self.start.assert_not_called()
