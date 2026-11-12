@@ -3236,37 +3236,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: done
 **Depends on:** Phase 180
 
-#### Work Order
+#### As-built
 
-**Goal:** A repeat of the Phase 180 folder collection over `scripts/direct` gives known coverage for the tests whose only unknown cause is a child from another test, and reports the overlap candidates.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 2): the folder collection is approved. Phase 180 ran it and got 0 known of 1,558 tests, from a collector defect. The repair and one repeat run finish that approval. Candidates are not removal approvals. No test removal or coverage reduction is approved.
-
-**Spec:**
-1. Find the cause. In the Phase 180 run, every test has the cause `child outlived its test`. 618 tests have only that cause. `child_causes` in `scripts/test_times/coverage_overlap.py` uses `math.inf` as the end of a launch with no recorded end. Then that launch is "alive" at the start of every later test in the run. `LineCollector.poll_children` in `scripts/test_times/line_collector.py` records an end only when a held `Popen` returns from `poll()`. Name the launches that have no end in a folder run, and say why (still running, not held, mocked, or other).
-2. Repair the cause in the collector. Do not hide it in the report. A child that still runs at a later test start stays a valid cause for that test. A child with no evidence that it ran at that time is not a cause. Keep each other cause rule as it is.
-3. Add rows to `scripts/test_times/test_coverage_overlap.py` for the defect: one launch with no seen exit, followed by later tests in other modules. Prove the rows fail on the old code.
-4. Run the folder collection again, as in Phase 180 Spec items 1-3, at the new commit, with `COVERAGE_OUT` in `phases/184/`. Report as in Phase 180 Spec items 4-5, plus the count of tests that changed from unknown to known.
-
-**Files:**
-- `scripts/test_times/coverage_overlap.py` — launch end rules in `child_causes`.
-- `scripts/test_times/line_collector.py` — child end records, if the cause is there.
-- `scripts/test_times/test_coverage_overlap.py` — new rows for the defect.
-- `phases/184/coverage_overlap_report.md`, `phases/184/coverage_overlap.json` — in the session folder.
-
-**Workers:** 1 writer; the collector and its tests share one cause and cannot split.
-- impl: the cause, the repair, the new rows and the repeat run.
-
-**Constraints from prior phases:**
-- Phase 180: 207 modules, 1,558 tests, all passed; collector CPU 1,711 s, wall 43.5 min; 0 known, 0 candidates; cause counts Bash 729, Cargo 68, Git 361, ps 167, forks 146; every test has `child outlived its test`.
-- Phase 179: three sampled modules gave 5 of 21 tests unknown. The defect shows only in a long run.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
+- Checkpoint `0a6f179eb`. Cause: the collector gave a launch with no seen exit an end of infinity, so it counted as alive at every later test start. `line_collector.py` now wraps spawn and `waitpid` to see child exits, with a monotonic clock; a launch with no exit evidence still counts as alive (the reviewer blocker F001 kept that rule). New rows in `test_coverage_overlap.py` fail on the old code. Repeat run at `0a6f179eb` over 207 `scripts/direct` modules: 1,558 tests, all pass; 617 known (was 0), 941 unknown, 335 candidates; collector 1,665 CPU s, 45.8 min wall. Top candidate modules: `test_progress_history` 124, `test_phase_table` 49, `test_findings` 41, `test_phase_process` 40, `test_phase_reservation` 35. Largest unknown causes: unverified Bash launches 729, shared thread 602, child outlived its test 589 (most from `test_tree_watch` Git and the `test_verify_hold_*` Python children). Candidates are not removal approvals.
 
 ### Phase 185 — The recorder commands that review launches call import less  · status: done
 **Depends on:** none
@@ -3322,29 +3294,6 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `task_cpu.py` measures a run in which a task name holds byte `0xff`, with the same results for ordinary tasks.
-
-**Decision:** next item 6a (architect after Phase 178): repair this measurement tool before another broad command census; keep it apart from test-speed savings.
-
-**Spec:**
-1. `task_ids` (`scripts/test_times/task_cpu.py:59`) decodes the whole `/proc/<pid>/status` file as text. A task name with byte `0xff` broke it in Phase 177. Read the file as bytes and parse only the numeric `Tgid:` and `PPid:` fields.
-2. Add rows to the existing task CPU tests in `scripts/test_times/test_module_cost.py`: a status input with byte `0xff` in `Name:`, and an ordinary status input. The `0xff` row fails on the old code.
-3. Change nothing else.
-
-**Files:**
-- `scripts/test_times/task_cpu.py` — `task_ids`.
-- `scripts/test_times/test_module_cost.py` — the two rows.
-
-**Workers:** 1 writer; one function and its rows.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 177: an in-memory replacement worked around this in its measurement record.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.test_times.test_module_cost` passes; the `0xff` row fails on the old code.
-- basedpyright on both files reports 0 errors and 0 warnings.
+- Checkpoint `58aaa15cc`. `task_ids` in `task_cpu.py` reads `/proc/<pid>/status` as bytes and parses only `Tgid:` and `PPid:`. Two rows in `test_module_cost.py`: a `Name:` with byte `0xff` (fails on the old code) and an ordinary status. Nothing else changed.
