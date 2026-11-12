@@ -94,32 +94,62 @@ class NoStoppedRun:
 NO_STOPPED_RUN = NoStoppedRun()
 
 
-def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> frozenset[build_hold.ProcessIdentity]:
+def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
     """Read local claim records without contacting the Mac or AWS."""
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
     claimed: set[build_hold.ProcessIdentity] = set()
-    for target in target_config.read_targets():
-        if not isinstance(target, target_config.SshTarget):
-            continue
-        paths = claim_state.state_paths(target.name)
-        for claim in claim_state.read_claims(paths):
-            identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
-            if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
-                claimed.add(identity)
-    return frozenset(claimed)
+    try:
+        for target in target_config.read_targets():
+            if not isinstance(target, target_config.SshTarget):
+                continue
+            paths = claim_state.state_paths(target.name)
+            for claim in claim_state.read_claims(paths):
+                identity = build_hold.ProcessIdentity(claim.record["pid"], claim.record["proc_start"])
+                if build_hold.process_start_time(identity.pid, proc_root) == identity.start_time:
+                    claimed.add(identity)
+    except claim_state.ClaimStateUnreadable as error:
+        return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
+    except target_config.ConfigError as error:
+        return build_hold.ClaimsUnreadable(str(error))
+    return build_hold.LiveClaims(frozenset(claimed))
+
+
+def holds_claim(
+    process: build_hold.AuditProcess, processes: Mapping[int, build_hold.AuditProcess],
+    claimed: frozenset[build_hold.ProcessIdentity],
+) -> bool:
+    """Find a live claim on this process, an ancestor, or a descendant."""
+    if not claimed:
+        return False
+    if any(item.identity in claimed for item in (process, *build_hold.audit_ancestors(process, processes))):
+        return True
+    for identity in claimed:
+        child = processes.get(identity.pid)
+        if (child is not None and child.identity == identity
+                and any(parent.identity == process.identity for parent in build_hold.audit_ancestors(child, processes))):
+            return True
+    return False
+
+
+def is_outermost_gate(process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess]) -> bool:
+    """A gate with no gate above it owns its whole process family."""
+    return is_waiting_gate(process) and not any(is_waiting_gate(parent) for parent in ancestors)
 
 
 def classify_drain_runs(
     processes: Mapping[int, build_hold.AuditProcess],
-    admitted: frozenset[build_hold.ProcessIdentity], claimed: frozenset[build_hold.ProcessIdentity],
-) -> tuple[WaitingRun | WorkingRun, ...]:
+    admitted: frozenset[build_hold.ProcessIdentity],
+    claimed: build_hold.LiveClaims | build_hold.ClaimsUnreadable,
+) -> tuple[WaitingRun | WorkingRun, ...] | build_hold.ClaimsUnreadable:
     """Classify each gate by its descendants, reservations, and target claims."""
+    if isinstance(claimed, build_hold.ClaimsUnreadable):
+        return claimed
     runs: list[WaitingRun | WorkingRun] = []
     ancestors = {pid: build_hold.audit_ancestors(process, processes) for pid, process in processes.items()}
     for process in processes.values():
-        if not is_waiting_gate(process) or any(is_waiting_gate(parent) for parent in ancestors[process.identity.pid]):
+        if not is_outermost_gate(process, ancestors[process.identity.pid]):
             continue
         owner = build_hold.audit_owner(process, ancestors[process.identity.pid])
         family = [item for item in processes.values()
@@ -128,7 +158,7 @@ def classify_drain_runs(
         reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
                                         for item in family) else
                   "admission reservation" if identities & admitted else
-                  "Mac or AWS claim" if identities & claimed else "")
+                  "Mac or AWS claim" if holds_claim(process, processes, claimed.identities) else "")
         if reason:
             runs.append(WorkingRun(process, owner, reason))
         else:
@@ -138,8 +168,13 @@ def classify_drain_runs(
 
 def working_drain_identities(proc_root: Path) -> tuple[build_hold.ProcessIdentity, ...]:
     """Keep existing work through the enforcer when the drain hold starts."""
-    runs = classify_drain_runs(build_hold.read_audit_processes(proc_root),
-                               admitted_processes(), claimed_processes(proc_root))
+    processes = build_hold.read_audit_processes(proc_root)
+    claims = claimed_processes(proc_root)
+    runs = classify_drain_runs(processes, admitted_processes(), claims)
+    if isinstance(runs, build_hold.ClaimsUnreadable):
+        print(f"claims unreadable: {runs.reason}", file=sys.stderr)
+        return tuple(process.identity for process in processes.values()
+                     if is_outermost_gate(process, build_hold.audit_ancestors(process, processes)))
     return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
 
 
@@ -267,10 +302,19 @@ def drain(
     attempted: set[build_hold.ProcessIdentity] = set()
     signalled: set[build_hold.ProcessIdentity] = set()
     heartbeat = clock()
+    claims_unreadable = False
     try:
         while True:
             processes = build_hold.read_audit_processes(proc_root)
-            runs = classify_drain_runs(processes, admitted_processes(), claimed_processes(proc_root))
+            claims = claimed_processes(proc_root)
+            runs = classify_drain_runs(processes, admitted_processes(), claims)
+            if isinstance(runs, build_hold.ClaimsUnreadable):
+                if not claims_unreadable:
+                    print(f"claims unreadable: {runs.reason}", file=sys.stderr)
+                claims_unreadable = True
+                sleep(1)
+                continue
+            claims_unreadable = False
             if not runs:
                 print("drained", flush=True)
                 return 0
@@ -525,7 +569,7 @@ def gate_job_root(
 
 def decide_builds(
     processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
-    uid: int, enforcer_pid: int,
+    uid: int, enforcer_pid: int, claimed: frozenset[build_hold.ProcessIdentity],
 ) -> tuple[BuildDecision, ...]:
     protected: frozenset[build_hold.ProcessIdentity] = frozenset()
     if enforcer_pid in processes:
@@ -541,7 +585,8 @@ def decide_builds(
         if (not process.environment.get("BUILDLOG_CALL_ID") and "rust-analyzer" in names
                 and isinstance(owner, NoOwningSession)):
             continue
-        reason = protected_reason(process, ancestors, owner, holders, protected)
+        reason = ("holds a live Mac or AWS claim" if holds_claim(process, processes, claimed)
+                  else protected_reason(process, ancestors, owner, holders, protected))
         if reason or not holders:
             decisions.append(AllowedBuild(process, owner, reason or "no hold is in force"))
             continue
@@ -549,7 +594,7 @@ def decide_builds(
         if isinstance(kept, build_hold.Holder):
             decisions.append(KeptBuild(process, owner, kept))
             continue
-        owner_key = build_hold.holder_path(Path(), owner.session_id).name if isinstance(owner, OwningSession) else ""
+        owner_key = build_hold.holder_path(Path(), build_hold.holder_of(owner.session_id).key).name if isinstance(owner, OwningSession) else ""
         blocking = [holder for holder in holders if holder.key != owner_key] or list(holders)
         holder = min(blocking, key=lambda item: item.since)
         decisions.append(WouldStopBuild(process, owner, f"test or build outside {holder.name}'s hold for {holder.purpose}",
@@ -662,7 +707,8 @@ class StopBuildsAndTests:
             return False
 
     def kill_survivors(self, processes: Mapping[int, build_hold.AuditProcess],
-                       holders: Sequence[build_hold.Holder], enforcer_pid: int) -> None:
+                       holders: Sequence[build_hold.Holder], enforcer_pid: int,
+                       claimed: frozenset[build_hold.ProcessIdentity]) -> None:
         if not self.terminating:
             return
         now = self.clock()
@@ -674,6 +720,7 @@ class StopBuildsAndTests:
             owner = build_hold.audit_owner(process, ancestors) if process is not None else NoOwningSession()
             # A route change cannot cancel termination of an old process.
             if (not holders or identity in protected or build_hold.owner_is_sole_holder(owner, holders)
+                    or process is not None and holds_claim(process, processes, claimed)
                     or process is not None and isinstance(
                         keeping_holder(process, ancestors, processes, holders), build_hold.Holder)):
                 del self.terminating[identity]
@@ -683,9 +730,10 @@ class StopBuildsAndTests:
                 del self.terminating[identity]
 
     def stop(self, build: WouldStopBuild, processes: Mapping[int, build_hold.AuditProcess],
-             holders: Sequence[build_hold.Holder], enforcer_pid: int) -> None:
+             holders: Sequence[build_hold.Holder], enforcer_pid: int,
+             claimed: frozenset[build_hold.ProcessIdentity]) -> None:
         root = build.stop_root
-        if root.identity in self.terminating:
+        if root.identity in self.terminating or holds_claim(root, processes, claimed):
             return
         ancestors = build_hold.audit_ancestors(build.process, processes)
         if isinstance(keeping_holder(build.process, ancestors, processes, holders), build_hold.Holder):
@@ -716,6 +764,8 @@ class StopBuildsAndTests:
             seen.add(process.identity)
             parents = build_hold.audit_ancestors(process, processes)
             owner = build_hold.audit_owner(process, parents)
+            if holds_claim(process, processes, claimed):
+                continue
             if protected_reason(process, parents, owner, holders, protected):
                 continue
             if isinstance(keeping_holder(process, parents, processes, holders), build_hold.Holder):
@@ -764,23 +814,35 @@ def run(
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        claims_unreadable = False
         while True:
             holders = build_hold.natedev_holds(holder_directory).in_force
             if not holders:
                 return 0
             processes = read_processes(proc_root, uid, cgroup_root)
-            stopper.kill_survivors(processes, holders, enforcer_pid)
-            for decision in decide_builds(processes, holders, uid, enforcer_pid):
+            claims = claimed_processes(proc_root)
+            if isinstance(claims, build_hold.ClaimsUnreadable):
+                if not claims_unreadable:
+                    print(f"claims unreadable; enforcement waits: {claims.reason}", file=sys.stderr)
+                claims_unreadable = True
+                sleep(1)
+                continue
+            if claims_unreadable:
+                print("claims readable; enforcement resumes", file=sys.stderr)
+            claims_unreadable = False
+            claimed = claims.identities
+            stopper.kill_survivors(processes, holders, enforcer_pid, claimed)
+            for decision in decide_builds(processes, holders, uid, enforcer_pid, claimed):
                 if isinstance(decision, WouldStopBuild):
                     # Recheck the holder set in case a release or another hold followed the table read.
                     current_holders = build_hold.natedev_holds(holder_directory).in_force
                     if not current_holders:
                         return 0
                     current = decision if current_holders == holders else next(
-                        item for item in decide_builds(processes, current_holders, uid, enforcer_pid)
+                        item for item in decide_builds(processes, current_holders, uid, enforcer_pid, claimed)
                         if item.process.identity == decision.process.identity)
                     if isinstance(current, WouldStopBuild):
-                        stopper.stop(current, processes, current_holders, enforcer_pid)
+                        stopper.stop(current, processes, current_holders, enforcer_pid, claimed)
             sleep(1)
 
 
@@ -800,7 +862,11 @@ def report(proc_root: Path, directory: Path) -> list[str]:
     lines = [f"kept by {holder.name}: pid {run.pid}, start {run.start_time}"
              for holder in holders for run in holder.keep]
     processes = read_processes(proc_root, os.getuid())
-    return lines + decision_lines(decide_builds(processes, holders, os.getuid(), os.getpid()))
+    claims = claimed_processes(proc_root) if holders else build_hold.LiveClaims(frozenset())
+    if isinstance(claims, build_hold.ClaimsUnreadable):
+        lines.append(f"claims unreadable: {claims.reason}")
+    claimed: frozenset[build_hold.ProcessIdentity] = claims.identities if isinstance(claims, build_hold.LiveClaims) else frozenset()
+    return lines + decision_lines(decide_builds(processes, holders, os.getuid(), os.getpid(), claimed))
 
 
 def scan(proc_root: Path, holder_directory: Path, uid: int, enforcer_pid: int,
@@ -808,7 +874,11 @@ def scan(proc_root: Path, holder_directory: Path, uid: int, enforcer_pid: int,
     began = time.monotonic()
     holders = build_hold.natedev_holds(holder_directory).in_force
     processes = read_processes(proc_root, uid, cgroup_root)
-    for line in decision_lines(decide_builds(processes, holders, uid, enforcer_pid)):
+    claims = claimed_processes(proc_root) if holders else build_hold.LiveClaims(frozenset())
+    if isinstance(claims, build_hold.ClaimsUnreadable):
+        print(f"claims unreadable: {claims.reason}")
+    claimed: frozenset[build_hold.ProcessIdentity] = claims.identities if isinstance(claims, build_hold.LiveClaims) else frozenset()
+    for line in decision_lines(decide_builds(processes, holders, uid, enforcer_pid, claimed)):
         print(line)
     print(f"pass: {time.monotonic() - began:.6f} s; {len(processes)} processes")
 

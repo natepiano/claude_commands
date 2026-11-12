@@ -5,6 +5,7 @@ from scripts.production.staff_test_support import foreign_hostname
 
 import json
 import os
+import shutil
 import signal
 import tempfile
 import sqlite3
@@ -88,6 +89,23 @@ class WorkspaceRunTests(CargoProjectTests):
     tree: str = ""
     runner: FakeRunner = FakeRunner()
     server: ScriptedServer = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.project_seed
+        _ = (fixture.repo / "Cargo.toml").write_text(
+            (fixture.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
+        (fixture.repo / "beta/src").mkdir(parents=True)
+        _ = (fixture.repo / "beta/Cargo.toml").write_text(
+            '[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
+        _ = (fixture.repo / "beta/src/lib.rs").write_bytes((fixture.repo / "src/lib.rs").read_bytes())
+        _ = fixture.git("add", ".")
+        _ = fixture.git("commit", "-qm", "workspace fixture")
+        cls.base = fixture.git("rev-parse", "HEAD")
+        cls.tree = fixture.git("rev-parse", "HEAD^{tree}")
 
     def assert_refused_writer_releases_its_finding(self, *, shared_proposal: bool) -> None:
         ledger, definition, findings = self.setup_findings(shared_proposal=shared_proposal)
@@ -355,14 +373,7 @@ class WorkspaceRunTests(CargoProjectTests):
         }))
         _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
 
-        _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
-        (self.repo / "beta/src").mkdir(parents=True)
-        _ = (self.repo / "beta/Cargo.toml").write_text('[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
-        _ = (self.repo / "beta/src/lib.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-qm", "workspace fixture")
-        self.base = self.git("rev-parse", "HEAD")
-        self.tree = self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-index", "--refresh")
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
@@ -700,11 +711,21 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertFalse(intent.path.exists())
 
     def test_admission_window_preserves_only_admission_interrupts(self) -> None:
+        seed = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="admission-window-seed-"))) / "case"
+        # Keep recorded paths valid when each case restores the private staff and repository.
+        _ = shutil.copytree(self.root, seed, symlinks=True)
         for case in ("cleanup_interrupt", "recovery_interrupt", "startup_interrupt", "tested_interrupt"):
             with self.subTest(case=case):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(seed, self.root, symlinks=True)
                 fixture = WorkspaceRunTests(methodName="runTest")
+                fixture.root = self.root
+                fixture.repo = self.repo
+                fixture.runner = FakeRunner()
+                fixture.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
                 try:
-                    fixture.setUp()
+                    fixture.queue = fixture.enterContext(unqueued_style_children())
+                    _ = fixture.git("update-index", "--refresh")
                     fixture.check_admission_window(case)
                 finally:
                     _ = fixture.doCleanups()

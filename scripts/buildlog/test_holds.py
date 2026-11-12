@@ -14,6 +14,7 @@ from unittest.mock import patch
 from scripts.buildlog import holds
 from scripts.build_hold import build_hold
 from scripts.mac_test import mac_test
+from scripts.production import staff
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog import index
 from scripts.buildlog import store
@@ -289,6 +290,12 @@ class HoldsTests(unittest.TestCase):
         self.add(hold_event("began", since.isoformat(), since.isoformat(), "mac", store.host_name()))
         self.assertEqual(self.history().intervals[0].ended, holds.OpenHold(NOW))
         self.assertEqual(holds.now_lines(holds.read_current_holds()), ["Now: Mac blocked by hana for render since 2026-10-09 16:00 UTC"])
+        member = staff.StaffRow(staff.StaffId("fixed-mac-holder"), "producer", "renamed-holder", staff.StaffRoot(),
+                                current_session=staff.StaffId("native-holder"))
+        write_mac_block(since, member.id)
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            self.assertEqual(holds.now_lines(holds.read_current_holds()),
+                             ["Now: Mac blocked by renamed-holder for render since 2026-10-09 16:00 UTC"])
 
     def test_each_target_has_a_coverage_line_and_does_not_claim_current_state_from_events(self) -> None:
         self.add(hold_event("began", "mac-key", "2026-10-12T12:00:00Z", "mac"),

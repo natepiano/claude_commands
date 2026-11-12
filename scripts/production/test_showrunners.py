@@ -603,7 +603,9 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         with mock.patch.object(showrunners, "socket_for", side_effect=AssertionError("no sessions subprocess")) as sockets, \
              mock.patch.object(showrunners, "_session_name", side_effect=AssertionError("no session reread")) as names:
             found = showrunners.registered_showrunners(self.notifier, known_sessions={fixture_runtime_id("builds-id"): record})
-            record["name"] = "renamed-builds"
+            owner = showrunners.owner_for("builds")
+            _ = staff.rename(owner.id, "renamed-builds")
+            record["name"] = "unrelated registry name"
             renamed = showrunners.registered_showrunners(self.notifier, known_sessions={fixture_runtime_id("builds-id"): record})
             absent = showrunners.registered_showrunners(self.notifier, known_sessions={})
         self.assertEqual([(runner["name"], runner["session"], runner["socket"], runner["doc"]) for runner in found], [
@@ -632,14 +634,17 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         pid = self.record("first-name", "live-id")
         self.assertEqual(self.successful("list").splitlines(), [
             # A timer whose check names no production doc is not a showrunner's: it is left out.
-            f"show\tfirst-name\t{LOS_ANGELES}\t{self.doc}"])
-        self.assertEqual(self.successful("name", "show"), "first-name\n")
+            f"show\tshow\t{LOS_ANGELES}\t{self.doc}"])
+        self.assertEqual(self.successful("name", "show"), "show\n")
         # A unit messages the showrunner's session on this machine, whoever else has its name.
         self.assertEqual(self.successful("address", "show"), f"uds:{self.root / 'live-id.sock'}\n")
-        # A rename is written in one place, the session's own record, and every reader sees it.
-        _ = self.record("renamed", "live-id", pid=pid)
-        self.assertIn("show\trenamed\t", self.successful("list"))
-        self.assertEqual(self.successful("name", "show"), "renamed\n")
+        # The staff rename changes each display without changing the native recipient.
+        _ = self.record("unrelated registry name", "live-id", pid=pid)
+        owner = showrunners.owner_for("show")
+        _ = staff.rename(owner.id, "renamed")
+        self.assertIn("renamed\trenamed\t", self.successful("list"))
+        self.assertEqual(self.successful("name", "renamed"), "renamed\n")
+        self.assertEqual(self.successful("address", "renamed"), f"uds:{self.root / 'live-id.sock'}\n")
         self.assertFalse(self.config.exists())
 
     def test_address_follows_current_session_after_clear_while_timer_keeps_fixed_owner(self) -> None:
@@ -652,7 +657,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         configuration = self.notifier / f"showrunner-{row.id}" / "conf"
         before = configuration.read_bytes(), configuration.stat().st_mtime_ns
         self.assertEqual(self.successful("address", "demo"), f"uds:{self.root / (current + '.sock')}\n")
-        self.assertEqual(self.successful("name", "demo"), "still-demo\n")
+        self.assertEqual(self.successful("name", "demo"), "demo\n")
         self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
         self.assertIn("TARGET=session:" + row.id, configuration.read_text())
 
@@ -662,8 +667,8 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         _ = (self.notifier / f"showrunner-{owner.id}" / "state").write_text(
             "ENABLED=0\nNEXT_DUE=0\nLAST_SENT=0\nLAST_RESTART=0\nLAST_TARGET=\n", encoding="utf-8")
         _ = self.record("on-demand", "live-id")
-        self.assertEqual(self.successful("name", "show"), "on-demand\n")
-        self.assertIn("show\ton-demand\t", self.successful("list"))
+        self.assertEqual(self.successful("name", "show"), "show\n")
+        self.assertIn("show\tshow\t", self.successful("list"))
         self.assertEqual([source.timer.name for source in showrunners.read_sources(
             self.notifier, unreadable=showrunners.UnreadableTimerPolicy.STRICT)], ["show"])
         self.assertEqual(showrunners.timer_docs(self.notifier), {"show": self.doc})
@@ -736,7 +741,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         result = self.cli("list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(result.stdout.splitlines()), sorted(
-            f"{production_name}\tdirector\t{LOS_ANGELES}\t{doc}"
+            f"{production_name}\t{production_name}\t{LOS_ANGELES}\t{doc}"
             for production_name, doc in (("no-zone", no_zone), ("other-zone", other_zone), ("bad-zone", bad_zone))))
         self.assertNotIn("skipping", result.stderr)
 
@@ -748,24 +753,25 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         (self.root / "lost-production.md").unlink()
         self.instance("showrunner-show", doc=self.doc)
         _ = self.record("director", "live-id")
-        # A session that answers on its socket and has no live named process cannot be named.
+        # The socket establishes liveness; staff supplies the name.
         _ = self.record("gone", "unnamed-id", pid=99999999)
         result = self.cli("list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
-            f"lost-doc\tdirector\t{LOS_ANGELES}\t{self.root / 'lost-production.md'}",
-            f"show\tdirector\t{LOS_ANGELES}\t{self.doc}"])
+            f"lost-doc\tlost-doc\t{LOS_ANGELES}\t{self.root / 'lost-production.md'}",
+            f"show\tshow\t{LOS_ANGELES}\t{self.doc}",
+            f"unnamed\tunnamed\t{LOS_ANGELES}\t{self.root / 'unnamed-production.md'}"])
         self.assertNotIn("skipping showrunner-no-target", result.stderr)
         self.assertNotIn("skipping showrunner-no-doc:", result.stderr)
         self.assertNotIn("no showrunner staff row", result.stderr)
         self.assertNotIn("skipping showrunner-lost-doc", result.stderr)
-        self.assertIn(f"skipping showrunner-unnamed: session {fixture_runtime_id('unnamed-id')} has no live named process", result.stderr)
+        self.assertNotIn("skipping showrunner-unnamed", result.stderr)
 
     def test_the_name_comes_from_the_live_process_not_a_stale_record_of_the_same_session(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
         _ = self.record("stale-name", "live-id", pid=99999999)
         _ = self.record("director", "live-id")
-        self.assertEqual(self.successful("name", "show"), "director\n")
+        self.assertEqual(self.successful("name", "show"), "show\n")
 
     def test_the_old_ready_and_status_commands_do_nothing_and_succeed(self) -> None:
         # Sessions started before a unit's run state was read from its run records still call them.

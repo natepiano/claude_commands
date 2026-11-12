@@ -56,6 +56,8 @@ set -euo pipefail
 BOARD_SCRIPT=${BASH_SOURCE[0]}
 [[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
 BOARD_DIR=${BOARD_SCRIPT%/*}
+# shellcheck source=/dev/null
+source "$BOARD_DIR/file_lock.sh"
 UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -177,15 +179,8 @@ lock_guard() {
   if ! exec 9>>"$1"; then
     return 2
   fi
-  local status perl candidate
-  # Use perl because the Mac has no flock(1). Look past PATH, as scripts/lib/py
-  # does for python3, so a caller with a cut PATH still gets the guard.
-  for candidate in "$(command -v perl)" /run/current-system/sw/bin/perl /usr/bin/perl; do
-    [[ -n "$candidate" && -x "$candidate" ]] && { perl="$candidate"; break; }
-  done
-  if [[ -n "${perl:-}" ]] && "$perl" -e 'use Fcntl ":flock";
-open my $guard, ">&=", 9 or exit 2;
-flock($guard, LOCK_EX|LOCK_NB) or exit($!{EWOULDBLOCK} || $!{EAGAIN} ? 75 : 2);' 2>/dev/null; then
+  local status
+  if lock_file_descriptor 9 nonblocking 2>/dev/null; then
     return 0
   else
     status=$?

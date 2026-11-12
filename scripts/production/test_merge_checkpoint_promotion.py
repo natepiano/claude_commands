@@ -32,7 +32,7 @@ from scripts.message import sessions
 from scripts.production.merge_checkpoint import promote, request_from
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
-from scripts.production.production_doc import Production
+from scripts.production.production_doc import Production, ProductionDocument
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
@@ -770,10 +770,43 @@ with lock.open("a") as held:
         def now(zone: tzinfo | None = None) -> datetime:
             return MERGED_AT.astimezone(zone)
 
-        with mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now):
+        original_prepare = merge_checkpoint.prepare_checkpoint
+        original_push = merge_checkpoint.push_git
+        original_promote = merge_checkpoint.promote_local_checkout
+        missing_at: list[str] = []
+
+        def remove_origin_refs(checkout: Path) -> None:
+            _ = self.git("config", "remote.origin.fetch", "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch", cwd=checkout)
+            for branch in ("production", "main"):
+                _ = self.git("update-ref", "-d", f"refs/remotes/origin/{branch}", cwd=checkout)
+            self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/production", "refs/remotes/origin/main", cwd=checkout), "")
+
+        def prepare_without_refs(production: ProductionDocument, merge_head: str, *, published_tip: str = "") -> tuple[str, ...]:
+            remove_origin_refs(production.checkout)
+            missing_at.append("prepare")
+            return original_prepare(production, merge_head, published_tip=published_tip)
+
+        def push_without_refs(production: ProductionDocument, may_undo: bool) -> str:
+            _ = self.git("update-ref", "-d", "refs/remotes/origin/production", cwd=production.checkout)
+            self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/production", cwd=production.checkout), "")
+            missing_at.append("push")
+            return original_push(production, may_undo)
+
+        def promote_without_refs(checkout: Path, branch: str, tip: str) -> (
+                merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+            remove_origin_refs(checkout)
+            missing_at.append("promote")
+            return original_promote(checkout, branch, tip)
+
+        with (mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now),
+              mock.patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=prepare_without_refs),
+              mock.patch.object(merge_checkpoint, "push_git", side_effect=push_without_refs),
+              mock.patch.object(merge_checkpoint, "promote_local_checkout", side_effect=promote_without_refs)):
             result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
                                          "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertEqual(missing_at, ["prepare", "push", "promote"])
         tip = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)

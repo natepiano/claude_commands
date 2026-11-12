@@ -12,6 +12,7 @@ from importlib import import_module
 import json
 import re
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
@@ -259,16 +260,32 @@ class TornTranscriptRecord:
     """A transcript line is not complete JSON."""
 
 
-def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornTranscriptRecord]:
-    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
-        for line in transcript:
+class TranscriptRecordBoundary(Enum):
+    ALL_RECORDS = "include the final record without a newline"
+    COMPLETE_LINES = "read only records that end with a newline"
+
+
+def transcript_records(source: Path, *, offset: int = 0,
+                       boundary: TranscriptRecordBoundary = TranscriptRecordBoundary.ALL_RECORDS
+                       ) -> Generator[dict[str, object] | TornTranscriptRecord]:
+    """Read transcript records from the supplied byte boundary."""
+    with open_transcript(source) as stream:
+        _ = stream.seek(offset)
+        for line in stream:
+            if boundary is TranscriptRecordBoundary.COMPLETE_LINES and not line.endswith(b"\n"):
+                break
             try:
                 fields = cast(object, json.loads(line))
             except json.JSONDecodeError:
                 yield TornTranscriptRecord()
                 continue
             if isinstance(fields, dict):
-                yield transcript_entry(cast(dict[str, object], fields), changed)
+                yield cast(dict[str, object], fields)
+
+
+def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornTranscriptRecord]:
+    for fields in transcript_records(source):
+        yield fields if isinstance(fields, TornTranscriptRecord) else transcript_entry(fields, changed)
 
 
 def conversation_entries(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend,

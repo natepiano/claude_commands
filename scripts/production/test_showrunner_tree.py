@@ -97,11 +97,12 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertEqual(showrunner_tree.children_of("remote"), ["child"])
         self.assertEqual(showrunner_tree.root_of("child"), "remote")
 
-    def test_attach_refuses_a_running_showrunner_not_named_for_its_production(self) -> None:
+    def test_attach_uses_staff_names_when_registry_names_differ(self) -> None:
         self.showrunner("top")
         self.showrunner("mid", name="mid-name")
-        stderr = self.refused("attach", "mid", "top")
-        self.assertIn("production mid has showrunner mid-name", stderr)
+        result = self.successful("attach", "mid", "top")
+        self.assertIn("mid now reports to top", result)
+        self.assertEqual(showrunner_tree.parent_of("mid"), "top")
         self.assertFalse(self.parent_receipt("mid").exists())
 
     def test_attach_stores_the_parent_and_every_lookup_reads_it(self) -> None:

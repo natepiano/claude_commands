@@ -44,7 +44,6 @@ class CodexDaemon:
 @dataclass(frozen=True)
 class DaemonSession:
     thread_id: str
-    name: str
     cwd: str
     status: str
 
@@ -308,7 +307,6 @@ def _read_thread(client: _DaemonClient, thread_id: str) -> DaemonSession:
         raise ValueError(f"thread/read: thread {thread_id} has no id")
     return DaemonSession(
         thread_id=returned_id,
-        name=_as_string(thread.get("name")) or returned_id,
         cwd=_as_string(thread.get("cwd")),
         status=_as_string(_as_dict(thread.get("status")).get("type")) or "unknown",
     )

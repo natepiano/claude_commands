@@ -417,8 +417,7 @@ class UnitConfigTests(UnitConfigFixture):
         fields: dict[str, object] = {
             "plan": "docs/plans/worker.md", "port": 8123,
             "responsibilities": ["nightly-review", "build-check"],
-            "retired": {"date": "2026-10-31", "session": "session-before-retire",
-                        "folder": str(self.worktree), "branch": "feature/worker"},
+            "retired": {"date": "2026-10-31", "session": "session-before-retire"},
         }
         self.assertEqual(config.decode(fields), replace(self.config(), retired=self.retirement()))
         for key, invalid in (("port", True), ("responsibilities", "nightly-review"),
@@ -630,6 +629,12 @@ class UnitConfigTests(UnitConfigFixture):
             _ = config.read(self.worktree)
 
     def test_park_restore_and_discard_keep_retirement_facts_until_the_last_step(self) -> None:
+        for staff_file, directory in (("", self.home / ".local/state/staff/units"),
+                                      (str(self.root / "private/staff.json"), self.root / "private/units")):
+            with self.subTest(staff_file=staff_file), patch.dict(os.environ, {"STAFF_FILE": staff_file}):
+                self.assertEqual(config.parked_path(self.unit), directory / f"{self.unit}.toml")
+                self.assertEqual(config.parked_path(self.unit, home=self.home),
+                                 self.home / ".local/state/staff/units" / f"{self.unit}.toml")
         self.assertIsInstance(config.place(self.unit, self.worktree), config.Nowhere)
         _ = config.write(self.worktree, self.config())
         source = self.source.read_bytes()
@@ -637,8 +642,7 @@ class UnitConfigTests(UnitConfigFixture):
         _ = config.park(self.unit, self.worktree, self.retirement())
         self.assertEqual(self.source.read_bytes(), source)
         facts = cast(dict[str, object], tomllib.loads(self.parked.read_text())["retired"])
-        self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire",
-                                 "branch": "feature/worker"})
+        self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire"})
         self.assertEqual(config.place(self.unit, self.worktree), config.Both(self.source, self.parked, True))
         self.source.unlink()
         self.assertEqual(config.place(self.unit, self.worktree), config.Parked(self.parked))
@@ -655,18 +659,16 @@ class UnitConfigTests(UnitConfigFixture):
         self.assertEqual(self.file_versions(), before)
 
     def test_legacy_retirement_folder_is_ignored_and_not_written(self) -> None:
-        _ = config.write(self.worktree, self.config())
-        _ = config.park(self.unit, self.worktree, self.retirement())
-        legacy = self.parked.read_text().replace('[retired]', '[retired]\nfolder = "/old/unit"')
-        _ = self.parked.write_text(legacy)
-        saved = config.read_parked(self.unit)
-        self.assertEqual(saved, replace(self.config(), retired=self.retirement()))
-        assert isinstance(saved, config.UnitConfig)
-        _ = config.write_parked(self.unit, saved)
-        self.assertNotIn("folder =", self.parked.read_text())
-        before = self.file_versions()
-        _ = config.write_parked(self.unit, saved)
-        self.assertEqual(self.file_versions(), before)
+        self.park_config()
+        original = self.parked.read_text()
+        for field in ('folder = "/old/unit"', 'branch = "old-branch"'):
+            with self.subTest(field=field):
+                legacy = original.replace('[retired]', '[retired]\n' + field)
+                _ = self.parked.write_text(legacy)
+                before = self.file_versions()
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.read_parked(self.unit)
+                self.assertEqual(self.file_versions(), before)
 
     def test_park_after_worktree_removal_uses_verified_retirement_and_changes_nothing(self) -> None:
         self.park_config()
@@ -747,7 +749,7 @@ class UnitConfigTests(UnitConfigFixture):
         self.park_config()
         before = self.file_versions()
         with self.assertRaisesRegex(config.ConfigRefused, "retired"):
-            _ = config.park(self.unit, self.worktree, replace(self.retirement(), branch=config.Branch("other")))
+            _ = config.park(self.unit, self.worktree, replace(self.retirement(), session_id="other-session"))
         self.assertEqual(self.file_versions(), before)
 
     def test_matching_copies_make_park_and_restore_reruns_noops(self) -> None:

@@ -71,9 +71,10 @@ def production_doc(instance_dir: Path) -> Path | None:
 
 
 def read_production(instance_dir: Path) -> Production | None:
+    """Return a running production, or report a failed read with FooterError."""
     try:
         owner = showrunners.owner_for_timer(instance_dir)
-        if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if not isinstance(owner.doc, staff.LiveDoc):
             return None
         doc = owner.doc.path
         lines = doc.read_text().splitlines()
@@ -83,8 +84,8 @@ def read_production(instance_dir: Path) -> Production | None:
         # The user's zone setting; the doc's own User zone line is no longer read.
         zone = user_zone_name()
         return Production(owner.name, doc, zone, owner)
-    except (OSError, ValueError, ZoneInfoNotFoundError, KeyError):
-        return None
+    except (OSError, ValueError, ZoneInfoNotFoundError, KeyError) as error:
+        raise FooterError(f"{instance_dir}: production read failed: {error}") from error
 
 
 def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None) -> int | None:

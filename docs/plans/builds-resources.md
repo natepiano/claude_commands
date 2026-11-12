@@ -2265,3 +2265,23 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
 
 **Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.
+
+### Phase 107 — A natedev hold never stops a run that holds a live Mac or AWS claim  · status: done
+
+#### As-built
+
+- A natedev hold keeps each process family that holds a live Mac or AWS claim. `holds_claim(process, processes, claimed)` is true when the process, an ancestor or a descendant has a claimed identity (pid and start time). The claim pid is the `offload.py` process.
+- `hold_enforcer.claimed_processes()` returns `build_hold.LiveClaims(identities)`, or `build_hold.ClaimsUnreadable(reason)` on `ClaimStateUnreadable` or `ConfigError`.
+- `decide_builds(..., claimed)` allows a claimed family first, with the reason `holds a live Mac or AWS claim`. `StopBuildsAndTests.stop()` signals no claimed process, and `kill_survivors()` cancels the kill of a process that became claimed.
+- `run()`, `drain()`, `report()`, `scan()` and `build_hold.audit_builds` read the process table first, then the claims. On `ClaimsUnreadable` the enforcer sends no signals, logs `claims unreadable; enforcement waits: …` once, retries each second, and logs `claims readable; enforcement resumes` on recovery.
+- `is_outermost_gate()` is shared by `classify_drain_runs()` and the `hold --drain` start. With unreadable claims, a drain start keeps every outermost gate.
+- `build_hold.BuildClass` has `claimed`; the audit shows it as `holds a live Mac or AWS claim`, and `audit_hold` skips it.
+- A Mac-eligible step in `waiting_hold` or `waiting_mac` keeps its route to the Mac. `hold --drain` keeps its own rules (cargo child, admission reservation, claim) and still waits for working runs.
+
+**Files:**
+- `scripts/build_hold/hold_enforcer.py` — claim read, family check, enforcer loop, drain
+- `scripts/build_hold/build_hold.py` — `LiveClaims`, `ClaimsUnreadable`, the `claimed` audit class
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_hold/test_build_hold.py` — claim, stale record, ended claim, pending kill, waiting route, unreadable and recovery, read order, drain rows
+- `commands/build/hold.md`, `docs/as-built/builds-aws-target.md` — the rule text
+
+**Gotchas:** read the process table before the claim records. The reverse order lets a claim taken between the two reads receive TERM.

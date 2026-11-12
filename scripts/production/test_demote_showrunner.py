@@ -94,6 +94,8 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.git("init", "--bare", "-q", str(self.root / "origin.git"))
         _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
         _ = self.worker
+        from scripts.production.staff_test_support import fixture_session
+        fixture_session(self.child.current_session, staff.ClaudeBackend())
         self.events = []
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "__ETC_ZSHENV_SOURCED": "1"})))
@@ -131,9 +133,9 @@ class DemoteShowrunnerTests(StaffTestCase):
         row = fixture_member("unit", name=name, parent=self.child.id,
                              worktree=staff.PresentWorktree(remote.local_machine(), tree))
         _ = unit_config.write(tree, unit_config.UnitConfig(unit_config.PlanFile(Path("old.md")), unit_config.AppPort(9000), ()))
-        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session, unit_config.Branch(branch)))
+        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session))
         _ = self.git("worktree", "remove", "--force", str(tree))
-        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree), expected=row.worktree)
+        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree, staff.ParkedBranch(branch)), expected=row.worktree)
 
     def question_staff(self) -> update_registration.QuestionStaff:
         return update_registration.QuestionStaff.for_record(staff.snapshot(), session_staff.MemberSources(()))
@@ -741,7 +743,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 stop.assert_called_once_with(self.child.current_session)
                 self.assertEqual(staff.by_id(self.child.id), self.child)
                 args = start.call_args.args
-                self.assertEqual(args[:4], ("fixture", self.child_name, "child-session", str(self.child_tree)))
+                self.assertEqual(args[:4], ("fixture", self.child_name, self.child_name, str(self.child_tree)))
                 self.assertEqual(cast(dict[str, str], args[4])["CLAUDE_CONFIG_DIR"], str(self.root / "showrunner-account"))
                 self.assertIn(self.child.current_session, cast(list[str], args[6]))
                 if isinstance(outcome, herdr.AgentNotStarted):

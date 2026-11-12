@@ -5,6 +5,7 @@ description: Report context costs and compare saved results.
 Use `report` when `$ARGUMENTS` is empty or starts with `--`.
 Otherwise use `$ARGUMENTS` unchanged.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <arguments>`.
+The command forwards to natedev over SSH on other hosts and prints its output.
 For `changes`, remove `--raw` from the arguments. Without `--raw`, print only the summary in <ChangesSummary/>.
 For all other commands, and for `changes --raw`, print the output as it arrives.
 
@@ -21,7 +22,7 @@ Use `--family claude` for every precompute experiment save, threshold read, and 
 Use `--where KEY=JSON` on `report`, `save` or `compare`; repeat it for more settings.
 `report` shows the filtered value in the settings column and omits rows with no samples.
 
-Both machines cache parsed transcript events under `~/.cache/context_economy/`.
+Natedev caches parsed transcript events under `~/.cache/context_economy/`.
 Warm reads reuse unchanged files; appended files resume at the last complete line with their saved parser state.
 Append checks hash only the first 4 KiB and the last 4 KiB before the saved offset.
 A failed anchor, size, device, or inode check causes a full parse.
@@ -31,16 +32,15 @@ Summaries survive file deletion and share one entry with the `.jsonl.zst` form.
 Compressed files without a summary use the shared zstd reader once.
 `cache_max_megabytes` in `config/context_economy.conf` bounds reproducible entries by least recent access.
 Entries whose plain source files are compressed or deleted remain protected from eviction.
-Long reads show file progress on stderr, including the Mac read.
+Long reads show file progress on stderr.
 `progress_seconds` in the same config sets the update interval.
 
 <ChangesSummary>
-Write in Simplified Technical English. Take each measured number from the output.
+Write in Simplified Technical English, in everyday words. Take each number from the output.
 
-1. For each settings change, write one heading: the date, the machine, and the setting `old -> new`. Under it, put one table with the columns `Role | Verdict | Moved (before -> after)`. Give one row per judged role. Name up to three measures that moved, with their values. For `no clear change`, write `no measure moved`.
-2. Under each table, write one line: `Also changed in this window:` and the other changes, in short words.
-3. Write one line: `Trust:` low, medium or high, and why. Name the session counts, and the other changes that can cause the same movement.
-4. Write one line: `Next step:` one test that separates the change from the confounds. Propose the setting, the days and the sessions on each side.
-
-Changes with no judged role share one line at the end. End with: `Full report: /context_economy changes <same arguments> --raw`.
+1. For each settings change, write one sentence: what changed, whether it helped, and how sure we are. Example: "On 11-07 the compaction window got smaller; we cannot tell yet if it helped, because few sessions ran after it and other settings changed the same day."
+2. Trust is low when a side has fewer than 10 sessions, or another change in the same window can cause the same movement. Otherwise it is medium or high.
+3. Only at medium or high trust, add at most two numbers, `before -> after`. Name each measure in everyday words: "context each call", "cost each call", "context after a compaction", "compactions each hour". At low trust, give no numbers.
+4. Put changes with no judged role in one line.
+5. End with one line, `Next step:`, the one test that would give an answer. Then `Full report: /context_economy changes <same arguments> --raw`.
 </ChangesSummary>

@@ -38,7 +38,7 @@ There is no separate charge timer.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
-7. Run `python3 scripts/aws_target/deploy.py quota-request` to request the configured Spot vCPU quota in each gate region.
+7. Run `python3 scripts/aws_target/deploy.py quota-request` to request Standard and G and VT Spot quotas in the configured regions.
 8. Run `python3 scripts/aws_target/deploy.py up --approve-resources` for deployment.
    Deployment refuses a price older than `price_max_age_seconds`.
    Confirm that `notification_email_file` names an existing private file before deployment.
@@ -47,19 +47,84 @@ There is no separate charge timer.
 
 A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The user approved `us-east-2c` (`use2-az3`) at $0.2250/h on 2026-11-03.
 
-On 2026-11-11, the Standard Spot vCPU quota (`L-34B43A08`) in `us-west-2` is 5.
+On 2026-11-11, the recorded Standard Spot vCPU quota (`L-34B43A08`) in `us-west-2` was 5.
 The largest configured gate needs 32 vCPUs.
-`deploy.py quota-request` requests `spot_quota_request_vcpus=128` from `cloud_gate.conf` in each configured region.
+`regions` and `spot_candidate_regions` contain `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+`us-east-2` remains the home region for shared artifacts.
+
+Prepare the European regions before deployment:
+
+1. Enable `eu-south-2` in the AWS Account page's AWS Regions section.
+2. Wait until the region status is `ENABLED`.
+3. Add `eu-north-1` and `eu-south-2` to the allowed regions in the Organizations `RegionFloor` policy.
+4. Keep the existing home and US region permissions.
+5. Run `python3 scripts/aws_target/deploy.py quota-request` before deployment.
+
+Region activation can take several hours.
+See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
+
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+The command uses `spot_quota_request_vcpus=136` from `cloud_gate.conf`.
+This supports four 32-vCPU gates and one 8-vCPU Hana box.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+Spot work and later price steering use the same candidate region list.
 The command decrypts the administrator key at the terminal.
 It skips sufficient quotas and existing open requests.
 It prints request status and desired values without request, case, or account identifiers.
 A failed region prints only the AWS error code or Python error class while other regions continue.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy needs `servicequotas:GetServiceQuota`, `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`, and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
+
+`deploy.py prices` reads gate regions, then candidate regions, without duplicates.
+It preserves the configured order within each list.
+It adds `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` to the existing price rows.
+All three new keys are in `cloud_gate.conf`.
+
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+A separate non-blocking `spot-prices.lock` prevents concurrent price refreshes.
+A held price lock makes the tick skip the refresh.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each candidate region and each deployed gate region once, without duplicates.
+It writes the latest price for each zone and gate type to `spot-prices.json` in the AWS state folder.
+Failed or incomplete reads preserve the previous file and let the controller tick continue.
+The controller also reads prices when the former builder route is disabled or removed.
+
+New gates prefer larger vCPU sizes, then the lowest expected gate cost within each size.
+Before the first ranking, each gate reads live Spot prices from all deployed regions in parallel.
+Each regional call requests Linux/UNIX prices for all configured `instance_types`.
+`spot_price_live_read_timeout_s=3` bounds the whole parallel read.
+The latest live zone and type rows replace matching hourly rows for this ranking only.
+Failed or slow regions keep hourly rows.
+The gate leaves `spot-prices.json` unchanged.
+`launch.json` and launch history rows record each region's call seconds and whether ranking used its live rows.
+The saved `spot_price_reads` entries contain `region`, `seconds`, and `used`.
+Resumed launches use the saved order without another price read.
+Expected cost includes the Spot price times expected gate hours and `remote_region_transfer_usd=0.00015` outside the home region.
+It also includes `region_extra_gate_seconds[region] * gate_wait_usd_per_minute / 60`.
+`region_extra_gate_seconds={}` is a JSON map of measured extra seconds by region.
+Missing regions contribute zero extra seconds.
+`gate_wait_usd_per_minute=0` keeps price ordering unchanged until the delay trial and builds review set the wait cost.
+Expected hours use recent median `gate_s` values for the same mode, or `lifetime_minutes` when no values exist.
+Prices and duration samples use `price_max_age_seconds=7200`.
+Equal costs keep configured order.
+Missing prices follow fresh prices for the same vCPU count.
+With no fresh prices, gates keep configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves refused variants to the end; gates can still try them.
+Capacity errors affect one zone and type.
+Spot quota errors affect the whole region.
+The gate reads only the needed history tail in 64 KiB blocks.
+`launch.json` saves the ranked list before launch, so retries keep the same order and ClientToken offsets.
+Older saved offsets keep configured order.
+The launch ranking keys are in `cloud_gate.conf`.
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
-- `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- The recorded `RegionFloor` allows `us-east-1`, `us-east-2`, and `us-west-2`. European deployment needs the two EU regions in its allowed region list.
+- The policy denies most actions in `us-east-1`, including the Pricing API. Keep `us-east-2` as the home region.
 - The region policy is `AdvancedModeRegionRestrictionSecurityControlPolicy`. It had a `UsWest2Partitional` statement that denied EC2 in `us-west-2`. The user removed it on 2026-11-11 for the gate fallback region. `RegionFloor` and `UsEast1Partitional` remain.
 - No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
@@ -67,9 +132,11 @@ The account (created 2026-11-03) is a project account. The user activated advanc
 
 Create or update the encrypted administrator file at your terminal.
 Never send a credential or passphrase to a session.
+`deploy.py` reads the scaler file path from `credential_file` in `cloud_gate.conf` and expands `~`.
+`AWS_SHARED_CREDENTIALS_FILE` overrides that path when its value is nonempty.
+Every deployment command gives AWS subprocesses the same resolved file path.
 
 ```sh
-export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
 python3 scripts/aws_target/deploy.py secrets
 ```
 
@@ -183,7 +250,7 @@ Keep the encrypted administrator file and the private Budget address file in pla
 Run this command at your terminal:
 
 ```sh
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py up --approve-resources
+python3 scripts/aws_target/deploy.py up --approve-resources
 ```
 
 The command runs eleven ordered stages through activation and routing proof.
@@ -495,11 +562,13 @@ The guard and Budget do not remove that data automatically.
 
 Keep offload and control enabled until stopped evidence is confirmed.
 `Controller._action` returns immediately when offload is off, including manual stop.
+Direct controller and AWS CLI commands need the resolved scaler path in their environment.
+The resolver below reads only the configured path.
 
 ```sh
 cd "$HOME/.claude"
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" \
-  python3 scripts/aws_target/aws_target.py stop
+export AWS_SHARED_CREDENTIALS_FILE="$(python3 -c 'from scripts.aws_target.admin_secrets import credentials_file; print(credentials_file())')"
+python3 scripts/aws_target/aws_target.py stop
 aws --profile build-scaler ec2 describe-instances --region REGION \
   --instance-ids INSTANCE_ID \
   --query 'Reservations[].Instances[].State.Name'
@@ -576,7 +645,9 @@ Keep `routing.json`, `deployment.json`, and `up.json` outside the repository.
 1. Run `deploy.py secrets` in your terminal before the first encrypted deployment.
 2. Enter the AWS administrator key and Tailscale OAuth values without echo.
 3. Enter the encryption passphrase twice.
-4. Run `deploy.py up --approve-resources` with the scaler credential file environment.
+4. Run `deploy.py up --approve-resources`.
+
+Deployment commands use `credential_file` from `cloud_gate.conf` unless `AWS_SHARED_CREDENTIALS_FILE` overrides it.
 
 The default encrypted path is `~/.config/aws-build/admin.gpg`.
 The helper uses symmetric AES256 encryption and disables the GPG symmetric passphrase cache.
@@ -603,7 +674,7 @@ The plan states that the `/home` build cache is lost.
 Run the approved removal at your terminal.
 
 ```sh
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py down --approve-destroy
+python3 scripts/aws_target/deploy.py down --approve-destroy
 ```
 
 The helper disables routing and the controller before checking jobs that still run.

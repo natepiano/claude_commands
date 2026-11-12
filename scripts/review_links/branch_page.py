@@ -421,6 +421,10 @@ def page_at(root: Path, request_path: str) -> BranchPage:
                       unowned_total - (len(rows) - len(available)))
 
 
+def render_date(value: str, date_class: str) -> str:
+    return f'<strong class="{date_class}">{html.escape(value[:10])}</strong>{html.escape(value[10:])}'
+
+
 def render(page: BranchPage) -> bytes:
     unit_rows: list[str] = []
     unowned_rows: list[str] = []
@@ -435,8 +439,8 @@ def render(page: BranchPage) -> bytes:
         dates_in_order = datetime.fromisoformat(row.commit_date) <= datetime.fromisoformat(row.merge_date)
         date_class = "date-in-order" if dates_in_order else "date-out-of-order"
         rows.append(f'''<section><label><input type="checkbox" name="branch" value="{name}" checked>
-<strong>{name}</strong></label><p>{owner}Last commit: <strong class="{date_class}">{html.escape(row.commit_date)}</strong>
-Merged into main: {html.escape(row.merge[:12])} · <strong class="{date_class}">{html.escape(row.merge_date)}</strong></p></section>''')
+<strong>{name}</strong></label><p>{owner}Last commit: {render_date(row.commit_date, date_class)}
+Merged into main: {html.escape(row.merge[:12])} · {render_date(row.merge_date, date_class)}</p></section>''')
     content = '<h1>Branches to delete</h1>'
     if page.rows:
         unowned_heading = f"Merged, no owner recorded ({len(unowned_rows)} of {page.unowned_total})"

@@ -5174,14 +5174,20 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
         notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+            ProblemCause("warning", warning), NoUserStep())))
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
@@ -5289,6 +5295,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(error.__cause__, FileNotFoundError):
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
+    detached = session_state.running_detached_work(membership)
+    inputs.update(detached.inputs)
     for path in pane_launch.record_directory().glob("*.json"):
         inputs.add(path)
         try:
@@ -5296,9 +5304,9 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         except (OSError, ValueError):
             continue
         for launch in entries.values():
-            previous = launches.get(launch["session_id"])
+            previous = launches.get(pane_launch.reference_id(launch))
             if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
+                launches[pane_launch.reference_id(launch)] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 
@@ -5325,7 +5333,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                                              session_staff.LiveSession(identity))
             if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.StoredReference(launch["session_id"]))
+                                                 session_staff.StoredReference(pane_launch.reference_id(launch)))
         except (staff.StaffUnreadable, ValueError) as error:
             print(f"accounts: unit {identity}: {error}", file=sys.stderr)
             continue
@@ -5347,13 +5355,13 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
-                state = session_state.classify(session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                state = session_state.classify(owner if owner is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             else:
                 member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
                     member_row if member_row is not None else session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
@@ -5367,7 +5375,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        state = session_state.classify(member, session_state.NoLiveSession())
+        state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
         counts.setdefault((directory, role), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
@@ -5388,7 +5396,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
-                        session_state.UnrecordedStaff(), session_state.LiveActivity(status))
+                        state.row, session_state.LiveActivity(status), detached=detached)
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
@@ -5402,7 +5410,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
-                    session_state.UnrecordedStaff(), session_state.LiveActivity(process.activity))
+                    member, session_state.LiveActivity(process.activity), detached=detached)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 

@@ -120,5 +120,3 @@ def status_blocks(path: Path, units: tuple[str, ...]) -> tuple[StatusBlock, ...]
     if missing:
         raise StatusFailure("status", f"missing unit blocks: {', '.join(missing)}")
     return tuple(blocks)
-
-

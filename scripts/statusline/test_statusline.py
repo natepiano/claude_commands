@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,10 +18,11 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
+from scripts.hooks import showrunner_footer
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, staff
 from scripts.agents import remote
-from scripts.statusline import adhoc_items, assignment, rebuild_row
+from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -950,6 +952,115 @@ class CountsRowTests(unittest.TestCase):
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
         self.assertEqual(self.cache.read_text(encoding="utf-8").splitlines()[:2], ["", ""])
+
+    def test_failed_reads_retry_and_restore_the_full_row(self) -> None:
+        _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
+        self.questions({"since": "2026-10-16T19:00", "text": "A"})
+        config = self.home / "config"
+        config.mkdir()
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        record = self.home / ".local/state/staff/staff.json"
+        saved = record.read_text(encoding="utf-8")
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(record), "CONF_DIR": str(config),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        failures = (OSError("unreadable row"), ValueError("invalid row"),
+                    showrunner_footer.FooterError("unreadable footer"), None)
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__ if failure else "unreadable staff"):
+                # The next shell render occurs after the retry without a wait.
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), ExitStack() as mocks:
+                    if failure is None:
+                        _ = record.write_text("{", encoding="utf-8")
+                    else:
+                        _ = mocks.enter_context(patch.object(counts_row, "row", side_effect=failure))
+                    _ = mocks.enter_context(patch.object(time, "time", return_value=now))
+                    cache = counts_row.write(instance)
+                built = cache.stat().st_mtime_ns
+                _ = record.write_text(saved, encoding="utf-8")
+                os.utime(record, ns=(built - 1, built - 1))
+                line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(line, "")
+                self.assertEqual(due, str(now + 7))
+                self.assertEqual(sources, [str(instance / "conf"), str(record)])
+                self.assertEqual(self.lines()[-1], "For you: 1 question, 1 proposal")
+                self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[:2],
+                                 ["For you: 1 question, 1 proposal", ""])
+
+    def test_unusable_retry_config_writes_a_cache_and_refreshes_after_a_config_fix(self) -> None:
+        self.questions({"since": "2026-10-16T19:00", "text": "A"})
+        config = self.home / "config"
+        config.mkdir()
+        settings = config / "statusline.conf"
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        record = self.home / ".local/state/staff/staff.json"
+        saved = record.read_text(encoding="utf-8")
+        doc = self.home / "docs/plans/show-production.md"
+        saved_doc = doc.read_text(encoding="utf-8")
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(record), "CONF_DIR": str(config),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        for failure in ("exception", "unreadable staff", "staff repair", "doc repair"):
+            with self.subTest(failure=failure):
+                _ = settings.write_text("# whole: 1..\ncounts.retry_seconds=invalid\n", encoding="utf-8")
+                try:
+                    with patch.dict(os.environ, environment), ExitStack() as mocks:
+                        if failure == "exception":
+                            _ = mocks.enter_context(patch.object(counts_row, "row", side_effect=OSError("unreadable row")))
+                        elif failure == "doc repair":
+                            _ = doc.write_bytes(b"\xff")
+                        else:
+                            _ = record.write_text("{", encoding="utf-8")
+                        cache = counts_row.write(instance)
+                finally:
+                    _ = record.write_text(saved, encoding="utf-8")
+                built = cache.stat().st_mtime_ns
+                os.utime(record, ns=(built - 1, built - 1))
+                line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
+                self.assertEqual((line, due), ("", ""))
+                self.assertIn(str(settings), sources)
+                self.assertIn(str(record), sources)
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines()))
+                self.assertEqual(cache.stat().st_mtime_ns, built)
+                if failure == "staff repair":
+                    os.utime(record, ns=(built + 10**9, built + 10**9))
+                elif failure == "doc repair":
+                    _ = doc.write_text(saved_doc, encoding="utf-8")
+                    os.utime(doc, ns=(built + 10**9, built + 10**9))
+                else:
+                    _ = settings.write_text("# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+                    os.utime(settings, ns=(built + 10**9, built + 10**9))
+                self.assertEqual(self.lines()[-1], "For you: 1 question")
+
+    def test_inactive_productions_watch_sources_without_a_retry(self) -> None:
+        config = self.home / "config"
+        config.mkdir()
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        record = self.home / ".local/state/staff/staff.json"
+        doc = self.home / "docs/plans/show-production.md"
+        missing = doc.parent / "missing/production.md"
+        _ = doc.write_text("> **Status: PRODUCTION — wrapped**\n", encoding="utf-8")
+        states = (("wrapped", staff.WrappedDoc(remote.local_machine(), doc), doc),
+                  ("wrapped missing doc", staff.WrappedDoc(remote.local_machine(), missing), doc.parent),
+                  ("no doc", staff.DocUnfilled(), None),
+                  ("wrapped status", staff.LiveDoc(remote.local_machine(), doc), doc))
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(record), "CONF_DIR": str(config),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        for name, location, watched in states:
+            with self.subTest(state=name):
+                _ = record.write_text(staff_text(replace(OWNER, doc=location)), encoding="utf-8")
+                with patch.dict(os.environ, environment):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
+                self.assertEqual((line, due), ("", ""))
+                expected = {str(instance / "conf"), str(record)}
+                if watched is not None:
+                    expected.add(str(watched))
+                self.assertEqual(set(sources), expected)
+                built = cache.stat().st_mtime_ns
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines()))
+                self.assertEqual(cache.stat().st_mtime_ns, built)
 
     def test_the_cache_is_rebuilt_only_when_a_file_it_was_read_from_changes(self) -> None:
         self.questions({"since": "2026-10-16T19:00", "text": "A"})

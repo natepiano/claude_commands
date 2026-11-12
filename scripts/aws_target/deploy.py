@@ -102,11 +102,43 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     return largest
 
 
-def spot_quota(api: AwsCli) -> Decimal:
-    """Read the regional Standard Spot vCPU quota."""
+def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
+    """Read the regional Spot vCPU quota for the supplied code."""
     reply = api.call('get-service-quota', '--service-code', 'ec2',
-                     '--quota-code', 'L-34B43A08', service='service-quotas')
+                     '--quota-code', code, service='service-quotas')
     return conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
+
+
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+    """Request one regional quota unless its value is sufficient or a request is open."""
+    region = api.region
+    closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    try:
+        quota = spot_quota(api, code)
+        if quota >= desired:
+            print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
+            return True
+        history = api.call('list-requested-service-quota-change-history-by-quota',
+            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
+        if opened:
+            for row in opened:
+                status = ledger.text(row, 'Status')
+                value = conf.decimal(str(row['DesiredValue']))
+                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+            return True
+        reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
+            '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
+        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
+        return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    except (admin_secrets.SecretsRefused, DeploymentRefused):
+        raise
+    except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+        match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+        reason = match[1] if match else type(error).__name__
+        print(f'{region}: {label} quota request failed: {reason}')
+        return False
 
 
 @dataclass(frozen=True)
@@ -359,6 +391,8 @@ class Deployment:
         """Show the regional gate quota without stopping deployment on a failed read."""
         try:
             quota = spot_quota(api)
+        except (admin_secrets.SecretsRefused, DeploymentRefused):
+            raise
         except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             print(f'{api.region}: Spot vCPU quota unknown: {self.admin.redact(str(error))}')
             return
@@ -790,9 +824,12 @@ class Deployment:
 
     def _check_credentials(self) -> None:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        credential_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
-        if not credential_file or stat.S_IMODE(Path(credential_file).expanduser().stat().st_mode) != 0o600:
-            raise DeploymentRefused('AWS_SHARED_CREDENTIALS_FILE must name a private mode 0600 file')
+        try:
+            mode = admin_secrets.credentials_file().stat().st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                raise OSError
+        except OSError:
+            raise DeploymentRefused('credential_file must name a private mode 0600 file') from None
 
     def setup_start(self, *, approve_resources: bool = False) -> dict[str, str]:
         """Restart the deployed instance for user setup while admission stays disabled."""
@@ -945,7 +982,7 @@ class Deployment:
     def _scaler_key(self) -> None:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
-        credential_file = Path(os.environ['AWS_SHARED_CREDENTIALS_FILE']).expanduser()
+        credential_file = admin_secrets.credentials_file()
         previous = credential_file.read_bytes()
         key_id = ''
         checkpoint = self.directory / 'scaler-key.json'
@@ -1240,15 +1277,26 @@ class Deployment:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
         from scripts.aws_target import cloud_gate
-        configured_types = cloud_gate.settings().words('instance_types')
+        values = cloud_gate.settings()
+        configured_types = values.words('instance_types')
         largest = largest_gate_vcpus(configured_types)
         sizes = tuple(dict.fromkeys([*configured_types,
-                                    'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge']))
+                                    'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge', *values.words('gpu_instance_types')]))
+        regions = tuple(dict.fromkeys([*gate_regions(settings.region), *values.words('spot_candidate_regions')]))
         _ = self.admin.get()
         print('region type zone price')
-        for region in gate_regions(settings.region):
+        for region in regions:
             target = api.in_region(region)
             self._print_spot_quota(target, largest)
+            try:
+                quota = spot_quota(target, 'L-3819A6DF')
+                print(f'{region}: G and VT Spot quota {quota.normalize():f} vCPUs')
+            except (admin_secrets.SecretsRefused, DeploymentRefused):
+                raise
+            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                reason = code[1] if code else type(error).__name__
+                print(f'{region}: G and VT Spot quota unknown: {reason}')
             zones = [ledger.text(row, 'ZoneName') for row in ledger.rows(target.call('describe-availability-zones',
                 '--filters', 'Name=state,Values=available'), 'AvailabilityZones')]
             rows = ledger.rows(target.call('describe-spot-price-history', '--instance-types', *sizes,
@@ -1265,39 +1313,19 @@ class Deployment:
                     print(region, size, zone, str(row.get('SpotPrice', 'unavailable')))
 
     def quota_request(self) -> bool:
-        """Request the configured Spot vCPU quota without duplicating open requests."""
+        """Request both regional Spot quotas without duplicating open requests."""
         settings = read_deployment_settings(self.settings_path, self.directory)
-        desired = conf.read_or_repository('cloud_gate').whole('spot_quota_request_vcpus')
+        values = conf.read_or_repository('cloud_gate')
         api = self._api(settings)
+        requests = (
+            (gate_regions(settings.region), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+            (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+        )
         success = True
-        closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
-        for region in gate_regions(settings.region):
-            target = api.in_region(region)
-            try:
-                quota = spot_quota(target)
-                if quota >= desired:
-                    print(f'{region}: Spot quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
-                    continue
-                history = target.call('list-requested-service-quota-change-history-by-quota',
-                    '--service-code', 'ec2', '--quota-code', 'L-34B43A08', service='service-quotas')
-                opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
-                if opened:
-                    for row in opened:
-                        status = ledger.text(row, 'Status')
-                        value = conf.decimal(str(row['DesiredValue']))
-                        print(f'{region}: open Spot quota request {value.normalize():f} vCPUs; status {status}')
-                    continue
-                reply = target.call('request-service-quota-increase', '--service-code', 'ec2',
-                    '--quota-code', 'L-34B43A08', '--desired-value', str(desired), service='service-quotas')
-                status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
-                print(f'{region}: Spot quota request {desired} vCPUs; status {status}')
-                if status in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}:
+        for regions, code, desired, label in requests:
+            for region in regions:
+                if not request_spot_quota(api.in_region(region), code, desired, label):
                     success = False
-            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
-                reason = code[1] if code else type(error).__name__
-                print(f'{region}: Spot quota request failed: {reason}')
-                success = False
         return success
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
@@ -1584,6 +1612,7 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
+    os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
     if sys.argv[1:2] == ['gate-trial']:
         from scripts.aws_target import gate_trial
         settings_path = conf.path('aws_target')

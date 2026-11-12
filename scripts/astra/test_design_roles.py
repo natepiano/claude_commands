@@ -602,6 +602,9 @@ class DurableRolesTests(HeldRolePaneCase):
         result = self.panes.assign(arguments)
         if "--new-worker" in arguments and result.returncode == 0:
             for row in staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id):
+                for pane, (pid, family, _) in self.panes.world.foreground.items():
+                    if self.panes.world.processes[pid].identity.id == row.current_session:
+                        self.panes.world.record(row, pane, cast(Literal["claude", "codex"], family))
                 idle_transcript(row)
             if self.lose_creation_ack:
                 self.lose_creation_ack = False

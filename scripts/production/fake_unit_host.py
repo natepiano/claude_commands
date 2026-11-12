@@ -25,7 +25,7 @@ PANE_RESULT = herdr.Herdr.result
 def private_process_registry() -> Generator[None]:
     """Read private process generations and retain normal reads for other processes."""
     from scripts.message import sessions
-    from scripts.message import sessions as runtime_sessions
+    from scripts.message import session_records as runtime_sessions
 
     original_start = runtime_sessions.process_start
     original_running = runtime_sessions.running_session
