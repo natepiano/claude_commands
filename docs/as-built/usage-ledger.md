@@ -109,7 +109,18 @@ Every stored time is UTC ISO-8601 text ending `+00:00`.
 - `finding_opened`, `finding_verdict` → `findings`, key (`machine`, `phase_instance_id`, `finding_id`); `state` is `open` until a verdict, then its `resulting_state`.
 - `finding_batch_dispatched`, `_landed`, and `_abandoned` enter the `repair_rounds` audit table. Its key is (`machine`, `phase_instance_id`, `round`). These rows preserve dispatch records. Repair counts require started fix passes. Relaunches of one ledger batch add no round. Refunded batches add no round unless they later land.
 
-In `runs`, `phases` and `passes`, `state` is `open` until the finish event and `finished_at` is NULL only while `open`. `source_event` is the creating event's `event_id`, from which a finding's title and detail can be found in the history file.
+The `runs` columns are `machine`, `run_id`, `started_at`, `plan_doc`, `worktree`, `finished_at`, and `source_event`.
+The table stores no `state` or `branch`.
+`HISTORY_FIELDS` gives `run_started` only the `plan_doc` and `worktree` fields.
+Its insert names all six supplied columns explicitly.
+`run_finished` carries no event-specific fields and updates only `finished_at`.
+A run without an imported finish event keeps `finished_at` NULL.
+
+In `phases` and `passes`, `state` is `open` until the finish event.
+The finish event sets both `state` and `finished_at`.
+`validate_history_fields` rejects an `open` finish status only for `phase_finished` and `pass_finished`.
+`source_event` is the creating event's `event_id`.
+It identifies the source event in the history file, including a finding's title and detail.
 
 **Checkpoints** (`scripts/usage/outcomes.py`, natedev only). `git log --all --format=%H%x00%ct%x00%s` in every repository `outcomes.repositories(...)` returns. `checkpoint_subject` parses `checkpoint(<plan-slug>): phase <id> — <title>`; the phase id is everything between `phase ` and the first ` — ` and may contain spaces. Any other `checkpoint(` subject is stored with NULL slug and phase. `checkpoint_mapping` is recomputed for every checkpoint on every pass: among `phases` whose run's `plan_doc` stem equals the slug, with the same phase id, started at or before the commit, and still `open` or finished at or after it, the latest-started one makes `mapping = 'mapped'`; otherwise `unmapped` with NULL `machine`, `run_id`, `phase_instance_id`.
 

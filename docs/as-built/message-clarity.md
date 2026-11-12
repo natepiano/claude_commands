@@ -399,7 +399,11 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
   - An `open_for_user` entry is either a reminder (a plain one-line string) or an object `{text, after?, question?}`.
   - A new object item (its `text` not already outstanding) must carry `question`. Registration refuses one without it, before any review runs.
   - Duplicate texts are handled once, at their first occurrence.
-  - The plumbing check (`dailies_render.plumbing(line) -> str | None`, the `PLUMBING` words) runs here, on each `text`, and nowhere on read (2026-10-18). A new or changed text that fails it is refused (`questions: failed — <text>: …`) and nothing is written. A stored text that fails it is named (`questions: reword — <text>: …`) and the write goes on. `read_outstanding` no longer refuses: one stored word blocked every update to hana's list.
+  - `update_registration.plumbing(line) -> str | None` checks each `text` against `PLUMBING` when registration writes it.
+    It performs no read-time check.
+    A new or changed text that fails the check prints `questions: failed — <text>: …` and prevents the write.
+    A stored text that fails the check prints `questions: reword — <text>: …` but permits the write.
+    Read-time checks were removed on 2026-10-18 because one stored word blocked every update to hana's list.
   - Each new question is reviewed once with `review.review_question(QuestionKey(name, text), question, revision=False) -> QuestionOutcome`. This uses guide tags `question,all`, no push header parsing, no length limits and no `withhold`.
   - Outcomes:
     - `QuestionAccepted(question)`: the original, or the rewrite if it passed a second check.
@@ -429,7 +433,9 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
     - "… said/wrote/asked/in its own words/own words".
 
     A user-return marker (`back to you:`, `for you:`, `to you:`, `to the user:`, `question for you:`, `your decision:`) gives the rest of the line back to the user.
-- `dailies_render.read_outstanding()` returns `OutstandingReminder` or `OutstandingQuestion`, with `DueNow` or `DeferredUntil` in place of an optional `after`. `open_items()` prints each stored full question.
+- `update_registration.read_open_items()` reads typed questions and reminders from the production question store.
+  Timing uses `DueNow` or `DeferredUntil`.
+  `open_items()` prints each stored full question.
 
 ### Nightly `messages` mode
 

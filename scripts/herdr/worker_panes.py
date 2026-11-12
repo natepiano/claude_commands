@@ -323,6 +323,13 @@ class SelectedWorkers:
     names: frozenset[str]
 
 
+@dataclass(frozen=True)
+class SelectedWorkerRows:
+    """Judge these fixed rows and retain incomplete absence evidence."""
+
+    ids: frozenset[StaffId]
+
+
 class AllWorkers(Enum):
     CURRENT = "all workers"
 
@@ -397,9 +404,11 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                      read: PaneRead | PaneReadUnavailable, *,
-                     selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
+                     selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
     workers = record.find(kind="worker", parent=parent)
-    selected = [row for row in workers if not isinstance(selection, SelectedWorkers) or row.name in selection.names]
+    selected = [row for row in workers if isinstance(selection, AllWorkers)
+                or isinstance(selection, SelectedWorkers) and row.name in selection.names
+                or isinstance(selection, SelectedWorkerRows) and row.id in selection.ids]
     if isinstance(read, PaneReadUnavailable):
         return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected], frozenset())
     panes, scan, statuses = read.panes, read.scan, read.statuses
@@ -447,7 +456,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 states.append(_uncertain(row, "labelled pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
-        elif isinstance(selection, AllWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
+        elif not isinstance(selection, SelectedWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
             states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))
@@ -487,13 +496,14 @@ def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
     return _evidence(parent, record, _client()).states
 
 
-def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot) -> dict[StaffId, list[WorkerPane]]:
-    """Join all requested parents to one pane read."""
+def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot, *,
+                    selection: SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> dict[StaffId, list[WorkerPane]]:
+    """Judge the selected workers of these parents from one pane read."""
     if not parents:
         return {}
     client = _client()
     read = _read_panes(record, client)
-    return {parent.id: _parent_evidence(parent.id, record, read).states for parent in parents}
+    return {parent.id: _parent_evidence(parent.id, record, read, selection=selection).states for parent in parents}
 
 
 def worker_state(observed: WorkerPane) -> Literal["idle", "busy", "unknown"]:

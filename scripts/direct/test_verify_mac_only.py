@@ -11,7 +11,9 @@ import sys
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
+from scripts.direct import verify_mac_offload_test_support
 from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -304,7 +306,7 @@ try_reserved_target
         self.assertEqual(self.routing_record()["target"], "")
 
     def test_mac_failure_keeps_runner_status(self) -> None:
-        result = self.verify("test", "sample", "--mac", "why", extra={
+        result = self.mac_result(extra={
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
@@ -408,12 +410,33 @@ try_reserved_target
 
     def test_missing_runner_refuses_instead_of_running_locally(self) -> None:
         self.runner.unlink()
-        result = self.verify("test", "sample", "--mac", "why")
+        result = self.mac_result(extra={})
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac runner gave no usable result", result.stderr)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "runner")
+
+    def test_fixture_reports_and_reaps_a_marked_process_that_outlives_the_test(self) -> None:
+        ready = self.runner_state / "leaked-child-ready"
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys; from pathlib import Path; Path(sys.argv[1]).touch(); signal.pause()",
+             str(ready)],
+            env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.wait_for_path(ready, (child,))
+            # Expire the leak wait while the real marked child remains alive.
+            with mock.patch.object(verify_mac_offload_test_support, "TEST_HANG_GUARD_SECS", 0):
+                with self.assertRaisesRegex(AssertionError, "processes outlived the test"):
+                    self.assert_nothing_outlives()
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(child.returncode, -signal.SIGKILL, output + errors)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

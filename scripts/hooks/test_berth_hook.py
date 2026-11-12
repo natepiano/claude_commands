@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+from dataclasses import replace
 import os
 import runpy
 import shutil
@@ -157,13 +158,16 @@ class BerthHookTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000036"
         binding = design_roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
         parent = unit_membership("demo", "design-unit")
+        parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.repo), expected=parent.worktree)
+        binding = replace(binding, checkout=design_roles.UnitCheckout(parent.id))
         thread = fixture_runtime_id("berth-designer")
-        _ = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
+        worker = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
                                   "2026-10-21T12:00:00+00:00", binding,
-                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(staff.native_id(thread))),
-                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(worker.id)),
+                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())),
+                                  checkout=design_roles.UnitCheckout(parent.id))
         self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]

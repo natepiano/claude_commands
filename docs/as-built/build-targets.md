@@ -193,7 +193,9 @@ It saves no pass because a saved pass describes this machine.
 - "Installed" means the same file (device and inode, links followed) as `<home>/.claude/scripts/<fixed path>`, where `<home>` comes from the password database, never from `HOME`. Shell uses `[[ a -ef b ]]`, Python `os.path.samefile`.
 - The line: `<file>: <NAME> is set to '<value>'; the installed scripts under <home>/.claude/scripts do not run with it. Unset it and run again.` The shell guard also refuses every script when `HOME` is read-only in the shell.
 - `override_guard.sh` is sourced, bash 3.2 syntax, builtins only. `verify.sh` and `memory_gate.sh` source it first, above any line that reads `HOME`, and call `build_override_refusal "${BASH_SOURCE[0]}" <path under scripts/> || exit 2`. Status 2 is also how a PreToolUse hook blocks its tool call, so the launch hook blocks with no code of its own.
-- `override_guard.refuse_overrides(Path(__file__), "<dir>/<file>")` is the first statement of `main` in `build_hold.py`, `build_targets.py`, `mac_test.py`, `offload.py`, `audit.py`, `dailies_input.py`, and of `build_hold_active` in `rust_release.py`. `refusal(...) -> OverridesAllowed | OverridesRefused(line)` reads no file when nothing is set.
+- `main` calls `override_guard.refuse_overrides(Path(__file__), "<dir>/<file>")` first in `build_hold.py`, `build_targets.py`, `mac_test.py`, `offload.py`, and `audit.py`.
+  `rust_release.py` calls it first in `build_hold_active`.
+  `refusal(...) -> OverridesAllowed | OverridesRefused(line)` reads no file when no override is set.
 
 ### The Mac side
 
@@ -441,7 +443,8 @@ the log does not record that connection. Journal retention also limits the evide
 - A hold nobody releases still escalates after 2 h: the waiter prints the holder and asks the agent to ask them.
 - Defaults are "go": no load threshold and no check for others' processes on any target. The claim watcher's activity check counts processes only to release an idle claim, never to turn a test away.
 - The scripts keep their arguments and exit codes: `build_hold.py hold|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
-- The guard lines stay first in `verify.sh` and `memory_gate.sh`, above every line that reads `HOME` or a listed variable. The guard runs at an entry point, never inside a function that reads a directory: `dailies_input.py` sets `BUILD_HOLD_DIR` in its own process on every run.
+- Guard lines precede every read of `HOME` or a listed variable in `verify.sh` and `memory_gate.sh`.
+  The guard runs at an entry point, never inside a directory reader.
 - The installed callers require `override_guard.sh`. Both machines need compatible installed helpers.
 - `MACOSX_DEPLOYMENT_TARGET` stays at 12.0 or above and follows the value hana's development shell exports on the Mac; `offload.py` and `mac_run.sh` carry the same value.
 - Repository imports use package names such as `scripts.build_hold.build_hold`.

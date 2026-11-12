@@ -20,7 +20,7 @@ from threading import Event
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from importlib import import_module
 
 from scripts.herdr import herdr
@@ -36,6 +36,9 @@ from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFai
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.whoami.account import named_account_environment
+
+if TYPE_CHECKING:
+    from scripts.herdr.worker_panes import AllWorkers, SelectedWorkerRows as WorkerRowSelection
 
 class StopReadArguments(TypedDict, total=False):
     """Forward shared observations only when the caller supplies them."""
@@ -62,6 +65,17 @@ def account_matches(kind: Literal["claude", "codex"], environment: dict[str, str
         accounts.accounts_home() / ".codex").expanduser().resolve() == account.home.resolve()
 
 
+class AllRestartRows(Enum):
+    CURRENT = "all staff rows"
+
+
+@dataclass(frozen=True)
+class SelectedRestartRows:
+    """Observe only the requested fixed staff rows."""
+
+    ids: frozenset[staff.StaffId]
+
+
 class WorkerRestartScope(Enum):
     FOLLOW_OWNER = "restore the owner's workers"
     SELECTED_ROWS = "restart only selected rows"
@@ -84,7 +98,9 @@ class WorkerPanes(Protocol):
     StoppedWorker: type[WorkerRow]
     ClosedWorker: type[WorkerRow]
     def observe(self, parent: staff.StaffId, record: staff.StaffSnapshot) -> list[WorkerRow]: ...
-    def observe_parents(self, parents: list[staff.StaffRow], record: staff.StaffSnapshot
+    SelectedWorkerRows: type[WorkerRowSelection]
+    def observe_parents(self, parents: list[staff.StaffRow], record: staff.StaffSnapshot, *,
+                        selection: WorkerRowSelection | AllWorkers = ...
                         ) -> dict[staff.StaffId, list[WorkerRow]]: ...
 
 
@@ -540,30 +556,39 @@ def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
 def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bool = False,
               resolver: session_staff.RowResolver | None = None,
               account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
-              observed: RestartObservations | None = None) -> list[staff.StaffRow]:
+              observed: RestartObservations | None = None,
+              selection: SelectedRestartRows | AllRestartRows = AllRestartRows.CURRENT) -> list[staff.StaffRow]:
     observed = _observations(record, client) if observed is None else observed
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
-    # The registry supplies candidate names; the reader proves each conversation.
-    try:
-        candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
-            (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
-    except (OSError, ValueError) as error:
-        print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
-        candidates = {}
     codex = observed.codex
-    for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
-        _ = candidates.setdefault(identity, identity)
-    owned = {row.current_session for row in record.rows}
-    for identity in sorted(candidates.keys() - owned):
-        if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-            print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
-                  + "restart anomaly: unassigned live session", file=sys.stderr)
-    owners = [row for row in record.rows if row.id in observed.pane_owners]
-    workers = {state.row.id: state for states in worker_panes.observe_parents(owners, record).values()
-               for state in states} if owners else {}
+    rows = [row for row in record.rows if not isinstance(selection, SelectedRestartRows) or row.id in selection.ids]
+    if isinstance(selection, AllRestartRows):
+        # The registry supplies candidate names; the reader proves each conversation.
+        try:
+            candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
+                (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
+        except (OSError, ValueError) as error:
+            print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
+            candidates = {}
+        for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
+            _ = candidates.setdefault(identity, identity)
+        owned = {row.current_session for row in record.rows}
+        for identity in sorted(candidates.keys() - owned):
+            if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
+                print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
+                      + "restart anomaly: unassigned live session", file=sys.stderr)
+        owners = [row for row in record.rows if row.id in observed.pane_owners]
+        observations = worker_panes.observe_parents(owners, record) if owners else {}
+    else:
+        parents = {parent.id for row in rows if row.kind == "worker"
+                   and (parent := record.parent_of(row)) is not None}
+        owners = [row for row in record.rows if row.id in parents]
+        observations = worker_panes.observe_parents(
+            owners, record, selection=worker_panes.SelectedWorkerRows(selection.ids)) if owners else {}
+    workers = {state.row.id: state for states in observations.values() for state in states}
     active_workers = [state.row for state in workers.values()
                       if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker))]
-    candidates_rows = [row for row in record.rows if row.id not in workers]
+    candidates_rows = [row for row in rows if row.id not in workers]
     if not isinstance(account, AllRestartAccounts):
         candidates_rows.extend(active_workers)
     selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
@@ -656,10 +681,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         observed = _observations(record, client)
         selected: list[staff.StaffRow] = []
         if stop_all:
-            selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account, observed=observed)
-            if only:
-                requested = {row.id for reference in only if (row := record.by_member_reference(reference)) is not None}
-                selected = [row for row in selected if row.id in requested]
+            selection = (SelectedRestartRows(frozenset(row.id for reference in only
+                if (row := record.by_member_reference(reference)) is not None)) if only else AllRestartRows.CURRENT)
+            selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account,
+                                 observed=observed, selection=selection)
         select_only = bool(only) and not stop_all
         pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
                        list(only) if select_only else

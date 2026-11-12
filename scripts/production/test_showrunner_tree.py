@@ -74,6 +74,8 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         _ = staff.move(child.id, staff.ReportsTo(parent.id))
         write_text_atomic(self.state / "child" / "parent", "old\n")
         record = staff.snapshot()
+        leaf = record.by_path("leaf")
+        assert leaf is not None
         expected = {"child": "new", "leaf": "child"}
         with mock.patch.object(staff, "snapshot", side_effect=AssertionError("tree reread staff")):
             self.assertEqual(showrunner_tree.edges(record=record), expected)
@@ -86,7 +88,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
             self.assertEqual(showrunner_tree.root_of("leaf", record=record), "new")
             self.assertEqual(showrunner_tree.user_facing("new", below=True, record=record), ["new", "child", "leaf"])
             self.assertEqual(showrunner_tree.edges_to_release("child", record=record),
-                             showrunner_tree.WrapRelease(showrunner_tree.ReportedTo("new"), ("leaf",), ()))
+                             showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent.id), (leaf.id,), ()))
 
     def test_tree_keeps_recorded_parent_without_a_local_timer(self) -> None:
         self.showrunner("child", running=False)

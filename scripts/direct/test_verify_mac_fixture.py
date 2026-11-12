@@ -120,6 +120,7 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                 (tree / "build_hold").mkdir(parents=True)
                 (tree / "buildlog").mkdir()
                 (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
+                (tree / "direct").symlink_to(VERIFY.parent.parent / "direct", target_is_directory=True)
                 release = tree.parent / "recorder-release"
                 completed = tree.parent / "recorder-completed"
                 self.write_executable(tree / "buildlog/record.py", f'''

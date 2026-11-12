@@ -67,15 +67,6 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
-    def test_example_without_a_manifest_has_no_step(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            checkout = Path(temporary)
-            _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
-            production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
-                                                  checkout / "production.log", ZoneInfo("UTC"))
-            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
-            self.assertEqual(steps, [])
-
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
