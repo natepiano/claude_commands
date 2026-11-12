@@ -3648,14 +3648,24 @@ def configured(words: tuple[str, ...], start: int, end: int, inner: bool) -> boo
                and attribute_name(words, begin) in {"cfg", "cfg_attr"} for begin, _ in attribute_spans(words))
 
 
-def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
-                 texts: Mapping[str, MoveText]) -> str | None:
-    """Why the crate does not compile the module's file plainly in the tree of texts, or None.
+class ModulePathConditions(Enum):
+    """The cfg attributes that a module path can contain."""
 
-    Each module on the path from the crate root needs a `mod <name>;` line in its parent's file whose attributes are
-    all inert and hold no comment, and no file below the crate root on the path may hold an inner `cfg` or
-    `cfg_attr`.
+    UNCONDITIONAL = "unconditional"
+    ALLOW_CFG = "allow_cfg"
+
+
+def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
+                 texts: Mapping[str, MoveText],
+                 conditions: ModulePathConditions = ModulePathConditions.UNCONDITIONAL) -> str | None:
+    """Return the reason that the module path is unsupported, or None.
+
+    Each parent must declare its child with a `mod <name>;` line.
+    Declaration attributes must be inert and contain no comments.
+    By default, declarations and files below the crate root must contain no `cfg` or `cfg_attr` attributes.
+    ALLOW_CFG permits outer and inner `cfg` attributes on the path.
     """
+    allowed_cfg = frozenset({"cfg"}) if conditions is ModulePathConditions.ALLOW_CFG else frozenset[str]()
     files = crate_files(sources, crate, tuple())
     files.update({path: text.scope.module for path, text in texts.items()})
     for size in range(len(module) + 1):
@@ -3666,12 +3676,11 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
             text = texts[path].text if path in texts else sources.text(path)
             spans = texts[path].spans if path in texts else token_spans(text)
             words = tuple(span.token.value for span in spans)
-            if size and configured(words, 0, len(words), inner=True):
+            if size and conditions is ModulePathConditions.UNCONDITIONAL and configured(words, 0, len(words), inner=True):
                 return f"{path}: a cfg attribute on the path to {module_path(module)}"
-            # An inner attribute such as `no_implicit_prelude` reaches the child modules. The crate root's reach A
-            # and B alike.
+            # Inner attributes reach child modules. Crate root attributes reach both source and destination modules.
             for begin, end in attribute_spans(words) if size else ():
-                name = macro_attribute(words[begin:end], INNER_ATTRIBUTES) if words[begin + 1] == "!" else None
+                name = macro_attribute(words[begin:end], INNER_ATTRIBUTES | allowed_cfg) if words[begin + 1] == "!" else None
                 if name is not None:
                     return f"{path}: the inner attribute {name} on the path to {module_path(module)}"
             if size == len(module):
@@ -3681,10 +3690,11 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
                 return f"{path}: cannot read its items"
             for item in items:
                 if item.kind == "mod" and item.name == module[size] and words[item.end - 1] == ";":
-                    if configured(words, item.start, item.keyword, inner=False):
+                    if (conditions is ModulePathConditions.UNCONDITIONAL
+                            and configured(words, item.start, item.keyword, inner=False)):
                         return f"{path}: a cfg attribute on the path to {module_path(module)}"
                     for begin, end in attribute_spans(words[item.start:item.keyword]):
-                        name = macro_attribute(words[item.start + begin:item.start + end])
+                        name = macro_attribute(words[item.start + begin:item.start + end], INERT_ATTRIBUTES | allowed_cfg)
                         if name is not None:
                             return f"{path}: the attribute {name} on the path to {module_path(module)}"
                         if attribute_comment(text, spans, item.start + begin, item.start + end):

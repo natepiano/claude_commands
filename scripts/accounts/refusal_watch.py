@@ -1366,7 +1366,7 @@ def main(argv: list[str] | None = None, *, account_config: conf.ConfigRead | acc
         for probe in [name, *(args.proof_group or [])]:
             matching = [session for session in owners if session["session_id"] == probe
                         or (member.name if (member := record.by_current_session(session["session_id"]))
-                            is not None else session["name"]) == probe]
+                            is not None else "") == probe]
             if len(matching) != 1:
                 parser.error("name or id must identify one local live owner")
             selected[matching[0]["session_id"]] = matching[0]

@@ -155,9 +155,16 @@ class RegistrationTests(RegistrationFixture):
                               encoding="utf-8")
         result = self.run_command("register")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("register: warn", result.stdout)
-        self.assertIn("production example has showrunner other", result.stdout)
-        self.assertIn("/agents rename example other", result.stdout)
+        self.assertNotIn("register: warn", result.stdout)
+        self.assertNotIn("production example has showrunner other", result.stdout)
+        self.assertNotIn("/agents rename example other", result.stdout)
+        with mock.patch.dict(os.environ, self.env):
+            _ = staff.rename(staff.StaffId(self.owner_id), "renamed-example")
+        renamed = self.run_command("register")
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertNotIn("register: warn", renamed.stdout)
+        updates = [call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.owner_id}"]]
+        self.assertEqual([call[call.index("--to") + 1] for call in updates], [f"session:{self.owner_id}"] * 2)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
 

@@ -101,13 +101,16 @@ def _joined(production_name: str, every: unit_lookup.LabeledProductions) -> list
             for unit in every.members.get(production_name, ())]
 
 
-def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
-    """The session names, as they are now, of the showrunner's units that have a live Claude.
+def live_unit_ids(runner: showrunners.Showrunner) -> list[str]:
+    """The staff ids of the showrunner's units that have a live Claude, read through one staff snapshot.
 
     A herdr that cannot say which sessions exist leaves the list empty and says why.
     """
+    record = staff.snapshot()
     try:
-        return [unit.name for unit in units_of(runner["name"]) if unit.name]
+        return [str(member.id) for unit in units_of(runner["name"])
+                if unit.session is not None and isinstance(unit.session.claude, unit_lookup.LiveClaude)
+                and (member := record.by_current_session(unit.session.claude.session_id)) is not None]
     except OSError as error:
         print(f"live_units: the units of {runner['name']} could not be listed: {error}", file=sys.stderr)
         return []

@@ -102,10 +102,10 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     return largest
 
 
-def spot_quota(api: AwsCli) -> Decimal:
-    """Read the regional Standard Spot vCPU quota."""
+def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
+    """Read the regional Spot vCPU quota for the supplied code."""
     reply = api.call('get-service-quota', '--service-code', 'ec2',
-                     '--quota-code', 'L-34B43A08', service='service-quotas')
+                     '--quota-code', code, service='service-quotas')
     return conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
 
 
@@ -1249,6 +1249,13 @@ class Deployment:
         for region in gate_regions(settings.region):
             target = api.in_region(region)
             self._print_spot_quota(target, largest)
+            try:
+                quota = spot_quota(target, 'L-3819A6DF')
+                print(f'{region}: G and VT Spot quota {quota.normalize():f} vCPUs')
+            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                reason = code[1] if code else type(error).__name__
+                print(f'{region}: G and VT Spot quota unknown: {reason}')
             zones = [ledger.text(row, 'ZoneName') for row in ledger.rows(target.call('describe-availability-zones',
                 '--filters', 'Name=state,Values=available'), 'AvailabilityZones')]
             rows = ledger.rows(target.call('describe-spot-price-history', '--instance-types', *sizes,

@@ -46,7 +46,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -345,6 +345,20 @@ class TranscriptUnreadable:
     """A matching transcript file could not be read; absence of a turn is unproven."""
 
 
+def complete_transcript_offset(stream: BinaryIO) -> int:
+    """Find the byte after the last complete transcript record."""
+    position = stream.seek(0, os.SEEK_END)
+    while position:
+        start = max(0, position - 4096)
+        _ = stream.seek(start)
+        chunk = stream.read(position - start)
+        newline = chunk.rfind(b"\n")
+        if newline >= 0:
+            return start + newline + 1
+        position = start
+    return 0
+
+
 @dataclass
 class TranscriptCursor:
     """The complete new turns seen by one submission, with per-file byte positions."""
@@ -353,6 +367,7 @@ class TranscriptCursor:
     since: datetime
     offsets: dict[Path, int] = field(default_factory=dict)
     sizes: dict[Path, int] = field(default_factory=dict)
+    current_paths: tuple[Path, ...] = field(default=(), init=False)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
 
@@ -365,24 +380,14 @@ class TranscriptCursor:
             for path in paths:
                 with path.open("rb") as stream:
                     size = stream.seek(0, os.SEEK_END)
-                    position = size
-                    offset = 0
-                    while position:
-                        start = max(0, position - 4096)
-                        _ = stream.seek(start)
-                        chunk = stream.read(position - start)
-                        newline = chunk.rfind(b"\n")
-                        if newline >= 0:
-                            offset = start + newline + 1
-                            break
-                        position = start
-                    self.offsets[path] = offset
+                    self.offsets[path] = complete_transcript_offset(stream)
                     self.sizes[path] = size
         except OSError:
             self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
+        self.current_paths = ()
         # A session id is a file component, never a glob supplied by a caller.
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
             return []
@@ -391,6 +396,7 @@ class TranscriptCursor:
         except OSError:
             self.readability = TranscriptUnreadable()
             paths = ()
+        self.current_paths = paths
         for path in paths:
             try:
                 with path.open("rb") as stream:
