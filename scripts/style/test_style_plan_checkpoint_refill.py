@@ -55,8 +55,8 @@ class StylePlanTests(StylePlanFixture):
                     ticket = proposal_ledger.ticket_get(ticket_id)
                     prompt = style_plan.phase_text(
                         ticket, proposal_ledger.pinned_rule_texts(ticket_id), case.plan, case.plan_header())
-                need = ("First record any reserved, unmerged or dirty file the change needs outside this ticket with "
-                        + f"`style_ledger.py ticket need --repo . --id {ticket_id} --finding <finding id> --path <file>`.")
+                need = ("Record each reserved, unmerged or dirty file that the finding needs outside this ticket. Use "
+                        + "`style_ledger.py held need --repo . --finding <finding id> --path <file>`.")
                 yielded = ("When a finding's file, or a file its change edits, is reserved, unmerged or dirty, "
                            + "yield the finding's file with "
                            + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: "

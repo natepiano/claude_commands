@@ -3194,16 +3194,12 @@ class Ledger:
         ).fetchall())
         return tuple(path for path, in rows)
 
-    @_ticket_operation("need")
-    def ticket_need(self, id: str, finding_id: str, path: str) -> None:
-        """Record an edit path for a finding that the ticket holds."""
+    def finding_need(self, finding_id: str, path: str) -> None:
+        """Record an edit path for any finding in the ledger."""
         path = self._path(path)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            ticket = self._ticket(id)
-            if (finding_id not in ticket["finding_ids"]
-                    or self._held(finding_id).build_ticket != BuildTicket(id)):
-                raise LedgerError(f"{id}: the ticket does not hold finding {finding_id}")
+            _ = self._held(finding_id)
             _ = self._connection.execute(
                 "INSERT OR IGNORE INTO finding_needs VALUES (?,?,?)", (finding_id, path, _now()),
             )
@@ -8102,10 +8098,10 @@ def main() -> None:
     for command in (record, correction, candidate, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "need", "refuse")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
+        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -8135,9 +8131,6 @@ def main() -> None:
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
                     _ = command.add_argument("--path", required=True)
-                elif action == "need":
-                    _ = command.add_argument("--finding", dest="finding_id", required=True)
-                    _ = command.add_argument("--path", required=True)
                 elif action == "refuse":
                     _ = command.add_argument("--finding", action="append", required=True)
                     _ = command.add_argument("--by", required=True)
@@ -8158,6 +8151,9 @@ def main() -> None:
                 _ = command.add_argument("--after", required=True, help=FINDING_REPLACEMENT_GUIDANCE)
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
+            elif action == "need":
+                _ = command.add_argument("--finding", dest="finding_id", required=True)
+                _ = command.add_argument("--path", required=True)
             elif action == "list":
                 _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built", "withdrawn"), default=None)
                 _ = command.add_argument("--json", action="store_true")
@@ -8259,8 +8255,6 @@ def main() -> None:
                 elif args.action == "yield":
                     for finding_id in ledger.ticket_yield(args.id, args.path):
                         print(f"yielded {finding_id}: it stays filed for a later ticket")
-                elif args.action == "need":
-                    ledger.ticket_need(args.id, args.finding_id, args.path)
                 elif args.action == "refuse":
                     _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
                     print(f"{args.id}: named findings refused; remaining findings kept")
@@ -8309,6 +8303,8 @@ def main() -> None:
                             if isinstance(check, RenameNotApplied):
                                 print(f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all "
                                       + f"(issue {finding.state.proposal})", file=sys.stderr)
+                elif args.action == "need":
+                    ledger.finding_need(args.finding_id, args.path)
                 elif args.action == "replace":
                     person: WaiveUndo = WaiveUndoneBy(args.person.strip()) if args.person is not None else NoWaiveUndo()
                     print(ledger.replace_held(args.id, args.after, person).finding_id)
