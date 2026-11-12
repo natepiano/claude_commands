@@ -44,6 +44,27 @@ EXACT_RUNTIME_ID = staff.runtime_id
 NATIVE_SESSION_READER = herdr.Herdr.native_session
 
 
+def fixture_launch_transcript(root: Path, entry: pane_launch.PaneLaunch, record: staff.StaffSnapshot) -> None:
+    """Give a stopped fixture session its private transcript source."""
+    reference = pane_launch.launch_reference(entry, record)
+    identity = (str(record.rows_by_id[reference.id].current_session)
+                if isinstance(reference, pane_launch.StaffLaunchReference) else reference.session)
+    kind = entry.get("kind", "claude")
+    home = Path(entry.get("config_dir") or root / (".codex2" if kind == "codex" else ".claude3"))
+    if not home.is_relative_to(root):
+        home = root / (".codex2" if kind == "codex" else ".claude3")
+    for opposite in root.glob((".claude*" if kind == "codex" else ".codex*") + "/**/*" + identity + ".jsonl"):
+        opposite.unlink()
+    target = (home / "sessions" / f"rollout-{identity}.jsonl" if kind == "codex" else
+              home / "projects/fixture" / f"{identity}.jsonl")
+    process = root / "proc/123/cmdline"
+    if process.exists() and Path(process.read_text().split("\0")[0]).name != kind:
+        write_text_atomic(process, "\0".join([kind, "resume" if kind == "codex" else "--resume", identity]) + "\0")
+    if not target.exists():
+        write_text_atomic(target, json.dumps({"type": "session_meta", "payload": {"id": identity, "cwd": entry["cwd"]}}) + "\n"
+            if kind == "codex" else "")
+
+
 @contextmanager
 def mac_process_commands(root: Path, responses: Mapping[str, object]) -> Generator[None]:
     """Read private Mac process replies through the existing command fake."""
@@ -289,7 +310,9 @@ class PaneRestoreTests(unittest.TestCase):
         launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha", environment,
                                     ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "opus"], kind=kind)
         pane_record.save("agents", {})
-        pane_record.write("agents", cast(pane_record.PaneLaunch, cast(object, {**launch, **changes})))
+        entry = cast(pane_record.PaneLaunch, cast(object, {**launch, **changes}))
+        fixture_launch_transcript(self.root, entry, staff.StaffSnapshot((self.row,)))
+        pane_record.write("agents", entry)
 
     def run_restore(self, client: FakeClient) -> tuple[int, str]:
         output = io.StringIO()
@@ -604,6 +627,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         missing = fixture_runtime_id("missing-row")
         directory = self.root / "saved-panes"
         config = self.root / ".claude3"
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}))
         (config / "projects/work").mkdir(parents=True)
         entries: dict[str, pane_record.PaneLaunch] = {}
         rows: list[dict[str, object]] = []
@@ -758,7 +782,7 @@ class RestoreStaffNamesTests(StaffTestCase):
                 replacement["session_id"] = owner.id
             entries = pane_record.read("agents")
             entries[pane] = replacement
-            pane_record.save("agents", entries)
+            pane_record.save("agents", entries, record=record)
             return herdr.PromptSubmissionNotRequired()
 
         def native(pane: str, kind: str, timeout: float) -> str:
@@ -1025,10 +1049,11 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         backend, _transcript = self.moved_codex()
         save = pane_launch.save
 
-        def refuse_retirement(path: Path, entries: dict[str, pane_record.PaneLaunch]) -> None:
+        def refuse_retirement(path: Path, entries: dict[str, pane_record.PaneLaunch], *,
+                              record: staff.StaffSnapshot | pane_launch.StaffSnapshotRead = pane_launch.StaffSnapshotRead.CURRENT) -> None:
             if "w1:p1" not in entries:
                 raise OSError("forced retirement write failure")
-            save(path, entries)
+            save(path, entries, record=record)
 
         with self.codex_restore(backend) as (client, _proof):
             with (mock.patch.object(pane_launch, "save", side_effect=refuse_retirement),
@@ -1067,6 +1092,11 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         from scripts.agents import stop_resume
 
         backend = self.folder_backend("claude", live=False)
+        fixture_launch_transcript(self.root, {"session_id": self.owner.current_session,
+            "pane_id": "w1:p1", "kind": "claude", "cwd": str(self.old_folder), "name": self.owner.name,
+            "config_dir": str(backend.config), "model": "", "remote_control": False, "environment": {},
+            "flags_read": True, "written_at": "fixture"}, staff.StaffSnapshot((self.owner,)))
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(backend.config)}))
         original = pane_record.read("agents")["w1:p1"]
         original["ended"] = False
         pane_record.write("agents", original)
@@ -1105,6 +1135,10 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
     def moved_codex(self) -> tuple[FolderMoveBackend, Path]:
         backend = self.folder_backend("codex", live=True)
+        fixture_launch_transcript(self.root, {"session_id": self.owner.current_session,
+            "pane_id": "w1:p1", "kind": "codex", "cwd": str(self.old_folder), "name": self.owner.name,
+            "config_dir": str(backend.config), "model": "", "remote_control": False, "environment": {},
+            "flags_read": True, "written_at": "fixture"}, staff.StaffSnapshot((self.owner,)))
         entry = pane_record.launch("w1:p1", self.owner.current_session, str(self.old_folder),
             {"CODEX_HOME": str(backend.config)}, ["codex", "--model", "fixture-model"], kind="codex")
         entry["name"] = "kept-name"
@@ -1119,7 +1153,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         backend.live = False
         backend.publish_process_state()
         transcript = backend.config / "sessions/2026/11/02" / f"rollout-{self.owner.current_session}.jsonl"
-        transcript.parent.mkdir(parents=True)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text(json.dumps({"type": "session_meta", "payload": {
             "id": self.owner.current_session, "cwd": str(self.old_folder)}}) + "\n")
         retained = pane_record.read("agents")["w1:p1"]
@@ -1265,7 +1299,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         entry["cwd"] = str(self.old_folder)
         pane_record.write("agents", entry)
         transcript = backend.config / "projects/work" / f"{self.owner.current_session}.jsonl"
-        transcript.parent.mkdir(parents=True)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text("{}\n")
         before = pane_record.read("agents")
         for publish in (False, True):

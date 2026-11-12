@@ -171,25 +171,15 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
         except (OSError, ValueError, herdr_types.HerdrFailure):
             pass
         conflicts.append((identity, pane["pane_id"]))
-    named: list[tuple[str, tuple[int, ...]]] = [
-        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions() if row["name"] == name]
-    homes = {agent_accounts.codex_home(), *(owner.home for owner in codex_daemon.daemons(os.environ))}
-    threads: set[str] = set()
-    for home in sorted(homes):
-        try:
-            lines = (home / "session_index.jsonl").read_text().splitlines()
-        except FileNotFoundError:
-            continue
-        for line in lines:
-            if not line.strip():
-                continue
-            entry = herdr.json_object(cast(object, json.loads(line)), "producer thread index")
-            if entry.get("thread_name") == name:
-                threads.add(herdr.json_text(entry.get("id"), "producer thread id"))
-    if threads:
-        codex = herdr.codex_conversations()
-        named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
     membership = staff.initial_snapshot()
+    member = next((row for row in membership.find(kind="producer") if row.name == name), None)
+    named: list[tuple[str, tuple[int, ...]]] = [
+        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions()
+        if member is not None and row["sessionId"] == member.current_session]
+    if member is not None:
+        codex = herdr.codex_conversations()
+        if member.current_session in codex.live:
+            named.append((member.current_session, codex.live[member.current_session]))
     for daemon in codex_daemon.read_daemons(os.environ):
         if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
             raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")
@@ -306,8 +296,8 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
             worktree=staff.PresentWorktree(remote.local_machine(), folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
         if entry["pane_id"]:
-            expectation = pane_launch.ProducerStartExpectation(row.id, native, kind, folder, home.path)
-            with pane_launch.producer_start(pane_record.record_directory(), expectation):
+            expectation = pane_launch.ProducerLaunchRequest(row.id, native, kind, folder, home.path)
+            with pane_launch.producer_launch_request(expectation):
                 row = pane_launch.staff_admitted(row)
             client.remember_row_tab(str(row.id), entry["pane_id"])
         else:
@@ -424,8 +414,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
         row = staff.ensure("producer", name=request.name, runtime_id=identity,
             worktree=staff.PresentWorktree(remote.local_machine(), request.folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
-        expectation = pane_launch.ProducerStartExpectation(row.id, identity, kind, request.folder, pending.home)
-        with pane_launch.producer_start(pane_record.record_directory(), expectation):
+        expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
+        with pane_launch.producer_launch_request(expectation):
             row = pane_launch.staff_admitted(row)
         publication = pane_record.read_strict(client.session).get(pending.pane)
         if publication is None or not publication.get("producer_binding", False):
@@ -471,7 +461,8 @@ def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_N
     for pane in client.panes():
         identity = pane["session_id"]
         entry = entries.get(pane["pane_id"])
-        owner = membership.by_member_reference(entry["session_id"]) if entry is not None else None
+        reference = pane_launch.launch_reference(entry, membership) if entry is not None else pane_launch.NativeLaunchReference("")
+        owner = membership.rows_by_id[reference.id] if isinstance(reference, pane_launch.StaffLaunchReference) else None
         saved_identity = owner.current_session if owner is not None else entry["session_id"] if entry is not None else ""
         label = pane.get("label") or ""
         producer = owner or membership.by_current_session(identity or "")
@@ -835,7 +826,7 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> t
 
 def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
     """Use the selected launch environment, retained home, or normal account."""
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     directory = entry["environment"].get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR", "")
     home = staff.SessionHome(Path(directory)) if directory else pane_launch.config_home(entry)
     if isinstance(home, staff.HomeUnknown):
@@ -848,7 +839,7 @@ def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
 def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     if kind == "claude":
         home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
         herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
@@ -869,7 +860,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
 
     from scripts.lib.agent_program import resolve_program
 
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
     unset, pane_environment = _pane_environment(tab, entry)
     environment.update(pane_environment)
@@ -1186,7 +1177,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = recovered
         if entry is not None:
             entry = names.resume(entry)
-        kind = pane_launch.agent_kind(entry) if entry is not None else "claude"
+        kind = pane_launch.saved_kind(entry) if entry is not None else (
+            pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
             kind = restart.producer_launch(row)[0]
@@ -1229,6 +1221,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
+        if row is not None and row.kind == "producer":
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            entry["environment"] = expectation.environment(entry["environment"])
         if row is None:
             entry["config_dir"] = str(target_dir)
             previous_home = pane_launch.config_home(original.entry, record=names.tab_record) if original is not None else staff.HomeUnknown()
@@ -1291,8 +1286,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
-            expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
-            start_scope.enter_context(pane_launch.producer_start(pane_record.record_directory(), expectation))
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            start_scope.enter_context(pane_launch.producer_launch_request(expectation))
             completed = expectation.expected_launch(entry)
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             if row is None:
@@ -1644,7 +1639,8 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             row = membership.by_member_reference(session) or next((row for row in membership.rows if row.name == session), None)
             identity = row.current_session if row is not None else session
             publication = pane_record.publication_for_session(identity, record=membership)
-            kind = pane_launch.agent_kind(publication.entry) if publication is not None else "claude"
+            kind = pane_launch.agent_kind(publication.entry, record=membership) if publication is not None else (
+                pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
             if row is not None and row.kind == "producer":
                 restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
                 kind = restart.producer_launch(row)[0]

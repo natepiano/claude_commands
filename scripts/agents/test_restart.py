@@ -39,8 +39,8 @@ from scripts.accounts import accounts
 from scripts.whoami import agent_accounts, note_file
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
-from scripts.agents import shutdown_record, stop_resume, pane_record
-from scripts.lib import file_lock, unit_runs
+from scripts.agents import member_account, shutdown_record, stop_resume, pane_record
+from scripts.lib import conf, file_lock, unit_runs, resume_message
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.atomic_file import write_text_atomic
@@ -57,10 +57,25 @@ HERDR_RESULT = herdr.Herdr.result
 READ_PANES = herdr.Herdr.panes
 
 
+READ_CONFIG = conf.read
+
+
+def short_resume_check_config(file: str | Path) -> conf.ConfigRead:
+    """Keep the restart check short while using the configuration reader."""
+    settings = READ_CONFIG(file)
+    if file == "shutdown" and isinstance(settings.settings, dict):
+        values = dict(settings.settings)
+        for key in ("RESUME_CHECK_SECONDS", "RESUME_CHECK_INTERVAL_SECONDS"):
+            values[key] = conf.Setting("0.001", "# range: 0..3600", 0)
+        return replace(settings, settings=values)
+    return settings
+
+
 class RestartTestCase(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(conf, "read", side_effect=short_resume_check_config))
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (home / "proc").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -606,7 +621,8 @@ class MixedRestartTests(ShutdownTestCase):
             self.run_commands(("stop",), frozenset())
 
     def run_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
-        with patch.object(herdr, "_PLATFORM", "linux"), patch.object(sys, "platform", "linux"):
+        with (patch.object(herdr, "_PLATFORM", "linux"), patch.object(sys, "platform", "linux"),
+              patch.object(conf, "read", side_effect=short_resume_check_config)):
             self.linux_commands(commands, surviving)
 
     def linux_commands(self, commands: tuple[str, ...], surviving: frozenset[int]) -> None:
@@ -1072,7 +1088,12 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
-            worktree=staff.PresentWorktree(remote.local_machine(), self.root)) for n in range(3))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root),
+            home=staff.SessionHome(config)) for n in range(3))
+        from scripts.production.staff_test_support import fixture_session
+
+        for row in self.rows:
+            fixture_session(str(row.current_session), staff.ClaudeBackend())
         self.running = {str(row.current_session) for row in self.rows}
         self.launches = []
         self.stops = []
@@ -1095,6 +1116,19 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "save_layout"))
         _ = self.enterContext(patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(patch.object(herdr.Herdr, "tab_sessions", return_value=[]))
+        from scripts.agents.test_pane_restore import fixture_launch_transcript
+
+        saved_records = pane_record.save
+        def save(session: str, entries: dict[str, pane_record.PaneLaunch]) -> None:
+            for entry in entries.values():
+                fixture_launch_transcript(self.root, entry, staff.StaffSnapshot(self.rows))
+            saved_records(session, entries)
+        _ = self.enterContext(patch.object(pane_record, "save", side_effect=save))
+        publish_record = pane_record.write
+        def write(session: str, entry: pane_record.PaneLaunch) -> None:
+            fixture_launch_transcript(self.root, entry, staff.StaffSnapshot(self.rows))
+            publish_record(session, entry)
+        _ = self.enterContext(patch.object(pane_record, "write", side_effect=write))
         _ = self.enterContext(patch.object(herdr.Herdr, "result", side_effect=self.layout_result))
         _ = self.enterContext(patch.object(herdr.Herdr, "panes", side_effect=self.panes))
         _ = self.enterContext(patch.object(herdr.Herdr, "native_session", side_effect=self.native))
@@ -1688,6 +1722,7 @@ class RestartTests(RestartTestCase):
                       patch.object(sessions, "process_liveness", side_effect=process),
                       patch.object(stop_resume, "_signal_process", side_effect=signal_process),
                       patch.object(time, "monotonic", side_effect=now),
+                      patch.object(time, "sleep", side_effect=advance),
                       patch.object(stop_resume, "monotonic", side_effect=now),
                       patch.object(stop_resume, "Event", return_value=ClockEvent()),
                       patch.object(pane_record, "seed", return_value=0),
@@ -1731,6 +1766,8 @@ class RestartTests(RestartTestCase):
                     entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
                         {"CODEX_HOME": str(self.root / ".codex2")}, ["codex", "--model", "old-model", "--sandbox", "read-only",
                          "-c", 'model_reasoning_effort="low"', "-c", 'service_tier="flex"'], kind="codex")
+                    from scripts.agents.test_pane_restore import fixture_launch_transcript
+                    fixture_launch_transcript(self.root, entry, staff.StaffSnapshot((row,)))
                     publication = pane_launch.LaunchPublication(self.root / "agents.json", entry) if saved else None
                     with (self.subTest(kind=row.kind, saved=saved, target=requested),
                           patch.object(pane_record, "publication_for_session", return_value=publication),
@@ -1849,6 +1886,7 @@ class RestartTests(RestartTestCase):
             self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
 
     def test_saved_codex_record_uses_workers_home_without_claude_trust(self) -> None:
+        self.running.clear()
         row = self.rows[0]
         home = self.root / ".codex2"
         workers = self.root / ".codex1"
@@ -1869,6 +1907,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(workers))
 
     def test_saved_codex_restart_uses_explicit_account(self) -> None:
+        self.running.clear()
         row = self.rows[0]
         home = self.root / ".codex2"
         target = self.root / ".codex3"
@@ -2004,8 +2043,9 @@ class RestartTests(RestartTestCase):
                   target_account: str | accounts.AccountSelection,
                   worker_scope: restart.WorkerRestartScope,
                   observed: restart.RestartObservations,
-                  opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt) -> None:
-            _ = present, resolver, target_account, worker_scope, observed, opening
+                  opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                  resume_checks: restart.DirectorResumeChecks) -> None:
+            _ = present, resolver, target_account, worker_scope, observed, opening, resume_checks
             shutdown_record.update(started=[], pending=[other])
 
         shutdown_record.save([str(self.rows[0].id), str(self.rows[1].id)])
@@ -2142,6 +2182,7 @@ class RestartTests(RestartTestCase):
                 directory.mkdir(exist_ok=True)
                 original = pane_record.launch("old", producer.id, str(self.root),
                                               {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2")}, ["claude"])
+                original["staff_id"] = producer.id
                 cross = scenario in ("cross session", "source unavailable")
                 source_path = directory / ("legacy.json" if cross else "agents.json")
                 pane_launch.save(source_path, {"old": original})
@@ -2341,6 +2382,126 @@ class RestartTests(RestartTestCase):
                     self.assertEqual(errors.getvalue(),
                         "renamed: restart anomaly: continuation message was not sent: fixture prompt failed\n")
 
+        class TranscriptAfterRestart(Enum):
+            ASSISTANT = "assistant"
+            MESSAGE = "message"
+            MISSING = "missing"
+            HELD_AND_WORKER = "held-and-worker"
+            UNREADABLE = "unreadable"
+            PARTIAL_TAIL = "partial-tail"
+            PARTIAL_AT_LAUNCH = "partial-at-launch"
+            REMOVED = "removed"
+            TORN_LINE = "torn-line"
+
+        checks: tuple[tuple[Literal["claude", "codex"], TranscriptAfterRestart, str, int], ...] = (
+            ("claude", TranscriptAfterRestart.ASSISTANT, "", 1),
+            ("claude", TranscriptAfterRestart.MESSAGE, "no work after the continuation message", 0),
+            ("claude", TranscriptAfterRestart.MISSING, "no continuation message", 0),
+            ("codex", TranscriptAfterRestart.ASSISTANT, "", 1),
+            ("codex", TranscriptAfterRestart.MISSING, "no continuation message", 0),
+            ("claude", TranscriptAfterRestart.HELD_AND_WORKER, "", 1),
+            ("claude", TranscriptAfterRestart.UNREADABLE, "transcript unreadable", 0),
+            ("codex", TranscriptAfterRestart.PARTIAL_TAIL, "no work after the continuation message", 0),
+            ("codex", TranscriptAfterRestart.PARTIAL_AT_LAUNCH, "", 1),
+            ("claude", TranscriptAfterRestart.REMOVED, "transcript unreadable", 0),
+            ("codex", TranscriptAfterRestart.TORN_LINE, "transcript unreadable", 0),
+        )
+        for family, transcript_case, failure, passed in checks:
+            with self.subTest(family=family, transcript_case=transcript_case):
+                row = replace(self.rows[0], name="TEST-director", kind="unit",
+                              paused=staff.Active(), exited=staff.Active())
+                held = replace(self.rows[1], name="TEST-held", kind="showrunner",
+                               paused=staff.Paused("2026-11-11", "user", "review"))
+                child = replace(self.rows[2], name="TEST-worker", kind="worker",
+                                parent=staff.ReportsTo(row.id))
+                self.rows = (row, held, child)
+                record = staff.StaffSnapshot(self.rows)
+                home = self.root / (family + "-" + transcript_case.value)
+                native_id = str(row.current_session) + ("-launched" if family == "claude" else "")
+                source = (home / "projects/fixture" / (native_id + ".jsonl")
+                          if family == "claude" else
+                          home / "sessions/rollout-" / (str(row.current_session) + ".jsonl"))
+                message = resume_message.resume_message("agents restart ran")
+                historical = [
+                    {"timestamp": "2020-01-01T00:00:00+00:00", "type": "user" if family == "claude" else "response_item",
+                     "message" if family == "claude" else "payload": {"role": "user", "content": message}},
+                    {"timestamp": "2020-01-01T00:00:01+00:00", "type": "assistant" if family == "claude" else "response_item",
+                     "message" if family == "claude" else "payload": {"role": "assistant", "content": "Old work"}},
+                ]
+                write_text_atomic(source, "".join(json.dumps(item) + "\n" for item in historical))
+                if transcript_case is TranscriptAfterRestart.PARTIAL_AT_LAUNCH:
+                    write_text_atomic(source, source.read_text() + '{"type":')
+                self.running.clear()
+                requested = self.rows if transcript_case is TranscriptAfterRestart.HELD_AND_WORKER else (row,)
+                shutdown_record.save([str(item.id) for item in requested])
+                account = (accounts.NamedAccount("claude2", home) if family == "claude" else
+                           accounts.CodexWorkersAccount("codex1", home))
+
+                now = [0.0]
+                intervals: list[float] = []
+
+                def advance(seconds: float) -> None:
+                    now[0] += seconds
+                    intervals.append(seconds)
+                    if transcript_case is TranscriptAfterRestart.REMOVED:
+                        source.unlink()
+                    if family == "claude" and transcript_case is TranscriptAfterRestart.ASSISTANT:
+                        work = {"timestamp": datetime.now(timezone.utc).isoformat(), "type": "assistant",
+                                "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "fixture"}]}}
+                        write_text_atomic(source, source.read_text() + json.dumps(work) + "\n")
+
+                def launched(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                             prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                             opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *,
+                             agent: str, reported_unknown: str = "",
+                             codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT
+                             ) -> herdr.AgentLaunched:
+                    del session, destination, prepared, kind, arguments, timeout, agent, reported_unknown, codex
+                    if isinstance(opening, herdr.OpeningPrompt):
+                        _ = opening.before_prompt(herdr.SessionTranscript(home, native_id))
+                    message = (opening.text if isinstance(opening, herdr.OpeningPrompt) else
+                               resume_message.resume_message("agents restart ran"))
+                    if transcript_case is TranscriptAfterRestart.UNREADABLE:
+                        source.unlink()
+                        source.mkdir()
+                        return herdr.AgentLaunched("w1:p0", herdr.PromptSubmissionNotRequired())
+                    rows: list[dict[str, object]] = []
+                    for role in (("user",) if family == "claude" and transcript_case is TranscriptAfterRestart.ASSISTANT else
+                                 ("user", "assistant") if transcript_case in (TranscriptAfterRestart.ASSISTANT, TranscriptAfterRestart.HELD_AND_WORKER, TranscriptAfterRestart.PARTIAL_AT_LAUNCH)
+                                 else ("user",) if transcript_case in (TranscriptAfterRestart.MESSAGE, TranscriptAfterRestart.PARTIAL_TAIL,
+                                                                     TranscriptAfterRestart.REMOVED, TranscriptAfterRestart.TORN_LINE)
+                                 else ("assistant",)):
+                        payload: dict[str, object] = {"role": role, "content": message if role == "user" else "Resumed work"}
+                        rows.append({"timestamp": datetime.now(timezone.utc).isoformat(),
+                                     "type": role if family == "claude" else "response_item",
+                                     "message" if family == "claude" else "payload": payload})
+                    previous = source.read_text()
+                    if transcript_case is TranscriptAfterRestart.PARTIAL_AT_LAUNCH:
+                        previous += '"event_msg", "timestamp": "2020-01-01T00:00:00+00:00"}\n'
+                    tail = ('{"type":' if transcript_case is TranscriptAfterRestart.PARTIAL_TAIL else
+                            '{"type":\n' if transcript_case is TranscriptAfterRestart.TORN_LINE else "")
+                    write_text_atomic(source, previous + "".join(json.dumps(item) + "\n" for item in rows) + tail)
+                    return herdr.AgentLaunched("w1:p0", herdr.PromptSubmissionNotRequired())
+
+                staff_before = Path(os.environ["STAFF_FILE"]).read_bytes()
+                with (patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(restart, "session_launch", return_value=(family, {},
+                          ["--resume" if family == "claude" else "resume", str(row.current_session)])),
+                      patch.object(member_account, "resume_account", return_value=account),
+                      patch.object(restart, "_restore_workers", return_value=""),
+                      patch.object(herdr, "launch_prepared_agent", side_effect=launched),
+                      patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                      patch.object(time, "sleep", side_effect=advance),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(restart.restart(only=tuple(str(item.id) for item in requested)), 0)
+                lines = [line for line in output.getvalue().splitlines() if "restart check:" in line]
+                self.assertEqual(lines, ([f"{row.name}: restart check: {failure}"] if failure else []) +
+                                 [f"restart check: {passed} of 1 directors resumed"])
+                self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), staff_before)
+                self.assertEqual(len(intervals), int(bool(failure) or (
+                    family == "claude" and transcript_case is TranscriptAfterRestart.ASSISTANT)))
+                self.assertEqual(shutdown_record.read(), [str(held.id)] if transcript_case is TranscriptAfterRestart.HELD_AND_WORKER else [])
+
     def test_restart_failure_keeps_only_the_failed_fixed_reference(self) -> None:
         identities = [str(row.id) for row in self.rows]
         shutdown_record.save(identities)
@@ -2482,7 +2643,8 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED,
+                      current_session=staff.StaffId(str(uuid5(NAMESPACE_URL, "codex-resume-without-rollout"))))
         self.rows = (row,)
         self.running.clear()
         pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",
@@ -2579,6 +2741,9 @@ class RestartTests(RestartTestCase):
         self.assertEqual(shutdown_record.read(), [str(self.rows[0].id)])
 
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:
+        for row in self.rows:
+            assert isinstance(row.home, staff.SessionHome)
+            (row.home.path / "projects/fixture" / f"{row.current_session}.jsonl").unlink()
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):
                 records = self.records_for(self.running | {"orphan"})
@@ -2607,6 +2772,8 @@ class RestartTests(RestartTestCase):
                 if dry_run:
                     self.assertEqual(output.getvalue().splitlines(), expected)
                 else:
+                    expected.extend(f"{row.name}: restart check: transcript unreadable" for row in self.rows)
+                    expected.append(f"restart check: 0 of {len(self.rows)} directors resumed")
                     self.assertCountEqual(output.getvalue().splitlines(), expected)
                 self.assertCountEqual(self.stops, [] if dry_run else [str(row.id) for row in self.rows])
                 self.assertCountEqual([name for name, _place in self.launches], [] if dry_run else [row.name for row in self.rows])

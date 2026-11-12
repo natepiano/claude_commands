@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -116,6 +117,13 @@ def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_p
         if line == 'Cloud gate: uploading':
             state = 'uploading'
     return cloud_progress.CloudProgress(state, size_vcpus, len(failed), updated_at)
+
+
+@dataclass(frozen=True)
+class GateTermination:
+    attempt: str
+    instance: str
+    region: str
 
 
 @dataclass
@@ -220,6 +228,47 @@ class GateWorker:
                 return
             self.pause(settings().number('result_poll_s'))
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
+
+    def termination_call(self, region: str, operation: str, instances: Sequence[str], deadline: float) -> dict[str, object]:
+        remaining = deadline - self.clock()
+        if remaining <= 0:
+            raise AwsUnavailable('The trial cleanup deadline passed')
+        return self.regional_api(region).call(operation, '--instance-ids', *instances,
+            timeout_s=min(settings().number('api_timeout_s'), remaining))
+
+    def request_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> None:
+        """Request termination without waiting for a final instance state."""
+        regions = tuple(dict.fromkeys(box.region for box in boxes))
+        for region in regions:
+            try:
+                _ = self.termination_call(region, 'terminate-instances',
+                    [box.instance for box in boxes if box.region == region], deadline)
+            except (AwsUnavailable, OSError, subprocess.SubprocessError) as error:
+                print('paired cleanup: ' + str(error), file=sys.stderr)
+
+    def confirm_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> bool:
+        """Record confirmed terminations under one shared deadline."""
+        regions = tuple(dict.fromkeys(box.region for box in boxes))
+        pending = list(boxes)
+        while pending and self.clock() < deadline:
+            for region in regions:
+                instances = [box.instance for box in pending if box.region == region]
+                if not instances or self.clock() >= deadline:
+                    continue
+                try:
+                    reply = self.termination_call(region, 'describe-instances', instances, deadline)
+                    terminated = {ledger.text(row, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
+                                  for row in ledger.rows(group, 'Instances')
+                                  if ledger.text(ledger.mapping(row['State']), 'Name') == 'terminated'}
+                    for box in pending:
+                        if box.region == region and box.instance in terminated:
+                            self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance))
+                    pending = [box for box in pending if box.region != region or box.instance not in terminated]
+                except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    print('paired cleanup: ' + str(error), file=sys.stderr)
+            if pending:
+                self.pause(max(0, min(settings().number('result_poll_s'), deadline - self.clock())))
+        return not pending
 
     def reconcile(self) -> None:
         """Resolve expired launches in every region that can own them."""
@@ -602,12 +651,17 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
     """Use the installed scaler environment for each gate controller."""
     credential = str(Path(settings().text('credential_file')).expanduser())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
+    cleanup: list[str] = []
+    stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
+    if paired:
+        folder = arguments[arguments.index('--paired-worker') + 1]
+        command = shlex.join([sys.executable, '-m', module, '--paired-cleanup', folder])
+        cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
     return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
             '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
-            *configuration,
+            *configuration, *cleanup,
             '--property=KillMode=' + ('mixed' if paired else 'control-group'), '--property=UMask=0077',
-            '--property=TimeoutStopSec=' + str(settings().number('termination_timeout_s')
-                + 2 * settings().number('api_timeout_s')),
+            '--property=TimeoutStopSec=' + str(stop_timeout),
             '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
             '--working-directory=' + str(Path.home() / '.claude'), sys.executable, '-m', module, *arguments]
 

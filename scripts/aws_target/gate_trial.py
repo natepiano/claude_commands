@@ -1,4 +1,4 @@
-"""Compare pushed revisions on disposable gate instances."""
+"""Compare local revisions on disposable gate instances."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -13,12 +13,12 @@ from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
+import re
 import sys
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 import signal
 import statistics
-from types import FrameType
 import subprocess
 import time
 from typing import Protocol, cast
@@ -33,6 +33,7 @@ from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+from scripts.lib.process_group import send_process_group
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
@@ -54,37 +55,57 @@ def host_nixpkgs_revision() -> str:
 TRIAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
-class TrialCancelled(Exception):
-    """The user stopped the trial."""
-
-
 def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
+    if '--paired-cleanup' in argv:
+        return paired_cleanup_main(argv, settings_path, directory)
     if '--paired-worker' in argv:
         return paired_worker_main(argv, settings_path, directory)
     return paired_main(argv, directory)
 
 
 @dataclass(frozen=True)
-class PushedRevision:
+class TrialRevision:
     commit: str
     tree: str
 
 
 @dataclass(frozen=True)
 class PairedTrialRequest:
-    base: PushedRevision
-    changed: PushedRevision
+    base: TrialRevision
+    changed: TrialRevision
     modules: tuple[str, ...]
     rounds: int
     clone_url: str
 
 
 def checked_git(repo: Path, *arguments: str) -> str:
+    if arguments and arguments[0] in ('push', 'ls-remote'):
+        return network_git(repo, *arguments)
     return subprocess.check_output(['git', '-C', str(repo), *arguments], text=True, stderr=subprocess.PIPE).strip()
 
 
-def pushed_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
-    """Resolve public history without changing the source checkout."""
+def network_git(repo: Path, *arguments: str) -> str:
+    """Bound network Git calls and stop their process groups on cancellation."""
+    command = ['git', '-C', str(repo), *arguments]
+    timeout = cloud_gate.settings().number('git_network_timeout_s')
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as process:
+        try:
+            output, errors = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                send_process_group(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
+        return output.strip()
+
+
+def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
+    """Resolve local commits without changing the source checkout."""
     from urllib.parse import urlsplit
     if rounds <= 0 or not modules or len(set(modules)) != len(modules):
         raise ValueError('Use positive rounds and distinct modules')
@@ -96,26 +117,51 @@ def pushed_request(repo: Path, base: str, changed: str, modules: Sequence[str], 
     parsed = urlsplit(url)
     if parsed.username or parsed.password or parsed.query:
         raise ValueError('The clone URL must contain no credential')
-    tips = {line.split()[0] for line in checked_git(repo, 'ls-remote', '--heads', '--tags', url).splitlines()}
-    revisions: list[PushedRevision] = []
+    revisions: list[TrialRevision] = []
     for ref in (base, changed):
         commit = checked_git(repo, 'rev-parse', '--verify', ref + '^{commit}')
-        if not any(pushed_in(repo, commit, tip) for tip in tips):
-            raise ValueError('Both revisions must be pushed refs')
         tree = checked_git(repo, 'rev-parse', commit + '^{tree}')
         for module in modules:
             if checked_git(repo, 'cat-file', '-t', commit + ':scripts/' + module) != 'blob':
                 raise ValueError('The module is absent from a requested tree')
-        revisions.append(PushedRevision(commit, tree))
+        revisions.append(TrialRevision(commit, tree))
     return PairedTrialRequest(revisions[0], revisions[1], tuple(modules), rounds, url)
 
 
-def pushed_in(repo: Path, commit: str, tip: str) -> bool:
-    """A remote tip holds the commit; a tip absent locally holds nothing known."""
-    if tip == commit:
-        return True
-    ancestor = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', commit, tip], capture_output=True)
-    return ancestor.returncode == 0
+def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int, trial_id: str) -> None:
+    """Find and delete remote branches in this trial's unique namespace."""
+    namespace = f'refs/heads/{prefix}-{expires}-{trial_id}-'
+    try:
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'paired trial: could not list branches for trial {trial_id}', file=sys.stderr)
+        return
+    for line in remote.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[1].startswith(namespace):
+            continue
+        branch = fields[1]
+        try:
+            _ = checked_git(repo, 'push', clone_url, '--delete', branch)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+
+
+def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
+    """Delete expired trial branches without blocking a new trial on failure."""
+    namespace = f'refs/heads/{prefix}-'
+    try:
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+        for line in remote.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not fields[1].startswith(namespace):
+                continue
+            name = fields[1].removeprefix(namespace)
+            match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
+            if match and int(match[1]) < now:
+                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 
 
 def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires: int) -> dict[str, object]:
@@ -203,8 +249,96 @@ def trial_cost(book: ledger.CostLedger, attempts: set[str], settings_path: Path,
     return total, complete
 
 
-def stop_paired(number: int, _frame: FrameType | None) -> None:
-    raise TrialCancelled(number)
+@dataclass(frozen=True)
+class UncertainTrialLaunch:
+    attempt: str
+    region: str
+    client_token: str
+    expires: int
+
+
+def cleanup_trial(folder: Path, worker: cloud_gate.GateWorker) -> bool:
+    """Terminate recorded boxes and retain reservations without confirmed cleanup."""
+    paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
+    complete = True
+    deadline = worker.clock() + cloud_gate.settings().number('termination_timeout_s')
+    boxes: list[cloud_gate.GateTermination] = []
+    uncertain: list[UncertainTrialLaunch] = []
+    for path in paths:
+        try:
+            request = cloud_gate.read(path)
+            attempt = ledger.text(request, 'attempt')
+            reservation = next((row for row in worker.book.read_snapshot().gate_reservations
+                                if row.attempt == attempt), None)
+            if reservation is None or isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
+                continue
+            launch_path = path.parent / 'launch.json'
+            launch = cloud_gate.read(launch_path) if launch_path.exists() else {}
+            worker.box_region = str(launch.get('region', reservation.region or worker.api.region))
+            instance = str(launch.get('instance', ''))
+            if not instance and isinstance(reservation.state, ledger.GateRunning):
+                instance = reservation.state.instance_id
+            if not instance and 'arguments' in launch:
+                arguments = ledger.mapping(launch['arguments'])
+                uncertain.append(UncertainTrialLaunch(attempt, worker.box_region,
+                    ledger.text(arguments, 'ClientToken'), ledger.instant(request, 'expires')))
+                continue
+            if instance:
+                boxes.append(cloud_gate.GateTermination(attempt, instance, worker.box_region))
+            else:
+                worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())))
+        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+            print('paired cleanup: ' + str(error), file=sys.stderr)
+            complete = False
+    worker.request_terminations(boxes, deadline)
+    for launch in uncertain:
+        try:
+            remaining = deadline - worker.clock()
+            if remaining <= 0:
+                raise AwsUnavailable('The trial cleanup deadline passed')
+            reply = worker.regional_api(launch.region).call('describe-instances', '--filters',
+                'Name=client-token,Values=' + launch.client_token,
+                timeout_s=min(cloud_gate.settings().number('api_timeout_s'), remaining))
+            instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
+            if instances:
+                found = cloud_gate.GateTermination(launch.attempt, ledger.text(instances[0], 'InstanceId'), launch.region)
+                boxes.append(found)
+                worker.request_terminations([found], deadline)
+            elif worker.clock() < launch.expires:
+                complete = False
+            else:
+                worker.book.resolve_gate(launch.attempt, ledger.GateAbsent(int(worker.clock())))
+        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+            print('paired cleanup: ' + str(error), file=sys.stderr)
+            complete = False
+    return worker.confirm_terminations(boxes, deadline) and complete
+
+
+def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
+    """Clean expired trials before a new trial reserves boxes."""
+    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations
+                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))}
+    for previous in sorted(folder.parent.iterdir()):
+        if previous == folder or not previous.is_dir():
+            continue
+        requests = [cloud_gate.read(path) for path in sorted(previous.glob('*/request.json'))]
+        if (requests and all(ledger.instant(row, 'expires') <= worker.clock() for row in requests)
+                and any(ledger.text(row, 'attempt') in unresolved for row in requests)):
+            _ = cleanup_trial(previous, worker)
+
+
+def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
+    parser = argparse.ArgumentParser()
+    _ = parser.add_argument('--paired-cleanup', type=Path, required=True)
+    class CleanupArguments(argparse.Namespace):
+        paired_cleanup: Path = Path()
+    args = parser.parse_args(list(argv), namespace=CleanupArguments())
+    policy = conf.read(settings_path)
+    worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
+        cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path,
+        args.paired_cleanup / 'reservation.cgroup', clock=time.time)
+    with defer_cleanup_signals():
+        return int(not cleanup_trial(args.paired_cleanup, worker))
 
 
 class LaunchBarrier(Protocol):
@@ -215,8 +349,6 @@ class LaunchBarrier(Protocol):
 
 def paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier) -> None:
     """Keep one queue slot while the shared worker owns its box."""
-    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        _ = signal.signal(number, stop_paired)
     request = cloud_gate.read(folder / 'request.json')
     policy = conf.read(settings_path)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
@@ -234,18 +366,8 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                 slot.status = int(outcome.get('status') != 'complete')
             finally:
                 with defer_cleanup_signals():
-                    launch_path = folder / 'launch.json'
-                    launch = cloud_gate.read(launch_path) if launch_path.exists() else {}
-                    if launch.get('instance'):
-                        instance = ledger.text(launch, 'instance')
-                        attempt = ledger.text(request, 'attempt')
-                        terminated = any(row.attempt == attempt and isinstance(row.state, ledger.GateTerminated)
-                                         and row.state.instance_id == instance
-                                         for row in worker.book.read_snapshot().gate_reservations)
-                        if not terminated:
-                            worker.box_region = str(launch.get('region', worker.api.region))
-                            slot.status = 1
-                            worker.terminate(attempt, instance)
+                    if not cleanup_trial(folder, worker):
+                        slot.status = 1
     except BaseException as error:
         cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': str(error)})
     finally:
@@ -261,7 +383,6 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         cloud_gate.settings().number('api_timeout_s')), book, settings_path, folder / 'reservation.cgroup', clock=time.time)
     requests = [cloud_gate.read(path) for path in sorted(folder.glob('*/request.json'))]
     children: list[tuple[BaseProcess, LaunchBarrier]] = []
-    previous = {number: signal.signal(number, stop_paired) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     failed = False
     fee_path = folder / 'query-cost.json'
     query_fee = Decimal(str(cloud_gate.read(fee_path)['usd'])) if fee_path.exists() else Decimal(0)
@@ -270,6 +391,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         query_fee += fee
         cloud_gate.save(fee_path, {'usd': str(query_fee)})
     try:
+        sweep_trial_resources(folder, worker)
         with control_lock(directory / 'paired-trial-slots'):
             context = multiprocessing.get_context('fork')
             for request in requests:
@@ -288,7 +410,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         for process, _connection in children:
             process.join()
     except (OSError, ValueError, EOFError, GateRefused, AwsUnavailable, subprocess.SubprocessError,
-            TrialCancelled, KeyboardInterrupt) as error:
+            KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         failed = True
     finally:
@@ -299,8 +421,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
                 connection.close()
             for process, _connection in children:
                 process.join()
-            for number, handler in previous.items():
-                _ = signal.signal(number, handler)
+            failed = not cleanup_trial(folder, worker) or failed
     summaries: list[dict[str, object]] = []
     cursor = folder / 'emitted.json'
     emitted = cloud_gate.read(cursor) if cursor.exists() else {}
@@ -336,10 +457,6 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         summary = module_summary(ledger.text(request, 'module'), ledger.instant(request, 'rounds'), runs)
         failed = failed or summary['all_passed'] is not True
         summaries.append(summary)
-        launch_path = path / 'launch.json'
-        launch = cloud_gate.read(launch_path) if launch_path.exists() else {}
-        if 'arguments' not in launch:
-            book.resolve_gate(attempt, ledger.GateAbsent(int(time.time())))
     for summary in summaries:
         print(json.dumps(summary), flush=True)
     cost, cleanup = trial_cost(book, {ledger.text(row, 'attempt') for row in requests}, settings_path, int(time.time()))
@@ -358,21 +475,22 @@ def paired_worker_main(argv: Sequence[str], settings_path: Path, directory: Path
 
 
 def paired_service(command: Sequence[str], unit: str) -> int:
-    """Stop the owning service when the terminal receives a signal."""
-    previous = {number: signal.signal(number, stop_paired) for number in TRIAL_SIGNALS}
+    """Stop the service if its terminal command raises an exception."""
+    completed = False
     try:
-        return subprocess.call(command)
-    except (TrialCancelled, KeyboardInterrupt):
-        with defer_cleanup_signals():
-            _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
+        status = subprocess.call(command)
+        completed = True
+        return status
+    except KeyboardInterrupt:
         return 1
     finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
+        if not completed:
+            with defer_cleanup_signals():
+                _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
-    parser = argparse.ArgumentParser(description='Compare two pushed revisions on disposable gate boxes')
+    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
@@ -385,17 +503,29 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         rounds: int = 3
         repo: Path = Path()
     args = parser.parse_args(list(argv), namespace=PairedArguments())
+    trial_id = ''
+    prefix = ''
+    clone_url = ''
+    expires = 0
     try:
         modules = args.modules
         if len(modules) > cloud_gate.settings().whole('slots'):
             raise GateRefused('The trial needs more cloud slots than configured')
-        trial = pushed_request(args.repo, args.base, args.changed, modules, args.rounds)
+        trial = trial_request(args.repo, args.base, args.changed, modules, args.rounds)
         home = conf.read(account_settings_path()).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(directory / 'gate-deployment.json', home)
+        clone_url = trial.clone_url
+        prefix = cloud_gate.settings().text('trial_branch_prefix')
+        sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
-        expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
+        trial_id = folder.name
+        for variant, revision in (('base', trial.base), ('changed', trial.changed)):
+            branch = f'{prefix}-{expires}-{folder.name}-{variant}'
+            _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
+            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
@@ -404,10 +534,14 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         command = cloud_gate.service_command('scripts.aws_target.gate_trial', ['--paired-worker', str(folder)],
                                              'cloud-paired-trial-' + folder.name, paired=True)
         return paired_service(command, 'cloud-paired-trial-' + folder.name)
-    except (OSError, ValueError, GateRefused, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, GateRefused, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
         return 1
+    finally:
+        with defer_cleanup_signals():
+            if trial_id:
+                delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 
 
 if __name__ == '__main__':

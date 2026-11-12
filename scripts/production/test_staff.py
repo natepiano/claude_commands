@@ -1278,7 +1278,8 @@ class StaffTests(StaffCommandTestCase):
 
     def test_staff_writes_keep_unknown_row_location_and_pause_fields(self) -> None:
         runner, unit, worker = self.tree()
-        for row, other, key, state in ((unit, runner, "worktree", "present"),
+        for row, other, key, state in ((unit, runner, "worktree", "parked"),
+                                       (unit, runner, "worktree", "present"),
                                        (unit, runner, "worktree", "removed"),
                                        (runner, unit, "doc", "live"),
                                        (runner, unit, "doc", "wrapped")):
@@ -1288,6 +1289,8 @@ class StaffTests(StaffCommandTestCase):
                                "future_location": ["retained", {"revision": 2}]},
                          "paused": {"since": "2026-11-06T16:54:00-05:00", "by": "owner", "why": "review",
                                     "future_pause": {"enabled": True}}}
+                if state == "parked":
+                    value[key] = {**cast(dict[str, object], value[key]), "state": "removed", "branch": "feature/parked"}
                 _ = self.write_document({"schema": 2, "rows": [value, other.to_json(), worker.to_json()]})
                 current = staff.snapshot().by_id(row.id)
                 assert current is not None
@@ -1295,6 +1298,9 @@ class StaffTests(StaffCommandTestCase):
                 location = current.worktree if key == "worktree" else current.doc
                 assert isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc))
                 self.assertEqual(location.unknown_fields, {"future_location": ["retained", {"revision": 2}]})
+                if state == "parked":
+                    assert isinstance(location, staff.RemovedWorktree)
+                    self.assertEqual(location.branch, staff.ParkedBranch("feature/parked"))
                 assert isinstance(current.paused, staff.Paused)
                 self.assertEqual(current.paused.unknown_fields, {"future_pause": {"enabled": True}})
                 _ = staff.rename(other.id, "other-" + state)

@@ -15,7 +15,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import remote
 
 from scripts.production import session_labels, session_staff, staff, unit_config
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 
 class NativeSessionLabelTests(StaffTestCase):
@@ -48,6 +48,7 @@ class NativeSessionLabelTests(StaffTestCase):
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
         names = LaunchNames(staff.snapshot())
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
             {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
@@ -126,13 +127,12 @@ class RowResolverTests(StaffTestCase):
 
     def test_removed_worktree_reads_only_parked_branch_and_configuration_without_cleanup(self) -> None:
         fixture = self.row_production()
-        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
+        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree, staff.ParkedBranch("parked-branch")))
         parked = unit_config.parked_path(removed.id)
         parked.parent.mkdir(parents=True)
         write_text_atomic(parked, 'plan = "permanent"\nport = 8712\nresponsibilities = ["parked"]\n'
                           + '[retired]\ndate = "2026-11-01"\n'
-                          + f'session = "{removed.current_session}"\nfolder = "{fixture.worktree}"\n'
-                          + 'branch = "parked-branch"\n')
+                          + f'session = "{removed.current_session}"\n')
         abandoned = parked.with_name(f".{parked.name}.99999999.fixture.tmp")
         write_text_atomic(abandoned, "retained recovery bytes")
         before = parked.read_bytes(), parked.stat().st_mtime_ns, abandoned.read_bytes()
@@ -150,19 +150,23 @@ class RowResolverTests(StaffTestCase):
 
     def test_missing_or_malformed_parked_facts_never_use_the_present_folder(self) -> None:
         fixture = self.row_production()
-        removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree))
-        path = unit_config.parked_path(removed.id)
+        path = unit_config.parked_path(fixture.unit.id)
         path.parent.mkdir(parents=True)
         for malformed in (False, True):
-            with self.subTest(malformed=malformed):
-                if malformed:
-                    write_text_atomic(path, "plan = [invalid")
-                resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
-                branch = resolver.unit_branch(removed)
-                self.assertIsInstance(branch, session_staff.RetiredFactsUnavailable)
-                assert isinstance(branch, session_staff.RetiredFactsUnavailable)
-                self.assertIn(str(path), branch.reason)
-                self.assertNotEqual(branch, session_staff.Branch("branch-from-git"))
+            for retained in (staff.BranchUnrecorded(), staff.ParkedBranch("parked-branch")):
+                with self.subTest(malformed=malformed, retained=retained):
+                    if malformed:
+                        write_text_atomic(path, "plan = [invalid")
+                    removed = replace(fixture.unit, worktree=staff.RemovedWorktree("natedev", fixture.worktree, retained))
+                    resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
+                    branch = resolver.unit_branch(removed)
+                    if isinstance(retained, staff.ParkedBranch):
+                        self.assertEqual(branch, session_staff.Branch(retained.value))
+                    else:
+                        self.assertIsInstance(branch, session_staff.RetiredFactsUnavailable)
+                        assert isinstance(branch, session_staff.RetiredFactsUnavailable)
+                        self.assertIn("staff", branch.reason)
+                    self.assertNotEqual(branch, session_staff.Branch("branch-from-git"))
 
     def test_an_unreadable_git_worktree_is_not_a_confirmed_retirement(self) -> None:
         fixture = self.row_production()

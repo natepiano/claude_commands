@@ -223,6 +223,18 @@
       "time": "2026-10-27T11:40:34.667654-04:00"
     }
   },
+  "nightly.assigned": {
+    "tests_failed": {
+      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
+      "sha256": "ddc96d9ad493780308322ed36edf62ae4d396e4a9b147a94e61a0a733c822b2d",
+      "time": "2026-11-11T13:40:09.429004-05:00"
+    },
+    "types_failed": {
+      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
+      "sha256": "ddc96d9ad493780308322ed36edf62ae4d396e4a9b147a94e61a0a733c822b2d",
+      "time": "2026-11-11T13:40:09.429060-05:00"
+    }
+  },
   "nightly.not_run": {
     "cold_credentials": {
       "objections": [
@@ -306,6 +318,18 @@
       "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
       "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
       "time": "2026-11-06T10:40:29.948005-05:00"
+    }
+  },
+  "nightly.unassigned": {
+    "received": {
+      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
+      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
+      "time": "2026-11-11T13:40:09.429090-05:00"
+    },
+    "unreceived": {
+      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
+      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
+      "time": "2026-11-11T13:40:09.429110-05:00"
     }
   },
   "nix_heal.failed": {

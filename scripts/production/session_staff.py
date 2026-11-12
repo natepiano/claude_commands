@@ -456,11 +456,9 @@ class RowResolver:
         if isinstance(tree, WorktreeUnfilled):
             return LocationUnfilled("the worktree is not recorded")
         if isinstance(tree, RemovedWorktree):
-            config = self.unit_config(holder)
-            if isinstance(config, UnitConfig) and isinstance(config.retired, configuration.RetiredSession):
-                return Branch(config.retired.branch.value)
-            return RetiredFactsUnavailable(config.reason if isinstance(config, (ConfigMissing, RetiredFactsUnavailable))
-                                          else "parked retirement facts are missing")
+            if isinstance(tree.branch, staff.ParkedBranch):
+                return Branch(tree.branch.value)
+            return RetiredFactsUnavailable("the parked branch is not recorded in staff")
         state, text = self._fact(tree.machine, "git", tree.path)
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
@@ -866,7 +864,7 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        if agent_kind(launch) == "codex":
+        if agent_kind(launch, record=self.record) == "codex":
             return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)
         owner = self.record.by_member_reference(launch["session_id"])

@@ -165,18 +165,19 @@ class GateRecordTests(unittest.TestCase):
         times.update(tests_run=7, errors=2, skipped=3)
         executions = [
             gate_record.Execution("hooks", "test_a.py", 4.0, 2.0, 12.0, -15, "hold",
-                                  gate_record.NoModuleTimes("runner stopped"), "", started_at=1.0, ended_at=5.0),
+                                  gate_record.NoModuleTimes("runner stopped"), "", wall_clock=gate_record.WallClockSpan(1.0, 5.0)),
             gate_record.Execution("notify", "test_a.py", 5.0, 3.0, 13.0, 1, "", times, "",
-                                  started_at=2.0, ended_at=7.0),
+                                  wall_clock=gate_record.WallClockSpan(2.0, 7.0)),
             gate_record.Execution(*gate_record.TYPE_CHECK_JOB, 6.0, 4.0, 14.0, 0, "",
-                                  gate_record.TimingNotApplicable(), "", started_at=3.0, ended_at=9.0),
+                                  gate_record.TimingNotApplicable(), "", wall_clock=gate_record.WallClockSpan(3.0, 9.0)),
             gate_record.Execution("hooks", "test_a.py", 7.0, 5.0, 15.0, 0, "", times, "",
-                                  started_at=4.0, ended_at=11.0),
+                                  wall_clock=gate_record.WallClockSpan(4.0, 11.0)),
             gate_record.Execution("notify", "test_b.py", 8.0, 6.0, 16.0, 0, "", times, "",
-                                  started_at=5.0, ended_at=13.0),
+                                  wall_clock=gate_record.WallClockSpan(5.0, 13.0)),
             gate_record.Execution("notify", "test_a.py", 9.0, 7.0, 17.0, 0, "", times, "",
-                                  started_at=6.0, ended_at=15.0),
-            gate_record.Execution("notify", "test_legacy.py", 1.0, 0.5, 10.0, 0, "", times, ""),
+                                  wall_clock=gate_record.WallClockSpan(6.0, 15.0)),
+            gate_record.Execution("notify", "test_legacy.py", 1.0, 0.5, 10.0, 0, "", times, "",
+                                  wall_clock=gate_record.WallClockNotRecorded("not recorded")),
         ]
         modules = gate_record.module_runs(executions, 1.25)
         self.assertEqual(gate_record.module_runs([], 1.25), [])
@@ -189,8 +190,8 @@ class GateRecordTests(unittest.TestCase):
                               execution.peak_mib, execution.status, execution.restart))
         self.assertEqual(
             [(row.get("started_at"), row.get("ended_at")) for row in modules],
-            [(store.utc_iso(job.started_at) if job.started_at is not None else None,
-              store.utc_iso(job.ended_at) if job.ended_at is not None else None) for job in executions],
+            [(store.utc_iso(job.wall_clock.started_at), store.utc_iso(job.wall_clock.ended_at))
+             if isinstance(job.wall_clock, gate_record.WallClockSpan) else (None, None) for job in executions],
         )
         self.assertEqual(modules[0].get("started_at"), "1970-01-01T00:00:01.000Z")
         self.assertEqual(modules[0].get("ended_at"), "1970-01-01T00:00:05.000Z")

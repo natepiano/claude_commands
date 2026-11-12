@@ -199,9 +199,9 @@ def child_causes(collector: LineCollector, evidence: ChildEvidence) -> dict[str,
         started = launch["started"]
         end = ends.get(launch_id, math.inf)
         for test_id, recorded in collector.completed.items():
-            at_start = started < recorded.started < end
-            at_stop = started < recorded.stopped < end
-            overlap = started < recorded.stopped and recorded.started < end
+            at_start = launch_id in recorded.live_children_at_start or started < recorded.started < end
+            at_stop = launch_id in recorded.live_children_at_stop or started < recorded.stopped < end
+            overlap = at_start or at_stop or (started < recorded.stopped and recorded.started < end)
             if owner == SHARED_THREAD:
                 if overlap:
                     causes[test_id].add("shared thread")

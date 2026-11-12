@@ -44,6 +44,7 @@ from scripts.direct.findings_test_support import invoke_findings
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production.cli_fixture import invoke_cli
 
@@ -2704,6 +2705,30 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(wait["holders"], expected[str(wait["wait_id"])])
             self.assertEqual(wait["owner_session"], "waiting-session")
             self.assertEqual(cast(dict[str, object], wait["wait_end"])["epoch"], 1040)
+
+        member = fixture_member("producer", name="staff-holder")
+        native = fixture_runtime_id("current-holder-conversation")
+        member = staff.update_current_session(member.current_session, staff.StaffId(native))
+        holds = self.root / "fixed-holds"
+        holds.mkdir()
+        _ = (holds / member.id).write_text(json.dumps({"holder": member.name, "for": "history checks",
+            "since": datetime.now(UTC).isoformat(), "release_eta": "unknown"}))
+        script = shell_functions(SCRIPT.with_name("verify.sh"), "phase_wait_holder_flags")
+        script += '\nPY=$1 PHASE_WAIT_RECORDER=$2 BUILD_HOLD_DIR=$3\nphase_wait_holder_flags hold\n'
+        environment = {**os.environ, "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
+                       "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+                       "PLAN_DELEGATE_SESSION_DIR": ""}
+        result = subprocess.run(["bash", "-c", script, "bash", str(SCRIPT.parents[1] / "lib/py"),
+                                 str(SCRIPT), str(holds)], env=environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        flags = result.stdout.splitlines()
+        wait_id = self.run_command("start-wait", "--session-dir", str(session), "--kind", "ReadyWithoutCapacity",
+                                   *flags, at=1060)
+        started = self.read_events(name)[-1]
+        self.assertEqual(started["holder"], {"state": "NamedHolder", "resource_kind": "slot", "resource": "natedev",
+                                          "holder": {"state": "SessionHolder", "session_id": native}})
+        _ = self.run_command("finish-wait", "--session-dir", str(session), "--wait-id", wait_id, at=1070)
 
     def test_unnamed_holder_is_explicit_and_can_follow_a_named_holder(self) -> None:
         session = self.covered_wait_phase("unnamed-holder")

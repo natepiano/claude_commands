@@ -1991,6 +1991,20 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertNotEqual(self.moves.calls[0].target, "claude1")
         self.assertIsInstance(refusal_watch.session_refusal("probe"), refusal_watch.NoSessionRefusal)
         self.assertIsInstance(refusal_watch.session_refusal("other"), refusal_watch.NoSessionRefusal)
+        with staff_test_support.isolated_staff_file(self.home / "proof-staff.json", {}):
+            member = staff_test_support.fixture_member("producer", name="old-probe")
+            owner = self.owner(str(member.current_session))
+            owner["name"] = "old-probe"
+            _ = staff.rename(member.id, "renamed-probe")
+            current = staff.native_id(staff_test_support.fixture_runtime_id("renamed-proof-current"))
+            _ = staff.update_current_session(member.current_session, current)
+            _ = self.owner(str(current))
+            with patch.object(refusal_watch, "run", return_value=[]) as run:
+                code, _, _ = self.cli("--assume-refused", "renamed-probe", "weekly")
+                self.assertEqual(code, 0)
+                run.assert_called_once()
+            with self.assertRaises(SystemExit):
+                _ = self.cli("--assume-refused", "old-probe", "weekly")
 
     def test_proof_without_room_does_not_suppress_a_real_refusals_notice_on_the_same_login(self) -> None:
         _ = self.owner("probe")
@@ -3398,7 +3412,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("assumed", host="ghostty")
         _ = self.owner("unrelated", host="terminal")
         before = usage_store.store_file().read_bytes()
-        _, output, error = self.cli("--assume-refused", "owner assumed", "five-hour", "--reset-in", "19")
+        _, output, error = self.cli("--assume-refused", "assumed", "five-hour", "--reset-in", "19")
         self.assertEqual(error, "")
         self.assertIn("wait", output)
         self.assertNotIn("unrelated", output)
