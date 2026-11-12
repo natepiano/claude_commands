@@ -367,7 +367,7 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
                 output, f"no tests recorded matching {text}")
 
 
-TREND_CACHE_VERSION = 3
+TREND_CACHE_VERSION = 4
 TREND_CACHE_NAME = "gate-trend.json"
 TREND_HEADERS = ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
                  "cost mean", "cost p95", "cost total"]
@@ -446,7 +446,7 @@ def gate_costs() -> dict[str, Decimal | CostNotRecorded]:
     except ledger.LedgerUnavailable:
         return {}
     return {"gate-" + row.attempt:
-            row.rate.usd_per_hour * Decimal(row.state.at - row.at) / Decimal(3600) + row.allowance_usd
+            row.rate.usd_per_hour * Decimal(row.state.at - row.at) / Decimal(3600) + ledger.gate_allowance(row).usd
             if isinstance(row.state, ledger.GateTerminated) and row.rate.source != "not priced" else CostNotRecorded()
             for row in evidence.gate_reservations}
 

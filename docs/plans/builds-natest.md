@@ -3227,3 +3227,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on each changed file reports 0 errors and 0 warnings.
 - `phases/172/removed_tests.md` lists every removed test with its reason, and the counts.
 - Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 173 — The test-time trend shows the booked cost of each aws gate  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/test_times trend` shows each aws gate's cost with the booked gate allowance, the same cost the aws ledger and `gate_trial` report.
+
+**Decision:** builds showrunner, 2026-11-11, from an aws-unit report: the trend showed a gate mean of 0.074 USD where the ledger booked 0.055 USD. The user sees this number.
+
+**Spec:**
+1. In `scripts/test_times/show.py` `gate_costs()` (line 439), replace `row.allowance_usd` with `ledger.gate_allowance(row).usd`. `gate_allowance` returns the booked allowance of a terminated gate and the attempt reserve of an open gate.
+2. Read the reservations from the snapshot that carries booked allowances. `gate_trial.trial_cost` uses `book.priced_snapshot(now)`. Check whether `read_snapshot()` already carries the saved `booked_allowance`; use `priced_snapshot` only when it does not. State the choice and the reason in the reply.
+3. Keep the box-hour term and the `not priced` rule unchanged.
+4. Add the booked allowance to the existing trend cost test in `scripts/test_times/test_show.py` (rows to existing tests; no new test unless no existing test can carry it). The `write_trend_ledger` fixture writes `booked_allowance` for a row that has one. The test proves the trend shows the booked value where it differs from `allowance_usd`.
+5. Raise `TREND_CACHE_VERSION` by one, so the next report re-prices each cached day once with the booked value. Add no other migration.
+
+**Files:**
+- `scripts/test_times/show.py` — `gate_costs()` at line 439.
+- `scripts/test_times/test_show.py` — `write_trend_ledger` at line 126; the trend cost tests at lines 1032 and 1093.
+
+**Workers:** 1 writer; two files in one module pair.
+- impl: `scripts/test_times/show.py`, `scripts/test_times/test_show.py`.
+
+**Constraints from prior phases:**
+- `ledger.gate_allowance` (scripts/aws_target/ledger.py:841) is the one owner of the gate allowance. Do not copy its rule.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.test_times.test_show` passes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- The trend cost test fails on the old `allowance_usd` sum and passes with the change.
