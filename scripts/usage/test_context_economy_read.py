@@ -8,17 +8,16 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
 from collections.abc import Callable, Iterator
 from typing import BinaryIO, cast, final, override
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 from scripts.lib import conf
 from scripts.lib.transcript_test_support import compressed_copy
@@ -61,7 +60,6 @@ class ContextEconomyReadTests(unittest.TestCase):
             + "files = commands/unit/direct.md docs/direct/write_prompt_contract.md docs/fixture-policy.md\n"
             + "min_requests = 20\n"
             + "active_gap_seconds = 600\n"
-            + "# whole: 1..\nmac_timeout_seconds = 300\n"
             + "# whole: 1..\ncache_max_megabytes = 512\n# whole: 1..\nprogress_seconds = 1\n", encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
@@ -618,123 +616,6 @@ class ContextEconomyReadTests(unittest.TestCase):
             self.assertEqual(errors.getvalue(),
                 "fixture-machine claude: files 1 of 2; skipped 0" + separator
                 + "fixture-machine claude: files 2 of 2; skipped 0\n")
-
-    def test_mac_progress_reaches_stderr_without_changing_the_result_document(self) -> None:
-        program = ("import sys; print('mac claude: files 1 of 1; skipped 0', file=sys.stderr); "
-                   + "print('{\"type\":\"timeline\",\"entries\":[]}')")
-        with (patch.dict(os.environ, {"CONTEXT_ECONOMY_MAC_COMMAND": json.dumps([sys.executable, "-I", "-c", program])}),
-              redirect_stderr(io.StringIO()) as errors):
-            result = reader.read_mac(self.since, self.until)
-        self.assertEqual(result, reader.MacSessions([], []))
-        self.assertEqual(errors.getvalue(), "mac claude: files 1 of 1; skipped 0\n")
-
-    def test_mac_payload_carries_settings_and_emit_ignores_missing_remote_keys(self) -> None:
-        _ = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
-        rollout = self.codex_rollout()
-        _ = self.settings_history()
-        configuration = self.root / "configuration/context_economy.conf"
-        _ = configuration.write_text(configuration.read_text(encoding="utf-8").replace(
-            "cache_max_megabytes = 512", "cache_max_megabytes = 3").replace(
-            "progress_seconds = 1", "progress_seconds = 7"), encoding="utf-8")
-        with patch.dict(os.environ, {
-            "CONTEXT_ECONOMY_MAC_PROJECTS_ROOT": str(self.projects),
-            "CONTEXT_ECONOMY_MAC_CODEX_ROOTS": json.dumps([str(rollout.parents[3])]),
-            "CONTEXT_ECONOMY_MAC_CHECKOUT": str(self.checkout),
-        }):
-            payload = cast(Callable[[datetime, datetime], str], getattr(reader, "_mac_payload"))
-            request = cast(dict[str, object], json.loads(payload(self.since, self.until)))
-        self.assertEqual(request["cache_max_megabytes"], 3)
-        self.assertEqual(request["progress_seconds"], 7)
-        _ = configuration.write_text("\n".join(line for line in configuration.read_text(encoding="utf-8").splitlines()
-            if not line.startswith(("cache_max_megabytes =", "progress_seconds ="))) + "\n", encoding="utf-8")
-        with (redirect_stdout(io.StringIO()) as output,
-              patch.object(reader, "TranscriptCache", wraps=cache_module.TranscriptCache) as cache,
-              patch.object(reader, "FileProgress", wraps=cache_module.FileProgress) as progress):
-            reader.emit_mac(request)
-        settings = cache_module.TranscriptReadSettings(3, 7)
-        self.assertEqual(cache.call_args_list, [call(settings), call(settings)])
-        self.assertEqual(progress.call_args_list, [call("mac", "claude", 1, settings), call("mac", "codex", 1, settings)])
-        rows = [cast(dict[str, object], json.loads(line)) for line in output.getvalue().splitlines()]
-        self.assertEqual(rows[0]["type"], "timeline")
-        self.assertEqual([(row["machine"], row["family"], row["agent_id"]) for row in rows[1:]],
-                         [("mac", "claude", "parent-fixture"), ("mac", "codex", "codex-fixture")])
-
-    def test_mac_payload_reads_both_families_and_the_remote_timeline_without_writes(self) -> None:
-        parent = self.transcript("parent-fixture.jsonl", "project/parent-fixture.jsonl")
-        child = self.transcript("agent-child-fixture.jsonl", "project/parent-fixture/subagents/agent-child-fixture.jsonl")
-        rollout = self.codex_rollout()
-        commits, _, _ = self.settings_history()
-        before = {path: path.read_bytes() for path in (parent, child, rollout, self.checkout / "settings.json")}
-        with patch.dict(os.environ, {
-            "CONTEXT_ECONOMY_MAC_COMMAND": json.dumps([sys.executable, "-I", "-c"]),
-            "CONTEXT_ECONOMY_MAC_PROJECTS_ROOT": str(self.projects),
-            "CONTEXT_ECONOMY_MAC_CODEX_ROOTS": json.dumps([str(rollout.parents[3])]),
-            "CONTEXT_ECONOMY_MAC_CHECKOUT": str(self.checkout),
-        }):
-            result = reader.read_mac(self.since, self.until)
-        self.assertIsInstance(result, reader.MacSessions, result)
-        assert isinstance(result, reader.MacSessions)
-        self.assertCountEqual([(session.machine, session.family, session.agent_id) for session in result.sessions], [
-            ("mac", "claude", "parent-fixture"), ("mac", "claude", "child-fixture"), ("mac", "codex", "codex-fixture"),
-        ])
-        self.assertEqual([entry.commit for entry in result.timeline], commits)
-        codex = next(session for session in result.sessions if session.family == "codex")
-        self.assertEqual((codex.requests[0].model, codex.requests[0].cli_version, codex.requests[0].context),
-                         ("gpt-6.1-sol", "0.101.0", 1000))
-        self.assertIsInstance(codex.compactions[0].pre_tokens, reader.SizeNotReported)
-        claude = next(session for session in result.sessions if session.agent_id == "parent-fixture")
-        self.assertEqual((claude.compactions[0].pre_tokens, claude.compactions[0].post_tokens), (9000, 400))
-        self.assertIsInstance(claude.compactions[2].post_tokens, reader.SizeNotReported)
-        self.assertEqual({path: path.read_bytes() for path in before}, before)
-
-    def test_mac_with_no_sessions_returns_its_timeline(self) -> None:
-        commits, _, _ = self.settings_history()
-        with patch.dict(os.environ, {
-            "CONTEXT_ECONOMY_MAC_COMMAND": json.dumps([sys.executable, "-I", "-c"]),
-            "CONTEXT_ECONOMY_MAC_PROJECTS_ROOT": str(self.projects),
-            "CONTEXT_ECONOMY_MAC_CODEX_ROOTS": json.dumps([str(self.root / "empty-codex")]),
-            "CONTEXT_ECONOMY_MAC_CHECKOUT": str(self.checkout),
-        }):
-            result = reader.read_mac(self.since, self.until)
-        self.assertIsInstance(result, reader.MacSessions, result)
-        assert isinstance(result, reader.MacSessions)
-        self.assertEqual(result.sessions, [])
-        self.assertEqual([entry.commit for entry in result.timeline], commits)
-
-    def test_mac_reports_command_failures_and_rejects_malformed_records(self) -> None:
-        configuration = self.root / "configuration/context_economy.conf"
-        _ = configuration.write_text(configuration.read_text(encoding="utf-8").replace(
-            "mac_timeout_seconds = 300", "mac_timeout_seconds = 1"), encoding="utf-8")
-        valid: dict[str, object] = {
-            "type": "session", "machine": "mac", "family": "codex", "session_id": "fixture", "agent_id": "fixture",
-            "first_record_at": None, "requests": [], "starts": [], "compactions": [],
-        }
-        header = json.dumps({"type": "timeline", "entries": []}) + "\n"
-        commands = [
-            ("import sys; print('fixture unreachable', file=sys.stderr); sys.exit(7)", "fixture unreachable"),
-            ("import signal; signal.pause()", "timed out after 1 seconds"),
-        ]
-        for output in ("{broken", "", header + json.dumps({**valid, "family": "other"}),
-                       header + json.dumps({**valid, "requests": [{"at": "invalid"}]}),
-                       header + json.dumps({**valid, "compactions": [{"at": self.since.isoformat(), "trigger": None,
-                                                  "kind": "unknown", "pre_tokens": False, "post_tokens": None}]}),
-                       header + json.dumps({**valid, "compactions": [{"at": self.since.isoformat(), "trigger": None,
-                                                  "kind": "unknown", "pre_tokens": -1, "post_tokens": None}]}),
-                       header + json.dumps({**valid, "requests": [{"at": self.since.isoformat(), "model": "gpt-6.1-sol",
-                                                  "cli_version": "0.101.0", "input": -1, "cache_read": 0,
-                                                  "cache_write_5m": 0, "cache_write_1h": 0, "output": 0}]}),
-                       header + json.dumps({**valid, "starts": [{"at": self.since.isoformat(), "source": "other"}]})):
-            commands.append((f"import sys; sys.stdout.write({output!r})",
-                             "Mac data" if output != "{broken" else "property name"))
-        for program, reason in commands:
-            with self.subTest(program=program), patch.dict(os.environ, {
-                "CONTEXT_ECONOMY_MAC_COMMAND": json.dumps([sys.executable, "-I", "-c", program]),
-            }):
-                result = reader.read_mac(self.since, self.until)
-                self.assertIsInstance(result, reader.MacReadFailed)
-                assert isinstance(result, reader.MacReadFailed)
-                self.assertIn(reason, result.reason)
-
 
 if __name__ == "__main__":
     _ = unittest.main()
