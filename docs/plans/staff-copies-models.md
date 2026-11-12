@@ -81,35 +81,16 @@
 
 ### Phase 4 — Astra design records keep staff ids  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** an opened design role keeps its worker staff id and no name. A staff-owned checkout keeps the owning unit id and no path. The legacy `holder` object is gone.
-
-**Spec:**
-
-1. `scripts/astra/design_roles.py`: a role with no worker id keeps `name` as its creation claim. A role with a worker id saves no `name`; `_prompt`, `dispatch_turn`, `recover`, `end` and `list_roles` read the name from the worker's staff row.
-2. `repository` and `binding.repository`: when the checkout equals the owning unit's staff worktree at open, save `repository_owner: <unit id>` and no path. Readers resolve the path from that row's `worktree`. Any other checkout keeps its path.
-3. `scripts/message/roster.py` `_durable_roles` and `worker_shown_name` read the name and path the same way. Tell hierarchies before this edit.
-4. Deploy program: delete the `holder` object from each `~/.local/state/astra/design-roles/*/design.json`; drop `name` from roles with a worker id; convert a staff-owned `repository` to `repository_owner`. natedev holds 1 design file with 1 holder and 2 unopened roles.
-5. Add no other guard, refusal or scan.
+- `scripts/astra/design_roles.py` holds the checkout as a tagged field: `UnitCheckout(owner)` or `IndependentCheckout`. When the checkout equals the caller unit's staff worktree, the record saves `repository_owner: <unit id>` and no path, in the design and in its binding. Any other checkout keeps its path.
+- An owned design saves `document` relative to its checkout. Readers resolve the checkout from the owner row's current `worktree`, so a worktree move moves the document too. `held_document` resolves raw owned records the same way, so a damaged matching record still refuses.
+- `rebind` to the current checkout keeps the recorded owner and binding for any caller. An absent owner row raises `RoleRefused`, which the roster's per-record handling reports as a warning.
+- A role with a worker staff id saves no `name`. `instance_name` reads it from the worker's staff row for `_prompt`, `dispatch_turn`, `recover`, `end` and `list_roles`. A role with no worker id keeps `name` as its creation claim. The legacy `holder` object is gone.
+- `scripts/message/roster.py` `_durable_roles` and `worker_shown_name` use `instance_name` and `design_repository`.
+- A one-off deploy program outside the repository deletes `holder`, drops `name` from roles with a worker id, and converts a `repository` that equals a unit's staff worktree to `repository_owner` with a relative `document`.
 
 **Files:**
-- `scripts/astra/design_roles.py` — design record shape and readers.
+- `scripts/astra/design_roles.py` — checkout types, record shape and readers.
 - `scripts/message/roster.py` — durable role readers.
-- `scripts/astra/test_design_roles.py` — design rows.
-- `scripts/hooks/test_berth_hook.py` — patch check rows.
-- `scripts/message/test_roster.py` — roster rows.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — the source files above.
-- `test` — the test files above. Rows: a worker rename shows the new name in the prompt and the role list; a unit worktree move resolves the new checkout path; an independent checkout keeps its path.
-
-**State:** design record shape; deploy program above.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-1. The unittest line passes for the three test modules above.
-2. basedpyright over the changed Python files reads `0 errors, 0 warnings, 0 notes`.
+- `scripts/astra/test_design_roles.py`, `scripts/hooks/test_berth_hook.py`, `scripts/message/test_roster.py` — rename, checkout move, rebind, absent owner and prompt-count rows.
