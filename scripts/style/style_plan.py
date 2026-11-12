@@ -3218,8 +3218,8 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
             "Type Design Contract: ~/.claude/docs/type_design.md applies to the code you change.\n"
             "Edit only the listed paths.\n"
             "Run no git add, commit, stash, reset or checkout.\n"
-            "Start no detached run you will not wait on.\n"
-            "Finish your summary before you end your turn.\n\n"
+            "After you start a detached run, end your turn. Its result arrives as your next message.\n"
+            "Write your summary after the last result arrives.\n\n"
         )
         atomic_write(prompt, (header + match.group(0)).encode())
     paths = directory / "ticket-paths.txt"
