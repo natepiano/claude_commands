@@ -23,44 +23,22 @@
 
 ## Phases
 
-### Phase 1 — /remove_command  · status: todo
+### Phase 1 — /remove_command  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/remove_command <name>` gives an agent the full steps to find, remove and report a command's whole footprint.
-
-**Spec:**
-
-Write `commands/remove_command.md` in the format of the other top-level commands (frontmatter `description`, one-line purpose, **Usage**, numbered steps). Usage: `/remove_command <command name>`.
-
-Steps it gives:
-
-1. **Inventory.** Search the repository with `git grep -n -i` for the name in every spelling: `ask_a_friend`, `ask-a-friend`, `/ask_a_friend`, and the words with spaces. Then read the command file and search for each term it defines: its scripts folder, policies, targets, config keys and sections, file names and state paths. Read each hit.
-2. **Classify** each hit as one of:
-   - `dedicated` — exists only for the command: delete the file, key, section or test.
-   - `embedded` — a case, row, branch, flag value or sentence inside a shared file: cut only that part.
-   - `shared` — other callers use it: keep it; name its owner.
-   - `history` — a dated plan, record or as-built history section that describes the past: leave it.
-   - `permission` — an allow or deny rule in a settings file that names the command or its files: never edit it. List each one, with its file and line, as a step for the user to remove by hand.
-3. **Report** the table to the caller before any deletion: path, line, class, action, owner.
-4. **Remove** the `dedicated` and `embedded` parts. Ask the owner first for a file another unit owns.
-5. **Verify.** Run the tests of every changed module and lint every changed Python file. Run the step 1 searches again: only `history`, `shared` and `permission` hits remain.
-6. **Notify morty** with `python3 ~/.claude/scripts/message/send.py --to morty`: the command name, that it is removed, the commit, and one line on what went with it, for morty's tracking list.
-7. **Change-Review line** for the commit: the command is gone from the command list.
-
-The skill is a prompt only. It adds no script and no test.
+- `commands/remove_command.md` (`/remove_command <command name>`) is a prompt only, with no script and no test.
+- It gives seven steps: inventory, classify, report, remove, verify, notify morty, and the Change-Review line.
+- The inventory uses `git grep -n -i --untracked` for every spelling. It also searches the ignored local settings (`.claude/settings*.json`, `templates/settings*.json`).
+- The classes are `dedicated`, `embedded`, `shared`, `history` and `permission`.
+- A `permission` rule is never edited. The report gives each one to the user as a numbered step, with its file, line and exact text.
+- The morty notice goes through `send.py --to morty` after the removal commit exists.
+- The Change-Review line has three fields: `/<command name> is removed | <machine>, any session: type /<command name> | The command is not in the command list`.
 
 **Files:**
-- `commands/remove_command.md` — new command.
+- `commands/remove_command.md` — the command.
 
-**Workers:** 1 writer; one file, nothing splits.
-- `impl` — `commands/remove_command.md`.
-
-**State:** none.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `commands/remove_command.md` exists and gives steps 1–7. `git diff --check` is clean.
+**Binds later work:** Remove /ask_a_friend follows the seven steps and the five classes. Amend /remove_command edits this file.
 
 ### Phase 2 — Remove /ask_a_friend  · status: todo
 
