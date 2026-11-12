@@ -1516,12 +1516,14 @@ def set_worker_role(identity: StaffId, role: KnownWorkerRole) -> StaffRow:
     return _transaction(edit)
 
 
-def set_home(identity: StaffId, home: SessionHome) -> StaffRow:
+def set_home(identity: StaffId, home: SessionHome, *, only_unknown: bool = False) -> StaffRow:
     """Record the home proved by a pane start."""
     if not is_owner():
-        return _remote_row(["set-home", identity, str(home.path)])
+        return _remote_row(["set-home", identity, str(home.path), *(["--only-unknown"] if only_unknown else [])])
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
+        if only_unknown and not isinstance(row.home, HomeUnknown):
+            return row
         changed = replace(row, home=home)
         rows[rows.index(row)] = changed
         return changed
@@ -2072,6 +2074,7 @@ class _Arguments:
     runtime_id: str = ""
     new_id: str = ""
     value: str = ""
+    only_unknown: bool = False
     verb: str = ""
     kind: Kind | None = None
     unit_type: UnitType | None = None
@@ -2107,6 +2110,8 @@ def _parser() -> argparse.ArgumentParser:
         fact = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = fact.add_argument("target")
         _ = fact.add_argument("value", choices=WORKER_ROLES if command == "set-worker-role" else None)
+        if command == "set-home":
+            _ = fact.add_argument("--only-unknown", action="store_true")
         _ = fact.add_argument("--json", action="store_true")
     for command in ("set-run", "clear-run"):
         run_parser = verbs.add_parser(command)
@@ -2211,7 +2216,8 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return (set_run(row.id, OpenRun(Path(arguments.path))) if arguments.verb == "set-run"
                 else clear_run(row.id, Path(arguments.path)))
     if arguments.verb == "set-home":
-        return set_home(StaffId(arguments.target), SessionHome(Path(arguments.value).absolute()))
+        return set_home(StaffId(arguments.target), SessionHome(Path(arguments.value).absolute()),
+                        only_unknown=arguments.only_unknown)
     if arguments.verb == "set-hold":
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
