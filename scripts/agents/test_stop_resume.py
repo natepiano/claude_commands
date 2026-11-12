@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable, Generator, Mapping
+from contextvars import Context
 from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from dataclasses import replace
@@ -1241,6 +1242,27 @@ class StopResumeTests(unittest.TestCase):
         self.assertNotIn("config_dir", saved)
         self.assertNotIn("CLAUDE_CONFIG_DIR", saved["environment"])
 
+        running_home = target_home
+        target_home = self.root / ".claude3"
+        for failed in (True, False):
+            with self.subTest(destination="claude3", failed=failed):
+                starts.clear()
+                before = pane_record.record_path("agents").read_bytes()
+                with patch.object(stop_resume, "_start_session",
+                                  side_effect=OSError("fixture target start failed") if failed else started):
+                    result = stop_resume.resume(row.id, to="claude3")
+                current = staff.by_id(row.id)
+                assert current is not None
+                if failed:
+                    self.assertIsInstance(result, stop_resume.ResumeFailed)
+                    self.assertEqual(current.home, staff.SessionHome(running_home))
+                    self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
+                    self.assertEqual(starts, [])
+                else:
+                    self.assertIsInstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual(starts, ["claude3"])
+                    self.assertEqual(current.home, staff.SessionHome(target_home))
+
     def test_account_change_keeps_pane_data_until_the_start_publication(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "alpha", staff.STAFF_ROOT,
@@ -1535,25 +1557,41 @@ class StopResumeTests(unittest.TestCase):
                 retained = self.entry.copy()
                 retained.update(staff_id=row.id, kind=family, environment={variable: str(source)}, config_dir=str(source))
                 pane_record.save("agents", {"w1:p2": retained})
-                atomic_file.write_text_atomic(pane_record.record_directory() / f".producer-start-{row.id}", json.dumps({
+                contract_path = pane_record.record_directory() / f".producer-start-{row.id}"
+                atomic_file.write_text_atomic(contract_path, json.dumps({
                     "member": row.id, "session": row.current_session, "kind": family,
                     "folder": str(self.root), "home": str(source), "attempt": "killed-start"}))
+                contract_bytes = contract_path.read_bytes()
                 self.launched.clear()
                 self.tab_titles["w1:t9"] = row.name
                 executed = self.root / f"{family}-exec.json"
+                requests: list[pane_launch.ProducerLaunchRequest] = []
+                launch_scope = pane_launch.producer_launch_request
+
+                @contextmanager
+                def observe_request(request: pane_launch.ProducerLaunchRequest) -> Generator[None]:
+                    requests.append(request)
+                    with launch_scope(request):
+                        yield
+
                 def execute_launch(program: str, arguments: list[str], environment: dict[str, str]) -> Never:
-                    atomic_file.write_text_atomic(executed, json.dumps({"program": program, "environment": environment}))
+                    request = requests[-1]
+                    atomic_file.write_text_atomic(executed, json.dumps({"program": program, "environment": environment,
+                        "request": {"member": request.member, "session": request.session, "kind": request.kind,
+                                    "folder": str(request.folder), "home": str(request.home)}}))
                     if family == "claude":
                         replacement = pane_record.launch("w1:p2", row.current_session, str(self.root), environment,
                                                          arguments, kind="claude")
                         replacement.update(pid=456, proc_start="generation-1")
-                        pane_record.write("agents", replacement)
+                        with patch.dict(os.environ, environment, clear=True):
+                            Context().run(pane_record.write, "agents", replacement)
                     os._exit(0)
                 def conversation(identity: str, kind: str = "") -> herdr.LiveConversation | herdr.StoppedConversation:
                     del kind
                     return (herdr.LiveConversation(pane_launch.agent_kind(retained), (456,)) if identity in self.launched
                             else herdr.StoppedConversation())
                 with (patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}), patch.object(os, "chdir"),
+                      patch.object(pane_launch, "producer_launch_request", side_effect=observe_request),
                       patch.object(herdr, "read_conversation", side_effect=conversation),
                       patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
                           herdr.EnvironmentThread(row.current_session), "generation-1",
@@ -1571,12 +1609,15 @@ class StopResumeTests(unittest.TestCase):
                     invocation = cast(dict[str, object], json.loads(executed.read_text()))
                     self.assertEqual(invocation["program"], str(self.root / "bin" / family))
                     self.assertEqual(cast(dict[str, str], invocation["environment"])[variable], str(target))
+                    self.assertEqual(json.loads(cast(dict[str, str], invocation["environment"])[
+                        pane_launch.PRODUCER_LAUNCH_REQUEST_ENV + row.id.encode().hex()]), invocation["request"])
+                    self.assertEqual(contract_path.read_bytes(), contract_bytes)
                     if family == "codex":
                         self.assertEqual(pane_record.read("agents"), {"w1:p2": retained})
-                        contract = cast(dict[str, str], json.loads((pane_record.record_directory()
-                            / f".producer-start-{row.id}").read_text()))
-                        self.assertEqual(contract["home"], str(target))
-                        self.assertNotEqual(contract["attempt"], "killed-start")
+                        self.assertEqual(cast(dict[str, str], invocation["request"])["home"], str(target))
+                        self.assertEqual(invocation["request"], {
+                            "member": row.id, "session": row.current_session, "kind": family,
+                            "folder": str(self.root), "home": str(target)})
                     self.launched.add(row.current_session)
                     with patch.object(os, "execvpe", side_effect=AssertionError("the live session must not execute again")) as execute:
                         second = stop_resume.resume(row.name)

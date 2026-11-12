@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
 from enum import Enum
 from importlib import import_module
-from uuid import uuid4
 
 if TYPE_CHECKING:
     from scripts.production.session_labels import StaffLabels
@@ -31,6 +30,7 @@ KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
 MODEL_FLAGS = frozenset({"--model"})
+PRODUCER_LAUNCH_REQUEST_ENV = "HERDR_PRODUCER_LAUNCH_REQUEST"
 
 
 class PaneLaunch(TypedDict):
@@ -69,8 +69,8 @@ class NativeProcessReader(Protocol):
 
 
 @dataclass(frozen=True)
-class ProducerStartExpectation:
-    """The conversation, backend, folder, and account selected before a producer starts."""
+class ProducerLaunchRequest:
+    """The parent operation's selected conversation, backend, folder, and account."""
 
     member: staff.StaffId
     session: staff.StaffId
@@ -78,27 +78,48 @@ class ProducerStartExpectation:
     folder: Path
     home: Path
 
+    @property
+    def environment_key(self) -> str:
+        return PRODUCER_LAUNCH_REQUEST_ENV + self.member.encode().hex()
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        """Give the child process the selected launch request."""
+        return {**base, self.environment_key: json.dumps({
+            "member": self.member, "session": self.session, "kind": self.kind,
+            "folder": str(self.folder), "home": str(self.home)})}
+
     def expected_launch(self, entry: PaneLaunch) -> PaneLaunch:
         expected = entry.copy()
         expected.update(staff_id=self.member, session_id=self.session, kind=self.kind, cwd=str(self.folder), config_dir=str(self.home))
         return expected
 
 
+class ProducerLaunchFromStaff(Enum):
+    CURRENT = "publication outside a parent launch operation"
+
+
+def process_producer_launch_request(member: staff.StaffId) -> ProducerLaunchRequest | ProducerLaunchFromStaff:
+    """Read the launch request from the publisher's process environment."""
+    encoded = os.environ.get(PRODUCER_LAUNCH_REQUEST_ENV + member.encode().hex())
+    if encoded is None:
+        return ProducerLaunchFromStaff.CURRENT
+    request = cast(dict[str, str], json.loads(encoded))
+    return ProducerLaunchRequest(staff.StaffId(request["member"]), staff.StaffId(request["session"]),
+        cast(Literal["claude", "codex"], request["kind"]), Path(request["folder"]), Path(request["home"]))
+
+
 @contextmanager
-def producer_start(directory: Path, expected: ProducerStartExpectation) -> Generator[None]:
-    """Publish the selected start contract for the Claude hook or the Codex publisher."""
-    path = directory / f".producer-start-{expected.member}"
-    contract = json.dumps({"member": expected.member, "session": expected.session, "kind": expected.kind,
-                           "folder": str(expected.folder), "home": str(expected.home), "attempt": uuid4().hex})
-    with _publication_lock(directory):
-        atomic_file.write_text_atomic(path, contract)
+def producer_launch_request(request: ProducerLaunchRequest) -> Generator[None]:
+    """Give direct publishers the same request as the child process."""
+    previous = os.environ.get(request.environment_key)
+    os.environ.update(request.environment({}))
     try:
         yield
     finally:
-        with _publication_lock(directory):
-            if path.exists() and path.read_text(encoding="utf-8") == contract:
-                path.unlink()
-
+        if previous is None:
+            del os.environ[request.environment_key]
+        else:
+            os.environ[request.environment_key] = previous
 
 
 @dataclass(frozen=True)
@@ -475,6 +496,7 @@ def save(path: Path, entries: dict[str, PaneLaunch], *,
 
 def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> None:
     """Persist pane observations with the fixed staff reference."""
+    native_session = launch["session_id"]
     try:
         membership = staff.initial_snapshot()
         reference = launch_reference(launch, membership)
@@ -489,7 +511,10 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
         _ = launch.pop("config_dir", None)
     with locked(path):
         if owner is not None and owner.kind == "producer":
-            _publish_producer(path, launch, owner, membership, sources)
+            request = process_producer_launch_request(owner.id)
+            if isinstance(request, ProducerLaunchRequest) and request.session != native_session:
+                request = ProducerLaunchFromStaff.CURRENT
+            _publish_producer(path, launch, owner, membership, sources, request)
             return
         entries = read(path)
         if entries.get(launch["pane_id"]) == launch:
@@ -499,7 +524,8 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
 
 
 def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
-                      membership: staff.StaffSnapshot, sources: Sequence[Path]) -> None:
+                      membership: staff.StaffSnapshot, sources: Sequence[Path],
+                      request: ProducerLaunchRequest | ProducerLaunchFromStaff) -> None:
     """Commit one proved producer binding and remove its other bindings without closing panes."""
     paths = sorted({path.absolute(), *(source.absolute() for source in sources)})
     if any(source.parent != path.absolute().parent for source in paths):
@@ -535,17 +561,15 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
     expected = launch.copy()
     expected["session_id"] = owner.id
     expected["kind"] = models_registry.launch_settings("producers", owner.name).kind
-    contract_path = path.parent / f".producer-start-{owner.id}"
-    if contract_path.exists():
-        contract = cast(dict[str, str], json.loads(contract_path.read_text(encoding="utf-8")))
-        if contract["member"] != owner.id or contract["session"] != owner.current_session:
+    if isinstance(request, ProducerLaunchRequest):
+        if request.member != owner.id or request.session != owner.current_session:
             raise ValueError("producer start expectation names another conversation")
-        expected["cwd"] = contract["folder"]
-        if contract["kind"] != saved_kind(launch):
+        expected["cwd"] = str(request.folder)
+        if request.kind != saved_kind(launch):
             raise ValueError("producer publication uses another backend")
         variable = "CODEX_HOME" if saved_kind(launch) == "codex" else "CLAUDE_CONFIG_DIR"
         process_home = Path(observed.environment.get(variable) or Path.home() / (".codex" if saved_kind(launch) == "codex" else ".claude"))
-        if process_home.resolve() != Path(contract["home"]).resolve():
+        if process_home.resolve() != request.home.resolve():
             raise ValueError("producer publication uses another account")
     elif isinstance(owner.worktree, staff.PresentWorktree):
         expected["cwd"] = str(owner.worktree.path)

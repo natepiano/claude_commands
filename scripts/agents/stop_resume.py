@@ -306,8 +306,8 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
             worktree=staff.PresentWorktree(remote.local_machine(), folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
         if entry["pane_id"]:
-            expectation = pane_launch.ProducerStartExpectation(row.id, native, kind, folder, home.path)
-            with pane_launch.producer_start(pane_record.record_directory(), expectation):
+            expectation = pane_launch.ProducerLaunchRequest(row.id, native, kind, folder, home.path)
+            with pane_launch.producer_launch_request(expectation):
                 row = pane_launch.staff_admitted(row)
             client.remember_row_tab(str(row.id), entry["pane_id"])
         else:
@@ -424,8 +424,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
         row = staff.ensure("producer", name=request.name, runtime_id=identity,
             worktree=staff.PresentWorktree(remote.local_machine(), request.folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
-        expectation = pane_launch.ProducerStartExpectation(row.id, identity, kind, request.folder, pending.home)
-        with pane_launch.producer_start(pane_record.record_directory(), expectation):
+        expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
+        with pane_launch.producer_launch_request(expectation):
             row = pane_launch.staff_admitted(row)
         publication = pane_record.read_strict(client.session).get(pending.pane)
         if publication is None or not publication.get("producer_binding", False):
@@ -1231,6 +1231,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
+        if row is not None and row.kind == "producer":
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            entry["environment"] = expectation.environment(entry["environment"])
         if row is None:
             entry["config_dir"] = str(target_dir)
             previous_home = pane_launch.config_home(original.entry, record=names.tab_record) if original is not None else staff.HomeUnknown()
@@ -1293,8 +1296,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
-            expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
-            start_scope.enter_context(pane_launch.producer_start(pane_record.record_directory(), expectation))
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            start_scope.enter_context(pane_launch.producer_launch_request(expectation))
             completed = expectation.expected_launch(entry)
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             if row is None:

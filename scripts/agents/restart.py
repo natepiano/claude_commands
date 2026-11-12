@@ -348,6 +348,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
                        client.saved_row_tab(str(row.id), row.name, workspace))
+        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+        expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
+        if row.kind == "producer":
+            environment = expectation.environment(environment)
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):
@@ -384,11 +388,9 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         settings = conf.read("shutdown")
         start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
-        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
         if isinstance(opening, herdr.OpeningPrompt):
             opening = replace(opening, transcript=herdr.SessionTranscript(selected_home, str(row.current_session)))
-        expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(folder), selected_home)
-        scope = (pane_launch.producer_start(pane_record.record_directory(), expectation)
+        scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
