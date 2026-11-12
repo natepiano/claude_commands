@@ -608,6 +608,15 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
+  Both tables use `display_cells.fitted(headers, rows, *, cuttable, columns)` before escaping cells.
+  `cuttable` contains original column indexes in cut order, so equal header text does not change the selected columns.
+  The helper omits columns whose cells are all `—`; a table without rows keeps its columns.
+  Both callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
+  The helper measures display columns with `terminal_cells.terminal_width` and allows four columns for the terminal margin.
+  Row width is `1 + sum(width + 3)`, with each width at least three columns.
+  The helper cuts text in the specified order until the rows fit or each cuttable column reaches its header width.
+  A cut adds `…` and never splits a wide character.
+  Fixed columns and minimum text widths can exceed a smaller configured width.
   The command reads terminal metadata, never pane contents.
   - **Status and anomalies:** Both tables derive Status through the shared session classifier and the staff hold fields.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
@@ -654,11 +663,17 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
     Plans above 20 phases use 20 equal groups, with open before not started before done.
     The bar has no text cut, and all three characters use the same display width.
+    When the table keeps Progress, it adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+    `progress_cell` and `progress_legend` use the same `ProgressState` constants for the squares and labels.
+    A table with no Progress bar in any row has no legend; the style table also has no legend.
     Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
     Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
-    Notes limits text to 80 characters and ends longer text with `…`.
+    Notes first limits text to 80 characters and ends longer text with `…`.
+    The table then cuts Queued, Non-Phase Work, Workers, and Notes, in that order, to fit the width.
+    Notes keeps its text while another cuttable column can shrink.
+    Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Non-Phase Work or Queued.
@@ -692,7 +707,8 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     The table shows the oldest assigned or checkpointed ticket.
     Otherwise, it shows `idle (<HH:MM>)` with the last refill time, else `idle`.
     `NoTicket` represents a unit with no such ticket.
-  - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. The full refill outcome appears only in Step, including any sync wait reason. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
+    The table cuts Step before Ticket to fit the width.
+  - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. Step includes the refill outcome and any sync wait reason, subject to the table width. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
   - **Style counts:** The production's `Style units` table assigns families to each unit.
     `style_units.table` sums `FamilyCounts` across those families for each unit row.
     Findings built counts all built findings; Last 24 h counts findings first built in the last 24 hours.

@@ -788,3 +788,59 @@ It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
 `remove-images` changes the home image and keeps regional stacks and copied images.
 Copied image records permit cleanup after an interrupted deployment.
+
+## GPU size trial
+
+`gpu_size_trial.py` provides local preparation, a transient scaler service, cleanup, and local comparison.
+The session prepares and compares the trial without AWS calls:
+
+```sh
+python3 -m scripts.aws_target.gpu_size_trial prepare --commit SHA
+python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
+```
+
+The user installs the policy and starts the service:
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py gpu-size-trial run --trial-folder DIR --approve-resources
+```
+
+Preparation uses build admission and natedev holds.
+It builds one archive and one NixOS GPU system closure.
+The Rust tools and nextest come from Nix store paths.
+The Hana toolchain output takes precedence when it exists.
+Otherwise, the pinned host nixpkgs supplies Rust through its locked overlay.
+A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
+Preparation uses a private Cargo cache.
+It never copies the user's Rust or Cargo directories.
+It checks toolchain wrappers for home paths and tests Cargo with an empty `HOME`.
+
+The service selects the first candidate region with an applied G and VT Spot quota of at least 32.
+It checks regional offerings and current Spot prices.
+It uses the regional gate template and its NixOS image.
+A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
+The CPU gate statement remains unchanged.
+
+Each box imports the signed closure download and reboots once.
+The prepared system enables NVIDIA Vulkan and starts the trial runner.
+The runner uploads each run's report and memory rows separately.
+The wrapper records `ru_maxrss` for the largest single process of each test.
+The report excludes GPU memory.
+
+The ledger stores the mode, trial budget, and root size with each reservation.
+The USD6 check includes completed costs and full open reservations under the accounting lock.
+The daily and monthly limits still apply.
+A restart retains the trial ID, limit, region, and type order.
+A saved budget stop ends the trial.
+
+The service confirms termination before another launch.
+The guest stops five minutes before the lifetime ends.
+The expiry tag triggers two minutes before the lifetime ends.
+`ExecStopPost` cleans known boxes and uncertain launches.
+The service uses no new signal handler.
+
+`gpu_size_trial_root_gib=100` is an estimated disk requirement.
+It includes the GPU driver, runtime, archive extraction, and two test runs.
+The service reserves the configured maximum compute cost plus `gpu_size_trial_box_extra_usd` for each box.
+The default extra is USD0.05.

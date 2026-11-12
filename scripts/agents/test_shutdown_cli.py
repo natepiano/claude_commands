@@ -316,7 +316,8 @@ class RetireUnitTests(unittest.TestCase):
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
+                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
+                            + "# whole: 40..\nunits_table_columns=170\n")
         return path
 
 

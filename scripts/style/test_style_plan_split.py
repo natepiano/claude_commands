@@ -294,7 +294,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual((self.plan.read_bytes(), issue.read_bytes()), (before_plan, before_issue))
         rendered = style_units.table([live_units.LiveUnit("names", None)], {}, doc=self.doc, now=measured_at, zone=UTC,
                                      ledger_paths={"names": ledger.database})
-        self.assertIn("| names | exited | idle | idle | — | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
+        self.assertIn("| names | exited | idle | idle | 0 | 0 | 1: ready 1 · changed 0 · structure 0 · other 0 (0 min) |", rendered)
 
     def test_a_scan_error_or_time_limit_keeps_the_last_split_and_reports_the_cause(self) -> None:
         _ = self.rule("failed-split")
