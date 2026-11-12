@@ -36,7 +36,7 @@ from scripts.message import process_table
 from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
-from scripts.production.live_units import live_unit_ids
+from scripts.production.live_units import live_unit_ids as live_unit_ids
 from scripts.message.sessions import live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")

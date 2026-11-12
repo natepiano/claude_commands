@@ -351,7 +351,7 @@ def merged_checkpoints(production: Production, *, record: staff.StaffSnapshot | 
 def on_origin(request: MergeRequest) -> str | None:
     """Find an origin branch holding the checkpoint, trying the unit branch first."""
     checkout = request.production.checkout
-    fetched = git(checkout, "fetch", "origin", request.unit.branch)
+    fetched = git(checkout, "fetch", "--no-prune", "origin", request.unit.branch)
     # A missing unit branch is not a failure: another head may hold this phase.
     missing = fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
                                         f"refs/heads/{request.unit.branch}").returncode == 2
@@ -359,15 +359,18 @@ def on_origin(request: MergeRequest) -> str | None:
         _ = good(fetched, "ancestry")
         if git(checkout, "merge-base", "--is-ancestor", request.commit, "FETCH_HEAD").returncode == 0:
             return f"origin/{request.unit.branch}"
-    # Explicit heads also work with a narrow fetch refspec. Prune so a deleted
-    # remote branch cannot certify a checkpoint through its stale tracking ref.
-    _ = good(git(checkout, "fetch", "--prune", "origin",
-                 "+refs/heads/*:refs/remotes/origin/*"), "ancestry")
+    # Fetch every head without deleting refs shared with other worktrees.
+    fetched = git(checkout, "fetch", "--no-prune", "--porcelain", "--verbose", "origin",
+                  "+refs/heads/*:refs/remotes/origin/*")
+    _ = good(fetched, "ancestry")
+    advertised = {fields[2]: fields[1] for line in fetched.stdout.splitlines()
+                  if line[:1] in (" ", "+", "*", "=") and len(fields := line[1:].split()) == 3
+                  and fields[2].startswith("refs/remotes/origin/")}
     refs = good(git(checkout, "for-each-ref", "--contains", request.commit,
-                    "--format=%(refname) %(symref)", "refs/remotes/origin/"), "ancestry")
+                    "--format=%(refname) %(objectname) %(symref)", "refs/remotes/origin/"), "ancestry")
     for line in refs.splitlines():
         fields = line.split()
-        if len(fields) == 1:  # origin/HEAD is an alias, not an origin branch.
+        if len(fields) == 2 and advertised.get(fields[0]) == fields[1]:
             return fields[0].removeprefix("refs/remotes/")
     return None
 
@@ -707,16 +710,18 @@ def undo_failed_push(production: ProductionDocument, old_origin: str, before_mer
     checkout = production.checkout
     if git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         _ = good(git(checkout, "merge", "--abort"), "push")
-    remote = good(git(checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}"), "push")
-    if remote.split() and remote.split()[0] == old_origin:
-        _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
+    if old_origin:
+        remote = good(git(checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}"), "push")
+        if not remote.split() or remote.split()[0] != old_origin:
+            return
+    _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
 
 
 def merge_main(production: ProductionDocument) -> None:
     """Integrate main before the checkpoint selects and runs its tests."""
     checkout = production.checkout
-    _ = good(git(checkout, "fetch", "origin", "main"), "push")
-    main = git(checkout, "rev-parse", "origin/main")
+    _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "push")
+    main = git(checkout, "rev-parse", "refs/remotes/origin/main")
     if main.returncode == 0:
         merge_main_commit(production, main.stdout.strip())
 
@@ -739,8 +744,11 @@ def merge_main_commit(production: ProductionDocument, main_commit: str) -> None:
 @contextmanager
 def push_rollback(production: ProductionDocument, before_merge_tip: str) -> Generator[None]:
     """Restore the original tip if preparation or publication fails before the push."""
-    old_origin = good(git(production.checkout, "rev-parse", f"origin/{production.merge_branch}"), "push")
+    ref = f"refs/remotes/origin/{production.merge_branch}"
+    old_origin = ""
     try:
+        _ = good(git(production.checkout, "fetch", "origin", f"+refs/heads/{production.merge_branch}:{ref}"), "push")
+        old_origin = good(git(production.checkout, "rev-parse", ref), "push")
         yield
     except (checkpoint_gate.Stop, OSError, ValueError):
         if before_merge_tip:
@@ -779,8 +787,8 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
         with push_rollback(production, before_merge_tip):
             _ = publication_lock.enter_context(main_push_lock.main_push_lock(checkout))
             while follow_main:
-                _ = good(git(checkout, "fetch", "origin", "main"), "push")
-                if git(checkout, "merge-base", "--is-ancestor", "origin/main", tested_tip).returncode == 0:
+                _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "push")
+                if git(checkout, "merge-base", "--is-ancestor", "refs/remotes/origin/main", tested_tip).returncode == 0:
                     break
                 merge_main(production)
                 tip = good(git(checkout, "rev-parse", "HEAD"), "test")
@@ -807,8 +815,8 @@ def refresh_pushed_tip(production: ProductionDocument, tip: str) -> str:
 def pushed_state(production: ProductionDocument, checkpoint: str) -> PushedTip | NotYetPushed:
     checkout = production.checkout
     branch = production.merge_branch
-    _ = good(git(checkout, "fetch", "origin", branch), "push")
-    remote = f"origin/{branch}"
+    remote = f"refs/remotes/origin/{branch}"
+    _ = good(git(checkout, "fetch", "origin", f"+refs/heads/{branch}:{remote}"), "push")
     if git(checkout, "merge-base", "--is-ancestor", checkpoint, remote).returncode:
         return NotYetPushed()
     return PushedTip(good(git(checkout, "rev-parse", remote), "push"))
@@ -839,16 +847,16 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
         PromotionAlreadyAtTip | PromotionOriginPushed | PromotionAdvanced | PromotionNotPushed):
     """Fast-forward one main checkout and push any eligible unpushed tip."""
     with main_push_lock.main_push_lock(checkout):
-        _ = good(git(checkout, "fetch", "origin", merge_branch), "promote")
+        _ = good(git(checkout, "fetch", "origin", f"+refs/heads/{merge_branch}:refs/remotes/origin/{merge_branch}"), "promote")
         current_branch = good(git(checkout, "branch", "--show-current"), "promote")
         if current_branch != "main":
             raise checkpoint_gate.Stop("promote", "failed", f"{checkout} is on {current_branch}, expected main",
                        "switch the promotion checkout to main and rerun this checkpoint")
         current = good(git(checkout, "rev-parse", "main"), "promote")
-        _ = good(git(checkout, "fetch", "origin", "main"), "promote")
+        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "promote")
         if current == tip:
-            unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
-            foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"),
+            unpushed = good(git(checkout, "rev-list", "refs/remotes/origin/main..main"), "promote")
+            foreign = good(git(checkout, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"),
                            "promote")
             if foreign:
                 return PromotionNotPushed(tip, True)
@@ -864,8 +872,8 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             status = git(checkout, "status", "--short").stdout.strip()
             raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
                        "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-        unpushed = good(git(checkout, "rev-list", "origin/main..main"), "promote")
-        foreign = good(git(checkout, "rev-list", "main", "^origin/main", f"^origin/{merge_branch}"), "promote")
+        unpushed = good(git(checkout, "rev-list", "refs/remotes/origin/main..main"), "promote")
+        foreign = good(git(checkout, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
         if foreign:
             return PromotionNotPushed(tip, False)
         if unpushed:
@@ -1468,8 +1476,10 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
     publication_started = False
     tip = ""
     try:
-        published_tip = good(git(shared.production.checkout, "rev-parse",
-                                 f"origin/{shared.production.merge_branch}"), "test")
+        remote = f"refs/remotes/origin/{shared.production.merge_branch}"
+        _ = good(git(shared.production.checkout, "fetch", "origin",
+                     f"+refs/heads/{shared.production.merge_branch}:{remote}"), "test")
+        published_tip = good(git(shared.production.checkout, "rev-parse", remote), "test")
         paths = prepare_checkpoint(shared.production, first.merge_head, published_tip=published_tip)
         test_tip = good(git(shared.production.checkout, "rev-parse", "HEAD"), "test")
         retest(paths, test_tip)
