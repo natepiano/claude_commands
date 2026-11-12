@@ -3304,35 +3304,76 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: done
 **Depends on:** Phase 193
 
+#### As-built
+
+- Checkpoint `7a5781915`. `CrateRun.advance` (`crate_run.py:977`) looks up the package and its saved stage before frozen checkout acquisition and returns for `ABANDONED` and `INTEGRATED`; the `serial` run lock and the `complete_run` context stay around the return, and the nine other stages still acquire the checkout. The proof (in the checkpoint message) shows that the terminal body, `complete_run`, `copies.workspace`, `copies.end_workspaces` and the `scratch` removal path read the canonical manifest, worker records, holds and the copies registry, never the frozen checkout; the skipped work is the unused `copies.standing` lifetime. One row in an existing terminal cleanup test (`test_crate_run.py:511`) fails on the old code. 96 tests and 587 assertions kept. aws pairs: `test_crate_run.py` 58.06 to 56.15 CPU s (1.91 s); `test_bulk_run.py` unchanged.
+
+### Phase 195 — Profile the copy-guard source scan and name its removable work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Local runs: `copies/test_copy_guard_sources.py` 34.1 and 20.2 CPU s (two runs, both pass). Step split: Python policy evaluation 15.8–16.2 s, shell checks 2.8–3.0 s, AST parses 2.0 s, file reads 0.03 s, no child processes. Both tests already share one scan; each file is read and parsed once. Candidates (bounds, not measured; all queue-owned in `scripts/copies/copy_guard.py`): allocate fallbacks only for missing keys (`:797`) 0–9.8 s; combine scope traversals (`:900,1124`) 0–1.8 s; smaller items below 0.4 s. First aws trial: the `:797` change alone, three pairs, all 50 policy tests kept, after queue's go. Report: `phases/195/copy_guard_report.md` in the session folder.
+
+### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: todo
+**Depends on:** none
+
 #### Work Order
 
-**Goal:** A crate run that resumes in a terminal stage returns without building the frozen checkout, with every cleanup, lock and evidence check kept.
+**Goal:** A report splits the CPU of the four `test_bulk_run.py` interruption cases and their shared setup, and names any repeated preparation, with a bounded estimate and an owner for each item.
 
-**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R1): only if a terminal resume never reads that checkout; show that proof in the checkpoint. Tell style and queue (owner of `scripts/copies`) before the edit. Paired aws trials decide.
+**Decision:** architect after Phase 193 (next items step 6, item 3): research only; no code change. style owns `scripts/style/bulk_run.py`. Assign no saving before a controlled trial.
 
 **Spec:**
-1. Prove first: trace every read of the frozen checkout on the terminal path from `style/crate_run.py:974` through `complete_run` (`:1159`) and `copies.end_workspaces`. Write the proof to `phases/194/terminal_proof.md` in the session folder. If any terminal read exists, stop and report; land nothing.
-2. Move only the package lookup and the terminal-stage check before frozen checkout acquisition (`crate_run.py:979,986`). Keep the serial run lock and the `complete_run` context around that return.
-3. Keep every owner, unsaved-file, busy-lock, pending-removal and result-evidence check. Do not skip the checkout for selected, pending, claimed, tested or imported work.
-4. Add one row to an existing terminal test in `test_crate_run.py` that fails if a terminal resume builds the frozen checkout.
-5. Run `test_crate_run` and every importer of `crate_run.py`. The director runs three aws pairs.
+1. Profile `style/test_bulk_run.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> style/test_bulk_run.py --tests 10 --commands 10`, two runs.
+2. Separate the four interruption cases at `test_bulk_run.py:713` and their shared setup: admission startup, child processes, Git, journals and recovery.
+3. Map each assertion to the work it proves. Name preparation that each case repeats and a class fixture could hold.
+4. Keep real admission startup, interruption, journals and recovery. Give each candidate a bounded estimate (kept apart from measurements), its file and line, and its owner.
+5. Change no repository file. Write the report to `phases/196/bulk_run_report.md` in the session folder.
 
 **Files:**
-- `scripts/style/crate_run.py` — the terminal return before checkout acquisition.
-- `scripts/style/test_crate_run.py` — the new row.
-- `phases/194/terminal_proof.md` — in the session folder.
+- `phases/196/bulk_run_report.md` — in the session folder.
 
-**Workers:** 1 writer; the proof and the change are one unit.
-- impl: all files.
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
 
 **Constraints from prior phases:**
-- Phase 191: twenty terminal-entry frozen scopes cost 2.86 CPU s inclusive, in seven tests. Not measured as a saving.
-- Phase 193 changes `test_crate_run.py` fixtures; this phase starts after it lands so the aws pairs measure one change.
+- Phase 194: `test_bulk_run.py` 42.87 CPU s median in aws pairs (108 tests).
+- No speed phase is selected from a local estimate; aws pairs decide.
 
 **State:** none.
 
 **Acceptance gate:**
-- The proof shows no read of the frozen checkout on the terminal path.
-- `python3 -m unittest` passes `test_crate_run` and every importer of `crate_run.py`.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
+- The report gives the per-case split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
+- No repository file changes.
+
+### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because the Python policy builds a fallback value only when a key is missing, with every policy check kept.
+
+**Decision:** queue go via builds, 2026-11-12: one aws paired trial of `copy_guard.py:797` alone (3 pairs, all 50 policy tests kept). Code lands only on a measured gain. Send the change to queue for review before its checkpoint.
+
+**Spec:**
+1. At `scripts/copies/copy_guard.py:797`, build the fallback only when the key is missing (for example `if key not in mapping` before the allocation, in place of an eager `get(key, <new value>)` or `setdefault`). Read the Phase 195 report section for this candidate first.
+2. Keep the result of every lookup the same for every input. Change nothing else in `copy_guard.py`.
+3. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
+4. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. The director runs three aws pairs.
+
+**Files:**
+- `scripts/copies/copy_guard.py` — the lookup at line 797.
+
+**Workers:** 1 writer; one small change.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 195: Python policy evaluation 15.8–16.2 CPU s locally; this candidate's bound is 0–9.8 s and includes required work. Not measured as a saving.
+
+**State:** none.
+
+**Acceptance gate:**
+- All importers of `copy_guard.py` pass with unchanged test counts; basedpyright reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
+- queue reviews the change before the checkpoint.
