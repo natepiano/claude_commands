@@ -34,6 +34,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve
+from scripts.rebuild import need
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
 
@@ -162,6 +163,24 @@ def repository_seed() -> Path:
 
 
 class ReviewTextTests(unittest.TestCase):
+    def test_button_borders_keep_three_to_one_contrast_in_both_schemes(self) -> None:
+        body = change_page.document("").decode()
+        colors = re.search(r'background:light-dark\((#[0-9a-f]{6}),(#[0-9a-f]{6})\);color:CanvasText;'
+                           + r'border:1px solid light-dark\((#[0-9a-f]{6}),(#[0-9a-f]{6})\)', body)
+        assert colors is not None
+
+        def luminance(color: str) -> float:
+            channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+            linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+                      for channel in channels]
+            return sum(channel * weight for channel, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+        for fill, border, background in ((colors[1], colors[3], "#ffffff"), (colors[2], colors[4], "#1c1b22")):
+            for adjacent in (fill, background):
+                with self.subTest(fill=fill, border=border, adjacent=adjacent):
+                    high, low = sorted((luminance(border), luminance(adjacent)), reverse=True)
+                    self.assertGreaterEqual((high + 0.05) / (low + 0.05), 3)
+
     def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
         text = '\n First <line> \r\n\r Second & line\u2028Third\n'
         for block in ("p", "pre"):
@@ -329,6 +348,7 @@ class ChangePageTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.temporary / "state"),
             "STAFF_FILE": str(self.temporary / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.temporary / "showrunner-state"),
+            "REBUILD_NEEDS_DIR": str(self.temporary / "rebuild-needs"),
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
@@ -769,7 +789,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(forms.outcomes[key], [])
                 self.assertNotIn(key, forms.save_urls)
                 self.assertIn("No showrunner owns this question.", body)
-                self.assertIn("Route an unknown owner?", body)
+                self.assertIn("Which layout gives each review card enough space for its controls?", body)
                 fields = {"row": key, "token": change_browser.row_token(browser, key),
                           "outcome": "answer", "feedback": "Use compact"}
                 with self.assertRaisesRegex(change_page.QuestionAnswerRefused, "No showrunner owns"):
@@ -1111,7 +1131,8 @@ class ChangePageTests(unittest.TestCase):
         production = read_production(owner, record)
         items = [item.item for item in update_registration.question_records(production, identities) if item.status == "open"]
         item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text,
-            question=text + "?\n1. Compact <layout>\n2. Wide layout", asked_by=(asker or self.unit).id)
+            question="Which layout gives each review card enough space for its controls?\n1. Compact <layout>\n2. Wide layout",
+            asked_by=(asker or self.unit).id)
         update_registration.store_questions(production, [*items, item], identities)
         filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
         return "question/" + owner.id + "/" + filed.path.name
@@ -1140,15 +1161,71 @@ class ChangePageTests(unittest.TestCase):
         _, forms, body = self.browser()
         self.assertIn('data-review-type="questions"', body)
         self.assertIn('data-review-type="changes"', body)
-        self.assertNotIn('data-review-type="rebuilds"', body)
+        self.assertIn('data-review-type="rebuilds"', body)
         self.assertIn('data-type-count="questions">1</span>', body)
         self.assertIn('data-type-count="changes">4</span>', body)
-        self.assertIn("Choose the layout?", body)
+        self.assertIn("Which layout gives each review card enough space for its controls?", body)
+        self.assertEqual(body.count("Choose the layout"), 1)
+        self.assertIn("questions:'Questions to answer',changes:'Changes to review',rebuilds:'Rebuilds needed'", body)
+        self.assertIn('<title>Changes to review</title>', body)
         self.assertIn("Compact &lt;layout&gt;", body)
         self.assertIn("Asked by builder-unit", body)
         self.assertEqual(forms.tabs[question], "page-owner")
         self.assertEqual(forms.outcomes[question], ["answer"])
         self.assertEqual(forms.question_counts["page-owner"], 1)
+
+        with self.subTest(rebuilds="missing folder"):
+            browser = change_page.ReviewBrowser("private-rebuilds")
+            status = change_page.DeliveryStatus(self.root)
+            with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
+                body = change_browser.render(browser, status).decode()
+            reads.assert_called_once_with()
+            self.assertIn('data-type-count="rebuilds">0</span>', body)
+            self.assertIn('<p>No rebuild is needed.</p>', body)
+            self.assertFalse(Path(os.environ["REBUILD_NEEDS_DIR"]).exists())
+
+        with self.subTest(rebuilds="machine reasons and current names"):
+            owner = next(row for row in staff.snapshot().rows if row.name == "page-owner")
+            second = fixture_member("unit", name="second-session", parent=owner.id)
+            _ = staff.rename(self.unit.id, "renamed <unit>")
+            rows: tuple[tuple[need.Machine, str, str, str, str, str], ...] = (
+                ("natedev", "b" * 40, "Apply the second settings.", second.id, second.id, "2026-11-12T13:00:00+00:00"),
+                ("natedev", "a" * 40, "Apply the first <settings>.", self.unit.id, owner.id, "2026-11-12T12:00:00+00:00"),
+                ("mac", "c" * 40, "Apply the Mac settings.", "unknown-staff", "unknown-requester", "2026-11-12T11:00:00+00:00"),
+            )
+            for machine, commit, reason, concerns, requester, created in rows:
+                need.add_need(machine, commit, reason, concerns, requester)
+                path = Path(os.environ["REBUILD_NEEDS_DIR"]) / f"{machine}-{commit}.json"
+                record = cast(need.NeedRecord, json.loads(path.read_text()))
+                record["created_at"] = created
+                _ = path.write_text(json.dumps(record))
+            with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
+                body = change_browser.render(browser, status).decode()
+            reads.assert_called_once_with()
+            self.assertIn('data-type-count="rebuilds">2</span>', body)
+            self.assertLess(body.index('data-review-type="changes"'), body.index('data-review-type="rebuilds"'))
+            block = body.split('<div hidden data-rebuilds data-count="2">', 1)[1].split('</div>', 1)[0]
+            self.assertLess(block.index('data-machine="mac"'), block.index('data-machine="natedev"'))
+            self.assertIn('<h2>natedev · <code>bbbbbbb</code></h2>', block)
+            self.assertIn('<h2>mac · <code>ccccccc</code></h2>', block)
+            self.assertLess(block.index("Apply the first &lt;settings&gt;."), block.index("Apply the second settings."))
+            self.assertIn("For renamed &lt;unit&gt; · requested by page-owner", block)
+            self.assertIn("For second-session</p>", block)
+            self.assertNotIn("requested by second-session", block)
+            self.assertIn("For unknown-staff · requested by unknown-requester", block)
+            for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
+                self.assertNotIn(control, block)
+            self.assertIn("showrunners.hidden=rebuildMode", body)
+            self.assertIn("next.hidden=rebuildMode || waiting().length===0", body)
+            self.assertIn(".length+rebuildCount)+' waiting'", body)
+
+            with self.subTest(rebuilds="need spacing"):
+                self.assertIn('[data-rebuilds] li p{margin:0}', body)
+                gaps = re.search(r'\[data-rebuilds\] li p\+p\{margin-top:(\d+)px\}'
+                                 + r'\[data-rebuilds\] li\+li\{margin-top:(\d+)px\}', body)
+                self.assertIsNotNone(gaps)
+                assert gaps is not None
+                self.assertLess(int(gaps[1]), int(gaps[2]))
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:
         destination = fixture_member("showrunner", name="destination")
@@ -2104,8 +2181,15 @@ class ChangePageTests(unittest.TestCase):
         del path
         self.assertEqual(forms.pending, dict.fromkeys(forms.rows, True))
         self.assertEqual(forms.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback", "question"])
+        with self.subTest(button="negative verdict label"):
+            self.assertIn('name="outcome" value="not works">Does not work</button>', body)
+            self.assertNotIn('>Not works</button>', body)
         self.assertIn('data-next hidden>Next', body)
-        self.assertIn('<p data-left></p>', body)
+        self.assertNotIn('data-left', body)
+        self.assertIn('<p hidden data-empty></p>', body)
+        self.assertIn("empty.hidden=rebuildMode || current!==null", body)
+        self.assertIn("No questions are waiting.", body)
+        self.assertIn("No changes are waiting.", body)
         self.assertIn("current===row && tab===row.dataset.tab && navigation===position", body)
         self.assertIn("row.dataset.pending='false';form.hidden=true", body)
         self.assertIn("go(following?.dataset.key || '')", body)
@@ -2156,7 +2240,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("C1: the user asks you to validate this", self.messages[0][2])
         self.assertIn(words, self.messages[0][2])
         page = self.request(self.page_path, {}).body
-        self.assertIn("2 changes left", page)
+        self.assertNotIn("changes left", page)
         self.assertIn('value="next">Next', page)
         self.assertNotIn("Saved:", page)
         self.assert_no_delivery_controls(page)
@@ -2230,7 +2314,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(set(urgency.ended(queue.name)), {"demo/C1"})
         self.assertNotIn("demo/C1", [entry.key for entry in urgency.queue_order(queue.entries, queue.name)])
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["demo"])
-        self.assertIn("3 changes left", self.request(path, {}).body)
+        self.assertNotIn("changes left", self.request(path, {}).body)
 
     def test_paths_commands_extra_fields_and_forged_page_tokens_are_refused(self) -> None:
         before = self.review_list.read_bytes()
@@ -2953,7 +3037,7 @@ class ChangePageTests(unittest.TestCase):
         urgency.pin(queue.name, "C3")
         folders = set(self.root.iterdir())
         page = self.request(self.page_path, {}).body
-        self.assertIn("2 changes left", page)
+        self.assertNotIn("changes left", page)
         self.assertIn('value="next">Next', page)
         self.assertEqual(set(self.root.iterdir()), folders)
         for fields in ({"outcome": "next", "token": "wrong"},
@@ -2973,7 +3057,7 @@ class ChangePageTests(unittest.TestCase):
         for row in page.rows:
             self.assertEqual(self.request(path, dict(self.answer(row), token=page.token)).status, 303)
         body = self.request(path, {}).body
-        self.assertIn("0 changes left", body)
+        self.assertIn("No changes are waiting.", body)
         self.assertNotIn('value="next"', body)
         self.assertEqual(self.request(path, {"outcome": "next", "token": page.token}).status, 400)
 

@@ -54,6 +54,8 @@ The JSON output contains the newest record fields with the joined `reason`.
 
 `read_needs() -> list[MachineNeeds]` gives the page the same summaries as the list command.
 Each `MachineNeeds` contains `newest: NeedRecord` and `reasons: tuple[str, ...]`.
+Its `records: tuple[NeedRecord, ...]` retains each open record, from oldest to newest.
+The review page uses these records to show each reason with its own staff member.
 Its `record()` method returns the newest fields with the joined reason.
 The reader reads only the open JSON files in the needs folder.
 It does not read completed files or run subprocesses.

@@ -16,6 +16,7 @@ from scripts.lib import conf, urgency
 from scripts.production import change_review, change_routing, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.issues import frontmatter
+from scripts.rebuild import need
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
@@ -58,6 +59,7 @@ class PreparedReviews:
     queues: dict[str, change_review.ChangeQueue]
     questions: tuple[WaitingQuestion, ...]
     question_tabs: tuple[str, ...]
+    record: staff.StaffSnapshot
 
 
 def page_at(root: Path, path: str) -> ReviewBrowser:
@@ -164,7 +166,7 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     questions.sort(key=lambda item: (item.record.item["since"], item.key))
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
-    return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs)
+    return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs, routing.record)
 
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
@@ -202,9 +204,30 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
+def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
+    """Show each machine's reasons with the current staff names."""
+    def name(identity: str) -> str:
+        member = record.by_id(staff.StaffId(identity))
+        return html.escape(member.name if member is not None else identity)
+
+    blocks: list[str] = []
+    for machine in machines:
+        items: list[str] = []
+        for item in machine.records:
+            requester = (" · requested by " + name(item["requested_by"])
+                         if item["requested_by"] and item["requested_by"] != item["concerns"] else "")
+            items.append(f'<li><p>{html.escape(item["reason"])}</p><p>For {name(item["concerns"])}{requester}</p></li>')
+        blocks.append(f'<article data-machine="{html.escape(machine.newest["machine"])}">'
+            + f'<h2>{html.escape(machine.newest["machine"])} · <code>{html.escape(machine.newest["nixos_commit"][:7])}</code></h2>'
+            + '<ul>' + ''.join(items) + '</ul></article>')
+    return (f'<div hidden data-rebuilds data-count="{len(machines)}">'
+            + (''.join(blocks) if blocks else '<p>No rebuild is needed.</p>') + '</div>')
+
+
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
     prepared = prepare(browser, status)
+    rebuilds = need.read_needs()
     tabs = ''.join(f'<button type="button" role="tab" data-type="changes" data-showrunner="{html.escape(tab)}">'
                    + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
                    for tab in prepared.queues)
@@ -213,15 +236,19 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
         for tab in prepared.question_tabs)
     type_tabs = ('<nav role="tablist" aria-label="Review type">'
         + f'<button type="button" role="tab" data-review-type="questions">Questions (<span data-type-count="questions">{len(prepared.questions)}</span>)</button>'
-        + f'<button type="button" role="tab" data-review-type="changes">Changes (<span data-type-count="changes">{sum(item.waiting for item in prepared.changes)}</span>)</button></nav>')
+        + f'<button type="button" role="tab" data-review-type="changes">Changes (<span data-type-count="changes">{sum(item.waiting for item in prepared.changes)}</span>)</button>'
+        + f'<button type="button" role="tab" data-review-type="rebuilds">Rebuilds (<span data-type-count="rebuilds">{len(rebuilds)}</span>)</button></nav>')
     content = ('''<style>[hidden]{display:none!important}nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:8px}
 nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
 section+section{border:0;margin:0;padding:0}
+[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:24px;padding-top:12px}
+[data-rebuilds] li p{margin:0}[data-rebuilds] li p+p{margin-top:4px}[data-rebuilds] li+li{margin-top:16px}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
-</style><h1>Changes to review</h1>''' + type_tabs + '<nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav>'
+</style><h1 data-review-heading>Changes to review</h1>''' + type_tabs + '<nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav>'
                + ''.join(section(item, feedback_rows) for item in prepared.changes)
                + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
-               + '<p data-total></p><p data-left></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
+               + rebuild_list(rebuilds, prepared.record)
+               + '<p hidden data-empty></p><p data-total></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
                + '<noscript>Enable JavaScript to review changes and use Next.</noscript>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
     return change_page.document(content)
@@ -321,8 +348,11 @@ SCRIPT = r'''
 const rows=[...document.querySelectorAll('section[data-key]')];
 const allTabs=[...document.querySelectorAll('[data-showrunner]')];
 const types=[...document.querySelectorAll('[data-review-type]')];
+const rebuilds=document.querySelector('[data-rebuilds]'), rebuildCount=Number(rebuilds.dataset.count);
+const showrunners=document.querySelector('nav[aria-label="Showrunner"]');
 const total=document.querySelector('[data-total]');
-const next=document.querySelector('[data-next]'), left=document.querySelector('[data-left]');
+const next=document.querySelector('[data-next]'), empty=document.querySelector('[data-empty]');
+const heading=document.querySelector('[data-review-heading]');
 const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
 function waiting(){return rows.filter(r=>r.dataset.type===kind && r.dataset.tab===tab && r.dataset.pending==='true');}
 function show(){
@@ -330,18 +360,24 @@ function show(){
  const requested=place.has('row') ? place.get('row') : initial;
  kind=place.get('type') || rows.find(r=>r.dataset.key===requested)?.dataset.type || (rows.some(r=>r.dataset.type==='questions') ? 'questions' : 'changes');
  const tabs=allTabs.filter(t=>t.dataset.type===kind);
+ const rebuildMode=kind==='rebuilds';
+ heading.textContent={questions:'Questions to answer',changes:'Changes to review',rebuilds:'Rebuilds needed'}[kind];
+ rebuilds.hidden=!rebuildMode;showrunners.hidden=rebuildMode;
+ document.querySelector('.navigation').hidden=rebuildMode;
  types.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.reviewType===kind));
-  t.querySelector('[data-type-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.reviewType && r.dataset.pending==='true').length;});
+  t.querySelector('[data-type-count]').textContent=t.dataset.reviewType==='rebuilds' ? rebuildCount : rows.filter(r=>r.dataset.type===t.dataset.reviewType && r.dataset.pending==='true').length;});
  allTabs.forEach(t=>t.hidden=t.dataset.type!==kind);
  tab=place.get('showrunner') || rows.find(r=>r.dataset.key===requested)?.dataset.tab || tabs[0]?.dataset.showrunner;
  if(!tabs.some(t=>t.dataset.showrunner===tab)) tab=tabs[0]?.dataset.showrunner;
  current=rows.find(r=>r.dataset.key===requested && r.dataset.tab===tab && r.dataset.type===kind) || waiting()[0] || null;
+ empty.hidden=rebuildMode || current!==null;
+ empty.textContent=kind==='questions' ? 'No questions are waiting.' : 'No changes are waiting.';
  rows.forEach(r=>r.hidden=r!==current);
  tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab && t.dataset.type===kind));
   t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.type && r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
- left.textContent=waiting().length+' '+kind+' left'; total.textContent=rows.filter(r=>r.dataset.pending==='true').length+' waiting'; next.hidden=waiting().length===0;
+ total.textContent=(rows.filter(r=>r.dataset.pending==='true').length+rebuildCount)+' waiting'; next.hidden=rebuildMode || waiting().length===0;
  if(current) remembered.set(kind+'/'+tab,current.dataset.key);
- const hash=new URLSearchParams({type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
+ const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
  places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
 function go(key){navigation++;location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
 allTabs.forEach(t=>t.addEventListener('click',()=>{tab=t.dataset.showrunner;go(remembered.get(kind+'/'+tab));}));

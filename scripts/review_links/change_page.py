@@ -346,7 +346,7 @@ ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
-button{font:inherit;margin:0 8px 8px 0;padding:6px 12px}button[aria-pressed=true]{outline:2px solid currentColor}
+button{font:inherit;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 </style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
 
 
@@ -366,7 +366,7 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row = notice.row if notice.row in page.rows else page.rows[0]
     row_id = html.escape(row)
     buttons: list[str] = []
-    for value, label in (("works", "Works"), ("not works", "Not works"),
+    for value, label in (("works", "Works"), ("not works", "Does not work"),
                          ("validate", "Validate yourself"), ("feedback", "Send feedback"), ("question", "Ask a question")):
         if value == "question" and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
@@ -518,11 +518,12 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
     queue = next_item.change_queue(page.production)
     moved = urgency.ended(queue.name)
     if saved or any(queue_key(page, row) in moved for row in page.rows):
-        sections.append(f'<p>{len(queue.entries)} changes left</p>')
         if queue.entries:
             sections.append(f'''<form method="post">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
 <button name="outcome" value="next">Next</button></form>''')
+        else:
+            sections.append('<p>No changes are waiting.</p>')
     return document("".join(sections))
 
 

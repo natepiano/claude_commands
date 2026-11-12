@@ -83,11 +83,14 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
-### Questions and Changes
+### Questions, Changes, and Rebuilds
 
-The review page has Questions and Changes type tabs with waiting counts.
-The global waiting count includes both types.
-Each type has staff-based showrunner tabs and one card at a time.
+The review page has Questions, Changes, and Rebuilds type tabs with waiting counts.
+The global waiting count includes all three types.
+The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
+The document title remains Changes to review.
+Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
+Questions and Changes have staff-based showrunner tabs and one card at a time.
 Switching types retains each type's selected showrunner and card.
 The URL fragment records the type, showrunner, and card.
 Next skips a card without saving an answer.
@@ -119,6 +122,18 @@ Recovery sends only answers with `saved: true` whose canonical question record i
 Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 The Changes tab retains its existing cards, controls, and count rules.
+
+Rebuilds shows one list, with one block per machine in machine order.
+It has no showrunner tabs, card navigation, Next, or answer form.
+Its count is the number of machines with open rebuild needs.
+Each block shows the machine and the first seven characters of its newest need's NixOS commit.
+The block lists each open need from oldest to newest.
+Each need shows its reason and the current name of the staff member it concerns.
+It also shows `requested by <name>` when the requesting staff ID differs from the affected staff ID.
+Unknown staff IDs remain visible as IDs.
+The reader uses the same staff record as the page routing.
+Each render calls `rebuild.need.read_needs()` once.
+An empty or missing needs folder shows `No rebuild is needed.` and a count of 0.
 
 ### Answering a change review
 
@@ -226,7 +241,8 @@ Next selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
 A reload restores that place when the row waits, awaits validation, or has an open question.
 An answered row stays absent from the browser list during delivery and after a reload.
-An empty tab shows **0 changes left** and hides Next.
+An empty showrunner tab shows **No changes are waiting.** or **No questions are waiting.** and hides Next.
+The showrunner tab supplies the count; the card has no separate remaining count.
 Each successful save opens the next waiting change in the same tab.
 Next skips a change without saving an answer.
 The page keeps the current row if the user selects Next or another tab during the save.
@@ -251,7 +267,7 @@ The list file stores cell line breaks as `<br>` and reads them as line breaks.
 A typed `<br>` takes one more backslash in storage and reads back unchanged.
 Every line separator that Python's `splitlines` recognizes is a line break.
 Each row stays on one table line.
-The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
+The user can select Works, Does not work, Validate yourself, Send feedback, or Ask a question.
 The feedback box is a textarea with `feedback_rows` rows.
 The setting starts at 5.
 The box accepts line breaks for every outcome.
@@ -259,7 +275,7 @@ The server converts CRLF, CR, and Unicode line separators to newline characters.
 The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
-Not works with text saves `not works: <text>`.
+Does not work with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
 Its saved verdict removes the row from the page count, including feedback that returns the change to its unit.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.

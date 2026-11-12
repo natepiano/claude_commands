@@ -83,6 +83,8 @@ class NeedTests(unittest.TestCase):
             local = next(summary for summary in summaries if summary.newest["machine"] == "natedev")
             self.assertEqual(local.newest["nixos_commit"], "b" * 40)
             self.assertEqual(local.reasons, ("Apply the first settings.", "Apply the second settings."))
+            self.assertEqual(local.records, (self.record("natedev", "a" * 40), self.record("natedev", "b" * 40)))
+            self.assertEqual([record["concerns"] for record in local.records], ["staff-a", "staff-b"])
             rows = cast(list[need.NeedRecord], json.loads(self.command("list", "--json")))
             row = next(record for record in rows if record["machine"] == "natedev")
             self.assertEqual(row["reason"], "Apply the first settings. Apply the second settings.")
