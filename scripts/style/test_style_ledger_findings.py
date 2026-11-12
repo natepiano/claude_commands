@@ -1255,8 +1255,29 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
         self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
 
+    def legacy_test_file_findings(
+        self, ledger: style_ledger.Ledger, rule: str, path: str,
+        items: tuple[tuple[int, str, str, str], ...], anchor: str,
+    ) -> tuple[style_ledger.HeldFinding, ...]:
+        """Seed item rows that predate folding during held add."""
+        blob = self.blob(rule)
+        rows = tuple(
+            (hashlib.sha256(json.dumps((rule, path, line, text, blob), separators=(",", ":")).encode()).hexdigest()[:16],
+             rule, path, line, text, before, after, blob, anchor)
+            for line, text, before, after in items
+        )
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany(
+                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,"
+                + "state,proposal,created_at,updated_at,anchor_commit) "
+                + "VALUES (?,?,?,?,?,'restructure',?,?,?,'outside','unfiled','',"
+                + "'2026-11-12T00:00:00+00:00','2026-11-12T00:00:00+00:00',?)",
+                rows,
+            )
+        return ledger.named_held(row[0] for row in rows)
+
     def test_sibling_test_file_moves_fold_at_filing_and_through_the_cli(self) -> None:
-        for mode in ("filing", "fold"):
+        for mode in ("filing", "fold", "add"):
             with self.subTest(mode=mode):
                 rule = self.rule("test-moves-" + mode, "tier: D\nfamily: modules\ninput_scope: file\n")
                 ledger = self.ledger()
@@ -1272,24 +1293,29 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 anchor = self.commit("Declare the sibling test modules")
                 originals: list[style_ledger.HeldFinding] = []
                 for path in paths:
-                    for line in range(1, 4):
-                        module = "other_tests" if path == paths[2] and line == 3 else "tests"
-                        originals.append(ledger.hold(
-                            rule, path, line, f"fn item_{line}() {{}}", "restructure", f"item_{line} lives in {path}.",
-                            f"Move item_{line} into the inline {module} module in {parent}.",
-                            self.blob(rule), "outside"))
+                    items = tuple(
+                        (line, f"fn item_{line}() {{}}", f"item_{line} lives in {path}.",
+                         f"Move item_{line} into the inline {'other_tests' if path == paths[2] and line == 3 else 'tests'} module in {parent}.")
+                        for line in range(1, 4)
+                    )
+                    if mode == "add":
+                        for line, text, before, after in items:
+                            finding = ledger.hold(rule, path, line, text, "restructure", before, after,
+                                                  self.blob(rule), "outside")
+                            originals.append(finding)
+                            if path in paths[:3]:
+                                self.assertIsInstance(finding.state, style_ledger.Withdrawn)
+                    else:
+                        originals.extend(self.legacy_test_file_findings(ledger, rule, path, items, anchor))
                 issue = self.root / (mode + ".md")
                 if mode == "filing":
-                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
-                        _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
-                                                   [(anchor, finding.finding_id) for finding in originals])
                     self.write(parent, "")
                     _ = self.commit("Remove the current declarations after judgment")
                     for finding in originals:
                         ledger.file_held(finding.finding_id, issue)
                     live = tuple(finding for finding in ledger.proposal_findings(issue)
                                  if isinstance(finding.state, style_ledger.Filed))
-                else:
+                elif mode == "fold":
                     result = self.cli("held", "fold-test-files")
                     self.assertIn("folded 3 files: 9 -> 3 findings\n", result.stdout)
                     self.assertEqual(len(result.stdout.splitlines()), 4)
@@ -1298,6 +1324,23 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     before = self.held_rows(ledger.database)
                     self.assertEqual(self.cli("held", "fold-test-files").stdout, "folded 0 files: 0 -> 0 findings\n")
                     self.assertEqual(self.held_rows(ledger.database), before)
+                else:
+                    original = originals[0]
+                    result = self.cli("held", "add", "--rule", rule, "--path", original.path,
+                                      "--line", str(original.line), "--text", original.text, "--kind", original.kind,
+                                      "--before", original.before, "--after", original.after,
+                                      "--rule-blob", original.rule_blob, "--ticket", original.ticket)
+                    self.assertEqual(result.stdout, original.finding_id + "\n")
+                    ledger.file_held(original.finding_id, issue)
+                    added = ledger.hold(rule, original.path, 4, "fn item_4() {}", "restructure", "Separate test item.",
+                                        "Inline the whole test file.", self.blob(rule), "outside")
+                    originals.append(added)
+                    self.assertIsInstance(added.state, style_ledger.Withdrawn)
+                    filed, = ledger.proposal_findings(issue)
+                    self.assertIsInstance(filed.state, style_ledger.Filed)
+                    live = tuple(finding for state in ("unfiled", "filed")
+                                 for finding in ledger.held_findings(style_ledger.HeldFindingsInState(state))
+                                 if finding.rule == rule)
                 self.assertEqual(len(live), 12)
                 for path in paths[:3]:
                     whole, = tuple(finding for finding in live if finding.path == path)
@@ -1345,9 +1388,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.write(path, "fn moved_fixture() {}\n")
                     _ = case.commit("Declare a supported sibling test module")
                     ledger = case.ledger()
-                    for line in (1, 2):
-                        _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
-                                        "Inline the whole test file.", case.blob(rule), "outside")
+                    _ = case.legacy_test_file_findings(
+                        ledger, rule, path,
+                        tuple((line, f"item_{line}", "Separate test item.", "Inline the whole test file.")
+                              for line in (1, 2)), "")
                     folded, = ledger.fold_test_files()
                     live, = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
                     self.assertEqual(folded.path, path)
@@ -1403,12 +1447,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 if generation < 2:
                     self.write(path, f"fn item_{generation}() {{}}\n")
                     anchor = self.commit("Change the sibling test file")
-                items = tuple(ledger.hold(rule, path, generation * 2 + line, f"item_{generation}_{line}",
-                                          "restructure", f"Separate item {generation}_{line}.", "Inline the whole test file.",
-                                          self.blob(rule), "outside") for line in (1, 2))
-                with closing(sqlite3.connect(ledger.database)) as connection, connection:
-                    _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
-                                               [(anchor, item.finding_id) for item in items])
+                items = self.legacy_test_file_findings(
+                    ledger, rule, path,
+                    tuple((generation * 2 + line, f"item_{generation}_{line}", f"Separate item {generation}_{line}.",
+                           "Inline the whole test file.") for line in (1, 2)), anchor)
                 result = ledger.fold_test_files()
                 live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
                 if generation == 2:
