@@ -963,7 +963,11 @@ def release_hold(directory: Path, holder: Holder) -> str:
 
 
 def release_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_RELEASE_DIR", str(Path.home() / ".local/state/build-hold-release")))
+    explicit = os.environ.get("BUILD_HOLD_RELEASE_DIR")
+    if explicit is not None:
+        return Path(explicit)
+    holders = holder_directory().absolute()
+    return holders.with_name(holders.name + "-release")
 
 
 @contextmanager
