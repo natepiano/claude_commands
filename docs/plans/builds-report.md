@@ -1113,3 +1113,37 @@ Raise it to 100800. A changed config value needs the user's go. Sent to the buil
 **Acceptance gate:**
 - `scripts.lint.test_sweep` passes, with the two new rows.
 - `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
+
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
+
+From builds (not the user), 2026-11-12: go on this phase. `tmp_sweep.py` is resources' file; the builds showrunner gave the go for this unit to write the fix. Keep it small and land fast: folder-design phase 2 changes the same sweep next.
+
+Problem: a run folder kept by a live session's worktree, an open run or a live director also keeps every entry in its `tmp/`. Killed test runs leave temp folders there, and nothing removes them. On 2026-11-12 at 13:31 the sweep kept 925 entries in one of this unit's run `tmp/` folders, and 28,642 run `tmp/` entries in all, for "a live or paused session uses its worktree". The docstring says each run `tmp/` entry is judged by the 4 h rule.
+
+#### Work Order
+
+**Goal:** Each entry of a run's `tmp/` goes after 4 h with no change and no process use, whatever keeps the run folder.
+
+**Spec:**
+- `scripts/lint/tmp_sweep.py` `judge_entries`: when the entry's root is a run `tmp/` folder (from `temp_parents`), a run keep reason from `run_folder_guards` does not apply to the entry. The run folder itself and its `tmp/` folder still stay.
+- Keep these for run `tmp/` entries: `RunKeepReason.UNREADABLE_RECORD`, the no-session-registry case (`NO_SESSIONS`), `WORKER_USES` (detached run cwd), process use (`IN_USE`), the 4 h rule and the git check.
+- Remove or rewrite the comment "Apply to every deletion path, including entries inside a protected run's tmp/." Make the module docstring state the rule once: run keep reasons keep the run folder; its `tmp/` entries go by the 4 h and process-use rules; an unreadable record keeps them.
+- Change no other root or rule. No new config value.
+- Tests in `scripts/lint/test_tmp_sweep.py`: add rows to existing tests, no new test class.
+  - A run kept for `SESSION_WORKTREE`, for `OPEN_RUN` and for `DIRECTOR`: an idle `tmp/` entry goes; a fresh `tmp/` entry stays; the run folder stays.
+  - An idle `tmp/` entry that a process uses stays.
+  - `test_unreadable_ownership_records_keep_the_run` still passes unchanged.
+  - Update `test_a_staff_run_pointer_keeps_a_run_after_its_session_stops` so it proves the run folder stays, not an idle `tmp/` entry.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py`
+- `scripts/lint/test_tmp_sweep.py`
+
+**Workers:** `1 writer`
+- writer: the sweep change and its test rows.
+
+**State:** none.
+
+**Acceptance gate:**
+- `scripts.lint.test_tmp_sweep` passes.
+- `basedpyright` reports 0 errors and 0 warnings on both files.
