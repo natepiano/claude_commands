@@ -30,7 +30,7 @@ from unittest.mock import call, patch
 
 from scripts.agents import inventory
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.message import sessions
+from scripts.message import sessions, session_records
 from scripts.agents import restart, shutdown
 from scripts.agents.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff, worker
@@ -75,6 +75,7 @@ class RestartTestCase(ShutdownTestCase):
                                                         ASTRA_RUN_ROOT=home / "astra")))
         _ = self.enterContext(patch.object(codex_daemon, "read_daemons", return_value=[]))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="fixture-start"))
+        _ = self.enterContext(patch.object(session_records, "process_start", return_value="fixture-start"))
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex1", Path.home() / ".codex1") if role == "workers" else
                     accounts.NamedAccount("claude2", Path(os.environ["CLAUDE_CONFIG_DIR"])))
@@ -1077,7 +1078,7 @@ class RestartTests(RestartTestCase):
         self.stops = []
         record = staff.StaffSnapshot(self.rows)
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=record))
-        _ = self.enterContext(patch.object(sessions, "_readable_records", side_effect=self.records))
+        _ = self.enterContext(patch.object(session_records, "_readable_records", side_effect=self.records))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
         _ = self.enterContext(patch.object(stop_resume, "stop_unit_workers", return_value=[], create=True))
@@ -1431,7 +1432,7 @@ class RestartTests(RestartTestCase):
         row = self.rows[0]
         home = self.root / ".codex1"
         observed = codex_daemon.DaemonRead(codex_daemon.CodexDaemon(home, home / "control.sock"), [
-            codex_daemon.DaemonSession(str(row.current_session), row.name, str(self.root), "idle")])
+            codex_daemon.DaemonSession(str(row.current_session), str(self.root), "idle")])
         with (patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", ())),
               patch.object(codex_daemon, "read_daemons", return_value=[observed])):
             self.assertEqual(restart.live_members([row], staff.StaffSnapshot(self.rows),
@@ -2590,7 +2591,7 @@ class RestartTests(RestartTestCase):
                     if self.rows[0].current_session in self.running:
                         identities[str(self.rows[0].current_session)] = (123,)
                     return herdr.CodexConversations(identities, ())
-                with (patch.object(sessions, "_readable_records", return_value=records),
+                with (patch.object(session_records, "_readable_records", return_value=records),
                       patch.object(herdr, "codex_conversations", side_effect=codex_conversations),
                       patch.object(herdr, "running_codex_threads",
                                    return_value={str(self.rows[0].current_session), "orphan", "codex-orphan"}) as codex,
