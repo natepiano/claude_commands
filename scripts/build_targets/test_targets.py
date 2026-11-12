@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 
-
 import io
 import json
 import os
@@ -26,7 +25,6 @@ from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
 from scripts.mac_test import offload
-from scripts.build_targets import target_config
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -164,19 +162,15 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
-    def test_aws_classification_requires_linux_and_a_name_or_settings_match(self) -> None:
-        cases: tuple[tuple[str, target_config.Platform, str, bool], ...] = (
-            ("aws", "linux", "custom.conf", True),
-            ("builder", "linux", "aws_target.conf", True),
-            ("builder", "linux", "custom.conf", False),
-            ("aws", "macos", "custom.conf", False),
-            ("builder", "macos", "aws_target.conf", False),
-            ("aws", "macos", "aws_target.conf", False),
-        )
-        for name, platform, filename, expected in cases:
-            with self.subTest(name=name, platform=platform, filename=filename):
-                target = target_config.SshTarget(name, platform, self.root / filename)
-                self.assertEqual(target_config.is_aws_target(target), expected)
+    def test_removed_builder_cannot_register_by_name_or_settings(self) -> None:
+        registry = self.root / 'removed-target.conf'
+        for name, filename in (('aws', 'custom.conf'), ('builder', 'aws_target.conf')):
+            with self.subTest(name=name, filename=filename):
+                _ = (self.root / filename).write_text('')
+                _ = registry.write_text(f'targets={name}\nkind.{name}=ssh\nplatform.{name}=linux\nsettings.{name}={filename}\n')
+                with self.assertRaisesRegex(targets.ConfigError, 'permanent AWS builder was removed'):
+                    _ = targets.read_targets(registry)
+
 
     def test_shipped_config_reads_mac_then_natedev(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
