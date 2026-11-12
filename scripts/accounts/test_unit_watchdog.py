@@ -116,6 +116,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
         _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         _ = self.fixture.groups(units="claude2")
@@ -155,6 +156,7 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.launch(name, name, cast(str, owner["cwd"]),
             {"CLAUDE_CONFIG_DIR": str(accounts.account_dir(label)), ('' + 'SHOWRUNNER_' + 'UNIT'): "fixture",
              ('' + 'SHOWRUNNER_' + 'UNIT_ID'): name}, ["claude", "-n", owner["name"]])
+        write_text_atomic(accounts.account_dir(label) / "projects/fixture" / f"{owner['session_id']}.jsonl", "")
         pane_record.write("shared", entry)
         identity = accounts.account_identity(accounts.account_dir(label))
         assert isinstance(identity, agent_accounts.NumberedAccount)

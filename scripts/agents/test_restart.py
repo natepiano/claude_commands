@@ -1071,7 +1071,12 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         self.rows = tuple(staff.StaffRow(staff.StaffId(f"row-{n}"), "unit", f"unit-{n}", staff.StaffRoot(),
             current_session=staff.StaffId(f"conversation-{n}"),
-            worktree=staff.PresentWorktree(remote.local_machine(), self.root)) for n in range(3))
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root),
+            home=staff.SessionHome(config)) for n in range(3))
+        from scripts.production.staff_test_support import fixture_session
+
+        for row in self.rows:
+            fixture_session(str(row.current_session), staff.ClaudeBackend())
         self.running = {str(row.current_session) for row in self.rows}
         self.launches = []
         self.stops = []
@@ -1094,6 +1099,19 @@ class RestartTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr.Herdr, "save_layout"))
         _ = self.enterContext(patch.object(herdr.Herdr, "remember_row_tab"))
         _ = self.enterContext(patch.object(herdr.Herdr, "tab_sessions", return_value=[]))
+        from scripts.agents.test_pane_restore import fixture_launch_transcript
+
+        saved_records = pane_record.save
+        def save(session: str, entries: dict[str, pane_record.PaneLaunch]) -> None:
+            for entry in entries.values():
+                fixture_launch_transcript(self.root, entry, staff.StaffSnapshot(self.rows))
+            saved_records(session, entries)
+        _ = self.enterContext(patch.object(pane_record, "save", side_effect=save))
+        publish_record = pane_record.write
+        def write(session: str, entry: pane_record.PaneLaunch) -> None:
+            fixture_launch_transcript(self.root, entry, staff.StaffSnapshot(self.rows))
+            publish_record(session, entry)
+        _ = self.enterContext(patch.object(pane_record, "write", side_effect=write))
         _ = self.enterContext(patch.object(herdr.Herdr, "result", side_effect=self.layout_result))
         _ = self.enterContext(patch.object(herdr.Herdr, "panes", side_effect=self.panes))
         _ = self.enterContext(patch.object(herdr.Herdr, "native_session", side_effect=self.native))
@@ -1730,6 +1748,8 @@ class RestartTests(RestartTestCase):
                     entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root),
                         {"CODEX_HOME": str(self.root / ".codex2")}, ["codex", "--model", "old-model", "--sandbox", "read-only",
                          "-c", 'model_reasoning_effort="low"', "-c", 'service_tier="flex"'], kind="codex")
+                    from scripts.agents.test_pane_restore import fixture_launch_transcript
+                    fixture_launch_transcript(self.root, entry, staff.StaffSnapshot((row,)))
                     publication = pane_launch.LaunchPublication(self.root / "agents.json", entry) if saved else None
                     with (self.subTest(kind=row.kind, saved=saved, target=requested),
                           patch.object(pane_record, "publication_for_session", return_value=publication),
@@ -1848,6 +1868,7 @@ class RestartTests(RestartTestCase):
             self.assertEqual(output.getvalue(), f"test: trust anomaly: {reason}\n")
 
     def test_saved_codex_record_uses_workers_home_without_claude_trust(self) -> None:
+        self.running.clear()
         row = self.rows[0]
         home = self.root / ".codex2"
         workers = self.root / ".codex1"
@@ -1868,6 +1889,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(workers))
 
     def test_saved_codex_restart_uses_explicit_account(self) -> None:
+        self.running.clear()
         row = self.rows[0]
         home = self.root / ".codex2"
         target = self.root / ".codex3"
@@ -2141,6 +2163,7 @@ class RestartTests(RestartTestCase):
                 directory.mkdir(exist_ok=True)
                 original = pane_record.launch("old", producer.id, str(self.root),
                                               {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2")}, ["claude"])
+                original["staff_id"] = producer.id
                 cross = scenario in ("cross session", "source unavailable")
                 source_path = directory / ("legacy.json" if cross else "agents.json")
                 pane_launch.save(source_path, {"old": original})

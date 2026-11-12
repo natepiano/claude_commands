@@ -1818,6 +1818,7 @@ class WorkerRenameTests(StaffTestCase):
         child = fixture_worker("review", owner.id)
         world.add(owner, "w1:p0")
         world.add(child, "w1:p1", live=False, label="TEST-old-review")
+        world.record(child, "w1:p1")
         before = self.staff_file.read_bytes()
 
         def retitle(pane: str, title: str, *, tab: bool = True) -> bool:
@@ -1863,6 +1864,7 @@ class WorkerRenameTests(StaffTestCase):
                 location = fixture.world.locations[started.pane]
                 fixture.world.add(stopped, "w1:p9", live=False, label="TEST-old-review",
                                   workspace=str(location["workspace_id"]), tab=str(location["tab_id"]))
+                fixture.world.record(stopped, "w1:p9")
                 old_name = fixture.world.agent_names[-1]
                 agents = {old_name: started.pane}
                 original_run = fixture.world.run

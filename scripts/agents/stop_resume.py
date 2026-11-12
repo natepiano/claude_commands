@@ -468,7 +468,8 @@ def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_N
     for pane in client.panes():
         identity = pane["session_id"]
         entry = entries.get(pane["pane_id"])
-        owner = membership.by_member_reference(entry["session_id"]) if entry is not None else None
+        reference = pane_launch.launch_reference(entry, membership) if entry is not None else pane_launch.NativeLaunchReference("")
+        owner = membership.rows_by_id[reference.id] if isinstance(reference, pane_launch.StaffLaunchReference) else None
         saved_identity = owner.current_session if owner is not None else entry["session_id"] if entry is not None else ""
         label = pane.get("label") or ""
         producer = owner or membership.by_current_session(identity or "")
@@ -832,7 +833,7 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> t
 
 def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
     """Use the selected launch environment, retained home, or normal account."""
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     directory = entry["environment"].get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR", "")
     home = staff.SessionHome(Path(directory)) if directory else pane_launch.config_home(entry)
     if isinstance(home, staff.HomeUnknown):
@@ -845,7 +846,7 @@ def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
 def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     if kind == "claude":
         home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
         herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
@@ -866,7 +867,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
 
     from scripts.lib.agent_program import resolve_program
 
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
     unset, pane_environment = _pane_environment(tab, entry)
     environment.update(pane_environment)
@@ -1183,7 +1184,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = recovered
         if entry is not None:
             entry = names.resume(entry)
-        kind = pane_launch.agent_kind(entry) if entry is not None else "claude"
+        kind = pane_launch.saved_kind(entry) if entry is not None else (
+            pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
             kind = restart.producer_launch(row)[0]
@@ -1641,7 +1643,8 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             row = membership.by_member_reference(session) or next((row for row in membership.rows if row.name == session), None)
             identity = row.current_session if row is not None else session
             publication = pane_record.publication_for_session(identity, record=membership)
-            kind = pane_launch.agent_kind(publication.entry) if publication is not None else "claude"
+            kind = pane_launch.agent_kind(publication.entry, record=membership) if publication is not None else (
+                pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
             if row is not None and row.kind == "producer":
                 restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
                 kind = restart.producer_launch(row)[0]

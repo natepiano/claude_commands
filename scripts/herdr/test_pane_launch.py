@@ -75,12 +75,13 @@ class LaunchEnvironmentTests(unittest.TestCase):
                     source = root / "source.json"
                     destination = root / "destination.json" if case in ("different records", "interrupted records", "interrupted then unit write") else source
                     old = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)
+                    old["staff_id"] = owner.id
                     old["written_at"] = "2026-01-01T00:00:00+00:00"
                     if case == "native reference":
                         old["session_id"] = owner.current_session
                     unrelated: dict[str, pane_launch.PaneLaunch] = {
-                        "other": {**old, "pane_id": "other", "session_id": other.id},
-                        "unit": {**old, "pane_id": "unit", "session_id": member.id}}
+                        "other": {**old, "pane_id": "other", "session_id": other.id, "staff_id": other.id},
+                        "unit": {**old, "pane_id": "unit", "session_id": member.id, "staff_id": member.id}}
                     pane_launch.save(source, {"old": old, **unrelated})
                     target = "old" if case == "control same pane" else "new"
                     launch = old.copy()

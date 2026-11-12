@@ -74,6 +74,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
         with (mock.patch.object(pane_record, "RECORD_DIR", records),
               mock.patch("scripts.agents.pane_record.RECORD_DIR", records),
               mock.patch.dict(os.environ, self.env)):
+            write_text_atomic(config / "projects/fixture" / f"{owner.current_session}.jsonl", "")
             pane_record.write("agents", original)
             with (mock.patch.object(add_unit, "launched_unit", return_value=add_unit.LabeledSessionFound(labeled)),
                   mock.patch.object(add_unit, "launch_session", side_effect=launch),

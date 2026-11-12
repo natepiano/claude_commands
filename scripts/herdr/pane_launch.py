@@ -1,4 +1,4 @@
-"""Read and write retained launches without loading a terminal or lifecycle controller."""
+"""Read pane launch options and resolve current staff and native facts."""
 from __future__ import annotations
 
 import fcntl
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from scripts.message import sessions
 from scripts.herdr.place import HerdrPlace
+from scripts.herdr import herdr_types
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib import atomic_file, legacy_identity
 from scripts.production import staff
@@ -36,6 +37,7 @@ class PaneLaunch(TypedDict):
     kind: NotRequired[Literal["claude", "codex"]]
     pane_id: str
     session_id: str
+    staff_id: NotRequired[str]
     config_dir: NotRequired[str]
     cwd: str
     name: str
@@ -78,7 +80,7 @@ class ProducerStartExpectation:
 
     def expected_launch(self, entry: PaneLaunch) -> PaneLaunch:
         expected = entry.copy()
-        expected.update(session_id=self.session, kind=self.kind, cwd=str(self.folder), config_dir=str(self.home))
+        expected.update(staff_id=self.member, session_id=self.session, kind=self.kind, cwd=str(self.folder), config_dir=str(self.home))
         return expected
 
 
@@ -98,6 +100,123 @@ def producer_start(directory: Path, expected: ProducerStartExpectation) -> Gener
                 path.unlink()
 
 
+
+@dataclass(frozen=True)
+class StaffLaunchReference:
+    """The fixed staff owner supplies the current launch facts."""
+
+    id: staff.StaffId
+
+
+@dataclass(frozen=True)
+class NativeLaunchReference:
+    """An unstaffed native session retains its saved launch facts."""
+
+    session: str
+
+
+def launch_reference(entry: Mapping[str, object], record: staff.StaffSnapshot) -> StaffLaunchReference | NativeLaunchReference:
+    reference = entry.get("staff_id", entry.get("session_id", ""))
+    owner = record.by_member_reference(reference) if isinstance(reference, str) else None
+    return StaffLaunchReference(owner.id) if owner is not None else NativeLaunchReference(str(entry.get("session_id", "")))
+
+
+def current_launch(entry: PaneLaunch, record: staff.StaffSnapshot) -> PaneLaunch:
+    """Combine retained launch options with the current staff facts."""
+    reference = launch_reference(entry, record)
+    current = entry.copy()
+    if isinstance(reference, NativeLaunchReference):
+        return current
+    owner = record.rows_by_id[reference.id]
+    current.update(staff_id=owner.id, session_id=owner.current_session, name=owner.name)
+    row_folder = cast(Callable[[staff.StaffRow, staff.StaffSnapshot], tuple[str, Path]],
+        import_module("scripts.agents.shutdown_record").row_folder)
+    try:
+        current["cwd"] = str(row_folder(owner, record)[1])
+    except (ValueError, staff.StaffUnreadable):
+        # Keep the existing fallback when staff has no folder.
+        pass
+    if isinstance(owner.home, staff.SessionHome):
+        current["config_dir"] = str(owner.home.path)
+    else:
+        _ = current.pop("config_dir", None)
+    current["kind"] = agent_kind(entry, record=record)
+    return current
+
+
+class NativeBackendPanes(Protocol):
+    def panes(self) -> list[dict[str, object]]: ...
+    def result(self, *arguments: str) -> dict[str, object]: ...
+
+
+def native_kind(row: staff.StaffRow) -> str:
+    """Read the current backend from its native pane or Claude registry."""
+    module = import_module("scripts.herdr.herdr")
+    session = cast(Callable[[], str], module.shared_session)()
+    client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
+    native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
+    codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
+    claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
+    try:
+        for pane in client.panes():
+            report = pane.get("agent_session")
+            identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")
+            if identity != row.current_session:
+                continue
+            reply = client.result("pane", "process-info", "--pane", str(pane["pane_id"]))
+            info = cast(dict[str, object], reply.get("process_info", {}))
+            for value in cast(list[dict[str, object]], info.get("foreground_processes", [])):
+                arguments = cast(list[str], value.get("argv", []))
+                family = "codex" if codex(arguments) else "claude" if claude(arguments) else ""
+                pid = value.get("pid")
+                if family and isinstance(pid, int):
+                    if family == "codex":
+                        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
+                        try:
+                            if resume_thread(pid) == row.current_session:
+                                return family
+                        except (OSError, ValueError):
+                            pass
+                    if native(pid, family).current_identity == row.current_session:
+                        return family
+    except (OSError, ValueError, herdr_types.HerdrFailure):
+        pass
+    observed = sessions.session_liveness(row.current_session)
+    if isinstance(observed, sessions.LiveSessionProcess):
+        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
+        try:
+            if resume_thread(observed.pid) == row.current_session:
+                return "codex"
+        except (OSError, ValueError):
+            pass
+        return "claude"
+    return ""
+
+
+def current_kind(row: staff.StaffRow) -> Literal["claude", "codex"]:
+    """Read the live backend first, then the current session's transcript."""
+    family = native_kind(row)
+    if family in ("claude", "codex"):
+        return family
+    from scripts.lib.transcripts import transcript_paths
+
+    homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
+    homes.extend(Path.home().glob(".codex*"))
+    if home := os.environ.get("CODEX_HOME"):
+        homes.append(Path(home))
+    if any(transcript_paths(home / folder, f"**/*{row.current_session}.jsonl")
+           for home in dict.fromkeys(homes) for folder in ("sessions", "archived_sessions")):
+        return "codex"
+    if (isinstance(row.home, staff.SessionHome) and
+            transcript_paths(row.home.path / "projects", f"*/{row.current_session}.jsonl")) or sessions.transcript_locations(row.current_session):
+        return "claude"
+    reader = cast(Callable[[str], object], import_module("scripts.herdr.herdr").read_conversation)
+    family = cast(str, getattr(reader(str(row.current_session)), "kind", ""))
+    if family in ("claude", "codex"):
+        return family
+    raise ValueError(f"{row.name}: current backend is unavailable")
+
+
 def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | None = None) -> staff.SessionHome | staff.HomeUnknown:
     """Read a staffed session's home, or an unstaffed launch's config folder."""
     if record is None:
@@ -107,10 +226,9 @@ def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | No
             record = staff.StaffSnapshot(())
         except staff.StaffUnreadable:
             return staff.HomeUnknown()
-    reference = entry.get("session_id", "")
-    row = record.by_member_reference(reference) if isinstance(reference, str) else None
-    if row is not None:
-        return row.home
+    reference = launch_reference(entry, record)
+    if isinstance(reference, StaffLaunchReference):
+        return record.rows_by_id[reference.id].home
     directory = entry.get("config_dir", "")
     return staff.SessionHome(Path(directory)) if isinstance(directory, str) and directory else staff.HomeUnknown()
 
@@ -118,10 +236,13 @@ def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | No
 def _record_home(entry: PaneLaunch) -> PaneLaunch:
     """Publish the pane's home through the staff writer when membership exists."""
     try:
-        row = staff.initial_snapshot().by_member_reference(entry["session_id"])
+        record = staff.initial_snapshot()
+        reference = launch_reference(entry, record)
+        row = record.rows_by_id[reference.id] if isinstance(reference, StaffLaunchReference) else None
         if row is None:
             return entry
         current = entry.copy()
+        current["staff_id"] = row.id
         directory = current.pop("config_dir", "")
         if directory:
             home = staff.SessionHome(Path(directory).absolute())
@@ -180,8 +301,8 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
     if not isinstance(value, dict):
         raise ValueError(f"{location}: launch must be an object")
     launch = cast(dict[str, object], value)
-    _ = agent_kind(cast(PaneLaunch, cast(object, launch)))
-    for field in ("pane_id", "session_id", "config_dir", "cwd", "name", "model", "written_at"):
+    _ = saved_kind(cast(PaneLaunch, cast(object, launch)))
+    for field in ("pane_id", "session_id", "staff_id", "config_dir", "cwd", "name", "model", "written_at"):
         if field not in launch and field not in required_strings:
             continue
         if not isinstance(launch.get(field), str):
@@ -209,8 +330,21 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
     return cast(PaneLaunch, cast(object, launch))
 
 
-def agent_kind(entry: PaneLaunch) -> Literal["claude", "codex"]:
-    """Read the backend kind; records from before this field describe Claude."""
+class StaffSnapshotRead(Enum):
+    CURRENT = "read the current staff snapshot"
+
+
+def agent_kind(entry: PaneLaunch, *, record: staff.StaffSnapshot | StaffSnapshotRead = StaffSnapshotRead.CURRENT) -> Literal["claude", "codex"]:
+    """Read the current backend for staff or the saved backend for an unstaffed session."""
+    record = staff.initial_snapshot() if isinstance(record, StaffSnapshotRead) else record
+    reference = launch_reference(entry, record)
+    if isinstance(reference, StaffLaunchReference):
+        return current_kind(record.rows_by_id[reference.id])
+    return saved_kind(entry)
+
+
+def saved_kind(entry: PaneLaunch) -> Literal["claude", "codex"]:
+    """Read the backend field in unstaffed or newly observed launch evidence."""
     kind = entry.get("kind", "claude")
     if kind not in ("claude", "codex"):
         raise ValueError(f"invalid retained agent kind: {kind!r}")
@@ -236,7 +370,7 @@ def read_valid_entries(path: Path, *, record: staff.StaffSnapshot | None = None)
     for pane, value in read_entries(path).items():
         try:
             entry = _validated_launch(path, pane, value, required_strings=required_strings)
-            if "config_dir" in entry or record.by_member_reference(entry["session_id"]) is not None:
+            if "config_dir" in entry or isinstance(launch_reference(entry, record), StaffLaunchReference):
                 valid[pane] = entry
         except ValueError:
             continue
@@ -326,8 +460,15 @@ def without_staff_labels(entry: PaneLaunch) -> PaneLaunch:
     return current
 
 
-def save(path: Path, entries: dict[str, PaneLaunch]) -> None:
+def save(path: Path, entries: dict[str, PaneLaunch], *,
+         record: staff.StaffSnapshot | StaffSnapshotRead = StaffSnapshotRead.CURRENT) -> None:
     """Publish one retained launch file through the atomic writer."""
+    if isinstance(record, StaffSnapshotRead) and any("staff_id" not in entry for entry in entries.values()):
+        record = staff.initial_snapshot()
+    if isinstance(record, staff.StaffSnapshot):
+        entries = {pane: {**entry, "staff_id": reference.id} if isinstance(
+            reference := launch_reference(entry, record), StaffLaunchReference) else entry
+            for pane, entry in entries.items()}
     with _publication_lock(path.parent):
         atomic_file.write_text_atomic(path, json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
@@ -336,13 +477,15 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
     """Persist pane observations with the fixed staff reference."""
     try:
         membership = staff.initial_snapshot()
-        owner = membership.by_member_reference(launch["session_id"])
+        reference = launch_reference(launch, membership)
+        owner = membership.rows_by_id[reference.id] if isinstance(reference, StaffLaunchReference) else None
     except (staff.StaffUnreadable, OSError, ValueError):
         membership = staff.StaffSnapshot(())
         owner = None
     if owner is not None:
         launch = launch.copy()
         launch["session_id"] = owner.id
+        launch["staff_id"] = owner.id
         _ = launch.pop("config_dir", None)
     with locked(path):
         if owner is not None and owner.kind == "producer":
@@ -352,7 +495,7 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
         if entries.get(launch["pane_id"]) == launch:
             return
         entries[launch["pane_id"]] = launch
-        save(path, entries)
+        save(path, entries, record=membership)
 
 
 def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
@@ -379,12 +522,12 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
             if membership.by_member_reference(current["session_id"]) != owner:
                 return
         records[path.absolute()][launch["pane_id"]] = launch
-        save(path, records[path.absolute()])
+        save(path, records[path.absolute()], record=membership)
         return
     from scripts.lib import models_registry
 
     process_reader = cast(NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
-    observed = process_reader.native_process(pid, agent_kind(launch))
+    observed = process_reader.native_process(pid, saved_kind(launch))
     if (observed.current_identity != owner.current_session or observed.started != generation
             or observed.environment.get("HERDR_PANE_ID") != launch["pane_id"]
             or observed.environment.get("HERDR_SESSION", "default") != path.stem):
@@ -398,10 +541,10 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         if contract["member"] != owner.id or contract["session"] != owner.current_session:
             raise ValueError("producer start expectation names another conversation")
         expected["cwd"] = contract["folder"]
-        if contract["kind"] != agent_kind(launch):
+        if contract["kind"] != saved_kind(launch):
             raise ValueError("producer publication uses another backend")
-        variable = "CODEX_HOME" if agent_kind(launch) == "codex" else "CLAUDE_CONFIG_DIR"
-        process_home = Path(observed.environment.get(variable) or Path.home() / (".codex" if agent_kind(launch) == "codex" else ".claude"))
+        variable = "CODEX_HOME" if saved_kind(launch) == "codex" else "CLAUDE_CONFIG_DIR"
+        process_home = Path(observed.environment.get(variable) or Path.home() / (".codex" if saved_kind(launch) == "codex" else ".claude"))
         if process_home.resolve() != Path(contract["home"]).resolve():
             raise ValueError("producer publication uses another account")
     elif isinstance(owner.worktree, staff.PresentWorktree):
@@ -413,7 +556,7 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
     place = cast(Callable[[int], object], import_module("scripts.herdr.herdr").herdr_place_of)(pid)
     if isinstance(place, HerdrPlace):
         cast(Callable[[str, str], None], import_module("scripts.herdr.herdr").forget_pane_evidence)(place.session, place.pane)
-    current = process_reader.native_process(pid, agent_kind(launch))
+    current = process_reader.native_process(pid, saved_kind(launch))
     if current.current_identity != observed.current_identity or current.started != generation:
         raise ValueError("producer process changed before publication")
     committed = launch.copy()
@@ -427,11 +570,11 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         journal = path.parent / ".producer-publication"
         atomic_file.write_text_atomic(journal, json.dumps({source.name: entries for source, entries in changed.items()}))
         for source, entries in changed.items():
-            save(source, entries)
+            save(source, entries, record=membership)
         journal.unlink()
     elif changed:
         source, entries = next(iter(changed.items()))
-        save(source, entries)
+        save(source, entries, record=membership)
 
 
 @dataclass(frozen=True)
@@ -447,7 +590,7 @@ def newest_publication(directory: Path, references: Sequence[str]) -> LaunchPubl
     matches = [LaunchPublication(path, entry)
                for path in sorted(directory.glob("*.json"))
                for entry in read_strict(path).values()
-               if entry["session_id"] in references]
+               if entry.get("staff_id", entry["session_id"]) in references or entry["session_id"] in references]
     return max(matches, key=lambda publication: publication.entry["written_at"], default=None)
 
 
@@ -510,7 +653,7 @@ def _usable_replacement(path: Path, attempt: ResumeAttempt, entry: PaneLaunch,
     else:
         print(f"anomaly: {attempt.pane_id}: session home is unknown; keep the selected account", file=sys.stderr)
     if (entry["pane_id"] != attempt.pane_id or entry["session_id"] not in proof.references
-            or agent_kind(entry) != agent_kind(expected)
+            or saved_kind(entry) != saved_kind(expected)
             or home_changed
             or Path(entry["cwd"]).resolve() != Path(expected["cwd"]).resolve()
             or not entry.get("flags_read", False)
@@ -532,7 +675,7 @@ def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
                 and entries.get(replacement.pane_id) != replacement.publication):
             raise ValueError(f"{replacement.pane_id}: replacement launch changed before retirement")
         del entries[pane_id]
-        save(path, entries)
+        save(path, entries, record=staff.StaffSnapshot(()))
 
 
 @overload

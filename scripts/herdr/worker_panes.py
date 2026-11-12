@@ -335,10 +335,21 @@ class AllWorkers(Enum):
 
 
 @dataclass(frozen=True)
+class LaunchRecords:
+    entries: dict[str, pane_launch.PaneLaunch]
+
+
+@dataclass(frozen=True)
+class LaunchRecordsUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PaneRead:
     panes: list[dict[str, object]]
     scan: herdr.RowPaneScan
     statuses: dict[str, herdr.AgentStatus]
+    launches: LaunchRecords | LaunchRecordsUnavailable
 
 
 @dataclass(frozen=True)
@@ -395,11 +406,17 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
         scan = client.scan_row_panes(record, panes)
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         return PaneReadUnavailable(str(error))
+    launches: LaunchRecords | LaunchRecordsUnavailable
+    try:
+        launches = LaunchRecords(pane_launch.read_valid_entries(
+            pane_launch.record_directory() / f"{client.session}.json", record=record))
+    except (OSError, ValueError) as error:
+        launches = LaunchRecordsUnavailable(f"launch records are unavailable: {error}")
     try:
         statuses = {agent["pane_id"]: agent["agent_status"] for agent in agent_inventory(client)}
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         statuses = {}
-    return PaneRead(panes, scan, statuses)
+    return PaneRead(panes, scan, statuses, launches)
 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
@@ -412,11 +429,12 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
     if isinstance(read, PaneReadUnavailable):
         return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected], frozenset())
     panes, scan, statuses = read.panes, read.scan, read.statuses
-    parent_row = record.by_id(parent)
-    unread = {item.pane for item in scan.unknown}
-    parent_panes = scan.found.get(parent, []) + [
-        pane for pane in panes if parent_row is not None and pane.get("label") == parent_row.name
-        and _text(pane, "pane_id") in unread]
+    launch_owners = ({pane: reference.id for pane, entry in read.launches.entries.items()
+                      if isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)}
+                     if isinstance(read.launches, LaunchRecords) else {})
+    parent_panes = scan.found.get(parent, []) + [pane for pane in panes
+        if launch_owners.get(_text(pane, "pane_id")) == parent
+        and not any(pane in found for owner, found in scan.found.items() if owner != parent)]
     parent_tabs = {_text(pane, "tab_id") for pane in parent_panes} - {""}
     states: list[WorkerPane] = []
     for row in selected:
@@ -433,8 +451,11 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             else:
                 states.append(OpenWorker(row, identity, terminal, statuses.get(identity, herdr.AgentStatus.UNKNOWN)))
             continue
-        labels = {row.name, agent_name(parent_row, row.name)} if parent_row else {row.name}
-        labelled = [pane for pane in panes if pane.get("label") in labels
+        if isinstance(read.launches, LaunchRecordsUnavailable):
+            states.append(_uncertain(row, read.launches.reason))
+            continue
+        labelled = [pane for pane in panes
+                    if launch_owners.get(_text(pane, "pane_id")) == row.id
                     and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
         related_unknown = [item for item in scan.unknown if any(
@@ -462,9 +483,11 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             states.append(ClosedWorker(row))
     terminals: frozenset[str] = frozenset()
     if isinstance(selection, SelectedWorkers):
-        labels = {label for row in workers for label in (row.name, f"{parent_row.name}-{row.name}" if parent_row else row.name)}
+        worker_ids = {row.id for row in workers}
         terminals = frozenset(_text(pane, "terminal_id") for pane in panes
-                               if pane.get("label") in labels and _text(pane, "tab_id") in parent_tabs)
+            if (launch_owners.get(_text(pane, "pane_id")) in worker_ids
+                or any(pane in scan.found.get(row.id, []) for row in workers))
+            and _text(pane, "tab_id") in parent_tabs)
     return PaneEvidence(panes, scan, states, terminals)
 
 
@@ -1277,7 +1300,7 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
     path = pane_launch.record_directory() / f"{client.session}.json"
     for pane, entry in pane_launch.read_valid_entries(path).items():
         owner = record.by_member_reference(entry["session_id"])
-        if pane_launch.agent_kind(entry) == "codex" and owner is not None and owner.id == row.id:
+        if owner is not None and owner.id == row.id and pane_launch.agent_kind(entry) == "codex":
             pane_launch.retire_launch(path, pane, entry)
 
 

@@ -178,13 +178,16 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         return False
 
 
-def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-    projected = entry.copy()
-    projected["session_id"] = identity
-    projected["name"] = name
+def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
+                  record: staff.StaffSnapshot | pane_launch.StaffSnapshotRead = pane_launch.StaffSnapshotRead.CURRENT) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+    record = staff.initial_snapshot() if isinstance(record, pane_launch.StaffSnapshotRead) else record
+    projected = pane_launch.current_launch(entry, record)
+    if "staff_id" not in projected:
+        projected["session_id"] = identity
+        projected["name"] = name
     arguments = pane_record.resume_arguments(projected)
-    kind = pane_launch.agent_kind(entry)
-    home = pane_launch.config_home(entry)
+    kind = pane_launch.saved_kind(projected)
+    home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         return kind, {}, arguments
@@ -333,7 +336,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if row.kind == "producer":
             kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
         else:
-            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
+            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):

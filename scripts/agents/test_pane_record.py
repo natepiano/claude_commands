@@ -81,6 +81,9 @@ class PaneRecordTests(unittest.TestCase):
                 assert saved is not None
                 self.assertEqual(saved.to_json().get("home"), str(home))
                 self.assertNotIn("config_dir", pane_record.read("TEST-session")["TEST-pane"])
+                for copied in ("", str(self.root / "old-home")):
+                    stale = {**entry, "staff_id": owner.id, "config_dir": copied}
+                    self.assertEqual(pane_launch.config_home(stale), saved.home)
 
     def test_admission_completes_the_pane_home_publication(self) -> None:
         parent = staff.ensure("showrunner", name="TEST-parent", runtime_id=fixture_runtime_id("TEST-pane-parent"))
@@ -102,6 +105,9 @@ class PaneRecordTests(unittest.TestCase):
             retained = pane_record.read("TEST-admission")["TEST-" + member_kind]
             self.assertNotIn("config_dir", retained)
             self.assertEqual(pane_launch.config_home(retained), staff.SessionHome(home))
+            for copied in ("", str(self.root / "old-home")):
+                stale = {**retained, "staff_id": row.id, "config_dir": copied}
+                self.assertEqual(pane_launch.config_home(stale), row.home)
 
     def test_retained_write_keeps_the_running_home_until_a_pane_start(self) -> None:
         owner = staff.ensure("showrunner", name="TEST-write-order", runtime_id=fixture_runtime_id("TEST-write-order"))
@@ -115,6 +121,9 @@ class PaneRecordTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(current.to_json().get("home"), str(running_home))
         self.assertNotIn("config_dir", pane_record.read("TEST-write-order")["TEST-write-order"])
+        for copied in ("", str(target_home)):
+            stale = {**entry, "staff_id": owner.id, "config_dir": copied}
+            self.assertEqual(pane_launch.config_home(stale), current.home)
 
     def start(self, pane: str, session_id: str, *flags: str, source: str = "startup") -> subprocess.CompletedProcess[str]:
         """The hook under a process whose argv is `claude <flags>`, as a pane's Claude runs it."""
@@ -368,6 +377,7 @@ class PaneRecordTests(unittest.TestCase):
             pane_record.write("agents", entry)
             expected = entry.copy()
             expected["environment"] = {}
+            expected["staff_id"] = owner.id
             _ = expected.pop("config_dir", None)
             self.assertEqual(pane_record.read("agents"), {"w1:p2": expected})
             self.assertEqual(pane_record.forget_unit(identity), ["agents:w1:p2"])
@@ -399,23 +409,50 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_resume_projection_uses_current_session_without_rewriting_retained_evidence(self) -> None:
-        from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
+        from scripts.production.staff_test_support import fixture_session, isolated_staff_file, isolated_source_readers, source_environment
 
         path = self.root / "staff.json"
         with (isolated_staff_file(path, {}),
               mock.patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
-            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id="019b3a40-4250-7000-8000-000000000102")
+            owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id),
+                runtime_id="019b3a40-4250-7000-8000-000000000102",
+                worktree=staff.PresentWorktree(remote.local_machine(), self.root / "current-worktree"))
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
-            retained = pane_record.launch("w1:p2", owner.id, "/work/alpha", {}, ["claude"])
+            fixture_session(current, staff.ClaudeBackend())
+            retained = pane_record.launch("w1:p2", owner.id, "/work/alpha",
+                {"CLAUDE_CONFIG_DIR": str(self.root / "current-home")}, ["claude"])
+            owner = staff.by_id(owner.id)
+            assert owner is not None and isinstance(owner.home, staff.SessionHome)
             with mock.patch.object(pane_record, "RECORD_DIR", self.records):
                 pane_record.write("agents", retained)
                 record_path = self.records / "agents.json"
                 before = path.read_bytes(), record_path.read_bytes(), record_path.stat().st_mtime_ns
                 projected = pane_record.resume_launch(retained)
-                self.assertEqual(projected, {**retained, "session_id": current})
+                expected = {**retained, "staff_id": owner.id, "session_id": current, "name": owner.name,
+                            "cwd": str(self.root / "current-worktree"), "kind": "claude", "config_dir": str(owner.home.path)}
+                self.assertEqual(projected, expected)
+                for copied in ("session", "name", "folder", "kind", "home"):
+                    with self.subTest(copied=copied):
+                        stale = retained.copy()
+                        stale["staff_id"] = owner.id
+                        if copied == "session":
+                            stale["session_id"] = "019b3a40-4250-7000-8000-000000000199"
+                        elif copied == "name":
+                            stale["name"] = "old-name"
+                        elif copied == "folder":
+                            stale["cwd"] = "/old-folder"
+                        elif copied == "kind":
+                            stale["kind"] = "codex"
+                        else:
+                            stale["config_dir"] = "/old-home"
+                        resumed = pane_record.resume_launch(stale)
+                        self.assertEqual(pane_record.resume_arguments(resumed),
+                            ["--resume", current, "-n", owner.name, "--settings", '{"disableAgentView": true}'])
+                        self.assertEqual((resumed["cwd"], pane_launch.config_home(resumed)),
+                            (str(self.root / "current-worktree"), owner.home))
                 self.assertEqual(retained["session_id"], owner.id)
                 self.assertEqual(pane_record.resume_launch(projected), projected)
                 unknown = pane_record.launch("w1:p4", "019b3a40-4250-7000-8000-000000000104", "/other", {}, ["claude"])
@@ -436,6 +473,9 @@ class PaneRecordTests(unittest.TestCase):
 
     def test_worker_resume_uses_the_typed_parent_for_its_folder(self) -> None:
         from scripts.agents import launch_names, session_types
+        from scripts.production.staff_test_support import fixture_session
+
+        fixture_session("worker-session", staff.ClaudeBackend())
 
         location = staff.PresentWorktree(remote.local_machine(), self.root / "unit")
         unit = staff.StaffRow(staff.StaffId("unit"), "unit", "alpha", staff.StaffRoot(),
@@ -557,6 +597,8 @@ class PaneRecordTests(unittest.TestCase):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
                 repaired = pane_record.read_strict("agents")
                 expected = {**retained, "environment": new["environment"]}
+                if legacy:
+                    expected["staff_id"] = owner.id
                 self.assertEqual(repaired["new"], expected)
                 self.assertEqual(repaired["old"], {**old, "environment": {}})
                 before = (path.read_bytes(), path.stat().st_mtime_ns)

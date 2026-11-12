@@ -48,7 +48,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
-from scripts.agents.test_pane_restore import FakeClient
+from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcript
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 
@@ -678,7 +678,8 @@ class StopResumeTests(unittest.TestCase):
     def test_stop_uses_the_runtime_from_an_ended_launch_with_a_fixed_staff_id(self) -> None:
         identity = self.entry["session_id"]
         row = staff.StaffRow(staff.StaffId("fixed-agent"), "producer", "alpha", staff.StaffRoot(),
-                             current_session=staff.StaffId(identity))
+                             current_session=staff.StaffId(identity),
+                             home=staff.SessionHome(self.root / ".claude3"))
         for kind in ("claude", "codex"):
             entry = self.entry.copy()
             entry.update(session_id=str(row.id), kind=kind, ended=True)
@@ -1519,7 +1520,7 @@ class StopResumeTests(unittest.TestCase):
                 target = self.root / (".codex2" if family == "codex" else ".claude4")
                 _ = staff.set_home(row.id, staff.SessionHome(source))
                 retained = self.entry.copy()
-                retained.update(kind=family, environment={variable: str(source)}, config_dir=str(source))
+                retained.update(staff_id=row.id, kind=family, environment={variable: str(source)}, config_dir=str(source))
                 pane_record.save("agents", {"w1:p2": retained})
                 atomic_file.write_text_atomic(pane_record.record_directory() / f".producer-start-{row.id}", json.dumps({
                     "member": row.id, "session": row.current_session, "kind": family,
@@ -1699,6 +1700,7 @@ class StopResumeTests(unittest.TestCase):
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
         owner = staff.StaffRow(fixed, "unit", "row-name", staff.StaffRoot(), current_session=current)
+        fixture_launch_transcript(self.root, {**self.entry, "session_id": str(current)}, staff.StaffSnapshot(()))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))):
             arguments = stop_resume.resume_arguments(self.entry)
         self.assertEqual(arguments[arguments.index("--resume") + 1], current)
@@ -1741,7 +1743,7 @@ class StopResumeTests(unittest.TestCase):
                 source_home = self.root / (".codex1" if family == "codex" else ".claude3")
                 target_home = self.root / (".codex2" if family == "codex" else ".claude4" if stale else ".claude3")
                 saved = self.entry.copy()
-                saved.update(kind=family, environment={variable: str(source_home)})
+                saved.update(kind=family, environment={variable: str(source_home)}, config_dir=str(source_home))
                 self.client.rows[:] = [dict(retained)]
                 if workspace == "producers" and not shared and shell:
                     herdr._write_layout("agents", herdr.SavedLayout(at=time.time(), workspaces=[  # pyright: ignore[reportPrivateUsage]
@@ -1754,6 +1756,7 @@ class StopResumeTests(unittest.TestCase):
                 self.client.native_ids.clear()
                 self.launched.clear()
                 self.start.reset_mock()
+                fixture_launch_transcript(self.root, {**saved, "session_id": str(current)}, staff.StaffSnapshot(()))
                 pane_record.save("agents", {self.entry["pane_id"]: saved})
                 if stale:
                     atomic_file.write_text_atomic(pane_record.record_directory() / f".producer-start-{row.id}", json.dumps({
@@ -1992,6 +1995,23 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
+        fixture_launch_transcript(self.root, self.entry, staff.StaffSnapshot(()))
+        saved_records = pane_record.save
+        def save(session: str, entries: dict[str, pane_record.PaneLaunch]) -> None:
+            for entry in entries.values():
+                fixture_launch_transcript(self.root, entry, staff.StaffSnapshot(()))
+            saved_records(session, entries)
+        _ = self.enterContext(patch.object(pane_record, "save", side_effect=save))
+        publish_record = pane_record.write
+        def write(session: str, entry: pane_record.PaneLaunch) -> None:
+            source = entry.copy()
+            try:
+                _ = staff.native_id(source["session_id"])
+            except staff.StaffRefused:
+                source["session_id"] = self.entry["session_id"]
+            fixture_launch_transcript(self.root, source, staff.StaffSnapshot(()))
+            publish_record(session, entry)
+        _ = self.enterContext(patch.object(pane_record, "write", side_effect=write))
         pane_record.write("agents", self.entry)
         _ = self.enterContext(patch.object(stall_watch, "STATE_DIR",
                                          Path(self.enterContext(tempfile.TemporaryDirectory()))))
@@ -2262,6 +2282,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(staff, "local_snapshot", return_value=record))
         retained = self.entry.copy()
         retained["session_id"] = current
+        retained["staff_id"] = row.id
         pane_record.save("agents", {retained["pane_id"]: retained})
         self.client.rows.clear()
         opened: list[str] = []
@@ -2363,6 +2384,7 @@ class StopResumeTests(unittest.TestCase):
             owner = staff.set_home(owner.id, staff.SessionHome(self.root / ".claude3"))
             current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
             _ = staff.update_current_session(owner.current_session, current)
+            fixture_launch_transcript(self.root, {**self.entry, "session_id": str(current)}, staff.StaffSnapshot(()))
             folder = self.root / "staff-folder"
             _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), folder), expected=owner.worktree)
             self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
@@ -2999,7 +3021,9 @@ class StopResumeTests(unittest.TestCase):
         self.process.side_effect = self.alive_until_kill
         self.client.process_info = {"foreground_processes": [
             {"pid": 123, "argv": ["codex", "resume", identity], "cwd": str(self.root)}]}
-        def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
+        def native_process(pid: int, kind: str,
+                           reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+            del reported
             self.assertEqual((pid, kind), (123, "codex"))
             processes = herdr.json_items(self.client.process_info["foreground_processes"], "fixture foreground processes")
             if herdr.json_object(processes[0], "fixture Codex process")["argv"] != ["codex", "resume", identity]:
@@ -3635,12 +3659,22 @@ class StopResumeTests(unittest.TestCase):
 
     def test_saved_entry_finds_an_unlabelled_pane_with_empty_or_stale_herdr_id(self) -> None:
         self.client.rows[0]["label"] = None
-        for agent in (None, {"kind": "id", "value": "stale-session"}):
-            with self.subTest(agent=agent):
-                self.launched.clear()
-                self.client.rows[0]["agent_session"] = agent
-                self.assertEqual(stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="maintenance"),
-                                 stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
+        original = self.entry.copy()
+        identity = original["session_id"]
+        owner = staff.StaffRow(staff.StaffId(fixture_runtime_id("fixed-shell-owner")), "unit", "alpha", staff.StaffRoot(),
+                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".claude3"))
+        for stale_copy in (False, True):
+            for agent in (None, {"kind": "id", "value": "stale-session"}):
+                with self.subTest(agent=agent, stale_copy=stale_copy):
+                    self.launched.clear()
+                    self.client.rows[0]["agent_session"] = agent
+                    entry = original.copy()
+                    if stale_copy:
+                        entry.update(staff_id=owner.id, session_id=fixture_runtime_id("old-shell-session"))
+                    atomic_file.write_text_atomic(pane_record.record_path("agents"), json.dumps({entry["pane_id"]: entry}))
+                    with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,)) if stale_copy else staff.StaffSnapshot(())):
+                        self.assertEqual(stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="maintenance"),
+                                         stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
 
     def test_saved_entry_never_selects_a_different_live_conversation(self) -> None:
         self.client.rows[0]["agent_session"] = {"kind": "id", "value": "another-live-session"}
