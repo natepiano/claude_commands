@@ -3102,7 +3102,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - No module leaves a folder behind.
 - aws pairs show a CPU gain per module; a module with no gain keeps its old file.
 
-### Phase 162 — The last three merge checkpoint test modules keep only the tests that pay their way  · status: todo
+### Phase 162 — The last three merge checkpoint test modules keep only the tests that pay their way  · status: done
 **Depends on:** none
 
 #### Work Order
