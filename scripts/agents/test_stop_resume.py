@@ -273,9 +273,9 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(publication["session_id"], row.id)
                 self.assertTrue(publication.get("producer_binding", False))
                 if check_binding:
-                    self.assertEqual([(tab.get("row_id"), tab.get("terminal_id"))
+                    self.assertEqual([tab["staff_id"]
                         for space in herdr.saved_layout("agents")["workspaces"] for tab in space["tabs"]],
-                        [(row.id, world.case.client.rows[-1]["terminal_id"])])
+                        [row.id])
                 for reference in ("dwight", str(row.id)):
                     self.assertIsInstance(stop_resume.resume(reference), stop_resume.ClaudeUp)
                 self.assertEqual(len(world.arguments), 1)
@@ -1218,7 +1218,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(stop_resume, "resume", return_value=up) as resumed):
             results = stop_resume.move_sessions(["saved"], "claude4", why="limit")
         self.assertEqual(results, [up])
-        resumed.assert_called_once_with("saved", why="limit", to="claude4")
+        resumed.assert_called_once_with("saved", why="limit", to="claude4", client=self.client)
 
 
     def test_stale_launch_metadata_does_not_prevent_resume(self) -> None:
@@ -1838,8 +1838,8 @@ class StopResumeTests(unittest.TestCase):
                 self.client.rows[:] = [dict(retained)]
                 if workspace == "producers" and not shared and shell:
                     herdr._write_layout("agents", herdr.SavedLayout(at=time.time(), workspaces=[  # pyright: ignore[reportPrivateUsage]
-                        herdr.SavedSpace(name="producers", seen=time.time(), tabs=[herdr.SavedName(
-                            name=row.id, row_id=row.id, terminal_id=herdr.json_text(retained["terminal_id"], "producer terminal"),
+                        herdr.SavedSpace(name="producers", seen=time.time(), tabs=[herdr.SavedMemberTab(
+                            staff_id=row.id,
                             seen=time.time())])]))
                 if metadata:
                     self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
@@ -1908,7 +1908,8 @@ class StopResumeTests(unittest.TestCase):
                     return native(pid, kind)
                 def launch(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                            prepared: herdr.PreparedAgentEnvironment, kind: Literal["claude", "codex"], arguments: list[str],
-                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str) -> herdr.AgentLaunched:
+                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str, client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> herdr.AgentLaunched:
+                    _ = client
                     del opening, timeout
                     self.assertIsInstance(destination, herdr.ExistingPane)
                     assert isinstance(destination, herdr.ExistingPane)
@@ -3911,7 +3912,7 @@ class StopResumeTests(unittest.TestCase):
                 assert request["kind"] == "requested"
                 self.assertEqual((request["from"], request["to"]), ("claude1" if family == "claude" else source, target))
                 self.assertEqual(request["tool"], family)
-                resume.assert_called_once_with(identity, why="auto: head", to=target)
+                resume.assert_called_once_with(identity, why="auto: head", to=target, client=self.client)
                 tell.assert_not_called()
 
     def test_move_records_and_reports_an_immediate_resume_exit(self) -> None:
@@ -3980,7 +3981,9 @@ class StopResumeTests(unittest.TestCase):
         def stop_unit(identity: str) -> stop_resume.Stopped:
             return stop_resume.Stopped(identity, 123)
 
-        def resume_unit(identity: str, *, why: str, to: str, requester: str) -> stop_resume.ResumeFailed:
+        def resume_unit(identity: str, *, why: str, to: str, requester: str,
+                        client: herdr.Herdr) -> stop_resume.ResumeFailed:
+            self.assertIs(client, self.client)
             self.assertEqual((why, to, requester), ("auto: head", "claude5", "director"))
             return stop_resume.ResumeFailed(identity, "session did not start")
 
@@ -4177,7 +4180,8 @@ class StopResumeTests(unittest.TestCase):
         results = [stop_resume.ClaudeUp("bad", "bad-pane", "claude3"),
                    stop_resume.ClaudeUp("good", "good-pane", "claude4")]
 
-        def resume_one(identity: str, *, why: str, to: str) -> stop_resume.ClaudeUp:
+        def resume_one(identity: str, *, why: str, to: str, client: herdr.Herdr) -> stop_resume.ClaudeUp:
+            self.assertIs(client, self.client)
             self.assertEqual((why, to), ("move", "claude4"))
             return results[0] if identity == "bad" else results[1]
 
@@ -4234,7 +4238,9 @@ class StopResumeTests(unittest.TestCase):
             if session == "stop-error":
                 raise OSError("cannot signal")
             return stop_resume.NotRunning(session)
-        def resume_one(session: str, *, why: str, to: str) -> stop_resume.ClaudeUp | stop_resume.SessionNotFound:
+        def resume_one(session: str, *, why: str, to: str,
+                       client: herdr.Herdr) -> stop_resume.ClaudeUp | stop_resume.SessionNotFound:
+            self.assertIs(client, self.client)
             self.assertEqual(why, "limit")
             if session == "resume-error":
                 raise OSError("cannot run")
