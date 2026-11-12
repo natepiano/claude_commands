@@ -822,7 +822,6 @@ class OutsideFailure(StrEnum):
     AMBIGUOUS_ITEMS = "ambiguous destination items"
     BODY_FAILED = "body check failed"
     BODY_UNREADABLE = "body unreadable or empty"
-    WRONG_KEYWORD = "keyword differs"
     WRONG_OWNER = "owner differs"
     TRAIT_UNCERTAIN = "trait identity uncertain"
     NOT_GAINED = "declaration not gained"
@@ -895,13 +894,14 @@ class OutsideRenameUnresolved:
 
 
 def outside_evidence_line(evidence: OutsideRenameNotProven) -> str:
-    """Name every examined target and each failed check in a stable order."""
+    """Count passed candidates first, then failed checks in OutsideFailure order."""
     candidates = "none"
     if isinstance(evidence.candidates, OutsideCandidates):
-        candidates = ", ".join(
-            f"{item.path}:{item.line} {declarations.declaration_line(item.declaration)} "
-            + f"{item.unchanged}/{item.old_nonblank_count} body lines "
-            + ("passed" if not item.checks else "/".join(item.checks)) for item in evidence.candidates.items)
+        counts = Counter(check for item in evidence.candidates.items for check in set(item.checks))
+        passed = sum(not item.checks for item in evidence.candidates.items)
+        checks = [f"passed: {passed}"] if passed else []
+        checks.extend(f"{check}: {counts[check]}" for check in OutsideFailure if counts[check])
+        candidates = f"{len(evidence.candidates.items)} ({', '.join(checks)})"
     return (f"outside rename not proved: {', '.join(evidence.reasons)}; candidates: {candidates}; "
             + mapped_evidence_line(evidence.mapped))
 
@@ -5788,11 +5788,13 @@ class Ledger:
                 continue
             destination = self._declared_file(tip.commit, path)
             for item in destination.declared_items:
+                if item.declaration.keyword != target.keyword:
+                    continue
+                if item.declaration.owner not in (target.owner, old.declaration.owner):
+                    continue
                 if item.declaration.name == old.declaration.name:
                     continue
                 checks: list[OutsideFailure] = []
-                if item.declaration.keyword != target.keyword:
-                    checks.append(OutsideFailure.WRONG_KEYWORD)
                 if item.declaration.owner != target.owner:
                     checks.append(OutsideFailure.WRONG_OWNER)
                 if not checks and target.owner == old.declaration.owner:
@@ -6678,33 +6680,59 @@ class Ledger:
         self._built_rename_evidence[tip.commit] = evidence
         return evidence
 
+    def _release_declaration_commit(self, commit: str) -> None:
+        """Release declaration caches that name this completed group's historical commit."""
+        self._declared_files = {key: value for key, value in self._declared_files.items() if key[0] != commit}
+        self._commit_files = {key: value for key, value in self._commit_files.items() if key[0] != commit}
+        self._item_bodies = {key: value for key, value in self._item_bodies.items() if key[0] != commit}
+        self._outside_bodies = {key: value for key, value in self._outside_bodies.items() if key[0] != commit and key[2] != commit}
+        self._outside_diffs = {key: value for key, value in self._outside_diffs.items() if commit not in key[:2]}
+        self._file_modules = {key: value for key, value in self._file_modules.items() if key[0] != commit}
+        self._extern_names = {key: value for key, value in self._extern_names.items() if key[0] != commit}
+        # Binding proofs use (ticket, path, commit); site maps use (before, after, path).
+        self._binding_proofs = {key: value for key, value in self._binding_proofs.items() if key[2] != commit}
+        self._site_maps = {key: value for key, value in self._site_maps.items() if commit not in key[:2]}
+        _ = self._tips.pop(commit, None)
+
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
                              approved: Callable[[Path], bool]) -> DeclarationReading:
-        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
+        findings = tuple(self._held(finding_id) for finding_id in finding_ids)
+        self._prepare_sites(findings, tip)
         rust_files = frozenset(tip.rust_files)
         built = self._built_renames(tip)
         self._refresh_site_rows()
-        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, built.renames,
-                                                   built.findings) for finding_id in finding_ids)
-        for outcome in outcomes:
-            finding = outcome.finding
-            if isinstance(outcome, FindingSite):
-                evidence = outcome.evidence
-            elif isinstance(outcome, DeclarationMoved):
-                anchor = self.finding_anchor(finding)
-                evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
-                            if isinstance(anchor, FindingAnchor) else anchor)
-            elif isinstance(outcome, DeclarationRemoved):
-                evidence = NeedsJudgment("no source site after proved declaration removal")
-            elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
-                # Existing untracked findings are eligible for filing; this asserts no historical carry.
-                evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
-            elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
-                evidence = self._site_proof(finding, tip.commit)
-            else:
-                evidence = NeedsJudgment("existing declaration proof refused this transition")
-            self._follow_evidence[(finding, tip.commit)] = evidence
-        return DeclarationReading(tip.commit, outcomes)
+        groups: dict[str | int, list[tuple[int, HeldFinding]]] = {}
+        for index, finding in enumerate(findings):
+            anchor = self.finding_anchor(finding)
+            # A finding without an anchor uses its input position as its group key.
+            group_key = anchor.commit if isinstance(anchor, FindingAnchor) else index
+            groups.setdefault(group_key, []).append((index, finding))
+        outcomes: dict[int, DeclarationOutcome] = {}
+        for commit, group in groups.items():
+            for index, finding in group:
+                outcome = self._declaration_outcome(self._held(finding.finding_id), tip, rust_files, approved,
+                                                    built.renames, built.findings)
+                outcomes[index] = outcome
+                finding = outcome.finding
+                if isinstance(outcome, FindingSite):
+                    evidence = outcome.evidence
+                elif isinstance(outcome, DeclarationMoved):
+                    anchor = self.finding_anchor(finding)
+                    evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
+                                if isinstance(anchor, FindingAnchor) else anchor)
+                elif isinstance(outcome, DeclarationRemoved):
+                    evidence = NeedsJudgment("no source site after proved declaration removal")
+                elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                    # Existing untracked findings remain eligible for filing without historical carry.
+                    evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
+                elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
+                    evidence = self._site_proof(finding, tip.commit)
+                else:
+                    evidence = NeedsJudgment("existing declaration proof refused this transition")
+                self._follow_evidence[(finding, tip.commit)] = evidence
+            if isinstance(commit, str) and commit != tip.commit:
+                self._release_declaration_commit(commit)
+        return DeclarationReading(tip.commit, tuple(outcomes[index] for index in range(len(findings))))
 
     def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:
         """What follow_declarations writes for the findings at the synced tip; it writes nothing.
