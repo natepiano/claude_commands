@@ -3208,113 +3208,25 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 180 — Collect line coverage overlap across scripts/direct  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** One read-only `coverage_overlap.py` collection over every test module in `scripts/direct` reports the overlap candidates and the tests with unknown coverage, apart.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 2): run the collection (about 52 serial minutes, read-only). Candidates are not removal approvals. No test removal or coverage reduction is approved.
-
-**Spec:**
-1. Run `scripts/test_times/coverage_overlap.py scripts/direct <every test_*.py in scripts/direct>` once, with `COVERAGE_OUT` set to a JSON file in the session phase folder.
-2. Run it in a clean copy of the checkpoint commit through `python3 ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit <commit> -- <command>`, as a detached run. Change no repository file.
-3. If a module fails or hangs under the collector, record it and continue with the rest; do not retry the whole folder.
-4. Report: tests collected, known, unknown (with the cause classes: Bash, Cargo, Git, ps, forks), candidates per module, collector CPU and wall time. Keep candidates apart from unknown coverage. Mark each count measured.
-5. For the top 10 modules by candidate count, list the candidate tests with the kept tests that cover their lines. Do not review assertions for removal.
-
-**Files:**
-- `phases/180/coverage_overlap_report.md` — the report, in the session folder; no repository file changes.
-- `phases/180/coverage_overlap.json` — the collector output, in the session folder.
-
-**Workers:** 1 researcher; one serial collection.
-- impl: the collection and the report.
-
-**Constraints from prior phases:**
-- Phase 179: three sampled modules gave collector multipliers of 1.36 CPU and 1.45 wall; 5 of 21 tests came back unknown. Estimate for the folder: 2,545 CPU s, 52 serial minutes, 207 modules, 1,558 tests.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report and JSON exist, with candidates and unknown coverage in separate tables.
-- `git status` shows no change from the collection.
+- Checkpoint `68da1fa10` (plan only). One read-only `coverage_overlap.py` run over 207 `scripts/direct` modules: 1,558 tests, all pass; collector 1,711 CPU s, 43.5 min wall. 0 known, 0 candidates: every test has `child outlived its test`, from a collector defect (a launch with no seen exit counts as alive for the rest of the run). 618 tests have only that cause. Phase 184 repairs the collector and repeats the run.
 
 ### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_wait_holder.py`, the slowest gate module (67.9 CPU s median), costs less CPU with the same 27 tests and every assertion.
+- Checkpoint `68da1fa10`. In `test_verify_wait_holder.py` three tests call the real hold and route functions (`start_hold_step`, `start_pinned_route`) in place of a full `verify.sh` entry. 27 tests; 126 assertions kept and 7 added. Fixtures unchanged. The verify keeps stay: a full entry for each wait kind, holder changes, exact NotRecorded lines, both owner paths, the memory-close retry. aws pairs: 63.99 to 62.61 CPU s (1.37 s). Local separate runs claimed 25 s: noise. The full-entry keeps hold the rest of the cost.
 
-**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check and the keep-coverage rule; no test removal. verify-unit go, 2026-11-11, for the module and its fixtures, with four keeps (Spec item 3). panes-unit phase 24 may add rows to this module: start after it lands, or merge it first.
-
-**Spec:**
-1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py`. Name where the CPU goes: full `verify.sh` entries, recorder children, stubs, fixtures.
-2. Map each test's assertions to the code they prove. Where the decision lives in a `verify.sh` function, call the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) in one Bash process. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
-3. Keep (verify-unit):
-   1. At least one full `verify.sh` entry test for each wait kind: memory admission, cargo token, Mac busy. Each calls the real `progress_history.py` as a child process.
-   2. The holder-change path (`wait-holder` after `start-wait`) and the NotRecorded stderr lines, with their exact text.
-   3. The owner split: `CODEX_THREAD_ID` gives `--worker-thread-id`; otherwise `--director` with `CLAUDE_CODE_SESSION_ID`.
-   4. The pending phase-close retry for memory waits (`phase-close.*.memory` files).
-4. Keep all 27 tests and every assertion. Change no production code. A missing callable boundary goes to verify-unit as a proposal; do not copy the decision into a fixture.
-5. Shared fixtures (`verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`) serve other modules: keep their current behavior for those callers, and run each importer.
-6. Measure after with the same command. The director runs three aws pairs; only aws pairs decide.
-
-**Files:**
-- `scripts/direct/test_verify_wait_holder.py` — 27 tests in six classes.
-- `scripts/direct/verify_token_wait_test_support.py` — shared fixture; read first, edit only when a change keeps its other callers.
-- `scripts/direct/verify_hold_wait_test_support.py` — shared fixture; same rule.
-
-**Workers:** 1 writer; one module and its fixtures cannot split.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 179: 26 tests of this module start the full `verify.sh` in the slow-test census.
-- Phase 66 floor: the real `build_targets.py` commands in the wait-holder module run through `verify.sh`; that import hold stays.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.direct.test_verify_wait_holder` passes three times with 27 tests.
-- Every importer of a changed fixture passes.
-- basedpyright on each changed Python file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
-
-### Phase 182 — Review launches start the recorder fewer times, with the same pass records  · status: todo
+### Phase 182 — Review launches start the recorder fewer times, with the same pass records  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the review launcher tests cost less CPU because `review.sh` starts `progress_history.py` fewer times, with the same records, output and checks.
+- Dropped; nothing landed. A trial kept one `progress_history.py` server per review launch (bash coproc) with light relay clients. aws pairs: the three review-launcher modules saved 1.57-1.79 CPU s each; `test_progress_history.py` +0.54, `test_assign_claude_follow.py` +0.11; net about 4.45 CPU s per gate. Peak memory rose up to 111 MiB. Blind reviews found two blockers: SIGPIPE in cleanup replaced the exit status, and `coproc` needs Bash 4 (the repository keeps Bash 3.2). Simple ranks above Fast. sdlc accepted the drop and gave a go for a lighter recorder import (Phase 185).
 
-**Decision:** sdlc go via builds, 2026-11-11: one bounded trial of recorder reuse in `review.sh`, run by natest. Paired aws runs decide: a measured saving ships to sdlc, which lands it; no saving drops it. Queue: behind the slow `verify.sh` tests, unless a writer is free with no verify module ready.
-
-**Spec:**
-1. Measure first, on a temporary copy, how much CPU each `review.sh` recorder start costs in the four observed modules: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_review_launcher.py direct/test_review_launcher_trees.py direct/test_review_launcher_style.py direct/test_assign_claude_follow.py`. If the recorder starts are not a measurable part of the module CPU, stop and report; change nothing.
-2. `review.sh` calls the recorder at `scripts/direct/review.sh:167` (`check-launch`), `:258` (`start-pass`) and `:376` (`finish-pass`). Find the smallest change that removes starts in a real launch: for example, one recorder command that does `check-launch` and `start-pass` together when nothing between them needs the gap, or one reused recorder process for the launch. Pick the simplest that keeps every item in Spec 3.
-3. Keep: the real launcher; caller identity (`UNIT_PASS_OWNER=launcher`, director and worker thread ids); pass ownership; stderr and exit status on each failure path; `write_review_status` values; the UX lens rule that records no pass; the completion checks. Every test and assertion stays.
-4. A new recorder command lives in `scripts/direct/progress_history.py` with its own rows in its existing tests. One owner switches all callers: change every caller of a replaced command sequence in the same change. Add no re-export shim.
-5. Change no test only to make it faster. Tests change only where the command sequence they assert changes.
-6. Measure after with the same command. The director runs three aws pairs; only aws pairs decide.
-
-**Files:**
-- `scripts/direct/review.sh` — the recorder calls at :167, :258 and :376.
-- `scripts/direct/progress_history.py` — the recorder; a combined command, if the design needs one.
-- `scripts/direct/test_progress_history.py` — rows for a new command.
-- `scripts/direct/test_review_launcher.py` — read; edit only where the asserted command sequence changes.
-
-**Workers:** 1 writer; one launcher and its recorder cannot split.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 177: 390 recorder starts cost 98.9 CPU s in the sample; the four review-launcher modules hold 150 starts and 46.2 CPU s. The saving ceiling is 0–76.7 CPU s per gate (estimate).
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest` passes for every `scripts/direct/test_review_launcher*.py` module, `scripts.direct.test_assign_claude_follow` and `scripts.direct.test_progress_history`, with unchanged test counts.
-- basedpyright on each changed Python file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
-
-### Phase 183 — The Mac-only tests call the real verify.sh functions where the decision is in one function, and keep the full entries verify named  · status: todo
+### Phase 183 — The Mac-only tests call the real verify.sh functions where the decision is in one function, and keep the full entries verify named  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3391,3 +3303,39 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
 - basedpyright reports 0 errors and 0 warnings on the changed files.
 - The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
+
+### Phase 185 — The recorder commands that review launches call import less  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `progress_history.py check-launch`, `start-pass` and `finish-pass` start faster because they import less, with the same records, output and exit status.
+
+**Decision:** sdlc go via builds, 2026-11-12: the lighter recorder import for these three commands. Paired aws runs measure. Ship any measured saving that keeps the code simple. Land through builds.
+
+**Spec:**
+1. Measure first: `python3 -X importtime scripts/direct/progress_history.py check-launch --help` (and the other two), and `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_review_launcher.py`. Name the imports that cost the most and which of them the three commands use.
+2. Find the simplest change that makes the three commands import less: for example, move the import that only other commands use into those commands' module, or split the three commands' code into a small module that `review.sh` calls. Pick the one with the fewest new concepts.
+3. Keep: the records each command writes, its stdout and stderr text, its exit status on each failure path, caller identity (`UNIT_PASS_OWNER=launcher`, director and worker thread ids, launcher pid), and pass ownership. Every test and assertion stays.
+4. One owner switches all callers. Add no re-export shim. Do not use a module `__getattr__` or other lazy-attribute trick. Keep Bash 3.2 syntax in shell files.
+5. Measure after with the same commands. The director runs three aws pairs on the review-launcher modules, `test_assign_claude_follow.py` and `test_progress_history.py`; only aws pairs decide.
+
+**Files:**
+- `scripts/direct/progress_history.py` — the recorder.
+- `scripts/direct/review.sh` — only if the command it calls changes.
+- `scripts/direct/test_progress_history.py` — rows for any moved code.
+- `scripts/direct/progress_launch.py` — new, only if Spec 2 picks a split; the writer may choose another name in `scripts/direct/`.
+
+**Workers:** 1 writer; one recorder and its callers cannot split.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 182: recorder starts cost 46.6 CPU s across 150 starts in the four review modules (34% of their task CPU). A server design was dropped for complexity.
+- Phase 177: 390 recorder starts cost 98.9 CPU s in the census sample.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest` passes for every `scripts/direct/test_review_launcher*.py` module, `scripts.direct.test_assign_claude_follow` and `scripts.direct.test_progress_history`, with unchanged test counts.
+- basedpyright on each changed Python file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
