@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
@@ -28,7 +29,6 @@ import threading
 import time
 import subprocess
 import unittest
-from types import ModuleType
 from typing import cast, override
 from unittest import mock
 
@@ -3689,40 +3689,34 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(len(fixture.server.reservations), 1)
 
     def test_unparsed_request_refusals_decode_with_both_protocol_versions(self) -> None:
-        source = subprocess.run(["git", "show", "7ab78b74e:scripts/build_queue/admission_protocol.py"],
-            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
-        legacy = ModuleType("admission_protocol_version_one")
-        with mock.patch.dict(sys.modules, {legacy.__name__: legacy}):
-            exec(compile(source, "admission_protocol_version_one.py", "exec"), legacy.__dict__)
-            decode_legacy = cast(Callable[[str], object], getattr(legacy, "parse_reply"))
-            for version in (1, 2):
-                for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
-                    with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
-                        fixture.configure(request_max_bytes=512)
-                        _ = fixture.run_pass()
-                        prefix = f'{{"v":{version},'
-                        if kind.startswith("oversize"):
-                            line = prefix + '"data":"'
-                            tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
-                            limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
-                            line += "x" * (limit + 1 - len(line) - len(tail)) + tail
-                        else:
-                            line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
-                        sent: list[str] = []
+        for version in (1, 2):
+            for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
+                with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
+                    fixture.configure(request_max_bytes=512)
+                    _ = fixture.run_pass()
+                    prefix = f'{{"v":{version},'
+                    if kind.startswith("oversize"):
+                        line = prefix + '"data":"'
+                        tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
+                        limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
+                        line += "x" * (limit + 1 - len(line) - len(tail)) + tail
+                    else:
+                        line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
+                    sent: list[str] = []
 
-                        def capture(line: str) -> str:
-                            sent.append(line)
-                            return line
+                    def capture(line: str) -> str:
+                        sent.append(line)
+                        return line
 
-                        with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
-                            peer = fixture.connect(line)
-                            if kind == "fragmented":
-                                self.assertEqual(peer.replies(), [])
-                                peer.socket.sendall(b'"type":"view","data": }\n')
-                            reply, = peer.replies()
-                        self.assertIsInstance(reply, wire.Refused)
-                        self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
-                        self.assertEqual(wire.parse_reply(sent[-1]), reply)
+                    with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                        peer = fixture.connect(line)
+                        if kind == "fragmented":
+                            self.assertEqual(peer.replies(), [])
+                            peer.socket.sendall(b'"type":"view","data": }\n')
+                        reply, = peer.replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
+                    self.assertEqual(wire.parse_reply(sent[-1]), reply)
 
     def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
