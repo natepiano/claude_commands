@@ -377,7 +377,18 @@ def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMe
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
-        labels = roster.unit_labels_for(session_ids, os.environ)
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        recorded: dict[str, UnitMembership] = {}
+        try:
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+        except (OSError, ValueError):
+            pass
+        missing = [session for session in session_ids if session not in recorded]
+        if missing:
+            recorded.update(roster.unit_labels_for(missing, os.environ))
+        labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}
 
