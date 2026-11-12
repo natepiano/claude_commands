@@ -1,4 +1,4 @@
-Status: design only; requires agreement from AWS, NixOS, Linux runner, queue, copies, remote-runner, and buildlog owners.
+Status: design only; requires agreement from AWS, resources, queue, verify, report, and natedev owners.
 
 # One kept AWS machine for Hana
 
@@ -10,30 +10,46 @@ The expected daily cost is about USD 2.00–2.81, subject to the trial.
 
 ## Placement and lifecycle
 
-Reuse `PlacementAssignment`, build holds, exact-source ownership, the Linux runner, and buildlog result contracts.
+Start code only after queue Phases 44 and 44c are on builds.
+Extend Phase 44 placement from `PlacementRequest` constraints through `PlacementAssignment`, assigned-info, and `ExecutionReport`.
+Add one provider candidate within that path; create no selector or separate placement path.
+Reuse build holds, exact-source ownership, the Linux runner, and buildlog result contracts.
 Use the existing gate S3 transport instead of adding SSH credentials or an instance IAM role.
-Add the target `hana-aws` as an optional Hana placement candidate, rather than changing the global `targets` list.
+Read the candidate target row only through `target_config.read_targets`.
+Put the target name `hana-aws` in configuration, not in code.
+Disable the candidate when `config/hana_aws.conf` has `enabled=off`.
+Extend the existing `build_targets` capability path; add no second placement rule.
 An enabled Hana route tries this candidate before natedev.
-Preserve explicit target pins and all other routing.
+Preserve explicit target pins and all other routing tests unchanged.
 Match Hana by its existing repository identity, not a directory name.
+Queue supplied the names `BusyProviderDiagnostic` and `ProviderRetryNotice` for notices that Phase 44/44c will add.
+Start code after those phases are on builds; use the names that land for busy, starting, and held states.
 
 | State | Queue action |
 | --- | --- |
 | No provisioned machine | Use natedev; provision only through a separate approved setup command. |
 | Machine stopped after idle, capacity and spend allowed | Hold one start claim and start immediately. |
-| Machine stopped by interruption | Use natedev until AWS restores capacity. |
-| Starting machine | Let that claimant wait at most 120 seconds; send other claims to natedev. |
+| Machine stopped by interruption | Use natedev after any prior attempt settles, until AWS restores capacity. |
+| Starting machine | Bound the claimant wait at 120 seconds; keep pending starts blocked until settlement. |
 | Ready and idle | Claim the machine and the source worktree, then execute remotely. |
-| Busy, held, unhealthy, or start deadline exceeded | Use the normal natedev queue without another remote wait. |
-| Interrupted, refused, or remote result lost | Reconcile or cancel any remote attempt, then use the normal natedev path on the live worktree. |
+| Busy, held, unhealthy, or start deadline exceeded | Use natedev only after any remote attempt settles. |
+| Interrupted, refused, or remote result lost | Settle the remote attempt before the normal natedev path uses the live worktree. |
 
+Enforce the Phase 44 settlement barrier before local fallback.
+A settled `PrelaunchRefused` or `ExecutionNotStarted` closes the attempt immediately.
+Keep that provider excluded until cleanup completes.
+A pending or unacknowledged start remains blocked until settlement.
+After loss or watchdog termination, let offload record the attempt lost and fence its generation before settlement permits fallback.
 Do not transfer the remote snapshot to local fallback.
 Keep `scripts/direct/verify.sh` unchanged.
 
 Begin with one active step, limited to 4 vCPUs and 24 GiB RAM.
 The supplied steps use 0.7–2.1 cores; their median peak memory reaches 9.1 GiB.
 Do not run two commands against the same worktree cache.
-Release local compute admission while AWS executes; retain the caller's hold and ownership records.
+Release local memory admission and the cargo token through the existing Mac offload release path.
+Retain the caller's hold and ownership records.
+Define the local remote-step waiter class in `build_hold.audit_builds` and `hold_enforcer.decide_builds`.
+A natedev drain hold leaves this waiter running because remote work uses no natedev memory.
 A normal compiler failure returns that failure instead of silently running again elsewhere.
 
 Use a persistent Spot request with interruption behavior `stop`, rather than the gates' termination behavior.
@@ -42,7 +58,9 @@ This interval retains short bursts without paying for a quiet evening.
 Serialize idle-stop and new claims under the controller's existing lifecycle lock.
 AWS alone can restart an instance stopped by interruption; capacity recovery has no promised deadline.
 An automatic restart without a fresh work permit stops again within 60 seconds.
-Install the stop guard before tool setup, so failed preparation cannot leave an unattended running machine.
+Implement the stop guard as a systemd unit without dependencies on the data disk, network, or tool setup.
+Order tool setup `After=` the guard.
+A failed tool setup must still let the guard stop the machine.
 Add a guest watchdog beside [RemoteAgent.tick()](../../scripts/aws_target/remote.py) and the [Linux runner](../../scripts/mac_test/linux_runner.py).
 The existing idle-stop check cannot stop a command that never exits.
 Run the watchdog independently of the controller and the command.
@@ -54,11 +72,17 @@ These constraints follow the [AWS stop rules](https://docs.aws.amazon.com/AWSEC2
 
 ## Exact source and warm storage
 
-Reuse the copies service's source selection and leases, plus the Mac/Linux runner's input identity checks.
-Extend their transport boundary for S3; do not create an independent checkout service.
-Key each cache by repository and persistent worktree identity.
+Reuse `copies.py` source capture through `staged_tree`, `source_commit`, `apply_changes`, and the existing `SourcePolicy`.
+Keep the caller's real index unchanged; create no second snapshot path.
+Reuse the Mac/Linux runner's input identity checks.
+Reuse `claim_tree`, `available_tree`, and `GateRecord` for the remote cache lease.
+Represent a warm AWS cache as another tree kind keyed by owner, repository, and persistent worktree identity.
+Keep the existing lease format.
+Use a separate S3 module behind one typed transport boundary for digest upload, manifests, and materialization.
+Implement the S3 module in `scripts/aws_target/hana_transport.py`.
+Keep `copies.py` free of AWS imports and the sole source of truth for source definitions.
 
-1. Capture the exact tracked and permitted untracked files through the existing snapshot service.
+1. Capture the exact tracked and permitted untracked files through the existing copies source path.
 2. Include staged and unstaged changes without changing the caller's real index.
 3. Upload missing content by digest and send a manifest with the tree, command, features, and allowed environment.
 4. Acquire the worktree cache lease before materializing that manifest.
@@ -73,30 +97,43 @@ Use the existing Linux shell cache and invalidate incompatible tool state.
 
 Keep a 40 GiB root volume and a 300 GiB encrypted gp3 data volume in the same zone.
 Retain the data volume through stop and instance replacement.
+Mount the data disk with `nofail` and a device timeout.
+A missing disk refuses work without delaying boot indefinitely.
 Keep Rust tools and Cargo caches on the data volume.
 Reserve 30 GiB free and initially budget 56 GiB per worktree cache, following the existing Hana Mac allowance.
 This fits approximately four warm caches after shared tools and sources.
-Remove only unleased build outputs, oldest first, when space is low.
+Remove only unleased cache trees, oldest first, through the existing holder check when space is low.
 Never remove an active cache or unsaved caller source.
 A replacement must fence the old owner before attaching the single-writer volume.
 Do not create trial snapshots; measure cold rebuilds after cache loss.
 
 ## Tools and returned results
 
-Use Hana's pinned Nix shell and Rust 1.99.1 with its declared components, including clippy.
+Use the Hana toolchain source that natedev's NixOS configuration uses, including clippy and the pinned Nix shell.
+Add no second Rust version pin in `aws-build.nix`.
+
 Validate `rustc -vV` against the requested compiler identity.
 Disable the target when the requested toolchain or shell cannot be reproduced.
 
-Return stdout, stderr, exit status, timings, peak memory, source identity, and one buildlog execution row.
+Return stdout, stderr, exit status, timings, peak memory, source identity, and a buildlog row for the remote attempt.
 Keep interrupted attempts linked to the caller; accept only one final result per execution generation.
 Reuse diagnostics path mapping and result synchronization.
-Accept a remote result only when its source identity matches the caller's capture.
+Use the same captured source identity as the `verify.sh` verify cache key.
+Refuse a remote result when its source identity differs.
 Reject results when the command no longer matches.
+Reject late results from fenced generations before any buildlog row or verify cache entry is written.
+Record the remote attempt and its natedev fallback as two step rows with one shared link key.
+Count the step once by its final result.
+Show lost remote time separately from natedev step totals.
+Give each remote row its own host.
+Keep natedev step tables, memory pressure, and Rebuilds limited to natedev rows.
+Bump `SCHEMA_VERSION` for new buildlog columns.
+Read missing columns from older records as `NULL`; preserve every existing column's meaning.
 
 Preserve the existing warning policy for clippy judgments.
 Return no patch or binary.
 Preserve the existing lint sequence and recapture source after local repairs before another remote judgment.
-The queue and remote-runner owners must confirm that the provider integration preserves them.
+The queue and verify owners must confirm that the provider integration preserves them.
 
 ## Cost and configuration
 
@@ -128,10 +165,26 @@ Reserve compute exposure through the permit deadline and retain that reservation
 Keep storage reserved after the machine stops.
 Keep the effective account daily limit at USD 35, including gates and every other AWS workload.
 Include the Hana budget within that limit.
-Use bill totals and usage quantities for daily cost; label recent estimates and pending bills explicitly.
+Read kept-machine running time, disk cost, and transfer cost from the AWS ledger in `aws_report.py`.
+Use bills when available and label estimates.
+Compute no cost in `record.py`.
+Add a kept-machine compute column beside 32-CPU and 16-CPU in the daily spend table.
 
-Add only these keys in a new `config/hana_aws.conf`; change no existing configuration value.
-Read them through `scripts/lib/conf.py`.
+Add the workload keys below in a new `config/hana_aws.conf`.
+Add only the new target row keys shown below in `config/build_targets.conf`.
+These new keys need no user approval.
+Keep the row outside the active `targets=` list, as the existing Manual Linux proof configuration does.
+Change no existing configuration value during implementation.
+At enable time, add `hana-aws` to `targets=` only through the user's own `/tune` approval.
+Obtain that approval after the user approves the USD 6 first-day trial bound.
+Read these workload keys through `scripts/lib/conf.py`; retain `target_config` as the sole target-row reader.
+Keep `start_timeout_seconds=120`, `idle_stop_seconds=600`, and `max_steps=1` as configuration keys, as listed below.
+
+| New target row key in `config/build_targets.conf` | Value |
+| --- | --- |
+| `kind.hana-aws` | The provider kind supplied by Phase 44/44c |
+| `platform.hana-aws` | `linux` |
+| `settings.hana-aws` | `hana_aws.conf` |
 
 | New key | Value | Reason |
 | --- | --- | --- |
@@ -158,43 +211,84 @@ Derive the compiler revision from the requested source instead of adding a dupli
 
 Keep the same secret boundary as disposable gates.
 Only natedev holds AWS credentials; manual setup uses the encrypted admin session.
-The machine receives only short-lived, object-scoped URLs and an expiring execution permit through that authenticated transport.
+Deliver the permit and short-lived, object-scoped signed URLs at run time through the authenticated transport.
+Store no secrets in the Nix store or bootstrap template.
 Do not install repository tokens, SSH keys, Tailscale credentials, or a broad instance role.
 Refresh URLs through the trusted controller and reject stale boot or execution generations.
 Run Cargo and build scripts unprivileged, outside the root control service.
 Keep controller files inaccessible to the runner and reject archive paths outside the leased source root.
 Hold, cancellation, interruption, and cap refusal stop the process group before local fallback.
-If cancellation is uncertain, mark the attempt lost and fence its later result before local execution.
+Keep uncertain cancellation blocked until the attempt settles under the Phase 44 barrier.
 Print safe aliases and error codes, without cloud identifiers, addresses, secrets, or signed URLs.
+
+1. Send queue the `build_queue` and copies diffs before checkpoint and before merge.
+2. Send verify the `offload.py` and `linux_runner.py` diffs before checkpoint.
+3. Send report the `record.py` and `aws_report.py` diffs before checkpoint.
+
+Send the `/etc/nixos` change to natedev as a branch on the `nixos` origin with its file list.
+Natedev reviews, merges, and pushes that branch.
+Start no build or spend before all owners agree and the user approves the USD 6 first-day bound.
+Keep existing `scripts/mac_test`, `test_verify_mac*`, and `ssh_targets` tests unchanged; add new rows beside them.
+Place new copies tests beside `scripts/copies/test_copies.py` tests.
+Create independent temporary repositories for each copies test; use no live units.
+Coordinate the pending `ConnectTimeout` removal in `offload.py` and `mac_test.py` before editing those files.
 
 | Files or area | Estimated change | Owner and required agreement |
 | --- | --- | --- |
-| `scripts/aws_target/hana_box.py` (new) | 250–350 lines for lifecycle, gate transport, execution and result handling | AWS unit |
-| `scripts/aws_target/{deploy,remote,ledger}.py`, `docs/plans/builds-aws/cloudformation.json` | 180–280 lines for a separate kept workload, permit expiry watchdog, stop recovery and physical charges | AWS unit |
-| `/etc/nixos/hosts/aws-build.nix`, `/etc/nixos/hosts/aws-bootstrap.sh.in`, `scripts/mac_test/linux_runner.py` | 60–100 lines for warm Rust tools, compiler checks and the command cgroup boundary | NixOS and Linux runner owners: required go |
-| `scripts/build_targets/{target_config,build_targets}.py`, `scripts/build_queue` | 100–180 lines for Hana placement, capability checks and single-machine admission | Queue unit: required go |
-| `scripts/copies` and `scripts/mac_test/offload.py` | 80–140 lines for existing source and lease contracts over gate transport | Copies and remote-runner owners: required go |
-| `scripts/buildlog/{record,aws_report}.py` | 60–100 lines for linked attempts, host timing and visible kept storage costs | Buildlog unit: required go |
-| New configuration and AWS operation documents | Under 70 lines | AWS unit |
-| Tests beside these modules | 160–280 lines | Each code owner |
+| `scripts/aws_target/hana_box.py` (new) | 250–350 lines for lifecycle, gate transport, execution and results | AWS |
+| `scripts/aws_target/{deploy,remote,ledger}.py`, `docs/plans/builds-aws/cloudformation.json` | 180–280 lines for the kept workload, watchdog, stop recovery and charges | AWS |
+| `/etc/nixos/hosts/aws-build.nix`, `/etc/nixos/hosts/aws-bootstrap.sh.in` | 40–70 lines for shared toolchain inputs, guard and disk mount | Natedev: required go |
+| `scripts/build_targets/{target_config,build_targets}.py` | 50–90 lines for the configured target row and existing capability path | Resources: required go |
+| `scripts/build_hold/{build_hold,hold_enforcer}.py` | 20–40 lines for the remote waiter class and drain hold | Resources: required go |
+| `scripts/build_queue` | 50–90 lines within Phase 44 placement and settlement | Queue: required go |
+| `scripts/copies/{copies,test_copies}.py` | 30–50 implementation lines for existing source, tree kind and lease contracts; tests below | Queue: GO, under the conditions below |
+| `scripts/aws_target/hana_transport.py` (new) | 80–120 lines for S3 behind the typed transport boundary | AWS; queue reviews the copies boundary |
+| `scripts/mac_test/{offload,linux_runner}.py` | 70–120 lines for source identity, admission release, fencing and cgroups | Verify: required go |
+| `scripts/buildlog/{record,aws_report}.py` | 80–120 lines for linked rows, schema and ledger reporting | Report: required go |
+| `config/hana_aws.conf`, new row keys in `config/build_targets.conf`, AWS operation documents | Under 70 lines; later `targets=` edit requires user `/tune` | AWS; resources reviews target registration |
+| Tests beside these modules | 220–350 lines | Each code owner |
+
+### Owner conditions
+
+| Owner | Condition | Where the design meets it |
+| --- | --- | --- |
+| Resources | One target reader; new inactive row keys; later `targets=` change through user `/tune`; existing capabilities; drain-safe waiter | Placement; configuration; files; drain test |
+| Queue | Phase 44/44c first, settled fallback, configured limits | Placement; configuration; settlement test |
+| Queue (notices) | Names from queue: `BusyProviderDiagnostic` and `ProviderRetryNotice`; added by Phase 44/44c. Start code after those land; use the names that land. | Placement; Phase 44/44c dependency |
+| Verify | Shared source identity, one release path, fenced results, unchanged tests | Placement; results; delivery rules; fencing test |
+| Report | Linked rows, host separation, ledger costs, compatible schema | Results; cost; report tests |
+| Natedev | Shared toolchain, independent guard, bounded mount, runtime secrets, branch review | Lifecycle; storage; tools; security; delivery rules |
+| Queue (copies): GO | Reuse source functions and `SourcePolicy`; preserve the real index | Exact source; capture test |
+| Queue (copies): GO | Reuse tree leases and `GateRecord`; check holders before eviction | Exact source and warm storage; lease test |
+| Queue (copies): GO | Separate typed S3 boundary; no AWS imports in `copies.py` | Exact source; transport file |
+| Queue (copies): GO | Copies tests use temporary repositories and no live units | Implementation; copies tests |
+| Queue (copies): GO | Review the copies diff before checkpoint and merge | Delivery step 1 |
 
 | Required test rows | Expected behavior |
 | --- | --- |
 | Wrong repository, mend, build, nextest, local pin, disabled mode | Preserve existing placement. |
 | Clippy repair flags and local repair followed by judgment | Keep repairs local and capture the updated source for judgment. |
-| Simultaneous requests, idle-stop race, busy machine | Start one instance and admit one step; retain local fallback. |
-| Two dirty worktrees and deleted or untracked files | Preserve exact independent source and cache identities. |
+| Simultaneous requests, idle-stop race, busy machine | Start one instance and admit one step; use existing provider notices. |
+| Natedev drain hold during remote execution | Keep the classified local waiter running without local memory admission or a cargo token. |
+| Pending start, unacknowledged start, settled refusal, cleanup | Enforce the Phase 44 barrier and provider exclusion until cleanup. |
+| Two dirty worktrees and deleted or untracked files | Preserve exact independent source and cache identities through existing source functions and `SourcePolicy`. |
+| Staged source capture and change application | Preserve the real index in independent temporary repositories without live units. |
+| Warm tree claim, availability, and eviction | Reuse `GateRecord` and the lease format; the holder check protects leased trees. |
 | Edited source during execution or result transfer | Reject stale remote judgments. |
-| Remote refusal or loss after a local edit | Use the live worktree through the normal natedev path; do not transfer the snapshot. |
+| Remote refusal or loss after a local edit | Settle and fence the attempt before the normal natedev path uses the live worktree. |
 | Compiler mismatch or incompatible shell | Refuse remote execution before Cargo starts. |
+| Failed tool setup or missing data disk | Stop through the independent guard; refuse work without hanging boot. |
 | Interruption, automatic restart, lost controller, cancellation | Fence stale work, stop safely, and return one final result. |
 | Controller loss during a command that never exits | At permit expiry, kill the command cgroup and stop without the controller; retain exposure until stop confirmation. |
 | Memory, disk, workload budget, or account cap reached | Record the reason and use the permitted local path. |
+| Late result after fencing | Write no buildlog row or verify cache entry. |
+| Linked remote loss and natedev fallback | Count one final step; separate remote time, host, memory, and Rebuilds. |
+| Older buildlog records and new ledger columns | Read missing fields as NULL; preserve old meanings and label estimated costs. |
 | Stop intervals and delayed or revised bills | Charge physical compute once and retain storage charges. |
 
 ## First-day trial and decisions
 
-1. Obtain agreement from all owners listed in the status line.
+1. Obtain all owner agreements and user approval of the USD 6 first-day bound.
 2. Confirm USD 6 of headroom below the account cap, including existing exposure and reserves.
 3. Provision one instance and record all setup time and cost inside the first-day budget.
 4. Measure cold, warm, and one-edit runs for clippy and check on identical snapshots on AWS and natedev.
@@ -223,4 +317,4 @@ A separate storage decision remains necessary after the trial, because stopped v
 Mend requires a patch contract with exact-source validation before local application.
 Build requires selected binary downloads, verified hashes, compatible runtime files, and real local paths.
 Measure compressed outputs and agree a transfer allowance before either route expands.
-These changes require a separate design and the verification owner's agreement.
+These changes require a separate design and the verify owner's agreement.
