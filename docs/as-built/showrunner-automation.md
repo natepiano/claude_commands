@@ -555,6 +555,20 @@ Pane labels do not identify a friend.
   Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
   Quota and notifier refresh paths keep their own behavior.
 
+- **For you.** A unit director sees waiting questions, changes, proposals, and efficiency items from that unit.
+  The payload's current session selects the unit staff row.
+  The unit's parent supplies the production document.
+  Counts match the unit's fixed staff id against `asked_by`, `Producer`, `proposed_by`, and `[by: <staff id>]`.
+  Items without a recorded source count for no unit.
+  Unit counts omit unrouted changes.
+  Showrunner sessions retain the full production counts.
+  `counts_row.py --unit <staff id>` writes `<showrunner state>/counts/<unit staff id>`.
+  Each cache retains the counts line, deadline, and watched paths.
+  A unit cache ends with `source=unit:<staff id>`.
+  A source marker mismatch forces a refresh, even when the cache is newer than staff.
+  The status line refreshes only that unit's cache when a watched path changes or the deadline passes.
+  Failed reads use the existing retry deadline.
+
 - **Configured zones.** The status line reads `USER_ZONE`, else `zone=` from `USER_ZONE_CONF` or `config/user_zone.conf`.
   `send_later.py --at` reads the user's zone and sends UTC to systemd.
   `verify.sh` uses the user's zone for recorded results.
