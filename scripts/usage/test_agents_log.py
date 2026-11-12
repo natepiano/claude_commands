@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -16,6 +18,7 @@ from unittest.mock import patch
 
 from scripts.usage import agents_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 
@@ -326,44 +329,44 @@ class AgentsLogTests(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("agents_log: "), result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def assignment_processes(self, count: int, action: Callable[[int], None]) -> list[subprocess.CompletedProcess[str]]:
+        context = multiprocessing.get_context("fork")
+        ready = context.Barrier(count + 1)
+
+        def write(index: int, announcement: int) -> int:
+            _ = os.write(announcement, b"ready\n")
+            os.close(announcement)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+            action(index)
+            return 0
+
+        with ForkChildren() as children:
+            processes: list[ForkChild] = []
+            announcements: list[int] = []
+            for index in range(count):
+                reader, writer = children.pipe()
+                processes.append(children.start(
+                    lambda index=index, writer=writer: write(index, writer), pass_fds=(writer,)))
+                announcements.append(reader)
+            for announcement in announcements:
+                self.assertEqual(os.read(announcement, 6).decode(), "ready\n")
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+            return [process.result() for process in processes]
+
     def test_concurrent_default_registration_writes_one_assignment_and_returns_one_true(self) -> None:
-        script = """
-import json
-import sys
-from datetime import datetime, timezone
-from scripts.usage.agents_log import register_default
-print('ready', flush=True)
-sys.stdin.readline()
-print(json.dumps(register_default('shared-session', 'interactive', datetime.now(timezone.utc))))
-"""
-        processes: list[subprocess.Popen[str]] = []
+        def register(index: int) -> None:
+            del index
+            print(json.dumps(agents_log.register_default(
+                "shared-session", "interactive", datetime.now(timezone.utc))))
+
+        processes = self.assignment_processes(6, register)
         outcomes: list[bool] = []
-        try:
-            for _worker in range(6):
-                processes.append(subprocess.Popen(
-                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script],
-                    cwd=REPOSITORY, env=os.environ.copy(),
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                ))
-            for process in processes:
-                assert process.stdout is not None
-                self.assertEqual(process.stdout.readline(), "ready\n")
-            for process in processes:
-                assert process.stdin is not None
-                _ = process.stdin.write("go\n")
-                process.stdin.flush()
-            for process in processes:
-                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual((process.returncode, errors), (0, ""))
-                wrote = cast(object, json.loads(output))
-                self.assertIsInstance(wrote, bool)
-                assert isinstance(wrote, bool)
-                outcomes.append(wrote)
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                _ = process.communicate()
+        for process in processes:
+            self.assertEqual((process.returncode, process.stderr), (0, ""))
+            wrote = cast(object, json.loads(process.stdout))
+            self.assertIsInstance(wrote, bool)
+            assert isinstance(wrote, bool)
+            outcomes.append(wrote)
 
         self.assertEqual(outcomes.count(True), 1)
         self.assertEqual(outcomes.count(False), 5)
@@ -515,37 +518,14 @@ print(json.dumps(register_default('shared-session', 'interactive', datetime.now(
             setattr(agents_log.Unassigned(), "role", "impl")
 
     def test_concurrent_processes_append_complete_json_lines(self) -> None:
-        script = """
-import sys
-from datetime import datetime, timezone
-from scripts.usage.agents_log import append
-sys.stdin.readline()
-for index in range(20):
-    append(f'{sys.argv[1]}-{index}-' + 'x' * 32768, 'worker', None,
-           datetime.now(timezone.utc))
-"""
-        processes: list[subprocess.Popen[str]] = []
-        try:
-            for worker in range(4):
-                processes.append(subprocess.Popen(
-                    [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, str(worker)],
-                    cwd=REPOSITORY, env=os.environ.copy(),
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True,
-                ))
-            # Release every writer before waiting for any of them.
-            for process in processes:
-                assert process.stdin is not None
-                _ = process.stdin.write("go\n")
-                process.stdin.flush()
-            for process in processes:
-                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual((process.returncode, output, errors), (0, "", ""))
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                _ = process.communicate()
+        def append(worker: int) -> None:
+            for index in range(20):
+                agents_log.append(f"{worker}-{index}-" + "x" * 32768, "worker", None,
+                                  datetime.now(timezone.utc))
+
+        processes = self.assignment_processes(4, append)
+        for process in processes:
+            self.assertEqual((process.returncode, process.stdout, process.stderr), (0, "", ""))
 
         records = self.records()
         self.assertEqual(len(records), 80)

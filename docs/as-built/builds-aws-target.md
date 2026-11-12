@@ -493,7 +493,23 @@ The same administrator session reads failure details without another passphrase 
 ## Paired speed trials
 
 Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
-Both refs must exist in pushed public history for `~/.claude`.
+Both refs can name local commits in `~/.claude`.
+The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
+The expires field records the trial's fixed expiry epoch in seconds.
+The trial folder's UUID supplies the id; `trial_branch_prefix` configures the prefix.
+At trial end, cleanup lists the trial's remote branch namespace and deletes each branch, including after errors and Ctrl-C.
+`paired_main` installs no signal handler.
+SIGTERM or SIGHUP can skip this cleanup.
+Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
+The sweep reads no current lifetime setting.
+A lower lifetime setting leaves existing trials' fixed expiries unchanged.
+The sweep preserves unexpired branches, malformed names, and unrelated branches.
+A sweep failure prints one stderr line and the trial continues.
+This cleanup covers a push accepted remotely before the client reports an error.
+Each network Git call uses `git_network_timeout_s`, which defaults to 60 seconds.
+A timeout or cancellation kills the Git process group, including SSH children.
+A cleanup failure prints one stderr line for the trial or branch and preserves the trial's exit code.
+The pushes use the invoking terminal's Git credentials.
 Each module uses one disposable gate box.
 All boxes launch after the full trial obtains its cloud slots and cost reservations.
 The trial refuses costs above the daily or monthly room.
@@ -597,6 +613,7 @@ The prices command prints regional Spot prices without resource identities.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
 `deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
+Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each configured region.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.

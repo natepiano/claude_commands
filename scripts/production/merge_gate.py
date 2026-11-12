@@ -222,6 +222,8 @@ class GateJobResult:
     peak_mib: float = 0.0
     restart: Literal["", "hold"] = ""
     memory_stopped: bool = False
+    wall_clock: gate_record.WallClockSpan | gate_record.WallClockNotRecorded = field(
+        default=gate_record.WallClockNotRecorded("job did not run"), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -246,6 +248,7 @@ class RunningGateJob:
     path: Path
     process: subprocess.Popen[str]
     started: float
+    started_at: float
     output: TextIO
     log: Path
     module: str
@@ -747,6 +750,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
     output = log.open("w+")
     started = time.monotonic()
+    started_at = time.time()
     try:
         process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                    cwd=repo, env=environment, stdin=subprocess.DEVNULL,
@@ -756,7 +760,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
         output.close()
         raise
     module = test_module_name(repo, suite, path)
-    return RunningGateJob(suite, path, process, started, output, log, module, kind=kind)
+    return RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -829,7 +833,8 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 1
     return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
                          tripwire_tripped, job.kind, job.cpu_seconds, times, job.peak_memory_mib,
-                         memory_stopped=job.memory_stopped)
+                         memory_stopped=job.memory_stopped,
+                         wall_clock=gate_record.WallClockSpan(job.started_at, time.time()))
 
 
 @dataclass(frozen=True)
@@ -1006,7 +1011,8 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
         slow_test_s = gate_record.slow_test_s()
         recorded_executions = [
             gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds,
-                                  job.peak_mib, job.returncode, job.restart, job.times, job.output)
+                                  job.peak_mib, job.returncode, job.restart, job.times, job.output,
+                                  wall_clock=job.wall_clock)
             for job in executions
         ]
         modules = gate_record.module_runs(recorded_executions, slow_test_s)
