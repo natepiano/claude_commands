@@ -905,7 +905,7 @@ class ProcessUseTests(SweepCase):
         nested = self.hana / "proof" / "target"
         nested.mkdir(parents=True)
         owners = sweep.TargetOwnerIndex([str(self.hana), str(nested), str(self.other)])
-        for how in ("exe", "cwd", "maps", "nextest", "nested", "sibling"):
+        for how in ("exe", "cwd", "maps", "nextest", "verify", "nested", "sibling"):
             with self.subTest(how=how):
                 if self.proc.exists():
                     shutil.rmtree(self.proc)
@@ -913,9 +913,10 @@ class ProcessUseTests(SweepCase):
                 fake_process(self.proc, 10,
                              exe=path if how == "exe" else "/usr/bin/true",
                              cwd=path if how in ("cwd", "nested") else (
-                                 str(self.workspace) if how == "nextest" else str(self.hana) + "-old"),
+                                 str(self.workspace) if how in ("nextest", "verify") else str(self.hana) + "-old"),
                              maps=f"7f00-7f10 r-xp 00000000 00:1f 42 {path}\n" if how == "maps" else "",
-                             argv=("cargo", "nextest", "run") if how == "nextest" else ("true",))
+                             argv=("cargo", "nextest", "run") if how == "nextest" else (
+                                 ("bash", "/x/verify.sh", "build", "hana") if how == "verify" else ("true",)))
                 uses = sweep.process_use(str(self.hana), owners, str(self.proc))
                 self.assertEqual(set(uses), set() if how in ("nested", "sibling") else {str(self.hana)})
                 if uses:
@@ -1027,6 +1028,23 @@ class ProcessUseTests(SweepCase):
                      cwd=str(self.workspace / "crates" / "app"),
                      argv=("/nix/store/x-cargo-nextest/bin/cargo-nextest", "nextest", "run"))
         self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace / 'crates' / 'app'}"})
+
+        cases = (
+            (("bash", "/x/verify.sh", "build", "hana"), self.workspace / "crates" / "app", (), (self.hana,)),
+            (("/x/verify.sh", "build", "hana"), self.workspace, (), (self.hana,)),
+            (("bash", "-e", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("sh", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("zsh", "-f", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("dash", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("bash", "/x/other.sh"), self.workspace, (), ()),
+            (("bash", "/x/verify.sh", "build"), self.workspace, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), self.other.parent, (), (self.other,)),
+        )
+        for argv, cwd, environ, targets in cases:
+            with self.subTest(argv=argv, cwd=cwd, environ=environ):
+                shutil.rmtree(self.proc)
+                fake_process(self.proc, 10, cwd=str(cwd), argv=argv, environ=environ)
+                self.assertEqual(self.uses(), {str(target): f"runs verify.sh in {cwd}" for target in targets})
 
     def test_a_nextest_run_uses_the_target_its_flag_or_environment_names(self) -> None:
         for argv, environ in ((("cargo", "nextest", "run", "--target-dir", str(self.other)), ()),
