@@ -3146,7 +3146,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `8f30bce69`. Read-only replay of the affected-test selection on 62 failed cloud merge gates (42 trees) since 11-08. Of 35 trees with a commit, the selection includes every failing module on 25, some on 4 and none on 6; 7 trees have no commit object. Most misses are whole-repository audits and fixtures that read a config file (Phase 176).
 
-### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
+### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: done
 **Depends on:** Phase 175
 
 #### Work Order
@@ -3236,37 +3236,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: done
 **Depends on:** Phase 180
 
-#### Work Order
+#### As-built
 
-**Goal:** A repeat of the Phase 180 folder collection over `scripts/direct` gives known coverage for the tests whose only unknown cause is a child from another test, and reports the overlap candidates.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 2): the folder collection is approved. Phase 180 ran it and got 0 known of 1,558 tests, from a collector defect. The repair and one repeat run finish that approval. Candidates are not removal approvals. No test removal or coverage reduction is approved.
-
-**Spec:**
-1. Find the cause. In the Phase 180 run, every test has the cause `child outlived its test`. 618 tests have only that cause. `child_causes` in `scripts/test_times/coverage_overlap.py` uses `math.inf` as the end of a launch with no recorded end. Then that launch is "alive" at the start of every later test in the run. `LineCollector.poll_children` in `scripts/test_times/line_collector.py` records an end only when a held `Popen` returns from `poll()`. Name the launches that have no end in a folder run, and say why (still running, not held, mocked, or other).
-2. Repair the cause in the collector. Do not hide it in the report. A child that still runs at a later test start stays a valid cause for that test. A child with no evidence that it ran at that time is not a cause. Keep each other cause rule as it is.
-3. Add rows to `scripts/test_times/test_coverage_overlap.py` for the defect: one launch with no seen exit, followed by later tests in other modules. Prove the rows fail on the old code.
-4. Run the folder collection again, as in Phase 180 Spec items 1-3, at the new commit, with `COVERAGE_OUT` in `phases/184/`. Report as in Phase 180 Spec items 4-5, plus the count of tests that changed from unknown to known.
-
-**Files:**
-- `scripts/test_times/coverage_overlap.py` — launch end rules in `child_causes`.
-- `scripts/test_times/line_collector.py` — child end records, if the cause is there.
-- `scripts/test_times/test_coverage_overlap.py` — new rows for the defect.
-- `phases/184/coverage_overlap_report.md`, `phases/184/coverage_overlap.json` — in the session folder.
-
-**Workers:** 1 writer; the collector and its tests share one cause and cannot split.
-- impl: the cause, the repair, the new rows and the repeat run.
-
-**Constraints from prior phases:**
-- Phase 180: 207 modules, 1,558 tests, all passed; collector CPU 1,711 s, wall 43.5 min; 0 known, 0 candidates; cause counts Bash 729, Cargo 68, Git 361, ps 167, forks 146; every test has `child outlived its test`.
-- Phase 179: three sampled modules gave 5 of 21 tests unknown. The defect shows only in a long run.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
+- Checkpoint `0a6f179eb`. Cause: the collector gave a launch with no seen exit an end of infinity, so it counted as alive at every later test start. `line_collector.py` now wraps spawn and `waitpid` to see child exits, with a monotonic clock; a launch with no exit evidence still counts as alive (the reviewer blocker F001 kept that rule). New rows in `test_coverage_overlap.py` fail on the old code. Repeat run at `0a6f179eb` over 207 `scripts/direct` modules: 1,558 tests, all pass; 617 known (was 0), 941 unknown, 335 candidates; collector 1,665 CPU s, 45.8 min wall. Top candidate modules: `test_progress_history` 124, `test_phase_table` 49, `test_findings` 41, `test_phase_process` 40, `test_phase_reservation` 35. Largest unknown causes: unverified Bash launches 729, shared thread 602, child outlived its test 589 (most from `test_tree_watch` Git and the `test_verify_hold_*` Python children). Candidates are not removal approvals.
 
 ### Phase 185 — The recorder commands that review launches call import less  · status: done
 **Depends on:** none
@@ -3322,29 +3294,49 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
 **Depends on:** none
 
+#### As-built
+
+- Checkpoint `58aaa15cc`. `task_ids` in `task_cpu.py` reads `/proc/<pid>/status` as bytes and parses only `Tgid:` and `PPid:`. Two rows in `test_module_cost.py`: a `Name:` with byte `0xff` (fails on the old code) and an ordinary status. Nothing else changed.
+
+### Phase 188 — The coverage collector verifies the Python descendants of a Bash launch  · status: done
+**Depends on:** Phase 184
+
+#### As-built
+
+- Dropped; nothing landed. A trial traced each Bash launch with Linux `strace` to prove every descendant (+364 lines, an `strace` dependency). Sample of the 10 modules that hold the 59 tests with only `unverified launch bash`: 2 recovered. With real system binaries (`date`, `mkdir`, `dirname`, `cat`, `rm`, `mv` and others) added as leaves, the projection is 46 of 59, and the folder goes from 617 to 663 known of 1,558. The other 13 stay unknown (the `py` wrapper, fixture executables). The folder records cannot project more. Simple ranks above a 3% coverage gain, and no removal work is approved to use it. Patch: `phases/188/bash_descendant_evidence.patch` in the session folder.
+
+### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: todo
+**Depends on:** Phase 176
+
 #### Work Order
 
-**Goal:** `task_cpu.py` measures a run in which a task name holds byte `0xff`, with the same results for ordinary tasks.
+**Goal:** A test module that scans the tree selects on a change under its declared folders only, so a targeted run adds fewer modules with the same containment.
 
-**Decision:** next item 6a (architect after Phase 178): repair this measurement tool before another broad command census; keep it apart from test-speed savings.
+**Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
 
 **Spec:**
-1. `task_ids` (`scripts/test_times/task_cpu.py:59`) decodes the whole `/proc/<pid>/status` file as text. A task name with byte `0xff` broke it in Phase 177. Read the file as bytes and parse only the numeric `Tgid:` and `PPid:` fields.
-2. Add rows to the existing task CPU tests in `scripts/test_times/test_module_cost.py`: a status input with byte `0xff` in `Name:`, and an ordinary status input. The `0xff` row fails on the old code.
-3. Change nothing else.
+1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 133 of the median 170). For each, read the scan and name the folders it really reads.
+2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
+3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
+4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
+4a. Declare `production/test_merge_checkpoint_batch.py` with the folder of the code its fixture runs as a process: the fixture starts `merge_checkpoint`, which starts `style_sync`, which imports `style_plan`. This closes the Phase 176 replay miss for that module (builds, 2026-11-12: each miss is caught or named out of scope). Add a replay row that proves it.
+5. Add rows to the existing scan test in `scripts/production/test_affected_modules.py`: a declared module selects on a change under its folder and not on a change outside it; an undeclared unresolved scan still selects. Each declared row fails on the Phase 176 code.
+6. Replay the 55 saved runs. Containment holds (no module the old selector picked is dropped). Report the added median and largest, per rule, before and after.
 
 **Files:**
-- `scripts/test_times/task_cpu.py` — `task_ids`.
-- `scripts/test_times/test_module_cost.py` — the two rows.
+- `config/merge_gate.conf` — the `scan_roots` key.
+- `scripts/production/affected_modules.py` — declared scan evidence.
+- `scripts/production/test_affected_modules.py` — the new rows.
 
-**Workers:** 1 writer; one function and its rows.
-- impl: both files.
+**Workers:** 1 writer; the key, its reader and its rows are one change.
+- impl: all three files and the replay.
 
 **Constraints from prior phases:**
-- Phase 177: an in-memory replacement worked around this in its measurement record.
+- Phase 176: 55 replays keep every old selection; added median 170, largest 476; source-scan rule median 133, largest 458. Builds ruled out the general import closure; full merge gates stay unchanged.
 
 **State:** none.
 
 **Acceptance gate:**
-- `python3 -m unittest scripts.test_times.test_module_cost` passes; the `0xff` row fails on the old code.
-- basedpyright on both files reports 0 errors and 0 warnings.
+- `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
+- The replay keeps containment for all 55 runs and shows the added median before and after.
