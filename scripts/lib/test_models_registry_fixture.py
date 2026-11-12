@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import subprocess
@@ -69,10 +70,14 @@ class RegistryOverrideTests(unittest.TestCase):
     def test_fresh_operations_sync_before_reading_and_inherited_or_tier_only_operations_skip_sync(self) -> None:
         root = self.path.parent
         log = root / "sync-log"
+        receipt = root / "sync-environment.json"
         sync_environment = self._catalog_sync_environment("#!" + sys.executable + "\n" + '\n'.join([
-            "import os", "from pathlib import Path",
+            "import json, os", "from pathlib import Path",
             "path = Path(os.environ['MODELS_CONFIG_FILE'])",
             f"with Path({str(log)!r}).open('a') as output: output.write(str(path) + '\\n')",
+            f"Path({str(receipt)!r}).write_text(json.dumps({{key: os.environ[key] for key in "
+            + "('HOME', 'MODELS_CONFIG_FILE', 'MODELS_CONFIG_TIER_ONLY', 'CODEX_CONFIG_FILE', "
+            + "'CODEX_MODELS_CACHE_FILE', 'CODEX_CATALOG_SYNC_STATE_FILE')}))",
             "path.write_text(path.read_text().replace('source=before', 'source=synced'))",
             "Path(os.environ['CODEX_CATALOG_SYNC_STATE_FILE']).touch()",
         ]) + "\n")
@@ -96,17 +101,45 @@ class RegistryOverrideTests(unittest.TestCase):
                     inherited = (models_registry.LaunchModelConfiguration(self.path, original, ())
                                  if factory is models_registry.launch_configuration
                                  else models_registry.RegistryEditBase(self.path, original, ()))
-                    environment = inherited.environment({}) if mode == "inherited" else {}
                     synchronize = mode not in ("inherited", "tier-only", "current-state")
                     with self._catalog_sync_scope({**sync_environment,
                         "MODELS_CONFIG_TIER_ONLY": "1" if mode == "tier-only" else "0",
                     }):
+                        environment = inherited.environment(os.environ) if mode == "inherited" else dict(os.environ)
                         configuration = factory(environment)
                     self.assertEqual(log.read_text().splitlines(), [str(self.path)] if synchronize else [])
                     self.assertEqual(configuration.path, self.path)
                     self.assertEqual(configuration.text, original.replace("before", "synced") if synchronize else original)
                     self.assertEqual(next(row.value for row in configuration.rows if row.key == "source"),
                                      "synced" if synchronize else "before")
+
+        with self.subTest(mode="call-environment"):
+            call_home = root / "call-home"
+            call_home.mkdir()
+            selected = call_home / "models.conf"
+            _ = selected.write_text(original)
+            call_paths = {
+                "CODEX_CONFIG_FILE": call_home / "config.toml",
+                "CODEX_MODELS_CACHE_FILE": call_home / "models.json",
+                "CODEX_CATALOG_SYNC_STATE_FILE": call_home / "sync-state",
+            }
+            for key, path in call_paths.items():
+                _ = path.write_text("call")
+                os.utime(path, (20, 20) if key == "CODEX_CATALOG_SYNC_STATE_FILE" else (30, 30))
+            _ = log.write_text("")
+            with self._catalog_sync_scope({**sync_environment, "MODELS_CONFIG_TIER_ONLY": "1"}):
+                environment = {**os.environ, "HOME": str(call_home), "MODELS_CONFIG_FILE": str(selected),
+                               "MODELS_CONFIG_TIER_ONLY": "0",
+                               **{key: str(path) for key, path in call_paths.items()}}
+                configuration = models_registry.launch_configuration(environment, registry=selected)
+            self.assertEqual(log.read_text().splitlines(), [str(selected)])
+            self.assertEqual(configuration.path, selected)
+            self.assertEqual(configuration.text, original.replace("before", "synced"))
+            self.assertEqual(next(row.value for row in configuration.rows if row.key == "source"), "synced")
+            self.assertEqual(receipt.read_text(), json.dumps({
+                key: environment[key] for key in (
+                    "HOME", "MODELS_CONFIG_FILE", "MODELS_CONFIG_TIER_ONLY", "CODEX_CONFIG_FILE",
+                    "CODEX_MODELS_CACHE_FILE", "CODEX_CATALOG_SYNC_STATE_FILE")}))
 
     def test_failed_catalog_sync_warns_and_returns_the_current_configuration(self) -> None:
         environment = self._catalog_sync_environment("#!/bin/sh\nexit 9\n")
@@ -115,7 +148,7 @@ class RegistryOverrideTests(unittest.TestCase):
         for factory in (models_registry.launch_configuration, models_registry.edit_base):
             with self.subTest(factory=factory.__name__), \
                     self._catalog_sync_scope(environment), redirect_stderr(io.StringIO()) as errors:
-                configuration = factory({})
+                configuration = factory(dict(os.environ))
             self.assertEqual(errors.getvalue(),
                              "WARNING: Codex catalog sync failed; using the current model registry.\n")
             self.assertEqual(configuration.path, self.path)

@@ -33,7 +33,7 @@ from scripts.lib import conf, test_hang_guard
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
 
 class FeedStopped(Exception):
@@ -360,6 +360,70 @@ process.stdout.write(JSON.stringify({
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(float(result.stdout), stale)
+
+    def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
+        _ = write_config_fixture(self.root / "build_folders.conf")
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        chrome = self.root / "chrome"
+        report = self.root / "chrome-report.json"
+        _ = chrome.write_text(f"#!{sys.executable}\n" + textwrap.dedent(r"""
+            import base64, hashlib, json, os, signal, socket, sys, tempfile
+            from pathlib import Path
+            profile = next(argument.split('=', 1)[1] for argument in sys.argv if argument.startswith('--user-data-dir='))
+            allocated = tempfile.mkdtemp(prefix='url_fetcher_')
+            record = {'profile': profile, 'temporary': os.environ['TMPDIR'], 'allocated': allocated}
+            report = Path(os.environ['CHROME_REPORT'])
+            report.write_text(json.dumps(record))
+            if os.environ['CHROME_END'] == 'request':
+                with socket.socket() as server:
+                    server.bind(('127.0.0.1', 0))
+                    server.listen(1)
+                    print(f'DevTools listening on ws://127.0.0.1:{server.getsockname()[1]}/debugger', file=sys.stderr, flush=True)
+                    with server.accept()[0] as connection:
+                        stream = connection.makefile('rb')
+                        headers = {}
+                        while line := stream.readline().strip():
+                            if b':' in line:
+                                key, value = line.split(b':', 1)
+                                headers[key.lower()] = value.strip()
+                        key = headers[b'sec-websocket-key'] + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+                        accept = base64.b64encode(hashlib.sha1(key).digest())
+                        connection.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+                        frame = stream.read(2)
+                        size = frame[1] & 127
+                        if size == 126:
+                            size = int.from_bytes(stream.read(2), 'big')
+                        mask = stream.read(4)
+                        payload = bytes(value ^ mask[index % 4] for index, value in enumerate(stream.read(size)))
+                        record['request'] = json.loads(payload)['method']
+                        report.write_text(json.dumps(record))
+                        os.kill(os.getpid(), signal.SIGKILL)
+            if os.environ['CHROME_END'] == 'kill':
+                os.kill(os.getpid(), signal.SIGKILL)
+            sys.exit(1)
+        """))
+        chrome.chmod(0o755)
+        for ending in ('exit', 'kill', 'request'):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                caller = Path(directory)
+                environment = {**os.environ, "TMPDIR": str(caller), "CHROME": str(chrome),
+                    "CHROME_REPORT": str(report), "CHROME_END": ending}
+                result = subprocess.run([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
+                    str(self.root / "proof")], env=environment, text=True, capture_output=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                if ending == 'request':
+                    self.assertRegex(result.stderr, "Chrome (closed during a debugger request|debugger connection closed)")
+                else:
+                    self.assertIn("Chrome closed before its debugger started", result.stderr)
+                record = cast(dict[str, str], json.loads(report.read_text()))
+                if ending == 'request':
+                    self.assertEqual(record['request'], 'Target.createTarget')
+                profile, temporary, allocated = (Path(record[key]) for key in ("profile", "temporary", "allocated"))
+                self.assertTrue(temporary.is_relative_to(profile))
+                self.assertTrue(allocated.is_relative_to(temporary))
+                self.assertFalse(profile.exists())
+                self.assertEqual(list(caller.iterdir()), [])
 
     def test_an_interrupted_page_publication_preserves_the_previous_page(self) -> None:
         self.output.mkdir()
