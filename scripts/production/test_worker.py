@@ -19,7 +19,7 @@ from dataclasses import replace
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from typing import Literal, TextIO, cast, final, override
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.herdr import herdr_types
@@ -398,6 +398,119 @@ class WorkerCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
+
+    def test_restore_reaps_detached_orphans_once_before_resuming(self) -> None:
+        opened = self.opened()
+        _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
+            prompt=self.prompt, kind="impl", lens="")
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        folder = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        folder.mkdir()
+        path = folder / "orphan.json"
+        run: detached_runs.RunRecord = {
+            "run_id": "orphan", "status": "running", "session_dir": str(self.run_dir),
+            "worker": opened.row.name, "staff_id": opened.row.id, "label": "fixture gate",
+            "command": ["true"], "log": str(folder / "orphan.log"), "started_at": 1,
+            "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
+        }
+        atomic_file.write_text_atomic(path, json.dumps(run))
+
+        def resume(_row: staff.StaffRow, _active: progress_history.ActiveDispatch) -> worker.ExitCode:
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            self.assertEqual(saved["status"], "finished")
+            return worker.ExitCode.OK
+
+        with (patch.object(detached_runs, "deliver", return_value="private fixture") as deliver,
+              patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
+              patch.object(unit_runs, "held", return_value=[str(self.run_dir)] * 2),
+              patch.object(worker, "_resume_launcher", side_effect=resume)):
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    code, output, errors = self.command("restore")
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual(output.count("reaped detached run orphan"), int(attempt == 0))
+            deliver.assert_called_once()
+            self.assertEqual(reap.call_args_list, [call(str(self.run_dir))] * 2)
+
+        sibling = self.opened("review", "review")
+        for selection, selected in (("selected", frozenset({opened.row.id})),
+                                    ("empty", frozenset[staff.StaffId]()),
+                                    ("missing", frozenset({staff.StaffId("missing-worker")}))):
+            paths: dict[str, Path] = {}
+            for row in (opened.row, sibling.row):
+                identity = f"{selection}-{row.name}"
+                paths[row.name] = folder / f"{identity}.json"
+                atomic_file.write_text_atomic(paths[row.name], json.dumps({**run, "run_id": identity,
+                    "status": "running", "worker": row.name, "staff_id": row.id,
+                    "log": str(folder / f"{identity}.log")}))
+            sibling_before = paths[sibling.row.name].read_bytes()
+            with (self.subTest(selection=selection),
+                  patch.object(detached_runs, "deliver", return_value="private fixture"),
+                  patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
+                  patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(worker.restore(self.fixture.parent.id, only=selected), worker.ExitCode.OK)
+                self.assertEqual(paths[sibling.row.name].read_bytes(), sibling_before)
+                status = cast(dict[str, object], json.loads(paths[opened.row.name].read_text()))["status"]
+                self.assertEqual(status, "finished" if opened.row.id in selected else "running")
+                self.assertEqual(reap.call_args_list,
+                                 [call(str(self.run_dir), opened.row.name)] if selected == frozenset({opened.row.id}) else [])
+
+    def test_restore_lists_finished_results_newest_first(self) -> None:
+        for launcher in ("explicit", "assign"):
+            with self.subTest(launcher=launcher):
+                opened = self.opened()
+                expected: list[str] = []
+                completed: list[tuple[str, Path]] = []
+                for number in range(2):
+                    reply = (self.run_dir / f"reply-{number}.md" if launcher == "explicit" else
+                             self.run_dir / "phases/8/impl_reply.txt")
+                    prompt = self.run_dir / f"work-{number}.md"
+                    atomic_file.write_text_atomic(prompt, f"Complete work {number}.\n")
+                    command = (["assign.sh", "--reply-file", str(reply)] if launcher == "explicit" else
+                               ["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
+                                "--role", "implement", "--to", "impl", "--session-dir", str(self.run_dir),
+                                "--phase", "8", "--prompt", str(prompt)])
+                    dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                        worker_name=opened.row.name, worker_id=opened.row.id,
+                        launcher_command=command,
+                        prompt=prompt, kind="impl", lens="")
+                    progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
+                        progress_history.DispatchDelivery("fixture", dispatch_id, str(reply)))
+                    atomic_file.write_text_atomic(reply, f"result {number}\n")
+                    progress_history.complete_dispatch(self.run_dir, "impl", dispatch_id)
+                    expected.insert(0, f"impl: phase 8; dispatch {dispatch_id}; reply {reply}")
+                    completed.append((dispatch_id, reply))
+                state_path = self.run_dir / unit_runs.STATE_FILE
+                state = cast(dict[str, object], json.loads(state_path.read_text()))
+                phase = cast(dict[str, object], state["phase"])
+                with (self.run_dir / "history.jsonl").open("a") as history:
+                    _ = history.write(json.dumps({"padding": "x" * worker.WORKER_HISTORY_BYTES}) + "\n")
+                for placement in ("current", "parked", "closed", "reopened"):
+                    state["open_phases"] = [phase] if placement == "parked" else []
+                    state["phase"] = ({"id": "9", "instance_id": "phase-nine", "status": "active"}
+                                      if placement == "parked" else
+                                      {**phase, "status": "completed"} if placement == "closed" else
+                                      {**phase, "instance_id": f"new-phase-eight-{launcher}"} if placement == "reopened" else phase)
+                    atomic_file.write_text_atomic(state_path, json.dumps(state))
+                    before = state_path.read_bytes(), len(self.fixture.world.launches)
+                    for attempt in range(2):
+                        with self.subTest(placement=placement, attempt=attempt):
+                            code, output, errors = self.command("restore")
+                            self.assertEqual((code, errors), (0, ""))
+                            replies = expected if placement in ("current", "parked") else []
+                            self.assertEqual(output.splitlines(), ["unit: workers unchanged", *replies])
+                    self.assertEqual((state_path.read_bytes(), len(self.fixture.world.launches)), before)
+                self.assertEqual(self.agent.submitted, [])
+                code, output, errors = self.command("list", "--json")
+                self.assertEqual((code, errors), (0, ""))
+                listing = cast(list[dict[str, object]], json.loads(output))
+                dispatch_id, reply = completed[-1]
+                self.assertEqual({key: listing[0][key] for key in
+                                  ("dispatch_id", "run_path", "completion_state", "reply_path")},
+                                 {"dispatch_id": dispatch_id, "run_path": str(self.run_dir),
+                                  "completion_state": "completed", "reply_path": str(reply)})
 
     def test_restore_reuses_given_runs_for_two_workers(self) -> None:
         first = self.fixture.worker_run("a-first", "unit", self.fixture.parent.current_session,
@@ -2143,8 +2256,9 @@ class WorkerCommandTests(unittest.TestCase):
                     bind = worker_panes.WorkerLockHold.bind
                     guard = LauncherHangGuard("first assignment ready hooks")
                     with ThreadPoolExecutor(max_workers=4) as hooks:
-                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
-                            bind(hold, row)
+                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, *,
+                                             deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+                            bind(hold, row, deadline=deadline)
                             if current_thread() is assignment_thread and ready_hooks and row.name not in pending:
                                 pending[row.name] = hooks.submit(turn_end.handle,
                                     turn_end.WorkerEvent(str(row.current_session), reply="ready"))
@@ -2383,11 +2497,13 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(worker_panes.dispatch_role(current), "review")
 
     def test_private_run_restore_uses_finished_dispatch_history(self) -> None:
+        self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(self.dispatch(role="review"), worker.ExitCode.OK)
         row = self.agent.row(self.agent.submitted[-1][0])
         with patch.object(sys, "argv", ["progress_history.py", "finish-pass", "--status", "completed",
                                       "--session-dir", str(self.run_dir)]):
             progress_history.main()
+        dispatch_id = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
         private_root = self.fixture.root / "private"
         private_root.mkdir()
         self.run_dir = self.run_dir.rename(private_root / "held-run")
@@ -2395,7 +2511,9 @@ class WorkerCommandTests(unittest.TestCase):
         before = len(self.fixture.world.launches)
         with patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(private_root)}):
             code, output, errors = self.command("restore")
-        self.assertEqual((code, output, errors), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
+        self.assertEqual((code, output, errors), (0,
+            f"{self.fixture.parent.name}: workers restored\n"
+            + f"{row.name}: phase 8; dispatch {dispatch_id}; reply {self.reply}\n", ""))
         self.assertEqual(staff.snapshot().by_id(row.id), row)
         self.assertEqual(len(self.fixture.world.launches), before)
         self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
@@ -2617,6 +2735,8 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(sum(isinstance(cast(object, call.args[0]), bytes) for call in decoded.call_args_list), 3)
         self.assertEqual(sum(cast(tuple[object, ...], call.args)[0] == history for call in opened.call_args_list), 1)
         rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual([rows[row.id]["run_path"] for row in (first, second)],
+                         [str(path.parent) for path in paths])
         self.assertEqual([rows[row.id]["state"] for row in (first, second)], ["completed", "completed"])
         self.assertEqual([rows[row.id]["role"] for row in (first, second)], ["review", "review"])
         self.assertEqual([rows[row.id]["activity"] for row in (first, second)],
@@ -2771,9 +2891,13 @@ class WorkerCommandTests(unittest.TestCase):
                 "run_id": run_id, "worker": name,
                 "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
                 "status": status, "pid": pid, "label": label}))
-        for alive, hold, expected, location in ((True, "", "busy", "known"), (False, "", "idle", "known"),
-                (True, "pause", "paused", "known"), (True, "exit", "exited", "known"),
-                (True, "", "busy", "saved dispatch")):
+        for alive, hold, expected, location, activity in (
+                (True, "", "waiting", "known", "idle"), (False, "", "idle", "known", "idle"),
+                (True, "pause", "paused", "known", "idle"), (True, "exit", "exited", "known", "idle"),
+                (True, "", "starting", "known", "starting"), (False, "", "starting", "known", "starting"),
+                (True, "pause", "paused", "known", "starting"), (True, "exit", "exited", "known", "starting"),
+                (True, "", "waiting", "saved dispatch", "idle")):
+            self.fixture.world.locations[opened.pane]["agent_status"] = activity
             if location == "saved dispatch":
                 outside = self.fixture.root / "private" / "saved-dispatch"
                 outside.mkdir(parents=True)
@@ -2795,7 +2919,7 @@ class WorkerCommandTests(unittest.TestCase):
                 return alive and pid == 101
             with patch.object(detached_run_process, "supervises", side_effect=supervises):
                 for scope in ((), ("--all-parents",)):
-                    with (self.subTest(alive=alive, hold=hold, scope=scope, location=location),
+                    with (self.subTest(alive=alive, hold=hold, scope=scope, location=location, activity=activity),
                           patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
                           patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                         code, rows, errors = self.text_command("list", *scope)
@@ -2918,6 +3042,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(listing[0]["role"], "review")
         self.assertEqual(listing[0]["state"], "OpenWorker")
         self.assertEqual(listing[0]["activity"], "done")
+        self.assertEqual({key: listing[0][key] for key in
+                          ("dispatch_id", "run_path", "completion_state", "reply_path")},
+                         {"dispatch_id": "dispatch-impl2", "run_path": str(self.fixture.root / "run"),
+                          "completion_state": "completed", "reply_path": ""})
 
     def test_list_open_busy_worker_reports_work_account_and_home(self) -> None:
         row = self.fixture.worker("astra-designer", family="codex")
@@ -3076,6 +3204,82 @@ class WorkerCommandTests(unittest.TestCase):
         with patch.dict(os.environ, {"CODEX_THREAD_ID": str(other.current_session)}):
             self.assertEqual(self.command("list", "--json")[:2], (0, "[]\n"))
         self.assertEqual(self.agent.submitted, [])
+
+
+    def test_launcher_recovery_reports_an_absent_director(self) -> None:
+        opened = self.opened()
+        with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
+              patch.object(self.fixture.world, "prompt") as prompt, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(worker._resume_launcher(opened.row, progress_history.ActiveDispatch("saved-pass", ("assign.sh",))),  # pyright: ignore[reportPrivateUsage]
+                             worker.ExitCode.UNCERTAIN)
+        prompt.assert_not_called()
+        self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
+
+    def test_publication_failure_reports_that_its_new_pane_close_failed(self) -> None:
+        with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
+              patch.object(self.fixture.world, "close_pane", return_value=False),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
+        self.assertIn("pane w1:p1 close failed", errors.getvalue())
+        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
+        self.assertIn("w1:p1", self.fixture.world.locations)
+        self.assertEqual(self.agent.submitted, [])
+
+    def test_list_all_resolves_the_legacy_unit_account_once_from_stored_history(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default"}))
+        atomic_file.write_text_atomic(accounts.roles_history_file(), json.dumps({
+            "role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"}) + "\n")
+        with patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolved:
+            code, output, errors = self.command("list", "all", "--json", "--all-parents")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(rows[second.id]["home"], str(Path.home() / ".claude2"))
+        resolved.assert_not_called()
+
+    def test_list_all_reads_only_the_needed_default_account_history_once(self) -> None:
+        _first, second, _paths = self.recorded_list_fixture()
+        atomic_file.write_text_atomic(accounts.groups_file(), json.dumps({"units": "default", "showrunners": "default"}))
+        history = accounts.roles_history_file()
+        atomic_file.write_text_atomic(history, "".join(json.dumps(row) + "\n" for row in (
+            {"role": "unit", "label": "default", "account_label": "claude2", "at": "2026-10-08T00:00:00Z"},
+            {"group": "showrunners", "label": "default", "account_label": "claude3", "at": "2026-10-08T00:00:00Z"})))
+        original = Path.read_text
+        reads: list[Path] = []
+        def read(path: Path, *args: object, **kwargs: object) -> str:
+            reads.append(path)
+            return original(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+        with (patch.object(Path, "read_text", autospec=True, side_effect=read),
+              patch.object(accounts, "resolve_history_label", wraps=accounts.resolve_history_label) as resolve):
+            code, output, errors = self.command("list", "all", "--json", "--all-parents")
+        self.assertEqual(code, 0, errors)
+        rows = {str(row["id"]): row for row in cast(list[dict[str, object]], json.loads(output))}
+        self.assertEqual(rows[second.id]["account"], "claude2")
+        self.assertEqual(reads.count(history), 0)
+        resolve.assert_not_called()
+
+    def test_list_scans_runs_once_and_prints_each_run_anomaly_once(self) -> None:
+        unit_runs.report_anomaly.cache_clear()
+        self.addCleanup(unit_runs.report_anomaly.cache_clear)
+        rows = [self.fixture.worker(name) for name in ("impl", "review", "test")]
+        for index, row in enumerate(rows, 1):
+            self.fixture.world.add(row, f"w1:p{index}")
+        runs = self.fixture.root
+        for name in ("ownerless-a", "ownerless-b"):
+            run = runs / name
+            run.mkdir(parents=True)
+            atomic_file.write_text_atomic(run / unit_runs.STATE_FILE, '{}')
+            atomic_file.write_text_atomic(run / "fixture-impl_status", "running\n")
+        with patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scans:
+            code, output, errors = self.command("list", "all", "--json")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(scans.call_count, 1)
+        listing = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual({item["name"] for item in listing}, {row.name for row in rows})
+        self.assertEqual(errors.splitlines(), [
+            f"anomaly: {runs / name}: this run has no owner because {unit_runs.STATE_FILE} names no staff row"
+            for name in ("ownerless-a", "ownerless-b")])
 
 
 if __name__ == "__main__":

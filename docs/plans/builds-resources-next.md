@@ -57,7 +57,7 @@
   - Revealed by: Phase 26; narrowed after the existing pane route and writer tests satisfied the access requirement.
 
 - [ ] **One owner for Cargo target detection in scripts/lib/cargo_output.py** (after the held 63-64 hash lands)
-  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`) and their tests.
+  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`, `scripts/lint/folder_audit.py`) and their tests, `scripts/lib/test_scratch.py` included.
   - Why needed: `memory.py` loads the whole sweeper to ask whether a folder is Cargo output, and the sweeper imports buildlog modules back. One owner in `scripts/lib` removes that cycle.
   - Completion condition: no copy of the detection is left in `sweep.py`; `memory.py` imports it at the top and drops its run-time `import sweep`. This replaces the Phase 67 import rule for `memory.py`. The change reports `memory.py` import time before and after, and the sweep, memory, disk and offload tests pass.
   - Revealed by: Phase 70 simplify review F008 (builds showrunner 2026-11-05: next; run after the held 63-64 hash lands, so `sweep.py` changes in one place at a time)

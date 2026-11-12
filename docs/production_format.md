@@ -1,9 +1,9 @@
 # Production format
 
-The shared contract for a **production**: several `/unit:direct` runs building
-one deliverable in parallel, coordinated by one session. The commands sit in one
-folder per role under `~/.claude/commands/`. These read or write this format and
-must not drift from it:
+This contract defines a **production** with units that build one deliverable in parallel.
+One showrunner coordinates the units.
+Commands use one folder per role under `~/.claude/commands/`.
+These commands read or write this format:
 
 - `/producer:greenlight` — judges whether phased plans should run as a
   production and proposes the units.
@@ -12,7 +12,21 @@ must not drift from it:
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:units` — shows the production status.
 - `/showrunner:accounts` — opens the accounts board.
-- `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
+- `/unit:direct`, `/unit:merge`, and `/unit:style` — unit commands selected by the staff row's `unit_type`.
+
+The staff row stores each unit's type: `direct`, `merge`, or `style`.
+
+| Type | Command | Work |
+| --- | --- | --- |
+| `direct` | `/unit:direct` | Phased implementation plans |
+| `merge` | `/unit:merge` | Authorized merge, gate, build, and promotion orders |
+| `style` | `/unit:style` | Standing tickets under `docs/direct/style_unit.md` |
+
+An absent type reads as `direct`; invalid values make the row unreadable.
+Readers discard the field on other staff kinds; the next write removes it.
+Promotion removes the type; demotion selects an explicit type with `--unit-type`, default `direct`.
+Pending admission and demotion records keep the selected type until the operation completes.
+Launch, resume, account move, rename, and compaction select the command from this type.
 
 ---
 
@@ -27,13 +41,12 @@ must not drift from it:
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports when asked. It writes no implementation code.
-- **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
-  branch. A unit is named for its area, e.g. `widget`. Its plan, worktree,
-  branch, phases, checkpoints and ETA are the unit's.
-- **Unit director** — the Claude session that runs a unit: the `/unit:direct`
-  session the showrunner launches in its own herdr session. It receives messages,
-  decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
-  reports. It writes no implementation code.
+- **Unit** — a production member with its own worktree and branch.
+  Its plan, phases, checkpoints, and ETA belong to the unit.
+- **Unit director** — the Claude session that runs a unit in a herdr tab.
+  The director writes Work Orders and dispatches workers.
+  The director controls gates, checkpoints, and reports.
+  The director writes no implementation code.
 - **Worker** — a staff member under a unit or showrunner, with a native Claude or Codex conversation in a pane.
   Launchers use the run's existing transport pin.
   Pane assignments reuse an idle or resumable worker in role-number order.
@@ -123,6 +136,9 @@ Read the current showrunner name from its staff row.
 Send to the address from `showrunners.py address <showrunner name>`.
 
 ## Style units
+
+Pass `--unit-type style` when launching a style unit with `add_unit.py`.
+The table below stores family ownership and ticket limits.
 
 Include this table when the production controls style units.
 It can name one to four units. Each family has exactly one owner.

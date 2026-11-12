@@ -19,6 +19,7 @@ from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_case
 
 from scripts.hooks import codex_hooks
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
@@ -195,11 +196,14 @@ class CodexHookInstallerTests(unittest.TestCase):
         _ = self.environment.pop("STUB_REFUSE", None)
 
     def run_installer(self, action: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(INSTALLER), action],
-            capture_output=True, text=True, check=False,
-            env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
-        )
+        if process_boundary_for_case(self):
+            return subprocess.run(
+                [sys.executable, str(INSTALLER), action],
+                capture_output=True, text=True, check=False,
+                env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
+            )
+        return invoke_cli(codex_hooks, codex_hooks.main, [action], self.environment,
+                          cwd if cwd is not None else Path.cwd())
 
     def run_bash_policy(self, command: str | list[str]) -> subprocess.CompletedProcess[str]:
         hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
@@ -296,6 +300,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         ]})
         _ = self.hooks_file.write_text(json.dumps(config))
 
+    @process_boundary
     def test_fresh_install_creates_group_and_records_trust(self) -> None:
         result = self.run_installer("install")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -916,6 +921,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(disabled.returncode, 1)
         self.assertIn("fn-length codex hook: disabled", disabled.stdout + disabled.stderr)
 
+    @process_boundary
     def test_dead_app_server_is_reported(self) -> None:
         executable = Path(self.environment["PATH"]) / "codex"
         _ = executable.write_text("#!/bin/sh\nexit 7\n")

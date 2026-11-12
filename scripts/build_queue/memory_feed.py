@@ -261,7 +261,12 @@ class RowProgress(TypedDict):
     unit: Literal["modules", "units", "tests"]
 
 
-class RunRow(TypedDict):
+class RowQueueNotes(TypedDict):
+    head_text: NotRequired[str]
+    priority_text: NotRequired[str]
+
+
+class RunRow(RowQueueNotes):
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
@@ -306,7 +311,7 @@ class SwapReading:
     files_read: int
 
 
-class WaitRow(TypedDict):
+class WaitRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
@@ -318,7 +323,7 @@ class WaitRow(TypedDict):
     fits: bool
 
 
-class CloudWorkRow(TypedDict):
+class CloudWorkRow(RowQueueNotes):
     kind: Literal["cloud"]
     work_kind: NotRequired[Literal["started on the Mac"]]
     name: str
@@ -413,6 +418,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
     cloud_slots: int
@@ -977,6 +983,25 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
+    unmatched_priority_text = ""
+    if isinstance(explanation.priority, admission_records.QueuePriority):
+        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
+                      for entry in explanation.priority.entries}
+        matched_units: set[str] = set()
+        for work_row in (*work_rows, *waiting_rows):
+            if work_row["unit"] in priorities:
+                work_row["priority_text"] = priorities[work_row["unit"]]
+                matched_units.add(work_row["unit"])
+        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
+    if waiting_rows:
+        head_pid = waiting_rows[0]["pid"]
+        if isinstance(explanation.head, admission_records.HeadExplanation):
+            head = explanation.head.waiter
+            head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
+        for waiting_row in waiting_rows:
+            if waiting_row["pid"] == head_pid:
+                waiting_row["head_text"] = queue_view.head_text(model)
+                break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
@@ -1003,6 +1028,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},

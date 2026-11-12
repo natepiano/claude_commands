@@ -45,7 +45,7 @@ class WorkingSetTests(unittest.TestCase):
                 *, cwd: str = "/home/test/.claude", owner: str = "") -> Path:
         if owner and not any(row.name == owner for row in self.rows):
             self.rows.append(staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
-                current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd))))
+                current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", Path(cwd)), unit_type=staff.UnitDetails("direct")))
         process = self.proc / str(pid)
         process.mkdir()
         _ = (process / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
@@ -187,7 +187,7 @@ class WorkingSetTests(unittest.TestCase):
             with self.subTest(script=script):
                 folder = Path("/work") / owner
                 row = staff.StaffRow(staff.StaffId(owner), "unit", owner, staff.STAFF_ROOT,
-                    current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder))
+                    current_session=staff.StaffId(owner + "-current"), worktree=staff.PresentWorktree("natedev", folder), unit_type=staff.UnitDetails("direct"))
                 resolver = session_staff.RowResolver(staff.StaffSnapshot((row,)))
                 self.assertEqual(working_set.owner_for(str(folder / script), resolver), owner)
 
@@ -197,7 +197,7 @@ class WorkingSetTests(unittest.TestCase):
             _ = self.process(pid, ["python3", script], 1024, cwd=f"/work/{owner}", owner=owner)
         _ = self.process(803, ["python3", script], 512, cwd="/work/first-other")
         self.rows.append(staff.StaffRow(staff.StaffId("retired"), "unit", "retired", staff.STAFF_ROOT,
-            current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other"))))
+            current_session=staff.StaffId("retired-current"), worktree=staff.RemovedWorktree("natedev", Path("/work/first-other")), unit_type=staff.UnitDetails("direct")))
         groups = {(group.script, group.owner): group.pss_kib for group in self.report().groups if group.script}
         self.assertEqual(groups, {(script, "first"): 1024, (script, "second"): 1024, (script, "unassigned"): 512})
 
@@ -216,7 +216,7 @@ class WorkingSetTests(unittest.TestCase):
         self.rows.extend((
             staff.StaffRow(staff.StaffId("outer-id"), "unit", "outer", staff.STAFF_ROOT,
                 current_session=staff.StaffId("outer-session"),
-                worktree=staff.PresentWorktree("natedev", Path("/work/unit"))),
+                worktree=staff.PresentWorktree("natedev", Path("/work/unit")), unit_type=staff.UnitDetails("direct")),
             staff.StaffRow(staff.StaffId("nested-id"), "producer", "nested", staff.STAFF_ROOT,
                 current_session=staff.StaffId("nested-session"),
                 worktree=staff.PresentWorktree("natedev", Path("/work/unit/nested"))),
@@ -227,7 +227,7 @@ class WorkingSetTests(unittest.TestCase):
 
     def test_unfilled_worktree_reports_one_problem_and_keeps_the_report(self) -> None:
         self.rows.append(staff.StaffRow(staff.StaffId("pending"), "unit", "pending", staff.STAFF_ROOT,
-                                       current_session=staff.StaffId("pending-session")))
+                                       current_session=staff.StaffId("pending-session"), unit_type=staff.UnitDetails("direct")))
         _ = self.process(813, ["python3", "/shared/helper.py"], 1024)
         with redirect_stderr(io.StringIO()) as errors:
             report = self.report()

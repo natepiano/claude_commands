@@ -41,7 +41,7 @@ UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/ru
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
     staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
-                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1])),
+                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1]), unit_type=staff.UnitDetails("direct")),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
 ))
 
