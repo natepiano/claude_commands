@@ -1113,3 +1113,19 @@ Raise it to 100800. A changed config value needs the user's go. Sent to the buil
 **Acceptance gate:**
 - `scripts.lint.test_sweep` passes, with the two new rows.
 - `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
+
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
+
+From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is resources' file, and the builds showrunner gave the go for this unit to write the fix.
+
+#### As-built
+
+- `tmp_sweep.judge_entries`: a run keep reason from `run_folder_guards` keeps the run folder and its `tmp/` folder. It no longer keeps the entries inside `tmp/`.
+- Each run `tmp/` entry goes by the 4 h rule, process use (`IN_USE`), `WORKER_USES` and the git check.
+- `RunKeepReason.UNREADABLE_RECORD` and an unreadable session registry (`NO_SESSIONS`) still keep run `tmp/` entries.
+- The module docstring states the rule once.
+- Cause: killed test runs left temp folders in run `tmp/` folders (verify.sh's TMPDIR). On 2026-11-12 the sweep kept 925 such entries in one run; the dry run after the fix selects 55,100 across all runs.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
+- `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.

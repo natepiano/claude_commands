@@ -14,9 +14,9 @@ const callerFolder = process.argv[2];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1]))', folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, stdio:'pipe'});
+  const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
@@ -92,18 +92,33 @@ try {
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
-    const profile = await mkdtemp(join(tmpdir(), 'memory-proof-chrome-'));
+    // Chrome needs a short path for its Unix sockets.
+    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
     try {
+      const temporary = join(profile, 'tmp');
+      await mkdir(temporary);
       const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);
       });
       let ws;
+      let debuggerError;
+      const pending = new Map();
+      const events = new Map();
+      const rejectPending = error => {
+        debuggerError ||= error;
+        for (const request of pending.values()) request.reject(debuggerError);
+        for (const event of events.values()) event.reject(debuggerError);
+        pending.clear();
+        events.clear();
+      };
+      chrome.once('exit', () => rejectPending(new Error('Chrome closed during a debugger request.')));
+      chrome.once('error', rejectPending);
       try {
         const endpoint = await new Promise((resolve, reject) => {
           let output = '';
@@ -116,10 +131,9 @@ try {
           chrome.once('exit', () => reject(new Error('Chrome closed before its debugger started.')));
         });
         ws = new WebSocket(endpoint);
-        await once(ws, 'open');
+        ws.addEventListener('close', () => rejectPending(new Error('Chrome debugger connection closed.')));
+        await Promise.race([once(ws, 'open'), exited.then(() => { throw debuggerError; })]);
         let id = 0;
-        const pending = new Map();
-        const events = new Map();
         ws.addEventListener('message', event => {
           const message = JSON.parse(event.data);
           if (message.id) {
@@ -130,10 +144,11 @@ try {
             else request.resolve(message.result);
           } else {
             const key = `${message.sessionId || ''}:${message.method}`;
-            if (events.has(key)) { events.get(key)(message.params); events.delete(key); }
+            if (events.has(key)) { events.get(key).resolve(message.params); events.delete(key); }
           }
         });
         const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+          if (debuggerError) { reject(debuggerError); return; }
           const next = ++id;
           pending.set(next, {resolve,reject});
           ws.send(JSON.stringify({id:next,method,params,...(sessionId ? {sessionId} : {})}));
@@ -151,9 +166,8 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
-        await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/memory_live.html`});
-        await loaded;
+        const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
+        await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/memory_live.html`})]);
         await evaluate(`(async () => {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
