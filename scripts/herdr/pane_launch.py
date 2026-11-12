@@ -410,6 +410,9 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         expected["cwd"] = newest["cwd"]
     _usable_replacement(path, ResumeAttempt(launch["pane_id"], launch), launch,
                         VerifiedResume(expected, frozenset({owner.id, owner.current_session})), same_pane=False)
+    place = cast(Callable[[int], object], import_module("scripts.herdr.herdr").herdr_place_of)(pid)
+    if isinstance(place, HerdrPlace):
+        cast(Callable[[str, str], None], import_module("scripts.herdr.herdr").forget_pane_evidence)(place.session, place.pane)
     current = process_reader.native_process(pid, agent_kind(launch))
     if current.current_identity != observed.current_identity or current.started != generation:
         raise ValueError("producer process changed before publication")

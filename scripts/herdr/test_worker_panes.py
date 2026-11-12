@@ -2955,15 +2955,31 @@ class WorkerPaneTests(StaffTestCase):
         row = self.worker()
         self.world.add(row, "w1:p1")
         self.world.unknown["w1:p1"] = "process permission denied"
-        with redirect_stderr(io.StringIO()) as errors:
-            observed = self.observation(row)
-        self.assertIsInstance(observed, worker_panes.ProcessUnknownWorker)
-        assert isinstance(observed, worker_panes.ProcessUnknownWorker)
-        self.assertEqual((observed.pane, observed.terminal), ("w1:p1", "terminal-w1:p1"))
-        self.assertIn("process permission denied", observed.reason)
-        notes = errors.getvalue().splitlines()
-        self.assertEqual(len(notes), 1, notes)
-        self.assertIn("w1:p1", notes[0])
+        siblings = [self.worker("sibling2"), self.worker("sibling3")]
+        for sibling in siblings:
+            self.world.add(sibling, "w1:p" + sibling.name[-1])
+        for several in (False, True):
+            with self.subTest(several=several):
+                before = self.world.process_reads.count("w1:p1")
+                with herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors:
+                    with herdr.observation_snapshot():
+                        observed = self.observation(row)
+                    if several:
+                        record = staff.snapshot()
+                        for sibling in siblings:
+                            with herdr.observation_snapshot():
+                                state = worker_panes.observe_worker(self.parent.id, sibling, record)
+                                self.assertIsInstance(state, worker_panes.OpenWorker)
+                                self.world.remember_row_tab(str(sibling.id), "w1:p" + sibling.name[-1])
+                        self.world.save_layout(record=record)
+                self.assertEqual(self.world.process_reads.count("w1:p1") - before, 1)
+                self.assertIsInstance(observed, worker_panes.ProcessUnknownWorker)
+                assert isinstance(observed, worker_panes.ProcessUnknownWorker)
+                self.assertEqual((observed.pane, observed.terminal), ("w1:p1", "terminal-w1:p1"))
+                self.assertIn("process permission denied", observed.reason)
+                notes = errors.getvalue().splitlines()
+                self.assertEqual(len(notes), 1, notes)
+                self.assertIn("w1:p1", notes[0])
         with redirect_stderr(io.StringIO()):
             closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
         self.assertIsInstance(closed, worker_panes.UncertainWorker)
