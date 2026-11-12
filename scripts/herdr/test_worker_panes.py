@@ -689,6 +689,41 @@ class WorkerPaneTests(StaffTestCase):
         self.assertNotIn("config_dir", saved)
         self.assertEqual(self.world.launches, [])
 
+        for explicit_home in (True, False):
+            with self.subTest(retained_launch=False, explicit_home=explicit_home):
+                identity = staff.native_id(fixture_runtime_id(f"unrecorded-recovery-{explicit_home}"))
+                row = staff.StaffRow(identity, "worker", f"unrecorded-{explicit_home}",
+                                     staff.ReportsTo(self.parent.id), current_session=identity)
+                home = self.root / "process-account" if explicit_home else Path.home() / ".codex"
+                fixture_session(identity, staff.CodexBackend(home))
+                pane = "w1:p2" if explicit_home else "w1:p3"
+                self.world.add(row, pane, family="codex", label=worker_panes.agent_name(self.parent, row.name))
+                process = self.world.processes[self.world.foreground[pane][0]]
+                if explicit_home:
+                    process.environment["CODEX_HOME"] = str(home)
+                self.world.locations[pane]["cwd"] = str(self.root)
+                (pane_launch.record_directory() / f"fixture-{identity}.json").unlink()
+                publications: list[worker_admission.PublishedWorker] = []
+                publish_worker = worker_admission.publish
+
+                def publish(allowed: worker_admission.WorkerStartAllowed, runtime_id: str, *,
+                            launch_home: staff.SessionHome | staff.HomeUnknown = worker_admission.UNKNOWN_LAUNCH_HOME
+                            ) -> worker_admission.PublishedWorker:
+                    published = publish_worker(allowed, runtime_id, launch_home=launch_home)
+                    publications.append(published)
+                    return published
+
+                with patch.object(worker_admission, "publish", side_effect=publish):
+                    result = self.start(row.name, account=accounts.CodexWorkersAccount(
+                        "codex3", self.root / "selected-account"))
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual([item.row.home for item in publications], [staff.SessionHome(home)])
+                self.assertEqual(result.row.home, staff.SessionHome(home))
+                self.assertEqual(staff.by_id(result.row.id), result.row)
+                self.assertEqual(staff.backend(result.row), staff.CodexBackend(home))
+                self.assertEqual(self.world.launches, [])
+
     def test_a_worker_name_with_its_owner_prefix_keeps_one_prefix_on_the_pane(self) -> None:
         name = self.parent.name + "-astra-reviewer"
         opened = self.start(name, "astra-reviewer")
