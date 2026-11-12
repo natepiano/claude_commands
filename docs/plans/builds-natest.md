@@ -3079,7 +3079,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:** judge each assertion, not the test name; a full returned value can guard harm.
 
-### Phase 166 — The bulk run tests build their workspace once for each class and the admission window test costs less  · status: todo
+### Phase 166 — The bulk run tests build their workspace once for each class and the admission window test costs less  · status: done
 **Depends on:** none
 
 #### Work Order
