@@ -536,6 +536,8 @@ A detached run continues across a session stop or restart.
 `detached_runs.py start` starts its supervisor in a new process session.
 The command runs in a `builds-detached.slice` scope when systemd is available.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
+After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
+The supervisor waits for delivery before it marks the run finished.
 The result goes to the worker's fixed staff row and its current conversation.
 A stopped worker's result goes to its parent. A stopped parent's result waits in its queue.
 
