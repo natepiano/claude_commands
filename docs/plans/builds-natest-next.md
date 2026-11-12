@@ -59,22 +59,12 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
    | Order | Work | Work split and acceptance |
    | --- | --- | --- |
    | 1 | Phase 205 is done: removable CPU is zero. Direct content tests already run in process; the other 982 starts (167 local CPU s) check shell integration, imports, guards, waits, signals or ownership. | No trial. |
-   | 2 | Phase 207 is done: the cost is registry-reader Python starts, not reads. Phase 208 is done at `ce9febf6d`: the Claude model shell takes the parsed launch table (10.04 s in aws pairs; `notify/test_review.py` alone 7.00 s). Next candidates: `add_unit.py:459` (0–3.22 s) and `assign.py:418` (0–2.00 s), each on an owner go. | aws pairs decide. |
+   | 2 | Phase 207 is done: the cost is registry-reader Python starts, not reads. Phase 208 is done at `ce9febf6d`: the Claude model shell takes the parsed launch table (10.04 s in aws pairs; `notify/test_review.py` alone 7.00 s). Phases 213 (`add_unit.py:459`, 0–3.22 s) and 214 (`assign.py:418`, 0–2.00 s) run on the sdlc go. | aws pairs decide. |
    | 3 | Phase 200 Git trials, each on an owner go and a paired measure | Phase 206 (copies bare flag) is done: 1.70 s. Phase 209 is done at `72252ade3`: style commit and tree in one read (2.68 s). Publication metadata (`models_registry.py:364,541`, `main_push_lock.py:22`, 0–0.847 s; sdlc go given) waits behind the content and resolver trials; keep both publication lock identities and fresh mutable-state checks. The old verified-commit bound is retired: after Phase 209 a passed commit removes no child; a new proposal needs fresh attribution. |
 
    Defer copy-guard scope traversal (`copy_guard.py:900,1122`, 0–1.8 s), full bulk-run attribution and crate ownership attribution (`crate_run.py:303`) until measured evidence changes this order (architect after Phase 201).
 
-   The Phase 202–204 content-call candidates are complete: aws pairs saved 21.38 (hold-event), 9.85 (phase-table) and 18.07 (screenshot tool) CPU s per gate. Screen usage-report, escalation and showrunner content calls next. Require unchanged assertions, owner approval, kept process evidence and paired aws gains (architect after Phase 204):
-
-   | Candidate | Census starts | Local CPU s | Approval |
-   | --- | ---: | ---: | --- |
-   | `scripts/usage/test_usage_report.py:114` | 74 | 15.615 | usage-ledger owner |
-   | `scripts/message/test_escalate.py:83` | 57 | 9.137 | messaging owner |
-   | `scripts/production/test_showrunners.py:190` | 28 | 3.728 | sdlc and devtools |
-
-   Order: usage_report, escalate, showrunners (planning ratios 5.21, 3.05 and 1.86 CPU s per work hour; not aws savings). One natest writer per module; serialize CPU comparisons.
-
-   Keep isolation in each module; add no new general adapter. usage_report keeps the SQLite snapshot checks at line 386. escalate binds `STATE`, `SEND` and `NOTIFIER` (`escalate.py:50-53`). Reuse `scripts/production/cli_fixture.py`; keep real CLI entries, cold imports, signals, timeouts, publication races and writer-lifetime proofs. A recorder that runs in a thread calls its main directly, not through `invoke_cli`: the restore would change module bindings while the thread runs (Phase 202 F001).
+   The content-call candidates are complete. aws pairs saved 21.38 (hold-event, Phase 202), 9.85 (phase-table, 203), 18.07 (screenshot tool, 204), 14.92 (usage report, 210), 9.19 (escalation, 211) and 2.56 (showrunners, 212) CPU s per gate. A new content-call candidate needs a fresh census rank. Keep isolation in each module and add no new general adapter. Reuse `scripts/production/cli_fixture.py`. Keep real CLI entries, cold imports, signals, timeouts, publication races and writer-lifetime proofs. A recorder that runs in a thread calls its main directly, not through `invoke_cli` (Phase 202 F001).
 
    Do not convert `direct/test_progress_history.py:408` or `direct/recorder_fixture.py:201`: they already call real handlers in process.
 
@@ -173,7 +163,7 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
 
 ## Items to consider
 
-- Host-independent fixtures (architect after Phase 209): `scripts/agents/test_restart.py:209` builds `Herdr`, which calls `herdr_binary()` before the patched methods run; `RestartTestCase.setUp` (line 76) sets no `HERDR_BIN`, so a host without herdr (the aws box) raises `HerdrMissing`. Bind a private `HERDR_BIN` in `setUp`; keep the fake-CLI override at line 827; prove the module with herdr absent from PATH. Phase 209 fixed the same defect in `production/test_add_unit.py`. Needs the restart owner's go.
+- [x] **Host-independent fixtures.** Done in Phase 210 (`db1ec4e5e`): `scripts/agents/test_restart.py` binds a private `HERDR_BIN` in `RestartTestCase.setUp`; all 107 tests pass on the aws box, which has no herdr. Phase 209 fixed `production/test_add_unit.py` the same way.
 
 - [x] **Shared test setup costs are measured across a whole gate before the next speed phase is picked.** Done 2026-11-09, 739 modules, natedev at low load, total 3,056 CPU s. Admission setup 28.0, admission loop 25.9, admission cleanup 3.1, process scans 24.8, process cleanup 24.0, seed copies 13.3. The highest eligible module is 50.3. Phase 113 takes the admission costs. Keep the required leak scans. Phase 157 removes the redundant `reap()` scan after an empty `wait_for_marker_exit` result; aws pairs measure the saving, and every importing module must pass before it lands.
   - Target: `scripts/build_queue/admission_test_support.py` and the shared verify fixture modules.
