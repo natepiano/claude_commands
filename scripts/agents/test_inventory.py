@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -27,7 +28,7 @@ from scripts.agents.test_support import ShutdownTestCase, linux_process_fixture
 from scripts.agents import inventory
 from scripts.whoami import account
 from scripts.herdr import herdr
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.agents import shutdown
@@ -253,8 +254,13 @@ class InventoryTests(ShutdownTestCase):
             _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
             os.utime(path, (timestamp, timestamp))
         self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        model = inventory.last_model(newer)
+        self.assertEqual(model, "newer")
+        archived = compressed_copy(newer)
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), archived)
+        self.assertEqual(inventory.last_model(archived), model)
         older.unlink()
-        newer.unlink()
+        archived.unlink()
         self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
 
     def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:
@@ -303,6 +309,13 @@ class InventoryTests(ShutdownTestCase):
             listed = inventory.listing()
             owned = inventory.listing(TARGET_LOGIN)
         by_id = {session.session_id: session for session in listed}
+        membership = staff.snapshot()
+        for identity, kind in ((UNIT_ID, "unit"), (DIRECTOR_ID, "showrunner")):
+            member = membership.by_current_session(identity)
+            assert member is not None
+            self.assertEqual((by_id[identity].name, by_id[identity].kind), (member.name, kind))
+        self.assertEqual(by_id[UNIT_ID].name, "shutdown")
+        self.assertEqual(by_id[DIRECTOR_ID].name, "build-followups")
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID, OTHER_ID})
         self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         for session in full:
@@ -322,6 +335,27 @@ class InventoryTests(ShutdownTestCase):
                     self.assertNotIn("production", session["host"])
                     self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
                     self.assertNotIn("doc", session["host"])
+
+        producer = fixture_member("producer", name="fixture-producer", runtime_id=OTHER_ID)
+        for registered in (True, False):
+            if not registered:
+                for folder in self.notifier.glob("showrunner-*"):
+                    (folder / "conf").unlink()
+                    folder.rmdir()
+            listed = {entry.session_id: entry for entry in inventory.listing()}
+            reports = [inventory.inventory(login) for login in (TARGET_LOGIN, OTHER_LOGIN)]
+            detailed = {entry["session_id"]: entry for report in reports for entry in report["sessions"]}
+            membership = staff.snapshot()
+            for identity in (UNIT_ID, DIRECTOR_ID, str(producer.current_session)):
+                member = membership.by_current_session(identity)
+                assert member is not None
+                with self.subTest(registered=registered, member=member.kind):
+                    self.assertEqual((listed[identity].name, listed[identity].kind), (member.name, member.kind))
+                    self.assertEqual((detailed[identity]["name"], detailed[identity]["kind"]), (member.name, member.kind))
+            self.assertEqual((listed[UNIT_ID].production, listed[UNIT_ID].doc),
+                             (listed[DIRECTOR_ID].name, listed[DIRECTOR_ID].doc))
+            for report in reports:
+                self.assertEqual(inventory.parse_inventory(json.dumps(report)), report)
 
     def test_registration_reads_the_folder_owner_document_from_one_staff_snapshot(self) -> None:
         doc = self.root / "document-name-differs.md"
@@ -351,7 +385,7 @@ class InventoryTests(ShutdownTestCase):
               patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
               patch.object(inventory, "_conf", wraps=getattr(inventory, "_conf")) as checked):
             registrations = inventory.showrunner_registrations()
-            listed = inventory.listing(registrations=registrations)
+            listed = inventory.listing()
             missing = inventory.unregistered_showrunners(listed, registrations=registrations)
         self.assertEqual(checked.call_count, 2, "membership and missing-target check must share the timer read")
         director = next(item for item in listed if item.session_id == DIRECTOR_ID)
@@ -473,7 +507,7 @@ class InventoryTests(ShutdownTestCase):
             patch.object(Path, "home", return_value=self.home)
         )
         _live_context: object = self.enterContext(
-            patch.object(sessions, "live_session", return_value=True)
+            patch.object(session_records, "live_session", return_value=True)
         )
         _unit_live_context: object = self.enterContext(
             patch.object(unit_lookup, "live_session", return_value=True)
@@ -1271,6 +1305,12 @@ elif "comm=" in joined:
         decoded = inventory.parse_inventory(json.dumps(found))
 
         self.assertEqual(decoded, found)
+        producer = fixture_member("producer", name="fixture-producer", runtime_id=DESKTOP_ID)
+        found = inventory.inventory(TARGET_LOGIN)
+        decoded = inventory.parse_inventory(json.dumps(found))
+        self.assertEqual(decoded, found)
+        observed = next(entry for entry in decoded["sessions"] if entry["session_id"] == producer.current_session)
+        self.assertEqual((observed["name"], observed["kind"]), (producer.name, producer.kind))
 
     def test_parse_inventory_normalizes_a_legacy_tmux_host_to_manual_recovery(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)

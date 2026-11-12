@@ -23,7 +23,7 @@ from scripts.accounts import accounts
 from scripts.whoami.account_test_support import write_claude_account
 from scripts.production import add_showrunner
 from scripts.production import showrunners, showrunner_tree, staff
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import private_process_registry, confirm_tab_close, native_claude, process as write_process
@@ -368,10 +368,6 @@ class AddShowrunnerFixture(unittest.TestCase):
 
         def advance(seconds: float) -> None:
             nonlocal elapsed
-            # Registry fixtures change on the next read; no asynchronous writer
-            # needs wall time. Keep the requested interval observable.
-            with (self.root / "polls.jsonl").open("a") as output:
-                _ = output.write(json.dumps(seconds) + "\n")
             elapsed += seconds
 
         with (patch.object(subprocess, "run", run),
@@ -389,6 +385,17 @@ class AddShowrunnerFixture(unittest.TestCase):
         _ = self.env.setdefault("FAKE_CLAUDE_PID", "998041")
         native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
         _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", fixture_runtime_id("showrunner::" + production_name))
+        if (self.state / "live-agents").exists():
+            path = Path(self.env["HERDR_PANE_RECORD_DIR"]) / "agents.json"
+            entries = pane_launch.read(path)
+            if "w1:p1" not in entries:
+                owner = staff.by_path(production_name)
+                options: pane_launch.LaunchOptions = {"pane_id": "w1:p1", "model": "", "remote_control": False,
+                    "environment": {}, "flags_read": True, "written_at": "fixture"}
+                entry = (pane_launch.StaffPaneLaunch(staff_id=owner.id, **options) if owner is not None else
+                         pane_launch.NativePaneLaunch(session_id=fixture_runtime_id("open-shell:" + production_name),
+                            name=production_name, cwd=str(self.root), kind="claude", **options))
+                pane_launch.save(path, {**entries, "w1:p1": entry}, record=staff.snapshot())
         self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
                     session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
@@ -404,6 +411,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
                 "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": production_name}]}})),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         write_process(self.env, 998040, 1, ["zsh"], {"HERDR_SESSION": SHARED, "HERDR_PANE_ID": "w1:p1"})

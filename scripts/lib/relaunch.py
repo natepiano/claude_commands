@@ -24,7 +24,7 @@ from scripts.production import staff, worker
 from scripts.agents import pane_record
 from scripts.agents.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
-from scripts.lib.models_registry import agent_environment
+from scripts.lib.models_registry import agent_environment, claude_arguments
 from scripts.lib.resume_message import NO_WORKERS, resume_message
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
@@ -149,6 +149,8 @@ def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str
     argv, environment = restored_launch(argv, environment)
     if program:
         argv = [program, *argv[1:]]
+    if argv and Path(argv[0]).name == "claude":
+        argv = [argv[0], *claude_arguments(argv[1:], environment)]
     return argv, environment
 
 

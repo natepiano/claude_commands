@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import NotRequired, TypedDict, cast
 
 from scripts.model_study.model_study import extract
@@ -211,7 +212,9 @@ class RequestExtractionTests(unittest.TestCase):
                 user("2026-10-06T23:00:50Z", [], origin="peer"),
                 assistant("2026-10-06T23:00:51Z", "sixth"),
             ]
-            result = read_session(write_transcript(directory, records), "fixture", None)
+            path = write_transcript(directory, records)
+            result = read_session(path, "fixture", None)
+            self.assertEqual(read_session(compressed_copy(path), "fixture", None), result)
 
             self.assertEqual(len(result.turns), 6)
             first, second, third, fourth, fifth, sixth = result.turns

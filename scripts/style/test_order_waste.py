@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -47,16 +48,25 @@ class OrderWasteTests(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
     connection: sqlite3.Connection = sqlite3.connect(":memory:")
+    repository_seed: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="order-waste-seed-")))
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "user.name", "Order waste tests")
+        _ = fixture.git("config", "user.email", "order-waste@example.invalid")
+        _ = fixture.git("config", "commit.gpgsign", "false")
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Order waste tests")
-        _ = self.git("config", "user.email", "order-waste@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
         self.connection = self.enterContext(closing(sqlite3.connect(":memory:")))
         for _, migration in sorted(style_ledger.MIGRATIONS.items()):
             _ = self.connection.executescript(migration)
@@ -150,6 +160,11 @@ class OrderWasteTests(unittest.TestCase):
         self.finding("gone", "dont-repeat-type-name-in-fields", "src/z.rs", "withdrawn", at(0, 30), at(2, 30), ticket="types-2",
                      gone_at="abc1234", followed_from="src/a.rs")
         self.finding("duplicate", "spell-out-names", "src/a.rs", "withdrawn", at(0, 30), at(6), duplicate_of="qualified")
+        self.finding("qualified", "spell-out-names", "src/a.rs", "unfiled", at(0, 30), at(6))
+        self.finding("whole-test-file", "split-by-type-ownership", "src/widget_tests.rs", "unfiled", at(0, 30), at(6))
+        _ = self.connection.execute("UPDATE held_findings SET kind='restructure' WHERE finding_id='whole-test-file'")
+        self.finding("folded-test-item", "split-by-type-ownership", "src/widget_tests.rs", "withdrawn", at(0, 30), at(6),
+                     duplicate_of="whole-test-file")
 
     def measured(self) -> order_waste.Report:
         return order_waste.report(order_waste.measure(self.connection, self.repo))
@@ -172,7 +187,7 @@ class OrderWasteTests(unittest.TestCase):
         self.assertEqual((data["changing_tickets"], data["counted_findings"]), (4, 4))
         self.assertEqual(data["not_counted"], {
             "bare rename duplicate": 1, "exception under a newer rule text": 1, "no other rule's merged fix changed its file": 1,
-            "person waive": 1,
+            "person waive": 1, "folded test file duplicate": 1,
         })
 
     def test_moved_lines_are_not_rework_and_keep_their_writer(self) -> None:

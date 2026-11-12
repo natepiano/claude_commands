@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -354,13 +355,35 @@ def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[st
 
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     """Return running records whose supervisor still owns the record."""
+    return _live_runs(runs, lambda raw: raw.get("worker") == worker)
+
+
+def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
+    """Read live records for fixed staff identities, including renamed members."""
+    return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
+
+
+def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> list[RunRecord]:
+    """Read each record once and check its owner and supervisor."""
     found: list[RunRecord] = []
     for path in sorted(runs.glob("*.json")):
         raw = worker_lifecycle.read_json_object(path)
-        if (raw.get("status") == "running" and raw.get("worker") == worker
+        if (raw.get("status") == "running" and owns(raw)
                 and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
     return found
+
+
+def resume_context(runs: Path, worker: str) -> str:
+    """Name live runs and their persistent result files for a resumed worker."""
+    lines: list[str] = []
+    for record in live_runs(runs, worker):
+        result = runs / f"{record['run_id']}.json"
+        command = shlex.join(["cat", "--", str(result), record["log"]])
+        lines.append(f"Detached run {record['run_id']} remains live. "
+                     + f"Result: {result}; log: {record['log']}. Read it with: `{command}`. "
+                     + "Its result follows this worker after the move.")
+    return "\n".join(lines)
 
 
 def command_start(args: argparse.Namespace) -> int:
@@ -582,6 +605,33 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
         return f"{delivery.outcome}: {delivery.detail}"
 
 
+def command_deliver(args: argparse.Namespace) -> int:
+    record_path = Path(str(getattr(args, "record", "")))
+    record = _read_record(record_path)
+    try:
+        delivery = deliver(record, command_result(record))
+    except RunDeliveryFailed as error:
+        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+        return 1
+    record = _read_record(record_path)
+    record["delivery"] = delivery
+    _ = _write_record(record_path, record)
+    return 0
+
+
+def deliver_in_fresh_process(record_path: Path) -> int:
+    """Import delivery code after the recorded command ends."""
+    script = Path(__file__).resolve()
+    try:
+        return subprocess.run(
+            [str(script.parents[1] / "lib/py"), str(script), "deliver", str(record_path)],
+            stdin=subprocess.DEVNULL, check=False,
+        ).returncode
+    except OSError as error:
+        print(f"detached_runs: delivery process did not start: {error}", file=sys.stderr)
+        return 1
+
+
 def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
     """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
@@ -626,6 +676,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         "UNIT_RUN_DIR": record["session_dir"],
         "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
         "UNIT_DETACHED_RECORD": str(record_path.resolve()),
+        "BUILDLOG_OWNER_STAFF_ID": record["staff_id"],
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
@@ -640,15 +691,12 @@ def command_supervise(args: argparse.Namespace) -> int:
     # unless the result is already held.
     record["exit_code"] = exit_code
     record = _write_record(record_path, record)
-    try:
-        delivery = deliver(record, CompletedCommand(exit_code))
-    except RunDeliveryFailed as error:
-        print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
+    if deliver_in_fresh_process(record_path) != 0:
         return 1
     record = _read_record(record_path)
     record.update({
         "status": "finished", "exit_code": exit_code,
-        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "delivery": delivery,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     _finish_record(record_path, record)
     return 0
@@ -674,6 +722,9 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
+    _ = delivery.add_argument("record")
+    delivery.set_defaults(handler=command_deliver)
     reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
     _ = reap.add_argument("--session-dir", required=True)
     _ = reap.add_argument("--worker", default="")

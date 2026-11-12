@@ -40,6 +40,7 @@ from scripts.lib import conf
 
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.production import staff
 
 
 def state_root() -> Path:
@@ -54,6 +55,7 @@ LINE = re.compile(
 )
 OPEN_END = re.compile(r" — (?P<state>proposed|deferred)\s*$")
 TAG = re.compile(r"\s*\[gain/week: (?P<gain>[^\]]+)\]\s*$")
+BY = re.compile(r"\s*\[by: (?P<by>[^\]]+)\]\s*$")
 GAIN = re.compile(r"^(?P<number>\d[\d,]*(?:\.\d+)?)\s*(?:(?P<minutes>min(?:utes?)?\b)|(?P<hours>h(?:ours?)?\b)|(?P<percent>%))")
 REPORT_FIELD = re.compile(r"^\*\*(?P<name>[^*:]+):\*\*\s*(?P<value>.*)$")
 # A night writes its Also found and Noted items as a bulleted or a numbered list.
@@ -91,6 +93,8 @@ class Candidate(NamedTuple):
     # The tag's words as written; empty when the line carries no tag.
     gain_text: str
     state: str
+    # The source unit's fixed staff id; empty when the source is unknown.
+    by: str = ""
 
     @property
     def area(self) -> str:
@@ -104,7 +108,8 @@ class Candidate(NamedTuple):
     @property
     def line(self) -> str:
         tag = f" [gain/week: {self.gain_text}]" if self.gain_text else ""
-        return f"{self.head}{tag} — {self.state}"
+        source = f" [by: {self.by}]" if self.by else ""
+        return f"{self.head}{tag}{source} — {self.state}"
 
 
 def read_gain(text: str) -> Gain:
@@ -135,11 +140,15 @@ def open_candidate(line: str) -> Candidate | None:
     if found is None or ending is None:
         return None
     title = OPEN_END.sub("", found["body"])
+    source = BY.search(title)
+    by = source["by"].strip() if source else ""
+    if source is not None:
+        title = title[: source.start()]
     tag = TAG.search(title)
     gain_text = tag["gain"].strip() if tag else ""
     if tag is not None:
         title = title[: tag.start()]
-    return Candidate(found["night"], found["scope"].strip(), found["kind"] or "", title.strip(), gain_text, ending["state"])
+    return Candidate(found["night"], found["scope"].strip(), found["kind"] or "", title.strip(), gain_text, ending["state"], by)
 
 
 def read_lines(path: Path) -> list[str]:
@@ -256,13 +265,17 @@ def record(report: Path) -> int:
     if not candidates:
         print(f"candidates: {report} has no `# <title>` and `**Target:**` to record", file=sys.stderr)
         return 1
+    identity = staff.caller_identity()
+    caller = staff.snapshot().by_current_session(identity) if identity else None
+    by = caller.id if caller is not None and caller.kind == "unit" else ""
     ledger = state_root() / "ledger.md"
     known = read_lines(ledger)
     new: list[str] = []
     for candidate in candidates:
-        # The outcome follows this exact heading and its optional gain, never words in the title.
+        candidate = candidate._replace(by=by)
+        # The outcome follows the exact heading and its optional gain and source tags.
         complete_record = re.compile(re.escape(candidate.head)
-                                     + r"(?: \[gain/week: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
+                                     + r"(?: \[gain/week: [^\]]+\])?(?: \[by: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
         if any(complete_record.fullmatch(line) is not None for line in known):
             continue
         # A stopped append can leave just the heading or part of its final state.

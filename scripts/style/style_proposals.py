@@ -396,11 +396,13 @@ class DecisionWriter:
         approval = self.rule_approval(key, inherited)
         project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
+        caller = staff.snapshot().by_current_session(staff.caller_identity())
+        proposed_by = caller.id if caller is not None and caller.kind == "unit" else self.standing.name
         with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
             body = Path(scratch) / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", self.standing.name, "--extra-tags", "style",
+                             "--proposed-by", proposed_by, "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
                              "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
@@ -1757,10 +1759,16 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
     # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading
     # the answer again under its write lock. The first step after the approval builds it.
-    reading = (style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
-                                                                  if outcome.finding.finding_id not in refused))
-               if dry_run else ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
-                                                          planned.tip, approved_decision))
+    if dry_run:
+        reading = style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
+                                                                   if outcome.finding.finding_id not in refused))
+    elif any(isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRenamed, style_ledger.DeclarationRemoved))
+             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite)
+             for outcome in planned.outcomes):
+        reading = ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
+                                             planned.tip, approved_decision)
+    else:
+        reading = planned
     for outcome in reading.outcomes:
         if not isinstance(outcome, (style_ledger.DeclarationNotRead, style_ledger.DeclarationInPlace,
                                     style_ledger.RenameAwaitingApproval)):

@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 
 
-_SESSION_MODULE_FILES = ("sessions.py", "process_identity.py", "relay_identity.py")
+_SESSION_MODULE_FILES = ("sessions.py", "session_records.py", "process_identity.py", "relay_identity.py")
 
 
 def copy_session_modules(destination: Path) -> None:

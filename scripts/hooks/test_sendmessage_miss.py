@@ -120,6 +120,10 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_relay_name_miss_finds_the_real_senders_session(self) -> None:
         write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        path = self.root / f"sessions/{os.getpid()}.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["name"] = "Different registry title"
+        _ = path.write_text(json.dumps(fields))
         with self.loaded_daemon(self.home, {"thread": "natedev"}):
             text = self.additional_context(self.run_hook(relay_session_name("natedev")))
         self.assertIn("natedev: codex freestanding, account codex2", text)
@@ -183,7 +187,7 @@ class SendMessageMissTests(unittest.TestCase):
         self.assertIn("--to Morty", text)
 
     def test_multiple_matches_list_addresses_instead_of_choosing_one(self) -> None:
-        with loaded_session_daemon(self.home, {"one": "Morty", "two": "morty"}):
+        with self.loaded_daemon(self.home, {"one": "Morty", "two": "morty"}):
             text = self.additional_context(self.run_hook("MORTY"))
         self.assertIn("codex:one", text)
         self.assertIn("codex:two", text)

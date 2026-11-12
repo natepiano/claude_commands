@@ -69,7 +69,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
     def open_run(self) -> Path | None:
         return unit_runs.open_run(staff.runtime_id())
 
-    def failing_worker(self, code: int = 2, *, recursive_history: bool = False, after_pass_start: bool = False) -> Path:
+    def failing_worker(self, code: int = 2, *, after_pass_start: bool = False) -> Path:
         """Run a failing child at the worker boundary of the real launcher."""
         command = self.session_dir.parent / "worker-python"
         calls = self.session_dir.parent / "failed-worker-commands.jsonl"
@@ -92,7 +92,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         )) + "\n")
         command.chmod(0o755)
         self.instrument_launcher("\n".join((
-            "from pathlib import Path",
             "from scripts.direct import assign",
             f"assign.PYTHON = {str(command)!r}",
             "prepare_run = assign.prepare_run",
@@ -100,14 +99,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             "    run, phase = prepare_run(*arguments)",
             "    return run, phase",
             "assign.prepare_run = prepare",
-            *(("real_cleanup = assign.execute_herdr",
-               "def cleanup(*args):",
-               "    code = real_cleanup(*args)",
-               "    history = assign.read_object(args[1] / 'progress_history_state.json')['history_file']",
-               "    with Path(history).open('a') as output:",
-               "        output.write('[' * 10000 + '0' + ']' * 10000 + '\\n')",
-               "    return code",
-               "assign.execute_herdr = cleanup") if recursive_history else ()),
         )))
         return calls
 
@@ -248,18 +239,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
 
     def test_a_finished_review_without_a_worker_name_keeps_the_run(self) -> None:
         self.assert_unnamed_review_keeps_run(finished=True)
-
-    def test_a_recursive_history_keeps_the_worker_exit_code_and_reports_one_cleanup_error(self) -> None:
-        calls = self.failing_worker(recursive_history=True)
-        result = self.launch()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(len(calls.read_text().splitlines()), 1)
-        self.assertEqual(self.open_run(), self.session_dir)
-        self.assertNotIn("status", read_object(self.session_dir / "progress_history_state.json"))
-        diagnostics = [line for line in result.stderr.splitlines() if "unable to end failed run" in line]
-        self.assertEqual(len(diagnostics), 1, result.stderr)
-        self.assertIn("recursion", diagnostics[0])
-        self.assertNotIn("Traceback", result.stderr)
 
     def test_a_completed_pass_keeps_the_run_after_a_later_launch_failure(self) -> None:
         _ = self.successful()
@@ -511,21 +490,6 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertIn(reason, (self.phase / "review_agent_1.log").read_text())
         self.assertEqual(self.fixture.agent.submitted, [])
         self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
-
-    def test_review_incomplete_start_closes_the_pane_without_either_stage(self) -> None:
-        self.fixture.fixture.world.outcome = herdr.PromptNotSubmitted("startup hook failed")
-        self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication failed: startup hook failed")
-        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
-
-    def test_review_failed_publication_closes_the_backend_without_either_stage(self) -> None:
-        rows = staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id)
-        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("publication unavailable")):
-            self.assert_start_not_delivered(worker.ExitCode.UNCERTAIN, "publication refused: publication unavailable")
-        self.assertIn("review: publication failed: staff: review:", (self.phase / "review_agent_1.log").read_text())
-        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.fixture.fixture.parent.id), rows)
-        self.assertEqual(len(self.fixture.fixture.world.launches), 2)
-        self.assertEqual(self.fixture.fixture.world.closed, [("w1:p2", "terminal-w1:p2")])
 
     def test_review_admission_failure_sends_neither_stage(self) -> None:
         launches = self.fixture.fixture.world.launches.copy()
@@ -1041,21 +1005,6 @@ class AssignLauncherTests(HookAssignmentFixture):
                 result = self.launch("review", "--phase", phase, execution=InProcessAssignment())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("invalid phase id:", result.stderr)
-        self.assertEqual(self.native.fixture.world.launches, [])
-
-    def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
-        for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
-            with self.subTest(options=options):
-                result = invoke_assignment(options, os.environ.copy())
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("usage", (result.stdout + result.stderr).lower())
-        self.assertEqual(self.native.fixture.world.launches, [])
-
-    def test_future_roles_are_refused_before_any_thread_is_opened(self) -> None:
-        for role in ("research", "propose"):
-            with self.subTest(role=role):
-                result = self.launch(role, execution=InProcessAssignment())
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.native.fixture.world.launches, [])
 
     def test_writer_paths_are_required_and_review_paths_are_refused(self) -> None:

@@ -11,6 +11,7 @@ from pathlib import Path
 import select
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -976,7 +977,16 @@ class StandingTests(unittest.TestCase):
         _ = self.git(self.source, "remote", "remove", "origin")
         linked = self.base / "worktree"
         _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
-        self.assertEqual(copies.repository_name(linked), self.source.name)
+        bare = self.base / "bare.git"
+        _ = self.git(self.base, "clone", "-q", "--bare", str(self.source), str(bare))
+        _ = self.git(bare, "remote", "remove", "origin")
+        bare_linked = self.base / "bare-worktree"
+        _ = self.git(bare, "worktree", "add", "--detach", str(bare_linked), self.head)
+        for source, main in ((self.source, self.source), (linked, self.source),
+                             (bare, bare), (bare_linked, bare)):
+            with self.subTest(source=source):
+                self.assertEqual(copies.main_checkout(source), main)
+                self.assertEqual(copies.repository_name(source), main.name)
 
     def test_relative_origin_uses_the_main_checkout_from_each_worktree(self) -> None:
         _ = self.git(self.source, "remote", "set-url", "origin", "../origin.git")
@@ -1002,6 +1012,7 @@ class StandingTests(unittest.TestCase):
         _ = self.git(main, "worktree", "add", "--detach", str(linked), "HEAD")
         for source in (main, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
+                self.assertEqual(copies.main_checkout(source), main)
                 self.assertEqual(self.cache(tree).parent.name, "widget")
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
@@ -1210,6 +1221,21 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(scratch.end_copy(tree, record.task, time.time()))
         self.assertFalse(tree.exists())
 
+        with self.subTest(ended_workspace="unlinked native copy with unsaved work"):
+            with copies.workspace(self.owner_id, self.source, self.published,
+                                  name="unsaved-sweep-package", branch="worker", task="gate:unlinked-run") as unsaved:
+                _ = (unsaved / "pending.txt").write_text("keep unsaved work\n")
+            record = scratch.task_of(unsaved)
+            assert isinstance(record, copy_record.Registered)
+            self.assertNotIn("crate_run", record.fields)
+            copies.end_workspaces(record.task, [unsaved])
+            self.assertTrue(unsaved.exists())
+            ended = scratch.task_of(unsaved)
+            assert isinstance(ended, copy_record.Registered)
+            self.assertEqual(ended.fields["ended_task"], record.task)
+            self.assertIsInstance(scratch.lifetime(unsaved), scratch.Ended)
+            self.assertEqual((unsaved / "pending.txt").read_text(), "keep unsaved work\n")
+
     def test_workspace_refuses_another_base_or_branch_without_resetting(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name="reserved", branch="worker") as tree:
             _ = (tree / "tracked.txt").write_text("keep these edits\n")
@@ -1296,18 +1322,101 @@ class StandingTests(unittest.TestCase):
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
-        program = ("import json,os,sys; from pathlib import Path; "
-                   + "Path(sys.argv[1]).write_text(json.dumps([os.getcwd(),sys.argv[2]])); sys.exit(7)")
-        result = self.run_cli(command=(sys.executable, "-c", program, str(output), "checkout={tree}/tracked.txt"))
-        self.assertEqual(result.returncode, 7, result.stderr)
-        row = cast(list[str], json.loads(output.read_text()))
-        tree = Path(row[0])
-        self.assertEqual(row, [str(tree), f"checkout={tree}/tracked.txt"])
-        self.assertTrue(tree.is_relative_to(self.base / "temporary"))
-        self.assertFalse(tree.exists())
-        tree = self.gates / "verify-unit-gate"
-        with scratch.busy_locks(tree, create=False) as idle:
-            self.assertTrue(idle)
+        evidence = self.base / "build-evidence.json"
+        program = "\n".join([
+            "import json,os,subprocess,sys; from pathlib import Path",
+            "Path(sys.argv[1]).write_text(json.dumps([os.getcwd(),sys.argv[2]]))",
+            "for relative, content, mode in [('target/debug/x', b'binary\\x00x', 0o751), "
+            + "('target/release/y', b'binary\\x00y', 0o705)]:",
+            "    path = Path(relative)",
+            "    path.parent.mkdir(parents=True, exist_ok=True)",
+            "    path.write_bytes(content)",
+            "    path.chmod(mode)",
+            "Path('target/debug/broken').mkdir(exist_ok=True)",
+            "Path(sys.argv[3]).write_text(json.dumps(["
+            + "subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), "
+            + "os.readlink('target')]))",
+            "sys.exit(int(sys.argv[4]))",
+        ])
+        cases = (
+            ("plain", (), 7, False),
+            ("published", ("target/debug/x", "target/release/y"), 0, False),
+            ("command-failed", ("target/debug/x", "target/release/y"), 7, False),
+            ("applied", ("target/debug/x",), 0, True),
+            ("partly-built", ("target/debug/x", "target/debug/missing"), 7, False),
+            ("not-built", ("target/debug/missing",), 0, False),
+            ("not-built-command-failed", ("target/debug/missing",), 7, False),
+            ("copy-failed", ("target/debug/x", "target/debug/broken"), 0, False),
+            ("copy-and-command-failed", ("target/debug/x", "target/debug/broken"), 7, False),
+        )
+        for label, requested, command_exit, apply in cases:
+            with self.subTest(case=label):
+                options = [part for path in requested for part in ("--publish", path)]
+                if apply:
+                    _ = (self.source / "untracked.txt").write_text("gate publication\n")
+                    options.extend(("--apply-uncommitted", str(self.source)))
+                folders_before = {folder.path for folder in scratch.folders()}
+                result = self.run_cli(*options, command=(
+                    sys.executable, "-c", program, str(output), "checkout={tree}/tracked.txt",
+                    str(evidence), str(command_exit),
+                ))
+                self.assertEqual(result.returncode, command_exit, result.stderr)
+                row = cast(list[str], json.loads(output.read_text()))
+                checkout = Path(row[0])
+                self.assertEqual(row, [str(checkout), f"checkout={checkout}/tracked.txt"])
+                self.assertTrue(checkout.is_relative_to(self.base / "temporary"))
+                self.assertFalse(checkout.exists())
+                tree = self.gates / "verify-unit-gate"
+                with scratch.busy_locks(tree, create=False) as idle:
+                    self.assertTrue(idle)
+                commit, target = cast(list[str], json.loads(evidence.read_text()))
+                self.assertEqual(Path(target).resolve(), tree / "target")
+                if apply:
+                    self.assertNotEqual(commit, self.head)
+                else:
+                    self.assertEqual(commit, self.head)
+                lines = [line for line in result.stdout.splitlines() if line.startswith("published: ")]
+                folders_after = {folder.path for folder in scratch.folders()}
+                if "target/debug/broken" in requested:
+                    self.assertIn("copies: publish:", result.stderr)
+                    self.assertIn("Is a directory", result.stderr)
+                    self.assertEqual(lines, [], result.stdout)
+                    self.assertEqual(folders_after, folders_before)
+                    continue
+                missing = [path for path in requested if path.endswith("/missing")]
+                self.assertEqual(result.stderr.splitlines(),
+                                 [f"copies: publish: {path} not built" for path in missing])
+                built = [path for path in requested if path not in missing]
+                self.assertEqual(len(lines), len(built), result.stdout)
+                if not built:
+                    self.assertEqual(folders_after, folders_before)
+                    continue
+                published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0]) for line in lines]
+                publication = published[0].parent
+                self.assertEqual(folders_after - folders_before, {publication})
+                self.assertTrue(publication.is_relative_to(self.base / "scratch"))
+                self.assertFalse(publication.is_relative_to(checkout))
+                self.assertEqual([path.parent for path in published], [publication] * len(built))
+                self.assertEqual([path.name for path in published], [Path(path).name for path in built])
+                self.assertEqual([line.rsplit(" ", 1)[1] for line in lines], [commit] * len(built))
+                record = scratch.task_of(publication)
+                assert isinstance(record, copy_record.Registered)
+                self.assertTrue(record.fields["throwaway"])
+                self.assertTrue(record.task.startswith("until:"))
+                manifest = cast(dict[str, object], json.loads((publication / "manifest.json").read_text()))
+                self.assertEqual(manifest, {
+                    "repository": self.source.name, "commit": commit, "command_exit": command_exit,
+                    "files": [path.name for path in published],
+                })
+                expected = [(path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                            for relative in built for path in (tree / relative,)]
+                copies.remove_trees(self.owner_id)
+                for path, (content, mode) in zip(published, expected, strict=True):
+                    self.assertTrue(path.is_absolute())
+                    self.assertFalse(path.is_symlink())
+                    self.assertTrue(stat.S_ISREG(path.stat().st_mode))
+                    self.assertEqual(path.read_bytes(), content)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
 
     def test_list_reports_tree_owner_repo_commit_busy_pid_and_target_size(self) -> None:
         mirror = copies.RemoteMirror(self.owner_id, copies.SelectedRepository(self.source.name),
@@ -1645,6 +1754,31 @@ class StandingTests(unittest.TestCase):
             pass
         copies.remove_trees(self.owner_id)
         self.assertFalse(tree.exists())
+        for stage in ("integrated", "abandoned"):
+            with self.subTest(crate_stage=stage):
+                name = "crate-" + stage
+                terminal = copies.workspace_path(self.owner_id, self.source, name)
+                active = copies.workspace_path(self.owner_id, self.source, name + "-active")
+                manifest_path = self.base / (name + ".json")
+                crates = {"terminal": {"checkout": str(terminal), "stage": stage},
+                          "active": {"checkout": str(active), "stage": "selected"}}
+                manifest = {"version": 2, "canonical": str(self.source), "base": self.head, "crates": crates}
+                _ = manifest_path.write_text(json.dumps(manifest))
+                with copies.workspace(self.owner_id, self.source, self.head, name=name,
+                                      branch="worker", run_manifest=manifest_path):
+                    pass
+                with copies.workspace(self.owner_id, self.source, self.head, name=name + "-active",
+                                      branch="worker", run_manifest=manifest_path):
+                    pass
+                with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(active), str(refused.exception))
+                self.assertFalse(terminal.exists())
+                self.assertTrue(active.exists())
+                crates["active"]["stage"] = "abandoned"
+                _ = manifest_path.write_text(json.dumps(manifest))
+                copies.remove_trees(self.owner_id)
+                self.assertFalse(active.exists())
 
     def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:

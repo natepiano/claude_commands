@@ -23,7 +23,8 @@ def step_labels(step: admission_records.WaitingStep | admission_records.RunningS
     if identity is not None:
         return replace(identity, unit=unit) if step.unit else identity
     fallback = " ".join(step.session_name.split()) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-    return unit_labels.UnitLabels(fallback, unit=unit or "—")
+    return unit_labels.UnitLabels(fallback, unit_labels.OWNER_NOT_RECORDED,
+                                 unit or unit_labels.OWNER_NOT_RECORDED)
 
 
 def step_pid_text(step: admission_records.WaitingStep | admission_records.RunningStep) -> str:
@@ -115,9 +116,8 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
         if missing:
             calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
-    ci = f" (CI keep-aside {gib(room.ci_keep_aside.bytes)})" if room.ci_keep_aside.bytes > 0 else ""
     text = (f"{calculation} "
-            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}{ci}; room {gib(room.room)}")
+            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}; room {gib(room.room)}")
     if room.shortfall:
         text += f"; shortfall {gib(room.shortfall)}"
     return text
@@ -166,7 +166,7 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
             text = "no running step needs to end"
         else:
             ended_steps = [step_labels(explanation.running[index].step, labels).session
-                           + " " + queue_lines.step_prose(explanation.running[index].step, names) for index in release.ended]
+                           + " " + queue_lines.step_prose(explanation.running[index].step, names, labels=labels) for index in release.ended]
             text = (f"{' + '.join(ended_steps)} end (keep-aside drops {gib(release.growth_drop)}; "
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
@@ -220,9 +220,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
     memory = running.step.measured
     if isinstance(memory, admission_records.CompilerServiceMemory) or (
             isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
-        ci = explanation.room.ci_keep_aside.bytes if isinstance(explanation.room, admission_records.MemoryRoom) else 0
-        extra = f"; CI keep-aside {gib(ci)}" if ci and isinstance(memory, admission_records.UnownedSliceMemory) else ""
-        return service_text(memory, explanation.now) + extra
+        return service_text(memory, explanation.now)
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at
     started = ("admission time unknown" if isinstance(admitted, admission_records.AdmissionTimeNotRecorded) else
@@ -238,7 +236,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
         observed = memory.peak_history
         phase = (f"; tests started: need {gib(gate.test_phase_charge(observed))} "
                  f"(test peak {gib(observed.peak_so_far)}, history {gib(observed.need.bytes)} x {observed.need.margin:g})")
-    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {queue_lines.step_prose(running.step, names)}: {started}; "
+    return (f"{step_pid_text(running.step)} · {identity.showrunner} / {identity.unit} / {identity.session}, {queue_lines.step_prose(running.step, names, labels=labels)}: {started}; "
             + evidence + phase + swap)
 
 

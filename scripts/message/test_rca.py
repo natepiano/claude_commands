@@ -15,6 +15,7 @@ from threading import Thread
 from time import monotonic
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 
 from typing import IO, cast, override
@@ -165,6 +166,12 @@ class RcaTests(unittest.TestCase):
         record = {"pid": os.getpid(), "name": name, "sessionId": session_id, "messagingSocketPath": str(socket_path),
                   "updatedAt": 1, "procStart": sessions.process_start(os.getpid()) or ""}
         _ = (self.root / "sessions" / f"{name}.json").write_text(json.dumps(record))
+        membership = staff.snapshot()
+        if membership.by_current_session(session_id) is None:
+            member = staff.StaffRow(staff.StaffId(session_id), "unit", name, staff.StaffRoot(),
+                                    current_session=staff.StaffId(session_id))
+            _ = self.enterContext(mock.patch.object(staff, "snapshot",
+                                                   return_value=replace(membership, rows=(*membership.rows, member))))
 
     def transcript(self, folder: str, session_id: str, mtime: float) -> Path:
         path = self.root / "projects" / folder / f"{session_id}.jsonl"

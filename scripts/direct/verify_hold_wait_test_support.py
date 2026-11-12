@@ -29,7 +29,7 @@ from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
-    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, wait_for_marker_exit,
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
@@ -74,10 +74,12 @@ def read_cycle_file(path: Path) -> build_hold.HoldCycle:
 @contextmanager
 def local_hold_environment(environment: Mapping[str, str]) -> Generator[None, None, None]:
     """Restore changed keys without clearing the admission reader's environment."""
+    from scripts.build_targets import build_targets
+
     previous_values = {name: os.environ[name] for name in environment if name in os.environ}
     try:
         os.environ.update(environment)
-        with hold_recorder_exits():
+        with hold_recorder_exits(), mock.patch.object(build_targets, "tell_wait_holder"):
             yield
     finally:
         for name in environment:
@@ -276,7 +278,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
         write_pressure_reading(pressure)
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
-            "CLAUDE_PYTHON": sys.executable,
+            "CLAUDE_PYTHON": "",
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -293,13 +295,14 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def run_unblocked_step(self, command: str) -> subprocess.CompletedProcess[str]:
         """Call the real hold checks, command launcher, and call recorder."""
+        install_fixed_cargo(self.fixture.bin_directory / "cargo")
         script = self.fixture.root / "unblocked-step.sh"
         _ = script.write_text('set -eo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
             + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
-PY=$CLAUDE_PYTHON
+PY=${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}
 CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
 STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0

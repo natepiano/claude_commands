@@ -57,10 +57,12 @@ class UnitResumeCommandTests(StaffTestCase):
 
     def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
         from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
 
         runner = fixture_member("showrunner", name="demo")
         row = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
             runtime_id=fixture_runtime_id("merges"), unit_type="merge")
+        fixture_session(row.current_session, staff.ClaudeBackend())
         row = staff.rename(row.id, "renamed")
         entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
         environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
@@ -266,7 +268,7 @@ class RelaunchTests(ShutdownTestCase):
 
     def test_director_resume_without_a_pane_marker_names_its_workers(self) -> None:
         from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_member, fixture_worker
+        from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_session
         from scripts.agents import pane_record
 
         with patch.dict(os.environ, {"HOME": str(self.root), "ROSTER_RUN_ROOT": str(self.root / "runs"),
@@ -274,9 +276,15 @@ class RelaunchTests(ShutdownTestCase):
             runner = fixture_member("showrunner", name="TEST-showrunner")
             director = fixture_member("unit", name="TEST-director", parent=runner.id,
                                       worktree=staff.PresentWorktree("natedev", self.root))
+            fixture_session(director.current_session, staff.ClaudeBackend())
             workers = [fixture_worker(name, director.id) for name in ("impl", "review")]
             entry = pane_record.launch("w1:p2", director.current_session, str(self.root), {}, ["claude"])
-            with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
+            from scripts.agents.test_pane_restore import FakeClient
+            from scripts.herdr import herdr
+
+            client = FakeClient([{"pane_id": "w1:p2", "label": director.name, "workspace_id": "w1"}])
+            with (patch.object(pane_record, "RECORD_DIR", self.root / "panes"),
+                  patch.object(herdr, "Herdr", return_value=client)):
                 pane_record.write("agents", entry)
                 arguments, _ = relaunch.restored_launch(["claude", "--resume", director.current_session],
                     {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"})
@@ -325,6 +333,35 @@ class RelaunchTests(ShutdownTestCase):
                     expected = [*expected, resume_message("you were stopped and resumed")]
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
+
+        from scripts.production import staff
+
+        from scripts.herdr import pane_launch
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from dataclasses import replace
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        with self.subTest(record="reused pane"):
+            arguments = ["claude", "--resume", str(owner.current_session)]
+            resumed = relaunch.restored_launch(arguments,
+                {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p7"})[0]
+            self.assertEqual(resumed, [*arguments, resume_message("you were stopped and resumed")])
+
 
     def test_explicit_move_account_replaces_the_saved_launch_account(self) -> None:
         from scripts.agents import pane_record

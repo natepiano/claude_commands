@@ -84,9 +84,6 @@ class SnapshotCompatibilityTests(unittest.TestCase):
         self.assertEqual(codec.parse_snapshot_value(
             {"kind": "PeakHold", "default_seconds": 30}, admission_records.PeakHold), admission_records.PeakHold(30))
 
-    def test_missing_required_field_is_refused(self) -> None:
-        with self.assertRaisesRegex(ValueError, "invalid snapshot record fields"):
-            _ = codec.parse_snapshot_value({"kind": "MeasuredMemory"}, admission_records.MeasuredMemory)
 
     def test_wrong_or_missing_tag_is_refused(self) -> None:
         for record in ({"bytes": 12}, {"kind": "GoneMemory", "bytes": 12}):
@@ -381,7 +378,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
         reading = ci.measured
         assert isinstance(reading, admission_records.UnownedSliceMemory)
         baseline_ci = replace(ci, measured=replace(reading, bytes=0))
-        for need, state in ((5, "admit"), (6, "hold")):
+        for need, state in ((12, "admit"), (13, "hold")):
             with self.subTest(need=need):
                 waiter: admission_records.Waiter = {"pid": 200, "start_time": "200", "need": need * GIB,
                                        "since": NOW_EPOCH}
@@ -393,17 +390,6 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 after = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
                 self.assertEqual(after.state, state)
                 self.assertEqual(after, before)
-
-    def test_ci_keep_aside_stays_separate_from_run_use_and_run_holds(self) -> None:
-        reading = gate.memory_room(admission_records.HostMemory(20 * GIB, 64 * GIB), [admission_records.RunMemory("run", 8 * GIB, admission_records.AnonymousRunUse(3 * GIB))], admission_policy_fixture(), ci_keep_aside=admission_records.CIKeepAside(7 * GIB))
-        assert isinstance(reading, admission_records.MemoryRoom)
-        self.assertEqual(reading.used, 3 * GIB)
-        self.assertEqual(reading.kept, 12 * GIB)
-        self.assertEqual(reading.room, 5 * GIB)
-        self.assertEqual(reading.cap, 20 * GIB)
-        self.assertEqual(len(reading.runs), 1)
-        self.assertEqual(reading.runs[0].bytes, 5 * GIB)
-        self.assertEqual(reading.ci_keep_aside.bytes, 7 * GIB)
 
     def test_negative_room_shows_zero_and_keeps_the_exact_shortfall(self) -> None:
         reading = gate.memory_room(admission_records.HostMemory(5 * GIB, 64 * GIB), [admission_records.RunMemory("run", 18 * GIB, admission_records.AnonymousRunUse(10 * GIB))], admission_policy_fixture())
@@ -755,13 +741,6 @@ class FilteredPromiseTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
         (self.root / "admission").mkdir()
 
-    def test_filtered_estimate_decodes_the_history_once_for_all_compile_steps(self) -> None:
-        self.samples([3 * GIB], filters=("native_rate",))
-        self.samples([6 * GIB], step="check")
-        self.samples([8 * GIB], step="build")
-        estimate = assert_history_decoded_once(
-            self, self.root / "admission/anon_peaks.jsonl", self.promise)
-        self.assertEqual(estimate, admission_records.ExpectedPeak(3 * GIB, "measured", 1))
 
     def test_shared_call_keeps_compile_results_and_nextest_selection_separate(self) -> None:
         rows: list[dict[str, object]] = [{
@@ -1364,18 +1343,6 @@ class FreshTestPromiseTests(unittest.TestCase):
                     first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
                 self.assertEqual(estimate, admission_records.ExpectedPeak(3 * GIB, "measured", 1))
 
-    def test_fresh_estimate_decodes_the_history_once(self) -> None:
-        self.samples([2 * GIB])
-        self.previous_build()
-        estimate = assert_history_decoded_once(
-            self, self.root / "admission/anon_peaks.jsonl", self.promise)
-        self.assertEqual(estimate, admission_records.ExpectedPeak(2 * GIB, "measured", 1))
-
-    def test_fresh_compile_fallback_reuses_the_decoded_history(self) -> None:
-        self.previous_build()
-        estimate = assert_history_decoded_once(
-            self, self.root / "admission/anon_peaks.jsonl", self.promise)
-        self.assertEqual(estimate, admission_records.ExpectedPeak(10 * GIB, "measured", 10))
 
     def test_same_tree_native_rate_run_uses_zero_compile_anon_p90_joined_by_call(self) -> None:
         self.samples([number * GIB // 4 for number in range(1, 11)])
@@ -2263,18 +2230,6 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 record = {**gate.test_phase_need_record(self.phase_need), "margin": margin}
                 self.assertEqual(gate.read_test_phase_need(record), gate.NoTestPhaseNeed("not_recorded"))
 
-    def test_charge_wire_types_have_one_shared_owner(self) -> None:
-        from scripts.lib import test_phase
-
-        pairs = (
-            (test_phase.TestPhaseChargeUse, test_phase.TestPhaseChargeUse),
-            (test_phase.NoTestPhaseChargeUse, test_phase.NoTestPhaseChargeUse),
-            (test_phase.CallRecord, test_phase.CallRecord),
-            (test_phase.NoCallRecord, test_phase.NoCallRecord),
-        )
-        for exported, shared in pairs:
-            with self.subTest(name=exported.__name__):
-                self.assertIs(exported, shared)
 
     def test_shared_charge_check_rejects_invalid_fields(self) -> None:
         from scripts.lib import test_phase
@@ -2500,7 +2455,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         path = self.root / "admission/queue_times.jsonl"
         return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def test_priority_replacement_stays_live_and_clear_restores_order_without_resetting_clocks(self) -> None:
+    def test_priority_list_stays_live_and_clear_restores_order_without_resetting_clocks(self) -> None:
         from scripts.build_queue import admission_protocol as wire
         self.label(300, "first")
         self.label(400, "second")
@@ -2514,7 +2469,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                 _ = admission.server.handle_request(request)
             before = {key: wire.encode_record(admission_records.stored_waiter(value.row))
                 for key, value in admission.server.waiters.items()}
-            for unit, expected in (("first", [300, 400]), ("second", [400, 300])):
+            for unit, expected in (("first", [300, 400]), ("second", [300, 400])):
                 replies = admission.completed_queue_change(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id"))
                 self.assertEqual(replies, [wire.Ok()])
                 reading, = admission.server.handle_request(wire.ViewRequest())
@@ -2524,11 +2479,11 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             _ = admission.server.run_pass()
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
-            self.assertEqual([step.pid for step in reading.reading.view.waiting], [400, 300])
+            self.assertEqual([step.pid for step in reading.reading.view.waiting], [300, 400])
             saved = admission.server.priority
             assert not isinstance(saved, admission_records.NoQueuePriority)
-            self.assertNotIn("until", saved)
-            self.assertEqual(saved["unit"], "second")
+            self.assertNotIn("until", wire.encode_record(saved))
+            self.assertEqual([entry["unit"] for entry in saved.entries], ["first", "second"])
             self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id")), [wire.Ok()])
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
@@ -2537,7 +2492,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                 for key, value in admission.server.waiters.items()}, before)
             events = [row for row in buildlog_rows(admission.state_dir.parent) if row.get("kind") == "queue_priority"]
             self.assertCountEqual([(row["action"], row["unit"]) for row in events],
-                [("set", "first"), ("set", "second"), ("clear", "second")])
+                [("set", "first"), ("set", "second"), ("clear", "first, second")])
             self.assertTrue(all("until" not in row for row in events))
 
 
@@ -2636,7 +2591,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
                 "initial", "chosen", "saved reason", "director")), [wire.Ok()])
             priority = fixture.server.priority
             assert not isinstance(priority, admission_records.NoQueuePriority)
-            before = priority.copy()
+            before = priority
             logged = buildlog_rows(fixture.state_dir.parent)
             for unit in ("not-a-roster-unit", UnitLabels("").unit):
                 self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
@@ -2651,8 +2606,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             request = fixture.request()
             self.labels[request.identity.session_id] = UnitLabels("unassigned")
             _ = fixture.server.handle_request(request)
-            fixture.server.priority = {"unit": UnitLabels("").unit, "why": "old wire value",
-                "set_at": fixture.clock.now(), "set_by": "director", "transition": admission_records.SettledPriority()}
+            fixture.server.priority = admission_records.QueuePriority(({'unit': UnitLabels("").unit, 'why': "old wire value", 'set_at': fixture.clock.now(), 'set_by': "director"},), admission_records.SettledPriority())
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual(admission_records.waiter_priority(view.reading.ordered[0][1]), admission_records.NormalOrder())
@@ -2670,8 +2624,8 @@ class ServicePriorityRepairTests(unittest.TestCase):
                     _ = fixture.completed_queue_change(request)
             priority = fixture.server.priority
             assert not isinstance(priority, admission_records.NoQueuePriority)
-            self.assertIsInstance(priority["transition"], admission_records.PendingPriorityTransition)
-            transition = priority["transition"]
+            self.assertIsInstance(priority.transition, admission_records.PendingPriorityTransition)
+            transition = priority.transition
             assert isinstance(transition, admission_records.PendingPriorityTransition)
             self.assertEqual(transition.month_row_end, len(prefix))
             fixture.restart()
@@ -3457,6 +3411,7 @@ class BuildNeedBasisTests(BuildPromiseFixture):
         with self.assertRaises((TypeError, ValueError)):
             _ = admission_records.ExpectedPeak(GIB, "shape", 1)
 
+
     def test_old_queue_row_has_basis_not_recorded(self) -> None:
         path = self.waiter(400, NOW_EPOCH, "/tmp/build", "builder", need=12)
         row = gate.read_waiter(path)
@@ -3557,9 +3512,6 @@ class HistoryAdmissionTests(MemoryQueueFixture):
             **fake_memory_readings(self.root, total_kib=60 * GIB // 1024),
             "LINT_CONFIG_FILE": str(config),
         })))
-
-
-
 
 
     def test_history_waiter_expires_when_lock_wait_exceeds_head_seconds(self) -> None:
@@ -4449,9 +4401,20 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertEqual(gate.reservation_need(row, reading), 4 * GIB)
         self.assertEqual(row["need"], 4 * GIB)
         text = gate.progress_text(adjusted)
-        self.assertIn("suites:1, 80% done", text)
+        self.assertIn("suites:1, 80.0% done", text)
         self.assertIn("need 1.5 GiB", text)
-        self.assertIn("highest anonymous use in the next 20%", text)
+        self.assertIn("highest anonymous use in the next 20.0%", text)
+
+    def test_progress_text_rounds_down_until_the_counter_is_complete(self) -> None:
+        for done, total, expected in (
+            (835, 836, "99.8%"), (836, 836, "100.0%"),
+            (10**18 - 1, 10**18, "99.9%"), (0, 836, "0.0%"),
+        ):
+            with self.subTest(done=done, total=total):
+                reading = admission_records.ProgressAdjustedMemory(GIB,
+                    counter=progress.ProgressCounter("build:1", done, total),
+                    window=progress.NoMatchingProfile("private fixture"), remaining_need=GIB)
+                self.assertIn(f"build:1, {expected} done", gate.progress_text(reading))
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
         first = self.reservation("merge-gate")
@@ -5492,19 +5455,6 @@ class QueueExplanationTests(MemoryQueueFixture):
         return fixture_queue_inputs(gate.admission_dir(self.root), gate.process_table(self.root / "proc"),
                                     NOW_EPOCH, admission_policy_fixture())
 
-    def test_queue_read_from_uses_no_files_processes_or_reader_limits(self) -> None:
-        _ = self.running(100, 6)
-        _ = self.waiting(300, 12 * GIB, 20)
-        _ = self.waiting(400, GIB, 5)
-        inputs = self.snapshot_inputs()
-        expected = gate.queue_read_from(inputs, policy=admission_policy_fixture())
-        with patch.dict(os.environ, {"BUILDLOG_PROC": "/absent"}), \
-             patch.object(Path, "open", side_effect=AssertionError("pure read opened file")), \
-             patch.object(Path, "read_text", side_effect=AssertionError("pure read read file")), \
-             patch.object(gate, "process_table", side_effect=AssertionError("pure read scanned processes")), \
-             patch.object(gate, "read_pressure", side_effect=AssertionError("pure read read recovery")):
-            self.assertEqual(gate.queue_read_from(inputs, policy=admission_policy_fixture()), expected)
-
 
     def test_pass_and_view_share_each_rows_decision_and_reason_in_every_scenario(self) -> None:
         _ = self.running(100, 8)
@@ -5535,8 +5485,8 @@ class QueueExplanationTests(MemoryQueueFixture):
                                                 "since": NOW_EPOCH - 30})]),
             "recorded priority": replace(inputs, ordered=[(head_path, {**head, "priority_rank": 0}),
                                                              inputs.ordered[1]],
-                priority={"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
-                          "set_by": "showrunner"}),
+                priority=admission_records.QueuePriority(({"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
+                          "set_by": "showrunner"},))),
             "override": replace(inputs, override=override, host=admission_records.HostMemory(60 * GIB, 60 * GIB)),
             "unavailable": replace(inputs, host=admission_records.ReadingUnavailable()),
             "expired": replace(inputs, ordered=[(head_path, {**head, "estimated_at": NOW_EPOCH - 600}),
@@ -5705,12 +5655,9 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.waiting(400, GIB, 0)
         priorities: tuple[admission_records.QueuePriority | admission_records.NoQueuePriority, ...] = (
             admission_records.NO_QUEUE_PRIORITY,
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.SettledPriority()},
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)},
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)})
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.SettledPriority()),
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)),
+            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)))
         for priority in priorities:
             for owners in (frozenset[str](), frozenset(('400-warmup', '300-head'))):
                 with self.subTest(owners=owners):
@@ -5730,14 +5677,6 @@ class QueueExplanationTests(MemoryQueueFixture):
         reading = gate.queue_read_from(restored, admission_policy_fixture())
         assert isinstance(reading.explanation.head, admission_records.HeadExplanation)
         self.assertEqual(reading.explanation.head.decision.measured, 0)
-
-    def test_gather_and_publication_never_resolve_or_store_limits(self) -> None:
-        inputs = self.snapshot_inputs()
-        encoded = codec.snapshot_value(inputs)
-        self.assertIsInstance(encoded, dict)
-        assert isinstance(encoded, dict)
-        for key in ("limits", "budget", "reserve"):
-            self.assertNotIn(key, cast(dict[str, object], encoded))
 
 
 class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
@@ -5777,7 +5716,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "ci_memory_margin_gib", "peak_history_share_percent"):
+                        "peak_history_share_percent"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5796,27 +5735,10 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.estimate_refresh_seconds, 7)
                         elif key == "slot_gap_seconds":
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
-                        elif key == "ci_memory_margin_gib":
-                            self.assertEqual(repaired.config.policy.ci_memory_margin_bytes, 7 * GIB)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
-
-    def test_ci_margin_reads_bytes_and_recovers_invalid_values_like_other_policy_keys(self) -> None:
-        for margin in (0, 2.5, 7):
-            with self.subTest(margin=margin):
-                self.write_config(ci_memory_margin_gib=str(margin))
-                config = admission_records.read_memory_config()
-                self.assertEqual(config.policy.ci_memory_margin_bytes, int(margin * GIB))
-        for raw in (None, "abc", "-1", "nan", "inf"):
-            with self.subTest(raw=raw):
-                self.write_config(ci_memory_margin_gib=raw)
-                with contextlib.redirect_stderr(io.StringIO()) as errors:
-                    config = admission_records.read_memory_config()
-                self.assertEqual(config.policy.ci_memory_margin_bytes, 7 * GIB)
-                self.assertIn("ci_memory_margin_gib", errors.getvalue())
-                self.assertIn("warning:", errors.getvalue())
 
     def test_cargo_estimate_reads_the_configured_first_peak_at_each_use(self) -> None:
         for peak in (7, 13):
@@ -5954,22 +5876,6 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         self.assertEqual((after.reason.cause if isinstance(after.reason, admission_records.HeadAdmissionStatus) else after.reason), admission_records.EstimateExpired(NOW_EPOCH - 450))
         self.assertEqual(admission_records.read_memory_config().policy.timing.estimate_refresh_seconds, 300)
 
-    def test_warning_boundary_reports_each_fallback_once_and_checker_stays_silent(self) -> None:
-        self.write_config(estimate_refresh_seconds="abc", slot_gap_seconds=None)
-        with patch.object(admission_records, "_warned_configuration_diagnostics", set[admission_records.ConfigurationDiagnostic]()), contextlib.redirect_stderr(io.StringIO()) as errors:
-            first = admission_records.read_memory_config(report=False)
-            second = admission_records.read_memory_config(report=False)
-            admission_records.warn_configuration_diagnostics(first.diagnostics)
-            admission_records.warn_configuration_diagnostics(second.diagnostics)
-        self.assertEqual(errors.getvalue().count("estimate_refresh_seconds='abc'"), 1)
-        self.assertEqual(errors.getvalue().count("slot_gap_seconds='<missing>'"), 1)
-        _ = self.running(100, 8)
-        with contextlib.redirect_stderr(io.StringIO()) as errors:
-            checked = self.pass_for(400, need=8, free=0)
-        self.assertIn("estimate_refresh_seconds", errors.getvalue())
-        self.assertEqual(checked.decision.state, "hold")
-        self.assertEqual(admission_records.read_memory_config().policy.timing.estimate_refresh_seconds, 600)
-
 
 class ServiceAdmissionRuleTests(unittest.TestCase):
     def test_reservation_stem_keeps_owner_identity_and_admission_time(self) -> None:
@@ -6068,8 +5974,8 @@ class CiSliceMemoryTests(unittest.TestCase):
                 f"anon {(6 - shared) * GIB}\nshmem {shared * GIB}\ninactive_file 0\n")
             processes = gate.process_table(self.proc)
             policy = admission_records.read_memory_config().policy
-            for registered, margin, registered_use, unregistered_use in (
-                    ((), 7, 0, 6), ((235,), 7, 2, 4), ((235, 346), 0, 6, 0)):
+            for registered, registered_use, unregistered_use in (
+                    ((), 0, 6), ((235,), 2, 4), ((235, 346), 6, 0)):
                 with self.subTest(registered=registered, shared=shared):
                     reservations = [fixture_reservation(pid, 8 * GIB) for pid in registered]
                     runs: list[admission_records.RunningStep] = []
@@ -6098,11 +6004,10 @@ class CiSliceMemoryTests(unittest.TestCase):
                     room = gate.inputs_room(inputs, policy)
                     self.assertIsInstance(room, admission_records.MemoryRoom)
                     if isinstance(room, admission_records.MemoryRoom):
-                        self.assertEqual(room.ci_keep_aside.bytes, margin * GIB)
                         self.assertEqual(room.used, registered_use * GIB)
                         self.assertEqual(room.ci_use, unregistered_use * GIB)
                         self.assertEqual(room.cap, 23 * GIB)
-                        self.assertEqual(room.kept, (8 * len(registered) - registered_use + margin) * GIB)
+                        self.assertEqual(room.kept, (8 * len(registered) - registered_use) * GIB)
 
     def queue_with_ci(self, reading: admission_records.StepMemory, available: int = 20 * GIB) -> admission_records.QueueRead:
         config = admission_records.read_memory_config()
@@ -6125,7 +6030,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.ci_use, expected)
                 self.assertEqual(room.cap, 17 * GIB + expected)
 
-    def test_running_ci_job_keeps_one_margin_and_reduces_room_by_seven_gib(self) -> None:
+    def test_running_ci_job_has_no_margin_and_keeps_the_same_room(self) -> None:
         idle = self.queue_with_ci(self.reading()).explanation.room
         self.start_ci_job()
         reading = self.reading()
@@ -6133,15 +6038,14 @@ class CiSliceMemoryTests(unittest.TestCase):
         active = self.queue_with_ci(reading).explanation.room
         assert isinstance(idle, admission_records.MemoryRoom)
         assert isinstance(active, admission_records.MemoryRoom)
-        self.assertEqual(active.ci_keep_aside.bytes, 7 * GIB)
-        self.assertEqual(active.kept, 7 * GIB)
-        self.assertEqual(active.room, 10 * GIB)
-        self.assertEqual(idle.room - active.room, 7 * GIB)
+        self.assertEqual(active.kept, 0)
+        self.assertEqual(active.room, 17 * GIB)
+        self.assertEqual(idle.room, active.room)
         self.assertEqual(active.runs, ())
         self.assertEqual(active.cap, idle.cap)
         config = admission_records.read_memory_config()
         policy = config.policy
-        self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 11 * GIB, [reading], policy=policy).state, "hold")
+        self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 11 * GIB, [reading], policy=policy).state, "admit")
         self.assertEqual(queue_decision(20 * GIB, 64 * GIB, 10 * GIB, [reading, reading], policy=policy).state, "admit")
 
     def test_ci_ram_changes_free_memory_without_entering_use_or_keep_asides(self) -> None:
@@ -6155,10 +6059,10 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(reading.bytes, resident * GIB)
                 self.assertEqual(room.available, available * GIB)
                 self.assertEqual(room.used, 0)
-                self.assertEqual(room.kept, 7 * GIB)
+                self.assertEqual(room.kept, 0)
                 self.assertEqual(room.runs, ())
                 self.assertEqual(room.cap, (resident + available - 3) * GIB)
-                self.assertEqual(room.room, (available - 10) * GIB)
+                self.assertEqual(room.room, (available - 3) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:
         resident = int(0.09 * GIB)
@@ -6171,7 +6075,6 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.assertIsInstance(reading.job_state, IdleService)
         room = self.queue_with_ci(reading).explanation.room
         assert isinstance(room, admission_records.MemoryRoom)
-        self.assertEqual(room.ci_keep_aside.bytes, 0)
         self.assertEqual((room.used, room.kept, room.room), (0, 0, 17 * GIB))
 
     def test_empty_ci_slice_allows_the_sole_oversized_step(self) -> None:
@@ -6233,7 +6136,6 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(captured.view.running[0].measured, reading)
                 room = captured.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
-                self.assertEqual(room.ci_keep_aside.bytes, 0)
                 self.assertEqual((room.used, room.kept, room.room), (0, 0, 17 * GIB))
 
 

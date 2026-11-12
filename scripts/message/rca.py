@@ -218,7 +218,7 @@ def production_of(report: Report) -> str:
     if report.production:
         return report.production
     record = staff.snapshot()
-    known = sessions.named(report.session, sessions.live_sessions())
+    known = sessions.named(report.session, sessions.live_sessions(), membership=record)
     identity = known["sessionId"] if known is not None else ""
     row = record.by_current_session(identity)
     while row is not None and row.kind != "showrunner":

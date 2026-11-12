@@ -56,7 +56,6 @@ from scripts.build_queue.admission_records import (
     BasisNotRecorded,
     BehindHead,
     BetweenStepsSlot,
-    CIKeepAside,
     CallerRun,
     CapNotRecorded,
     CapUnavailable,
@@ -170,6 +169,7 @@ from scripts.build_queue.admission_records import (
     WaitingStep,
     WidthNotRecorded,
     WithinSlot,
+    format_percent,
 )
 from scripts.build_queue.step_estimator import (
     Completed,
@@ -315,11 +315,7 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
         value = cast(object, json.loads(path.read_text()))
         if not isinstance(value, dict):
             raise ValueError("priority is not an object")
-        row = cast(dict[str, object], value)
-        if (any(not isinstance(row.get(key), str) for key in ("unit", "why", "set_by"))
-                or any(not isinstance(number := row.get(key), (float, int))
-                       or isinstance(number, bool) or not math.isfinite(number) for key in ("set_at",))):
-            raise ValueError("invalid priority fields")
+        row = records.upgrade_queue_priority(cast(dict[str, object], value))
         return cast(QueuePriority, codec.parse_snapshot_value(row, QueuePriority))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
@@ -329,24 +325,22 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
 
 
 def finish_priority_transition(priority: QueuePriority) -> None:
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, SettledPriority):
         return
-    record.queue_priority(transition.action, priority["unit"], priority["why"],
-                          priority["set_by"], transition.at, transition_id=transition.id, start=transition.month_row_end)
+    record.queue_priority(transition.action, transition.unit, transition.why,
+                          transition.set_by, transition.at, transition_id=transition.id, start=transition.month_row_end)
 
 
 def read_queue_priority(directory: Path, *, finish: bool = False) -> QueuePriority | NoQueuePriority:
     priority = load_queue_priority(directory)
     if isinstance(priority, NoQueuePriority):
         return priority
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, PendingPriorityTransition):
         if finish:
             finish_priority_transition(priority)
-        if transition.action == "clear":
-            return NO_QUEUE_PRIORITY
-    return priority
+    return priority if priority.entries else NO_QUEUE_PRIORITY
 
 
 class UnitMembership(Protocol):
@@ -383,7 +377,18 @@ def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMe
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
-        labels = roster.unit_labels_for(session_ids, os.environ)
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        recorded: dict[str, UnitMembership] = {}
+        try:
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+        except (OSError, ValueError):
+            pass
+        missing = [session for session in session_ids if session not in recorded]
+        if missing:
+            recorded.update(roster.unit_labels_for(missing, os.environ))
+        labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}
 
@@ -421,8 +426,9 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
     ranked: list[tuple[Path, RankedWaiter]] = []
     for path, row in rows:
         unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        order = (PriorityUnit(context.priority["unit"]) if not isinstance(context.priority, NoQueuePriority)
-                 and unit == context.priority["unit"] else NormalOrder())
+        entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
+        position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
+        order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
     return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
 
@@ -458,9 +464,6 @@ def head_override_event(action: Literal["set", "admitted", "lapsed"], override: 
                         need: int, free: int, reserve: int, at: float) -> None:
     record.head_admission(action, override["unit"], override["step"], need, free,
                           reserve, override["why"], override["set_by"], at)
-
-
-NO_CI_KEEP_ASIDE = CIKeepAside()
 
 
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
@@ -620,7 +623,6 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
 
 def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory],
                 policy: AdmissionPolicy, *,
-                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
                 ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
@@ -630,20 +632,13 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                   max(0, run.need - run.use.bytes) + run.held
                   if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
-    kept = sum(run.bytes for run in holds) + ci_keep_aside.bytes
+    kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept, cap, holds, total=host.total,
-                      ci_keep_aside=ci_keep_aside, ci_use=ci_use)
-
-
-def ci_keep_aside(readings: Iterable[StepMemory], margin: int) -> CIKeepAside:
-    """Keep one margin for a CI job with readable slice evidence."""
-    running = any(isinstance(reading, UnownedSliceMemory)
-                  and isinstance(reading.job_state, RunningServiceJob) for reading in readings)
-    return CIKeepAside(margin if running else 0)
+                      ci_use=ci_use)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1312,7 +1307,9 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return (0 if isinstance(records.waiter_priority(row), PriorityUnit) else 1), row.get("order_since", row["since"]), row["pid"]
+    order = records.waiter_priority(row)
+    rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
+    return rank, row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)
@@ -1819,7 +1816,7 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
@@ -1864,9 +1861,9 @@ def progress_text(reading: StepMemory) -> str:
     if not isinstance(reading, ProgressAdjustedMemory):
         return ""
     counter = reading.counter
-    phase = (f"{counter.phase}, {counter.percent:.0f}% done" if isinstance(counter, progress.ProgressCounter)
+    phase = (f"{counter.phase}, {format_percent(counter.percent, complete=counter.done == counter.total)} done" if isinstance(counter, progress.ProgressCounter)
              else counter.reason)
-    reason = (f"highest anonymous use in the next {reading.window.lookahead_percent:g}%"
+    reason = (f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
               if isinstance(reading.window, progress.WindowPeak) else
               f"full need: {reading.window.reason}")
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
@@ -1878,8 +1875,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     ci_use = sum(reading.bytes for reading in readings
                  if isinstance(reading, UnownedSliceMemory)
                  and not isinstance(reading.job_state, NotServiceSlice))
-    return memory_room(inputs.host, run_memories(inputs), policy,
-        ci_keep_aside=ci_keep_aside(readings, policy.ci_memory_margin_bytes), ci_use=ci_use)
+    return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:

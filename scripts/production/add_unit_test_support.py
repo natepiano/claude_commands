@@ -369,6 +369,20 @@ class AddUnitTestCase(ShutdownTestCase):
 
 
 def submit_command(argv):
+    if argv[2:4] == ["tab", "create"]:
+        from scripts.lib.atomic_file import write_text_atomic
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        responses = json.loads(path.read_text())
+        for command, response in tuple(responses.items()):
+            if command.startswith("--session " + argv[1] + " ") and "w1:p1" in command:
+                responses[command.replace("w1:p1", "w1:p2")] = response
+        responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {
+            "root_pane": {"pane_id": "w1:p2"}, "tab": {"tab_id": "w1:t2"}}})}
+        inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+        inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+            "label": argv[argv.index("--label") + 1]})
+        responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+        write_text_atomic(path, json.dumps(responses))
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
@@ -377,7 +391,7 @@ def submit_command(argv):
         responses[" ".join(argv)] = fixture_foreground(int(os.environ["FAKE_SHELL_PID"]))
         write_text_atomic(path, json.dumps(responses))
     result = main(argv)
-    if result == 0 and argv[2:4] == ["workspace", "create"]:
+    if result == 0 and argv[2:4] in (["workspace", "create"], ["tab", "create"]):
         from scripts.production.fake_unit_host import process
         from scripts.lib.atomic_file import write_text_atomic
         root = Path(os.environ["HERDR_PROC"])
@@ -385,7 +399,8 @@ def submit_command(argv):
         original = root / os.environ["FAKE_SHELL_PID"]
         parent = int((original / "stat").read_text().rsplit(")", 1)[1].split()[1])
         process(os.environ, shell, parent, ["zsh"],
-                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"}, cwd=(original / "cwd").resolve())
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p2" if argv[2] == "tab" else "w1:p1"},
+                cwd=(original / "cwd").resolve())
         write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
     if result == 0 and argv[2:4] == ["agent", "start"]:
         from scripts.production.add_unit_test_support import fixture_agent_started
@@ -403,6 +418,18 @@ def submit_command(argv):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
                                    "message": {"role": "user", "content": argv[-1]}}) + "\n")
+        if argv[4] == "w1:p2":
+            from scripts.production.add_unit_test_support import fixture_foreground
+            from scripts.lib.atomic_file import write_text_atomic
+            responses_path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+            responses = json.loads(responses_path.read_text())
+            inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+            inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+                "label": session_id, "agent_session": {"kind": "id", "value": session_id}})
+            responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+            responses["--session " + argv[1] + " pane process-info --pane w1:p2"] = fixture_foreground(
+                int(os.environ["FAKE_SHELL_PID"]))
+            write_text_atomic(responses_path, json.dumps(responses))
     return result
 
 '''
@@ -548,6 +575,7 @@ def submit_command(argv):
             f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
                 code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle"}}}))

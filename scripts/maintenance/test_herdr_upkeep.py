@@ -48,6 +48,7 @@ class UpkeepTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
+            "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
         _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
 
@@ -148,9 +149,10 @@ class UpkeepTests(unittest.TestCase):
         def launch(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
                    prepared: herdr.PreparedAgentEnvironment, kind: Literal["claude", "codex"], arguments: list[str],
                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
-                   reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT
+                   reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                   client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW
                    ) -> herdr.AgentLaunched:
-            del opening, reported_unknown, codex
+            del opening, reported_unknown, codex, client
             self.assertTrue(ready)
             self.assertIsInstance(destination, herdr.NewTab)
             self.assertGreater(timeout_ms, 0)

@@ -400,13 +400,16 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [self.sources[0]])
 
-    def test_refill_builds_a_ticket_when_the_unit_base_is_behind_the_synced_tip(self) -> None:
+    def test_refill_waits_for_the_style_branch_when_the_unit_base_is_behind_the_synced_tip(self) -> None:
         _ = self.only_first_source_open()
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
         self.write(self.sources[0], "pub fn synced() {}\n")
         self.tip = self.commit()
         self.sync()
-        self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
-        self.assertEqual(self.ledger().ticket_open(ticket_owner_id("names"))[0]["files"], [self.sources[0]])
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        self.assertEqual(self.run_next(),
+                         (6, f"merge the style branch first: unit tip {unit_tip[:7]} is behind the synced tip {self.tip[:7]}\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
 
     def test_a_decision_builds_no_ticket_on_a_file_the_unit_base_changed_after_the_synced_tip(self) -> None:
         rule = self.only_first_source_open()

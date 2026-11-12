@@ -23,6 +23,7 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
@@ -39,7 +40,6 @@ from scripts.mac_test import offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
-from scripts.build_hold.build_hold import NoOwningSession
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 
 

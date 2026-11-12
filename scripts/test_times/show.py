@@ -11,7 +11,10 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -30,7 +33,8 @@ else:
     from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
 TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
 
@@ -363,6 +367,175 @@ def test(connection: sqlite3.Connection, host: str, text: str, runs: int) -> Non
                 output, f"no tests recorded matching {text}")
 
 
+TREND_CACHE_VERSION = 4
+TREND_CACHE_NAME = "gate-trend.json"
+TREND_HEADERS = ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
+                 "cost mean", "cost p95", "cost total"]
+
+
+@dataclass(frozen=True)
+class CostNotRecorded:
+    """The run has no confirmed lifetime and rate in the cost ledger."""
+
+
+@dataclass(frozen=True)
+class TrendRun:
+    cpu_s: float
+    wall_s: float
+    modules: int
+    run_id: str
+
+
+@dataclass(frozen=True)
+class TrendDay:
+    place: str
+    selection: str
+    cells: tuple[str, ...]
+    run_ids: tuple[str, ...]
+
+
+@dataclass
+class TrendCache:
+    zone: str
+    completed_refresh_started_at: float = 0.0
+    days: dict[str, list[TrendDay]] = field(default_factory=dict)
+
+
+def read_trend_cache() -> TrendCache:
+    zone = str(user_zone())
+    try:
+        document = cast(dict[str, object], json.loads((store.root() / TREND_CACHE_NAME).read_text()))
+        if document["version"] != TREND_CACHE_VERSION or document["zone"] != zone:
+            return TrendCache(zone)
+        days = cast(dict[str, list[dict[str, object]]], document["days"])
+        return TrendCache(zone, float(str(document["completed_refresh_started_at"])), {
+            day: [TrendDay(str(row["place"]), str(row["selection"]),
+                           tuple(cast(list[str], row["cells"])), tuple(cast(list[str], row["run_ids"]))) for row in rows]
+            for day, rows in days.items()})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return TrendCache(zone)
+
+
+def write_trend_cache(cache: TrendCache) -> None:
+    write_text_atomic(store.root() / TREND_CACHE_NAME, json.dumps({
+        "version": TREND_CACHE_VERSION, "zone": cache.zone,
+        "completed_refresh_started_at": cache.completed_refresh_started_at,
+        "days": {day: [{"place": row.place, "selection": row.selection, "cells": row.cells, "run_ids": row.run_ids}
+                       for row in rows] for day, rows in cache.days.items()},
+    }, sort_keys=True) + "\n")
+
+
+def refresh_trend_index() -> None:
+    """Certify the start only after the index update completes."""
+    started = datetime.now(UTC).timestamp()
+    _ = index.update()
+    with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+        if (store.root() / TREND_CACHE_NAME).exists():
+            cache = read_trend_cache()
+            cache.completed_refresh_started_at = max(cache.completed_refresh_started_at, started)
+            write_trend_cache(cache)
+
+
+def gate_costs() -> dict[str, Decimal | CostNotRecorded]:
+    """Join reservations to runs and price confirmed lifetimes with applied rates."""
+    from scripts.aws_target import ledger
+    from scripts.build_targets import target_config
+
+    try:
+        evidence = ledger.CostLedger(target_config.ssh_target_state_directory("aws")).read_snapshot()
+    except ledger.LedgerUnavailable:
+        return {}
+    return {"gate-" + row.attempt:
+            row.rate.usd_per_hour * Decimal(row.state.at - row.at) / Decimal(3600) + ledger.gate_allowance(row).usd
+            if isinstance(row.state, ledger.GateTerminated) and row.rate.source != "not priced" else CostNotRecorded()
+            for row in evidence.gate_reservations}
+
+
+def nearest_rank(values: Sequence[float] | Sequence[Decimal]) -> float | Decimal:
+    return sorted(values)[math.ceil(len(values) * 0.95) - 1]
+
+
+def trend_day(connection: sqlite3.Connection, day: date,
+              costs: dict[str, Decimal | CostNotRecorded]) -> list[TrendDay]:
+    """Sum all module attempts before grouping the passing runs."""
+    zone = user_zone()
+    start = datetime.combine(day, datetime.min.time(), zone)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), zone)
+    groups: dict[tuple[str, str], list[TrendRun]] = defaultdict(list)
+    for row in query_rows(connection, """
+        SELECT r.id, r.host, r.selection, r.wall_s, r.modules_run,
+               (SELECT sum(m.cpu_s) FROM gate_modules m WHERE m.run_id = r.id) AS cpu_s
+        FROM gate_runs r
+        WHERE r.started_at >= ? AND r.started_at < ? AND r.status = 0
+          AND coalesce(r.aborted, 0) = 0 AND r.modules_run > 0
+          AND r.selection IN ('full', 'affected')
+    """, (start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+          end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"))):
+        if row["cpu_s"] is None:
+            continue
+        host = str(row["host"])
+        place = "aws" if str(row["id"]) in costs or host.startswith("ip-") or "compute.internal" in host else host
+        groups[place, str(row["selection"])].append(TrendRun(
+            float(str(row["cpu_s"])), float(str(row["wall_s"])), int(str(row["modules_run"])), str(row["id"])))
+    output: list[TrendDay] = []
+    for (place, selection), runs in sorted(groups.items()):
+        cpu = [run.cpu_s for run in runs]
+        wall = [run.wall_s for run in runs]
+        cells = [day.isoformat(), str(len(runs)), f"{statistics.mean(cpu):.0f}", f"{nearest_rank(cpu):.0f}",
+                 f"{statistics.mean(wall):.0f}", f"{nearest_rank(wall):.0f}"]
+        if selection == "affected":
+            cells.append(f"{statistics.median(run.modules for run in runs):g}")
+        output.append(TrendDay(place, selection, tuple(cells), tuple(run.run_id for run in runs)))
+    return output
+
+
+def trend(connection: sqlite3.Connection, days: int) -> None:
+    """Read finished days from the cache and compute the other days."""
+    today = datetime.now(user_zone()).date()
+    settle = conf.read("test_times").number("TREND_SETTLE_MINUTES") * 60
+    costs = gate_costs()
+    rows: list[TrendDay] = []
+    with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+        cache = read_trend_cache()
+        for offset in range(days - 1, -1, -1):
+            day = today - timedelta(days=offset)
+            key = day.isoformat()
+            if key in cache.days:
+                rows.extend(cache.days[key])
+                continue
+            daily = trend_day(connection, day, costs)
+            rows.extend(daily)
+            end = datetime.combine(day + timedelta(days=1), datetime.min.time(), user_zone()).timestamp()
+            if cache.completed_refresh_started_at >= end + settle:
+                cache.days[key] = daily
+        write_trend_cache(cache)
+    groups: dict[tuple[str, str], list[TrendDay]] = defaultdict(list)
+    for row in rows:
+        groups[row.place, row.selection].append(row)
+    if not groups:
+        print("no gate runs recorded yet")
+    for (place, selection), daily_rows in sorted(
+            groups.items(), key=lambda item: (item[0][0], item[0][1] != "full")):
+        label = "targeted tests" if selection == "affected" else "merge gates"
+        print(f"{place} {label}")
+        headers = TREND_HEADERS + (["median modules run"] if selection == "affected" else [])
+        rendered: list[tuple[str, ...]] = []
+        uncosted = 0
+        for row in daily_rows:
+            charged = [cost for run_id in row.run_ids
+                       if place == "aws" and isinstance(cost := costs.get(run_id), Decimal)]
+            costs_text = ("—", "—", "—")
+            if charged:
+                total = sum(charged, Decimal(0))
+                costs_text = (f"${total / len(charged):.3f}", f"${nearest_rank(charged):.3f}", f"${total:.3f}")
+            if place == "aws":
+                uncosted += len(row.run_ids) - len(charged)
+            rendered.append((*row.cells[:6], *costs_text, *row.cells[6:]))
+        print_table(headers, rendered)
+        if uncosted:
+            print(f"{uncosted} of {sum(int(row.cells[1]) for row in daily_rows)} runs have no cost record.")
+
+
 def positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -370,7 +543,7 @@ def positive(value: str) -> int:
     return number
 
 
-ReportCommand = Literal["top", "suites", "suite", "module", "test"]
+ReportCommand = Literal["top", "suites", "suite", "module", "test", "trend"]
 
 
 @dataclass(init=False)
@@ -391,6 +564,8 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     _ = top_parser.add_argument("--limit", type=positive, default=20)
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
+    trend_parser = subcommands.add_parser("trend", help="show daily CPU, wall time and cost for targeted tests and merge gates")
+    _ = trend_parser.add_argument("--days", type=positive, default=conf.read("test_times").whole("TREND_DAYS"))
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)
     suite_parser = subcommands.add_parser("suite", help="show one folder suite")
@@ -453,7 +628,7 @@ def refresh_after_report() -> None:
             _ = os.dup2(descriptor, target)
         if descriptor > 2:
             os.close(descriptor)
-        _ = index.update()
+        refresh_trend_index()
         status = 0
     finally:
         os._exit(status)
@@ -461,6 +636,15 @@ def refresh_after_report() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     request = arguments(sys.argv[1:] if argv is None else argv)
+    if request.command == "trend":
+        store.root().mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
+            cache = read_trend_cache()
+            if not cache.completed_refresh_started_at:
+                started = datetime.now(UTC).timestamp()
+                _ = index.update()
+                cache.completed_refresh_started_at = started
+                write_trend_cache(cache)
     try:
         connection = open_report_index()
     except sqlite3.OperationalError as error:
@@ -485,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
                     top(connection, request.host, request.limit, repo)
                 else:
                     nextest_top(connection, request.host, request.limit, repo, identity)
+            case "trend":
+                trend(connection, request.days)
             case "suites":
                 suites(connection, host, request.days)
             case "suite":

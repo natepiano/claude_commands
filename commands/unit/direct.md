@@ -120,13 +120,13 @@ the director neither prepares style inputs nor pastes a style assignment.
 <LongLivedWorkers>
 Dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
+Use `worker.py list all` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
 The worker command selects idle workers and resumes a stopped worker in its same pane.
-Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
+Use the short name from `worker.py list all` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 Successful prompt delivery returns the launcher.
 The transcript prevents replay and proves completion with the matching `DONE <dispatch id>` reply.

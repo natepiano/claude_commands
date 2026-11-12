@@ -173,17 +173,32 @@ done
         self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", FIRST_SESSION))
 
     def test_recorder_failures_retry_without_changing_admission(self) -> None:
-        for command in ("start-wait", "wait-holder"):
+        for command in ("start-wait", "wait-holder", "not-recorded"):
             with self.subTest(command=command):
                 (self.root / "recorder-failed").unlink(missing_ok=True)
+                if command == "not-recorded":
+                    self.environment["CODEX_THREAD_ID"] = fixture_runtime_id("unregistered-wait-worker")
+                previous_rows = len(wait_rows(self.root / "session"))
                 self.run_events([{"events": ["first", 'holder ' + json.dumps({"kind": "session",
                                 "session_id": FIRST_SESSION, "session_name": "render"}),
                                 'holder ' + json.dumps({"kind": "session", "session_id": NEXT_SESSION,
                                 "session_name": "next"}), "done"], "outcome": "Granted", "seconds": 15}], failure=command)
                 self.assertIn("wait history NotRecorded", self.event_errors)
+                if command == "wait-holder":
+                    call = next(call for call in reversed(self.recorder_calls()) if call[0] == "wait-holder")
+                    identifier = call[call.index("--wait-id") + 1]
+                    message = f"verify.sh: wait history NotRecorded: cannot update {identifier} holder"
+                else:
+                    message = "verify.sh: wait history NotRecorded: memory admission"
+                self.assertIn(message, self.event_errors.splitlines())
                 rows = wait_rows(self.root / "session")
-                self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
-                self.assertEqual(rows[-1]["event_type"], "wait_finished")
+                if command == "not-recorded":
+                    self.assertEqual(self.event_errors.count("NotRecorded"), 1, self.event_errors)
+                    self.assertNotIn("cannot update", self.event_errors)
+                    self.assertEqual([row["event_type"] for row in rows[previous_rows:]], ["wait_not_recorded"])
+                else:
+                    self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
+                    self.assertEqual(rows[-1]["event_type"], "wait_finished")
                 self.assertEqual((self.root / "outcomes").read_text().splitlines()[-1], "Granted|15")
 
     def test_memory_rejoin_opens_new_intervals_and_keeps_queue_age(self) -> None:
@@ -214,6 +229,8 @@ done
         rows = wait_rows(self.root / "session")
         starts = [row for row in rows if row["event_type"] == "wait_started"]
         self.assertEqual(len(starts), 2, rows)
+        self.assertIn(f"verify.sh: wait history NotRecorded: cannot close {starts[0]['wait_id']}",
+                      self.event_errors.splitlines())
         self.assertNotEqual(starts[0]["wait_id"], starts[1]["wait_id"])
         for start, holder in zip(starts, (FIRST_SESSION, NEXT_SESSION), strict=True):
             interval = [row for row in rows if row["wait_id"] == start["wait_id"]]
@@ -298,6 +315,9 @@ class VerifyRecordedTokenIdentityTests(RecordedWaitFixture):
         observer = self.root / "identity-python"
         _ = observer.write_text('''#!/bin/sh
 printf '%s\\n' "${VERIFY_PY_HELPER:-recorder}" >> "$TEST_HOLDER_PY_CALLS"
+if [ "${1##*/}" = progress_history.py ]; then
+    printf '%s\\n' "$@" >> "$TEST_IDENTITY_ROOT/identity-recorder-args"
+fi
 exec "$TEST_REAL_PYTHON" "$@"
 ''')
         observer.chmod(0o755)
@@ -342,12 +362,19 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         return rows
 
     def test_director_token_uses_the_recorded_owner_without_a_director_file(self) -> None:
+        self.environment.update({"CODEX_THREAD_ID": "",
+                                 "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-director")})
         self.acquire_identity_token("director")
         rows = self.record_token_passes('phase_wait_start token "cargo token"\n' * 3)
         self.assertEqual(recorded_holders(rows), [named_holder(
             "slot", "cargo", fixture_runtime_id("fixture-director"))])
         self.assertEqual((self.root / "identity-python-calls").read_text().splitlines(),
                          ["PHASE_WAIT_HOLDER", "recorder", "recorder"])
+        arguments = (self.root / "identity-recorder-args").read_text().splitlines()
+        self.assertIn("--director", arguments)
+        self.assertNotIn("--worker-thread-id", arguments)
+        self.assertEqual(arguments[arguments.index("--owner-session") + 1],
+                         fixture_runtime_id("fixture-director"))
 
     def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
         reference = self.worker_reference("fixture-first")
@@ -356,6 +383,10 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.acquire_identity_token("writer")
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
+        arguments = (self.root / "identity-recorder-args").read_text().splitlines()
+        self.assertEqual(arguments[arguments.index("--worker-thread-id") + 1],
+                         fixture_runtime_id("thread-impl"))
+        self.assertNotIn("--director", arguments)
 
     def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
         state = cast(dict[str, object], json.loads(
@@ -439,13 +470,35 @@ phase_wait_start token "cargo token"
 
 
 class VerifyHoldHolderTests(VerifyHoldWaitFixture):
+    def start_hold_step(self) -> subprocess.Popen[str]:
+        """Call the real hold wrapper before the real cargo launcher."""
+        script = self.fixture.root / "held-step.sh"
+        _ = script.write_text('set -euo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "step_state", "publish_step_state", "phase_wait_holder_flags",
+                              "phase_wait_start", "phase_wait_finish", "build_hold_wait_local") + '''
+PY=$TEST_REAL_PYTHON
+PHASE_WAIT_RECORDER=$2 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
+HOLD_WAIT_DIR=$PACKAGE_ROOT/hold-functions
+mkdir -p "$HOLD_WAIT_DIR"
+STEP_RECORD_ACTIVE=0 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify
+run_once cargo check
+''')
+        process = subprocess.Popen(["bash", str(script), str(SCRIPTS / "lint/invoke.sh"),
+                                    str(SCRIPTS / "direct/progress_history.py")], cwd=self.fixture.root,
+                                   env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        self.addCleanup(self.stop_process, process)
+        return process
+
     def test_local_build_hold_names_its_holder_and_closes_before_the_step(self) -> None:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         self.set_hold_routing("natedev_only")
         self.hold(FIRST_SESSION)
         _ = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        process = self.start("check", "sample", "--local", "holder test")
+        process = self.start_hold_step()
         self.fixture.wait_until(lambda: bool(wait_rows(session)), "the recorded hold", (process,), directory=session)
         self.assertEqual(recorded_holders(wait_rows(session)), [named_holder("slot", "natedev", FIRST_SESSION)])
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / FIRST_SESSION).unlink()
@@ -587,6 +640,54 @@ raise SystemExit(runner_status)
     def resume(self, number: int) -> None:
         (self.fixture.root / f"target-resume-{number}").touch()
 
+    def start_pinned_route(self) -> subprocess.Popen[str]:
+        """Call real target admission, wait recording, and remote execution."""
+        script = self.fixture.root / "pinned-route.sh"
+        _ = script.write_text('set -euo pipefail\nsource "$1"\n' + shell_functions(
+            VERIFY, "verify_helper", "step_state", "publish_step_state", "remove_step_record",
+            "phase_wait_holder_flags", "phase_wait_target_busy", "phase_wait_start", "phase_wait_finish",
+            "phase_wait_finish_all", "collect_routing_wait", "collect_hold_wait", "check_routing_hold",
+            "initialize_step_record", "step_can_retry", "target_platform", "target_for_settings",
+            "register_mac_wait", "remote_step_kind", "ssh_reserve_hook", "mac_retry_hook",
+            "remember_mac_retry", "try_reserved_target", "try_mac_test", "release_wait_claim",
+            "check_mac_only_result", "mac_only_refuse", "route_test")
+            + next(line for line in VERIFY.read_text().splitlines()
+                   if line.startswith("SSH_RETRYABLE_REASON=")) + '\n' + '''
+PY=$TEST_REAL_PYTHON
+VERIFY_START_DIR=$2
+STEP_RECORD_SCRIPT=$VERIFY_START_DIR/step_record.py
+PHASE_WAIT_RECORDER=$VERIFY_START_DIR/progress_history.py
+PHASE_WAIT_SESSION=$UNIT_RUN_DIR
+HOLD_WAIT_DIR=$PACKAGE_ROOT/route-functions
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-route-$$" BUILDLOG_CALLER=verify
+BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/seconds
+BUILDLOG_HOLD_WAIT_S=0 ROUTING_WAIT_STARTED=""
+CMD=check PKG=sample ARGS=(sample) COMMAND_ARGS=()
+PINNED_TARGET=mac LOCAL_ONLY=0 MAC_ONLY=0 LOCAL_REASON="" STEP_FORCE_MAC=0
+STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=natedev_only STEP_DEFER_LOCAL=0
+STEP_TARGET_TABLE="" DOC_REPO_TOP=$PACKAGE_ROOT
+MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
+MAC_IDLE_SCRIPT=$VERIFY_START_DIR/../buildlog/mac_idle.py
+MAC_IDLE_MARKER="" BUILDLOG_MAC_IDLE_HOOK=""
+MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0 MAC_RETRY_NOTICE_SHOWN=0
+SSH_RETIRED_SETTINGS=() SSH_RETRY_SETTINGS=() SSH_RETRY_DEADLINES=()
+SSH_RETRY_AFTER_SETTINGS="" SSH_RESERVE_RECOVERY=""
+MAC_VERB=check MAC_VERB_ARGS=(-p sample) MAC_SOURCE_ROOT="" MAC_FINISH_CALL=0
+MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0 FILTER_RUN=0
+MAC_PASSED=0 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID=""
+TREE_WATCH_PID="" CACHE_DIR=""
+trap 'phase_wait_finish_all; remove_step_record' EXIT
+initialize_step_record
+route_test
+''')
+        process = subprocess.Popen(["bash", str(script), str(SCRIPTS / "lint/memory_gate.sh"),
+                                    str(SCRIPTS / "direct")], cwd=self.fixture.root,
+                                   env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        self.addCleanup(self.stop_process, process)
+        return process
+
     def assert_closed_before_remote_steps(self) -> list[dict[str, object]]:
         snapshots = [cast(dict[str, object], json.loads(line)) for line in
                      (self.fixture.root / "run-waits.jsonl").read_text().splitlines()]
@@ -665,7 +766,7 @@ raise SystemExit(runner_status)
     def test_pinned_check_names_a_busy_claim_and_its_next_owner(self) -> None:
         claim = self.prepare_target_wait()
         _ = self.claim(claim, FIRST_SESSION)
-        process = self.start("check", "sample", "--target", "mac", "--no-cache")
+        process = self.start_pinned_route()
         rows = self.pause(process, 1)
         self.assertEqual(recorded_holders(rows), [named_holder("slot", "mac", FIRST_SESSION)])
         _ = self.claim(claim, NEXT_SESSION)
@@ -711,7 +812,7 @@ raise SystemExit(runner_status)
         self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.fixture.root / "capacity-tool.py")
         starting = self.fixture.root / "target-starting"
         starting.touch()
-        process = self.start("check", "sample", "--target", "mac", "--no-cache")
+        process = self.start_pinned_route()
         rows = self.pause(process, 1)
         holder, = recorded_holders(rows)
         self.assertEqual(cast(dict[str, object], holder)["state"], "HolderNotNamed")

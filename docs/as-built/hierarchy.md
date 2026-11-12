@@ -122,7 +122,7 @@ Results return to the worker or its current holder. Callers do not poll.
 | User question | `scripts/production/update_registration.py` records the question and its asker. |
 | Changes for user review | `scripts/production/change_review.py` supplies the shared scoped queue. |
 | Phone message | `send.py --to user` uses the notification review and delivery path. |
-| Requested production report | `dailies_input.py` and `dailies_render.py` assemble current production evidence. |
+| Unit status | `/showrunner:units` shows phases, ETAs, worker runs, and queued work through `scripts/production/unit_phases.py`. |
 
 A bare worker name resolves within the sender's own unit.
 A match only in another unit refuses delivery and lists the available full paths.

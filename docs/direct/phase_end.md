@@ -17,8 +17,7 @@ Run these steps in order for each completed loop or verbose phase:
 
 1. **Code commit.** Run <CheckpointCommit/> for the phase's code, tests, and
    plan doc with `status: done` and its Work Order still in place. Its
-   reservation release, <PushCheckpoint/>, `review-trial` line and
-   `phase_table.py parallel` line happen here.
+   reservation release, <PushCheckpoint/>, and `review-trial` line happen here.
 2. **Code ready notice.** Before sending <ProductionUnit/> item 3's checkpoint
    notice, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.

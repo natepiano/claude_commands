@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
@@ -129,17 +131,24 @@ class RunProcessTests(StaffTestCase):
         record = staff.snapshot()
         row = record.by_worktree(remote.local_machine(), self.unit_folder)
         assert row is not None and isinstance(row.worktree, staff.PresentWorktree)
-        for machine, hostname in ((row.worktree.machine, remote.local_machine()), ("mac", "Nates-MacBook-Pro.local")):
-            with self.subTest(machine=machine, hostname=hostname):
+        for machine, hostname, plain_file in ((row.worktree.machine, remote.local_machine(), False),
+                                               ("mac", "Nates-MacBook-Pro.local", False),
+                                               (row.worktree.machine, remote.local_machine(), True)):
+            with self.subTest(machine=machine, hostname=hostname, plain_file=plain_file):
+                if plain_file:
+                    _ = (self.root / "runs/active.lock").write_text("Private run lock.\n")
+                errors = io.StringIO()
                 owner = replace(row, worktree=staff.PresentWorktree(machine, row.worktree.path))
                 supplied = staff.StaffSnapshot(tuple(owner if member.id == owner.id else member for member in record.rows))
                 with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
                       mock.patch.object(shutdown, "retirement_command_line", wraps=self.arguments) as arguments,
                       mock.patch.object(shutdown, "local_machine", return_value=hostname),
                       mock.patch.object(staff, "snapshot", side_effect=AssertionError("local staff is unavailable")),
-                      mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("local staff is unavailable"))):
+                      mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("local staff is unavailable")),
+                      redirect_stderr(errors)):
                     found = shutdown.retirement_run_processes(owner, [101, 102], record=supplied)
                 self.assertEqual(set(found), {101, 102})
+                self.assertEqual(errors.getvalue(), "")
                 reads.assert_called_once_with("production")
                 settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
                 self.assertTrue(settings)

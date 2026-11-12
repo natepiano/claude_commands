@@ -16,7 +16,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production import unit_lookup
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.agents import stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
@@ -156,7 +156,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.write_resume_registry_record("recorded-start")
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        with patch.object(sessions, "process_start", return_value=None):
+        with (patch.object(sessions, "process_start", return_value=None),
+              patch.object(session_records, "process_start", return_value=None)):
             result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "

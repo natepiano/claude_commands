@@ -11,7 +11,6 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,17 +24,8 @@ from scripts.agents.remote import local_machine
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
 
 
-class NoDailiesSchedule(Enum):
-    PAUSED_OR_UNSCHEDULED = "paused or unscheduled"
-
-
 class FooterError(Exception):
     """A production's open-questions list cannot be read."""
-
-
-@dataclass(frozen=True)
-class ScheduledDailies:
-    next_due: int
 
 
 @dataclass(frozen=True)
@@ -43,17 +33,7 @@ class Production:
     name: str
     doc: Path
     zone: str
-    schedule: ScheduledDailies | NoDailiesSchedule
     owner: staff.StaffRow
-
-
-def key_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in path.read_text().splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = value
-    return values
 
 
 def outstanding_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
@@ -64,10 +44,6 @@ def outstanding_path(name: str, *, identities: QuestionStaff | None = None) -> P
 
 def state_root() -> Path:
     return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-
-
-def review_pause_path(name: str) -> Path:
-    return state_root() / "review-paused" / f"{name}.json"
 
 
 def targeted_instances(session_id: str) -> list[Path]:
@@ -95,9 +71,10 @@ def production_doc(instance_dir: Path) -> Path | None:
 
 
 def read_production(instance_dir: Path) -> Production | None:
+    """Return a running production, or report a failed read with FooterError."""
     try:
         owner = showrunners.owner_for_timer(instance_dir)
-        if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if not isinstance(owner.doc, staff.LiveDoc):
             return None
         doc = owner.doc.path
         lines = doc.read_text().splitlines()
@@ -106,21 +83,16 @@ def read_production(instance_dir: Path) -> Production | None:
             return None
         # The user's zone setting; the doc's own User zone line is no longer read.
         zone = user_zone_name()
-        try:
-            state = key_values(instance_dir / "state")
-        except OSError:
-            state = {}
-        schedule = (ScheduledDailies(int(state["NEXT_DUE"])) if state.get("ENABLED") == "1"
-                    else NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-        return Production(owner.name, doc, zone, schedule, owner)
-    except (OSError, ValueError, ZoneInfoNotFoundError, KeyError):
-        return None
+        return Production(owner.name, doc, zone, owner)
+    except (OSError, ValueError, ZoneInfoNotFoundError, KeyError) as error:
+        raise FooterError(f"{instance_dir}: production read failed: {error}") from error
 
 
-def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None) -> int | None:
-    """Count due questions and report unavailable ownership or unreadable records."""
-    from scripts.production.update_registration import RegistrationFailure, read_open_items
-    from scripts.production.dailies_render import InputError, due
+def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None,
+                   source: str = "") -> int | None:
+    """Count due questions, with an optional fixed source staff id."""
+    from scripts.production.update_registration import (InputError, OutstandingReminder, RegistrationFailure,
+                                                        due, read_open_items)
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -137,7 +109,8 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
             items = read_open_items(outstanding_path(owner.id, identities=identities),
                                     document=production.doc, identities=identities)
             now = datetime.now(ZoneInfo(production.zone)).replace(tzinfo=None)
-            count += len(due(items, now))
+            count += sum(not source or (not isinstance(item, OutstandingReminder) and item.asked_by == source)
+                         for item in due(items, now))
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             return None
@@ -146,8 +119,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
 
 def deferred_until(names: list[str], zone: str, *, identities: QuestionStaff | None = None) -> datetime | None:
     """Return the first deferred time from readable stores and report unavailable stores."""
-    from scripts.production.update_registration import RegistrationFailure, read_open_items
-    from scripts.production.dailies_render import InputError, DeferredUntil
+    from scripts.production.update_registration import DeferredUntil, InputError, RegistrationFailure, read_open_items
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()

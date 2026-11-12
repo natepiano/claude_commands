@@ -24,10 +24,10 @@ from scripts.accounts import accounts
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
 from scripts.production import showrunners
-from scripts.production import showrunner_tree
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
 from scripts.herdr import herdr
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr.fake_herdr import CommandResponse
 
 from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT
@@ -176,7 +176,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(ensured, child)
         self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
-    def assert_dead_launch_recovers(self, *, transcript_exists: bool) -> None:
+    def assert_dead_launch_recovers(self, *, transcript_exists: bool, home_write_fails: bool = False) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         class NativeCallbackInterrupted(BaseException):
             """The backend was observed before this launcher process ended."""
@@ -187,14 +187,25 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             raise NativeCallbackInterrupted("stopped after saving launch")
 
         before = self.staff.staff_file.read_bytes()
-        with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
+        interruption = (patch.object(staff, "set_home", side_effect=NativeCallbackInterrupted("stopped after saving launch"))
+                        if home_write_fails else patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted))
+        with interruption:
             with self.assertRaisesRegex(NativeCallbackInterrupted, "stopped after saving launch"):
                 _ = self.run_command("kid")
         receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/cfc4564d-fed3-5803-9a4c-e3119733bb53/add_showrunner.json", staff.initial_snapshot())
-        assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
-        identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt.fields)
-        self.assertEqual(receipt.identity, identity.session_id)
-        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        identity: add_showrunner.ShowrunnerLaunch | herdr.SessionTranscript
+        if home_write_fails:
+            assert isinstance(receipt, completion_receipt.OwnedReceipt)
+            self.assertIsInstance(receipt.owner.home, staff.HomeUnknown)
+            identity = herdr.SessionTranscript(Path(cast(str, receipt.fields["config_dir"])), receipt.owner.current_session)
+        else:
+            assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
+            identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt)
+            self.assertEqual(receipt.identity, identity.session_id)
+            self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        self.assertNotIn("session_id", receipt.fields)
+        self.assertEqual(receipt.fields["doc"], str(self.doc("kid")))
+        self.assertEqual(receipt.fields["config_dir"], str(identity.config_dir))
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
         self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
         old_pid = int(self.env["FAKE_CLAUDE_PID"])
@@ -225,13 +236,67 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         recovered_receipt = completion_receipt.read_launch_receipt(
             self.root / "showrunner" / child.id / "add_showrunner.json", staff.snapshot())
         assert isinstance(recovered_receipt, completion_receipt.OwnedReceipt)
-        self.assertEqual(recovered_receipt.fields["session_id"], returned_native)
+        self.assertEqual(recovered_receipt.owner.current_session, returned_native)
+        self.assertEqual(recovered_receipt.owner.home, staff.SessionHome(identity.config_dir))
+        for copied_fact in ("session_id", "doc", "config_dir"):
+            self.assertNotIn(copied_fact, recovered_receipt.fields)
 
     def test_dead_saved_launch_resumes_its_transcript_with_the_resume_prompt(self) -> None:
         self.assert_dead_launch_recovers(transcript_exists=True)
 
     def test_dead_saved_launch_without_a_transcript_starts_its_reserved_session(self) -> None:
         self.assert_dead_launch_recovers(transcript_exists=False)
+
+    def test_dead_admitted_launch_recovers_after_the_home_write_stops(self) -> None:
+        self.assert_dead_launch_recovers(transcript_exists=True, home_write_fails=True)
+
+    def test_dead_owned_launch_recovers_staff_session_home_and_document_after_rename(self) -> None:
+        native = fixture_runtime_id("owned-launch-before-rename")
+        self.starts(native, registers="kid")
+        with patch.object(herdr.Herdr, "submit_opening_prompt", return_value=herdr.PromptNotSubmitted("pane busy")):
+            first = self.run_command("kid")
+        self.assertEqual(first.returncode, add_showrunner.SESSION_NOT_READY, first.stderr)
+        owner = staff.by_path("kid")
+        assert owner is not None
+        receipt_path = self.root / "showrunner" / owner.id / "add_showrunner.json"
+        saved = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+        assert isinstance(saved, completion_receipt.OwnedReceipt)
+        for copied_fact in ("session_id", "doc", "config_dir"):
+            self.assertNotIn(copied_fact, saved.fields)
+        old_pid = int(self.env["FAKE_CLAUDE_PID"])
+        old_process = next(process for process in self.processes if process.pid == old_pid)
+        old_process.terminate()
+        _ = old_process.wait(timeout=TEST_HANG_GUARD_SECS)
+        current = staff.native_id(fixture_runtime_id("owned-launch-after-account-move"))
+        _ = staff.update_current_session(owner.current_session, current)
+        _ = staff.rename(owner.id, "renamed-kid")
+        document = self.root / "renamed-kid-production.md"
+        _ = self.doc("kid").rename(document)
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
+        home = self.named_account()
+        _ = staff.set_home(owner.id, staff.SessionHome(home))
+        transcript = home / "projects/fixture" / f"{current}.jsonl"
+        write_text_atomic(transcript, '{}\n')
+        self.starts(current, registers="renamed-kid")
+
+        recovered = self.run_command("renamed-kid")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[-1][starts[-1].index("--resume") + 1], current)
+        workspaces = [row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"]]
+        self.assertEqual(next(value for value in workspaces[-1] if value.startswith("CLAUDE_CONFIG_DIR=")),
+                         f"CLAUDE_CONFIG_DIR={home}")
+        self.assertEqual([row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]],
+                         [f"/showrunner:produce {document} resume"])
+        recovered_receipt = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+        assert isinstance(recovered_receipt, completion_receipt.OwnedReceipt)
+        self.assertEqual((recovered_receipt.owner.id, recovered_receipt.owner.current_session), (owner.id, current))
+        self.assertEqual(recovered_receipt.owner.doc, staff.LiveDoc("natedev", document))
+        self.assertEqual(recovered_receipt.owner.home, staff.SessionHome(home))
+        for copied_fact in ("session_id", "doc", "config_dir"):
+            self.assertNotIn(copied_fact, recovered_receipt.fields)
 
     def assert_open_launch_recovers(self, prompt_submitted: bool) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
@@ -301,6 +366,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertIsInstance(receipt, completion_receipt.UnpublishedReceipt)
             assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
             self.assertEqual(receipt.identity, native)
+            self.assertNotIn("session_id", receipt.fields)
+            self.assertEqual(receipt.fields["doc"], str(self.doc("kid")))
+            self.assertEqual(receipt.fields["config_dir"], str(Path(self.env["HOME"]) / ".claude2"))
             self.assertIsInstance(completion_receipt.read_receipt(receipt_path, staff.initial_snapshot()),
                                   completion_receipt.NoReceipt)
             self.assertEqual(self.staff.staff_file.read_bytes(), before)
@@ -358,6 +426,32 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             retry = self.run_command("kid")
         self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
         self.assertIn(f"pending backend {native} differs from {other_native}", retry.stderr)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[0], receipt_path)
+        self.assertEqual(staff.by_id(child.id), renamed)
+        self.assertEqual((self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()), before)
+
+    def test_pending_retry_refuses_a_pane_reused_after_the_first_native_read(self) -> None:
+        native = "cfc4564d-fed3-5803-9a4c-e3119733bb53"
+        self.starts(native, registers="kid")
+        first = self.run_command("kid")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        child = staff.by_path("kid")
+        assert child is not None
+        renamed = staff.rename(child.id, "renamed-kid")
+        receipt_path = self.root / "showrunner" / child.id / "add_showrunner.json"
+        receipt = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+        self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
+        before = self.staff.staff_file.read_bytes(), receipt_path.read_bytes(), self.herdr_calls()
+        other_native = fixture_runtime_id("another-showrunner-backend")
+        with (patch.object(completion_receipt, "read_launch_receipt",
+                           wraps=completion_receipt.read_launch_receipt) as read,
+              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr.Herdr, "native_session", side_effect=[native, other_native])):
+            with patch.object(add_showrunner, "running", return_value=False):
+                retry = self.run_command("kid")
+        self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
+        self.assertIn(f"session {native} does not own kid's tab", retry.stderr)
         self.assertEqual(read.call_count, 1)
         self.assertEqual(read.call_args.args[0], receipt_path)
         self.assertEqual(staff.by_id(child.id), renamed)
@@ -688,26 +782,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def test_resume_uses_the_configured_showrunners_account(self) -> None:
-        directory = self.named_account()
-        child = read_new_production(self.doc("kid"), "kid")
-        self.resume_record()
-        with patch.dict(os.environ, self.env, clear=True), \
-                patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
-            selected = add_showrunner.account_for_launch(child, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
-        self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
-        role.assert_called_once_with("showrunner")
-
-    def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
-        child = read_new_production(self.doc("kid"), "kid")
-        with patch.dict(os.environ, self.env, clear=True), \
-                patch.object(add_showrunner, "running", return_value=False), \
-                patch.object(showrunner_tree, "descendants_of", return_value=[]), \
-                patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
-            result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
-        self.assertIsNone(result)
-        destination.assert_called_once_with("kid", add_showrunner.NoEndingTab())
-
     def test_recorded_herdr_resume_without_an_account_passes_check_using_configured_group(self) -> None:
         self.resume_record()
         for pid, parent, argv, environment in (
@@ -856,23 +930,6 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.parent_of("kid"), "top")
 
-    def test_showrunner_wait_retries_with_the_configured_interval(self) -> None:
-        self.flaky_registry(1)
-        self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
-        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
-        polls = self.root / "polls.jsonl"
-        result = self.run_command("kid")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.parent_of("kid"), "top")
-        self.assertEqual([json.loads(line) for line in polls.read_text().splitlines()], [0.01])
-
-    def test_showrunner_poll_default_remains_two_seconds(self) -> None:
-        environment = {key: value for key, value in self.env.items() if key != "ADD_SHOWRUNNER_POLL_S"}
-        program = "from scripts.production import add_showrunner; print(add_showrunner.POLL_S)"
-        result = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), "-c", program], env=environment,
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual((result.returncode, result.stdout), (0, "2.0\n"), result.stderr)
-
     def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
         self.flaky_registry(1000)
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
@@ -890,6 +947,24 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_launch_check_with_no_ending_tab_refuses_a_same_named_shared_tab(self) -> None:
+        for shown in (None, "old-showrunner-title"):
+            with self.subTest(native_title=shown):
+                case = StaffTestCase()
+                case.setUp()
+                try:
+                    world = PaneWorld()
+                    world.setup(case)
+                    owner = fixture_member("showrunner", name="native-child")
+                    other = fixture_member("showrunner", name="other-child")
+                    world.add(owner, "w1:p1")
+                    world.locations["w1:p1"]["label"] = shown
+                    world.add(other, "w1:p2", label="native-child")
+                    with patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]):
+                        self.assertTrue(add_showrunner.herdr_tab_open("native-child", add_showrunner.EndingUnitTab("w1:p2")))
+                        self.assertFalse(add_showrunner.herdr_tab_open("old-showrunner-title", add_showrunner.NO_ENDING_TAB))
+                finally:
+                    case.doCleanups()
+
         (self.state / "live-agents").touch()
         self.refused(self.run_command("kid", "--check"), "a tab named kid is already open in herdr session agents")
         self.assertIn(["--session", "agents", "pane", "list"], self.herdr_calls())

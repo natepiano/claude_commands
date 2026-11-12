@@ -154,10 +154,12 @@ All main-path tests remain.
 
 1. Acquire `main_push_lock` and fetch main.
 2. Yield the tested tip when it already contains `origin/main`.
-3. Otherwise, release the lock, merge main, and retest the new paths.
+3. Otherwise, keep the lock, merge main, and retest the new paths.
 4. Repeat the comparison before publication.
 
-Tests run outside the lock.
+The first checkpoint test runs outside the lock.
+Retests run inside it, so main cannot move under a tested tip.
+This retest is the one lock hold through long work; other main pushers hold the lock only for their fetch, merge and push.
 The checkpoint push, interrupted promotion, and child handoff share this loop.
 `push_rollback` restores the original tip before publication when origin retains its old tip.
 It handles `checkpoint_gate.Stop`, `OSError`, and `ValueError`.
@@ -178,6 +180,42 @@ A deleted plan stays in scope when another origin merge base never contained tha
 After a nonzero commit result, it compares the named file with `HEAD`.
 Matching content keeps the new value and permits publication, including a rerere failure after Git created the commit.
 Other failures restore the previous file content.
+
+## Shared main push lock
+
+`scripts/lib/main_push_lock.py` owns `<git common dir>/main-push.lock`.
+The helper records `held_seconds` when the owner releases the lock.
+The helper tracks active holds in the process.
+A nested call in the same process uses the existing hold for that path.
+A different repository takes its own lock.
+The helper does not change `os.environ`.
+`held_environment(checkout)` gives a named child `MAIN_PUSH_LOCK_HELD` with the absolute lock path.
+It refuses when the process does not hold that lock.
+A child accepts a matching marker from its start environment.
+Only `merge_checkpoint.push_validate` passes this environment to share its hold with the validation shell.
+Detached gate children receive the plain environment and take their own locks.
+
+The shell entry runs a command and returns its exit status:
+
+```sh
+scripts/lib/py -m scripts.lib.main_push_lock --checkout "$PWD" -- git push origin main
+```
+
+Only main publication takes this lock.
+The checkpoint retest hold remains the exception for long work.
+Other pushers release their holds before tests, validation, Mac pulls, and CI waits.
+
+| Pusher | Protected step |
+| --- | --- |
+| `merge_checkpoint.tested_main_push` | Final fetch, main merge, retest, branch push, and local promotion. |
+| `fast_track.push_patch` | Final fetch and main push after the fast check. |
+| `merge_checkpoint.promote_local_checkout` | Main fetch, fast-forward, and eligible push. |
+| `models_registry.store_registry` | Main publication, including fetch, row replay, commit, and push retries. It takes the main lock before the registry lock. |
+| `main_publish.ready` and `main_publish.push` | Separate short holds for preparation and publication. |
+| `merge_gate.promote` | Fetch, ancestry checks, fast-forward, and push after the hold and release waits. |
+| `production_lifecycle.promote_main` | Fetch, main checks, and direct or local promotion after CI checks. |
+| `push_direct.sh` | Main publication checks and push through the shell entry. |
+| `restore_unreleased.sh` | Main push through the shell entry after changelog edits and commit. |
 
 ## Mac pulls and visible change ownership
 

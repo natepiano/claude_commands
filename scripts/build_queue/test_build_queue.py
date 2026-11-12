@@ -64,6 +64,11 @@ class QueueTests(NotificationGuardedTestCase):
         super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
+        mac_cache = self.root / "mac-builds.json"
+        _ = mac_cache.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=mac_cache))
+        _ = self.enterContext(mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.read_mac_builds()))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_activity_refresh_seconds", return_value=30))
         _ = cast(object, self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read)))
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "build_admission.conf"
@@ -303,14 +308,58 @@ class QueueTests(NotificationGuardedTestCase):
             with self.subTest(actor=actor), \
                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
                  mock.patch.object(memory_admit, "priority_labels", return_value=labels):
-                self.assertEqual(self.bump_output("2" if actor == "ordinary-session" else "1")[0], 0)
+                self.assertEqual(self.bump_output("2")[0], 0)
                 priority = admission.server.priority
                 self.assertNotIsInstance(priority, records.NoQueuePriority)
                 if not isinstance(priority, records.NoQueuePriority):
-                    self.assertEqual(priority["set_by"], actor)
+                    self.assertEqual(priority.entries[0]["set_by"], actor)
                 events = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
                           for line in path.read_text().splitlines() if '"queue_priority"' in line]
                 self.assertEqual(events[-1]["set_by"], actor)
+                self.assertEqual(admission_client.priority_clear(actor), wire.Ok())
+
+    def test_clear_one_unit_passes_the_unit_to_the_client(self) -> None:
+        with mock.patch.object(records, "queue_command_actor", return_value="actor"), mock.patch.object(
+                admission_client, "priority_clear", return_value=wire.Ok()) as clear, mock.patch(
+                "sys.argv", ["build_queue.py", "clear", "demo"]), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_queue.main(), 0)
+        clear.assert_called_once_with("actor", "demo")
+        self.assertEqual(output.getvalue(), "queue priority cleared\n")
+
+    def test_clear_unknown_unit_distinguishes_refusal_from_unavailable_service(self) -> None:
+        cases = (
+            (wire.Refused("unknown unit missing"), 3, "build queue: unknown unit missing\n", ""),
+            (wire.AdmissionUnavailable("no socket"), 2, "",
+             "build queue: admission service unavailable: no socket\n"),
+        )
+        for result, expected_status, expected_output, expected_errors in cases:
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(result=result), mock.patch.object(
+                    records, "queue_command_actor", return_value="actor"), mock.patch.object(
+                    admission_client, "priority_clear", side_effect=(
+                        result if isinstance(result, wire.AdmissionUnavailable) else None),
+                    return_value=result) as clear, mock.patch(
+                    "sys.argv", ["build_queue.py", "clear", "missing"]), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(build_queue.main(), expected_status)
+            clear.assert_called_once_with("actor", "missing")
+            self.assertEqual(output.getvalue(), expected_output)
+            self.assertEqual(errors.getvalue(), expected_errors)
+
+    def test_repeat_bump_prints_the_same_priority_place(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        admission = self.private_mutation_service()
+        labels = {"head-id": UnitLabels("head", unit="demo"),
+                  "worker-id": UnitLabels("worker", unit="cables")}
+        self.labels_read.return_value = labels
+        with mock.patch.object(memory_admit, "priority_labels", return_value=labels):
+            self.assertIn("priority #1", self.bump_output("1")[1])
+            self.assertIn("priority #2", self.bump_output("2")[1])
+            self.assertIn("priority #1", self.bump_output("1")[1])
+        priority = admission.server.priority
+        assert isinstance(priority, records.QueuePriority)
+        self.assertEqual([entry["unit"] for entry in priority.entries], ["demo", "cables"])
 
     def test_bump_passes_a_dash_unit_as_one_argparse_value(self) -> None:
         with mock.patch.object(records, "queue_command_actor", return_value="showrunner"), \
@@ -327,12 +376,12 @@ class QueueTests(NotificationGuardedTestCase):
             self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
             status, output, errors = self.bump_output("2")
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
-        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1\n", ""))
+        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1; priority #1\n", ""))
         self.assertEqual((first.read_bytes(), second.read_bytes()), before)
         priority = admission.server.priority
         self.assertNotIsInstance(priority, records.NoQueuePriority)
         if not isinstance(priority, records.NoQueuePriority):
-            self.assertEqual((priority["unit"], priority["why"]), ("berth", "the user's bump"))
+            self.assertEqual((priority.entries[0]["unit"], priority.entries[0]["why"]), ("berth", "the user's bump"))
 
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
         admission = self.private_mutation_service()
@@ -364,6 +413,12 @@ class QueueTests(NotificationGuardedTestCase):
         _ = self.fixture.waiter(100, "head-id", "head")
         self.labels_read.return_value = {}
         with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
+
+    def test_unowned_row_refuses_a_bump_without_writing_priority(self) -> None:
+        _ = self.fixture.waiter(100, "", "")
+        self.labels_read.return_value = {}
+        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unowned priority write")):
             self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
 
     def test_admit_head_and_clear_from_any_session_send_the_actor(self) -> None:
@@ -456,7 +511,7 @@ class QueueTests(NotificationGuardedTestCase):
             rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 32)
         self.assertEqual([row[:3] for row in rows[:10]], [f"{n:>3}" for n in range(1, 11)])
-        self.assertEqual([row.index("nextest") for row in rows[:2]], [40, 40])
+        self.assertEqual([row.index("nextest") for row in rows[:2]], [47, 47])
         self.assertTrue(all("| ---" not in row for row in rows))
 
     def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
@@ -657,12 +712,12 @@ class QueueTests(NotificationGuardedTestCase):
             if line.startswith("#") or line.startswith("Selected running step:"))
             for session, _ in identities)
         for label in ("hana · organon · organon-ci88", "hana · merge · merge-gate", "hana · hana-showrunner",
-                      "standalone", "offline · orphan", "recorded", "tree-7"):
+                      "standalone", "offline · orphan", "owner not recorded · recorded", "owner not recorded · tree-7"):
             cards = [row for row in text.splitlines() if row.startswith("#")]
             running_rows = [row for row in text.splitlines() if row.startswith("Selected running step:")]
-            self.assertEqual(sum(label in row for row in cards), 1)
+            self.assertEqual(sum(f" · {label} · " in row for row in cards), 1)
             session_label = label.split(" · ")[-1]
-            self.assertEqual(sum(session_label in row for row in running_rows), 1)
+            self.assertEqual(sum(f" / {session_label}, " in row for row in running_rows), 1)
         self.assertNotIn("clone88ci", text)
         self.assertNotIn("Roster:", text)
 

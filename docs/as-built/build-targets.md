@@ -59,7 +59,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 | `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
 | `eligible --repo-root <p> --package <n> [--local <why>] [--kind <kind>] [--target <name>]` | Each target row has five tab-separated fields: name, eligibility, reason, settings path and platform. Eligibility is `eligible` or `excluded`. An eligible target has reason `-`. An SSH target has its settings path and platform (`macos` or `linux`). A local target has `-` for settings and platform. Errors print `build targets: <error>` and exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
-| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force; release events wake it at once, with 15 s polling as a fallback. Prints the holder once and the 2 h notice once. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
+| `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force. Release events wake it at once; polling checks every 15 s as a fallback. Prints the holder once and the 2 h notice once. An unmatched run adds `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` Without a session, it adds `<speaker>: build has no session; waits on <holder> hold for <purpose>.` It prints this line once and sends the same line to the holder once. `hold_sender_timeout_seconds` limits the send to 30 seconds by default. A failed send prints `<speaker>: could not tell <holder>: <reason>` and the wait continues. A timeout reason names the limit in seconds. Invalid sender bytes use replacement characters. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
 | `check-local [--caller <name>]` | A nonblocking hold check. Without a caller, records a refused launch session for its release notice. |
 | `interrupt-local --call-id <id> [--signal INT\|TERM]` | Signals a running `wait-local` for that call, checked by pid and process-start identity. |
 
@@ -80,22 +80,37 @@ Without a matching row, `target_platform` returns no answer and status 1.
 ### Holds: `scripts/build_hold/build_hold.py`
 
 - `build_hold.py hold|release [--target <name>]`, default `natedev`. `--target` is parsed by `parse_hold_target` into `HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget(name, configured) | UncheckedHoldTarget(name, reason)`. Only a name other than `natedev` or `mac` reads the config: a readable one answers `unknown target <name>; configured targets: <list>`, an unreadable one (`ConfigError` or `UnicodeError`) answers `unknown target <name>; the target config cannot be read: <reason>`; both exit 2 before any lookup or record.
-- `--target mac` forwards to `mac_test.py block --holder <name> --for <why>` or `unblock --holder <name>` (`run_mac_hold`, `MacHoldResult(status, stdout, stderr)`, `print_mac_hold_result`) and passes the child's output and status through unchanged. It writes no natedev record or event. `--release-eta`, `--zone` and `--resume` print `<option> is not supported with --target mac`, exit 2. `release_mac_hold` survives a session rename: on `blocked by <name>` naming the caller's given or former name (`formerNames` in the live session registry), it retries `unblock` once with that name.
-- A natedev hold file is named by its holder's Claude session id (`holder_of`, `HolderIdentity(key, name)`); a holder that is no live session keeps its given name as the key. The hold notice is `natedev is held for <why>. verify.sh waits by itself; an app launch is refused until the release, so launch again after it. Tests that can run on the Mac keep running there. Stop only cargo you started outside verify.sh. No release after 2 h: ask me.` Recipients take no action.
+- `--target mac` forwards the fixed holder key to `mac_test.py block` or `unblock`. It preserves the child output and status. It writes no natedev record or event. The Mac target refuses `--release-eta`, `--zone`, and `--resume` with exit 2. Release matches only the fixed key and makes no former-name retry.
+- A natedev hold file uses its holder’s fixed staff ID. `HolderIdentity.name` shows the current staff name. An explicit holder outside staff keeps its given key. Without `--holder`, the caller’s native session must resolve to a staff member. The hold notice explains that local work waits and eligible Mac tests continue.
 - `hold` starts the enforcer and appends an audit of builds already running. The enforcer stops tests and builds outside its allow rules, including existing runs; `--keep PID` adds checked PID/start-time pairs. `status` shows the audit and enforcer decisions while a hold exists; `audit` can run by itself. The audit groups cargo and nextest compiler children into one build and classifies each as `holder`, `admitted`, `other_session` or `no_session`, with process start checks. Other-session and no-session builds get an `audit` row through `hold_enforcer.record_build` and `store.append_line` in the current process. Enforcer stops use the same writer with action `stopped`. Schema 21 adds `hold_builds.action`; old rows read as `audit`. The audit itself stops no processes. See [build-memory-admission.md](build-memory-admission.md).
 - `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle. A present file is always in force. `released_at` and `release_started_at` cannot admit a waiter or create a releasing state. Release removes the file first, records the release fields next, then sends notices after the last file is gone.
 - Holder files, the hold cycle, release delivery, the CLI table and recorded hold intervals are covered in [build-memory-admission.md](build-memory-admission.md) under "Build hold". The Mac block, its CI switch and its free message are in [mac-test-offload.md](mac-test-offload.md).
 
 ### Hold checks and release
 
-- `owning_session() -> OwningSession(session_id) | NoOwningSession` reads the staff row whose `run` matches the call's run folder.
-  It uses `UNIT_RUN_DIR`, then `UNIT_SESSION_DIR`, with exact path text.
-  The matching row supplies `current_session`.
-  Without a match, it uses `CLAUDE_CODE_SESSION_ID`.
-  Without either session, it returns `NoOwningSession`.
+- `run_resolution(environment) -> RunOwner(session_id) | NoRunNamed | RunNotInStaff(run: Path)` reads the staff row whose open run matches the call's run folder.
+  It checks `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR`, and `PLAN_DELEGATE_SESSION_DIR` in that order, with exact path text.
+  A matching row with `current_session` returns `RunOwner`.
+  No run variable returns `NoRunNamed`.
+  An unmatched run or an unreadable staff snapshot returns `RunNotInStaff`.
+  `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
+  A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
+  Without either session, `owning_session` returns `NoOwningSession`.
+  `scripts.build_hold.owning_session` defines both session types and imports no repository module.
+  All callers import the types from this module.
+  `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
-- After the last holder file is gone, each recipient gets one release notice. No answer or allocation is awaited. The result names failed or unconfirmed deliveries: `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+- After the last holder file is gone, each recipient gets one release notice.
+  The notice names each hold, its purpose, and its start time in the user zone.
+  For example: `fps hold for frame capture, from 07:33:20 EST`.
+  An old cycle without a purpose still names the hold and its start time.
+  The cycle keeps each purpose after the holder file is gone.
+  The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
+  An old release intent without cycle holders still names its one holder.
+  Release does not wait for an answer or an allocation.
+  The result names failed or unconfirmed deliveries:
+  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
@@ -178,7 +193,9 @@ It saves no pass because a saved pass describes this machine.
 - "Installed" means the same file (device and inode, links followed) as `<home>/.claude/scripts/<fixed path>`, where `<home>` comes from the password database, never from `HOME`. Shell uses `[[ a -ef b ]]`, Python `os.path.samefile`.
 - The line: `<file>: <NAME> is set to '<value>'; the installed scripts under <home>/.claude/scripts do not run with it. Unset it and run again.` The shell guard also refuses every script when `HOME` is read-only in the shell.
 - `override_guard.sh` is sourced, bash 3.2 syntax, builtins only. `verify.sh` and `memory_gate.sh` source it first, above any line that reads `HOME`, and call `build_override_refusal "${BASH_SOURCE[0]}" <path under scripts/> || exit 2`. Status 2 is also how a PreToolUse hook blocks its tool call, so the launch hook blocks with no code of its own.
-- `override_guard.refuse_overrides(Path(__file__), "<dir>/<file>")` is the first statement of `main` in `build_hold.py`, `build_targets.py`, `mac_test.py`, `offload.py`, `audit.py`, `dailies_input.py`, and of `build_hold_active` in `rust_release.py`. `refusal(...) -> OverridesAllowed | OverridesRefused(line)` reads no file when nothing is set.
+- `main` calls `override_guard.refuse_overrides(Path(__file__), "<dir>/<file>")` first in `build_hold.py`, `build_targets.py`, `mac_test.py`, `offload.py`, and `audit.py`.
+  `rust_release.py` calls it first in `build_hold_active`.
+  `refusal(...) -> OverridesAllowed | OverridesRefused(line)` reads no file when no override is set.
 
 ### The Mac side
 
@@ -204,7 +221,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
-| Build page | `buildlog charts [--days 7\|30] [--no-open]` | Prints the shared build page link, the same link as `/build:page`. Use the `buildlog` CLI for detailed records. |
+| `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
 Each command shows its script's output unchanged; each script answers in about a second. There are no stubs at the old names `/builds`, `/build_hold` or `/mac_test`.
@@ -426,7 +443,8 @@ the log does not record that connection. Journal retention also limits the evide
 - A hold nobody releases still escalates after 2 h: the waiter prints the holder and asks the agent to ask them.
 - Defaults are "go": no load threshold and no check for others' processes on any target. The claim watcher's activity check counts processes only to release an idle claim, never to turn a test away.
 - The scripts keep their arguments and exit codes: `build_hold.py hold|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
-- The guard lines stay first in `verify.sh` and `memory_gate.sh`, above every line that reads `HOME` or a listed variable. The guard runs at an entry point, never inside a function that reads a directory: `dailies_input.py` sets `BUILD_HOLD_DIR` in its own process on every run.
+- Guard lines precede every read of `HOME` or a listed variable in `verify.sh` and `memory_gate.sh`.
+  The guard runs at an entry point, never inside a directory reader.
 - The installed callers require `override_guard.sh`. Both machines need compatible installed helpers.
 - `MACOSX_DEPLOYMENT_TARGET` stays at 12.0 or above and follows the value hana's development shell exports on the Mac; `offload.py` and `mac_run.sh` carry the same value.
 - Repository imports use package names such as `scripts.build_hold.build_hold`.
@@ -466,10 +484,10 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - `step_selection.py` defines `Routed`, `Pinned`, `TargetSelection`, and `ROUTED`, and imports only `dataclasses`.
 - `step_record.py` re-exports these selection types for existing AWS callers. Each type has one definition.
 - `BUILDLOG_TARGET` becomes `mac` when a Mac attempt starts, before the claim is decided; it names where the call was when it ended, not proof that tests ran there.
-- A launch with no session id has the key `""` and waits while any holder file exists. A hold placed under a name that is no live session keys its file by that name, so no session's launch matches it.
+- A launch without a session waits while any holder file exists. A staff caller maps its current session to its fixed hold key. An explicit holder outside staff keeps its given key.
 - `holders_in_force`, `natedev_holds` and local hold checks use present holder files, never cycle release fields. A damaged cycle cannot admit a waiter; removing the last holder file permits it even when that cycle remains damaged.
 - `parse_hold_target` runs as argparse's `type=`, so an exception other than `ConfigError` or `UnicodeError` from `read_targets` prints a traceback. A non-UTF-8 config reaches the caller as `conf.Unusable`, which names the file.
-- `mac_test.py unblock` matches the stored holder name, not the session id; the rename retry runs at most one extra `unblock`.
+- `mac_test.py unblock` matches the stored holder key. Human-readable lines resolve that key to the current staff name when possible.
 - Installed hold and claim writers must use compatible code. A running waiter retains the code that it started.
 - The build log carries two Mac host names (`Mac` and `Nates-MacBook-Pro-2023`), so report code selects the Mac as `host <> 'natedev'`, never by one name. The `scripts/buildlog/buildlog` wrapper runs the installed copy; check worktree report code with `~/.claude/scripts/lib/py scripts/buildlog/cli.py` and `BUILDLOG_DIR` on a scratch copy of the log.
 - The claim watcher's ssh activity check has a fixed 10 s total limit beside the configurable connect timeout. A live check of worktree claim code runs `mac_test.py` through `~/.claude/scripts/lib/py` with scratch `MAC_TEST_STATE_DIR` and `MAC_TEST_CONFIG`; the installed copy refuses those overrides.

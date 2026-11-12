@@ -60,6 +60,7 @@ cli_agent_run() {
         claude)
             source "$CLI_AGENT_DIR/../agents/claude_account.sh"
             claude_launch_environment workers || return 1
+            AGENT_MODEL="$(_agents_model_slug claude "$AGENT_MODEL")" || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
             models_agent_environment
             if [[ -z "$invocation" ]]; then

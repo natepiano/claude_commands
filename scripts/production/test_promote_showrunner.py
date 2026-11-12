@@ -3,7 +3,7 @@
 lookups and add_showrunner's start: nothing real stops or starts. Git runs in temporary repositories."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -81,15 +81,54 @@ def commit_all(path: Path) -> None:
 
 @final
 class PromoteShowrunnerTests(unittest.TestCase):
+    def test_promotion_closes_other_workers_after_one_native_lookup_fails(self) -> None:
+        from scripts.herdr import pane_launch
+
+        unit = self.staff_unit()
+        broken = fixture_member("worker", name="broken", parent=unit.id)
+        retained = fixture_member("worker", name="retained", parent=unit.id)
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        world = PaneWorld()
+        world.session = promotion.marked.place.session
+        world.add(unit, PANE)
+        world.add(broken, "w7:p2", live=False)
+        world.add(retained, "w7:p3", live=False)
+        lookup = pane_launch.reference_panes
+        def selected(reference: pane_launch.StaffLaunchReference | pane_launch.NativeLaunchReference,
+                     *arguments: object, **options: object) -> list[dict[str, object]]:
+            del arguments, options
+            if reference == pane_launch.StaffLaunchReference(broken.id):
+                raise ValueError("native lookup failed")
+            return lookup(reference, staff.snapshot(), world, pane_launch.read(pane_launch.record_directory() / f"{world.session}.json"))
+        with (mock.patch.object(herdr, "Herdr", return_value=world),
+              mock.patch.object(herdr, "native_process", side_effect=world.native_process),
+              mock.patch.object(herdr, "_startup_processes", side_effect=world.descendants),
+              mock.patch.object(stop_resume, "stop_unit_workers", return_value=[]),
+              mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(SESSION, PID)),
+              mock.patch.object(pane_launch, "reference_panes", side_effect=selected),
+              mock.patch.object(world, "close_tab_confirmed", return_value=True) as closed,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(promote_showrunner.stop(promotion))
+        self.assertIn(mock.call("w7:p3", terminal="terminal-w7:p3"), closed.call_args_list)
+        self.assertEqual(errors.getvalue().splitlines(), ["anomaly: broken: native lookup failed"])
+
     def test_promotion_closes_retained_shells_only_after_every_stop_proves_success(self) -> None:
         unit = self.staff_unit()
         retained = fixture_member("worker", name="impl", parent=unit.id)
         promotion = promote_showrunner.checked("demo", "child", self.child_doc)
-        for stopped_director, unresolved, close_result in ((False, [], True), (True, [], True), (False, [], False),
-                (False, [], OSError("worker close failed")), (False, ["impl: not proved stopped"], True)):
+        for stopped_director, unresolved, close_result, shown in ((False, [], True, "impl"), (True, [], True, "impl"),
+                (False, [], False, "impl"), (False, [], OSError("worker close failed"), "impl"),
+                (False, ["impl: not proved stopped"], True, "impl"), (False, [], True, None),
+                (False, [], True, "old-worker-title")):
             world = PaneWorld()
+            world.session = promotion.marked.place.session
             world.add(unit, PANE, live=not stopped_director)
+            if stopped_director:
+                world.record(unit, PANE)
             world.add(retained, "w7:p2", live=False)
+            world.locations["w7:p2"]["label"] = shown
+            if shown != "impl":
+                world.locations[PANE]["label"] = "impl"
             before = staff.snapshot()
             def stop(session: str, *, deadline: float) -> stop_resume.Stopped:
                 _ = world.foreground.pop(PANE, None)
@@ -107,6 +146,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
             with (self.subTest(stopped_director=stopped_director, unresolved=unresolved, close_result=close_result),
                   mock.patch.object(worker_panes, "_client", return_value=world),
                   mock.patch.object(herdr.Herdr, "panes", side_effect=world.panes),
+                  mock.patch.object(herdr.Herdr, "result", side_effect=world.result),
+                  mock.patch.object(herdr.Herdr, "startup_processes", side_effect=world.startup_processes),
                   mock.patch.object(herdr.Herdr, "pane_activity", side_effect=world.pane_activity),
                   mock.patch.object(stop_resume, "stop", side_effect=stop),
                   mock.patch.object(herdr, "native_process", side_effect=world.native_process),
@@ -115,7 +156,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(herdr.Herdr, "close_tab_confirmed", side_effect=close) as closed,
                   redirect_stderr(io.StringIO()) as errors):
                 state = worker_panes.observe(unit.id, before)[0]
-                self.assertIsInstance(state, worker_panes.ClosedWorker if stopped_director else worker_panes.StoppedWorker)
+                self.assertIsInstance(state, worker_panes.StoppedWorker)
                 self.assertTrue(promote_showrunner.stop(promotion))
                 if unresolved:
                     closed.assert_not_called()
@@ -138,6 +179,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         retained = fixture_member("worker", name="impl", parent=unit.id)
         promotion = promote_showrunner.checked("demo", "child", self.child_doc)
         world = PaneWorld()
+        world.session = promotion.marked.place.session
         world.add(unit, PANE, live=False)
         world.add(retained, "w7:p2")
         world.add(retained, "w7:p3", live=False, tab="w1:t2")
@@ -475,6 +517,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5151)),
               mock.patch.object(herdr, "herdr_place_of", return_value=place),
               mock.patch.object(herdr.Herdr, "panes", return_value=[pane_identity(place.pane, "child")]),
+              mock.patch.object(herdr.Herdr, "native_session", return_value=SESSION),
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
               mock.patch.object(herdr.Herdr, "submit_opening_prompt") as prompt,
               mock.patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
@@ -887,6 +930,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(herdr, "live_sessions", return_value=[herdr.SessionEntry(
             name="agents", running=True, default=False, session_dir="/fixture", socket_path="/sock")]))
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "panes", return_value=panes))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+            "shell_pid": 998040, "foreground_process_group_id": 998040,
+            "foreground_processes": [{"pid": 998040, "argv": ["zsh"]}]}}))
+        from scripts.herdr import pane_launch
+        entries: dict[str, pane_launch.PaneLaunch] = {}
+        for pane in panes:
+            entry = pane_launch.launch(pane["pane_id"], fixture_runtime_id("child-shell:" + pane["pane_id"]),
+                str(self.worktree), {}, ["claude", "-n", "child"], kind="claude")
+            entries[pane["pane_id"]] = entry
+        pane_launch.save(pane_launch.record_directory() / "agents.json", entries, record=staff.StaffSnapshot(()))
         return child
 
     def test_the_childs_check_lets_the_units_own_tab_carry_its_name(self) -> None:

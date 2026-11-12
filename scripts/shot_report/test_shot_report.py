@@ -24,6 +24,7 @@ from scripts.shot_report.episodes import (
     GAP_CATEGORIES, EpisodeTimeline, LegacyEvidenceUnavailable, NoObservablePath, NoneCited,
     OneCitedShot, SeveralCitedShots, TimelineUnavailable, read_episodes, write_episodes,
 )
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptCountFromOrderedCaptures
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -824,23 +825,27 @@ class ShotReportTest(unittest.TestCase):
 
     def test_mac_reader_chunks_round_trip_and_count_source_bytes(self) -> None:
         content = b'{"cmd":"hana_shot.py shot"}\n' + b'x' * (2 * 65536 + 17)
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / ".codex/sessions/capture.jsonl"
-            source.parent.mkdir(parents=True)
-            _ = source.write_bytes(content)
-            clock = "import time\ntime.monotonic = lambda: 0\n"
-            result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
-                                    input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
-                                    env={**os.environ, "HOME": directory})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
-        chunks = [row for row in rows if row.get("kind") == "chunk"]
-        self.assertTrue(chunks)
-        self.assertTrue(all(row.get("encoding") == "zlib+base64" for row in chunks))
-        source_chunks = [_chunk_bytes(row) for row in chunks]
-        self.assertTrue(all(chunk for chunk in source_chunks))
-        self.assertEqual(sum(map(len, source_chunks)), len(content))
-        self.assertEqual(b"".join(source_chunks), content)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / ".codex/sessions/capture.jsonl"
+                source.parent.mkdir(parents=True)
+                _ = source.write_bytes(content)
+                if compressed:
+                    _ = compressed_copy(source)
+                clock = "import time\ntime.monotonic = lambda: 0\n"
+                result = subprocess.run([sys.executable, "-c", clock + report_module._mac_reader_source()],  # pyright: ignore[reportPrivateUsage]
+                                        input="{}", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
+                                        env={**os.environ, "HOME": directory})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [cast(dict[str, object], json.loads(line)) for line in result.stdout.splitlines()]
+            chunks = [row for row in rows if row.get("kind") == "chunk"]
+            self.assertTrue(chunks)
+            self.assertTrue(all(row.get("encoding") == "zlib+base64" for row in chunks))
+            source_chunks = [_chunk_bytes(row) for row in chunks]
+            self.assertTrue(all(chunk for chunk in source_chunks))
+            self.assertEqual(sum(map(len, source_chunks)), len(content))
+            self.assertEqual(b"".join(source_chunks), content)
+
 
     def test_mac_reader_resumes_legacy_manifest_then_restarts_same_size_rewrite(self) -> None:
         first_content = b'{"cmd":"hana_shot.py shot"}\n' + b'a' * (65536 + 23)

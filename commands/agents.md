@@ -1,6 +1,6 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, or restart sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run]'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION'
 ---
 
 Use the `agents` program.
@@ -21,6 +21,34 @@ Use the `agents` program.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
+- `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
+
+First admission adopts one proved live Claude session or Codex thread with the producer name.
+It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
+Adoption writes the staff row with that native session. It launches nothing.
+Two live sessions cause refusal. An unproved live session also causes refusal.
+The refusal names each conflicting session and pane. It writes no staff row.
+An empty labeled shell does not count as a live session.
+Recovery checks live sessions before it resumes a retained conversation.
+Recovery adopts a different proved live session and removes the pending admission record.
+Stop selects the producer row's `current_session` when several tabs have the same label.
+The Claude session registry proves a plain start without a session ID in its arguments.
+
+Remove a stray producer with these steps:
+
+1. Run `agents remove-stray NAME SESSION` with the stray session ID.
+2. Read the command result.
+
+The command refuses any staff row's `current_session`.
+It proves the selected process before it sends a signal.
+It closes only the selected pane. Other panes in the tab stay open.
+It deletes the selected transcript files across Claude account projects folders with Python.
+It removes a producer admission record that matches the session or the proved pane and terminal.
+It removes the matching admission record before pane closure and transcript deletion.
+It saves the proved cleanup targets before the first change.
+A repeated command uses that record to complete failed steps.
+It deletes the cleanup record after every step completes.
+A repeated command prints `unchanged` when no cleanup record or selected resource remains.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.
@@ -45,9 +73,23 @@ A bare name first selects the calling showrunner or unit and its direct children
 A unit rename changes matching folder and branch suffixes.
 A unit or showrunner rename updates its worker agent names and pane labels to `<new>-<worker>`.
 Use `--to-branch NAME` for an explicit unit branch.
-Keep OLD and NEW equal to change only that branch.
+Keep OLD and NEW equal to change that branch and migrate old qualified worker names.
 A showrunner document move requires both `--to-doc PATH` and `--to-branch NAME`.
 A worker rename changes proved pane titles and keeps shared tab and workspace names.
+Use `agents rename OWNER OWNER` once per owner at deploy to migrate old qualified worker names.
+A qualified prefix must equal the owner name or end with `-<owner name>`.
+A dashed role from staff.WORKER_ROLES keeps its full name and optional trailing digits.
+Other names use the last name component as the bare worker name.
+Without a bare twin, the migration sets the agent name and pane label before the staff name.
+Only OpenWorker, StoppedWorker, or ClosedWorker evidence permits the staff rename.
+Other evidence keeps the row and prints its name and evidence reason.
+Repeat the command after the evidence recovers.
+It ends an old row only when a bare twin exists, its pane is closed, and no dispatch is active.
+It keeps other clashes and prints both rows with the reason.
+A retirement refusal keeps both rows and prints the refusal text.
+The migration then continues with the next worker.
+An undecided prefix prints `/agents rename <id> <bare>`.
+A repeated run keeps completed changes and reports only unresolved rows.
 Repeat an interrupted rename to complete its saved move.
 Show each anomaly and the final output.
 See `docs/as-built/production-rename.md` and `docs/as-built/unit-rename.md`.

@@ -5,7 +5,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field as dataclass_field, replace
 from functools import cache, cached_property
 import os
+import json
 from pathlib import Path
+import subprocess
+import time
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
@@ -17,12 +21,140 @@ from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, plain, field, wrap
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+
+
+@dataclass(frozen=True)
+class MacBuild:
+    pid: int
+    folder: str
+    started_at: float
+
+
+@dataclass(frozen=True)
+class MacBuildReading:
+    read_at: float
+    builds: tuple[MacBuild, ...]
+    error: str = ""
+
+
+def mac_reading_path() -> Path:
+    """Use the feed folder for the shared periodic Mac reading."""
+    folder = Path(os.path.expandvars(conf.read("memory_feed").text("output_folder"))).expanduser()
+    return folder / "mac-builds.json"
+
+
+def mac_activity_refresh_seconds() -> int:
+    return conf.read("memory_feed").whole("mac_activity_refresh_seconds")
+
+
+def read_mac_builds() -> MacBuildReading:
+    """Read the cached Mac activity without a network call."""
+    try:
+        data = cast(dict[str, object], json.loads(mac_reading_path().read_text()))
+        rows = cast(list[dict[str, object]], data["builds"])
+        return MacBuildReading(float(cast(float, data["read_at"])), tuple(
+            MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])))
+            for row in rows), str(data.get("error", "")))
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return MacBuildReading(0, (), f"Mac reading unavailable: {error}")
+
+
+def mac_reading_status(reading: MacBuildReading, now: float) -> str:
+    """Replace old native rows with one line that states the reading age."""
+    elapsed = max(0, now - reading.read_at)
+    if not reading.error and elapsed <= 2 * mac_activity_refresh_seconds():
+        return ""
+    age_text = cloud_update_age(elapsed) if reading.read_at else "unknown"
+    return f"Mac reading is old · age {age_text}" + (f" · {reading.error}" if reading.error else "")
+
+
+def mac_build_status(reading: MacBuildReading, now: float) -> str:
+    elapsed = cloud_update_age(max(0, now - reading.read_at))
+    return (f"started on the Mac · reading age {elapsed} · "
+            "Progress unavailable: Mac process has no readable counter")
+
+
+def mac_build_script() -> str:
+    """Select build roots outside the mirrors with the Mac activity selectors."""
+    from scripts.mac_test import offload
+
+    return offload.mirror_selector_script(offload.ALL_MIRRORS) + r'''
+mirror_pids=$(select_leftovers) || exit 1
+process_records=$(ps -axww -o pid=,ppid=,uid=,etime=,comm=) || exit 1
+activity_user=$(id -u) || exit 1
+build_records=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
+    $3 == user {
+        executable = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", executable)
+        name = executable
+        sub(/^.*\//, "", name)
+        if (name == "cargo" || name == "rustc" || name == "cargo-nextest" || executable ~ /\/target\//)
+            printf "%s\t%s\t%s\t%s\n", $1, $2, $4, executable
+    }') || exit 1
+build_pids=$(printf '%s\n' "$build_records" | awk 'NF { print $1 }' | paste -sd, -) || exit 1
+if [ -n "$build_pids" ]; then
+    cwd_records=$(lsof -a -p "$build_pids" -d cwd -Fpn) || exit 1
+    printf '%s\n%s\n%s\n%s\n%s\n' "$mirror_pids" '--cwd--' "$cwd_records" '--builds--' "$build_records" | awk '
+        $0 == "--cwd--" { section=1; next }
+        $0 == "--builds--" { section=2; FS="\t"; next }
+        section == 0 && /^[0-9]+$/ { mirror[$0]=1; next }
+        section == 1 && /^p/ { pid=substr($0, 2); next }
+        section == 1 && /^n/ { cwd[pid]=substr($0, 2); next }
+        section == 2 && NF >= 4 { parent[$1]=$2; elapsed[$1]=$3; executable[$1]=$4 }
+        END {
+            for (pid in executable)
+                if (!mirror[pid] && !mirror[parent[pid]] && !(parent[pid] in executable)) {
+                    folder=cwd[pid]
+                    if (!folder) { folder=executable[pid]; sub(/\/[^/]*$/, "", folder) }
+                    printf "%s\t%s\t%s\n", pid, elapsed[pid], folder
+                }
+        }' || exit 1
+fi
+printf 'rc=0\n'
+'''
+
+
+def refresh_mac_builds() -> None:
+    """Refresh the shared reading from the feed loop at its configured interval."""
+    now = time.time()
+    previous = read_mac_builds()
+    try:
+        settings = conf.read("mac_test")
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
+            f"ConnectTimeout={settings.number('connect_timeout_s'):g}", settings.text("host"), mac_build_script()],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=10)
+        if result.returncode or not result.stdout.endswith("rc=0\n"):
+            raise ValueError(" ".join(result.stderr.split()) or "Mac activity check failed")
+        builds: list[MacBuild] = []
+        for line in result.stdout.splitlines()[:-1]:
+            pid, elapsed, folder = line.split("\t", 2)
+            days, separator, clock_text = elapsed.partition("-")
+            seconds = 0
+            for part in (clock_text if separator else elapsed).split(":"):
+                seconds = seconds * 60 + int(part)
+            if separator:
+                seconds += int(days) * 86400
+            builds.append(MacBuild(int(pid), folder, now - seconds))
+        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)))
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
+        reading = MacBuildReading(previous.read_at, previous.builds, str(error))
+    write_text_atomic(mac_reading_path(), json.dumps({"read_at": reading.read_at, "error": reading.error,
+        "builds": [{"pid": build.pid, "folder": build.folder, "started_at": build.started_at}
+                   for build in reading.builds]}), new_file_mode=0o644)
+
+
+def step_counter(step: admission_records.RunningStep) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+    """Read the counter from the local memory reading."""
+    if isinstance(step.measured, admission_records.ProgressAdjustedMemory):
+        return step.measured.counter
+    return progress_profile.NoCounter("the step has no readable counter")
 
 
 @dataclass(frozen=True)
@@ -403,10 +535,19 @@ def cloud_update_age(seconds: float) -> str:
     return f"{int(seconds)} s"
 
 
+def cloud_detail(row: wire.CloudRow) -> str:
+    progress = row.progress
+    if not isinstance(progress, cloud_progress.CloudProgress):
+        return ""
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+    return " · ".join(filter(None, (progress.stage, location)))
+
+
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
-        return (Span(work.state),)
-    text = " · ".join(filter(None, (work.state, work.modules, cloud_failed_modules(work))))
+        return (Span(" · ".join(filter(None, (work.state, cloud_detail(row))))),)
+    text = " · ".join(filter(None, (work.state, cloud_detail(row), work.modules, cloud_failed_modules(work))))
     return (Span(text),)
 
 
@@ -421,6 +562,7 @@ def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return cloud_status(row, work)
     parts = (work.state if work.state != "running" else "",
+             cloud_detail(row),
              work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
              cloud_failed_modules(work))
     return (Span(" · ".join(filter(None, parts))),)
@@ -428,8 +570,9 @@ def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
 
 def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
     identity = row.identity
-    label = model.cloud_labels.get(identity.session_id, UnitLabels(identity.name))
-    return replace(label, unit=gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels) or "—")
+    label = model.cloud_labels.get(identity.session_id, UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED))
+    return replace(label, unit=gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels)
+                   or unit_labels.OWNER_NOT_RECORDED)
 
 
 @dataclass(frozen=True)
@@ -501,29 +644,34 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     waiting = model.reading.view.waiting
     running = running_builds(model)
     cloud = cloud_rows(model)
+    mac_reading = read_mac_builds()
+    mac_status = mac_reading_status(mac_reading, explanation.now)
+    native_mac = () if mac_status else mac_reading.builds
     interval = cloud_push_interval() if cloud else CloudPushIntervalUnavailable("no cloud rows")
     stale_pushes = model.reading.cloud_gate_stale_pushes if isinstance(model.reading, wire.CloudQueueRead) else 0
     work = {row.owner: cloud_work(row, explanation.now, stale_pushes, interval) for row in cloud}
     local_cpus = os.cpu_count()
     cpus = str(local_cpus) if local_cpus is not None else "—"
-    bumped_unit = "" if isinstance(explanation.priority, admission_records.NoQueuePriority) else explanation.priority["unit"]
+    bumped_units = (() if isinstance(explanation.priority, admission_records.NoQueuePriority)
+                    else tuple(entry["unit"] for entry in explanation.priority.entries))
 
     def names(step: admission_records.WaitingStep | admission_records.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
-        show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
+        show = field(step.session_name if not step.session_id and step.unit else identity.owner_text) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         unit = unit or "—"
-        return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
+        return show, unit, identity.unit in bumped_units
 
     waiting_names = [names(step) for step in waiting]
     running_names = [names(row.step) for row in running]
     cloud_names: dict[wire.Owner, tuple[str, str, bool]] = {}
     for row in cloud:
         identity = cloud_step_labels(row, model)
-        show = field(identity.showrunner) or "—"
+        show = field(identity.owner_text) or "—"
         unit = field(identity.unit).removeprefix(show + "-") or "—"
         cloud_names[row.owner] = show, unit, False
-    all_names = [*waiting_names, *running_names, *cloud_names.values()]
+    all_names = [*waiting_names, *running_names, *cloud_names.values(),
+                 *((unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED, False) for _ in native_mac)]
     bars = [size_bar(step.need / admission_records.GIB, cap) for step in waiting]
     status = head_status(model)
     waiting_status = [
@@ -535,15 +683,17 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0),
                         max((len(str(age(row.started_at, explanation.now))) for row in running if row.started_at), default=0),
                         max((len(str(age(row.started_at or row.since, explanation.now))) for row in cloud), default=0))
-    step_width = max(7, min(max(13, columns // 3), max(
-        max((terminal_width(queue_lines.step_text(row.step, model.names)) for row in running), default=7),
-        max((terminal_width(queue_lines.step_text(step, model.names)) for step in waiting), default=7),
-        max((terminal_width(field(model.names.shown(row.identity.step))) for row in cloud), default=7))))
+    step_width = max(7, min(max(13, columns // 6), max(
+        max((terminal_width(queue_lines.step_text(row.step, model.names, labels=model.labels)) for row in running), default=7),
+        max((terminal_width(queue_lines.step_text(step, model.names, labels=model.labels)) for step in waiting), default=7),
+        max((terminal_width(field(model.names.shown(row.identity.step))) for row in cloud), default=7),
+        max((terminal_width(field(Path(build.folder).name)) for build in native_mac), default=7))))
     pids = [queue_evidence.step_pid_text(step) for step in waiting]
     running_pids = [queue_evidence.step_pid_text(row.step) for row in running]
-    pid_width = max((len(text) for text in [*pids, *running_pids, *(f"pid {row.owner.pid}" for row in cloud)]), default=5)
+    pid_width = max((len(text) for text in [*pids, *running_pids, *(f"pid {row.owner.pid}" for row in cloud),
+                     *(f"pid {build.pid}" for build in native_mac)]), default=5)
     machine = field(store.host_name()) if running else ""
-    machine_width = max(len("machine"), terminal_width(machine)) if running or cloud else 0
+    machine_width = max(len("machine"), terminal_width(machine), 3) if running or cloud or native_mac else 0
     vcpu_width = max(4, len(cpus), max((len(str(item.vcpus)) for item in work.values() if isinstance(item.vcpus, int)), default=0))
     # Reserve the text widths before the pid takes cells from the bars.
     fixed = place_width + step_width + minutes_width + 5
@@ -566,7 +716,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
             unit_width -= 1
     names_fit = all(terminal_width(show) <= show_width and terminal_width(unit) <= unit_width
                     for show, unit, _ in all_names)
-    if not cloud and (not names_fit or show_width + unit_width + machine_width + 1 > name_room):
+    if not cloud and not native_mac and (not names_fit or show_width + unit_width + machine_width + 1 > name_room):
         machine_width = 0
     machine_cells = machine_width + 1 if machine_width else 0
     bar_column = fixed + show_width + unit_width + pid_width + 1 + machine_cells + vcpu_width + 1
@@ -655,13 +805,24 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         held_end = used + row.kept / admission_records.GIB
         bar = running_bar(min(used, bar_width), min(held_end, bar_width), cap)
         minutes = str(age(row.started_at, explanation.now)) if row.started_at else "—"
-        append_row((*identity_columns("run", queue_lines.step_text(row.step, model.names), pair, minutes,
+        append_row((*identity_columns("run", queue_lines.step_text(row.step, model.names, labels=model.labels), pair, minutes,
                                         "▸" if (you and row.step.session_id == you
                                                 or selector and running_matches_selector(row.step, selector, model.labels)) else " "),
                       *((Span(column(machine, machine_width), "inactive"),) if machine_width else ()),
                       Span(pad_left(cpus, vcpu_width) + " ", "inactive"),
                       Span(column(running_pids[index], pid_width), "inactive"),
                       *bar, Span(text)))
+    for build in native_mac:
+        folder = field(build.folder)
+        append_row((*identity_columns("run", Path(folder).name,
+                                      (unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED, False),
+                                      str(age(build.started_at, explanation.now))),
+                    Span(column("mac", machine_width), "inactive"),
+                    Span(pad_left("—", vcpu_width) + " ", "inactive"),
+                    Span(column(f"pid {build.pid}", pid_width), "inactive"),
+                    Span(folder + " · " + mac_build_status(mac_reading, explanation.now))))
+    if mac_status:
+        append_row((Span(mac_status, "error"),))
     for entry in waiting_builds(model):
         if isinstance(entry, wire.CloudRow):
             append_cloud_row(entry)
@@ -670,7 +831,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
         pair, bar, suffix = waiting_names[index], bars[index], waiting_status[index]
         amount = f" {step.need / admission_records.GIB:.1f}"
         bar_width = max(0, columns - bar_column - terminal_width(amount) - terminal_width(plain([suffix])))
-        row = (*identity_columns(str(index + 1), queue_lines.step_text(step, model.names), pair, str(age(step.since, explanation.now)),
+        row = (*identity_columns(str(index + 1), queue_lines.step_text(step, model.names, labels=model.labels), pair, str(age(step.since, explanation.now)),
                                 "▸" if you and step.session_id == you else " "),
                *((Span(" " * machine_cells),) if machine_width else ()),
                Span(" " * (vcpu_width + 1)),

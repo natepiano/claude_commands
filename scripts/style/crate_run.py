@@ -148,12 +148,12 @@ def evidence(finding: ledger_api.HeldFinding) -> str:
 
 
 @contextmanager
-def serial(folder: Path) -> Generator[None]:
+def serial(folder: Path) -> Generator[copies.HeldCrateRunLock]:
     """One run lock also serializes different crates and publication retries."""
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / "run.lock").open("a") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
-        yield
+        yield copies.HeldCrateRunLock(folder / "run.lock")
 
 
 def changed(repo: Path, base: str, tip: str) -> tuple[str, ...]:
@@ -905,7 +905,7 @@ class CrateRun:
             if (set(result["findings"]) & refusals.keys()
                     or set(result["findings"]) | refusals.keys() != tickets.keys()):
                 raise ValueError("result does not partition the frozen claims")
-            checkout = Path(record["checkout"])
+            checkout = self.repo if CrateStage(record["stage"]) == CrateStage.INTEGRATED else Path(record["checkout"])
             base = self.read()["base"]
             parent, tree = run.git(checkout, "rev-parse", result["commit"] + "^1",
                                    result["commit"] + "^{tree}").splitlines()
@@ -974,17 +974,17 @@ class CrateRun:
     def advance(self, package: str, planner: Planner = plan, runner: run.Runner = run.run_command,
                 available: Callable[[Path, str], None] = bulk.check_available,
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
-        with serial(self.folder), self.complete_run():
+        with serial(self.folder) as run_lock, self.complete_run(run_lock):
             manifest = self.read()
+            if package not in manifest["crates"]:
+                raise bulk.BulkRenameError("crate is not in the frozen run")
+            record = manifest["crates"][package]
+            stage = CrateStage(record["stage"])
+            if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
+                return manifest
             with (self.frozen_checkout(manifest) as frozen,
                   self.ledger.rules_from_checkout(frozen), ExitStack() as workers,
                   ExitStack() as validation_checkouts):
-                if package not in manifest["crates"]:
-                    raise bulk.BulkRenameError("crate is not in the frozen run")
-                record = manifest["crates"][package]
-                stage = CrateStage(record["stage"])
-                if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
-                    return manifest
                 checkout = Path(record["checkout"])
                 validation: HeldCrateValidation | SeparateIntegrationCheckout = SeparateIntegrationCheckout()
                 base = manifest["base"]
@@ -1156,22 +1156,22 @@ class CrateRun:
                 return manifest
 
     @contextmanager
-    def complete_run(self) -> Generator[None]:
-        """End worker tasks after terminal manifest publication and worker lock release."""
+    def complete_run(self, run_lock: copies.HeldCrateRunLock) -> Generator[None]:
+        """Remove terminal copies after worker locks close and before the run lock closes."""
         try:
             yield
         finally:
             manifest = self.read()
-            if all(CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}
-                   for record in manifest["crates"].values()):
-                paths = [Path(record["checkout"]) for record in manifest["crates"].values()]
-                for record in manifest["crates"].values():
-                    path = Path(record["checkout"])
-                    if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
-                        with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
-                                              branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
-                            pass
-                copies.end_workspaces(self.task, paths)
+            terminal = [record for record in manifest["crates"].values()
+                        if CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}]
+            paths = [Path(record["checkout"]) for record in terminal]
+            for record in terminal:
+                path = Path(record["checkout"])
+                if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
+                    with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
+                                          branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
+                        pass
+            copies.end_workspaces(self.task, paths, run_lock=run_lock)
 
     def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
                               pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:

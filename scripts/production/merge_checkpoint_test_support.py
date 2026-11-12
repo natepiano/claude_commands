@@ -50,6 +50,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
                       root: Path) -> subprocess.CompletedProcess[str]:
     """Run the real CLI and current fake scripts, keeping Git as real processes."""
     real_run = subprocess.run
+    python_launcher = (Path(__file__).resolve().parents[1] / "lib/py").resolve()
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
@@ -59,7 +60,8 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
         executable = Path(shutil.which(command[0], path=child_env.get("PATH")) or command[0])
         script, args = executable, command[1:]
-        if not script.is_relative_to(root) and executable.name.startswith("python") and len(command) > 1:
+        if (not script.is_relative_to(root) and len(command) > 1
+                and (executable.name.startswith("python") or executable.resolve() == python_launcher)):
             script, args = Path(command[1]), command[2:]
         if executable.name != "git" and script.is_relative_to(root) and script.is_file() and script.read_text().startswith(f"#!{sys.executable}\n"):
             fake = ModuleType("checkpoint_tool_fixture")
@@ -92,7 +94,6 @@ SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (status zero and a clean summary), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
-PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -435,7 +436,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
-                       delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
+                       delivers: str | None = DELIVERS) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
         runs = self.root / "history/runs"
         fixture_records = runs / "fixture.jsonl"
@@ -451,8 +452,6 @@ class MergeCheckpointFixture(unittest.TestCase):
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
             arguments.extend(("--review-trial", trial))
-        if parallel is not None and "--shrink" not in extra and "--as-built" not in extra:
-            arguments.extend(("--parallel", parallel))
         if delivers is not None and "--shrink" not in extra and "--as-built" not in extra:
             arguments.extend(("--delivers", delivers))
         arguments.extend(extra)
@@ -765,19 +764,18 @@ class MergeCheckpointFixture(unittest.TestCase):
         return self.invoke(["--from-child", "example-style", "--checkpoint", checkpoint,
                             "--production", "example", "--started", STARTED, *extra])
 
-    def prepare_handoff_ledger(self, checkpoint: str, *, add_handoff: bool = True) -> None:
+    def prepare_handoff_ledger(self, checkpoint: str) -> None:
         ledger = Path(__file__).resolve().parents[1] / "style/style_ledger.py"
         self.env["MERGE_CHECKPOINT_STYLE_LEDGER"] = str(ledger)
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "style-state")
         catalog = self.root / "rule-catalog"
         catalog.mkdir()
         self.env["STYLE_HISTORY_NATE_STYLE_DIR"] = str(catalog)
-        commands = [["reconcile", "--branch-point", "production", "--style-branch", "alpha-branch"]]
-        if add_handoff:
-            commands.extend([
-                ["handoff", "add", "--checkpoint", checkpoint],
-                ["handoff", "send", "--checkpoint", checkpoint, "--to", "example"],
-            ])
+        commands = [
+            ["reconcile", "--branch-point", "production", "--style-branch", "alpha-branch"],
+            ["handoff", "add", "--checkpoint", checkpoint],
+            ["handoff", "send", "--checkpoint", checkpoint, "--to", "example"],
+        ]
         for arguments in commands:
             result = subprocess.run(
                 [sys.executable, str(ledger), *arguments, "--repo", str(self.unit)],

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import affected_modules, merge_gate
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -24,6 +25,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         from scripts.aws_target import cloud_gate
         from scripts.production import targeted_test
 
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "scan_roots=\n")
         subject, base = self.prepare_affected_subject()
         first = self.run_gate("--tests-only", type_dirs=())
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)

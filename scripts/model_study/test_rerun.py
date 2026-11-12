@@ -13,6 +13,7 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast
 from unittest.mock import patch
 
@@ -149,6 +150,7 @@ class CarryForwardTests(unittest.TestCase):
             _ = write_transcript(
                 project, transcript("2026-10-06T23:00", "director-request"), "director-id"
             )
+            _ = compressed_copy(project / "director-id.jsonl")
             subagents = project / "director-id" / "subagents"
             subagents.mkdir(parents=True)
             _ = write_transcript(

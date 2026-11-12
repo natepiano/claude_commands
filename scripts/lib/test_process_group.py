@@ -27,11 +27,33 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
 
+def shell_without_redirections(line: str) -> str:
+    """Remove redirections and preserve commands inside process substitutions."""
+    tokens = re.finditer(
+        r'''(?:[^\s;&|()<>'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+'''
+        + r'''|[<>]\(|&>>|<<<|<<-|>>|<<|>&|<&|<>|>\||&>|&&|\|\||[^\s]''', line)
+    parts: list[re.Match[str]] = []
+    target = False
+    for token in tokens:
+        if target:
+            target = False
+            if token.group() not in {"<(", ">("}:
+                continue
+        if token.group() in {"<", ">", ">>", "<<", "<<-", "<<<", ">&", "<&", "<>", ">|", "&>", "&>>"}:
+            if (parts and token.group() not in {"&>", "&>>"} and parts[-1].group().isdigit()
+                    and parts[-1].end() == token.start()):
+                _ = parts.pop()
+            target = True
+            continue
+        parts.append(token)
+    return " ".join(part.group() for part in parts)
+
+
 def shell_group_kills(line: str) -> bool:
     """Find group operands, including commands quoted for a nested shell."""
     if "kill" not in line:
         return False
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+    lexer = shlex.shlex(shell_without_redirections(line), posix=True, punctuation_chars=";&|()")
     lexer.whitespace_split = True
     try:
         words = list(lexer)
@@ -186,7 +208,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(directory)
         scripts = Path(__file__).resolve().parents[1]
-        for name in ("direct/board.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
+        for name in ("direct/board.sh", "direct/file_lock.sh", "direct/verify.sh", "lib/py", "lib/process_group.py",
                      "lib/process_start.py", "lib/conf.sh", "lib/conf_record.sh", "lib/conf.py", "lib/conf_reads.py"):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +372,24 @@ class ProcessGroupSourceTests(unittest.TestCase):
             "direct.py": "from os import " + "killpg as send\nsend(pid, 15)\n",
             "raw.sh": f'{shell_send} -TERM -- "-$CHILD_PID"\n',
             "numeric.sh": f"{shell_send} -9 -12345\n",
+            "equals.sh": f"{shell_send} = 0\n",
+            "command_equals.sh": f"command {shell_send} = 0\n",
+            "nested_equals.sh": f'bash -c "{shell_send} = 0"\n',
+            "nested_equals.py": f"import subprocess\nsubprocess.run(['bash', '-c', '{shell_send} = 0'])\n",
+            "shell_equals.py": f"import subprocess\nsubprocess.run('{shell_send} = 0', shell=True)\n",
+            "system_equals.py": f"import os\nos.system('{shell_send} = 0')\n",
+            "assignment_shell.py": f"script = 'x=1\\n{shell_send} -TERM -0'\n",
+            "redirect_stderr.sh": f"{shell_send} -TERM -0 2>/dev/null\n",
+            "redirect_stdin.sh": f"{shell_send} -TERM -0 < /dev/null\n",
+            "redirect_both.sh": f"{shell_send} -TERM 0&>/dev/null\n",
+            "redirect_both_append.sh": f"{shell_send} -TERM 0&>>/dev/null\n",
+            "process_substitution_input.sh": f"cat <({shell_send} -TERM -0)\n",
+            "process_substitution_output.sh": f"cat >({shell_send} -TERM -0)\n",
+            "redirect_process_substitution_input.sh": f"cat < <({shell_send} -TERM -0)\n",
+            "redirect_process_substitution_output.sh": f"cat > >({shell_send} -TERM -0)\n",
+            "spaced_descriptor.sh": f"{shell_send} -TERM 0 >/dev/null\n",
+            "quoted_descriptor.sh": f'{shell_send} -TERM "0">/dev/null\n',
+            "quoted_operator.sh": f'{shell_send} -TERM ">" 0\n',
             "continued.sh": f'{shell_send} -TERM \\\n-- "-$CHILD_PID"\n',
             "no_extension": f'#!/bin/bash\n{shell_send} -- "-$CHILD_PID"\n',
             "lib/process_group.py": f"def send_process_group(pid, sig):\n    {python_send}(pid, sig)\n{python_send}(pid, sig)\n",
@@ -365,6 +405,21 @@ class ProcessGroupSourceTests(unittest.TestCase):
             _ = (scripts / "prose.py").write_text(
                 f"body = 'Type ! {shell_send} -TERM -12345 in the other session.'\n"
                 + f'''reason = 'the body says to type "{shell_send} -TERM -12345"'\n''')
+            safe_cases = {
+                "worker.py": """worker = \"\"\"
+    kill = 'put-object' in arguments if during_launch < 0 else 'run-instances' in arguments if during_launch else 'get-object' in arguments and arguments[arguments.index('--key') + 1].endswith('/result.json')
+\"\"\"
+""",
+                "annotated_worker.py": 'worker = "kill: bool = during_launch < 0"\n',
+                "spaced_annotation_worker.py": 'worker = "kill : bool = during_launch < 0"\n',
+            }
+            for number, redirect in enumerate(("<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "2>", "0>")):
+                name = f"redirect_before_group_{number}.sh"
+                cases[name] = f"{shell_send} -TERM {redirect} /dev/null -- -0\n"
+                _ = (scripts / name).write_text(cases[name])
+                safe_cases[f"redirect_target_{number}.sh"] = f"{shell_send} -TERM {redirect} 0\n"
+            for name, source in safe_cases.items():
+                _ = (scripts / name).write_text(source)
             found = {finding.split(":", 1)[0] for finding in unguarded_group_signals(scripts)}
             self.assertEqual(found, set(cases))
 
