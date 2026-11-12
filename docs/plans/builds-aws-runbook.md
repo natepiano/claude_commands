@@ -38,7 +38,7 @@ There is no separate charge timer.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
-7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
+7. Run `python3 scripts/aws_target/deploy.py quota-request` to request the configured Spot vCPU quota in each gate region.
 8. Run `python3 scripts/aws_target/deploy.py up --approve-resources` for deployment.
    Deployment refuses a price older than `price_max_age_seconds`.
    Confirm that `notification_email_file` names an existing private file before deployment.
@@ -47,11 +47,20 @@ There is no separate charge timer.
 
 A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The user approved `us-east-2c` (`use2-az3`) at $0.2250/h on 2026-11-03.
 
-A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defaults to 5 vCPU. `m7a.4xlarge` needs 16. A start below the quota fails with "Max spot instance count exceeded".
+On 2026-11-11, the Standard Spot vCPU quota (`L-34B43A08`) in `us-west-2` is 5.
+The largest configured gate needs 32 vCPUs.
+`deploy.py quota-request` requests `spot_quota_request_vcpus=128` from `cloud_gate.conf` in each configured region.
+The command decrypts the administrator key at the terminal.
+It skips sufficient quotas and existing open requests.
+It prints request status and desired values without request, case, or account identifiers.
+A failed region prints only the AWS error code or Python error class while other regions continue.
+Any regional failure makes the command exit with status 1.
+The external administrator IAM policy needs `servicequotas:GetServiceQuota`, `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`, and `servicequotas:RequestServiceQuotaIncrease`.
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
 - `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- The region policy is `AdvancedModeRegionRestrictionSecurityControlPolicy`. It had a `UsWest2Partitional` statement that denied EC2 in `us-west-2`. The user removed it on 2026-11-11 for the gate fallback region. `RegionFloor` and `UsEast1Partitional` remain.
 - No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
 - The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
@@ -68,7 +77,8 @@ The command asks for four hidden values and a passphrase confirmation.
 Enter retains an imported or stored value.
 The command removes the plain administrator profile after encryption succeeds.
 It keeps the unattended scaler profile.
-Use the AWS console for placement and quota inspection.
+Use the AWS console for placement inspection.
+Use `deploy.py prices` for quota inspection.
 Do not create a plain administrator profile for CLI inspection.
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.

@@ -8,6 +8,15 @@ from scripts.lib.transcripts import open_transcript, transcript_paths
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_missing_transcript_raises_file_not_found_for_plain_and_compressed_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("missing.jsonl", "missing.jsonl.zst"):
+                with self.subTest(name=name):
+                    with self.assertRaises(FileNotFoundError):
+                        with open_transcript(root / name):
+                            self.fail("The reader opened a missing transcript.")
+
     def test_plain_and_compressed_streams_keep_bytes_offsets_and_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -47,16 +48,25 @@ class OrderWasteTests(unittest.TestCase):
     root: Path = Path()
     repo: Path = Path()
     connection: sqlite3.Connection = sqlite3.connect(":memory:")
+    repository_seed: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="order-waste-seed-")))
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        _ = fixture.git("init", "-q", "--initial-branch=main")
+        _ = fixture.git("config", "user.name", "Order waste tests")
+        _ = fixture.git("config", "user.email", "order-waste@example.invalid")
+        _ = fixture.git("config", "commit.gpgsign", "false")
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Order waste tests")
-        _ = self.git("config", "user.email", "order-waste@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
         self.connection = self.enterContext(closing(sqlite3.connect(":memory:")))
         for _, migration in sorted(style_ledger.MIGRATIONS.items()):
             _ = self.connection.executescript(migration)

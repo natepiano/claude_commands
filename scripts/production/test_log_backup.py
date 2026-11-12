@@ -1,4 +1,4 @@
-"""A production's LOG is copied on every update tick, and the newest copies are kept."""
+"""Keep the newest LOG copies from explicit backup calls and production checks."""
 
 from __future__ import annotations
 

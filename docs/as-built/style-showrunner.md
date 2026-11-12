@@ -43,7 +43,6 @@ For `**Kind:** style`, that procedure takes precedence over `commands/showrunner
 | `scripts/production/merge_checkpoint.py` | `--from-child` hand-off merge; `notify_style` |
 | `scripts/production/proposal_issue.py` | Issue writer: `create`, `approve`, `unapprove`, `start`, `close`, `reopen`, `move-approved`, `area-style`, `rules`, more |
 | `scripts/production/proposals_table.py`, `footer_counts.py` | Proposal states and the footer count |
-| `scripts/production/dailies_input.py`, `dailies_render.py` | The style line in the parent's dailies |
 | `scripts/production/production_lifecycle.py` | Wrap detaches style children |
 | `docs/direct/standing_plan_refill.md` `<StandingPlanRefill>`, `commands/unit/checkpoint.md` | Unit director side of refill and checkpoint |
 | `commands/showrunner/add_style.md`, `style_report.md`, `proposal.md` | Showrunner commands |
@@ -542,11 +541,12 @@ It skips both the ledger command and the acknowledgment.
 - Git ancestry identifies a merged hand-off. The receipt stores its merge commit. Unit checkpoint records supply CI counts.
 - Wrap: `production_lifecycle.wrap` detaches running style children (`refuse_running_children -> RunningStyleChildren`, `detach_style_children`) only after promotion, unit retirement and notifier removal, and tells each `<parent> wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs (docs/style_production.md, Merging back).` Any other running child holds the wrap. `retire_reservations` reads `read_board`, prints `retire skipped: board unavailable (<reason>)` on `BoardUnavailable`, and releases nothing for an unconfigured repo.
 
-### Style report and dailies line
+### Style report
+
+Use `/showrunner:units` for each unit's ticket, step, ETA, and finding counts.
 
 - `coverage_report.py --repo R [--rule <id or unique stem> | --crate <dir or package>]` (`/showrunner:style_report [rule|crate]` runs it for each style production at or below the caller). Header from `summary_of(repo rows)`: `<showrunner name> — synced <branch point> <tip> at HH:MM <zone>, <n> files (+<d> since yesterday)`; `Rules done: <d> of <t> (<n> by lint) · cells current <p>% · open · stale · awaiting merge · held`; the unclassified line; `Waiting to merge back: ...`; table `| Rule | Tier | Current | Stale | Open | Awaiting merge | Held | Done |` (classified tier A-D only; `#uncovered` folded in; stem, or full id when two rules share a stem); `Since last report: ...`. `rule_counts(WholeRepository())` runs once, plus `rule_counts(CrateCoverage(crate))` under `--crate`. `--rule` adds open tickets; `--crate` adds the oldest open ticket.
 - Snapshot `ReportSnapshot(rules, proposals, files_by_day)` is written atomically to `ledger.database.parent / "last_report.json"`; `previous_report -> FirstReport | PreviousReport`.
-- Dailies: `dailies_input` saves a `style` key only for a `**Kind:** style` doc (raw `summary --json`, or `{"unavailable": "<reason>"}`). `ChildReport.style: StyleSummary | NoStyleSummary | StyleSummaryUnavailable`; unknown keys are refused. `child_row` puts `<child>  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 14:05` in `Row.lines_below`, plus ` · unclassified <n> — pull nate_style` and ` · hand-off waiting <h>h` when the oldest pending hand-off is more than 4 h old. `cells` is `math.floor(pct)`. `ChildReport.cadence: ReportsEvery(minutes) | ReportsOnDemand`.
 
 ### Style decisions (proposals)
 
@@ -683,7 +683,6 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 | 90 min | `style_plan.py split` default time limit; one split of the types unit took 8.98 min on a copy of the live ledger |
 | 3 | `LOCK_ATTEMPTS` in `retry_on_change`; the third change refuses `...; rerun` |
 | 32 | alias expansion bound in trait-path resolution |
-| 4 h | dailies `hand-off waiting <h>h` flag |
 | 10 s / 35 s | `send.py --timeout` / subprocess bound (`SEND_RUN_SECONDS`) in `style_sync.py` |
 | 16 hex | `finding_id` length |
 | half | outside-rename body test: at least half the old non-blank lines remain |
@@ -707,7 +706,6 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - The tokenizer keeps a string literal as one token, so the `{_name}` capture regex runs over literal tokens. When `token_spans` is empty, the original change is kept and the answer stays review.
 - Pilot scope lines name workspace packages, not member folders; `status` groups by member folder.
 - `StyleSummary.synced_at` is naive local time in the report zone; `oldest_pending_since` is aware UTC.
-- The parent reads only the child's saved report, so the dailies line is as fresh as the child's last report. A grandparent's `expand` shows no style line.
 - A percentage prints one decimal with a trailing `.0` dropped; counts use thousands separators.
 - The proposals delta in the report compares filed decision identities, not the count.
 - Declaration identity collides across files often (test helpers, `fn main`, two impls of one trait), so a file counts only when it gained the declaration since the read commit.

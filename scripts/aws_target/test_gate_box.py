@@ -40,6 +40,41 @@ class GateBoxTests(unittest.TestCase):
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
         self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
 
+    def test_boot_timestamps_use_local_kernel_and_cached_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _ = (root / 'links.json').write_text('{}')
+            metadata = root / 'metadata.json'
+            cloud_init = root / 'instance-data.json'
+            stat = root / 'stat'
+            _ = stat.write_text('cpu 1 2 3\nbtime 1768438700\n')
+            prefix = gate_box.LEGACY_GUEST.split("links['boot'] =", 1)[0].replace(
+                "'/proc/stat'", repr(str(stat))).replace(
+                "'/etc/ec2-metadata/instance-identity-document'", repr(str(metadata))).replace(
+                "'/run/cloud-init/instance-data.json'", repr(str(cloud_init)))
+            document = {'pendingTime': '2026-01-15T01:00:00Z'}
+            for cached in ('absent', 'identity', 'cloud-init', 'invalid'):
+                with self.subTest(cached=cached), mock.patch.dict(os.environ,
+                        {'GATE_BOX_DIR': str(root), 'GATE_USER_DATA_STARTED_AT': '1768438801'}):
+                    metadata.unlink(missing_ok=True)
+                    cloud_init.unlink(missing_ok=True)
+                    if cached == 'identity':
+                        _ = metadata.write_text(json.dumps(document))
+                    elif cached == 'cloud-init':
+                        _ = cloud_init.write_text(json.dumps({'ds': {'dynamic': {'instance-identity': {'document': document}}}}))
+                    elif cached == 'invalid':
+                        _ = metadata.write_text('{broken')
+                    namespace: dict[str, object] = {}
+                    exec(compile(prefix, '<boot timestamps>', 'exec'), namespace)
+                    timestamps = ledger.mapping(namespace['timestamps'])
+                    self.assertEqual(timestamps['kernel_boot_at'], 1768438700)
+                    self.assertEqual(timestamps['user_data_started_at'], 1768438801)
+                    self.assertGreater(float(str(timestamps['nix_ready_at'])), 1768438801)
+                    if cached in ('identity', 'cloud-init'):
+                        self.assertEqual(timestamps['instance_running_at'], 1768438800)
+                    else:
+                        self.assertNotIn('instance_running_at', timestamps)
+
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
         links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
                  'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
@@ -209,6 +244,10 @@ else:
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure:
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
+                    result = results[-1]
+                    self.assertGreaterEqual(float(str(result['nix_ready_at'])), int(str(result['user_data_started_at'])))
+                    self.assertGreater(int(str(result['user_data_started_at'])), int(str(result['kernel_boot_at'])))
+                    self.assertNotIn('source_ready_at', result)
                     self.assertEqual(list(ledger.mapping(results[-1]['tools'])),
                                      ['git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup',
                                       'cargo-nextest', 'uv', 'sqlite3', 'python_sqlite'])

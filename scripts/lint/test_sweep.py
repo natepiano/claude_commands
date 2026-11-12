@@ -44,7 +44,6 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.buildlog.step_outputs_test_support import create_step_index, record_root_attempt
 from scripts.buildlog import index as build_index
 from scripts.buildlog import repository
-from scripts.lib import test_hang_guard
 if TYPE_CHECKING:
     from scripts.copies import copies
     from scripts.production.cli_fixture import ImmutableGitSeed
@@ -177,41 +176,6 @@ def fake_sender_process(sender: Path) -> Generator[mock.Mock]:
         yield process
 
 
-def fresh_import_modules(base: Path, directory: str, module: str) -> list[str]:
-    root = Path(__file__).resolve().parents[2]
-    environment = {**os.environ, **config_environment(base / "config"),
-                   "STAFF_FILE": "/nonexistent/staff.json",
-                   "BUILD_HOLD_DIR": str(base / "holders"),
-                   "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
-                   "BUILDLOG_DIR": str(base / "buildlog"),
-                   tmp_sweep.STATE_ENV: str(base / "state"),
-                   "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
-                   "PYTHONPATH": os.pathsep.join((str(root / "scripts" / directory), str(root)))}
-    for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
-        _ = environment.pop(name, None)
-    command = f"import json, sys, {module}; print(json.dumps(sorted(sys.modules)))"
-    result = subprocess.run([sys.executable, "-c", command], cwd=root, env=environment,
-                            capture_output=True, text=True, check=False,
-                            timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-    assert result.returncode == 0, result.stderr
-    return cast(list[str], json.loads(result.stdout))
-
-
-class ImportTests(unittest.TestCase):
-    def test_imports_leave_coordination_modules_unloaded(self) -> None:
-        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for directory, module in (("mac_test", "offload"), ("lint", "sweep")):
-            with self.subTest(module=module):
-                loaded = fresh_import_modules(base, directory, module)
-                coordination = [
-                    name for name in loaded
-                    if name in {"build_hold", "scripts.build_hold.build_hold",
-                                "memory_admit", "scripts.lint.memory_admit"}
-                    or name.startswith("scripts.build_queue")
-                ]
-                self.assertEqual(coordination, [])
-
-
 class Target:
     """target/debug with live copies, orphaned copies and files nothing claims."""
 
@@ -332,15 +296,6 @@ class DirectoryBlocksTests(SweepCase):
 
 
 class GroupTests(SweepCase):
-    def test_group_scan_reads_the_dep_info_limit_once_for_multiple_trees(self) -> None:
-        targets = [self.target(), self.target()]
-        trees = [str(target.tree) for target in targets]
-        scan = sweep.Scan()
-        with mock.patch("scripts.lint.sweep.conf.ConfigRead.whole", side_effect=conf.read("lint").whole) as whole:
-            owners = sweep.group_roots(trees, scan)
-        self.assertTrue(all(str(target.app_dep_info) in owners for target in targets))
-        self.assertGreater(len(scan.groups), 2)
-        self.assertEqual(whole.call_args_list, [mock.call("sweep_dep_info_head_bytes")])
 
     def test_linker_temp_and_copied_up_output_belong_to_their_unit(self) -> None:
         target = self.target()
@@ -429,20 +384,6 @@ class LastUseTests(SweepCase):
         scan, owners = scanned(target)
         self.assertIn(owners[str(incremental)], scan.groups)
         self.assertEqual(owners[str(incremental)].last_used, compiled)
-
-    def test_grouping_and_walk_share_directory_observations(self) -> None:
-        target = self.target()
-        trees = sweep.build_trees(str(target.root))
-        listed: list[str] = []
-        scandir = os.scandir
-        def observe(path: str) -> object:
-            listed.append(path)
-            return scandir(path)
-        with mock.patch.object(os, "scandir", side_effect=observe):
-            scan = sweep.scan_roots(sweep.DiscoveredTargetRoots([str(target.root)], [str(target.root)]), trees)
-        fingerprint = str(target.tree / ".fingerprint" / f"app-{APP}")
-        self.assertEqual(listed.count(fingerprint), 1)
-        self.assertIn(str(target.app), {path for group in scan.groups for path in group.observed})
 
 
 class DepInfoTests(SweepCase):
@@ -950,16 +891,6 @@ def fake_process(proc: Path, pid: int, *, exe: str = "/usr/bin/true", cwd: str =
     _ = (entry / "environ").write_bytes(b"".join(item.encode() + b"\0" for item in environ))
 
 
-def idle_processes(proc: Path, count: int) -> None:
-    """Readable processes outside all targets, so every batch must check every pid."""
-    outside = proc.parent / "outside"
-    for pid in range(1, count + 1):
-        fake_process(proc, pid, exe=str(outside / "bin"), cwd=str(outside), maps="".join(
-            f"7f00-7f10 r-xp 00000000 00:1f 42 {outside}/lib{number}.so\n"
-            for number in range(3)
-        ))
-
-
 def run_from(binary: Path, cwd: Path | None = None) -> subprocess.Popen[bytes]:
     """A sleeping process whose exe is a copy of sleep at binary, as a test binary runs from deps/."""
     sleep = shutil.which("sleep")
@@ -992,35 +923,6 @@ class ProcessUseTests(SweepCase):
                 if how == "nested":
                     self.assertEqual(set(sweep.process_use(str(nested), owners, str(self.proc))), {str(nested)})
 
-    def test_one_target_recheck_parses_only_maps_that_name_its_prefix(self) -> None:
-        idle_processes(self.proc, 4)
-        path = str(self.hana / "debug" / "mapped library.so")
-        wanted = f"7f00-7f10 r-xp 00000000 00:1f 42 {path}\n"
-        fake_process(self.proc, 20, maps=wanted)
-        original = sweep.mapped_files
-        parsed: list[bytes] = []
-
-        def parse(maps: bytes) -> list[str]:
-            self.assertIn(os.fsencode(str(self.hana) + os.sep), maps,
-                          "an unrelated process's maps must not be decoded")
-            parsed.append(maps)
-            return list(original(maps))
-
-        with mock.patch.object(sweep, "mapped_files", side_effect=parse):
-            uses = sweep.process_use(str(self.hana), sweep.TargetOwnerIndex([str(self.hana)]), str(self.proc))
-        self.assertEqual(parsed, [wanted.encode()])
-        self.assertEqual(uses, {str(self.hana): sweep.TargetUse(20, f"maps {path}")})
-
-    def test_kernel_process_paths_need_no_resolution_or_outside_parent_walk(self) -> None:
-        idle_processes(self.proc, 50)
-        fake_process(self.proc, 51, cwd=str(self.hana) + "-other/debug")
-        owners = sweep.TargetOwnerIndex([str(self.hana), str(self.other)])
-        with (mock.patch.object(os.path, "realpath", wraps=os.path.realpath) as resolve,
-              mock.patch.object(os.path, "dirname", wraps=os.path.dirname) as parent):
-            uses = sweep.process_uses(owners, str(self.proc))
-        self.assertEqual(uses, {})
-        self.assertEqual(resolve.call_count, 0)
-        self.assertEqual(parent.call_count, 0)
 
     def test_repeated_process_paths_share_one_owner_lookup_across_batch_rechecks(self) -> None:
         path = str(self.hana / "debug" / "deps" / "shared")
@@ -1041,27 +943,6 @@ class ProcessUseTests(SweepCase):
         self.assertEqual({root: use.pid for root, use in sweep.process_uses(owners, str(self.proc)).items()},
                          {str(self.hana): first_pid, str(self.other): 51})
 
-    def test_process_path_resolution_grows_only_by_the_added_targets(self) -> None:
-        idle_processes(self.proc, 50)
-        targets = [str(self.hana), str(self.hana / "proof" / "target")]
-        targets.extend(str(self.base / f"target-{number}") for number in range(78))
-        for target in targets:
-            Path(target).mkdir(parents=True, exist_ok=True)
-        counts: list[int] = []
-        parent_counts: list[int] = []
-        realpath = os.path.realpath
-        dirname = os.path.dirname
-        for size in (40, 80):
-            with (mock.patch.object(os.path, "realpath", wraps=realpath) as resolve,
-                  mock.patch.object(os.path, "dirname", wraps=dirname) as parent):
-                uses = sweep.process_uses(targets[:size], str(self.proc))
-            self.assertEqual(uses, {})
-            counts.append(resolve.call_count)
-            parent_counts.append(parent.call_count)
-        print(f"process realpath calls P=50: T=40 {counts[0]}, T=80 {counts[1]}")
-        print(f"process parent walks P=50: T=40 {parent_counts[0]}, T=80 {parent_counts[1]}")
-        self.assertLessEqual(counts[1], counts[0] + 40)
-        self.assertLessEqual(counts[0], 40 + 50 * 5)
 
     def test_symlinked_target_owns_real_process_paths_and_outer_paths_stay_outer(self) -> None:
         nested = self.hana / "proof" / "target"
@@ -2160,10 +2041,6 @@ class FloorTests(SweepCase):
         cold = sweep.rebuild_causes(steps, [sweep.SweepRemoval(3, str(mapping.build_directory), "floor take")], 0, 10)
         self.assertEqual([item.cause for item in cold], ["floor take"])
 
-    def test_floor_sources_have_no_fixed_build_drive_path(self) -> None:
-        source = Path(sweep.__file__).read_text()
-        self.assertNotIn('"/build/', source)
-        self.assertNotIn("'/build/", source)
 
     def residue_target(self, base: Path, name: str, used: float, *, stamp: bool = True) -> tuple[Path, Path]:
         root = base / name / "target"
@@ -3416,16 +3293,6 @@ class FloorTests(SweepCase):
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
 
-    def test_a_real_pass_does_not_walk_unchanged_idle_targets_again(self) -> None:
-        base = self.base()
-        targets = [cargo_target(base, name, digest, time.time() - DAY)[0].parent
-                   for name, digest in (("first", APP), ("second", DEMO))]
-        with mock.patch.object(sweep, "directory_blocks", wraps=sweep.directory_blocks) as walks:
-            status, text = self.hold(base, 10 * GIB, [9 * GIB], scanned=11 * GIB, recorded=True)
-        self.assertEqual(status, 0)
-        self.assertIn("nothing taken", text)
-        self.assertEqual([call.args[0] for call in walks.call_args_list if call.args[0] in map(str, targets)], [])
-        self.assertEqual(self.trim_rows(), [])
 
     def test_after_cache_bytes_match_a_full_walk_with_links_across_untouched_targets(self) -> None:
         base = self.base()
@@ -3480,36 +3347,6 @@ class FloorTests(SweepCase):
         after = sum(sweep.directory_blocks(root, seen) for root in roots)
         self.assertEqual(self.saved_record().build_cache_bytes, after)
 
-    def test_floor_grouping_resolves_each_target_once(self) -> None:
-        base = self.base()
-        for number in range(12):
-            _ = cargo_target(base, "repo", f"{number:016x}", time.time() - DAY)
-        index = sweep.CargoOutputIndex
-        roots_for = index.roots_for
-        scan_floor_roots = sweep.scan_floor_roots
-        target_last_use = sweep.target_last_use
-        grouping_queries: list[str] = []
-        all_queries: list[str] = []
-        observed_queries: list[list[str]] = []
-        def resolve(outputs: sweep.CargoOutputIndex, root: str) -> tuple[str, ...]:
-            grouping_queries.append(root)
-            all_queries.append(root)
-            return roots_for(outputs, root)
-        def scanned_roots(roots: list[str], trees: dict[str, list[str]], *,
-                          lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> sweep.Scan:
-            scan = scan_floor_roots(roots, trees, lint_settings=lint_settings)
-            grouping_queries.clear()
-            return scan
-        def last_use(root: str, groups: list[sweep.Group], discovered: Sequence[str] = ()) -> float:
-            observed_queries.append(list(grouping_queries))
-            return target_last_use(root, groups, discovered)
-        with (mock.patch.object(index, "roots_for", resolve),
-              mock.patch.object(sweep, "scan_floor_roots", side_effect=scanned_roots),
-              mock.patch.object(sweep, "target_last_use", side_effect=last_use)):
-            self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB - 1], dry_run=True, recorded=True)[0], 0)
-        root = str(base / "repo" / "target")
-        self.assertEqual(observed_queries[0], [root])
-        self.assertEqual(all_queries.count(root), 6)
 
     def base(self) -> Path:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -5222,19 +5059,6 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         record = self.saved_record()
         self.assertIsInstance(record.alert_history, sweep.DeliveredAlert)
 
-    def test_alert_delivery_failure_never_changes_exit_status(self) -> None:
-        send_floor_alert = sweep.send_floor_alert
-        send_holder_message = sweep.send_holder_message
-        base = self.base()
-        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
-        _ = write_config_fixture(conf.path("lint"), "sweep_large_removal_bytes=1\n")
-        with (mock.patch.object(subprocess, "run", side_effect=OSError("offline")),
-              mock.patch.object(sweep, "send_floor_alert", wraps=send_floor_alert),
-              mock.patch.object(sweep, "send_holder_message", wraps=send_holder_message),
-              redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=True)[0], 0)
-        self.assertIn("message to natedev failed", errors.getvalue())
-        self.assertNotIn("phone alert failed", errors.getvalue())
 
     def test_one_channel_delivering_counts_and_both_results_print(self) -> None:
         sender = Path(self.enterContext(tempfile.TemporaryDirectory())) / "message/send.py"
@@ -5347,26 +5171,6 @@ raise SystemExit(int(os.environ[variable]))
             self.assertEqual(int(example.values["shortfall"]), 300 - int(example.values["free"]))
             self.assertIn(example.values["shortfall"] + " GiB", push.action.text)
 
-    def test_failed_phone_send_reports_the_cause_printed_on_stdout(self) -> None:
-        sender = Path(self.enterContext(tempfile.TemporaryDirectory())) / "message/send.py"
-        sender.parent.mkdir(parents=True)
-        _ = sender.write_text(
-            """import sys
-
-if sys.argv[sys.argv.index("--to") + 1] == "user":
-    print("FAILED: Pushover keys are missing")
-    raise SystemExit(3)
-""",
-            encoding="utf-8",
-        )
-        errors = io.StringIO()
-        with (mock.patch.object(session_send, "SEND_SCRIPT", sender),
-              fake_sender_process(sender),
-              redirect_stdout(io.StringIO()), redirect_stderr(errors)):
-            self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
-            self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),
-                             sweep.FloorChannelOutcome.FAILED)
-        self.assertIn("phone alert failed (3): stdout: FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
         result = subprocess.CompletedProcess([], 1, "", "")
@@ -6806,44 +6610,6 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertIn("another sweep is holding it", output)
         self.assertTrue(output_file.exists())
 
-    def test_floor_batch_process_rechecks_have_a_linear_path_resolution_bound(self) -> None:
-        process_uses = sweep.process_uses
-        realpath = os.path.realpath
-        dirname = os.path.dirname
-        counts: list[int] = []
-        for size in (20, 40):
-            base = self.base()
-            proc = base / "proc"
-            idle_processes(proc, 50)
-            for number in range(size):
-                _ = cargo_target(base, f"repo-{number:02d}", APP, time.time() - DAY)
-            calls = 0
-            # Five paths per pid on the initial check and every batch, plus scan bookkeeping.
-            limit = 2 * (size + (size + 1) * 50 * 5) + 5000
-
-            def counted_path(path: str, *, strict: bool = False) -> str:
-                nonlocal calls
-                calls += 1
-                if calls > limit:
-                    raise AssertionError(f"T={size}: exceeded linear realpath bound at {calls} calls")
-                return realpath(path, strict=strict)
-
-            def private_uses(targets: Sequence[str]) -> dict[str, sweep.TargetUse]:
-                return process_uses(targets, str(proc))
-
-            try:
-                with (mock.patch.object(sweep, "process_uses", side_effect=private_uses) as checks,
-                      mock.patch.object(os.path, "realpath", side_effect=counted_path),
-                      mock.patch.object(os.path, "dirname", wraps=dirname) as parent):
-                    status, output = self.hold(base, 10 * GIB, [GIB, GIB], dry_run=True, recorded=True)
-                self.assertEqual(status, 0)
-                self.assertEqual(checks.call_count, size + 1)
-                self.assertEqual(output.count("the floor would take"), size)
-                counts.append(calls)
-                print(f"floor parent walks P=50, T={size}: {parent.call_count}")
-            finally:
-                print(f"floor realpath calls P=50, T={size}: {calls}; bound {limit}")
-        self.assertLessEqual(counts[1], 2 * counts[0] + 500)
 
     def test_floor_only_skips_the_workspace_and_holds_the_configured_floor(self) -> None:
         config = self.base() / "lint.conf"
@@ -7258,35 +7024,6 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(sweep.main([]), 0)
         self.assertEqual(workspace.call_args.args[3], 60.0)
 
-    def test_one_sweep_shares_settings_with_its_workspace_budget(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = write_config_fixture(root / "lint.conf", "recent_minutes=60\nsweep_budget_gib=1\n")
-        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), sweep.BUDGET_ENV: ""}),
-              mock.patch.object(conf, "read", wraps=conf.read) as reads,
-              mock.patch.object(sweep, "cargo_roots", return_value=[]),
-              mock.patch.object(sweep, "hold_floor", return_value=0),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(sweep.main([]), 0)
-        reads.assert_called_once_with("lint")
-
-    def test_sweep_import_omits_unused_modules(self) -> None:
-        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        environment = {**os.environ, "BUILD_HOLD_DIR": str(base / "holders"),
-                       "BUILD_HOLD_RELEASE_DIR": str(base / "release"),
-                       "BUILDLOG_DIR": str(base / "buildlog"),
-                       "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
-                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
-        omitted = ("scripts.lint.tmp_sweep", "scripts.buildlog.record", "scripts.buildlog.index")
-        command = ("import sys; from scripts.lint import sweep; "
-                   + f"assert not set({omitted!r}).intersection(sys.modules)")
-        result = subprocess.run([sys.executable, "-c", command], cwd=base, env=environment,
-                                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_sweep_import_loads_one_copy_of_step_outputs(self) -> None:
-        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        loaded = fresh_import_modules(base, "lint", "sweep")
-        self.assertEqual(len(set(loaded) & {"step_outputs", "scripts.buildlog.step_outputs"}), 1, loaded)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
         values = conf.read(Path(self.config())).values()

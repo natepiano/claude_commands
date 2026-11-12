@@ -250,6 +250,37 @@ class CloudGateTests(CostFixture):
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
         self.assertTrue(self.fake.terminated)
 
+    def test_box_end_uses_result_receipt_only_with_a_valid_final_result(self) -> None:
+        for result_state in ('valid', 'absent', 'invalid'):
+            with self.subTest(result_state=result_state):
+                attempt = 'end-' + result_state
+                folder = self.root / attempt
+                folder.mkdir()
+                request = {**self.request, 'attempt': attempt, 'source_key': ''}
+                cloud_gate.save(folder / 'request.json', request)
+                self.fake = FakeGateAws()
+                self.fake.result = {**self.result(), 'attempt': attempt}
+                ledger.mapping(self.fake.result['record'])['id'] = 'gate-' + attempt
+                self.fake.has_result = result_state != 'absent'
+                if result_state == 'invalid':
+                    self.fake.result['tree'] = 'other-tree'
+                self.fake.state = 'shutting-down'
+                received_at = int(self.now)
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if 'terminate-instances' in arguments:
+                        self.advance(16)
+                    return self.fake(arguments, **options)
+
+                worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+                    self.book, self.settings, folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+                outcome = worker.execute(folder, request, self.deployment)
+                self.assertEqual(outcome['status'], 'complete' if result_state == 'valid' else 'fallback')
+                reservation = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt)
+                self.assertEqual(reservation.state, ledger.GateTerminated(
+                    received_at if result_state == 'valid' else received_at + 16, 'i-fixture'))
+                self.assertTrue(self.fake.terminated)
+
     def test_saved_image_changes_only_the_launch_image(self) -> None:
         self.assertEqual(self.execute()['status'], 'complete')
         official = self.fake.launches[-1]

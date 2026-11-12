@@ -19,7 +19,7 @@ from collections.abc import Callable
 from contextlib import closing, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.style import bulk_rename as bulk
@@ -90,9 +90,19 @@ def word_edits(source: str, old: str, new: str, *, macros: bool = True) -> tuple
 
 
 class CargoProjectTests(unittest.TestCase):
+    project_seed: ClassVar[Path]
     queue: StyleQueueFake = StyleQueueFake()
     repo: Path = Path()
     root: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.project_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="bulk-rename-seed-"))) / "project"
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.project_seed
+        fixture.create_project()
 
     @override
     def setUp(self) -> None:
@@ -100,6 +110,13 @@ class CargoProjectTests(unittest.TestCase):
         self.set_up_tools()
         self.queue = self.enterContext(unqueued_style_children())
         self.repo = self.root / "project"
+        self.set_up_project()
+        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
+
+    def set_up_project(self) -> None:
+        _ = shutil.copytree(self.project_seed, self.repo, symlinks=True)
+
+    def create_project(self) -> None:
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
         _ = (self.repo / ".gitignore").write_text("/target\n/Cargo.lock\n")
@@ -109,7 +126,6 @@ class CargoProjectTests(unittest.TestCase):
         _ = self.git("config", "user.email", "bulk@example.invalid")
         _ = self.git("add", ".")
         _ = self.git("commit", "-qm", "fixture")
-        _ = self.enterContext(style_staff_fixture(self.root, self.repo))
 
     def set_up_tools(self) -> None:
         tools = rust_tool_path(self.root / "tools")

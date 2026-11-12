@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
+from enum import Enum
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast, final, override
@@ -25,13 +26,14 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
+from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import process_group, process_start, atomic_file, conf
+from scripts.lib import process_group, process_start, atomic_file, conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
@@ -230,8 +232,8 @@ class RetireUnitTests(unittest.TestCase):
         listing = live_units.units_in("alpha", observed)
         rendered = unit_phases.table(listing, {}, snapshot=record, pane_rows={})
         self.assertEqual(rendered.splitlines(), [
-            "| Unit | Status | Progress | Phase | ETA | Workers | Non-Phase Work | Queued |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Unit | Status | Progress | Phase | Notes | ETA Next | Workers | Non-Phase Work | Queued |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ])
 
 
@@ -1915,6 +1917,175 @@ class WorkerRenameTests(StaffTestCase):
                 self.assertEqual(fixture.world.agent_names[-1], "TEST-new-impl")
                 self.assertEqual(fixture.world.locations[resumed.pane]["label"], "TEST-new-impl")
                 self.assertNotIn(old_name, [pane["label"] for pane in fixture.world.locations.values()])
+
+        class QualifiedWorkerCase(Enum):
+            OWNER_SUFFIX = "a prefix ends with the owner name"
+            OWNER_PREFIX = "the owner name is the prefix"
+            UNDECIDED = "the prefix does not end with the owner name"
+            DASHED_ROLE = "the bare role contains a dash"
+            NUMBERED_DASHED_ROLE = "the bare role contains a dash and digits"
+            UNDECIDED_DASHED_ROLE = "an undecided prefix keeps the dashed role"
+            SHELL_NO_TWIN = "the renamed row retains its shell pane"
+            PROCESS_UNKNOWN = "the shell process evidence is temporarily unreadable"
+            TERMINAL_UNKNOWN = "the shell terminal evidence is temporarily incomplete"
+            RETIRE_REFUSED = "a live native process prevents retirement"
+            CLOSED_CLASH = "the old row has no pane or active dispatch"
+            ACTIVE_CLASH = "the old row has an active dispatch"
+            OPEN_CLASH = "the old row has an open pane"
+            SHELL_CLASH = "the old row retains its shell pane"
+
+        for owner_kind in ("unit", "showrunner"):
+            for scenario in QualifiedWorkerCase:
+                with self.subTest(owner_kind=owner_kind, migration=scenario):
+                    fixture = WorkerPaneTests()
+                    fixture.setUp()
+                    try:
+                        _ = fixture.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", fixture.root / "astra"))
+                        owner = (staff.rename(fixture.parent.id, "TEST-handler") if owner_kind == "unit" else
+                                 fixture_member("showrunner", name="TEST-handler", parent=fixture.parent.parent))
+                        fixture.parent_id = owner.id
+                        if owner_kind == "showrunner":
+                            fixture.world.add(owner, "w2:p0", workspace="w2", tab="w2:t2")
+                        bare = ("astra-designer" if scenario in (QualifiedWorkerCase.DASHED_ROLE,
+                                QualifiedWorkerCase.UNDECIDED_DASHED_ROLE) else
+                                "astra-reviewer1481574" if scenario is QualifiedWorkerCase.NUMBERED_DASHED_ROLE else "review")
+                        prefix = ("TEST-handler" if scenario is QualifiedWorkerCase.OWNER_PREFIX else
+                                  "TEST-handler-enhancements" if scenario in (QualifiedWorkerCase.UNDECIDED,
+                                      QualifiedWorkerCase.UNDECIDED_DASHED_ROLE) else
+                                  "cargo-liner-TEST-handler")
+                        qualified = fixture.worker(prefix + "-" + bare)
+                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.ACTIVE_CLASH,
+                                 QualifiedWorkerCase.OPEN_CLASH, QualifiedWorkerCase.SHELL_CLASH,
+                                 QualifiedWorkerCase.RETIRE_REFUSED)
+                        bare_twins = [fixture.worker("review")] if scenario in twins else []
+                        later = ([fixture.worker(prefix + "-impl")] if scenario is QualifiedWorkerCase.RETIRE_REFUSED else [])
+                        if scenario is QualifiedWorkerCase.RETIRE_REFUSED:
+                            live = session(qualified.current_session, qualified.name, os.getpid())
+                            live["procStart"] = sessions.process_start(os.getpid()) or ""
+                            write_text_atomic(sessions.sessions_dir() / f"{os.getpid()}.json", json.dumps(live))
+                        dispatches: list[str] = []
+                        if scenario is QualifiedWorkerCase.ACTIVE_CLASH:
+                            dispatch_run = fixture.run_state()
+                            prompt = fixture.root / "TEST-prompt.txt"
+                            write_text_atomic(prompt, "Review the TEST change.")
+                            dispatches.append(progress_history.begin_dispatch(dispatch_run, slot=qualified.name, phase="earlier", role="review",
+                                worker_name=qualified.name, worker_id=qualified.id, launcher_command=["assign.sh"],
+                                prompt=prompt, kind="review", lens=""))
+                        recovery_cases = (QualifiedWorkerCase.PROCESS_UNKNOWN, QualifiedWorkerCase.TERMINAL_UNKNOWN)
+                        shell_cases = (QualifiedWorkerCase.SHELL_NO_TWIN, *recovery_cases)
+                        if scenario in (QualifiedWorkerCase.OPEN_CLASH, QualifiedWorkerCase.SHELL_CLASH, *shell_cases):
+                            fixture.world.add(qualified, "w1:p9", live=scenario is QualifiedWorkerCase.OPEN_CLASH,
+                                              workspace="w2" if owner_kind == "showrunner" and scenario in shell_cases else "w1",
+                                              tab="w2:t2" if owner_kind == "showrunner" and scenario in shell_cases else "w1:t1")
+                        if scenario is QualifiedWorkerCase.PROCESS_UNKNOWN:
+                            fixture.world.unknown["w1:p9"] = "TEST process evidence unavailable"
+                        if scenario is QualifiedWorkerCase.TERMINAL_UNKNOWN:
+                            fixture.world.locations["w1:p9"]["terminal_id"] = ""
+                        before = fixture.staff_file.read_bytes()
+                        arguments = ["rename", str(owner.id), owner.name]
+                        interruptions = (["before label", "after label"]
+                                         if scenario is QualifiedWorkerCase.SHELL_NO_TWIN else [])
+                        def retitle(pane: str, title: str, *, tab: bool = True) -> bool:
+                            del tab
+                            if pane == "w1:p9" and interruptions == ["before label", "after label"]:
+                                del interruptions[0]
+                                raise herdr_types.HerdrFailure("TEST interrupted before label")
+                            changed = fixture.world.locations[pane]["label"] != title
+                            fixture.world.locations[pane]["label"] = title
+                            if pane == "w1:p9" and interruptions:
+                                del interruptions[0]
+                                raise herdr_types.HerdrFailure("TEST interrupted after label")
+                            return changed
+                        server_read, server_command = fixture.world.result, fixture.world.run
+                        workspace_labels = {"w1": "unit", "w2": "other"}
+                        def migration_read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                            result = server_read(*arguments, deadline=deadline)
+                            if arguments[:2] == ("workspace", "list"):
+                                for space in cast(list[dict[str, object]], result["workspaces"]):
+                                    space["label"] = workspace_labels[str(space["workspace_id"])]
+                            return result
+                        def migration_command(*arguments: str, deadline: float = math.inf) -> str:
+                            if arguments[:2] == ("workspace", "rename"):
+                                workspace_labels[arguments[2]] = arguments[3]
+                            return server_command(*arguments, deadline=deadline)
+                        with (mock.patch.object(fixture.world, "retitle", side_effect=retitle),
+                              mock.patch.object(fixture.world, "result", side_effect=migration_read),
+                              mock.patch.object(fixture.world, "run", side_effect=migration_command),
+                              mock.patch.object(fixture.world, "save_layout"),
+                              mock.patch.object(worker, "end", wraps=worker.end) as end):
+                            if scenario is QualifiedWorkerCase.SHELL_NO_TWIN:
+                                for point in ("before label", "after label"):
+                                    interrupted = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
+                                                             dict(os.environ), CHECKOUT)
+                                    self.assertNotEqual(interrupted.returncode, 0, interrupted.stderr)
+                                    self.assertIn("TEST interrupted " + point, interrupted.stderr)
+                                    self.assertEqual(fixture.staff_file.read_bytes(), before)
+                            result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
+                                                dict(os.environ), CHECKOUT)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            if scenario in recovery_cases:
+                                self.assertEqual(fixture.staff_file.read_bytes(), before)
+                                self.assertEqual(fixture.world.locations["w1:p9"]["label"], qualified.name)
+                                reason = ("TEST process evidence unavailable" if scenario is QualifiedWorkerCase.PROCESS_UNKNOWN
+                                          else "recovery terminal identity is missing or duplicated")
+                                self.assertEqual([line for line in result.stderr.splitlines()
+                                                  if line.startswith(qualified.name + " (")], [
+                                    f"{qualified.name} ({qualified.id}): kept; {reason}"])
+                                fixture.world.unknown.clear()
+                                fixture.world.locations["w1:p9"]["terminal_id"] = "terminal-w1:p9"
+                                result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
+                                                    dict(os.environ), CHECKOUT)
+                                self.assertEqual(result.returncode, 0, result.stderr)
+                            if scenario in (QualifiedWorkerCase.UNDECIDED, QualifiedWorkerCase.UNDECIDED_DASHED_ROLE):
+                                self.assertEqual(fixture.staff_file.read_bytes(), before)
+                                self.assertEqual(result.stderr.splitlines(), [
+                                    f"{qualified.name}: kept; prefix does not end with {owner.name}; "
+                                    + f"run /agents rename {qualified.id} {bare}"])
+                            elif scenario is QualifiedWorkerCase.RETIRE_REFUSED:
+                                self.assertEqual(staff.by_id(qualified.id), qualified)
+                                self.assertEqual(staff.by_id(bare_twins[0].id), bare_twins[0])
+                                self.assertEqual(staff.by_id(later[0].id), replace(later[0], name="impl"))
+                                self.assertEqual(result.stderr.splitlines(), [
+                                    f"{qualified.name} ({qualified.id}) and {bare_twins[0].name} ({bare_twins[0].id}): kept; "
+                                    + f"{qualified.id}: native session is live (pid {os.getpid()}); stop it before removing its row"])
+                                end.assert_called_once()
+                            elif scenario is QualifiedWorkerCase.CLOSED_CLASH:
+                                self.assertEqual(staff.snapshot().find(kind="worker", parent=owner.id), bare_twins)
+                                end.assert_called_once()
+                                self.assertEqual(result.stderr, "")
+                            elif scenario in (QualifiedWorkerCase.ACTIVE_CLASH, QualifiedWorkerCase.OPEN_CLASH,
+                                              QualifiedWorkerCase.SHELL_CLASH):
+                                self.assertEqual(fixture.staff_file.read_bytes(), before)
+                                reason = (f"active dispatch {dispatches[0]}" if scenario is QualifiedWorkerCase.ACTIVE_CLASH else
+                                          "the old pane is not closed")
+                                twin = bare_twins[0]
+                                self.assertEqual(result.stderr.splitlines(), [
+                                    f"{qualified.name} ({qualified.id}) and {twin.name} ({twin.id}): kept; {reason}"])
+                                end.assert_not_called()
+                            else:
+                                self.assertEqual(staff.by_id(qualified.id), replace(qualified, name=bare))
+                                self.assertEqual(result.stderr, "")
+                                if scenario in shell_cases:
+                                    current = staff.by_id(qualified.id)
+                                    assert current is not None
+                                    self.assertEqual(fixture.world.locations["w1:p9"]["label"], owner.name + "-" + bare)
+                                    observed = worker_panes.observe_worker(owner.id, current, staff.snapshot())
+                                    self.assertIsInstance(observed, worker_panes.StoppedWorker)
+                                    assert isinstance(observed, worker_panes.StoppedWorker)
+                                    self.assertEqual(observed.pane, "w1:p9")
+                            retained = fixture.staff_file.read_bytes()
+                            panes = {pane: dict(value) for pane, value in fixture.world.locations.items()}
+                            again = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
+                                               dict(os.environ), CHECKOUT)
+                            self.assertEqual(again.returncode, 0, again.stderr)
+                            self.assertEqual(fixture.staff_file.read_bytes(), retained)
+                            self.assertEqual(fixture.world.locations, panes)
+                            self.assertEqual(again.stderr, result.stderr)
+                            self.assertEqual(again.stdout, "unchanged\n")
+                            self.assertEqual(fixture.world.stops, [])
+                            self.assertEqual(fixture.world.closed, [])
+                    finally:
+                        fixture.doCleanups()
 
     def test_worker_id_rename_keeps_the_full_pane_label_and_shared_tab(self) -> None:
 

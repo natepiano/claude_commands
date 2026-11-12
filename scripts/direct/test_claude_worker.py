@@ -25,6 +25,7 @@ from scripts.usage import agents_log
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id, fixture_worker, transcript_fixture, stopped_worker_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.socket_test_support import ShortUnixSocket
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 BACKEND = '''import json, os, sys, socket
@@ -224,10 +225,14 @@ class NativeClaudeWorkerTests(StaffTestCase):
             '{"type": "assistant", "message": {"stop_reason": "end_turn"}}',
             '{"type": "assistant", "message": {"stop_reason": "stop_sequence"}}',
         )) + '\n')
-        delivered = claude_worker.follow_up(turn, self.fixture.identity)
-        self.assertIsInstance(delivered, claude_worker.Delivered)
-        assert isinstance(delivered, claude_worker.Delivered)
-        self.assertEqual(delivered.turns_before, 2)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                if compressed:
+                    _ = compressed_copy(transcript)
+                delivered = claude_worker.follow_up(turn, self.fixture.identity)
+                self.assertIsInstance(delivered, claude_worker.Delivered)
+                assert isinstance(delivered, claude_worker.Delivered)
+                self.assertEqual(delivered.turns_before, 2)
 
     def test_claude_dispatch_records_the_task_role_before_delivery(self) -> None:
         for switched in (False, True):

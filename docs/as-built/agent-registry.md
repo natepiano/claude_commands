@@ -58,7 +58,8 @@ A direct change to an unsupported family refuses without writing.
 
 `[codex.agents]` and `[codex.families]` come from catalog synchronization.
 Family aliases such as `sol` resolve to a concrete model from `[codex.families]`.
-The Claude catalog and family aliases are hand-maintained.
+The Claude catalog and family aliases are hand-maintained. Each `[claude.families]` value is the family word itself (`fable=fable`).
+A Claude launch turns that word into the newest model of the family; see [Claude family resolution](#claude-family-resolution).
 `production` has only a Claude set. `design_roles` has only a Codex set.
 `ask_a_friend` selects the caller's family.
 
@@ -133,6 +134,27 @@ Bash loads that table with `_models_table_load` and runs the real `agents_resolv
 The child environment sets `MODELS_CONFIG_TIER_ONLY=1`, so this path never synchronizes the Codex catalog.
 The result is four lines: family, model, effort, and service tier.
 A resolver failure or bad output raises `ValueError`. A missing registry raises `OSError` before bash starts.
+
+### Claude family resolution
+
+`_agents_model_slug claude <word>` is the one Claude model resolver.
+It reads the `*-cc.json` file with the largest `.fetchedAt` under `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache/model-catalog/`.
+It prints `.catalog.config.provider_alias_targets.<word>.default` when the installed `claude --version` meets that model's `min_claude_code_version`.
+In every other case it prints the `[claude.families]` value. A full model id passes unchanged.
+
+`agents_resolve` and `launch_settings` keep the family word in `AGENT_MODEL`. `AGENT_WORD` keys `[claude.agents]` effort lookups.
+Each account has its own catalog, so a launch resolves only after it chooses the account, with that account's environment.
+`models_registry.claude_model(model, environment)` and `claude_arguments(arguments, environment)` run the resolver for Python launchers. A failed call returns the input model.
+The launch paths are `herdr.launch_prepared_agent`, `stop_resume`, `accounts.exec_account`, `relaunch.child_launch`, `claude_worker`, `agent_exec.sh`, `cli_agent.sh`, the `send.py` relay and `review.py`.
+`worker_panes._live_policy` compares an unchanged explicit Claude policy with its resolved model, so a live pane stays reusable.
+
+Run records name the model that ran, not the family word:
+
+- `review.sh` runs `claude_launch_environment workers` and resolves `AGENT_MODEL` before it writes the agent file, board `register` line, `--called-model` and heartbeat header. It passes `AGENT_EXEC_CLAUDE_MODEL`, so `agent_exec.sh` skips its own account choice and resolve.
+- `claude_worker.prepare_launch(turn)` returns `PreparedClaudeLaunch(model, environment, loaded)`. `assign_claude.py` writes every record from that model and passes the same launch to `open_worker`.
+- `_switch` in `assign_claude.py` returns `NewClaudeWorker`, `ClaudeDeliveryRetry` or `ClaudeFollowUp`. Only `NewClaudeWorker` prepares a launch. A delivery retry reuses the published session, so it and a follow-up take the model from the saved worker record.
+
+Tests set a temporary `HOME` and `MODELS_CONFIG_PUBLISH=0`, and build a fixture catalog in a temporary `CLAUDE_CONFIG_DIR`. No test writes the live registry.
 
 ### Agent environment boundary
 

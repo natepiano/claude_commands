@@ -152,6 +152,14 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
             _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
 
 
+@dataclass(frozen=True)
+class _ResultNotReceived:
+    """No valid final result establishes an earlier box end time."""
+
+
+_RESULT_NOT_RECEIVED = _ResultNotReceived()
+
+
 @final
 class GateWorker:
     """Own one durable launch, result transfer, and confirmed termination."""
@@ -200,13 +208,15 @@ class GateWorker:
                 return False
             raise
 
-    def terminate(self, attempt: str, instance: str) -> None:
+    def terminate(self, attempt: str, instance: str, *,
+                  result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
         api = self.regional_api(self.box_region)
         _ = api.call('terminate-instances', '--instance-ids', instance)
         deadline = self.clock() + settings().number('termination_timeout_s')
         while self.clock() < deadline:
             if api.observe(instance, int(self.clock())).state == 'terminated':
-                self.book.resolve_gate(attempt, ledger.GateTerminated(int(self.clock()), instance))
+                ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
+                self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
                 return
             self.pause(settings().number('result_poll_s'))
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
@@ -364,6 +374,7 @@ class GateWorker:
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
+        result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
             if not (folder / 'launch.json').exists():
@@ -401,6 +412,7 @@ class GateWorker:
                         if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
                             raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
                         if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
+                            received_at = int(self.clock())
                             if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                                 raise ValueError('The final log is absent')
                             result = read(folder / 'remote-result.json')
@@ -408,6 +420,7 @@ class GateWorker:
                             if request.get('task') == 'paired' and any(
                                     sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
                                 raise ValueError('The sample instance type differs from the launch')
+                            result_seen_at = received_at
                             self.record_launch(request, ledger.text(arguments, 'InstanceType'), '', 'finished',
                                                gate_s=float(str(result['gate_s'])))
                             row = result
@@ -427,7 +440,7 @@ class GateWorker:
                     raise ValueError('The instance expired without a final result')
             finally:
                 with defer_cleanup_signals():
-                    self.terminate(attempt, instance)
+                    self.terminate(attempt, instance, result_seen_at=result_seen_at)
             return {'status': 'complete', 'instance': instance, 'result': row}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}

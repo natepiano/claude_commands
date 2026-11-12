@@ -30,6 +30,7 @@ from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
@@ -256,7 +257,7 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
     except ValueError:
         return
     tokens = 0
-    with source.open(encoding="utf-8") as transcript:
+    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
             record = rollouts.decode_rollout(line)
             if record is None:
@@ -615,6 +616,7 @@ def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.Wo
         return worker_panes.start_or_resume(parent, WorkerName.parse(name) if name else _free_name(parent, role, staff.snapshot()), role)
 
 
+@herdr.pane_evidence_run()
 def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path, slot: str,
            phase: str, kind: str, launcher_command: list[str], lens: str = "", name: str = "",
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
@@ -859,6 +861,7 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",

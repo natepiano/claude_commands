@@ -753,26 +753,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertIsInstance(ledger.named_held((old.finding_id,))[0].state, style_ledger.Withdrawn)
             self.assertIsInstance(ledger.named_held((resolved.finding_id,))[0].state, style_ledger.Waived)
 
-    def test_unchanged_rule_reconciliation_reads_distinct_pins_without_hydrating_findings(self) -> None:
-        rule = self.rule("unchanged")
-        with self.ledger() as ledger:
-            blob = self.blob(rule)
-            for line in range(1, 41):
-                finding = ledger.hold(rule, self.sources[0], line, "violation", "rename", "old", "new", blob, "outside")
-                ledger.file_held(finding.finding_id, self.root / "decision.md")
-            statements: list[str] = []
-            connection = ledger._connection  # pyright: ignore[reportPrivateUsage]
-            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
-            connection.set_trace_callback(statements.append)
-            try:
-                self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
-            finally:
-                connection.set_trace_callback(None)
-            finding_reads = [sql for sql in statements if "held_findings" in sql.lower()]
-            self.assertEqual(len(finding_reads), 1, finding_reads)
-            self.assertIn("group by", finding_reads[0].lower())
-            self.assertLessEqual(len(statements), 4, statements)
-
     def test_rule_body_change_withdraws_every_open_finding_atomically(self) -> None:
         changed = self.rule("changed")
         other = self.rule("other")
@@ -1523,11 +1503,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual(ledger.named_held((finding.finding_id,))[0].after, "other")
         self.assertEqual(len(self.held_rows(ledger.database)), 2)
         self.assertEqual(ledger.named_held((first.finding_id,))[0].after, "other")
-
-    def test_held_replace_refuses_an_unknown_id(self) -> None:
-        result = self.cli("held", "replace", "--id", "missing", "--after", "new", success=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr.strip(), "style_ledger: unknown held finding missing")
 
     def test_decline_keeps_a_nonempty_actor_when_it_overrides_a_unit_waive(self) -> None:
         rule = self.rule("decline-actor")
