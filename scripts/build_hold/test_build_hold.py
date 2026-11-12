@@ -975,7 +975,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
         for options in ((), ("--drain",)):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as scratch, \
-                 mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()):
+                 mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())):
                 folder = Path(scratch)
                 result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test", *options)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -2290,10 +2290,13 @@ class BuildAuditTests(IsolatedBuildHoldTest):
     proc: Path = Path()
     holders: Path = Path()
     log: Path = Path()
+    claimed: frozenset[build_hold.ProcessIdentity] = frozenset()
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.claimed = frozenset()
+        _ = self.enterContext(mock.patch.object(hold_enforcer, "claimed_processes", side_effect=self.read_claims))
         self.proc = self.scratch / "proc"
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
@@ -2302,6 +2305,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.holders.mkdir()
         _ = write_holder(self.holders, "holder", "2026-10-28T12:00:00+00:00", "app test")
         self.log = self.scratch / "buildlog"
+
+    def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
+        self.assertEqual(proc_root, self.proc)
+        return build_hold.LiveClaims(self.claimed)
 
     def process(self, pid: int, command: str, *, parent: int = 1, start: int = 0,
                 environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:
@@ -2340,14 +2347,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
     def enforce_builds(self) -> tuple[list[tuple[int, int]], tuple[hold_enforcer.BuildDecision, ...]]:
         table = hold_enforcer.read_processes(self.proc, os.getuid(), self.scratch / "cgroup")
         holders = build_hold.natedev_holds(self.holders).in_force
-        decisions = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+        decisions = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
         signals: list[tuple[int, int]] = []
         stopper = hold_enforcer.StopBuildsAndTests(
             self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)),
         )
         for decision in decisions:
             if isinstance(decision, hold_enforcer.WouldStopBuild):
-                stopper.stop(decision, table, holders, 999)
+                stopper.stop(decision, table, holders, 999, self.claimed)
         return signals, decisions
 
     def assert_gate_job_stopped(self) -> None:
@@ -2413,7 +2420,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                                       build_hold.audit_ancestors(table[20], table)], [10])
                     self.assertNotIn("BUILDLOG_CALL_ID", table[20].environment)
                     holders = build_hold.natedev_holds(self.holders).in_force
-                    before = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    before = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
                     self.assertEqual([decision.process.identity.pid for decision in before], [10, 20])
                     for decision in before:
                         self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
@@ -2424,7 +2431,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                         (build_hold.ProcessIdentity(kept_pid, str(kept_pid * 10)),),
                     )
                     holders = build_hold.natedev_holds(self.holders).in_force
-                    kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
                     self.assertEqual([decision.process.identity.pid for decision in kept], [10, 20])
                     for decision in kept:
                         self.assertIsInstance(decision, hold_enforcer.KeptBuild)
@@ -2435,10 +2442,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     )
                     for decision in before:
                         if isinstance(decision, hold_enforcer.WouldStopBuild):
-                            stopper.stop(decision, table, holders, 999)
+                            stopper.stop(decision, table, holders, 999, self.claimed)
                     for pid in (10, 20):
                         stopper.terminating[table[pid].identity] = 0
-                    stopper.kill_survivors(table, holders, 999)
+                    stopper.kill_survivors(table, holders, 999, self.claimed)
                     self.assertEqual(signals, [])
                     self.assertEqual(stopper.terminating, {})
                     self.assertEqual(self.rows(), [])
@@ -2458,6 +2465,16 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.assertEqual([(item.process.identity.pid, item.classification) for item in builds],
                          [(10, "holder"), (21, "admitted"), (30, "other_session"), (40, "no_session")])
         self.assertEqual([item.pid for item in builds[1].children], [22, 23, 24])
+
+        _ = self.process(35, "python3", parent=30, argv=("python3", "offload.py", "check"))
+        self.claimed = frozenset({build_hold.ProcessIdentity(35, "350")})
+        builds = self.builds()
+        claimed = next(item for item in builds if item.process.identity.pid == 30)
+        self.assertEqual(claimed.classification, "claimed")
+        self.assertIn("holds a live Mac or AWS claim: other, pid 30", "\n".join(build_hold.audit_lines(builds)))
+        self.claimed = frozenset()
+        ended = next(item for item in self.builds() if item.process.identity.pid == 30)
+        self.assertEqual(ended.classification, "other_session")
 
     def test_nearest_agent_ancestor_with_unreadable_environment(self) -> None:
         _ = self.process(10, "claude", environment={"CLAUDE_CODE_SESSION_ID": "farther"})
@@ -2657,6 +2674,37 @@ with mock.patch("sys.exit", side_effect=exit_code):
                 self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)
             self.assertIn("Build audit unavailable:", output.getvalue())
             self.assertTrue((self.holders / "holder").is_file())
+
+        _ = self.process(60, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "reader-owner"})
+        for reading in ("unreadable", "claim after table"):
+            with self.subTest(claim_read=reading):
+                events: list[str] = []
+                read_table = build_hold.read_audit_processes
+
+                def table_before_claims(proc_root: Path) -> dict[int, build_hold.AuditProcess]:
+                    table = read_table(proc_root)
+                    events.append("table")
+                    return table
+
+                def read_after_table(proc_root: Path) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
+                    self.assertEqual(proc_root, self.proc)
+                    events.append("claims")
+                    self.assertEqual(events, ["table", "claims"])
+                    if reading == "unreadable":
+                        return build_hold.ClaimsUnreadable("private claims are damaged")
+                    return build_hold.LiveClaims(frozenset({build_hold.ProcessIdentity(60, "600")}))
+
+                errors = io.StringIO()
+                with mock.patch.object(build_hold, "read_audit_processes", side_effect=table_before_claims), \
+                     mock.patch.object(hold_enforcer, "claimed_processes", side_effect=read_after_table), \
+                     redirect_stderr(errors):
+                    builds = self.builds()
+                build, = builds
+                self.assertEqual(build.process.identity.pid, 60)
+                self.assertEqual(build.classification, "other_session" if reading == "unreadable" else "claimed")
+                self.assertIn("pid 60", "\n".join(build_hold.audit_lines(builds)))
+                self.assertEqual(errors.getvalue().splitlines(),
+                                 ["claims unreadable: private claims are damaged"] if reading == "unreadable" else [])
 
 
 if __name__ == "__main__":

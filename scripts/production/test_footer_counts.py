@@ -164,8 +164,9 @@ class FooterCountsTests(unittest.TestCase):
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
+        sources: list[Path] = []
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state), "USER_ZONE": "UTC"}):
-            line, due, sources = counts_row.row(instance)
+            line, due = counts_row.row(instance, sources)
         self.assertEqual(line, "For you: 1 question")
         self.assertEqual(due, "")
         self.assertIn(folder, sources)

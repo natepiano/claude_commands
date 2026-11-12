@@ -5,6 +5,7 @@ description: Report context costs and compare saved results.
 Use `report` when `$ARGUMENTS` is empty or starts with `--`.
 Otherwise use `$ARGUMENTS` unchanged.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/usage/context_economy.py <arguments>`.
+The command forwards to natedev over SSH on other hosts and prints its output.
 For `changes`, remove `--raw` from the arguments. Without `--raw`, print only the summary in <ChangesSummary/>.
 For all other commands, and for `changes --raw`, print the output as it arrives.
 
@@ -21,7 +22,7 @@ Use `--family claude` for every precompute experiment save, threshold read, and 
 Use `--where KEY=JSON` on `report`, `save` or `compare`; repeat it for more settings.
 `report` shows the filtered value in the settings column and omits rows with no samples.
 
-Both machines cache parsed transcript events under `~/.cache/context_economy/`.
+Natedev caches parsed transcript events under `~/.cache/context_economy/`.
 Warm reads reuse unchanged files; appended files resume at the last complete line with their saved parser state.
 Append checks hash only the first 4 KiB and the last 4 KiB before the saved offset.
 A failed anchor, size, device, or inode check causes a full parse.
@@ -31,7 +32,7 @@ Summaries survive file deletion and share one entry with the `.jsonl.zst` form.
 Compressed files without a summary use the shared zstd reader once.
 `cache_max_megabytes` in `config/context_economy.conf` bounds reproducible entries by least recent access.
 Entries whose plain source files are compressed or deleted remain protected from eviction.
-Long reads show file progress on stderr, including the Mac read.
+Long reads show file progress on stderr.
 `progress_seconds` in the same config sets the update interval.
 
 <ChangesSummary>

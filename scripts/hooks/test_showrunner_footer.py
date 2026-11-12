@@ -152,8 +152,9 @@ class QuestionLibraryTests(unittest.TestCase):
                 _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
                 identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
+                paths: list[Path] = []
                 with contextlib.redirect_stderr(errors):
-                    line, due, paths = counts_row.row(instance, identities=identities)
+                    line, due = counts_row.row(instance, paths, identities=identities)
                 self.assertEqual(line, "For you: 1 efficiency")
                 self.assertEqual(due, "")
                 self.assertIn(document, paths)
@@ -187,6 +188,20 @@ class QuestionLibraryTests(unittest.TestCase):
                 _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {owner.id}\n")
                 self.assertIsNone(showrunner_footer.read_production(instance))
 
+    def test_read_production_reports_document_read_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            doc = root / "production.md"
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
+                instance = root / f"showrunner-{owner.id}"
+                for failure in ("missing", "invalid encoding"):
+                    with self.subTest(failure=failure):
+                        if failure == "invalid encoding":
+                            _ = doc.write_bytes(b"\xff")
+                        with self.assertRaises(showrunner_footer.FooterError):
+                            _ = showrunner_footer.read_production(instance)
+
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -219,11 +234,12 @@ class QuestionLibraryTests(unittest.TestCase):
                         + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
                         + f"registration: {json.dumps(fields)}\n---\n# {title}\n", encoding="utf-8")
                 identities = QuestionStaff.read()
+                sources: list[Path] = []
                 with (mock.patch.object(counts_row, "showrunner_footer", showrunner_footer),
                       mock.patch.object(QuestionStaff, "read", return_value=identities) as read_context,
                       mock.patch.object(showrunner_footer, "outstanding_path",
                                         wraps=showrunner_footer.outstanding_path) as outstanding):
-                    line, due, sources = counts_row.row(instance)
+                    line, due = counts_row.row(instance, sources)
                 self.assertTrue(outstanding.call_args_list)
                 for call in outstanding.call_args_list:
                     self.assertIs(cast(object, call.kwargs["identities"]), identities)

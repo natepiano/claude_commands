@@ -3914,14 +3914,46 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_piped_status_keeps_an_unrepresented_helper_warning(self) -> None:
         original = accounts.account_statuses
-        def inspect() -> list[accounts.AccountStatus]:
-            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
-            return original()
-        with patch.object(accounts, "account_statuses", side_effect=inspect):
-            code, output, error = self.run_cli("status", "--stored", "--json")
-        self.assertEqual((code, error), (0, ""))
-        lines = cast(list[str], json.loads(output)["problems"])
-        self.assertIn("accounts: read warning; usage store: could not claim the read; read without a hold", lines)
+        retain_raw = accounts.StatusDiagnostics.retain_raw
+        repeated = tuple(f"anomaly: session-{index}: herdr pane list: server_not_running" for index in range(23))
+        cases = (
+            (("usage store: could not claim the read; read without a hold",),
+             ("accounts: read warning; usage store: could not claim the read; read without a hold",)),
+            (repeated + (repeated[0],),
+             ("accounts: read warning; herdr pane list: server_not_running (23 sessions)",)),
+            ((repeated[0], "anomaly: session-other: herdr pane list: server_not_running",
+              "anomaly: session-0: herdr pane list: permission denied",
+              "anomaly: session-other: herdr pane list: permission denied"),
+             ("accounts: read warning; herdr pane list: server_not_running (2 sessions)",
+              "accounts: read warning; herdr pane list: permission denied (2 sessions)")),
+            ((repeated[0],),
+             ("accounts: read warning; anomaly: session-0: herdr pane list: server_not_running",)),
+            (("anomaly: /tmp/claude/run-a: this run has no owner because progress_history_state.json names no staff row",
+              "anomaly: /tmp/claude/run-b: this run has no owner because progress_history_state.json names no staff row"),
+             ("accounts: read warning; anomaly: /tmp/claude/run-a: this run has no owner because progress_history_state.json names no staff row",
+              "accounts: read warning; anomaly: /tmp/claude/run-b: this run has no owner because progress_history_state.json names no staff row")),
+            (("anomaly: shared server unavailable", "anomaly: another server unavailable"),
+             ("accounts: read warning; anomaly: shared server unavailable",
+              "accounts: read warning; anomaly: another server unavailable")),
+        )
+        for warnings, expected in cases:
+            for flags in ((), ("--json",)):
+                with self.subTest(warnings=warnings, flags=flags):
+                    raw: list[str] = []
+                    def inspect() -> list[accounts.AccountStatus]:
+                        for warning in warnings:
+                            print(warning, file=sys.stderr)
+                        return original()
+                    def retain(diagnostics: accounts.StatusDiagnostics, text: str, *, delivered: bool) -> None:
+                        retain_raw(diagnostics, text, delivered=delivered)
+                        raw.extend(diagnostics.raw)
+                    with (patch.object(accounts, "account_statuses", side_effect=inspect),
+                          patch.object(accounts.StatusDiagnostics, "retain_raw", new=retain)):
+                        code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines()
+                    self.assertEqual(tuple(line for line in lines if line.startswith("accounts: read warning;")), expected)
+                    self.assertEqual(tuple(raw), warnings)
 
     def test_piped_status_preserves_unknown_reader_and_renderer_warnings(self) -> None:
         original = accounts.render_status_json

@@ -108,7 +108,19 @@ An interruption marker reports the instance generation.
 - Unpinned test, check, doc, example, and lint judgments try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
-- `hold_enforcer.protected_reason` protects every step state except `ON_NATEDEV`, so a natedev hold stops only local work.
+- A natedev hold permits a process that holds a live Mac or AWS claim, plus its ancestors and descendants.
+  The reason is `holds a live Mac or AWS claim`, even when the step record is stale or unreadable.
+  The enforcer reads the process table before it reads claims once per pass during a hold.
+  It uses the same claims for decisions and signals.
+  A claim or target config read error prevents TERM and KILL for that pass.
+  The enforcer reports the error once and reports recovery once.
+  Audits and reports show the error and list builds without claim protection.
+  The drain reports the error once and stops no waiting run until claims are readable.
+  If the initial claim read fails, the drain hold keeps every outermost gate.
+  After claims become readable, the drain stops waiting gates and keeps working gates alive.
+  A new claim cancels a pending kill. An ended claim permits the next pass to stop the family.
+  `hold_enforcer.protected_reason` keeps live step controllers and route children alive in `waiting_hold` and `waiting_mac`.
+  `--drain` also waits for cargo children and admission reservations. It still stops waiting runs.
 
 ### Cost ledger and spending guard: `scripts/aws_target/`
 
@@ -276,6 +288,13 @@ It can import the administrator profile and the old OAuth file.
 It removes those plain credentials only after the encrypted write succeeds.
 It preserves the scaler profile and all unrelated sections.
 Enter retains a stored value during replacement.
+
+One resolver selects the scaler credential file for deployment, key creation, and teardown.
+It uses a nonempty `AWS_SHARED_CREDENTIALS_FILE` override before `credential_file` from `cloud_gate.conf`.
+It expands `~` in either path.
+Every `deploy.py` command sets the resolved path in its environment before dispatch.
+AWS CLI subprocesses inherit the same path.
+User deployment commands need no credential environment prefix.
 
 `price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
 `prepare` decrypts only when it must reconcile existing AWS resources.
@@ -749,6 +768,8 @@ A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
 `deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+Credential refusals print their message once and stop the command with a nonzero exit status.
+AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
