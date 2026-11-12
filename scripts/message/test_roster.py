@@ -456,7 +456,8 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(report["warnings"], ["bad: the production document is not recorded"])
         self.assertEqual(errors, ["could not read: warning: bad: the production document is not recorded"])
         self.assertIn("unit-one", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
-        self.assertNotIn("free-claude", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+        self.assertNotIn(f"session:{bad.current_session}",
+                         [entry["address"] for entry in cast(list[dict[str, object]], report["entries"])])
 
     def test_docless_staff_row_does_not_block_a_peer_name(self) -> None:
         _ = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")

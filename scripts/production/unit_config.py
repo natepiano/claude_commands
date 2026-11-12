@@ -160,19 +160,9 @@ class NoFormattingWorktree:
 
 
 @dataclass(frozen=True)
-class Branch:
-    value: str
-
-    def __post_init__(self) -> None:
-        if not self.value or any(character.isspace() for character in self.value):
-            raise ConfigRefused(f"retired.branch: invalid branch {self.value!r}")
-
-
-@dataclass(frozen=True)
 class RetiredSession:
     date: str
     session_id: str
-    branch: Branch
 
     def __post_init__(self) -> None:
         try:
@@ -322,10 +312,9 @@ def decode(fields: dict[str, object]) -> UnitConfig:
         if not isinstance(raw_retired, dict):
             raise ConfigRefused("retired: expected a table")
         facts = cast(dict[str, object], raw_retired)
-        if set(facts) - {"folder"} != {"date", "session", "branch"}:
-            raise ConfigRefused("retired: expected date, session and branch")
-        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"),
-                                 Branch(_string(facts, "branch")))
+        if set(facts) != {"date", "session"}:
+            raise ConfigRefused("retired: expected date and session")
+        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"))
     formatting = RepositoryTaploConfig(_string(fields, "taplo_config")) if "taplo_config" in fields else DefaultTaploConfig()
     return UnitConfig(plan, port, tuple(duties), retired, formatting)
 
@@ -369,8 +358,7 @@ def _fields(config: UnitConfig) -> dict[str, object]:
         fields["taplo_config"] = config.formatting.text
     if isinstance(config.retired, RetiredSession):
         facts = config.retired
-        fields["retired"] = {"date": facts.date, "session": facts.session_id,
-                             "branch": facts.branch.value}
+        fields["retired"] = {"date": facts.date, "session": facts.session_id}
     return fields
 
 

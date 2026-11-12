@@ -286,7 +286,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         mock.patch.object(merge_gate, "run_suites", side_effect=suite_run), \
-                        mock.patch.object(merge_gate, "tell_nightly_red") as notice, \
+                        mock.patch.object(merge_gate, "tell_nightly_red", return_value=merge_gate.NightlyNoticeUnreceived()) as notice, \
                         mock.patch.object(merge_gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
                     code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
                 self.assertEqual(code, int(red), output.getvalue())
@@ -351,7 +351,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
                 mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
                 redirect_stdout(output):
-            merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
+            _ = merge_gate.tell_nightly_red(merge_gate.GateArguments(merge_branch="integration"),
                                         "fixture-tree", ["hooks/test_first.py"])
         send.assert_called_once()
         arguments = send.call_args

@@ -26,7 +26,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.herdr import herdr_types  # noqa: E402
+from scripts.herdr import herdr, herdr_types  # noqa: E402
 from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
@@ -1286,8 +1286,6 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None) -> Roster:
     """Use the reported session or the pane process to address Codex."""
-    from scripts.herdr import herdr
-
     membership = staff.initial_snapshot() if membership is None else membership
     entries: list[RosterEntry] = []
     problems: list[str] = []
@@ -1350,6 +1348,8 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
+@herdr.observation_snapshot()
+@herdr.pane_snapshot()
 def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot,
                   registry: RegistryRead) -> Roster:
     home_state = account.home_account_state()
