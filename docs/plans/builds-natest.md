@@ -3383,92 +3383,20 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 202 — Hold-event tests run the recorder in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The build-hold tests write hold-event records through `record.main` in process, wait for each write as the subprocess path does, keep one real recorder process, and save measured aws CPU.
-
-**Decision:** resources, 2026-11-12: go for this test-only trial with two conditions. (1) Every hold-event record assertion keeps its expected contents; the in-process path waits for the asynchronous write the same way the subprocess path does, so no test passes on an empty or partial file. (2) Keep one test that runs the real recorder as a process, so the entry point stays covered. report, 2026-11-12: go with four conditions. (1) The in-process path runs the same record-writing code the detached recorder runs; record content and target file do not change; only the process start goes. (2) Keep real process starts for the detached recorder path and one case where two holders record at the same time (writer lock and order). (3) Tests wait for recorder completion, never a sleep or a poll interval. (4) No production change in `scripts/buildlog`; report receives the test file hash before it lands. Architect after Phase 201: content-call candidate (247 recorder starts, 19.409 local CPU s; bound 0–19.409 CPU s). Land only on a measured aws gain.
-
-**Spec:**
-1. In `scripts/build_hold/build_hold_test_support.py`, replace the recorder process that `start_recorder` (`build_hold.py:934`) starts with an in-process call of `record.main(argv)` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) or an equivalent test-side patch. Pass the same argv, environment and working folder. Patch `record.detach` in the test only.
-2. Keep the asynchronous shape: run the in-process write on the `hold-event-recorder` thread name, so `reap_recorders` and `recorded_hold_events` (completion, not a polling interval) still wait for every write before a test reads the file.
-3. Keep real recorder processes for the detached recorder path and for one case where two holders record at the same time (writer lock and order). Name each kept case in the reply.
-4. Keep every assertion and every expected record content. Add no new test method. Change no production file.
-
-**Files:**
-- `scripts/build_hold/build_hold_test_support.py` — the recorder patch and the wait.
-- `scripts/build_hold/test_build_hold.py` — only if the kept real-recorder case needs a marker.
-
-**Workers:** 1 writer; the support file holds the change.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 201: `invoke_cli` and the `detach` patch run `record.main` in process; `buildlog/test_record.py` fell 22.90 to 11.50 CPU s.
-- No speed phase lands on a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- `build_hold/test_build_hold.py`, `build_hold/test_override_guard.py` and every importer of the support file pass; basedpyright reports 0 errors and 0 warnings on the changed files.
-- An aws paired trial shows a CPU saving for the build-hold modules.
-- resources and report receive the file hashes before they land.
+- Checkpoint `9e14aa8fe`. `scripts/build_hold/build_hold_test_support.py` runs the hold-event recorder through the real `record.main` in a thread named `hold-event-recorder`, in place of one detached Python process per hold event. The row and its log path resolve under the caller environment and cwd before the caller continues; the real `store.append_line` write completes in the thread; `reap_recorders` joins every writer before a read and before teardown. The thread calls `record.main` directly, so the `record` module bindings stay stable through an append error (review fix F001; an earlier `invoke_cli` wrap restored them while the thread ran). Four cases keep real recorder processes: detached launch and reaping, two-holder record order, a locked log, and the launch-failure path. All 141 test bodies and assertions stay; no production file changed. report and resources gave the go; report checked the final support file at SHA-256 `9fd1b6cb`. aws pairs on the final file: `build_hold/test_build_hold.py` 30.72 to 9.39 CPU s (21.38 s, 3/3 rounds); wall 18.4 to 13.0 s; peak 616 to 158 MiB; `test_override_guard.py` unchanged.
 
 ### Phase 203 — Phase-table tests call the phase-table command in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_phase_table.py` runs its show, prune, archive and refresh content cases through the command's main in process with `invoke_cli`, keeps one real CLI start for the entry path, and saves measured aws CPU.
-
-**Decision:** sdlc via builds, 2026-11-12: go, test-only, code only on a measured gain. Architect after Phase 201: content-call candidate (67 starts, 9.240 local CPU s; bound 0–9.240 CPU s).
-
-**Spec:**
-1. Route `run_show_production` (`test_phase_table.py:279`), `run_prune` (`:297`), `run_archive` (`:314`) and `run_refresh` (`:453`) through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with the command's main. Pass the same argv, environment, working folder and stdin; return the same `subprocess.CompletedProcess[str]` shape, so callers stay unchanged.
-2. Keep one real CLI start for the entry path (`sys.executable` and the script), and real starts for any case that checks locks between processes, signals or timeouts. Name each kept case in the reply.
-3. Patch any process-wide side effect in the test only; name each one. Keep every assertion. Add no new test method. Change no production file.
-
-**Files:**
-- `scripts/direct/test_phase_table.py` — the run helpers and the kept CLI case.
-
-**Workers:** 1 writer; one test file holds the whole change.
-- impl: `scripts/direct/test_phase_table.py`.
-
-**Constraints from prior phases:**
-- Phase 201: `invoke_cli` sets the full environment, cwd, argv, stdin and output, maps `SystemExit` to the status, and restores bindings, import path and signal state; `buildlog/test_record.py` fell 22.90 to 11.50 CPU s.
-- No speed phase lands on a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- `direct/test_phase_table.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
-- An aws paired trial shows a CPU saving for `direct/test_phase_table.py`.
+- Checkpoint `52d1e5952`. `scripts/direct/test_phase_table.py` runs its show, prune, archive and refresh content cases through `phase_table.main` in process with the shared `invoke_cli` helper (`scripts/production/cli_fixture.py:84`). The test points `showrunners.NOTIFIER_STATE_DIR` at the fixture folder and restores it after each call. `test_show_help_loads_outside_repository` keeps the real CLI entry path. All 97 test methods and 531 assertions stay; no production file changed. sdlc gave the go; file SHA-256 `98530a20`. aws pairs: 12.88 to 3.03 CPU s (9.85 s, 3/3 rounds); wall 15.7 to 5.8 s.
 
 ### Phase 204 — Screenshot tool tests call the tool in process for argument and validation cases  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/hana_shot/test_hana_shot.py` runs its argument and validation cases through the tool's main in process with `invoke_cli`, keeps real CLI starts where the process boundary is the check, and saves measured aws CPU.
-
-**Decision:** natedev (owner of `scripts/hana_shot`) via builds, 2026-11-12: go for `:418` and `:585`; test-only; the CLI cases keep their exit codes and output checks; code lands only on a measured aws gain. Architect after Phase 201: content-call candidate (142 starts, 21.735 local CPU s; bound 0–21.735 CPU s). Test file only; hana-shot owns it. Land only on a measured aws gain.
-
-**Spec:**
-1. Route the helpers at `test_hana_shot.py:418` (`run_python`) and the shot helper used at `:585` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) for cases that check arguments, exit codes and output text. Pass the same environment (`script_environment`), working folder (`self.scratch`), argv and stdin; return the same `subprocess.CompletedProcess[str]` shape.
-2. Keep real CLI starts for: the entry path through `scripts/lib/py`, cases that check signals, timeouts, cold imports or child process lifetime, and cases whose fake server needs a separate process. Name each kept case in the reply.
-3. Patch any process-wide side effect in the test only; name each one. Keep every assertion. Add no new test method. Change no production file.
-
-**Files:**
-- `scripts/hana_shot/test_hana_shot.py` — the run helpers and the kept CLI cases.
-
-**Workers:** 1 writer; one test file holds the whole change.
-- impl: `scripts/hana_shot/test_hana_shot.py`.
-
-**Constraints from prior phases:**
-- Phase 201: `invoke_cli` sets the full environment, cwd, argv, stdin and output, maps `SystemExit` to the status, and restores bindings, import path and signal state; `buildlog/test_record.py` fell 22.90 to 11.50 CPU s.
-- No speed phase lands on a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- `hana_shot/test_hana_shot.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
-- An aws paired trial shows a CPU saving for `hana_shot/test_hana_shot.py`.
+- Checkpoint `d3269a529`. `scripts/hana_shot/test_hana_shot.py` runs its argument and validation content cases through `hana_shot.main` in process with the shared `invoke_cli` helper. A test helper gives each direct call a private `worker_pool` and `EXIT_SIGNAL_LATCH` and closes the pool after the call. Eighteen cases keep real CLI starts: entry and cold imports, timeout limits, traceback output, background cleanup at exit, keep-awake child lifetime, and signal delivery. All 117 test methods and 575 assertions stay; no production file changed. natedev gave the go; file SHA-256 `fecae85b`. aws pairs: 24.95 to 6.88 CPU s (18.07 s, 3/3 rounds); wall 25.9 to 7.7 s.
