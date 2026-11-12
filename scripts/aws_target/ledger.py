@@ -152,6 +152,64 @@ class PriceSample:
 
 
 @dataclass(frozen=True)
+class RegionalSpotPrice:
+    region: str
+    zone: str
+    instance_type: str
+    usd_per_hour: Decimal
+    read_at: int
+
+
+def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
+    """Read the complete regional price snapshot, or return no rows when absent."""
+    try:
+        document = mapping(cast(object, json.loads((directory / 'spot-prices.json').read_text())))
+    except FileNotFoundError:
+        return ()
+    prices = tuple(RegionalSpotPrice(text(row, 'region'), text(row, 'zone'), text(row, 'instance_type'),
+        money(text(row, 'usd_per_hour')), instant(row, 'read_at')) for row in rows(document, 'prices'))
+    if any(not row.region or not row.zone or not row.instance_type or row.usd_per_hour < 0 or row.read_at < 0 for row in prices):
+        raise ValueError('The regional Spot price snapshot has invalid rows')
+    return prices
+
+
+def write_spot_prices(directory: Path, prices: Sequence[RegionalSpotPrice]) -> None:
+    """Replace the complete regional price snapshot atomically."""
+    document = {'prices': [dict(region=row.region, zone=row.zone, instance_type=row.instance_type,
+        usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in prices]}
+    write_text_atomic(directory / 'spot-prices.json', json.dumps(document, sort_keys=True) + '\n')
+
+
+def recent_gate_launches(directory: Path, since: float) -> tuple[dict[str, object], ...]:
+    """Read backwards in 64 KiB blocks until the first row before the window."""
+    selected: list[dict[str, object]] = []
+    try:
+        with (directory / 'cloud-gate-launches.jsonl').open('rb') as stream:
+            position = stream.seek(0, 2)
+            pending = b''
+            while position:
+                count = min(position, 65536)
+                position -= count
+                _ = stream.seek(position)
+                lines = (stream.read(count) + pending).split(b'\n')
+                pending = lines.pop(0) if position else b''
+                for line in reversed(lines):
+                    if not line:
+                        continue
+                    try:
+                        row = mapping(cast(object, json.loads(line)))
+                        at = float(str(row['time']))
+                    except (ValueError, KeyError, TypeError, UnicodeError):
+                        continue
+                    if at < since:
+                        return tuple(selected)
+                    selected.append(row)
+    except FileNotFoundError:
+        pass
+    return tuple(selected)
+
+
+@dataclass(frozen=True)
 class PricedResource:
     name: str
     usd_per_month: Decimal

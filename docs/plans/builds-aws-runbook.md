@@ -52,7 +52,7 @@ The largest configured gate needs 32 vCPUs.
 `deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
 The command uses `spot_quota_request_vcpus=128` from `cloud_gate.conf`.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions=us-east-2 us-west-2`.
-It uses `gpu_spot_quota_request_vcpus=4` for one xlarge GPU box.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 Spot work and later price steering use the same candidate region list.
 The command decrypts the administrator key at the terminal.
 It skips sufficient quotas and existing open requests.
@@ -66,6 +66,32 @@ Both quota codes use these same three IAM actions.
 It preserves the configured order within each list.
 It adds `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` to the existing price rows.
 All three new keys are in `cloud_gate.conf`.
+
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+A separate non-blocking `spot-prices.lock` prevents concurrent price refreshes.
+A held price lock makes the tick skip the refresh.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each candidate region and each deployed gate region once, without duplicates.
+It writes the latest price for each zone and gate type to `spot-prices.json` in the AWS state folder.
+Failed or incomplete reads preserve the previous file and let the controller tick continue.
+The controller also reads prices when the former builder route is disabled or removed.
+
+New gates prefer larger vCPU sizes, then the lowest expected gate cost within each size.
+Expected cost includes the Spot price times expected gate hours and `remote_region_transfer_usd=0.00015` outside the home region.
+Expected hours use recent median `gate_s` values for the same mode, or `lifetime_minutes` when no values exist.
+Prices and duration samples use `price_max_age_seconds=7200`.
+Equal costs keep configured order.
+Missing prices follow fresh prices for the same vCPU count.
+With no fresh prices, gates keep configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves refused variants to the end; gates can still try them.
+Capacity errors affect one zone and type.
+Spot quota errors affect the whole region.
+The gate reads only the needed history tail in 64 KiB blocks.
+`launch.json` saves the ranked list before launch, so retries keep the same order and ClientToken offsets.
+Older saved offsets keep configured order.
+Both new keys are in `cloud_gate.conf`.
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 

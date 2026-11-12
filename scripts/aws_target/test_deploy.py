@@ -508,6 +508,9 @@ class DeploymentTests(CostFixture):
         gates = self.root / 'cloud_gate.conf'
         _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
         text_setting(gates, 'regions', 'us-east-1')
+        # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
+        _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
+                                    re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
         _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'

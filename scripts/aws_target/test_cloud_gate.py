@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import cloud_gate, gate_box, gate_trial, ledger
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import store
@@ -167,6 +167,129 @@ class CloudGateTests(CostFixture):
         worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
             self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
         return worker.execute(self.folder, self.request, self.deployment)
+
+    def steering_fixture(self) -> tuple[cloud_gate.GateWorker, list[cloud_gate.GateLaunchVariant]]:
+        types = ('m7a.8xlarge', 'c7a.8xlarge', 'm7a.4xlarge')
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', ' '.join(types))
+        numeric_settings(self.root / 'cloud_gate.conf', {'remote_region_transfer_usd': '0'})
+        self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region,
+            'subnets': [{'id': region + suffix, 'zone': region + suffix} for suffix in ('a', 'b')]}
+            for region in ('us-east-2', 'us-west-2')]
+        variants = [cloud_gate.GateLaunchVariant(region, size, region + suffix, region + suffix)
+                    for region in ('us-east-2', 'us-west-2') for size in types for suffix in ('a', 'b')]
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=self.fake), self.book,
+            self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, ledger.GateReservation(
+            'attempt', int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02'))), ledger.GateReserved)
+        return worker, variants
+
+    def variant_prices(self, variants: Sequence[cloud_gate.GateLaunchVariant],
+                       rates: dict[tuple[str, str, str], str], *, age: int = 0) -> None:
+        ledger.write_spot_prices(self.state, [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type,
+            Decimal(rates.get((row.region, row.instance_type, row.zone), '.5')), int(self.now) - age) for row in variants])
+
+    def test_variant_prices_prefer_the_cheapest_zone_and_preserve_equal_price_order(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {})
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[:4], variants[:4])
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        ranked = worker.rank_variants(variants, 'merge-gate')
+        self.assertEqual(ranked[:2], [variants[7], variants[0]])
+        self.assertFalse(any('describe-spot-price-history' in command for command in self.fake.commands))
+
+    def test_equal_vcpu_types_compete_on_price_and_smaller_sizes_remain_fallbacks(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-east-2', 'c7a.8xlarge', 'us-east-2a'): '.2',
+                                      ('us-east-2', 'm7a.4xlarge', 'us-east-2a'): '.001'})
+        ranked = worker.rank_variants(variants, 'merge-gate')
+        self.assertEqual(ranked[0], variants[2])
+        self.assertTrue(all(row.instance_type.endswith('8xlarge') for row in ranked[:8]))
+        self.assertTrue(all(row.instance_type.endswith('4xlarge') for row in ranked[8:]))
+
+    def test_absent_stale_or_invalid_prices_preserve_configured_order(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.variant_prices(variants, {}, age=7201)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        _ = (self.state / 'spot-prices.json').write_text('{')
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+
+    def test_missing_prices_follow_priced_variants_of_the_same_size(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices([variants[6]], {})
+        ranked = worker.rank_variants(variants, 'merge-gate')
+        self.assertEqual(ranked[0], variants[6])
+        self.assertEqual(ranked[1:4], variants[:4][:3])
+        self.assertEqual(ranked[-4:], [variants[4], variants[5], variants[10], variants[11]])
+
+    def test_zone_capacity_cooldown_ends_after_the_configured_window(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        for code in ('InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'):
+            with self.subTest(code=code):
+                _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
+                    time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
+                    availability_zone='us-west-2b', error_code=code)) + '\n')
+                self.assertEqual(worker.rank_variants(variants, 'merge-gate')[-1], variants[7])
+        self.advance(1260)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+
+    def test_quota_cooldown_moves_every_variant_of_the_region_last(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        for code in ('MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'):
+            with self.subTest(code=code):
+                _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
+                    time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
+                    availability_zone='us-west-2b', error_code=code)) + '\n')
+                ranked = worker.rank_variants(variants, 'merge-gate')
+                self.assertEqual([row.region for row in ranked], ['us-east-2'] * 6 + ['us-west-2'] * 6)
+                self.assertEqual(len(ranked), len(variants))
+
+    def test_saved_variant_order_survives_capacity_refusal_and_price_changes(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        self.fake.refusals = ['InsufficientInstanceCapacity']
+        save = cloud_gate.save
+        def stop_after_refusal(path: Path, row: dict[str, object]) -> None:
+            save(path, row)
+            if row.get('variant') == 1 and 'arguments' not in row:
+                raise OSError('fixture stop after refusal')
+        with mock.patch.object(cloud_gate, 'save', side_effect=stop_after_refusal):
+            with self.assertRaisesRegex(OSError, 'fixture stop after refusal'):
+                _ = worker.launch(self.folder, self.request, self.deployment)
+        saved = cloud_gate.read(self.folder / 'launch.json')
+        self.assertEqual(saved['variant'], 1)
+        self.assertEqual(len(ledger.rows(saved, 'variants')), len(variants))
+        self.variant_prices(variants, {('us-west-2', 'c7a.8xlarge', 'us-west-2a'): '.001'})
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', 'm7a.4xlarge')
+        with mock.patch.object(worker, 'rank_variants', side_effect=AssertionError('The order must remain saved')):
+            self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        self.assertEqual(self.fake.launches[-1]['ClientToken'], 'attempt-1')
+        self.assertEqual(self.fake.launches[-1]['InstanceType'], 'm7a.8xlarge')
+        self.assertEqual(self.fake.launches[-1]['NetworkInterfaces'], [{'DeviceIndex': 0, 'SubnetId': 'us-east-2a',
+            'Groups': ['fixture-group'], 'AssociatePublicIpAddress': True}])
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['variants'], saved['variants'])
+
+    def test_old_variant_offsets_keep_configured_order_despite_new_prices(self) -> None:
+        worker, variants = self.steering_fixture()
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        cloud_gate.save(self.folder / 'launch.json', {'variant': 1})
+        self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        self.assertEqual(self.fake.launches[-1]['ClientToken'], 'attempt-1')
+        self.assertEqual(self.fake.launches[-1]['NetworkInterfaces'], [{'DeviceIndex': 0, 'SubnetId': 'us-east-2b',
+            'Groups': ['fixture-group'], 'AssociatePublicIpAddress': True}])
+        self.assertNotIn('variants', cloud_gate.read(self.folder / 'launch.json'))
+
+    def test_remote_transfer_uses_the_recent_mode_median_or_the_lifetime(self) -> None:
+        worker, variants = self.steering_fixture()
+        numeric_settings(self.root / 'cloud_gate.conf', {'remote_region_transfer_usd': '.005'})
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        rows = [dict(time=self.now - 10, result='finished', mode='merge-gate', gate_s=duration) for duration in (300, 600, 900)]
+        rows.append(dict(time=self.now - 5, result='finished', mode='full', gate_s=36000))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[0])
 
     def test_regions_try_home_types_and_zones_before_west_and_keep_home_transfers(self) -> None:
         self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'ami-' + suffix,

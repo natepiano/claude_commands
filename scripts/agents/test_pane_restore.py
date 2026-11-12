@@ -349,7 +349,11 @@ class PaneRestoreTests(unittest.TestCase):
                 replacement.update(pid=123, proc_start="fixture-generation")
                 pane_record.write(client.session, replacement)
             return outcome
+        def open_member(space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+            return self.open_tab(client.session, space, title, cwd, environment, member=member)
+
         with (mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(client, "open_tab", side_effect=open_member),
               mock.patch.object(client, "result", side_effect=layout),
               mock.patch.object(client, "start_agent", side_effect=started),
               redirect_stdout(output), redirect_stderr(output)):
@@ -748,6 +752,8 @@ class RestoreStaffNamesTests(StaffTestCase):
         from scripts.production import session_staff
 
         directory, saved_client = self.saved_batch(machine="mac")
+        parent = next(row for row in staff.snapshot().rows if row.kind == "showrunner")
+        _ = staff.rename(parent.id, "demo")
         client = TitledLayoutHerdr()
         client.session = "agents"
         client.spaces = [("w1", "demo")]
@@ -811,6 +817,8 @@ class RestoreStaffNamesTests(StaffTestCase):
         uid = os.getuid()
         process_responses = {
             "-axo pid=,ppid=,state=,lstart=": {"stdout": "42 1 S Mon Nov 2 10:00:00 2026", "code": 0},
+            "-o command= -p 42": {"stdout": "zsh\n", "code": 0},
+            "eww -o command= -p 42": {"stdout": "zsh\n", "code": 0},
             f"-U {uid} -o pid=,ppid=,uid=,comm=": {"stdout": f"42 1 {uid} zsh", "code": 0},
             f"-U {uid} -o pid=,command=": {"stdout": "42 zsh", "code": 0},
             "-o tpgid= -p 42": {"stdout": "42", "code": 0},
@@ -1262,6 +1270,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
         def environment(pid: int) -> dict[str, str]:
             values = backend.environment(pid)
+            if pid != backend.pid:
+                return values
             if wrong_identity and (not publish or published):
                 values["CODEX_THREAD_ID"] = "019b3a40-4250-7000-8000-000000000199"
             if client.started and not publishing:
@@ -1273,12 +1283,15 @@ class CodexPaneRestoreTests(FolderMoveFixture):
             self.assertEqual((pane, kind), ("w1:p3", "codex"))
             return super(FakeClient, client).native_session(pane, kind, timeout)
 
+        def open_member(space: str, name: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+            return open_tab(client.session, space, name, cwd, environment, member=member)
+
         with (mock.patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
               mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(herdr, "herdr_places", side_effect=lambda: {
                   backend.pid: herdr.HerdrPlace(client.session, "w1:p3")}),
               mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace(client.session, "w1:p3")),
-              mock.patch.object(herdr, "open_tab", side_effect=open_tab),
+              mock.patch.object(client, "open_tab", side_effect=open_member),
               mock.patch.object(herdr, "run_program", side_effect=process_info),
               mock.patch.object(herdr, "process_environment", side_effect=environment),
               mock.patch.object(runtime_sessions, "process_start", side_effect=process_start),
@@ -1343,7 +1356,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
                     return outcome
 
                 with (mock.patch.object(herdr, "Herdr", return_value=client),
-                      mock.patch.object(herdr, "open_tab", return_value="w1:p3"),
+                      mock.patch.object(client, "open_tab", return_value="w1:p3"),
                       mock.patch.object(runtime_sessions, "session_liveness", return_value=runtime_sessions.SessionNotLive()),
                       mock.patch.object(sessions, "running_sessions", return_value=[]),
                       mock.patch.object(client, "start_agent", side_effect=start),
