@@ -1051,91 +1051,65 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `docs/as-built/merge-gate-and-test-speed.md` — partial cloud times.
 
 ### Phase 52 — The 10-minute disk job reads almost nothing · status: done
-**Depends on:** none.
 
-From the builds showrunner (not the user), 2026-11-12: `buildlog-disk.timer` runs `buildlog/cli.py disk` every 600 s. One run took 8 minutes and read about 45 MB/s. natedev IO pressure is 25-44%, and the user's keyboard sticks. Make the disk measure cheap. Do not stop or change the timer. From the user (through the showrunner), 2026-11-12: "this is unacceptable". It is the unit's top priority.
+#### As-built
 
-Director decision, 2026-11-12: the IO scheduler on every natedev disk is `none`, so `ionice -c3` has no effect. The fix is a walk interval. A run within the interval reads the free and used space only (`statvfs`) and keeps the last walk's folder sizes. `/tune` changes the values.
-
-From the builds showrunner (not the user), 2026-11-12: design accepted with one change. The full walk must not run while the user works. Run it only when it is due and inside a configured quiet hour (`DISK_WALK_HOUR`, user's zone). Keep `DISK_WALK_MINUTES` for the interval.
-
-#### Work Order
-
-**Goal:** A `buildlog disk` run walks the build folders at most once in `DISK_WALK_MINUTES`. Every other run refreshes only the free and used space of each known filesystem, with `statvfs`, and reads almost nothing.
-
-**Spec:**
-- `config/buildlog.conf`: add a new key with its comment block in the file's form:
-  - comment: `# Walk the build folders for the disk table at most once in this many minutes. Other runs of the disk job refresh only free and used space.`
-  - basis: `# Basis: builds 2026-11-12: a 10-minute walk read 45 MB/s for 8 minutes and made the keyboard stick; one walk a day keeps the folder sizes current enough for the daily report.`
-  - `# whole: 1..`
-  - `DISK_WALK_MINUTES=1200` (20 hours: below a day, so the daily walk in the quiet hour is never skipped by a few minutes of drift)
-- `config/buildlog.conf`: add a second new key the same way:
-  - comment: `# Run the full disk walk only in this hour of the day, in the user's zone.`
-  - basis: `# Basis: builds 2026-11-12: a walk at a random daytime minute makes the keyboard stick; 3 is a quiet hour.`
-  - `# whole: 0..23`
-  - `DISK_WALK_HOUR=3`
-- `scripts/buildlog/disk.py`:
-  - Read `DISK_WALK_MINUTES` through `scripts.lib.conf` (`conf.read("buildlog").whole(...)`), at run time, not at import.
-  - Read `DISK_WALK_HOUR` the same way. Take the hour from `datetime.now(scripts.lib.user_zone.user_zone())`.
-  - `snapshot()` reads the previous snapshot first. When the previous snapshot is a full measured snapshot (it has `filesystems`, `outside_build_caches`, `outside_build_cache_totals` and `previous_measured_at`), return a refreshed copy and do no walk, unless the walk is due: its `measured_at` is at least `DISK_WALK_MINUTES` old **and** the current hour is `DISK_WALK_HOUR`. The refreshed copy:
-    - keep `rows`, `outside_build_caches`, `outside_build_cache_totals`, `measured_at`, `previous_measured_at` and `output_unavailable` unchanged. `measured_at` keeps its meaning: the time of the folder walk. `scripts/lint/sweep.py` reads it for growth, so it must not move on a refresh.
-    - refresh `used` and `free` from `filesystem.filesystem_usage("/")`.
-    - refresh each `filesystems` row's `used` and `free` with `filesystem.filesystem_usage(row["path"])`. Keep a row whose path is gone with its old values.
-    - refresh `floor` with `read_floor()`.
-    - set a new key `capacity_measured_at` to now (`store.utc_iso`).
-  - Otherwise (the walk is due, or there is no full previous snapshot) do the full walk as now, and set `capacity_measured_at` equal to `measured_at`.
-  - The refresh path must not call `mapped_output_paths`, `sweep.target_dirs`, `read_cargo_output_roots`, `sweep.directory_blocks` or `outside_directory_bytes`.
-  - Add `capacity_measured_at: NotRequired[str]` to `DiskSnapshot` and `capacity_measured_at: str` to `MeasuredDiskSnapshot`.
-- `scripts/buildlog/report.py` `disk_section`: the closing line names both times when they differ: `Folder sizes measured by the buildlog disk job at {walk time}; free and used space at {capacity time}: allocated blocks, each hard-linked file once.` When `capacity_measured_at` is absent or equal to `measured_at`, keep the present line.
-- Tests change rows in existing tests or add rows beside them in `scripts/buildlog/test_disk.py` and `scripts/buildlog/test_report.py`:
-  - a recent full snapshot: `snapshot()` does no walk (patch the walk functions to fail), keeps the folder rows and `measured_at`, and gives fresh `used`, `free` and `capacity_measured_at`.
-  - an old full snapshot outside the quiet hour: no walk; refresh only.
-  - an old full snapshot in the quiet hour, an old-shape snapshot and no snapshot: `snapshot()` walks.
-  - a filesystem row whose path is gone keeps its old values.
-  - the report line with two different times, and with one time.
-  - Tests set their own `DISK_WALK_MINUTES`, `DISK_WALK_HOUR` and clock; they do not read the live config values.
+- `disk.snapshot()` walks the build folders only when there is no full previous snapshot (none, or an old shape), or when the last walk is at least `DISK_WALK_MINUTES` old **and** the current hour in the user's zone (`scripts.lib.user_zone.user_zone()`) is `DISK_WALK_HOUR`.
+- Every other run refreshes only free and used space: `/` and each `filesystems` row through `filesystem.filesystem_usage`. A path that fails keeps its old row. It refreshes `floor` and sets `capacity_measured_at`. It keeps `rows`, the outside data, `measured_at`, `previous_measured_at` and `output_unavailable`. It calls no walk function. A whole `buildlog disk` refresh took 0.17-0.28 s on a copy of the live `disk.json`.
+- A full walk sets `capacity_measured_at` equal to `measured_at`. `sweep.read_disk_measurement` still reads the walk time, so folder growth spans walks.
+- `report.disk_section` names both times when they differ: `Folder sizes measured by the buildlog disk job at {walk}; free and used space at {capacity}: allocated blocks, each hard-linked file once.` Without the key, or with equal times, it keeps the one-time line.
+- `config/buildlog.conf`: `DISK_WALK_MINUTES=1200` (below a day, so drift never skips the daily walk) and `DISK_WALK_HOUR=3` (the builds showrunner, 2026-11-12: a walk at a random daytime minute makes the keyboard stick).
+- natedev's IO scheduler is `none`, so `ionice` has no effect; the interval and the quiet hour are the fix.
+- With a daily walk, floor-crossing alerts drop folder choices after 15 minutes (`sweep_snapshot_max_age_seconds=900`). Phase 53 holds the fix.
 
 **Files:**
-- `config/buildlog.conf`
-- `scripts/buildlog/disk.py`
-- `scripts/buildlog/report.py`
-- `scripts/buildlog/test_disk.py`
-- `scripts/buildlog/test_report.py`
-
-**Workers:** `1 writer`
-- writer — all files and the tests.
-
-**Constraints from prior phases:**
-- `scripts/lint/sweep.py` `read_disk_measurement` needs `outside_build_caches`, `outside_build_cache_totals`, `previous_measured_at` and `measured_at` in `disk.json`. A refresh keeps all four unchanged.
-- `disk.json` is written through `write_snapshot` (temp file and replace). Keep it.
-
-**State:** `disk.json` gains `capacity_measured_at`. Older files have no key; the report treats that as one time.
-
-**Acceptance gate:**
-- `scripts.buildlog.test_disk`, `scripts.buildlog.test_report` and `scripts.lint.test_sweep` pass.
-- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
-- A refresh run of `buildlog disk` on natedev with a recent `disk.json` finishes in under 2 seconds.
+- `config/buildlog.conf` — `DISK_WALK_MINUTES`, `DISK_WALK_HOUR`.
+- `scripts/buildlog/disk.py` — `snapshot()`, `capacity_measured_at` in `DiskSnapshot` and `MeasuredDiskSnapshot`.
+- `scripts/buildlog/report.py` — the `disk_section` closing line.
+- `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
 
 ### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: todo
 
 Found by the Phase 52 reviews (finding F001, routed here).
 
-**Pending decision: raise `sweep_snapshot_max_age_seconds` from 900 to 90000**
+**Pending decision: raise `sweep_snapshot_max_age_seconds` from 900 to 100800**
 
 Actual problem:
-`scripts/lint/sweep.py` `folder_choices` (line 3316) offers folders in a floor-crossing alert only when the disk walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders and the alert text says "stale".
+`scripts/lint/sweep.py` `folder_choices` (line 3316) offers folders in a floor-crossing alert only when the last folder walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders, and `disk_measurement_lines` (line 3150) marks the measurement "stale".
 
 What exists now:
 - `config/lint.conf`: `sweep_snapshot_max_age_seconds=900`.
-- `buildlog disk` walks once a day in the quiet hour and refreshes only free and used space at other times.
+- `buildlog disk` walks once a day in the 03:00 hour (user's zone) and refreshes only free and used space at other times.
+- Two walks can be more than 25 hours apart: on the day clocks go back, 03:08 EDT to 03:10 EST the next day is 90,120 seconds, and a walk takes about 8 minutes.
 
 What should change:
-- Raise the value to 90000 (25 hours) through `/tune`, so "stale" means a missed daily walk.
+- Raise the value to 100800 (28 hours) through `/tune`. Then "stale" means a missed daily walk, with room for the clock change, timer drift and the walk time.
 
 Recommendation:
-Raise it to 90000. A changed config value needs the user's go. Sent to the builds showrunner 2026-11-12.
+Raise it to 100800. A changed config value needs the user's go. Sent to the builds showrunner 2026-11-12.
 
-**Files:** `config/lint.conf`.
+#### Work Order
+
+**Goal:** A floor-crossing alert offers folder choices from the last daily disk walk, and calls the measurement stale only when a daily walk was missed.
+
+**Spec:**
+- `config/lint.conf`: set `sweep_snapshot_max_age_seconds` to the approved value through `/tune`. Update its Basis line: the disk walk runs once a day (Phase 52), and the value covers a 25-hour day plus timer drift and the walk time.
+- Folder freshness stays on `measured_at` (the walk time). `capacity_measured_at` does not make folder sizes fresh. No code change in `sweep.py` is expected.
+- `docs/as-built/build-followups.md` **Measuring** paragraph: say that `snapshot()` walks only when no full previous snapshot exists, or when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` (user's zone). Other runs refresh free and used space only and set `capacity_measured_at`. Add the two-time report line beside the one-time example.
+- Add rows to the existing tests in `scripts/lint/test_sweep.py` (do not add a new test):
+  - in `test_unavailable_crossing_measurement_names_no_folder`'s neighbor that checks offered choices: a measurement 26 hours old under the approved limit offers its folders;
+  - a measurement older than the limit offers none and says "stale".
+
+**Files:**
+- `config/lint.conf`
+- `scripts/lint/test_sweep.py`
+- `docs/as-built/build-followups.md`
+
+**Workers:** `1 writer`
+- writer: the config value and the sweep test rows.
+
+**State:** none.
 
 **Acceptance gate:**
-- `scripts.lint.test_sweep` passes.
+- `scripts.lint.test_sweep` passes, with the two new rows.
+- `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
