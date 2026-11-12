@@ -553,7 +553,7 @@ class AccountsTests(unittest.TestCase):
                 identity = current.current_session
                 if evidence == "cleared staff identity":
                     marked = {}
-            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=stored_identity,
+            launches[identity] = pane_launch.NativePaneLaunch(pane_id=identity, session_id=stored_identity,
                 config_dir=str(self.home / ("." + label)), cwd=str(self.root), name=identity,
                 model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
                 environment=marked)
@@ -680,7 +680,7 @@ class AccountsTests(unittest.TestCase):
                 _ = accounts.set_group_account(group, "claude2", why="fixture")
                 records = self.root / "member-launches"
                 records.mkdir(exist_ok=True)
-                launch = pane_launch.PaneLaunch(pane_id="models-pane", session_id=member.id,
+                launch = pane_launch.NativePaneLaunch(pane_id="models-pane", session_id=member.id,
                     config_dir=str(self.home / ".claude2"), cwd=str(self.root), name=member.name,
                     model="", remote_control=False, environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z")
                 _ = (records / "fixture.json").write_text(json.dumps({"models-pane": launch}))
@@ -748,7 +748,7 @@ class AccountsTests(unittest.TestCase):
         _ = accounts.set_group_account("showrunners", "claude2", why="fixture")
         records = self.root / "private-launches"
         records.mkdir()
-        launches = {member.current_session: pane_launch.PaneLaunch(
+        launches = {member.current_session: pane_launch.NativePaneLaunch(
             pane_id=member.name, session_id=member.id, config_dir=str(self.home / ".claude4"),
             cwd=str(self.root), name=member.name, model="", remote_control=False,
             environment={}, flags_read=True, written_at="2026-11-05T06:00:00Z", ended=True)

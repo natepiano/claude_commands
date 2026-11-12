@@ -38,6 +38,7 @@ from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.lib import test_hang_guard
+from scripts.production.cli_fixture import process_boundary
 
 
 class ImportTests(unittest.TestCase):
@@ -1412,6 +1413,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
         self.assertEqual([(row["event"], row["hold_key"]) for row in self.events()],
                          [("began", "alice")])
 
+    @process_boundary
     def test_recorder_starts_after_release_lock_closes_and_finished_children_are_reaped(self) -> None:
         launched: list[subprocess.Popen[bytes]] = []
         real_popen = subprocess.Popen
@@ -1482,6 +1484,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                             for row in records))
         self.assertFalse((folder / "unsafe-name").exists())
 
+    @process_boundary
     def test_partial_and_final_release_write_end_events_only_after_file_removal(self) -> None:
         folder = self.begin()
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other work",
@@ -1510,6 +1513,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                 time.tzset()
         self.assertIn("holder since 12:00 EDT, for render checks - release eta: 13:00 EDT", output.getvalue())
 
+    @process_boundary
     def test_event_write_failure_keeps_the_hold_notice_and_file(self) -> None:
         with mock.patch.object(subprocess, "Popen", side_effect=OSError("cannot start recorder")):
             folder = self.begin()

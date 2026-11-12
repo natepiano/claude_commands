@@ -903,7 +903,7 @@ class StaffTests(StaffCommandTestCase):
             pane_launch.write(path, launch)
             self.assertEqual(staff.snapshot().by_id(owner.id), replace(owner,
                 home=staff.SessionHome(Path.home() / ".claude")))
-            self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
+            self.assertEqual(pane_launch.read_strict(path)["w1:p1"].get("staff_id"), owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
         self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)
 

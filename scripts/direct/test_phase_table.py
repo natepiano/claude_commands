@@ -24,6 +24,7 @@ from scripts.lib import unit_runs
 from scripts.direct import phase_table
 from scripts.message import sessions
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_showrunner, fake_unit_host, session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
@@ -276,56 +277,34 @@ class PhaseTableTests(unittest.TestCase):
         lines = [json.dumps(started), *(json.dumps(event) for event in events)]
         _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def run_command(
+        self, arguments: list[str], environment: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        with patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir):
+            return invoke_cli(phase_table, phase_table.main, arguments, environment, Path.cwd())
+
     def run_show_production(
         self, production: Path, at: int = 1_200
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "show",
-                "--production-doc",
-                str(production),
-                "--json",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(at),
+        return self.run_command(
+            ["show", "--production-doc", str(production), "--json"],
+            self.environment(at),
         )
 
     def run_prune(
         self, production: Path
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "prune",
-                "--production-doc",
-                str(production),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
+        return self.run_command(
+            ["prune", "--production-doc", str(production)],
+            self.environment(),
         )
 
     def run_archive(
         self, production: Path
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "archive",
-                "--production-doc",
-                str(production),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
+        return self.run_command(
+            ["archive", "--production-doc", str(production)],
+            self.environment(),
         )
 
     def unit_id(self, production: str = "show", unit: str = "table") -> str:
@@ -451,18 +430,9 @@ class PhaseTableTests(unittest.TestCase):
         )
 
     def run_refresh(self, at: int = 1_200) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "refresh",
-                "--session-dir",
-                str(self.session_dir),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(at),
+        return self.run_command(
+            ["refresh", "--session-dir", str(self.session_dir)],
+            self.environment(at),
         )
 
     def assert_epoch(self, value: object, expected: int) -> None:
@@ -2411,22 +2381,11 @@ class PhaseTableTests(unittest.TestCase):
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["UNIT_NOW_EPOCH"] = str(reported_at)
 
-        result = subprocess.run(
-            [
-                "python3",
-                str(SCRIPT),
-                "show",
-                "--session-dir",
-                str(self.session_dir),
-                "--zone",
-                "America/Los_Angeles",
-                "--json",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
+        result = self.run_command(
+            ["show", "--session-dir", str(self.session_dir), "--zone", "America/Los_Angeles", "--json"],
+            environment,
         )
+        result.check_returncode()
         parsed = cast("dict[str, object]", json.loads(result.stdout))
         current = cast("dict[str, object]", parsed["current"])
         eta = cast("dict[str, object]", current["eta"])
@@ -2503,21 +2462,9 @@ class PhaseTableTests(unittest.TestCase):
         )
         self.write_state(None)
 
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "show",
-                "--session-dir",
-                str(self.session_dir),
-                "--zone",
-                "UTC",
-                "--json",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(1_200),
+        result = self.run_command(
+            ["show", "--session-dir", str(self.session_dir), "--zone", "UTC", "--json"],
+            self.environment(1_200),
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -2549,21 +2496,9 @@ class PhaseTableTests(unittest.TestCase):
         )
         self.write_state(None)
 
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "show",
-                "--session-dir",
-                str(self.session_dir),
-                "--zone",
-                "UTC",
-                "--json",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(1_200),
+        result = self.run_command(
+            ["show", "--session-dir", str(self.session_dir), "--zone", "UTC", "--json"],
+            self.environment(1_200),
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -2745,12 +2680,9 @@ class PhaseTableTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
 
-        result = subprocess.run(
-            ["python3", str(SCRIPT), "show", "--session-dir", str(empty_session)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
+        result = self.run_command(
+            ["show", "--session-dir", str(empty_session)],
+            environment,
         )
 
         self.assertEqual(result.returncode, 1)
@@ -2769,12 +2701,9 @@ class PhaseTableTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        result = subprocess.run(
-            ["python3", str(SCRIPT), "show", "--session-dir", str(no_plan_session)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
+        result = self.run_command(
+            ["show", "--session-dir", str(no_plan_session)],
+            environment,
         )
 
         self.assertEqual(result.returncode, 1)
@@ -3324,18 +3253,9 @@ class PhaseTableTests(unittest.TestCase):
     def test_refresh_reports_missing_state_and_skips_a_removed_plan(self) -> None:
         empty_session = self.root / "missing-state"
         empty_session.mkdir()
-        missing_state = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "refresh",
-                "--session-dir",
-                str(empty_session),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
+        missing_state = self.run_command(
+            ["refresh", "--session-dir", str(empty_session)],
+            self.environment(),
         )
         missing_plan = self.working_dir / "docs" / "missing.md"
         self.write_state(None)
@@ -3353,18 +3273,9 @@ class PhaseTableTests(unittest.TestCase):
         )
 
         unreadable_plan = self.run_refresh()
-        unreadable_show = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "show",
-                "--session-dir",
-                str(self.session_dir),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.environment(),
+        unreadable_show = self.run_command(
+            ["show", "--session-dir", str(self.session_dir)],
+            self.environment(),
         )
 
         self.assertEqual(missing_state.returncode, 1)

@@ -98,7 +98,7 @@ def publication_for_session(session_id: str, *, record: staff.StaffSnapshot | No
     return pane_launch.newest_publication(record_directory(), (reference, session_id))
 
 
-def resume_launch(entry: PaneLaunch) -> PaneLaunch:
+def resume_launch(entry: PaneLaunch) -> pane_launch.CurrentLaunch:
     """Resolve a retained member reference to its current conversation for resume."""
     from scripts.production import staff
 
@@ -106,7 +106,7 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
-           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> PaneLaunch:
+           arguments: Sequence[str], *, kind: Literal["claude", "codex"] = "claude") -> pane_launch.CurrentLaunch:
     """Retain plugin paths only in the shutdown restore record."""
     entry = pane_launch.launch(pane_id, session_id, cwd, legacy_identity.without_legacy_identity(environment), arguments, kind=kind)
     if kind == "claude":
@@ -118,10 +118,10 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
 
 def resume_arguments(entry: PaneLaunch) -> list[str]:
     """Build backend arguments from a launch with its current conversation id."""
-    return _resume_arguments(entry)
+    return _resume_arguments(resume_launch(entry) if "session_id" not in entry else entry)
 
 
-def _resume_arguments(entry: PaneLaunch) -> list[str]:
+def _resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
     if pane_launch.saved_kind(entry) == "codex":
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
@@ -144,7 +144,7 @@ def _resume_arguments(entry: PaneLaunch) -> list[str]:
 def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
                                 settings: models_registry.LaunchSettings) -> list[str]:
     """Apply current model settings and retain the saved resume options."""
-    current = entry.copy()
+    current = resume_launch(entry) if "session_id" not in entry else cast(pane_launch.CurrentLaunch, entry.copy())
     current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
     if settings.kind == "codex":
         policy = ["-c", f'model_reasoning_effort="{settings.effort}"']
@@ -188,7 +188,10 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
     """Keep native runtime labels and account settings from retained launches."""
     environment: dict[str, str] = {}
     for previous in sorted(history, key=lambda item: item["written_at"]):
-        if previous["session_id"] == launch["session_id"]:
+        same_conversation = pane_launch.reference_id(previous) == pane_launch.reference_id(launch)
+        if "session_id" in previous and "session_id" in launch:
+            same_conversation = previous["session_id"] == launch["session_id"]
+        if same_conversation:
             environment.update({key: value for key, value in previous["environment"].items()
                                 if key in herdr_types.NATIVE_ID_MARKS or _needed(key)})
     environment.update(launch["environment"])
@@ -208,9 +211,7 @@ def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | No
     owner = staff.initial_snapshot().by_current_session(session_id)
     if owner is None:
         return retained
-    projected = retained.copy()
-    projected["session_id"] = session_id
-    return projected
+    return pane_launch.current_launch(retained, staff.initial_snapshot())
 
 
 def end(session: str, pane_id: str, session_id: str, *, record: "staff.StaffSnapshot | None" = None) -> None:
@@ -231,7 +232,7 @@ def _set_ended(session: str, pane_id: str, session_id: str, ended: bool,
     with locked(session):
         entries = read(session)
         entry = entries.get(pane_id)
-        if entry is None or entry["session_id"] not in (reference, session_id):
+        if entry is None or pane_launch.reference_id(entry) not in (reference, session_id):
             if not ended:
                 raise ValueError(f"{session_id}: retained launch changed before resume publication")
             return
@@ -252,7 +253,7 @@ def forget_unit(unit_id: str) -> list[str]:
     dropped: list[str] = []
     for path in sorted(record_directory().glob("*.json")):
         for pane, entry in pane_launch.read_strict(path).items():
-            if record.by_member_reference(entry["session_id"]) == owner:
+            if record.by_member_reference(pane_launch.reference_id(entry)) == owner:
                 pane_launch.retire_launch(path, pane, entry)
                 dropped.append(f"{path.stem}:{pane}")
     return dropped
@@ -336,7 +337,7 @@ def _process_environment(pid: int) -> dict[str, str]:
     return _environment((PROC / str(pid) / "environ").read_bytes().split(b"\0"))
 
 
-def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> PaneLaunch:
+def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> pane_launch.CurrentLaunch:
     """Capture one verified live Claude using the existing argv and environment readers."""
     from scripts.herdr import herdr
 

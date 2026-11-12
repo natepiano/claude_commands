@@ -362,6 +362,9 @@ class CloudGateTests(CostFixture):
         self.assertEqual(self.fake.launches[-1]['InstanceType'], 'm7a.4xlarge')
 
     def test_expired_pending_sweep_searches_both_regions(self) -> None:
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(re.sub(r'(?m)^(regions|spot_candidate_regions)=.*$',
+                                  r'\1=us-east-2 us-west-2', path.read_text()))
         _ = self.book.reserve_gate(self.settings, ledger.GateReservation(
             'lost', int(self.now), int(self.now) + 1, Decimal('.8'), Decimal('.02')))
         self.advance(2)
@@ -996,6 +999,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
 
     def test_expired_pending_gate_without_instance_stops_charging(self) -> None:
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(re.sub(r'(?m)^(regions|spot_candidate_regions)=.*$',
+                                  r'\1=us-east-2 us-west-2', path.read_text()))
         worker = self.worker_with_pending_gate()
         self.fake.has_instance = False
         self.advance(8 * 3600)
@@ -1389,6 +1395,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('.5'), Decimal(1), 'Hrs')))
         path = self.root / 'cloud_gate.conf'
         _ = path.write_text(re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge', path.read_text()))
+        _ = path.write_text(re.sub(r'(?m)^(regions|spot_candidate_regions)=.*$',
+                                  r'\1=us-east-2 us-west-2', path.read_text()))
         worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=self.fake), self.book,
             self.settings, self.folder / 'reservation', clock=lambda: self.now)
         with (mock.patch.object(worker, 'reconcile'), mock.patch.object(worker, 'charges'),
