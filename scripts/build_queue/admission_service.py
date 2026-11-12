@@ -124,6 +124,8 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...
 
 
+
+
 class Readings(Protocol):
     def host(self) -> records.HostMemory | records.ReadingUnavailable: ...
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure: ...
@@ -2050,7 +2052,8 @@ class AdmissionServer:
         adopted: list[placement.AdoptedProviderClaim] = []
         with claim_state.locked(paths.lock):
             held = claim_state.read_claims(paths)
-        generation = ""
+        generation = (offload.expected_instance_generation(target.name)
+                      if isinstance(target, target_config.SshTarget) and target_config.is_aws_target(target) else "")
         for claim in held:
             record = claim.record
             if "remote_host" not in record:

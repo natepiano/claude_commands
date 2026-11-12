@@ -38,14 +38,14 @@ class TargetSyncTests(unittest.TestCase):
         self.commands = []
         self.unavailable = set()
         self.failed_pushes = set()
-        for name in ("mac", "spare"):
+        for name in ("mac", "aws"):
             _ = (temporary / f"{name}.conf").write_text(f"host=fake-{name}\nci_repo=\n")
         _ = self.registry.write_text(
-            "targets=mac,spare,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
-            + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n"
+            "targets=mac,aws,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
+            + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "sync.connect_timeout_s=3\nsync.reach_timeout_s=7\nsync.rsync_timeout_s=11\n"
-            + "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023\nsync.hosts.spare=spare-build\n"
+            + "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023\nsync.hosts.aws=aws-build\n"
             + "sync.hosts.natedev=natedev\n"
             + "# whole: 0..10\nvault.lock_retries=5\n"
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
@@ -60,7 +60,7 @@ class TargetSyncTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "time", return_value=1_793_570_400.0))
         _ = self.enterContext(mock.patch.object(sync, "run", side_effect=self.command_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
-        for name in ("natedev", "ci", "Mac", "spare-build", "admission", "pending-steps", "pending-launches"):
+        for name in ("natedev", "ci", "Mac", "aws-build", "admission", "pending-steps", "pending-launches"):
             directory = self.root / name
             directory.mkdir(parents=True)
             _ = (directory / "owned.jsonl").write_text(name + "\n")
@@ -96,20 +96,20 @@ class TargetSyncTests(unittest.TestCase):
     def test_natedev_exchanges_with_every_configured_ssh_peer(self) -> None:
         self.assertEqual(self.exchange(), 0)
 
-        self.assertEqual(self.peers(), ["fake-mac", "fake-spare"])
+        self.assertEqual(self.peers(), ["fake-mac", "fake-aws"])
         self.assertEqual({argv[-2] for argv in self.pulls()}, {
-            f"fake-mac:{sync.REMOTE_ROOT}", f"fake-spare:{sync.REMOTE_ROOT}",
+            f"fake-mac:{sync.REMOTE_ROOT}", f"fake-aws:{sync.REMOTE_ROOT}",
         })
 
     def test_finished_target_exchanges_only_its_host_with_configured_timeouts(self) -> None:
-        _ = (self.registry.parent / "spare.conf").write_text("host=spare-build\nci_repo=\n")
+        _ = (self.registry.parent / "aws.conf").write_text("host=aws-build\nci_repo=\n")
         with redirect_stdout(io.StringIO()):
-            sync.sync_target("spare")
+            sync.sync_target("aws")
 
-        self.assertEqual(self.peers(), ["spare-build"])
+        self.assertEqual(self.peers(), ["aws-build"])
         pull, = self.pulls()
-        self.assertEqual(pull[-2:], [f"spare-build:{sync.REMOTE_ROOT}", f"{self.root}/"])
-        self.assertIn("--include=/spare-build/***", pull)
+        self.assertEqual(pull[-2:], [f"aws-build:{sync.REMOTE_ROOT}", f"{self.root}/"])
+        self.assertIn("--include=/aws-build/***", pull)
         self.assertNotIn("--include=/Mac/***", pull)
         for argv, timeout in self.commands:
             self.assertEqual(timeout, 7 if argv[0] == "ssh" else 11)
@@ -118,7 +118,7 @@ class TargetSyncTests(unittest.TestCase):
     def test_finished_target_skips_a_running_sync_without_contacting_the_peer(self) -> None:
         output = io.StringIO()
         with sync.sync_lock(), redirect_stdout(output):
-            sync.sync_target("spare")
+            sync.sync_target("aws")
 
         self.assertEqual(self.commands, [])
         self.assertEqual(len(output.getvalue().splitlines()), 1)
@@ -131,37 +131,37 @@ class TargetSyncTests(unittest.TestCase):
             return self.command_reply(argv, timeout)
 
         with mock.patch.object(sync, "run", side_effect=reply), redirect_stdout(io.StringIO()):
-            sync.sync_target("spare")
-        self.assertEqual(self.peers(), ["fake-spare"])
+            sync.sync_target("aws")
+        self.assertEqual(self.peers(), ["fake-aws"])
 
     def test_finished_target_respects_pause_and_missing_host_mapping(self) -> None:
         with redirect_stdout(io.StringIO()):
             _ = sync.pause("fixture pause")
-            sync.sync_target("spare")
+            sync.sync_target("aws")
             _ = sync.resume()
-            _ = self.registry.write_text(self.registry.read_text().replace("sync.hosts.spare=spare-build", "sync.hosts.spare="))
-            sync.sync_target("spare")
+            _ = self.registry.write_text(self.registry.read_text().replace("sync.hosts.aws=aws-build", "sync.hosts.aws="))
+            sync.sync_target("aws")
         self.assertEqual(self.commands, [])
 
     def test_finished_target_failure_prints_one_line_and_preserves_retry(self) -> None:
-        self.unavailable.add("fake-spare")
+        self.unavailable.add("fake-aws")
         output = io.StringIO()
         with redirect_stdout(output):
-            sync.sync_target("spare")
+            sync.sync_target("aws")
         self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertFalse(self.status("spare").ok)
+        self.assertFalse(self.status("aws").ok)
         self.unavailable.clear()
         with redirect_stdout(io.StringIO()):
-            sync.sync_target("spare")
-        self.assertTrue(self.status("spare").ok)
+            sync.sync_target("aws")
+        self.assertTrue(self.status("aws").ok)
 
     def test_unreachable_mac_does_not_prevent_aws_exchange(self) -> None:
         self.unavailable.add("fake-mac")
 
         self.assertEqual(self.exchange(), 0)
 
-        self.assertEqual(self.peers(), ["fake-mac", "fake-spare"])
-        self.assertEqual([argv[-2] for argv in self.pulls()], [f"fake-spare:{sync.REMOTE_ROOT}"])
+        self.assertEqual(self.peers(), ["fake-mac", "fake-aws"])
+        self.assertEqual([argv[-2] for argv in self.pulls()], [f"fake-aws:{sync.REMOTE_ROOT}"])
         legacy = sync.read_status()
         self.assertIsInstance(legacy, sync.SyncStatus)
         if isinstance(legacy, sync.SyncStatus):
@@ -172,8 +172,8 @@ class TargetSyncTests(unittest.TestCase):
 
         self.assertEqual(self.exchange(), 1)
 
-        self.assertEqual(self.peers(), ["fake-mac", "fake-spare"])
-        self.assertEqual([argv[-2] for argv in self.pulls()], [f"fake-spare:{sync.REMOTE_ROOT}"])
+        self.assertEqual(self.peers(), ["fake-mac", "fake-aws"])
+        self.assertEqual([argv[-2] for argv in self.pulls()], [f"fake-aws:{sync.REMOTE_ROOT}"])
 
     def test_transfers_preserve_host_ownership_and_atomic_replacement(self) -> None:
         self.assertEqual(self.exchange(), 0)
@@ -183,15 +183,15 @@ class TargetSyncTests(unittest.TestCase):
         for argv in pushes:
             self.assertIn(str(self.root / "natedev"), argv)
             self.assertIn(str(self.root / "ci"), argv)
-            for forbidden in ("Mac", "spare-build", "admission", "pending-steps", "pending-launches"):
+            for forbidden in ("Mac", "aws-build", "admission", "pending-steps", "pending-launches"):
                 self.assertNotIn(str(self.root / forbidden), argv)
         for argv in self.pulls():
-            if argv[-2].startswith("fake-spare:"):
-                self.assertIn("--include=/spare-build/***", argv)
+            if argv[-2].startswith("fake-aws:"):
+                self.assertIn("--include=/aws-build/***", argv)
                 self.assertNotIn("--include=/Mac/***", argv)
             else:
                 self.assertIn("--include=/Mac/***", argv)
-                self.assertNotIn("--include=/spare-build/***", argv)
+                self.assertNotIn("--include=/aws-build/***", argv)
             self.assertNotIn("--include=/natedev/***", argv)
             self.assertNotIn("--include=/ci/***", argv)
             first_include = next(i for i, word in enumerate(argv) if word.startswith("--include="))
@@ -206,7 +206,7 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual(self.exchange(), 0)
         for argv, timeout in self.commands:
             self.assertEqual(timeout, 7 if argv[0] == "ssh" else 11)
-            if "fake-spare" in " ".join(argv):
+            if "fake-aws" in " ".join(argv):
                 self.assertIn("ConnectTimeout=3", " ".join(argv))
         self.commands.clear()
         _ = self.registry.write_text(self.registry.read_text().replace("sync.reach_timeout_s=7", "sync.reach_timeout_s=13"))
@@ -218,7 +218,7 @@ class TargetSyncTests(unittest.TestCase):
     def test_pause_prevents_every_peer_command_and_keeps_success_state(self) -> None:
         self.assertEqual(self.exchange(), 0)
         before = {path: path.read_bytes() for path in (
-            sync.status_path(), sync.status_path("fake-mac"), sync.status_path("fake-spare"),
+            sync.status_path(), sync.status_path("fake-mac"), sync.status_path("fake-aws"),
         )}
         with redirect_stdout(io.StringIO()):
             self.assertEqual(sync.pause("fixture pause"), 0)
@@ -233,14 +233,14 @@ class TargetSyncTests(unittest.TestCase):
     def test_each_peer_retains_its_own_last_success(self) -> None:
         self.assertEqual(self.exchange(), 0)
         mac_before = self.status("fake-mac")
-        aws_before = self.status("fake-spare")
+        aws_before = self.status("fake-aws")
         self.unavailable.add("fake-mac")
 
         with mock.patch.object(time, "time", return_value=1_793_574_000.0):
             self.assertEqual(self.exchange(), 0)
 
         mac_after = self.status("fake-mac")
-        aws_after = self.status("fake-spare")
+        aws_after = self.status("fake-aws")
         self.assertFalse(mac_after.ok)
         self.assertEqual(mac_after.last_good, mac_before.last_good)
         self.assertNotEqual(mac_after.at, mac_before.at)
@@ -249,28 +249,28 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual(aws_after.last_good, sync.LastSynced(aws_after.at))
         self.assertEqual(sync.read_status(), mac_after)
         self.assertEqual(self.status("mac"), mac_after)
-        self.assertEqual(self.status("spare"), aws_after)
+        self.assertEqual(self.status("aws"), aws_after)
 
     def test_aws_failure_does_not_replace_the_legacy_mac_status(self) -> None:
         self.assertEqual(self.exchange(), 0)
         mac_before = self.status("fake-mac")
-        self.unavailable.add("fake-spare")
+        self.unavailable.add("fake-aws")
 
         self.assertEqual(self.exchange(), 0)
 
         self.assertEqual(sync.read_status(), mac_before)
-        self.assertFalse(self.status("fake-spare").ok)
+        self.assertFalse(self.status("fake-aws").ok)
 
     def test_inactive_aws_target_receives_no_connection(self) -> None:
-        _ = self.registry.write_text(self.registry.read_text().replace("targets=mac,spare,natedev", "targets=mac,natedev"))
+        _ = self.registry.write_text(self.registry.read_text().replace("targets=mac,aws,natedev", "targets=mac,natedev"))
 
         self.assertEqual(self.exchange(), 0)
 
         self.assertEqual(self.peers(), ["fake-mac"])
-        self.assertIsInstance(sync.read_status("fake-spare"), sync.NeverSynced)
+        self.assertIsInstance(sync.read_status("fake-aws"), sync.NeverSynced)
 
     def test_aws_host_does_not_initiate_peer_connections(self) -> None:
-        with mock.patch.object(store, "host_name", return_value="spare-build"):
+        with mock.patch.object(store, "host_name", return_value="aws-build"):
             self.assertEqual(self.exchange(), 0)
 
         self.assertEqual(self.commands, [])
@@ -278,16 +278,16 @@ class TargetSyncTests(unittest.TestCase):
     def test_host_mapping_reload_changes_the_pull_allowlist(self) -> None:
         self.assertEqual(self.exchange(), 0)
         self.commands.clear()
-        _ = self.registry.write_text(self.registry.read_text().replace("sync.hosts.spare=spare-build", "sync.hosts.spare=renamed-spare"))
+        _ = self.registry.write_text(self.registry.read_text().replace("sync.hosts.aws=aws-build", "sync.hosts.aws=renamed-aws"))
 
         self.assertEqual(self.exchange(), 0)
 
         for argv in self.pulls():
-            if argv[-2].startswith("fake-spare:"):
-                self.assertIn("--include=/renamed-spare/***", argv)
+            if argv[-2].startswith("fake-aws:"):
+                self.assertIn("--include=/renamed-aws/***", argv)
             else:
-                self.assertNotIn("--include=/renamed-spare/***", argv)
-            self.assertNotIn("--include=/spare-build/***", argv)
+                self.assertNotIn("--include=/renamed-aws/***", argv)
+            self.assertNotIn("--include=/aws-build/***", argv)
 
     def test_each_pull_preserves_the_other_peers_current_records(self) -> None:
         mac_file = self.root / "Mac/owned.jsonl"
@@ -304,8 +304,8 @@ class TargetSyncTests(unittest.TestCase):
         self.assertEqual(mac_file.read_text(), "fresh Mac record\n")
         mac_pull, aws_pull = self.pulls()
         self.assertIn("--include=/Mac/***", mac_pull)
-        self.assertNotIn("--include=/spare-build/***", mac_pull)
-        self.assertIn("--include=/spare-build/***", aws_pull)
+        self.assertNotIn("--include=/aws-build/***", mac_pull)
+        self.assertIn("--include=/aws-build/***", aws_pull)
         self.assertNotIn("--include=/Mac/***", aws_pull)
 
     def test_first_mac_failure_preserves_the_legacy_success_time(self) -> None:
@@ -327,15 +327,14 @@ class TargetSyncTests(unittest.TestCase):
             "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023", "sync.hosts.mac=macbook"))
 
         self.assertEqual(health.machine_for_host("macbook"), health.Machine.MAC)
-        with self.assertRaises(ValueError):
-            _ = health.machine_for_host("spare-build")
+        self.assertEqual(health.machine_for_host("aws-build"), health.Machine.AWS)
         self.assertNotIn("Mac", record.synchronized_hosts())
         with self.assertRaises(ValueError):
             _ = health.machine_for_host("Mac")
 
     def test_health_reads_spaced_target_lists_like_the_registry(self) -> None:
         _ = self.registry.write_text(self.registry.read_text().replace(
-            "targets=mac,spare,natedev", "targets=mac, spare, natedev"))
+            "targets=mac,aws,natedev", "targets=mac, aws, natedev"))
 
         machines = {state.machine if isinstance(state, health.RecorderHealthUnavailable) else state.snapshot.machine
                     for state in health.read_snapshots()}
@@ -353,7 +352,7 @@ class TargetSyncTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, outcome, "")
 
         settings = self.registry.read_text()
-        for host, timeout in (("spare-build", 3), ("spare-build", 9), ("Mac", 9)):
+        for host, timeout in (("aws-build", 3), ("aws-build", 9), ("Mac", 9)):
             with self.subTest(host=host, timeout=timeout), mock.patch.dict(os.environ, {"BUILDLOG_PEER": host}):
                 commands.clear()
                 _ = self.registry.write_text(settings.replace(
@@ -362,7 +361,7 @@ class TargetSyncTests(unittest.TestCase):
                     self.assertIsInstance(vault_pull.pull(), vault_pull.Current)
                 self.assertEqual([argv[0] for argv in commands], ["git", "ssh", "git"])
                 for argv in commands:
-                    if host == "spare-build":
+                    if host == "aws-build":
                         self.assertIn(f"ConnectTimeout={timeout}", " ".join(argv))
                     else:
                         self.assertNotIn("ConnectTimeout", " ".join(argv))

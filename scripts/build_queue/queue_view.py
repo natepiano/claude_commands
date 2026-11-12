@@ -112,7 +112,7 @@ if [ -n "$build_pids" ]; then
             for (pid in executable)
                 if (!mirror[pid] && !mirror[parent[pid]] && !(parent[pid] in executable)) {
                     folder=cwd[pid]
-                    if (!folder) { folder=executable[pid]; sub(/\/[^/]*$/, "", folder) }
+                    if (!folder) { folder=executable[pid]; sub(/\/[^\/]*$/, "", folder) }
                     printf "%s\t%s\t%s\n", pid, elapsed[pid], folder
                 }
         }' || exit 1

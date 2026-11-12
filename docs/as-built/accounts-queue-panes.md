@@ -90,19 +90,23 @@ Countdown spans redraw once per second until expiry, without another script run.
 ## Account drawing
 
 `AccountsView(elements, columns, status, zone, now)` fits the pane width.
-Its columns are the access mark, account, left, role, busy, idle, paused, exited, total, resets, credits, and enabled.
+Its columns include the access mark, account, left, role, busy, starting, waiting, idle, paused, exited, total, resets, credits, and enabled.
 Account labels are bold, and numbers align right.
 Each role has its own row and counts.
 Only the first row repeats the account values.
 Python combines machine counts in `role_counts` and retains separate records in `role_counts_by_machine`.
+The peer transport includes waiting within busy and starting within idle for older readers.
+The decoder separates those subsets before the board combines machine counts.
 A role without reported members has zero counts; `spare` has no count.
 The totals row sums known activity counts.
 
-Units and showrunners without live sessions count as exited on their selected role account.
+Without live detached work, units and showrunners without live sessions count as exited on their selected role account.
 Claude producers count under `showrunners` through the same hold and activity rules.
 Without a live session, they count on the selected showrunners account.
 Workers count only while live.
-Worker paused and exited counts stay zero.
+Busy panes count as busy. Starting panes count as starting, including with live detached work.
+Other live detached work counts as waiting.
+Staff exit and pause records take priority.
 The access mark uses `read_ok`.
 Low allowance uses error below 10 percent and warning below 25 percent.
 

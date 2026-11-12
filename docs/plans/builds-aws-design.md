@@ -78,9 +78,9 @@ AWS failures can delay termination beyond those bounds.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The target registry contains `mac,natedev`.
-The builder configuration and offload route have been removed.
+The retained `offload=on` value does not restore the removed target.
 Builder slots, warm mirrors, idle stop, and queue-based starts are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+Their code remains for compatibility and removal recovery.
 
 See the [runbook](builds-aws-runbook.md) for current commands.
 See the [as-built document](../as-built/builds-aws-target.md) for implementation details.

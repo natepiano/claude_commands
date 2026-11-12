@@ -733,6 +733,25 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         )
         return cast(str, values["variable"])
 
+    def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "\n".join((
+            "targets=mac,natedev,aws", "kind.aws=ssh", "platform.aws=linux", "settings.aws=aws_target.conf",
+        )))
+        settings = self.root / "aws_target.conf"
+        values = conf.read(settings).values()
+        self.assertTrue(all(key not in values for key in (
+            "alert_seconds", "push_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s",
+        )))
+        result = self.command("block", "--target", "aws", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        block = cast(dict[str, object], json.loads(
+            (self.root / ".local/state/build-targets/aws/block.json").read_text(),
+        ))
+        self.assertEqual(block["state"], "active")
+        self.assertEqual(block["holder"], "alice")
+        self.assertEqual(block["for"], "rendering")
+        self.assertEqual(block["ci"], "not_configured")
+        self.assertEqual(self.gh_calls(""), 0)
 
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)

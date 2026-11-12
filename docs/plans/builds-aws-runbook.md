@@ -12,11 +12,11 @@ Local fake tests do not prove live quota, capacity, or deployment state.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The registry contains `targets=mac,natedev`.
-The builder configuration and offload route have been removed.
+The retained `offload=on` value does not register an AWS target.
 Builder slots, warm mirrors, idle stop, and controller activation are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+The repository retains their code for compatibility and removal recovery.
 Use `up --workload merge-gates` for gate deployment.
-The default `up` command now selects gate deployment.
+The default `up` command selects the retained builder workflow.
 
 ## Configuration and state
 
@@ -110,17 +110,6 @@ Deployment records each completed regional stack in `gate-deployment.json`.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
 
-## Foundation maintenance
-
-`prepare` validates the retained deployment inputs and records the foundation plan.
-`apply --approve-resources` creates or updates the Budget and scaler foundation with compute disabled.
-It also confirms the scaler credential file.
-These commands do not create a permanent builder.
-Gate deployment requires the saved foundation ownership record.
-The removed `price`, `bootstrap`, and `setup-start` commands are unavailable.
-The removed builder service commands `start`, `stop`, and `serve` are unavailable.
-Use `aws_target.py tick` for account bill and regional price refresh.
-
 ## Merge gates and ranking
 
 The production merge gate selects the cloud path through `cloud_gate.py`.
@@ -133,7 +122,7 @@ The normal module counter replaces the setup stage when tests start.
 Before ranking, the worker reads live Spot prices from all deployed regions in parallel.
 `spot_price_live_read_timeout_s` bounds the complete read.
 Failed regional reads retain applicable hourly prices from `spot-prices.json`.
-`aws_target.py tick` refreshes cached prices and account bills without builder routing.
+The controller's price refresh remains available when builder routing is disabled.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.
@@ -197,8 +186,7 @@ It checks saved ownership and live claims before deletion.
 6. It removes `deployment.json`, `up.json`, the setup proofs, and the prepared bundle.
 
 It keeps the encrypted administrator file, the ledger, and the charge history.
-After complete removal, run `deploy.py prepare` and `deploy.py apply --approve-resources` to create the foundation again.
-Then run `deploy.py up --approve-resources` to create gate resources.
+A later `deploy.py up` must create the foundation, scaler credentials, and Budget again.
 Correct a reported removal failure before repeating the approved command.
 Preserve `down.json` until removal completes.
 

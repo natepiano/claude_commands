@@ -623,9 +623,14 @@ class DiskTests(unittest.TestCase):
                     raise FileNotFoundError(path)
                 return filesystem.FilesystemUsage(50, 60)
 
-            for elapsed in (timedelta(minutes=10), timedelta(hours=2)):
+            for elapsed, request_age in ((timedelta(minutes=10), None), (timedelta(hours=2), None),
+                                         (timedelta(hours=2), timedelta(minutes=-1))):
+                request_path = store.root() / store.DISK_WALK_REQUEST_NAME
+                if request_age is not None:
+                    store.write_disk_walk_request({"requested_at": store.utc_iso((began + request_age).timestamp()),
+                                                   "alert_at": store.utc_iso(began.timestamp()), "unnamed_bytes": 123})
                 with (
-                    self.subTest(age=elapsed),
+                    self.subTest(age=elapsed, request_age=request_age),
                     mock.patch.object(disk, "mapped_output_paths", side_effect=AssertionError("unexpected walk")),
                     mock.patch.object(sweep, "target_dirs", side_effect=AssertionError("unexpected walk")),
                     mock.patch.object(disk, "read_cargo_output_roots", side_effect=AssertionError("unexpected walk")),
@@ -647,6 +652,20 @@ class DiskTests(unittest.TestCase):
                 self.assertEqual((store.root() / store.DISK_NAME).read_bytes(), original)
                 disk.write_snapshot(refreshed)
                 original = (store.root() / store.DISK_NAME).read_bytes()
+                if request_age is not None:
+                    self.assertTrue(request_path.is_file())
+                    request_path.unlink()
+            store.write_disk_walk_request({"requested_at": store.utc_iso((began + timedelta(minutes=1)).timestamp()),
+                                           "alert_at": store.utc_iso(began.timestamp()), "unnamed_bytes": 123})
+            request_bytes = (store.root() / store.DISK_WALK_REQUEST_NAME).read_bytes()
+            clock.return_value = began + timedelta(hours=2)
+            timestamp.return_value = (began + timedelta(hours=2)).timestamp()
+            requested = disk.snapshot()
+            self.assertEqual(requested["previous_measured_at"], first["measured_at"])
+            self.assertEqual(requested["measured_at"], store.utc_iso((began + timedelta(hours=2)).timestamp()))
+            self.assertGreater(requested["outside_build_caches"][0]["growth_bytes"], 0)
+            self.assertEqual((store.root() / store.DISK_WALK_REQUEST_NAME).read_bytes(), request_bytes)
+            (store.root() / store.DISK_WALK_REQUEST_NAME).unlink()
             clock.return_value = began + timedelta(days=1)
             timestamp.return_value = (began + timedelta(days=1)).timestamp()
             second = disk.snapshot()

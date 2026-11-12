@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
 from contextvars import Context
 import tempfile
 from contextlib import nullcontext
@@ -201,6 +202,23 @@ class LaunchEnvironmentTests(unittest.TestCase):
                 self.assertEqual(pane_launch.read_valid_entries(path, record=staff.StaffSnapshot((row,))), entries)
                 snapshot.assert_not_called()
             self.assertEqual(pane_launch.read_strict(path), entries)
+            user_home = Path(directory) / "home"
+            user_home.mkdir()
+            for source in ("configured", "staff", "numbered"):
+                for folder in ("sessions", "archived_sessions"):
+                    with self.subTest(source=source, folder=folder):
+                        home = user_home / ".codex2" if source == "numbered" else Path(directory) / source
+                        identity = f"{row.current_session}-{source}-{folder}"
+                        transcript = home / folder / f"{identity}.jsonl"
+                        transcript.parent.mkdir(parents=True, exist_ok=True)
+                        transcript.touch()
+                        current = replace(row, current_session=staff.StaffId(identity),
+                                          home=staff.SessionHome(home) if source == "staff" else staff.HomeUnknown())
+                        with (patch.dict(os.environ, {"HOME": str(user_home),
+                                                      "CODEX_HOME": str(home) if source == "configured" else ""}),
+                              patch.object(pane_launch, "native_kind", return_value=""),
+                              patch.object(sessions, "transcript_locations", return_value=[])):
+                            self.assertEqual(pane_launch.current_kind(current), "codex")
 
     def test_environment_boundaries_use_the_shared_identity_filter(self) -> None:
         environment = {"STAFF_ID": "old", "SHOWRUNNER_UNIT": "old", "CODEX_THREAD_ID": "native", "PATH": "/bin"}

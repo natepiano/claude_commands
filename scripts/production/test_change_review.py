@@ -141,7 +141,7 @@ class ProducerFixture(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""), unit_type=staff.UnitDetails("direct"))
 
 
     @override
@@ -744,6 +744,28 @@ class AttachedListTest(unittest.TestCase):
             rows = change_review.scope_rows(self.current, self.doc)
         self.assertEqual([row["Change"] for row in rows], ["Earlier child", "Dependent child"])
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(self.current), errors.getvalue())
+
+    def test_a_collector_retains_unreadable_lists_while_default_readers_skip_them(self) -> None:
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == self.current:
+                raise PermissionError(f"{path}: unreadable")
+            return read_text(path, encoding=encoding, errors=errors)
+
+        record = staff.snapshot()
+        errors = io.StringIO()
+        sources: list[Path] = []
+        with mock.patch.object(Path, "read_text", read), redirect_stderr(errors):
+            routed = change_review.routed_review_entries(self.current, self.doc, record=record)
+            with self.assertRaises(ValueError) as raised:
+                _ = change_review.routed_review_entries(self.current, self.doc, record=record, sources=sources)
+        self.assertIn(self.earlier, {source.path for source, _, _ in routed})
+        self.assertNotIn(self.current, {source.path for source, _, _ in routed})
+        self.assertIn(self.doc, sources)
+        self.assertIn(self.current, sources)
+        self.assertIn(str(self.current), str(raised.exception))
         self.assertIn(str(self.current), errors.getvalue())
 
     def test_absent_earlier_list_preserves_current_row_keys_and_filter(self) -> None:

@@ -49,13 +49,19 @@ def values(raw: str) -> list[str]:
     return [one] if one else []
 
 
-def frontmatter(path: Path) -> dict[str, list[str]]:
-    """The file's frontmatter fields, or none when it has no closed frontmatter or cannot be read."""
+def frontmatter(path: Path, *, sources: list[Path] | None = None) -> dict[str, list[str]]:
+    """Read the fields. A source collector requires a readable file with closed frontmatter."""
+    if sources is not None:
+        sources.append(path)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
+        if sources is not None:
+            raise
         return {}
     if not lines or lines[0].strip() != FENCE or FENCE not in (line.strip() for line in lines[1:]):
+        if sources is not None:
+            raise ValueError(f"{path}: missing or unclosed frontmatter")
         return {}
     fields: dict[str, list[str]] = {}
     key = ""
@@ -70,7 +76,19 @@ def frontmatter(path: Path) -> dict[str, list[str]]:
     return fields
 
 
-def open_issues(folder: Path, tag: str) -> list[Issue]:
+def source_paths(folder: Path, pattern: str, *, sources: list[Path] | None = None) -> list[Path]:
+    """List source paths. A collector requires readable folders; missing folders are empty."""
+    if sources is None:
+        return list(folder.glob(pattern))
+    sources.append(folder)
+    try:
+        return sorted(path for path in folder.iterdir() if path.match(pattern))
+    except FileNotFoundError:
+        return []
+
+
+def open_issues(folder: Path, tag: str, *, sources: list[Path] | None = None) -> list[Issue]:
     """The issues directly in the folder whose status is open and whose tags hold the tag, by name."""
-    issues = (Issue(path, frontmatter(path)) for path in sorted(folder.glob("*.md")) if path.is_file())
+    issues = (Issue(path, frontmatter(path, sources=sources))
+              for path in sorted(source_paths(folder, "*.md", sources=sources)) if path.is_file())
     return [issue for issue in issues if issue.value("status") == "open" and tag in issue.fields.get("tags", [])]

@@ -340,13 +340,16 @@ def document(content: str) -> bytes:
 <title>Changes to review</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
-h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
-ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
+.id{opacity:.7;font-size:14px}.kind{font-weight:600}
+h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
+h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
+section h2{font-size:17px}section details{margin:16px 0}.secondary-actions{margin-top:8px}
+ul,ol{margin:16px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
-form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
-button{font:inherit;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
+form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
+button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
+summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 </style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
 
 
@@ -367,18 +370,25 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row_id = html.escape(row)
     buttons: list[str] = []
     for value, label in (("works", "Works"), ("not works", "Does not work"),
-                         ("validate", "Validate yourself"), ("feedback", "Send feedback"), ("question", "Ask a question")):
-        if value == "question" and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
+                         ("validate", "Ask showrunner to check"), ("question", "Ask a question")):
+        if value in ("validate", "question") and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
         selected = 'aria-pressed="true" ' if notice.outcome == value else ""
         buttons.append(f'<button {selected}name="outcome" value="{value}">{label}</button>')
     return f'''<form method="post">
 <input type="hidden" name="row" value="{row_id}">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
-<label for="feedback-{row_id}">Feedback or question</label>
+<label for="feedback-{row_id}">Comment or question</label>
 <textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
 {html.escape(notice.feedback)}</textarea>
-<div>{"".join(buttons)}</div></form>'''
+<div>{"".join(buttons[:2])}</div><div class="secondary-actions">{"".join(buttons[2:])}</div></form>'''
+
+
+def change_details(row: dict[str, str], key: str) -> str:
+    """Keep change metadata inside one closed disclosure."""
+    return ('<details><summary>Details</summary>'
+            + f'<div class="id">{html.escape(key)} · {html.escape(row.get("Merged", ""))}</div>'
+            + f'<p class="kind">{html.escape(row.get(change_review.KIND) or "Kind not recorded")}</p></details>')
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -508,9 +518,8 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         sections.append(f'''<section id="{row_id}">
 {alert}
-<p class="kind">{html.escape(row[change_review.KIND])}</p>
-<div class="id">{row_id} · {html.escape(row.get("Merged", ""))}</div>
 <h1>{html.escape(row["Change"])}</h1>
+{change_details(row, row["#"])}
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}</section>''')
     if notice.reason and not notice.row:
@@ -521,9 +530,9 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         if queue.entries:
             sections.append(f'''<form method="post">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
-<button name="outcome" value="next">Next</button></form>''')
+<button name="outcome" value="next">Skip for now</button></form>''')
         else:
-            sections.append('<p>No changes are waiting.</p>')
+            sections.append('<p>No changes to review.</p>')
     return document("".join(sections))
 
 
