@@ -13,6 +13,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -31,7 +32,8 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("config", "maintenance.auto", "false")
         _ = self.git("config", "user.name", "Selection Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
-        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n")
+        self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                   + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
         self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
@@ -203,13 +205,29 @@ class AffectedModulesTests(unittest.TestCase):
             ('(ROOT / "scripts/accounts").rglob("*.py")', "scripts/unrelated/subject.py", False),
             ("config_test_support", "assets/unrelated.conf", False),
             ("config_test_support", "config/limits.conf", True),
+            ('declared_scan(ROOT)', "scripts/component/nested/subject.txt", True),
+            ('declared_scan(ROOT)', "commands/component/nested/subject.txt", True),
+            ('declared_scan(ROOT)', "outside/subject.md", False),
             ('(ROOT / os.environ.get("SCAN_FOLDER", "scripts")).rglob("*.py")', "scripts/component/subject.py", True),
             ('ROOT.glob(os.environ.get("SCAN_PATTERN", "**/*.py"))', "scripts/component/subject.py", True),
             ('(ROOT / os.environ.get("SCAN_FOLDER", "scripts/component")).glob("*.py")', "scripts/component/subject.py", True),
             (f"Path({str(self.repo)!r}).rglob('*.py')", "scripts/component/subject.py", True),
         )
-        for expression, changed, selected in scans:
-            with self.subTest(scan=expression, changed=changed):
+        declaration_errors = {
+            "checks/test_absent.py:scripts/component": "test module is not a live gate module",
+            "checks/test_audit.py:scripts/stlye": "repository path does not exist",
+            "checks/test_audit.py:scripts/component:extra": "expected exactly one ':'",
+        }
+        cases = [(expression, changed, selected,
+                  "checks/test_audit.py:scripts/component checks/test_audit.py:commands/component"
+                  if expression == "declared_scan(ROOT)" else "") for expression, changed, selected in scans]
+        cases.extend(("declared_scan(ROOT)", "outside/subject.md", False, declaration)
+                     for declaration in declaration_errors)
+        self.write("commands/component/seed.txt", "fixture\n")
+        for expression, changed, selected, declaration in cases:
+            with self.subTest(scan=expression, changed=changed, declaration=declaration):
+                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                           + f"# text:\nscan_roots={declaration}\n")
                 self.write(changed, "# before\n")
                 self.write("scripts/component/audit.py", "import os\nfrom scripts.component import directory_walk\n"
                     + "def scan(folder):\n    return list(folder.rglob('*.py'))\n"
@@ -234,6 +252,7 @@ class AffectedModulesTests(unittest.TestCase):
                        if expression in {'IMPORTED_ROOT.rglob("*.py")', "imported_scan(IMPORTED_ROOT)"} else "")
                     + "ROOT = Path(__file__).resolve().parents[2]\nscratch = Path('/fixture')\n"
                     + "def scan(folder):\n    return list(folder.rglob('*.py'))\n"
+                    + "def declared_scan(folder):\n    return list((folder / 'outside').glob('*.md'))\n"
                     + "def source_scan(folder):\n    return list(folder.rglob('*.py'))\n"
                     + "def scratch_scan(folder):\n    return list(os.walk(folder))\n"
                     + "class Audit:\n    @staticmethod\n    def scan(folder):\n        return list(folder.rglob('*.py'))\n"
@@ -246,10 +265,51 @@ class AffectedModulesTests(unittest.TestCase):
                     with self.subTest(cached=cached):
                         result = affected.select_affected(self.repo, self.base, self.modules,
                             affected.dirty_paths(self.repo), state_dir=self.cache_dir())
+                        if declaration in declaration_errors:
+                            self.assertIsInstance(result, affected.FullSuite)
+                            assert isinstance(result, affected.FullSuite)
+                            self.assertIn("graph error:", result.reason)
+                            self.assertIn(declaration, result.reason)
+                            self.assertIn(declaration_errors[declaration], result.reason)
+                        else:
+                            self.assertIsInstance(result, affected.AffectedSelection)
+                            assert isinstance(result, affected.AffectedSelection)
+                            self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
+                self.modules.remove(self.repo / "scripts/checks/test_audit.py")
+
+        words = conf.read(Path(__file__).resolve().parents[2] / "config/merge_gate.conf").text("scan_roots").split()
+        data_inputs = (
+            ("config/issue_score.conf", ("issue_score/test_experiment.py", "issue_score/test_score_issues.py")),
+            ("config/agent_notes.toml", ("maintenance/test_vault_commit.py",)),
+            ("scripts/lib/py", ("review_links/test_review_link.py", "usage/test_collect_mac.py")),
+            ("outside/subject.md", ("agents/test_models_conf_publish.py", "lint/test_style_review.py")),
+        )
+        for changed, names in data_inputs:
+            with self.subTest(changed=changed):
+                self.write(changed, "before\n")
+                declaration = " ".join(word for word in words if word.partition(":")[0] in names)
+                for word in declaration.split():
+                    path = self.repo / word.partition(":")[2]
+                    if not path.exists():
+                        path.mkdir(parents=True)
+                self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
+                           + f"# text:\nscan_roots={declaration}\n")
+                for name in names:
+                    self.add_test(name, "from pathlib import Path\n"
+                                  + "ROOT = Path(__file__).resolve().parents[2]\nFILES = list(ROOT.rglob('*'))\n")
+                self.certify()
+                self.write(changed, "after\n")
+                _ = self.commit()
+                for cached in (False, True):
+                    with self.subTest(cached=cached):
+                        result = affected.select_affected(self.repo, self.base, self.modules,
+                            affected.dirty_paths(self.repo), state_dir=self.cache_dir())
                         self.assertIsInstance(result, affected.AffectedSelection)
                         assert isinstance(result, affected.AffectedSelection)
-                        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
-                self.modules.remove(self.repo / "scripts/checks/test_audit.py")
+                        self.assertEqual({path.relative_to(self.repo).as_posix() for path in result.modules},
+                                         {f"scripts/{name}" for name in names})
+                for name in names:
+                    self.modules.remove(self.repo / "scripts" / name)
 
     def test_content_reads_select_read_files_and_keep_config_selection(self) -> None:
         self.add_test("checks/test_reader.py", "VALUE = 1\n")
@@ -391,7 +451,8 @@ class AffectedModulesTests(unittest.TestCase):
         )
         for certificate, branches, expected_base, changed in cases:
             with self.subTest(branches=branches, certificate=certificate):
-                self.write(".git/test-config/merge_gate.conf", f"# text:\nlanding_branches={branches}\n")
+                self.write(".git/test-config/merge_gate.conf", f"# text:\nlanding_branches={branches}\n"
+                           + "# text:\nscan_roots=\n")
                 with mock.patch.object(affected, "git_output", wraps=affected.git_output) as git:
                     result = affected.select_affected(self.repo, certificate, self.modules, set())
                 self.assertIsInstance(result, affected.AffectedSelection)
