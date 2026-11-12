@@ -541,12 +541,21 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.merge_gate import GateRun, GateJobResult
     from dataclasses import asdict
     if not isinstance(run, GateRun):
         raise TypeError('expected a completed gate')
-    return {'jobs': [asdict(job) | {'kind': job.kind.name} for job in run.jobs],
-            'executions': [asdict(job) | {'kind': job.kind.name} for job in run.executions],
+
+    def encode_job(job: GateJobResult) -> dict[str, object]:
+        row: dict[str, object] = asdict(job)
+        row['kind'] = job.kind.name
+        for key in ('started_at', 'ended_at'):
+            if row[key] is None:
+                del row[key]
+        return row
+
+    return {'jobs': [encode_job(job) for job in run.jobs],
+            'executions': [encode_job(job) for job in run.executions],
             'seconds': run.seconds, 'peak_memory_mib': run.peak_memory_mib,
             'tests_reused': run.tests_reused, 'selection_certified': run.selection_certified}
 
@@ -577,7 +586,9 @@ def decode_run(value: object) -> GateRun:
         return GateJobResult(text(row, 'suite'), text(row, 'module'), status, number(row, 'seconds'),
                              str(row['output']), str(row['killed_for']), row['tripwire_tripped'] is True,
                              GateJobKind[text(row, 'kind')], number(row, 'cpu_seconds'), measured,
-                             number(row, 'peak_mib'), restart)
+                             number(row, 'peak_mib'), restart,
+                             started_at=number(row, 'started_at') if 'started_at' in row else None,
+                             ended_at=number(row, 'ended_at') if 'ended_at' in row else None)
 
     row = mapping(value)
     for key in ('tests_reused', 'selection_certified'):
@@ -591,7 +602,8 @@ def decode_run(value: object) -> GateRun:
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
-                                  job.returncode, job.restart, job.times, job.output)
+                                  job.returncode, job.restart, job.times, job.output,
+                                  started_at=job.started_at, ended_at=job.ended_at)
             for job in value.executions or value.jobs]
 
 

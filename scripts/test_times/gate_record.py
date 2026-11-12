@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -43,6 +43,9 @@ TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
+    # Older records can omit the module times.
+    started_at: NotRequired[str]
+    ended_at: NotRequired[str]
     config_reads: NotRequired[list[str]]
     folder_scans: NotRequired[list[str]]
     content_reads: NotRequired[list[str]]
@@ -223,6 +226,8 @@ class Execution:
     restart: Literal["", "hold"]
     times: ModuleTimes | NoModuleTimes | TimingNotApplicable
     output: str
+    started_at: float | None = field(default=None, kw_only=True)
+    ended_at: float | None = field(default=None, kw_only=True)
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -302,6 +307,8 @@ def slow_test_s() -> float:
 
 def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
     """Keep each attempt and select its test times with one threshold."""
+    from scripts.buildlog import store
+
     attempts: dict[tuple[str, str], int] = {}
     modules: list[ModuleRun] = []
     for job in executions:
@@ -315,6 +322,10 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
             "log": "",
         }
+        if job.started_at is not None:
+            module["started_at"] = store.utc_iso(job.started_at)
+        if job.ended_at is not None:
+            module["ended_at"] = store.utc_iso(job.ended_at)
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
             reads = module_read_record(times.get("config_reads"), times.get("folder_scans"), times.get("content_reads"))
