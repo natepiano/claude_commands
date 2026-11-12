@@ -31,6 +31,12 @@ from scripts.production.gate_modules import GateRefused
 
 
 HARDWARE = 'deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\ndeviceName = Fixture GPU\n'
+SOFTWARE = 'deviceType = PHYSICAL_DEVICE_TYPE_CPU\ndeviceName = llvmpipe\n'
+
+
+def fake_tool_path(name: str, *, path: str | None = None) -> str:
+    _ = path
+    return name
 
 
 @final
@@ -66,11 +72,17 @@ class GpuTrialTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = trial.settings()
 
-    def test_hardware_check_refuses_cpu_or_missing_adapter(self) -> None:
-        self.assertEqual(trial.hardware_vulkan(HARDWARE), ('Fixture GPU',))
-        cpu = 'deviceType = PHYSICAL_DEVICE_TYPE_CPU\ndeviceName = llvmpipe\n'
-        for payload in (cpu, HARDWARE + cpu, '', 'deviceType = unknown'):
-            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, 'CPU adapters are refused'):
+    def test_hardware_check_requires_at_least_one_hardware_adapter(self) -> None:
+        cpu = {'type': 'PHYSICAL_DEVICE_TYPE_CPU', 'name': 'llvmpipe'}
+        for kind in ('DISCRETE', 'INTEGRATED', 'VIRTUAL'):
+            gpu = {'type': f'PHYSICAL_DEVICE_TYPE_{kind}_GPU', 'name': 'Fixture GPU'}
+            payload = HARDWARE.replace('DISCRETE', kind)
+            for text, adapters in ((payload, (gpu,)), (payload + SOFTWARE, (gpu, cpu)),
+                                   (SOFTWARE + payload, (cpu, gpu))):
+                with self.subTest(kind=kind, payload=text):
+                    self.assertEqual(trial.hardware_vulkan(text), adapters)
+        for payload in (SOFTWARE, '', 'deviceType = unknown'):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, 'at least one hardware Vulkan adapter'):
                 _ = trial.hardware_vulkan(payload)
 
     def test_generated_guest_executes_both_runs_and_publishes_results(self) -> None:
@@ -100,7 +112,8 @@ from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 if name == 'vulkaninfo':
-    print('deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\ndeviceName = Fixture GPU')
+    print('deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\ndeviceName = Fixture GPU\\n'
+          'deviceType = PHYSICAL_DEVICE_TYPE_CPU\\ndeviceName = llvmpipe')
 elif name == 'curl':
     if '-T' in args:
         shutil.copyfile(args[args.index('-T') + 1], args[-1])
@@ -136,6 +149,13 @@ elif name == 'cargo':
         for number in (1, 2):
             with tarfile.open(uploaded / f'result-{number}.tar.gz') as bundle:
                 names = bundle.getnames()
+                machine = bundle.extractfile('machines/g6.xlarge/machine.json')
+                assert machine is not None
+                with machine:
+                    record = trial.mapping(cast(object, json.load(machine)))
+                self.assertEqual(record['adapters'], [
+                    {'type': 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', 'name': 'Fixture GPU'},
+                    {'type': 'PHYSICAL_DEVICE_TYPE_CPU', 'name': 'llvmpipe'}])
             self.assertIn('machines/g6.xlarge/vulkan.txt', names)
             self.assertIn(f'machines/g6.xlarge/{number}/samples/test.json', names)
             self.assertIn(f'machines/g6.xlarge/{number}/junit.xml', names)
@@ -201,6 +221,8 @@ elif name == 'cargo':
 
     def test_prepare_stops_before_build_when_hold_refuses(self) -> None:
         with (mock.patch.object(trial, 'checked', return_value='a' * 40) as command,
+              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'preflight', return_value={}),
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=GateRefused('held')),
               mock.patch.object(merge_gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held'):
@@ -212,6 +234,8 @@ elif name == 'cargo':
 
     def test_prepare_checks_hold_again_after_admission(self) -> None:
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
+              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'preflight', return_value={}),
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=[None, GateRefused('held again')]),
               mock.patch.object(merge_gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held again'):
@@ -223,6 +247,8 @@ elif name == 'cargo':
     def test_prepare_uses_admitted_worker(self) -> None:
         folder = self.root / 'trial'
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
+              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'preflight', return_value={'vulkaninfo': '/nix/store/fixture/bin/vulkaninfo'}),
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
               mock.patch.object(merge_gate, 'gate_reservation') as admission,
               redirect_stdout(StringIO())):
@@ -237,6 +263,64 @@ elif name == 'cargo':
         self.assertIn('--prepare-worker', argv)
         self.assertEqual(argv[-1], str(folder))
         self.assertEqual(trial.read_json(folder / 'request.json')['commit'], 'a' * 40)
+        self.assertEqual(trial.read_json(folder / 'request.json')['tools'],
+                         {'vulkaninfo': '/nix/store/fixture/bin/vulkaninfo'})
+
+    def test_preflight_refuses_missing_tools_before_any_hold_wait(self) -> None:
+        for missing in ('git', 'nix', 'nix-store', 'python', 'sh', 'cargo', 'rustc',
+                        'rustdoc', 'cargo-nextest', 'zstd', 'vulkaninfo', 'dev shell'):
+            with self.subTest(missing=missing):
+                def checked(argv: Sequence[str], _cwd: Path, *,
+                            environment: Mapping[str, str] = os.environ, timeout: float | None = None) -> str:
+                    _ = environment, timeout
+                    if 'rev-parse' in argv:
+                        return 'a' * 40
+                    if missing == 'dev shell' and argv[:2] == ['nix', 'develop']:
+                        raise subprocess.CalledProcessError(1, argv)
+                    executable = sys.executable if missing == 'python' else missing
+                    if executable in argv or (missing == 'vulkaninfo' and argv[-1] == '--summary'):
+                        raise FileNotFoundError(executable)
+                    if argv[-1] == 'nixpkgs#vulkan-tools':
+                        return '/nix/store/fixture-vulkan-tools'
+                    if 'command -v "$1"' in argv:
+                        return argv[-1]
+                    return 'fixture version'
+
+                with (mock.patch.object(trial, 'checked', side_effect=checked),
+                      mock.patch('shutil.which', side_effect=fake_tool_path),
+                      mock.patch.object(trial, 'export_source', return_value=self.root),
+                      mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free') as hold,
+                      mock.patch.object(merge_gate, 'gate_reservation') as admission):
+                    with self.assertRaisesRegex(ValueError, missing):
+                        trial.prepare(self.root, 'HEAD', self.root / missing)
+                hold.assert_not_called()
+                admission.assert_not_called()
+
+    def test_preflight_refuses_software_vulkan_and_command_timeout(self) -> None:
+        for failure in ('software', 'timeout'):
+            with self.subTest(failure=failure):
+                expected_timeout = conf.read('aws_target').number('gpu_size_trial_preflight_timeout_s') + 1
+                _ = write_config_fixture(conf.path('aws_target'),
+                                         f'gpu_size_trial_preflight_timeout_s={expected_timeout}')
+
+                def checked(argv: Sequence[str], _cwd: Path, *,
+                            environment: Mapping[str, str] = os.environ, timeout: float | None = None) -> str:
+                    _ = environment
+                    self.assertEqual(timeout, expected_timeout)
+                    if argv[-1] == 'nixpkgs#vulkan-tools':
+                        return '/nix/store/fixture-vulkan-tools'
+                    if 'command -v "$1"' in argv:
+                        return argv[-1]
+                    if argv[-1] == '--summary':
+                        if failure == 'timeout':
+                            raise subprocess.TimeoutExpired(argv, expected_timeout)
+                        return SOFTWARE
+                    return 'fixture version'
+
+                with (mock.patch.object(trial, 'checked', side_effect=checked),
+                      mock.patch('shutil.which', side_effect=fake_tool_path)):
+                    with self.assertRaisesRegex(ValueError, 'vulkaninfo'):
+                        _ = trial.preflight(self.root, {})
 
     def test_junit_config_preserves_groups_and_existing_options(self) -> None:
         original = '[profile.ci]\ndefault-filter="all()"\n[profile.ci.junit]\npath="old.xml"\nstore-success-output=true\n[test-groups.slow]\nmax-threads=1\n'
@@ -277,9 +361,19 @@ elif name == 'cargo':
         commands: list[tuple[str, ...]] = []
         real_checked = trial.checked
         real_run = subprocess.run
+        nix = '/nix/store/fixture-nix/bin/nix'
+        nix_store = '/nix/store/fixture-nix/bin/nix-store'
 
-        def checked(argv: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ) -> str:
+        def tool_path(name: str, *, path: str | None = None) -> str:
+            _ = path
+            return {'nix': nix, 'nix-store': nix_store}.get(name, name)
+
+        def checked(argv: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ,
+                    timeout: float | None = None) -> str:
+            _ = timeout
             commands.append(tuple(argv))
+            if argv[0] in (nix, nix_store):
+                argv = [Path(argv[0]).name, *argv[1:]]
             if argv[0] == 'git':
                 with mock.patch.object(subprocess, 'run', real_run):
                     return real_checked(argv, cwd, environment=environment)
@@ -288,17 +382,21 @@ elif name == 'cargo':
             if argv[:2] == ['nix', 'print-dev-env']:
                 return 'export LD_LIBRARY_PATH=/nix/store/fixture-runtime/lib'
             if argv[:2] == ['nix', 'build']:
+                if argv[-1] == 'nixpkgs#vulkan-tools':
+                    return '/nix/store/fixture-vulkan-tools'
                 return '/nix/store/fixture-system' if 'gpu-trial.nix' in argv[-1] else '/nix/store/fixture-rust'
             if argv[0] == 'nix-store':
                 return '/nix/store/fixture-system\n/nix/store/fixture-runtime\n/nix/store/fixture-rust'
+            if 'command -v "$1"' in argv:
+                return argv[-1]
             if argv[0] == '/nix/store/fixture-rust/bin/cargo' and '--version' in argv:
                 self.assertEqual(list(Path(environment['HOME']).iterdir()), [])
             if 'fetch' in argv:
                 fresh = Path(environment['CARGO_HOME']) / 'registry'
                 fresh.mkdir()
                 _ = (fresh / 'dependency').write_text('fresh source')
-            if 'vulkaninfo' in argv:
-                return HARDWARE
+            if argv[-2:] == ['/nix/store/fixture-vulkan-tools/bin/vulkaninfo', '--summary']:
+                return HARDWARE + SOFTWARE
             if 'archive' in argv:
                 _ = (folder / 'hana-tests.tar.zst').write_bytes(b'fixture archive')
             if 'list' in argv:
@@ -309,7 +407,7 @@ elif name == 'cargo':
         def execute(argv: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
             if argv[0] == 'git':
                 return real_run(argv, cwd=cast(Path, kwargs['cwd']), stdout=cast(BinaryIO, kwargs['stdout']), check=True)
-            if argv[0] == 'nix-store':
+            if argv[0] == nix_store:
                 _ = cast(BinaryIO, kwargs['stdout']).write(b'fixture closure')
             else:
                 commands.append(tuple(argv))
@@ -325,11 +423,27 @@ elif name == 'cargo':
         with (mock.patch.object(trial, 'checked', side_effect=checked),
               mock.patch.object(subprocess, 'run', side_effect=execute),
               mock.patch.object(trial, 'scan_toolchain_wrappers'),
+              mock.patch('shutil.which', side_effect=tool_path),
               mock.patch.dict(os.environ, {'CARGO_HOME': str(cache)})):
+            source = trial.export_source(repo, commit, folder)
+            request = trial.read_json(folder / 'request.json')
+            request['tools'] = trial.preflight(source, trial.trial_environment())
+            trial.write_json(folder / 'request.json', request)
             trial.prepare_worker(folder)
         manifest = trial.read_json(folder / 'manifest.json')
         self.assertEqual(manifest['state'], 'prepared')
         self.assertEqual(manifest['commit'], commit)
+        self.assertEqual(manifest['vulkan_tools'], '/nix/store/fixture-vulkan-tools')
+        self.assertEqual(trial.read_json(folder / 'machines/natedev/machine.json')['adapters'], [
+            {'type': 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', 'name': 'Fixture GPU'},
+            {'type': 'PHYSICAL_DEVICE_TYPE_CPU', 'name': 'llvmpipe'}])
+        self.assertFalse(any(command[0] in ('nix', 'nix-store') for command in commands))
+        self.assertEqual([command for command in commands if command[-1] == 'nixpkgs#vulkan-tools'], [
+            (nix, 'build', '--no-link', '--print-out-paths', '--inputs-from', str(folder / 'source'),
+             'nixpkgs#vulkan-tools')])
+        self.assertEqual([command for command in commands if command[-1] == '--summary'], [
+            (nix, 'develop', '--no-write-lock-file', '.#default', '-c',
+             '/nix/store/fixture-vulkan-tools/bin/vulkaninfo', '--summary')] * 3)
         for name, value in trial.mapping(manifest['sha256']).items():
             self.assertEqual(trial.digest(folder / name), value)
         self.assertFalse((folder / 'cargo-home/credentials.toml').exists())
