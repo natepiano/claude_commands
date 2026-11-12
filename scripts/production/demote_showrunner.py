@@ -256,9 +256,6 @@ def restore(path: Path) -> int:
         if isinstance(started, (herdr.nix_env.Refused, herdr.PromptNotSubmitted)):
             print(started.reason, file=sys.stderr)
             return 1
-        production = read_production(source)
-        if isinstance(update_registration.update_schedule(production.doc.read_text().splitlines()), update_registration.ScheduledUpdates):
-            _ = update_registration.notifier(["start", f"showrunner-{source.id}"])
         path.unlink()
     return 0
 

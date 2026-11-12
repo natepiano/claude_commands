@@ -24,14 +24,14 @@ The staff row owns the current unit folder. Other records must use the staff ide
 | Unit start facts | `.unit.toml`: `retired.folder` | `production/unit_config.py` | `resume_unit`, `retire_unit`, `production_lifecycle`, `staff_sources`; readers now use staff |
 | Retirement note | Units Plan cell: `folder` in the retired note | `production/retire_unit.py:retired_note` | former retirement recovery readers; these now use staff |
 | Showrunner promotion journal | promotion journal: `worktree` | `production/promote_showrunner.py` | promotion recovery |
-| Showrunner launch receipt | Legacy `add_showrunner.json`: `cwd` | Removed from `production/add_showrunner.py` | Launch recovery uses the owner and session identities |
+| Showrunner launch receipt | `add_showrunner.json`: `owner` and launch fields; pending creation claims | `production/add_showrunner.py` | Launch recovery reads the current session, document and home from staff |
 | Checkout move journal, deleted | No new record | Removed from checkout rename and shutdown storage | Restart reads the current session location |
 | Relaunch request | Legacy relaunch JSON: `cwd` | Removed from `agents/restart.py` | `lib/relaunch.py` attaches to herdr without a folder change |
 | Native Claude records | Claude session files and transcripts: `cwd`, project directory | Claude and session hooks | `message/sessions.py`, transcript readers; transcripts are found by session id |
 | Claude folder trust | account config: `projects` keys | Claude, `unit_move.copy_trust`, rename commands | Claude folder permission checks |
 | Native Codex records | Codex rollout/thread metadata: `cwd` | Codex server | Codex server and daemon reader; threads are found by thread id |
 | Build and admission records | queue, lint and build log records: `cwd`, `folder`, `worktree` | `lint/memory_admit.py`, `build_queue/admission_service.py`, `buildlog/record.py`, `mac_test/mac_test.py` | build execution, accounting and reports; these describe commands and historical builds |
-| Held design context | `design.json`: repository, document, binding, and fixed role identities | `astra/design_roles.py` | Held role launch, binding checks, and lifecycle operations |
+| Held design context | `design.json`: `repository_owner` or `repository`, `document`, binding, and role staff ids | `astra/design_roles.py` | Held role launch, binding checks, and lifecycle operations |
 
 ## Ownership
 
@@ -43,6 +43,12 @@ The staff row owns the current unit folder. Other records must use the staff ide
 6. The tester owns every test and fixture file.
 
 ## Current changes
+
+Owned designs and bindings store `repository_owner` instead of a checkout path.
+Owned designs store `document` relative to that checkout.
+Readers resolve both paths from the owner's current staff worktree.
+Independent checkouts retain absolute `repository` and `document` paths.
+Worker roles with staff ids omit `name` and read the current name from staff.
 
 Shutdown records omit unit `cwd` and checkout `path`. Their parser joins session ids to staff and supplies runtime paths.
 

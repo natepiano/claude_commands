@@ -43,6 +43,11 @@ RESUME = (
 )
 RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first at 15."
 ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
+PAUSE_CONTEXT = (
+    "Automatic updates for this session are paused while the user talks to you: "
+    "status reports. Leave them off; the session asks the user before they return. "
+    f"If the user asks for them back sooner, run: {RESUME}"
+)
 OTHER_ANSWER_CONTEXT = (
     'You asked the user "Return to automatic updates? (yes / no)" and they wrote '
     "something else. If their message answers that question, run "

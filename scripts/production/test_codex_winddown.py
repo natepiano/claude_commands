@@ -459,6 +459,20 @@ class CountTests(unittest.TestCase):
         self.assertEqual(result, 0)
         start_count.assert_called_once_with(newer)
 
+        for session_name in ("hana", "runner with spaces"):
+            record = newer.copy()
+            record["name"] = session_name
+            with (self.subTest(notifier="real parser", session=session_name),
+                  mock.patch.object(codex_winddown, "NOTIFIER", SCRIPT.parents[1] / "message/notifier.sh"),
+                  mock.patch.object(codex_winddown, "STATE", state),
+                  mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state / "notifier"),
+                                               "__ETC_ZSHENV_SOURCED": "1"})):
+                self.assertTrue(codex_winddown.start_count(record))
+                instance = state / "notifier" / codex_winddown.instance_name(session_name)
+                conf = dict(line.split("=", 1) for line in (instance / "conf").read_text().splitlines())
+                self.assertEqual(conf["TARGET"], "session:newer")
+                self.assertIn(f"count {shlex.quote(session_name)}`", conf["COMMAND"])
+
     def test_an_agent_belongs_to_its_nearest_named_session(self) -> None:
         table = {10: Process(10, 1, "claude", "claude"), 20: Process(20, 10, "claude", "claude"),
                  30: Process(30, 20, "bash", "bash assign.sh --role implement"), 40: Process(40, 30, "codex", "codex exec task"),
@@ -615,7 +629,8 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
         self.assertEqual(log.count("Sent directly to showrunners and unit directors on fixture and mac; do not pass it on."), 2)
         self.assertIn("notifier new codex-count-hana --every 2 --to session:b861068b-66ee-573d-b3be-ec6d4a321e71", log)
-        prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
+        prompt = next(line for line in log.splitlines()
+                      if line.startswith("notifier new codex-count-hana ")).split(" --command ", 1)[1]
         self.assertIn(f"{SCRIPT} count hana`", prompt)
 
     def test_clear_stops_every_count_and_sends_the_all_clear(self) -> None:

@@ -8,19 +8,23 @@ from scripts.direct import progress_history
 import fcntl
 import io
 import json
+import multiprocessing
 import os
 import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
@@ -29,6 +33,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
 from scripts.production import add_unit
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
@@ -399,21 +404,6 @@ class WaitingTests(unittest.TestCase):
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
         return update_registration.state_block(production, state, moment.strftime("%H:%M %Z"))
 
-    def producer_eta_line(self, moment: datetime, phase: str, eta: datetime,
-                          *, identifier: str = ALPHA) -> str:
-        zone = moment.tzname() or "PDT"
-        days = (eta.date() - moment.date()).days
-        clock = f"{eta:%H:%M} {zone}"
-        if days == 1:
-            clock += " tomorrow"
-        elif days != 0:
-            clock = f"{eta:%a} {clock}"
-        return (f"- {moment:%H:%M} {zone}: dailies ETAs: "
-                + f"{identifier} {phase.split(':')[0]} {clock}, 60% done")
-
-    def producer_held_eta_line(self, moment: datetime, phase: str, eta: datetime) -> str:
-        return self.producer_eta_line(moment, phase, eta)
-
 
     def test_scratch_green_uses_detached_unit_tip_and_preserves_its_log(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
@@ -647,17 +637,63 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(next_phase.returncode, 0, next_phase.stdout + next_phase.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", next_phase.stdout)
 
-    def eta_request_process(self, phase: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [sys.executable, str(SCRIPT), "eta-request", ALPHA, "--phase", phase,
-             "--production", "showrunner-example", "--state-dir", str(self.state)],
-            cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+    def eta_request_processes(self, phases: list[str]) -> list[subprocess.CompletedProcess[str]]:
+        context = multiprocessing.get_context("fork")
+        ready = context.Barrier(len(phases) + 1)
+        processes: list[BaseProcess] = []
+        outputs: list[tuple[TextIO, TextIO]] = []
+
+        def request(phase: str, stdout: TextIO, stderr: TextIO) -> None:
+            os.setpgid(0, 0)
+            try:
+                _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                result = self.run_waiting("eta-request", ALPHA, "--phase", phase,
+                                          "--state-dir", str(self.state))
+            except BaseException:
+                traceback.print_exc(file=stderr)
+                stderr.flush()
+                raise
+            _ = stdout.write(result.stdout)
+            _ = stderr.write(result.stderr)
+            stdout.flush()
+            stderr.flush()
+            raise SystemExit(result.returncode)
+
+        with ExitStack() as files:
+            try:
+                for phase in phases:
+                    stdout = files.enter_context(tempfile.TemporaryFile(mode="w+"))
+                    stderr = files.enter_context(tempfile.TemporaryFile(mode="w+"))
+                    process = context.Process(target=request, args=(phase, stdout, stderr))
+                    process.start()
+                    processes.append(process)
+                    outputs.append((stdout, stderr))
+                _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                results: list[subprocess.CompletedProcess[str]] = []
+                for phase, process, (stdout, stderr) in zip(phases, processes, outputs):
+                    process.join(timeout=TEST_HANG_GUARD_SECS)
+                    status = process.exitcode
+                    if status is None:
+                        raise TimeoutError("The ETA request process did not finish.")
+                    _ = stdout.seek(0)
+                    _ = stderr.seek(0)
+                    results.append(subprocess.CompletedProcess(
+                        [str(SCRIPT), "eta-request", ALPHA, "--phase", phase],
+                        status, stdout.read(), stderr.read()))
+                return results
+            finally:
+                for process in processes:
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.join(timeout=TEST_HANG_GUARD_SECS)
+                    process.close()
 
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
-        processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
+        processes = self.eta_request_processes(phases)
+        outputs = [(process.stdout, process.stderr) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -665,8 +701,8 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertFalse([path for path in self.state.iterdir() if path.suffix == ".tmp"])
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
-        processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
+        processes = self.eta_request_processes([PHASE for _ in range(12)])
+        outputs = [(process.stdout, process.stderr) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
@@ -830,15 +866,9 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                  "working_dir": str(self.alpha), "timestamp_epoch": start.timestamp()}
         self.write(self.root / "history/runs/alpha.jsonl", json.dumps(event) + "\n")
 
-    def agenda_log(self, start: datetime, phase: str, *, eta: datetime | None = None,
-                   wait: datetime | None = None, eta_identifier: str = ALPHA,
-                   ) -> None:
+    def agenda_log(self, start: datetime, phase: str, *, wait: datetime | None = None) -> None:
         self.record_phase_start(start)
         events = [(start, self.producer_launch_line(start))]
-        if eta is not None:
-            eta_moment = start + timedelta(minutes=10)
-            events.append((eta_moment, self.producer_eta_line(eta_moment, phase, eta,
-                                                               identifier=eta_identifier)))
         if wait is not None:
             events.append((wait, f"- {wait:%H:%M %Z}: block: {ALPHA} on {BETA} "
                                  + "(files: shared.txt), clears ~23:00"))
@@ -888,12 +918,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertNotIn(f"{ALPHA}|{PHASE_IDENTITY}", repeated.stdout)
 
-    def test_agenda_opens_when_eta_is_nine_hours_after_phase_start(self) -> None:
-        start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=1)
-        self.agenda_log(start, PHASE, eta=start + timedelta(hours=9))
-        result = self.run_waiting("agenda", "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
 
     def test_agenda_uses_the_recorded_phase_start_instead_of_git_commit_time(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "first phase\n")
@@ -914,7 +938,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     def test_agenda_ignores_long_wait_when_phase_itself_is_short(self) -> None:
         start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=1)
         old_wait = start - timedelta(hours=9)
-        self.agenda_log(start, PHASE, eta=start + timedelta(hours=2), wait=old_wait)
+        self.agenda_log(start, PHASE, wait=old_wait)
         result = self.run_waiting("agenda", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
@@ -925,85 +949,14 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         now = datetime.now(zone)
         start = now - timedelta(hours=10)
         old_state = self.producer_state_block(start + timedelta(minutes=5), {ALPHA: "Phase 3 of 3: old work"})
-        eta = self.producer_eta_line(start + timedelta(minutes=10), "Phase 3 of 3: old work",
-                                     start + timedelta(hours=12))
         done_state = self.producer_state_block(now, {ALPHA: "done"})
         self.write(self.log, "\n".join(("# Production log — example",
-                                        self.producer_launch_line(start), old_state, eta, done_state, "")))
+                                        self.producer_launch_line(start), old_state, done_state, "")))
         result = self.run_waiting("agenda", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("agenda: ok — 0 new items", result.stdout)
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
-    def test_agenda_does_not_inherit_an_eta_from_the_previous_phase(self) -> None:
-        zone = ZoneInfo("America/Los_Angeles")
-        now = datetime.now(zone)
-        launched = now - timedelta(hours=12)
-        phase_started = now - timedelta(hours=1)
-        self.record_phase_start(phase_started)
-        unit_tip = self.commit(self.alpha, "alpha.txt", "first phase\n")
-        _ = self.git("merge", "--no-ff", "-m",
-                     f"Merge {ALPHA} phase 1 ({unit_tip[:7]}) into production", "alpha-branch")
-        merge_tip = self.git("rev-parse", "HEAD")
-        old_phase = "Phase 1 of 3: old work"
-        lines = (
-            "# Production log — example",
-            self.producer_launch_line(launched),
-            self.producer_state_block(launched + timedelta(minutes=5), {ALPHA: old_phase}),
-            self.producer_eta_line(launched + timedelta(minutes=10), old_phase,
-                                   launched + timedelta(hours=10)),
-            self.producer_merge_line(phase_started, unit_tip, merge_tip),
-            self.producer_state_block(now, {ALPHA: PHASE}),
-            "",
-        )
-        self.write(self.log, "\n".join(lines))
-        result = self.run_waiting("agenda", "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("agenda: ok — 0 new items", result.stdout)
-        self.assertFalse((self.state / "agenda_seen.json").exists())
-
-    def test_agenda_matches_eta_segments_by_unit_or_session_name(self) -> None:
-        session = "alpha-session"
-        self.alpha_session(session)
-        zone = ZoneInfo("America/Los_Angeles")
-        for identifier in (ALPHA, session):
-            with self.subTest(identifier=identifier):
-                _ = (self.state / "agenda_seen.json").unlink(missing_ok=True)
-                start = datetime.now(zone) - timedelta(hours=1)
-                # The saved report state names a unit by its id; an ETA segment may use either name.
-                self.agenda_log(start, PHASE, eta=start + timedelta(hours=9), eta_identifier=identifier)
-                result = self.run_waiting("agenda", "--state-dir", str(self.state))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
-
-    def test_held_unchanged_eta_from_yesterday_stays_out_of_the_agenda(self) -> None:
-        zone = ZoneInfo("America/Los_Angeles")
-        start = datetime(2026, 10, 6, 18, 50, tzinfo=zone)
-        first_report = datetime(2026, 10, 6, 19, 30, tzinfo=zone)
-        eta = datetime(2026, 10, 6, 19, 35, tzinfo=zone)
-        now = datetime(2026, 10, 7, 0, 10, tzinfo=zone)
-        held_report = self.producer_held_eta_line(now, PHASE, eta)
-        lines = (
-            "# Production log — example",
-            self.producer_launch_line(start),
-            self.producer_eta_line(first_report, PHASE, eta),
-            held_report,
-            self.producer_state_block(now, {ALPHA: PHASE}),
-            "",
-        )
-        self.assertIn(f"{ALPHA} {PHASE_IDENTITY} Tue 19:35 PDT", held_report)
-        self.write(self.log, "\n".join(lines))
-
-        class AgendaClock:
-            @staticmethod
-            def now(requested_zone: ZoneInfo) -> datetime:
-                return now.astimezone(requested_zone)
-
-        output = io.StringIO()
-        with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(production_doc.read_production("showrunner-example"), self.state)
-        self.assertIn("agenda: ok — 0 new items", output.getvalue())
-        self.assertFalse((self.state / "agenda_seen.json").exists())
 
     def test_log_timeline_spans_two_midnights_for_waits_and_first_phase(self) -> None:
         now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(second=0, microsecond=0)
@@ -1048,6 +1001,16 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
+    def test_showrunner_uses_one_state_directory_for_waiting_records(self) -> None:
+        root = SCRIPT.parents[2]
+        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
+        self.assertIn("`WAITING_STATE_DIR` — `<STATE_DIR>/waiting_state`", produce)
+        calls = cast(list[str], re.findall(r"`([^`]*scripts/production/waiting\.py[^`]*)`", produce))
+        for action in ("scratch-test", "agenda", "eta-request"):
+            matches = [call for call in calls if f"waiting.py {action}" in call]
+            self.assertTrue(matches, action)
+            self.assertTrue(all("--state-dir WAITING_STATE_DIR" in call for call in matches), action)
+
     def test_showrunner_says_an_unmeasured_eta_request_cannot_repeat(self) -> None:
         produce = (SCRIPT.parents[2] / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **No footer.**", 1)[0]
@@ -1066,17 +1029,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda)
         self.assertEqual(agenda.count("`For discussion with you`"), 1)
         self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda)
-
-    def test_future_weekday_eta_resolves_after_the_log_line(self) -> None:
-        zone = ZoneInfo("America/Los_Angeles")
-        report_at = datetime(2026, 10, 6, 8, 0, tzinfo=zone)
-        eta = datetime(2026, 10, 8, 9, 0, tzinfo=zone)
-        line = f"- 08:00 PDT: dailies ETAs: {ALPHA} {PHASE_IDENTITY} Thu 09:00 PDT, 60% done"
-        prefix = f"{ALPHA} {PHASE_IDENTITY} "
-        eta_text = line.split("dailies ETAs: ", 1)[1].removeprefix(prefix)
-
-        self.assertTrue(eta_text.startswith("Thu 09:00 PDT"), line)
-        self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
 
 if __name__ == "__main__":
     _ = unittest.main()
