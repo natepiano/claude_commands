@@ -161,10 +161,11 @@ class LocalReviewTests(unittest.TestCase):
         registry = write_registry(self.root / "models.conf")
 
         def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
-                    check: bool, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+                    check: bool, timeout: float = 60, input: str | None = None) -> subprocess.CompletedProcess[str]:
             if argv[0] != "bash" or env.get("MODELS_CONFIG_FILE") != str(registry):
                 raise AssertionError(f"unexpected process: {argv}")
-            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout)
+            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout,
+                                    input=input)
 
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=process))
         _ = self.enterContext(mock.patch.object(review, "schedule"))

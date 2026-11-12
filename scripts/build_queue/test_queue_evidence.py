@@ -98,6 +98,11 @@ class QueueEvidenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        mac_cache = self.root / "mac-builds.json"
+        _ = mac_cache.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=mac_cache))
+        _ = self.enterContext(mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.read_mac_builds()))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_activity_refresh_seconds", return_value=30))
         config = self.root / "build_admission.conf"
         write_memory_config(config)
         self.directory = self.root / "buildlog/admission"
@@ -582,7 +587,7 @@ class QueueEvidenceTests(unittest.TestCase):
         )
         for name, step, admitted, need, used, kept in expected:
             row, = [line for line in rows if f"{name}-session," in line]
-            self.assertIn(f"hana / {name} / {name}-session, hana {step}: admitted {admitted}", row)
+            self.assertIn(f"hana / {name} / {name}-session, {name} {step}: admitted {admitted}", row)
             self.assertIn(f"need {need} GiB; anonymous use {used} GiB; held slot 0.0 GiB; kept aside {kept} GiB", row)
         compiler, = [line for line in rows if "sccache.service" in line]
         self.assertIn("sccache.service: idle; 0.4 GiB RAM; 0.0 GiB swapped", compiler)

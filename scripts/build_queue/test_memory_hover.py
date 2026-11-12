@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
+from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import memory_feed, progress_profile as progress
@@ -29,9 +30,9 @@ class MemoryHoverTests(unittest.TestCase):
         room = gate.inputs_room(inputs, admission_policy_fixture())
         assert isinstance(room, admission_records.MemoryRoom)
         text = memory_feed.run_keep_text(room.runs[0], inputs.running)
-        self.assertIn("suites:1, 80% done", text)
+        self.assertIn("suites:1, 80.0% done", text)
         self.assertIn("0.5 GiB", text)
-        self.assertIn("highest anonymous use in the next 20%", text)
+        self.assertIn("highest anonymous use in the next 20.0%", text)
         module_counter = memory_feed.row_progress(inputs.running)
         assert module_counter["kind"] == "RowProgress"
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
@@ -46,10 +47,10 @@ class MemoryHoverTests(unittest.TestCase):
                     "name": name, "unit": "fixture", "showrunner": "fixture-production",
                     "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
                     "progress": counter}]}))
-                self.assertEqual(hover[0], f"{name} · fixture-production")
-                for expected in ("suites:1, 80% done", "0.5 GiB", "highest anonymous use in the next 20%",
-                                 "The queue holds this memory for the run.", "\nfixture",
-                                 f"testing · 8 of 10 {counter['unit']} · 80% done"):
+                self.assertEqual(hover[0], "Running step")
+                for expected in ("suites:1, 80.0% done", "0.5 GiB", "highest anonymous use in the next 20.0%",
+                                 "The queue holds this memory for the run.", "Unit: fixture",
+                                 f"testing · 8 of 10 {counter['unit']} · 80.0% done"):
                     with self.subTest(expected=expected):
                         self.assertIn(expected, hover[1])
                 self.assertEqual("Modules start slowest first, so this reads low early." in hover[1], ordering_note)
@@ -57,22 +58,87 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
-            ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "testing · 7 of 12 modules · 58% done"),
-            ("setup", progress.NoCounter("no cloud counter"), "setup. Machine: aws."),
-            ("", progress.NoCounter("no cloud counter"), "Machine: aws. No local memory reservation."),
+            ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "58.3% done"),
+            ("setup", progress.NoCounter("no cloud counter"), "No local memory reservation."),
+            ("", progress.NoCounter("no cloud counter"), "No local memory reservation."),
         ):
             with self.subTest(status=status):
                 hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
-                    "kind": "cloud", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
+                    "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
                     "status": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn(expected, hover[1])
-                self.assertIn("Machine: aws. No local memory reservation.", hover[1])
+                self.assertIn("No local memory reservation.", hover[1])
+                self.assertIn("Machine: aws", hover[1])
+                if status:
+                    self.assertNotIn(status, hover[1])
                 self.assertFalse(hover[1].startswith("."), hover[1])
 
-    def page_expression(self, expression: str, data: object) -> object:
+    def test_progress_percent_rounds_down_until_the_counter_is_complete(self) -> None:
+        for done, total, percent, expected in (
+            (835, 836, 100 * 835 / 836, "99.8%"),
+            (836, 836, 100, "100.0%"),
+            (999, 1000, 100, "99.9%"),
+            (0, 836, 0, "0.0%"),
+        ):
+            with self.subTest(done=done, total=total, percent=percent):
+                text = self.page_expression("progressTip(data)", {"progress": {
+                    "kind": "RowProgress", "phase": "building", "unit": "units",
+                    "done": done, "total": total, "percent": percent}})
+                self.assertIn(f"building · {done} of {total} units · {expected} done", str(text))
+
+    def test_pressure_percent_uses_one_decimal_and_rounds_down(self) -> None:
+        hover = self.page_expression("[tipText('g-some', data), tipText('g-full', data), tipText('g-swap', data)]", {
+            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5, "swap": 85},
+            "swap_used": 1, "swap_total": 3})
+        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%", "85.0%"):
+            self.assertIn(expected, str(hover))
+
+    def test_chart_rows_show_time_without_a_step_table(self) -> None:
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                running: list[dict[str, object]] = [{"name": phase, "queued": True, "unit": "fixture", "pid": 10 + index,
+                            "machine": "fixture", "vcpus": 4, "started_at": 80,
+                            "progress": {"kind": "RowProgress", "phase": phase}}
+                           for index, phase in enumerate(("building", "testing"))]
+                running.append({"name": "no counter", "queued": True, "started_at": 80,
+                                "progress": {"kind": "NoProgress"}})
+                waiter = {"name": "waiting", "since": 200 - 2 * 86400, "detail": "fixture", "pid": 20,
+                          "progress": {"kind": "RowProgress", "phase": "building"}}
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+                        "walk": running, "waiters": [waiter] if waiting else []}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                self.assertIsNone(root.find(".//table"))
+                for index in range(3):
+                    row = root.find(f".//div[@data-run='{index}']")
+                    assert row is not None
+                    duration = row.find(".//span[@class='row-time']")
+                    assert duration is not None
+                    self.assertEqual(duration.text, "2 min")
+                spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
+                self.assertEqual(spacers, [])
+                if waiting:
+                    row = root.find(".//div[@data-tip='wait:0']")
+                    assert row is not None
+                    duration = row.find(".//span[@class='row-time']")
+                    assert duration is not None
+                    self.assertEqual(duration.text, "waits 2 days")
+
+    def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("const TIPS ="):html.index("const tip =")]
         constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        if walk:
+            functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
+            functions += html[html.index("function esc(s)"):html.index("let lastRead =")]
+            constants += """
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, {style: {}, classList: {toggle() {}}});
+  return elements.get(id);
+};
+function fitLabels() {}
+"""
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))

@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
@@ -91,6 +92,45 @@ class FixedSystemReader:
 
     def close(self) -> None:
         pass
+
+
+class ReferenceActivityReader(ScopeActivityReader):
+    """Keep the original ancestry traversal as an independent test reference."""
+
+    @override
+    def run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+        for ancestor in self.ancestors(pid):
+            run = self._run_at(ancestor, NoLiveBuildRun())
+            if isinstance(run, LiveBuildRun) or self.environment(ancestor).get("BUILDLOG_RUN"):
+                return run
+        return NoLiveBuildRun()
+
+
+class ProcessRunEvidenceTests(unittest.TestCase):
+    def test_process_run_evidence_reuses_ancestors_and_keeps_run_boundaries(self) -> None:
+        for cyclic in (False, True):
+            with self.subTest(cyclic=cyclic), AdmissionFixture() as fixture:
+                for pid in range(1, 201):
+                    parent = 3 if cyclic and pid == 1 else pid - 1
+                    write_process(fixture.proc.path, pid, parent=parent)
+                    directory = fixture.proc.path / str(pid)
+                    _ = (directory / "cmdline").write_bytes(
+                        b"bash\0verify.sh\0" if pid in (2, 17) else b"python3\0fixture.py\0")
+                    environment = b"BUILDLOG_RUN=absent\0" if pid == 41 else b""
+                    if pid == 88:
+                        environment = b"BUILDLOG_RUN=17:17\0"
+                    _ = (directory / "environ").write_bytes(environment)
+                processes = fixture.proc.processes()
+                activity = ReferenceActivityReader(processes, fixture.proc.path)
+                expected = {pid: activity.run(pid) for pid in processes}
+                reader = ScopeActivityReader(processes, fixture.proc.path)
+                with mock.patch.object(reader, "command", wraps=reader.command) as command:
+                    actual = {pid: reader.run(pid) for pid in processes}
+                self.assertEqual(actual, expected)
+                if not cyclic:
+                    self.assertLessEqual(command.call_count, len(processes))
+                self.assertIsInstance(actual[41], NoLiveBuildRun)
+                self.assertEqual(actual[88], actual[17])
 
 
 class ReplyPublicationTests(unittest.TestCase):
@@ -5418,9 +5458,11 @@ class RunPlaceTests(unittest.TestCase):
             model = queue_view.QueueModel(reading, {}, records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
                 queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
             rendered = plain(queue_view.render_view(model, 100))
+            heading, = [line for line in rendered.splitlines() if line.lstrip().startswith("# ")]
             row, = [line for line in rendered.splitlines()
-                    if line.split()[:1] == ["1"] and line.split()[3:5] == ["project", "check"]]
-            self.assertEqual(row.split()[5], "0", rendered)
+                    if line.lstrip().startswith("1 ") and "project check" in line]
+            minute_column = heading.index("min")
+            self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
             settings_path = fixture.root / "aws_target.conf"
             _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
                                      + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")

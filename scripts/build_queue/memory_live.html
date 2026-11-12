@@ -33,7 +33,7 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main, :root.layout-measuring main { margin: 0 auto; padding: 24px 10vw 48px; }
+main { margin: 0 auto; padding: 24px 10vw 48px; }
 h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .num { font-variant-numeric: tabular-nums; }
 .status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
@@ -42,14 +42,14 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); height: var(--status-height); }
 .status.is-stale .status-content { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; flex-wrap: inherit; background: var(--bg); }
 .dot.stale { background: var(--cap); }
-.card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
 .answer .big { font-size: 2.6rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
 .answer .big small { font-size: 1.1rem; font-weight: 600; color: var(--ink-2); }
 .answer .sub { color: var(--ink-2); }
 .hatch { background: repeating-linear-gradient(135deg, var(--res-a) 0 3px, var(--res-b) 3px 6px); }
-:root { --amt: 7rem; --gap: 10px; --details: 0px; }
-.bar-wrap { position: relative; padding-top: 24px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); margin-right: var(--details); }
+:root { --amt: 7rem; --gap: 10px; }
+.bar-wrap { position: relative; padding-top: 24px; margin-top: 10px; margin-left: calc(var(--amt) + var(--gap)); }
 .bar { display: flex; gap: 0; height: 44px; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
@@ -76,11 +76,11 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="progress"] { display: flex; flex-wrap: wrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
-#tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
+#tip { white-space: pre-line; overflow-wrap: anywhere; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
 #tip b { display: block; margin-bottom: 2px; }
 .mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); transition: left 0.6s ease; }
-.scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
+.scale { margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
 .legend { margin: 14px 0 0; display: grid; grid-template-columns: 12px minmax(min-content, max-content) max-content; gap: 2px 8px; }
@@ -143,17 +143,18 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .error { color: var(--cap); font-weight: 600; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
-.walk { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
-.walk-chart { margin-right: var(--details); }
+.walk { position: relative; }
 .walk-chart { min-width: 0; position: relative; }
 .walk-chart-head { height: 30px; }
 .walk-bud { position: absolute; top: 30px; bottom: 22px; width: 0; margin-left: -1px; border-left: 3px solid var(--cap); pointer-events: none; z-index: 1; transition: left 0.6s ease; }
 .wrow, .walk-axis { display: grid; grid-template-columns: var(--amt) minmax(0, 1fr); gap: var(--gap); position: relative; align-items: center; font-size: 0.88rem; text-align: left; }
-.wrow { min-height: 44px; }
+.wrow { min-height: 44px; padding: 6px 0; }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
-.row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 0.75rem; }
+.row-label .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.row-label .owner, .row-time { overflow-wrap: anywhere; color: var(--ink-2); }
+.row-label .owner, .row-time, .cloud-status .amounts { font-size: 0.75rem; }
+.row-time { font-variant-numeric: tabular-nums; }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -161,37 +162,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
 .wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
-.walk-table tr.room > *, .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
-.walk-table tr.wait { color: var(--ink-2); }
-.walk-table { min-width: 0; width: max-content; max-width: 100%; }
-.walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
-.walk-table thead tr { height: 30px; }
-.walk-table tbody tr { height: 44px; }
-.walk-table .step { display: none; }
-.walk-table th, .walk-table td { padding: 3px 16px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
-.walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
-.walk-table tbody th { color: inherit; font-weight: 400; }
-.walk-table .duration { width: var(--duration); min-width: var(--duration); }
-.walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
-.walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
-.walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
-.walk.beside .wrow.room, .walk.beside .wrow.wait-first,
-.walk.beside .walk-table tr.room > *, .walk.beside .walk-table tr.wait-first > * { border-top: 0; }
-.walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before {
-  content: ""; position: absolute; top: 0; left: 0; width: calc(100% + var(--details));
-  border-top: 1px solid var(--line); pointer-events: none;
-}
-.walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
-.walk.stacked .step { display: table-cell; }
-.walk.stacked .walk-table { width: 100%; overflow-x: auto; }
-.walk.stacked .walk-table .cell-text { max-width: min(6rem, var(--table-label, 6rem)); }
-.walk.measuring .step { display: none; }
-.walk.measuring .walk-table .cell-text { max-width: 8rem; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
@@ -225,9 +198,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .status { flex-wrap: wrap; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
-  .walk-table table { font-size: 0.78rem; }
-  .walk.stacked .walk-table .cell-text { max-width: min(4.5rem, var(--table-label, 4.5rem)); }
-  .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
   .why { padding-left: 28px; }
@@ -364,6 +334,10 @@ const TIPS = {
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
+function formatPercent(value, complete = true) {
+  const tenths = Math.floor(value * 10);
+  return `${((complete ? tenths : Math.min(tenths, 999)) / 10).toFixed(1)}%`;
+}
 function level(d) {
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
@@ -377,9 +351,9 @@ Object.assign(TIPS, {
   walkhead: () => ["Running, in start order", "Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
   ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The cap is unavailable." : "The red tick is the cap line."}`],
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
-  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : d.psi.some.toFixed(1))}%`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${d.limits.some}% (the red line).`],
-  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : d.psi.full.toFixed(1))}%`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${d.limits.full}%.`],
-  "g-swap": (d) => [`Swap used · ${pctOf(d.swap_used, d.swap_total).toFixed(0)}%`, `The queue holds above ${d.limits.swap}% swap used.`],
+  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${formatPercent(d.limits.some)} (the red line).`],
+  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
+  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
 });
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
@@ -396,9 +370,6 @@ function visibleDetail(row) {
 function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
-function rowUnit(row) {
-  return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
-}
 function rowOwner(row, waiting = false) {
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
@@ -406,9 +377,9 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner === publicText(row.unit || "") ? "" : owner;
 }
-function rowLabel(name, owner = "") {
+function rowLabel(name, owner = "", time = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${esc(owner)}</span></span>`;
+    `<span class="owner">${esc(owner)}</span>` + (time ? `<span class="row-time">${esc(time)}</span>` : "") + `</span>`;
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -418,10 +389,11 @@ function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
     (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
-function progressTip(row) {
+function progressTip(row, countsVisible = false) {
   const progress = row.progress;
   if (!progress || progress.kind !== "RowProgress") return "";
-  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${Math.round(progress.percent)}% done`;
+  const counter = (countsVisible ? "" : `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · `) +
+    `${formatPercent(progress.percent, progress.done === progress.total)} done`;
   return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
 }
 function rawTipText(key, d) {
@@ -433,9 +405,8 @@ function rawTipText(key, d) {
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
-    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: aws. No local memory reservation.${progressTip(r)}`];
-    if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
-    const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
+    if (r.kind === "cloud") return ["Running step", `No local memory reservation.${progressTip(r, true)}`];
+    if (r.ci) return ["CI runner", (r.keep_text || "") + progressTip(r)];
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
     const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
     if (r.group) {
@@ -443,13 +414,13 @@ function rawTipText(key, d) {
       const how = r.group === "Codex servers" ? "Codex servers hold this memory outside the build queue." : "Worker background runs hold this memory outside the build queue.";
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
-    return [`${r.name}${rowOwner(r) ? " · " + rowOwner(r) : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${r.unit ? "\n" + r.unit : ""}${progressTip(r)}`];
+    return ["Running step", `${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    if (w.kind === "cloud") return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${w.reason}. No local memory reservation.`];
-    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `Needs ${f1(w.need)} GiB. Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    if (w.kind === "cloud") return ["Waiting step", "No local memory reservation."];
+    return ["Waiting step", `Needs ${f1(w.need)} GiB. Reason: ${w.reason}.`];
   }
   return TIPS[key](d);
 }
@@ -459,7 +430,21 @@ function memoryText(text) {
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
 function tipText(key, d) {
-  return rawTipText(key, d).map(memoryText);
+  const text = rawTipText(key, d);
+  const [kind, index] = key.split(":");
+  const waiting = kind === "wait";
+  const row = kind === "row" ? d.walk[+index] : waiting ? d.waiters[+index] : null;
+  if (row) {
+    const place = !waiting ? "run" : row.kind === "cloud" ? "cloud"
+      : d.waiters.slice(0, +index + 1).filter(waiter => waiter.kind !== "cloud").length;
+    const shown = [row.name, row.ci ? "" : rowOwner(row, waiting)];
+    const fields = [["Place", place], ["Machine", row.machine || (waiting ? "not assigned" : "not recorded")],
+      ["vCPU", recorded(row.vcpus) ? row.vcpus : waiting ? "not assigned" : "not recorded"],
+      ["Unit", row.unit || "not recorded"], ["Pid", recorded(row.pid) ? row.pid : "not recorded"]];
+    const metadata = fields.filter(([, value]) => !shown.includes(value)).map(([name, value]) => `${name}: ${value}`).join(" · ");
+    text[1] = `${metadata}\n${text[1]}`;
+  }
+  return text.map(memoryText);
 }
 function roomEquation(d) {
   const terms = d.room_source === "cap"
@@ -547,8 +532,6 @@ function render(d) {
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit;
-  const wait = d.waiting > 0 ? `${d.waiting} ${d.waiting === 1 ? "step waits" : "steps wait"}.` : "No step waits.";
-  $("answer").textContent = `Next step room · ${wait}`;
   for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
@@ -590,8 +573,8 @@ function renderSwap(d) {
     $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
     $(`gl-${k}`).style.left = `${(lim).toFixed(2)}%`;
-    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : `${v.toFixed(1)}%`;
-    $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
+    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : formatPercent(v);
+    $(`limit-${k}`).textContent = `Queue holds at ${formatPercent(lim)}`;
   }
   placeLimitLabels();
   $("swaprows").innerHTML = d.swap_by.map((row, index) =>
@@ -738,37 +721,24 @@ window.addEventListener("resize", placeLimitLabels);
 function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
-  const tableRows = [];
-  const cells = (place, name, duration, machine, vcpus, unit, pid, tip, className = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
-      `<td class="pid">${typeof pid === "number" ? pid : "—"}</td></tr>`);
-  };
   const running = d.walk.map((row, index) => ({row, index}));
   const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, r.vcpus, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
-    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
+    const time = r.started_at ? ago(r.started_at, d.read_at) : idleCI ? "idle" : "duration not recorded";
+    return `<div class="wrow" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r), time)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
-  cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
-  let localPosition = 0;
   d.waiters.forEach((w, i) => {
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.machine || "", null, w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true), `waits ${ago(w.since, d.read_at)}`)}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
   $("walk").classList.toggle("has-cap", hasCap(d));
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
-    `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
-    `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `<th scope="col" class="place">#</th><th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th><th scope="col" class="unit">Unit</th>` +
-    `<th scope="col" class="pid">Pid</th></tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
@@ -807,92 +777,29 @@ function fitAxisLabels() {
 }
 
 const MIN_TRACK_WIDTH = 160;
-const TABLE_CAP_GAP = 12;
-function fitWalkDetails() {
+function fitWalkLabels() {
   const walk = $("walk");
-  const table = walk.querySelector(".walk-table");
-  const track = walk.querySelector(".track");
-  if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
+  if (!latest || !walk.querySelector(".track") || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
-  walk.classList.add("measuring");
-  const capFraction = !hasCap(latest) ? 0 : latest.cap / latest.total;
-  function measure(labelWidth) {
-    const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
-    root.style.setProperty("--amt", labelWidth);
-    const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
-    const reservedWidth = capFraction > 0
-      ? Math.max(0, (neededWidth - fullTrackWidth * (1 - capFraction)) / capFraction)
-      : neededWidth;
-    return {reservedWidth, remainingWidth: fullTrackWidth - reservedWidth};
-  }
-  // Normal spacing prevents the mobile styles from reversing the layout choice.
-  root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
-  function measureColumn(name) {
-    const widths = [...table.querySelectorAll(`.${name}`)].map(cell => {
-      const style = getComputedStyle(cell);
-      context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
-    });
-    if (name === "duration") widths.push(context.measureText("waits 99 h 59 min").width + 16);
-    root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
-  }
-  measureColumn("duration");
-  measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
+  const capFraction = !hasCap(latest) ? 1 : latest.cap / latest.total;
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (amountWidth + LABEL_GAP + 1) / (capFraction || 1));
-  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
-  const roomHeading = walk.querySelector(".wrow.room .row-heading");
-  context.font = getComputedStyle(roomHeading).font;
+  const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner, .row-time")];
+  context.font = getComputedStyle(walk.querySelector(".wrow.room .row-heading")).font;
   const roomWidth = context.measureText(`Next step room ${memoryAmount(latest.room)}`).width + 8;
   const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
     context.font = getComputedStyle(label).font;
     return context.measureText(label.textContent).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
-  let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
-  let fit = measure(labelWidth);
-  if (fit.remainingWidth < minimumTrackWidth) {
-    labelWidth = `${Math.min(textWidth, 9 * rem)}px`;
-    fit = measure(labelWidth);
-  }
-  const beside = fit.remainingWidth >= minimumTrackWidth;
-  root.classList.remove("layout-measuring");
-  fit = measure(labelWidth);
-  const naturalWidth = table.getBoundingClientRect().width;
-  root.style.setProperty("--details", `${beside ? fit.reservedWidth : 0}px`);
-  walk.classList.toggle("beside", beside);
-  walk.classList.toggle("stacked", !beside);
-  walk.classList.remove("measuring");
-  measureColumn("duration");
-  measureColumn("machine");
-  if (!beside) {
-    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
-      width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
-    const padding = ["step", "unit"].reduce((width, name) =>
-      width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
-    root.style.setProperty("--table-label", `${Math.max(0, (walk.clientWidth - fixedWidth - padding) / 2)}px`);
-  }
-  if (beside) {
-    const range = $("barwrap").getBoundingClientRect();
-    const tableLeft = !hasCap(latest)
-      ? walk.getBoundingClientRect().right - naturalWidth
-      : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
-    walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
-  }
-  for (const row of walk.querySelectorAll(".wrow.cloud-work")) {
-    const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
-    row.style.minHeight = "";
-    metadata.style.height = "";
-    const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
-    row.style.minHeight = `${height}px`;
-    metadata.style.height = `${height}px`;
-  }
+  const maximum = walk.clientWidth - minimumTrackWidth - parseFloat(getComputedStyle(walk.querySelector(".wrow")).columnGap);
+  root.style.setProperty("--amt", `${Math.min(textWidth, (maximum < 12 * rem ? 9 : 12) * rem)}px`);
 }
 
 function placeMemoryBars(d) {
@@ -996,7 +903,7 @@ function placeMemoryBars(d) {
 }
 
 function fitLabels() {
-  fitWalkDetails();
+  fitWalkLabels();
   if (latest) placeMemoryBars(latest);
   fitAxisLabels();
   const at = latest && hasCap(latest) ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
