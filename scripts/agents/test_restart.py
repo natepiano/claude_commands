@@ -872,9 +872,9 @@ class MixedRestartTests(ShutdownTestCase):
                 self.assertIn(workers[1].current_session, launched_sessions)
                 continue
             self.assertEqual(errors.getvalue(), "", output.getvalue())
-            # Stop uses direct pane reads. Restart also classifies tabs for ordering.
+            # Both commands use direct native pane reads.
             self.assertEqual((searches.call_count, scans.call_count, processes.call_count),
-                             (1, 1, int(command == "restart")), command)
+                             (1, 1, 0), command)
             self.assertNotIn("w1:p2", launches)
             self.assertCountEqual(signals, [991100 + index for index in (0, 1, 3, 4, 5)])
             self.assertEqual(len(launches), 5 if command == "restart" else 0)

@@ -22,7 +22,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TextIO, cast, final, override
+from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -94,6 +94,8 @@ def setUpModule() -> None:
 
 @final
 class WaitingTests(unittest.TestCase):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
     root: Path = Path()
     checkout: Path = Path()
     alpha: Path = Path()
@@ -108,21 +110,59 @@ class WaitingTests(unittest.TestCase):
     env: dict[str, str] = {}
     host_pids: dict[str, int] = {}
 
+    @classmethod
     @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        staff_environment: dict[str, str] = {}
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.fixture_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="waiting-"))) / "case"
+        cls.fixture_seed = cls.fixture_root.with_name("seed")
+        builder = cls()
+        builder.bind_fixture(cls.fixture_root)
+        builder.root.mkdir()
+        builder.env = {**os.environ, "HOME": str(builder.root / "home"),
+                       "XDG_CONFIG_HOME": str(builder.root / "config")}
+        builder.build_git_trees()
+        _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(cls.fixture_root)
+
+    def bind_fixture(self, root: Path) -> None:
+        self.root = root
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
         self.beta = self.root / "beta"
+        self.origin = self.root / "origin.git"
         self.doc = self.checkout / "docs/plans/example-production.md"
         self.log = self.checkout / "production.log"
         self.state = self.root / "state"
         self.board = self.root / "board.json"
         self.sends = self.root / "sends.jsonl"
-        self.state.mkdir()
         self.bin_path = self.root / "bin"
+
+    def build_git_trees(self) -> None:
+        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
+        _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
+        _ = self.git("config", "user.name", "Waiting Test")
+        _ = self.git("config", "user.email", "waiting@example.invalid")
+        _ = self.git("remote", "add", "origin", str(self.origin))
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
+        self.write(self.checkout / "README.md", "base\n")
+        self.write(self.checkout / "shared.txt", "base\n")
+        self.write_production_doc()
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "initial production")
+        _ = self.git("push", "-u", "origin", "production")
+        _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
+        _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
+
+    @override
+    def setUp(self) -> None:
+        self.addCleanup(shutil.rmtree, self.fixture_root)
+        # Git's linked worktree paths must match the seed's original paths.
+        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
+        self.bind_fixture(self.fixture_root)
+        staff_environment: dict[str, str] = {}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
+        self.state.mkdir()
         self.bin_path.mkdir()
         berth = self.bin_path / "cargo-berth"
         _ = berth.write_text(BERTH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
@@ -167,25 +207,12 @@ class WaitingTests(unittest.TestCase):
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
         _ = self.enterContext(production_paths(self.env))
         self.board_ready()
-        self.origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
-        _ = self.git("config", "user.name", "Waiting Test")
-        _ = self.git("config", "user.email", "waiting@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
-        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
-        self.write(self.checkout / "README.md", "base\n")
-        self.write(self.checkout / "shared.txt", "base\n")
         self.production_doc()
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "initial production")
-        _ = self.git("push", "-u", "origin", "production")
-        _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
-        _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         ensure_excluded(self.checkout, "/.unit.toml")
-        for folder, plan in ((self.alpha, "alpha"), (self.beta, "beta")):
-            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
         self.write(self.log, "# Production log — example\n\n### STATE\n")
+        # Copied indexes must record the new file metadata.
+        for checkout in (self.checkout, self.alpha, self.beta):
+            _ = self.git("update-index", "--refresh", cwd=checkout)
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +280,7 @@ class WaitingTests(unittest.TestCase):
             "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
 
-    def production_doc(self) -> None:
+    def write_production_doc(self) -> None:
         self.write(self.doc, "\n".join((
             "# Production — example", "", "> **Status: PRODUCTION — running.** Example.",
             "", "## Production Context", "", "- **Merge branch:** `production`",
@@ -263,6 +290,8 @@ class WaitingTests(unittest.TestCase):
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
+    def production_doc(self) -> None:
+        self.write_production_doc()
         owner = showrunner_relationship("showrunner-example")
         _ = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), self.doc))
         _ = write_timer(self.root / "notifier", owner.name, owner.id, "", self.doc)
