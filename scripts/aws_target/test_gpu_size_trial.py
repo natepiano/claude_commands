@@ -220,8 +220,21 @@ elif name == 'cargo':
         self.assertEqual(trial.comparison(incomplete, same), 'incomplete')
 
     def test_prepare_stops_before_build_when_hold_refuses(self) -> None:
+        outside = self.root / 'outside'
+        outside.mkdir()
+        _ = (outside / 'keep').write_text('fixture')
+
+        def export(_repo: Path, _commit: str, folder: Path) -> Path:
+            source = folder / 'source'
+            source.mkdir()
+            _ = (source / 'artifact').write_text('fixture')
+            _ = (folder / 'source.tar').write_bytes(b'fixture')
+            for name in ('toolchain-profile', 'runtime-profile', 'runtime-profile-1-link', 'system-profile'):
+                (folder / name).symlink_to(outside, target_is_directory=True)
+            return source
+
         with (mock.patch.object(trial, 'checked', return_value='a' * 40) as command,
-              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'export_source', side_effect=export),
               mock.patch.object(trial, 'preflight', return_value={}),
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=GateRefused('held')),
               mock.patch.object(merge_gate, 'gate_reservation') as admission):
@@ -231,6 +244,9 @@ elif name == 'cargo':
         self.assertEqual(command.call_count, 1)
         self.assertEqual(command.call_args.args[0][0], 'git')
         self.assertFalse((self.root / 'trial/closure.export').exists())
+        self.assertEqual(list((self.root / 'trial').iterdir()), [self.root / 'trial/prepare.log'])
+        self.assertIn('held', (self.root / 'trial/prepare.log').read_text())
+        self.assertTrue((outside / 'keep').exists())
 
     def test_prepare_checks_hold_again_after_admission(self) -> None:
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
@@ -265,6 +281,23 @@ elif name == 'cargo':
         self.assertEqual(trial.read_json(folder / 'request.json')['commit'], 'a' * 40)
         self.assertEqual(trial.read_json(folder / 'request.json')['tools'],
                          {'vulkaninfo': '/nix/store/fixture/bin/vulkaninfo'})
+        self.assertTrue((folder / 'prepare.log').exists())
+
+    def test_prepare_worker_failure_keeps_only_log(self) -> None:
+        folder = self.root / 'trial'
+        with (mock.patch.object(trial, 'checked', return_value='a' * 40),
+              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'preflight', return_value={}),
+              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
+              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+            place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
+            popen = cast(mock.MagicMock, place.popen)
+            wait = cast(mock.MagicMock, cast(mock.MagicMock, popen.return_value).wait)
+            wait.return_value = 1
+            with self.assertRaisesRegex(GateRefused, 'exit 1'):
+                trial.prepare(self.root, 'HEAD', folder)
+        self.assertEqual(list(folder.iterdir()), [folder / 'prepare.log'])
+        self.assertIn('exit 1', (folder / 'prepare.log').read_text())
 
     def test_preflight_refuses_missing_tools_before_any_hold_wait(self) -> None:
         for missing in ('git', 'nix', 'nix-store', 'python', 'sh', 'cargo', 'rustc',
@@ -295,6 +328,7 @@ elif name == 'cargo':
                         trial.prepare(self.root, 'HEAD', self.root / missing)
                 hold.assert_not_called()
                 admission.assert_not_called()
+                self.assertEqual(list((self.root / missing).iterdir()), [self.root / missing / 'prepare.log'])
 
     def test_preflight_refuses_software_vulkan_and_command_timeout(self) -> None:
         for failure in ('software', 'timeout'):
@@ -338,6 +372,63 @@ elif name == 'cargo':
             'filtered': {**case, 'filter-match': {'status': 'mismatch'}}}}}}
         self.assertEqual(trial.inventory(listed), [{'binary': 'fixture', 'test': 'kept'}])
 
+    def test_archive_config_includes_shared_libraries_and_keeps_existing_includes(self) -> None:
+        source = self.root / 'source'
+        (source / '.config').mkdir(parents=True)
+        target = self.root / 'custom-target'
+        libraries = [target / 'debug/deps/libbevy_dylib-fixture.so', target / 'debug/build/native/out/libother.so.1']
+        for path in libraries:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(b'fixture shared library')
+        _ = (libraries[0].parent / 'libfixture.rlib').write_bytes(b'fixture static library')
+        (target / 'directory.so').mkdir()
+        entries = [
+            '',
+            '[profile.default.archive]\ninclude = [{ path = "fixtures", relative-to = "target" }]\n',
+            '[profile.ci.archive]\ninclude = [{ path = "fixtures", relative-to = "target" }]\n',
+            '[[profile.ci.archive.include]]\npath = "fixtures"\nrelative-to = "target"\n',
+            '[profile.ci.archive]\ninclude = [{ path = '
+            + json.dumps(libraries[0].relative_to(target).as_posix()) + ', relative-to = "target" }]\n',
+        ]
+        for existing in entries:
+            with self.subTest(existing=existing):
+                original = '[profile.ci]\ndefault-filter="all()"\n' + existing
+                path = source / '.config/nextest.toml'
+                _ = path.write_text(original)
+                result = trial.mapping(cast(object, tomllib.loads(trial.archive_config(source, target))))
+                profile = trial.mapping(trial.mapping(result['profile'])[trial.ARCHIVE_PROFILE])
+                self.assertEqual(profile['inherits'], 'ci')
+                self.assertIn(str(profile['inherits']), trial.mapping(result['profile']))
+                archive = trial.mapping(profile['archive'])
+                includes = [trial.mapping(entry) for entry in cast(list[object], archive['include'])]
+                paths = [str(entry['path']) for entry in includes]
+                self.assertEqual(len(paths), len(set(paths)))
+                self.assertTrue(all(path.relative_to(target).as_posix() in paths for path in libraries))
+                self.assertFalse(any(path.endswith('.rlib') or path == 'directory.so' for path in paths))
+                if 'fixtures' in existing:
+                    self.assertIn({'path': 'fixtures', 'relative-to': 'target'}, includes)
+                self.assertEqual(path.read_text(), original)
+
+    def test_archive_validation_reports_the_missing_library(self) -> None:
+        source = self.root / 'source'
+        (source / '.config').mkdir(parents=True)
+        _ = (source / '.config/nextest.toml').write_text('[profile.ci]\n')
+        library = 'libbevy_dylib-fixture.so'
+
+        def checked(argv: Sequence[str], _cwd: Path, *, environment: Mapping[str, str] = os.environ,
+                    capture_stderr: bool = False) -> str:
+            _ = environment
+            if 'binaries-only' in argv:
+                return json.dumps({'rust-build-meta': {'target-directory': str(self.root / 'target')}})
+            if 'list' in argv:
+                self.assertTrue(capture_stderr)
+                raise subprocess.CalledProcessError(104, argv, stderr='error while loading shared libraries: ' + library)
+            return ''
+
+        with mock.patch.object(trial, 'checked', side_effect=checked):
+            with self.assertRaisesRegex(ValueError, library):
+                _ = trial.archive_tests(self.root, source, {}, ())
+
     def test_complete_prepare_and_comparison_use_fake_builds(self) -> None:
         repo = self.root / 'repo'
         repo.mkdir()
@@ -369,8 +460,8 @@ elif name == 'cargo':
             return {'nix': nix, 'nix-store': nix_store}.get(name, name)
 
         def checked(argv: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ,
-                    timeout: float | None = None) -> str:
-            _ = timeout
+                    timeout: float | None = None, capture_stderr: bool = False) -> str:
+            _ = timeout, capture_stderr
             commands.append(tuple(argv))
             if argv[0] in (nix, nix_store):
                 argv = [Path(argv[0]).name, *argv[1:]]
@@ -378,6 +469,7 @@ elif name == 'cargo':
                 with mock.patch.object(subprocess, 'run', real_run):
                     return real_checked(argv, cwd, environment=environment)
             if argv[:2] == ['nix', 'eval']:
+                self.assertTrue((folder / 'inventory.json').exists())
                 return '/nix/store/fixture-nixpkgs'
             if argv[:2] == ['nix', 'print-dev-env']:
                 return 'export LD_LIBRARY_PATH=/nix/store/fixture-runtime/lib'
@@ -397,7 +489,19 @@ elif name == 'cargo':
                 _ = (fresh / 'dependency').write_text('fresh source')
             if argv[-2:] == ['/nix/store/fixture-vulkan-tools/bin/vulkaninfo', '--summary']:
                 return HARDWARE + SOFTWARE
+            if 'binaries-only' in argv:
+                target = folder / 'source/target'
+                library = target / 'debug/deps/libbevy_dylib-fixture.so'
+                library.parent.mkdir(parents=True)
+                _ = library.write_bytes(b'fixture shared library')
+                self.assertIn('--all-features', argv)
+                return json.dumps({'rust-build-meta': {'target-directory': str(target)}})
             if 'archive' in argv:
+                config = Path(argv[argv.index('--tool-config-file') + 1].split(':', 1)[1])
+                self.assertIn('libbevy_dylib-fixture.so', config.read_text())
+                self.assertIn('--all-features', argv)
+                self.assertEqual(argv[argv.index('--config-file') + 1], str(folder / 'source/.config/nextest.toml'))
+                self.assertEqual(argv[argv.index('--profile') + 1], trial.ARCHIVE_PROFILE)
                 _ = (folder / 'hana-tests.tar.zst').write_bytes(b'fixture archive')
             if 'list' in argv:
                 return json.dumps({'rust-suites': {'fixture': {'testcases': {'test': {

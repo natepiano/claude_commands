@@ -350,6 +350,13 @@ A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
 Preparation uses a private Cargo cache.
 It never copies the user's Rust or Cargo directories.
 It checks toolchain wrappers for home paths and tests Cargo with an empty `HOME`.
+Preparation builds all features and discovers shared libraries in the Cargo target directory.
+A nextest archive profile inherits `ci` and includes each shared library through `archive.include`.
+The archive retains the workspace's existing archive includes.
+Nextest lists the extracted tests before preparation builds the NixOS closure.
+An archive validation error includes nextest's diagnostic, which names a missing shared library.
+A failed preparation keeps only `prepare.log` and removes the other files and GC root links.
+A successful preparation keeps all trial files.
 
 The service selects the first candidate region with an applied G and VT Spot quota of at least 32.
 It checks regional offerings and current Spot prices.

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 from typing import cast, final
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ from scripts.production.gate_modules import GateRefused
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_MODULE = ROOT / 'docs/plans/builds-aws/gpu-trial.nix'
 WRAPPER = Path(__file__).with_name('gpu_trial_wrapper.py')
+ARCHIVE_PROFILE = 'gpu-size-trial-archive'
 
 
 @dataclass(frozen=True)
@@ -83,9 +85,10 @@ def digest(path: Path) -> str:
 
 
 def checked(arguments: Sequence[str], cwd: Path, *, environment: Mapping[str, str] = os.environ,
-            timeout: float | None = None) -> str:
+            timeout: float | None = None, capture_stderr: bool = False) -> str:
     result = subprocess.run(arguments, cwd=cwd, env=environment, check=True,
-                            stdout=subprocess.PIPE, text=True, timeout=timeout)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE if capture_stderr else None,
+                            text=True, timeout=timeout)
     return result.stdout.strip()
 
 
@@ -171,25 +174,39 @@ def prepare(repo: Path, commit: str, folder: Path) -> None:
     if not re.fullmatch('[0-9a-f]{40}', resolved):
         raise ValueError('The trial needs a resolved Git commit')
     folder.mkdir(parents=True, exist_ok=False)
-    source = export_source(repo, resolved, folder)
-    tools = preflight(source, trial_environment())
-    write_json(folder / 'request.json', {'repo': str(repo), 'commit': resolved,
-                                       'tools': tools,
-                                       'limits': {**asdict(limits),
-                                                  'limit_usd': str(limits.limit_usd),
-                                                  'box_extra_usd': str(limits.box_extra_usd),
-                                                  'spot_max_usd_per_hour': {
-                                                      key: str(value) for key, value in limits.spot_max_usd_per_hour.items()}}})
-    hold = merge_gate.BuildHoldWait()
-    hold.wait_until_free()
-    with merge_gate.gate_reservation(repo, folder, hold, mode=merge_gate.SuiteMode.TARGETED_TEST) as place:
+    log = folder / 'prepare.log'
+    try:
+        log.touch()
+        source = export_source(repo, resolved, folder)
+        tools = preflight(source, trial_environment())
+        write_json(folder / 'request.json', {'repo': str(repo), 'commit': resolved,
+                                           'tools': tools,
+                                           'limits': {**asdict(limits),
+                                                      'limit_usd': str(limits.limit_usd),
+                                                      'box_extra_usd': str(limits.box_extra_usd),
+                                                      'spot_max_usd_per_hour': {
+                                                          key: str(value) for key, value in limits.spot_max_usd_per_hour.items()}}})
+        hold = merge_gate.BuildHoldWait()
         hold.wait_until_free()
-        command = [sys.executable, '-m', 'scripts.aws_target.gpu_size_trial', '--prepare-worker', str(folder)]
-        with (folder / 'prepare.log').open('wb') as output:
-            process = place.popen(command, cwd=ROOT, env=os.environ, stdout=output, stderr=subprocess.STDOUT)
-            status = process.wait()
-        if status:
-            raise GateRefused(f'GPU trial preparation failed with exit {status}: {folder / "prepare.log"}')
+        with merge_gate.gate_reservation(repo, folder, hold, mode=merge_gate.SuiteMode.TARGETED_TEST) as place:
+            hold.wait_until_free()
+            command = [sys.executable, '-m', 'scripts.aws_target.gpu_size_trial', '--prepare-worker', str(folder)]
+            with log.open('wb') as output:
+                process = place.popen(command, cwd=ROOT, env=os.environ, stdout=output, stderr=subprocess.STDOUT)
+                status = process.wait()
+            if status:
+                raise GateRefused(f'GPU trial preparation failed with exit {status}: {log}')
+    except Exception as error:
+        with log.open('a') as output:
+            _ = output.write(str(error) + '\n')
+        for path in folder.iterdir():
+            if path == log:
+                continue
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        raise
     print(folder)
 
 
@@ -301,6 +318,48 @@ def archive_arguments(folder: Path, source: Path) -> list[str]:
             '--profile', 'ci']
 
 
+def archive_config(source: Path, target: Path) -> str:
+    """Add target shared libraries to nextest's archive include list."""
+    original = mapping(cast(object, tomllib.loads((source / '.config/nextest.toml').read_text())))
+    profiles = mapping(original.get('profile', {}))
+    defaults = mapping(mapping(profiles.get('default', {})).get('archive', {}))
+    archive = mapping(mapping(profiles.get('ci', {})).get('archive', defaults))
+    includes = [mapping(entry) for entry in cast(list[object], archive.get('include', []))]
+    paths = {str(entry.get('path', '')) for entry in includes}
+    for library in sorted(target.rglob('*.so*')):
+        if library.is_file():
+            path = library.relative_to(target).as_posix()
+            if path not in paths:
+                includes.append({'path': path, 'relative-to': 'target', 'on-missing': 'error'})
+                paths.add(path)
+    return '[profile.ci]\n[profile.' + ARCHIVE_PROFILE + ']\ninherits = "ci"\n[profile.' + ARCHIVE_PROFILE + '.archive]\ninclude = [\n' + ''.join(
+        '  { ' + ', '.join(json.dumps(key) + ' = ' + json.dumps(value) for key, value in entry.items()) + ' },\n'
+        for entry in includes) + ']\n'
+
+
+def archive_tests(folder: Path, source: Path, environment: Mapping[str, str], prefix: Sequence[str]) -> list[dict[str, str]]:
+    """Build and archive tests, then verify their shared libraries before closure work."""
+    cargo = environment.get('GPU_TRIAL_CARGO', 'cargo')
+    selection = ['--locked', '--workspace', '--all-features', '--tests']
+    binaries = mapping(cast(object, json.loads(checked(
+        [*prefix, cargo, 'nextest', 'list', '--profile', 'ci', *selection,
+         '--list-type', 'binaries-only', '--message-format', 'json'],
+        source, environment=environment))))
+    target = Path(str(mapping(binaries['rust-build-meta'])['target-directory']))
+    config = folder / 'archive-nextest.toml'
+    _ = config.write_text(archive_config(source, target))
+    _ = checked([*prefix, cargo, 'nextest', 'archive', '--profile', ARCHIVE_PROFILE, *selection,
+                 '--config-file', str(source / '.config/nextest.toml'), '--tool-config-file', 'gpu-size-trial:' + str(config),
+                 '--archive-file', str(folder / 'hana-tests.tar.zst')], source, environment=environment)
+    try:
+        listed = checked([*prefix, cargo, 'nextest', 'list', *archive_arguments(folder, source),
+                          '--message-format', 'json'], source, environment=environment, capture_stderr=True)
+    except subprocess.CalledProcessError as error:
+        diagnostic = cast(str | None, error.stderr)
+        raise ValueError('Nextest could not list the archived tests: ' + (diagnostic or str(error))) from error
+    return inventory(mapping(cast(object, json.loads(listed))))
+
+
 def junit_config(text: str, path: Path) -> str:
     section = re.compile(r'(?ms)^\[profile\.ci\.junit\]\s*\n(.*?)(?=^\[|\Z)')
     value = 'path = ' + json.dumps(str(path)) + '\n'
@@ -371,15 +430,10 @@ def prepare_worker(folder: Path) -> None:
     vulkaninfo = tools['vulkaninfo']
     # Require a hardware GPU before the expensive archive build.
     _ = hardware_vulkan(checked([*prefix, vulkaninfo, '--summary'], source, environment=environment))
-    archive = folder / 'hana-tests.tar.zst'
-    _ = checked([*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'archive', '--profile', 'ci', '--locked',
-                 '--workspace', '--all-features', '--tests', '--archive-file', str(archive)],
-                source, environment=environment)
+    tests = archive_tests(folder, source, environment, prefix)
+    write_json(folder / 'inventory.json', {'tests': tests})
     _ = shutil.copyfile(WRAPPER, folder / WRAPPER.name)
     system = build_system(folder, source, environment, toolchain)
-    listed = checked([*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'list', *archive_arguments(folder, source),
-                      '--message-format', 'json'], source, environment=environment)
-    write_json(folder / 'inventory.json', {'tests': inventory(mapping(cast(object, json.loads(listed))))})
     manifest: dict[str, object] = {'schema': 2, 'toolchain_source': 'nix', 'trial': folder.name, 'commit': commit,
         'tree': checked([tools['git'], 'rev-parse', commit + '^{tree}'], repo, environment=environment),
         'created': datetime.now(UTC).isoformat(), 'system': system, 'toolchain': toolchain, 'vulkan_tools': vulkan_tools,
