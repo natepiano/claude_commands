@@ -45,7 +45,7 @@ class UnitConfigFixture(unittest.TestCase):
                              worktree=staff.PresentWorktree(remote.local_machine(), self.worktree))
         self.unit = row.id
         self.source = self.worktree / ".unit.toml"
-        self.parked = self.home / ".local/state/staff/units" / f"{self.unit}.toml"
+        self.parked = unit_config.parked_path(self.unit)
         self.exclude = self.worktree / ".git/info/exclude"
 
     def git(self, *arguments: str) -> str:

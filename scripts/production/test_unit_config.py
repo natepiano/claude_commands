@@ -629,6 +629,12 @@ class UnitConfigTests(UnitConfigFixture):
             _ = config.read(self.worktree)
 
     def test_park_restore_and_discard_keep_retirement_facts_until_the_last_step(self) -> None:
+        for staff_file, directory in (("", self.home / ".local/state/staff/units"),
+                                      (str(self.root / "private/staff.json"), self.root / "private/units")):
+            with self.subTest(staff_file=staff_file), patch.dict(os.environ, {"STAFF_FILE": staff_file}):
+                self.assertEqual(config.parked_path(self.unit), directory / f"{self.unit}.toml")
+                self.assertEqual(config.parked_path(self.unit, home=self.home),
+                                 self.home / ".local/state/staff/units" / f"{self.unit}.toml")
         self.assertIsInstance(config.place(self.unit, self.worktree), config.Nowhere)
         _ = config.write(self.worktree, self.config())
         source = self.source.read_bytes()

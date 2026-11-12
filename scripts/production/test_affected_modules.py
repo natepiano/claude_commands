@@ -174,12 +174,89 @@ class AffectedModulesTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
 
+    def test_source_audits_select_changed_file_kinds_without_scan_records(self) -> None:
+        scans = (
+            ('ROOT.rglob("*.py")', "scripts/component/subject.py", True),
+            ('ROOT.rglob("*.py")', "config/limits.conf", False),
+            ('ROOT.glob("**/*.py")', "scripts/component/subject.py", True),
+            ('os.walk(ROOT)', "scripts/component/subject.py", True),
+            ('subprocess.check_output(["git", "ls-files"], cwd=ROOT)', "commands/subject.md", True),
+            ('scan(ROOT)', "scripts/component/subject.py", True),
+            ('Audit.scan(ROOT)', "scripts/component/subject.py", True),
+            ('imported_scan(ROOT)', "scripts/component/subject.py", True),
+            ('audit.scan(ROOT)', "scripts/component/subject.py", True),
+            ('audit', "scripts/component/subject.py", False),
+            ('bare_audit.scan(ROOT)', "scripts/component/subject.py", True),
+            ('scan_imported_root()', "scripts/component/subject.py", True),
+            ('IMPORTED_ROOT.rglob("*.py")', "scripts/component/subject.py", True),
+            ('IMPORTED_ROOT.rglob("*.py")', "assets/unrelated.txt", False),
+            ('imported_scan(IMPORTED_ROOT)', "scripts/component/subject.py", True),
+            ('imported_scan(scratch)', "scripts/component/subject.py", False),
+            ('scratch.rglob("*.py")', "scripts/component/subject.py", False),
+            ('source_scan(ROOT)', "assets/unrelated.txt", False),
+            ('audit.scan(ROOT)', "assets/unrelated.txt", False),
+            ('audit.noop(ROOT)', "scripts/unrelated/subject.py", False),
+            ('(ROOT / "scripts/accounts").glob("*.py")', "scripts/unrelated/subject.py", False),
+            ('(ROOT / "scripts/accounts").glob("*.py")', "scripts/accounts/nested/subject.py", False),
+            ('(ROOT / "scripts/accounts").glob("*.py")', "scripts/accounts/subject.py", True),
+            ('(ROOT / "scripts/accounts").rglob("*.py")', "scripts/accounts/nested/subject.py", True),
+            ('(ROOT / "scripts/accounts").rglob("*.py")', "scripts/unrelated/subject.py", False),
+            ("config_test_support", "assets/unrelated.conf", False),
+            ("config_test_support", "config/limits.conf", True),
+            ('(ROOT / os.environ.get("SCAN_FOLDER", "scripts")).rglob("*.py")', "scripts/component/subject.py", True),
+            ('ROOT.glob(os.environ.get("SCAN_PATTERN", "**/*.py"))', "scripts/component/subject.py", True),
+            ('(ROOT / os.environ.get("SCAN_FOLDER", "scripts/component")).glob("*.py")', "scripts/component/subject.py", True),
+            (f"Path({str(self.repo)!r}).rglob('*.py')", "scripts/component/subject.py", True),
+        )
+        for expression, changed, selected in scans:
+            with self.subTest(scan=expression, changed=changed):
+                self.write(changed, "# before\n")
+                self.write("scripts/component/audit.py", "import os\nfrom scripts.component import directory_walk\n"
+                    + "def scan(folder):\n    return list(folder.rglob('*.py'))\n"
+                    + "def noop(folder):\n    return None\n"
+                    + "def unused_walk(folder):\n    return list(os.walk(folder))\n")
+                self.write("scripts/component/directory_walk.py", "import os\n"
+                    + "def scan(folder):\n    return list(os.walk(folder))\n")
+                self.write("scripts/component/root_audit.py", "from pathlib import Path\n"
+                    + "ROOT = Path(__file__).resolve().parents[2]\n"
+                    + "def scan(folder):\n    return list(folder.rglob('*.py'))\n")
+                self.write("scripts/component/source_root.py", "from pathlib import Path\nROOT = Path(__file__).resolve().parents[2]\n")
+                self.write("scripts/component/config_test_support.py", "from pathlib import Path\n"
+                    + "SOURCE = Path(__file__).resolve().parents[2] / 'config'\n"
+                    + "def config_files():\n    return list(SOURCE.glob('*.conf'))\n")
+                self.add_test("checks/test_audit.py", "from pathlib import Path\nimport os, subprocess\n"
+                    + "from scripts.component.audit import scan as imported_scan\nfrom scripts.component import audit\n"
+                    + "import audit as bare_audit\n"
+                    + ("from scripts.component import config_test_support\n" if expression == "config_test_support" else "")
+                    + ("from scripts.component.root_audit import scan as root_scan, ROOT as IMPORTED_ROOT\n"
+                       + "def scan_imported_root():\n    return root_scan(IMPORTED_ROOT)\n" if expression == "scan_imported_root()" else "")
+                    + ("from scripts.component.source_root import ROOT as IMPORTED_ROOT\n"
+                       if expression in {'IMPORTED_ROOT.rglob("*.py")', "imported_scan(IMPORTED_ROOT)"} else "")
+                    + "ROOT = Path(__file__).resolve().parents[2]\nscratch = Path('/fixture')\n"
+                    + "def scan(folder):\n    return list(folder.rglob('*.py'))\n"
+                    + "def source_scan(folder):\n    return list(folder.rglob('*.py'))\n"
+                    + "def scratch_scan(folder):\n    return list(os.walk(folder))\n"
+                    + "class Audit:\n    @staticmethod\n    def scan(folder):\n        return list(folder.rglob('*.py'))\n"
+                    + f"FILES = {expression}\n")
+                self.certify()
+                self.record_configs({})
+                self.write(changed, "# after\n")
+                _ = self.commit()
+                for cached in (False, True):
+                    with self.subTest(cached=cached):
+                        result = affected.select_affected(self.repo, self.base, self.modules,
+                            affected.dirty_paths(self.repo), state_dir=self.cache_dir())
+                        self.assertIsInstance(result, affected.AffectedSelection)
+                        assert isinstance(result, affected.AffectedSelection)
+                        self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
+                self.modules.remove(self.repo / "scripts/checks/test_audit.py")
+
     def test_content_reads_select_read_files_and_keep_config_selection(self) -> None:
         self.add_test("checks/test_reader.py", "VALUE = 1\n")
         cases: tuple[tuple[str, str, object, bool, bool, tuple[str, ...]], ...] = (
             ("changed script", "scripts/component/subject.py", ["scripts/component/subject.py"], False, True, ("test_reader.py",)),
             ("removed script", "scripts/component/subject.py", ["scripts/component/subject.py"], True, True, ("test_reader.py",)),
-            ("copied config", "config/limits.conf", ["config/limits.conf"], False, True, ()),
+            ("copied config", "config/limits.conf", ["config/limits.conf"], False, True, ("test_reader.py",)),
             ("null content", "scripts/component/subject.py", None, False, True, ("test_reader.py",)),
             ("empty content", "scripts/component/subject.py", [], False, True, ()),
             ("no content gate", "scripts/component/subject.py", [], False, False, ()),
@@ -496,6 +573,31 @@ class AffectedModulesTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertEqual(self.selection().modules, ())
 
+        fixtures = (
+            'from pathlib import Path\nVALUE = (Path(__file__).parents[2] / "config/limits.conf").read_text()\n',
+            'from scripts.lib import conf\nVALUE = conf.read("limits")\n',
+            'from pathlib import Path\nimport shutil\nshutil.copytree(Path(__file__).parents[2] / "config", "fixture")\n',
+            'from pathlib import Path\nNAME = "limits"\nVALUE = (Path(__file__).parents[2] / "config" / f"{NAME}.conf").read_text()\n',
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                self.write("config/limits.conf", "amount=1\n")
+                self.write("scripts/component/reader_test_support.py", fixture)
+                self.write("scripts/component/test_fixture.py", "from scripts.component import reader_test_support\n")
+                self.write("scripts/checks/test_limits.py", "from scripts.component import test_fixture\n")
+                self.certify()
+                self.record_configs({})
+                self.write("config/limits.conf", "amount=2\n")
+                _ = self.commit()
+                self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_limits.py",))
+
+        self.write("config/.conf", "amount=1\n")
+        self.write("scripts/checks/test_limits.py", 'NAME = ".conf"\n')
+        self.certify()
+        self.write("config/.conf", "amount=2\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_limits.py",))
+
     def test_configuration_selection_reuses_all_source_facts(self) -> None:
         self.write("config/limits.conf", "amount=1\n")
         self.write("scripts/component/reader.py", 'from scripts.lib import conf\nVALUE = conf.read("limits")\n')
@@ -641,12 +743,14 @@ class AffectedModulesTests(unittest.TestCase):
                    + 'from scripts.component import relay_test_support\n')
         self.write("scripts/component/relay_test_support.py",
                    "from scripts.component import reader_test_support\n")
+        self.write("scripts/component/test_fixture.py", "from scripts.component import relay_test_support\n")
         self.write("scripts/adapters/path_adapter.py",
                    "from scripts.component import reader_test_support\n")
         for path, text in (
             ("component/test_support_path.py", "from scripts.component import relay_test_support\n"),
             ("checks/test_folder_path.py", "PARTS = 'component tool.sh'\n"),
             ("checks/test_basename.py", "NAME = 'tool.sh'\n"),
+            ("checks/test_inherited_fixture.py", "from scripts.component import test_fixture\n"),
             ("checks/test_support_through_production.py", "from scripts.adapters import path_adapter\n"),
         ):
             self.add_test(path, text)
@@ -654,7 +758,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write("scripts/component/tool.sh", "false\n")
         _ = self.commit()
         self.assertCountEqual([path.name for path in self.selection().modules],
-                              ["test_support_path.py", "test_folder_path.py"])
+                              ["test_support_path.py", "test_folder_path.py", "test_inherited_fixture.py"])
 
     def test_a_changed_script_selects_tests_of_every_script_that_calls_it(self) -> None:
         self.write("scripts/component/tool.sh", "# runner.sh calls this file.\ntrue\n")

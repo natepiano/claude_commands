@@ -1596,7 +1596,7 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     saved = unit_config.read_parked(member.row.id, cleanup=False)
     current = unit_config.read(worktree, cleanup=False)
     if isinstance(saved, unit_config.ConfigMissing) and isinstance(current, unit_config.ConfigMissing):
-        raise RecoveryFactsMissing(f"{name}: no .unit.toml in {worktree} or ~/.local/state/staff/units/{member.row.id}.toml; "
+        raise RecoveryFactsMissing(f"{name}: no .unit.toml in {worktree} or {unit_config.parked_path(member.row.id)}; "
                                + "ask the showrunner")
     if isinstance(saved, unit_config.ConfigMissing):
         if isinstance(location, staff.RemovedWorktree) or not isinstance(current, unit_config.UnitConfig):
