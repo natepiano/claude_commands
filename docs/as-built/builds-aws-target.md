@@ -363,7 +363,11 @@ It retains diagnostics when a run has no valid status record.
 It then keeps only `prepare.log` and removes the other files and GC root links.
 A successful preparation keeps all trial files.
 
-The service selects the first candidate region with an applied G and VT Spot quota of at least 32.
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+It uses the existing type-size vCPU calculation and refuses a type whose vCPU count is unknown.
+If no region fits, the refusal reports the required vCPUs and each region's applied value.
+The quota request size remains separate from this selection rule.
 It checks regional offerings and current Spot prices.
 It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.

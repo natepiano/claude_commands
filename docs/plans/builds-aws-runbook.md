@@ -242,7 +242,11 @@ The existing gate policy remains unchanged.
 The separate GPU policy permits quota and offering reads.
 
 The second command checks the private scaler credential file and starts a transient service.
-The service selects the first configured candidate region with an applied G and VT quota of at least 32.
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+An unknown type-size vCPU count stops selection before AWS reads.
+If no region fits, the refusal shows the required vCPUs and each region's applied value.
+`gpu_spot_quota_request_vcpus` still controls the separate quota request size.
 It reports `not offered` for missing types.
 It reports `price above max` when no offered zone fits the configured maximum.
 It never substitutes another type or region.

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from io import BytesIO, StringIO
 import base64
 from datetime import UTC, datetime
@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -710,7 +710,7 @@ class FakeGpuAws:
         self.types = tuple(types)
         self.region = region
         self.now = 1768478400.0
-        self.quotas: dict[str, int] = {region: 32}
+        self.quotas: dict[str, int] = {region: largest_gate_vcpus(tuple(trial.settings().spot_max_usd_per_hour))}
         self.missing: set[str] = set()
         self.expensive: set[str] = set()
         self.events: list[str] = []
@@ -875,6 +875,61 @@ class GpuOnlineTests(CostFixture):
         self.assertNotIn('put-object', self.fake.events)
         regions = conf.read('cloud_gate').words('spot_candidate_regions')
         self.assertEqual(self.fake.events, ['get-service-quota:' + region for region in regions])
+
+    def selection_fixture(self, types: str) -> tuple[tuple[str, ...], int]:
+        price = next(iter(trial.settings().spot_max_usd_per_hour.values()))
+        _ = write_config_fixture(conf.path('cloud_gate'),
+            'gpu_size_trial_spot_max_usd_per_hour='
+            + json.dumps({name: str(price) for name in types.split()}) + '\n'
+            + 'spot_candidate_regions=fixture-first fixture-second fixture-last')
+        values = conf.read('cloud_gate')
+        regions = values.words('spot_candidate_regions')
+        self.deployment['regions'] = [{'region': region} for region in regions]
+        prices = trial.mapping(cast(object, json.loads(values.text('gpu_size_trial_spot_max_usd_per_hour'))))
+        return regions, largest_gate_vcpus(tuple(prices))
+
+    def test_small_types_accept_a_region_with_room_for_two_boxes(self) -> None:
+        regions, needed = self.selection_fixture('g6.xlarge g4dn.xlarge')
+        self.fake.quotas = {regions[0]: 2 * needed}
+        self.assertEqual(self.worker.select_region(self.deployment, trial.settings())['region'], regions[0])
+        self.assertEqual(self.fake.events, ['get-service-quota:' + regions[0]])
+
+    def test_region_below_the_largest_configured_gpu_type_is_skipped(self) -> None:
+        regions, needed = self.selection_fixture('g6.xlarge g6.8xlarge')
+        smaller = largest_gate_vcpus((next(iter(trial.settings().spot_max_usd_per_hour)),))
+        self.fake.quotas = {regions[0]: smaller, regions[1]: needed, regions[2]: needed * 2}
+        self.assertEqual(self.worker.select_region(self.deployment, trial.settings())['region'], regions[1])
+        self.assertEqual(self.fake.events, ['get-service-quota:' + region for region in regions[:2]])
+
+    def test_region_selection_uses_captured_limits_after_configuration_changes(self) -> None:
+        regions, needed = self.selection_fixture('g6.xlarge g6.8xlarge')
+        limits = trial.settings()
+        _, smaller = self.selection_fixture('g6.xlarge')
+        self.assertLess(smaller, needed)
+        self.fake.quotas = {regions[0]: smaller, regions[1]: needed}
+        self.assertEqual(self.worker.select_region(self.deployment, limits)['region'], regions[1])
+        self.assertEqual(self.fake.events, ['get-service-quota:' + region for region in regions[:2]])
+
+    def test_quota_refusal_names_the_requirement_and_every_applied_value(self) -> None:
+        regions, needed = self.selection_fixture('g6.xlarge g6.8xlarge')
+        self.fake.quotas = {region: needed - index - 1 for index, region in enumerate(regions)}
+        with self.assertRaises(ValueError) as refused:
+            _ = self.worker.select_region(self.deployment, trial.settings())
+        message = str(refused.exception)
+        self.assertIn(f'at least {needed} vCPUs', message)
+        for region in regions:
+            self.assertIn(f'{region}={self.fake.quotas[region]}', message)
+        self.assertEqual(self.fake.events, ['get-service-quota:' + region for region in regions])
+        self.assertEqual(self.fake.launches, [])
+
+    def test_unknown_gpu_vcpu_count_refuses_before_aws_reads(self) -> None:
+        limits = trial.settings()
+        _ = self.selection_fixture('fixture.unknown')
+        price = next(iter(limits.spot_max_usd_per_hour.values()))
+        unknown = replace(limits, spot_max_usd_per_hour={'fixture.unknown': price})
+        with self.assertRaisesRegex(ValueError, 'No vCPU count is available for configured GPU type: fixture.unknown'):
+            _ = self.worker.select_region(self.deployment, unknown)
+        self.assertEqual(self.fake.events, [])
 
     def test_not_offered_type_is_reported_and_next_type_runs(self) -> None:
         first, second = self.fake.types

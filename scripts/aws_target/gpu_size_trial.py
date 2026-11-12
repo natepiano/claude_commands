@@ -24,7 +24,7 @@ from typing import cast, final
 from uuid import uuid4
 
 from scripts.aws_target import cloud_gate, gate_box, ledger
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus
 from scripts.aws_target.config import gate_deployment, read_settings
 from scripts.lib import conf
 from scripts.production import merge_gate
@@ -749,16 +749,27 @@ class GpuTrialWorker:
     def __init__(self, gates: cloud_gate.GateWorker) -> None:
         self.gates = gates
 
-    def select_region(self, deployment: dict[str, object]) -> dict[str, object]:
+    def select_region(self, deployment: dict[str, object], limits: TrialLimits) -> dict[str, object]:
+        values = conf.read_or_repository('cloud_gate')
+        needed = 0
+        for size in limits.spot_max_usd_per_hour:
+            vcpus = largest_gate_vcpus((size,))
+            if not vcpus:
+                raise ValueError('No vCPU count is available for configured GPU type: ' + size)
+            needed = max(needed, vcpus)
         regions = {str(row['region']): row for row in ledger.rows(deployment, 'regions')}
-        for region in conf.read_or_repository('cloud_gate').words('spot_candidate_regions'):
+        applied: list[str] = []
+        for region in values.words('spot_candidate_regions'):
             reply = self.gates.regional_api(region).call('get-service-quota', '--service-code', 'ec2',
                 '--quota-code', 'L-3819A6DF', service='service-quotas')
-            if conf.decimal(str(mapping(reply['Quota'])['Value'])) >= 32:
+            quota = conf.decimal(str(mapping(reply['Quota'])['Value']))
+            applied.append(f'{region}={quota.normalize():f}')
+            if quota >= needed:
                 if region not in regions:
                     raise ValueError('The granted GPU region has no gate deployment: ' + region)
                 return regions[region]
-        raise ValueError('No configured region has an applied G and VT Spot quota of at least 32')
+        raise ValueError(f'No configured region has an applied G and VT Spot quota of at least {needed} vCPUs; '
+                         + 'applied vCPUs: ' + ', '.join(applied))
 
     def offered_zones(self, regional: dict[str, object], size: str) -> list[dict[str, object]]:
         api = self.gates.regional_api(str(regional['region']))
@@ -881,7 +892,7 @@ class GpuTrialWorker:
                    for row in self.gates.book.read_snapshot().gate_reservations):
                 raise ValueError('The trial already has bookings; resume its original trial folder')
             limits = settings()
-            regional = self.select_region(deployment)
+            regional = self.select_region(deployment, limits)
             online = {'trial': manifest['trial'], 'regional': regional, 'bucket': deployment['bucket'],
                       'deployment_id': deployment['deployment_id'],
                       'limit_usd': str(min(limits.limit_usd, conf.decimal(str(mapping(manifest['limits'])['limit_usd'])))),
