@@ -230,8 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
-   `read_cycle()` (`build_hold.py:994`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:983`) returns `Path | None`, for the same no-current-cycle state.
-   Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
+   `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
+   Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
    Update `read_cycle_for_change()` and its test callers.
    Dailies callers were retired on 2026-11-11.
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
@@ -240,7 +240,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1171) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1438) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
@@ -2288,51 +2288,16 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 108 — The floor keeps the build output of a copy with a live or waiting verify.sh build  · status: done
 
-**Depends on:** none.
+#### As-built
 
-**Source (2026-11-12, builds showrunner):** "(b) is yours: the floor treats a copy with a live or queued verify.sh build as in use. Go now; land order when green, with ETA."
-
-#### Work Order
-
-**Goal:** the disk floor treats a cargo target as in use while a `verify.sh` process runs in the workspace that owns it, also while that `verify.sh` waits in the build queue.
-
-**Measured:**
-1. At 15:23 EST the floor took 20.9 GiB from `/tmp/claude/scratch/until-2026-11-13T1207Z-double-sided-info-37p-3b01f2/checkout/target`. A `bash ~/.claude/scripts/direct/verify.sh build hana` (pid 1180249, start 15:02) had its cwd in that checkout. It waited in a 1-second loop and held no cargo lock.
-2. `process_uses()` (`scripts/lint/sweep.py:1208`) counts a process when its exe, cwd or a mapped file lies under the target, or when it is a cargo-nextest run whose workspace owns the target (`:1263`). The `verify.sh` cwd is the checkout, beside `target/`, so the floor saw no use.
-3. `verify.sh` works on `git rev-parse --show-toplevel` of its cwd (`scripts/direct/verify.sh:510`).
-4. `nextest_targets()` (`sweep.py:1533`) resolves the target of a process from `--target-dir`, `CARGO_TARGET_DIR`, cargo config, or the target beside a folder that holds the cwd.
-5. A waiting `verify.sh` is a live process for its whole wait. Its queue entry belongs to that process or to a child of it.
-
-**Spec:**
-1. In `process_uses()`, count a `verify.sh` process the same way as a cargo-nextest run. A process is a `verify.sh` process when one of these is true:
-   - the basename of argv[0] is `verify.sh`;
-   - the basename of argv[0] is `bash`, `sh`, `zsh` or `dash`, and the first argument that does not start with `-` has the basename `verify.sh`.
-2. Resolve its targets with the same function that resolves a nextest run. Rename `nextest_targets` to `workspace_targets` and update every caller. Keep one function.
-3. The use text is `runs verify.sh in <cwd>`. The floor prints `lint sweep: pid <pid> runs verify.sh in <cwd>; <target> left alone`.
-4. The rule applies to every `process_uses()` caller: the floor, the floor alert choices and the hand cleanup. Add no flag and no config key.
-5. Update the `process_uses()` docstring and the concurrency paragraph of the module docstring.
-6. Update the "Targets in use" bullet in `docs/as-built/build-memory-admission.md`.
-
-**Tests** (`scripts/lint/test_sweep.py`, add rows beside `test_a_nextest_run_uses_its_workspace_target_between_test_binaries` and use its fake `/proc`):
-1. `bash /x/verify.sh build hana` with cwd in `<workspace>/crates/app`: the workspace target is in use, with the text `runs verify.sh in <cwd>`.
-2. argv[0] `/x/verify.sh` with the workspace as cwd: in use.
-3. `bash -e /x/verify.sh test`: in use.
-4. `bash /x/other.sh` with the workspace as cwd: not in use.
-5. `bash /x/verify.sh build` with `CARGO_TARGET_DIR=<other>`: the other target is in use.
-6. A `verify.sh` process with cwd in another workspace: this target is not in use.
+- `process_uses()` counts a `verify.sh` process as a user of its workspace target, the same as a cargo-nextest run. A process is a `verify.sh` process when the basename of argv[0] is `verify.sh`, or argv[0] is `bash`, `sh`, `zsh` or `dash` and the first argument without a leading `-` has the basename `verify.sh`.
+- A `verify.sh` that waits in the build queue is a live process, so its target is in use for its whole wait.
+- `workspace_targets(argv, cwd, environ, targets)` (formerly `nextest_targets`) resolves the target for both runners: `--target-dir`, `CARGO_TARGET_DIR`, cargo config, then the target beside a folder that holds the cwd.
+- The use text is `runs verify.sh in <cwd>`. The rule applies to every `process_uses()` caller: the floor, the floor alert choices and the hand cleanup. No flag or config key controls it.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
+- `scripts/lint/sweep.py` — `process_uses()`, `workspace_targets()`
+- `scripts/lint/test_sweep.py` — the verify recheck row and a 9-row invocation table (bash, direct call, `bash -e`, sh, `zsh -f`, dash, other.sh, `CARGO_TARGET_DIR`, another workspace)
 - `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
 
-**Workers:** one implement worker.
-
-**State:** none.
-
-**Verification:**
-1. Test: `scripts.lint.test_sweep`.
-2. Lint: `basedpyright` on `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py`, once after the edits.
-3. Live check (director, read-only): call `process_uses()` on the real `/proc` for a target whose workspace has a live `verify.sh`. The result names the `verify.sh` pid. Delete nothing.
-
-**Speed:** one argv check per process in the existing `/proc` scan. The environ file is read only for a matching process. Name the measured scan time before and after in the reply.
+**Gotchas:** `bash -o pipefail verify.sh` is not matched, because the first argument without a leading `-` is `pipefail`.
