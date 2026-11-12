@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One holder file per session; decide when builds are quiet and may resume."""
+"""Keep one hold per staff member and decide when builds may resume."""
 
 from __future__ import annotations
 try:
@@ -257,25 +257,8 @@ def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
-def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
-    from scripts.message.sessions import live_sessions
-
-    def unblock(holder: str) -> MacHoldResult:
-        arguments = ["unblock", "--holder", holder]
-        return run_mac_hold(arguments, target)
-
-    result = unblock(identity.name)
-    prefix = "blocked by "
-    line = result.stdout.rstrip("\n")
-    if result.status != 1 or not line.startswith(prefix):
-        return result
-    holder = line[len(prefix):]
-    no_former_names: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions()
-                   if record["sessionId"] == identity.key), no_former_names)
-    if holder != identity.name and holder in (identity.name, given, *former):
-        return unblock(holder)
-    return result
+def release_mac_hold(identity: HolderIdentity, target: str = "mac") -> MacHoldResult:
+    return run_mac_hold(["unblock", "--holder", identity.key], target)
 
 
 def print_mac_hold_result(result: MacHoldResult) -> int:
@@ -286,12 +269,12 @@ def print_mac_hold_result(result: MacHoldResult) -> int:
 
 @dataclass(frozen=True)
 class Holder:
-    # The holder's name now when it is a live Claude session, else the name the hold was taken under.
+    # The current staff name, or the text given for a holder outside staff.
     name: str
     since: datetime
     purpose: str
     release: ReleaseEta
-    # The hold file's name: the holder's Claude session id, or its name when it is no Claude session.
+    # The fixed staff ID, or the text given for a holder outside staff.
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
 
@@ -571,7 +554,7 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> ses
 
 def owner_is_sole_holder(owner: session_owner.OwningSession | session_owner.NoOwningSession, holders: Sequence[Holder]) -> bool:
     return (isinstance(owner, session_owner.OwningSession) and bool(holders)
-            and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders))
+            and all(holder.key == holder_path(Path(), holder_of(owner.session_id).key).name for holder in holders))
 
 
 class HoldEnforcer(Protocol):
@@ -683,39 +666,48 @@ def holder_path(directory: Path, name: str) -> Path:
 
 
 def holder_of(given: str | None) -> HolderIdentity:
-    """The key a holder's hold is kept under, and the holder's name now.
+    """Resolve a fixed staff key and its current display name."""
+    from scripts.production import staff
 
-    The key is the Claude session id of the session `given` means, or of the caller when no name is
-    given, so a rename between hold and release loses nothing. A holder that is no live Claude
-    session keeps `given` as its key.
-    """
-    from scripts.message.sessions import addressed, live_sessions
-
-    records = live_sessions()
+    try:
+        membership = staff.snapshot()
+    except staff.StaffAbsent:
+        membership = staff.StaffSnapshot(())
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("give --holder: this is not a live Claude session")
-        return HolderIdentity(session["sessionId"], session["name"])
-    session = addressed(given, records)
-    return HolderIdentity(given, given) if session is None else HolderIdentity(session["sessionId"], session["name"])
+        member = membership.by_current_session(own) if own else None
+        if member is None:
+            raise ValueError("give --holder: this caller has no staff row")
+        return HolderIdentity(member.id, member.name)
+    from scripts.message.sessions import staff_recipient
+
+    member = membership.by_member_reference(given)
+    resolved = member if member is not None else staff_recipient(given, membership)
+    return HolderIdentity(resolved.id, resolved.name) if isinstance(resolved, staff.StaffRow) else HolderIdentity(given, given)
+
+
+def holder_address(key: str) -> str:
+    """Use a staff ID directly; preserve native session addresses for other keys."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return key if member is not None else f"session:{key}"
+
+
+def holder_session(key: str) -> str:
+    """Use a staff holder's current session; keep a native session key as it is."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return member.current_session if member is not None else key
 
 
 def held_key(directory: Path, given: str | None) -> str:
-    """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
-    kept by session id is found by the name given, the session's name now, and each name it once had."""
-    from scripts.message.sessions import live_sessions
-
+    """Find only the resolved holder's fixed key."""
     identity = holder_of(given)
-    key, name = identity.key, identity.name
-    none: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions() if record["sessionId"] == key), none)
-    candidates: list[str] = [key, given or name, name, *former]
-    found = next((one for one in candidates if holder_path(directory, one).is_file()), None)
-    if found is None:
-        raise ValueError(f"{given or name} held nothing")
-    return found
+    if not holder_path(directory, identity.key).is_file():
+        raise ValueError(f"{given or identity.name} held nothing")
+    return identity.key
 
 
 def aware_instant(value: str) -> datetime:
@@ -727,7 +719,7 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
-    from scripts.message.sessions import live_sessions
+    from scripts.production import staff
 
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
@@ -746,7 +738,8 @@ def read_holder(path: Path) -> Holder:
             release = fields.get("release_eta")
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
                 eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
-                now = next((record["name"] for record in live_sessions() if record["sessionId"] == path.name), name)
+                member = staff.initial_snapshot().by_id(staff.StaffId(path.name))
+                now = member.name if member is not None else name
                 keep: list[ProcessIdentity] = []
                 values = fields.get("keep", [])
                 if isinstance(values, list):
@@ -1255,10 +1248,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
-    from scripts.message.sessions import live_sessions
-
     with release_lock():
-        # A receipt for a former name must never shadow a live session-id hold.
+        # A completed release must never hide a current hold.
         if given is None and resume:
             if has_holder_file(directory):
                 return NoReleaseIntent()
@@ -1277,12 +1268,8 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
             if given is None and resume:
                 return HolderIdentity(intent["holder_key"], intent["holder_name"])
             identity = holder_of(given)
-            no_former_names: list[str] = []
-            former = next((record["formerNames"] for record in live_sessions()
-                           if record["sessionId"] == identity.key), no_former_names)
-            candidates = (identity.key, identity.name, given or identity.name, *former)
-            if any(holder_path(directory, candidate).name == intent["holder_key"] for candidate in candidates):
-                return HolderIdentity(intent["holder_key"], intent["holder_name"])
+            if holder_path(directory, identity.key).name == intent["holder_key"]:
+                return identity
         if recovered.set_aside and not has_holder_file(directory):
             for record in recovered.records:
                 if record.state == "pending" and record.intent["holder_directory"] == str(directory.resolve()):
@@ -1750,11 +1737,10 @@ def main(arguments: list[str]) -> int:
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
                 if action == "hold":
-                    command = ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]
+                    command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
                     result = run_mac_hold(command, target_name)
                 else:
-                    given = cast(str | None, options.holder) or identity.name
-                    result = release_mac_hold(identity, given, target_name)
+                    result = release_mac_hold(identity, target_name)
                 return print_mac_hold_result(result)
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))

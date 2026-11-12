@@ -305,7 +305,8 @@ def local_hold_state() -> TargetState:
             if isinstance(holder.release, build_hold.KnownReleaseEta)
             else UntilReleased()
         )
-        return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
+        return Held(holder.name, holder.purpose, holder.since, end,
+                    HolderSession(build_hold.holder_session(holder.key)))
     except build_hold.ReleaseRecordReadError as error:
         return StateUnreadable(build_hold.release_record_error_line(error))
     except (OSError, UnicodeError, ConfigError) as error:
@@ -329,7 +330,7 @@ def ssh_target_state(target: SshTarget) -> TargetState:
             )
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
-            return Held(block.holder, block.reason, block.since, block_end, session)
+            return Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session)
         if isinstance(offload.read_failed_probe(target.name), offload.FailedProbe):
             return Unreachable("failed probe")
         if is_aws_target(target):

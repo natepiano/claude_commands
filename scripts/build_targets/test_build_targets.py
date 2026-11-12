@@ -991,6 +991,57 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(self.sleeps, 1)
         self.assertFalse((self.holders / "hana").exists())
 
+        from scripts.message import send as message_send, sessions
+        from scripts.lib.socket_test_support import short_socket_directory
+        import socket
+
+        for registered in (False, True):
+            with self.subTest(staff_holder=registered), isolated_staff_file(self.root / "notice-staff.json", {}), \
+                 short_socket_directory() as socket_directory, socket.socket(socket.AF_UNIX) as live_socket:
+                _ = (self.root / "notice-staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
+                native = fixture_runtime_id("nonstaff-hold-notice")
+                key = native
+                if registered:
+                    member = fixture_member("producer", name="notice-holder")
+                    member = staff.update_current_session(member.current_session, staff.StaffId(native))
+                    key = member.id
+                socket_path = Path(socket_directory) / "notice.sock"
+                live_socket.bind(str(socket_path))
+                records = Path(os.environ["NOTIFIER_SESSIONS_DIR"])
+                records.mkdir(exist_ok=True)
+                path = records / "holder.json"
+                started = sessions.process_start(os.getpid())
+                assert started is not None
+                _ = path.write_text(json.dumps({"pid": os.getpid(), "sessionId": native, "name": "holder",
+                    "messagingSocketPath": str(socket_path), "updatedAt": 1, "procStart": started}))
+                notice_records = sessions.live_sessions()
+                self.assertEqual([record["sessionId"] for record in notice_records], [native])
+                entry = roster.RosterEntry(machine="fixture", kind="claude", role="freestanding", name="holder",
+                    status="working", reach=roster.Messageable("session:" + native), cwd=str(self.root),
+                    showrunner=roster.NoShowrunner(), director=roster.NoDirector(), assignment=roster.NotAWorker(),
+                    session=roster.ClaudeSession(native))
+                resolved: list[message_send.DeliveryRoute] = []
+
+                def lookup_notice(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    address = argv[argv.index("--to") + 1]
+                    try:
+                        route = message_send.resolve_recipient(address, message_send.LocalOnly(),
+                            roster.Roster([entry], []), membership=staff.snapshot(), records=notice_records)
+                    except message_send.RecipientNameMissing as error:
+                        self.fail(str(error))
+                    resolved.append(route)
+                    self.assertEqual(address, key if registered else "session:" + native)
+                    addressed = sessions.addressed("session:" + native, notice_records)
+                    assert addressed is not None
+                    self.assertEqual(addressed["sessionId"], native)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                holder = build_hold.Holder(name="holder", since=NOW, purpose="notice checks",
+                                           release=build_hold.UnknownReleaseEta(), key=key)
+                with mock.patch.object(subprocess, "run", side_effect=lookup_notice):
+                    build_targets.tell_wait_holder(holder, "The build waits for this hold.", "verify")
+                self.assertEqual(resolved, [message_send.ClaudeRecipient("session:" + native)])
+
     def leave_wait(self, leave_hook: str) -> tuple[int, str]:
         errors = io.StringIO()
         with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
@@ -1154,6 +1205,15 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         register.assert_not_called()
         self.assertEqual((cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes()), before)
         self.assertEqual([path.name for path in self.holders.iterdir()], ["holder-session"])
+        member = staff.StaffRow(staff.StaffId("fixed-holder"), "producer", "renamed-holder", staff.StaffRoot(),
+                                current_session=staff.StaffId("holder-session"))
+        _ = holder_file.rename(self.holders / member.id)
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            self.assertEqual(self.check_launch("holder-session"), (0, "", ""))
+            state = targets.local_hold_state()
+            assert isinstance(state, targets.Held)
+            self.assertEqual(state.holder, member.name)
+            self.assertEqual(state.holder_session, targets.HolderSession(member.current_session))
 
     def test_another_session_launch_is_refused_by_the_session_hold(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
@@ -1371,6 +1431,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                         send.assert_called_once_with(sender if program else session_send.send_argv(
                             "--to", "session:hana", "--text", line),
                                                      capture_output=True, text=True, errors="replace", timeout=timeout)
+
 
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()
