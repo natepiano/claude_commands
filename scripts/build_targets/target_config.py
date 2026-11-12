@@ -9,8 +9,7 @@ from contextvars import ContextVar
 from enum import Enum, auto
 from pathlib import Path
 import os
-import json
-from typing import Literal, cast
+from typing import Literal
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -31,11 +30,6 @@ class SshTarget:
     name: str
     platform: Platform
     settings: Path
-
-
-def is_aws_target(target: SshTarget) -> bool:
-    """Identify Linux targets governed by the AWS spending guard."""
-    return target.platform == "linux" and (target.name == "aws" or target.settings.name == "aws_target.conf")
 
 
 Target = LocalTarget | SshTarget
@@ -158,6 +152,8 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
         settings = (config.parent / Path(setting).expanduser()).resolve()
         if not settings.is_file():
             raise ConfigError(f"{key}: settings file does not exist: {settings}")
+        if name == 'aws' or settings.name == 'aws_target.conf':
+            raise ConfigError('The permanent AWS builder was removed; use cloud gates')
         targets.append(SshTarget(name, platform, settings))
     result = tuple(targets)
     if isinstance(current, CommandConfiguration):
@@ -172,16 +168,3 @@ def configured_ssh_target(target: str) -> SshTarget:
             require_target_name(target)
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
-
-
-def aws_routing_enabled(settings: conf.ConfigRead) -> bool:
-    """Read the external activation record before the legacy configuration value."""
-    path = ssh_target_state_directory('aws') / 'routing.json'
-    if path.exists():
-        value = cast(object, json.loads(path.read_text()))
-        if not isinstance(value, dict):
-            raise ConfigError('routing.json: expected an activation record')
-        record = cast(dict[str, object], value)
-        if record.get('settings') == str(settings.source.resolve()):
-            return record.get('enabled') is True
-    return settings.text('offload') == 'on'
