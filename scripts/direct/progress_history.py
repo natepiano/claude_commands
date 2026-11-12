@@ -6063,9 +6063,23 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
     from scripts.message import sessions
 
     records = sessions.live_sessions()
-    matches = [record for record in records if identity in
-               (record["name"], "session:" + record["sessionId"], *record["formerNames"])]
-    # A duplicate name is not an identity, even if addressed() would pick one.
+    try:
+        membership = resolver.record if resolver is not None else staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        return NoNamedSupplier(f"supplier staff is unavailable: {error}")
+    reference = identity.removeprefix("session:")
+    owner = membership.by_member_reference(reference)
+    owners = [owner] if owner is not None else [row for row in membership.rows if row.name == identity]
+    if len(owners) > 1:
+        return NoNamedSupplier(f"supplier alias has {len(owners)} live addresses")
+    if owners:
+        reference = str(owners[0].current_session)
+    else:
+        try:
+            _ = staff.native_id(reference)
+        except staff.StaffRefused:
+            return NoNamedSupplier("supplier alias has 0 live addresses")
+    matches = [record for record in records if record["sessionId"] == reference]
     if len(matches) != 1:
         return NoNamedSupplier(f"supplier alias has {len(matches)} live addresses")
     return NamedSupplier("uds:" + matches[0]["messagingSocketPath"])

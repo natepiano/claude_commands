@@ -6,7 +6,7 @@ description: Promote a session to unit director.
 
 The other direction, a unit becoming the showrunner of its own production under this one, is `/showrunner:promote_showrunner`.
 
-1. **Find it.** Its `ListAgents` name matches `name` in one `~/.claude/sessions/<pid>.json`, which gives `pid`, `sessionId` and `cwd`. Read its pane or its transcript's tail for what it is doing. For `<unit name>`, replace each run of characters outside letters, digits, `-` and `_` in the ListAgents name with one `-`, then drop leading and trailing `-`.
+1. **Find it.** Resolve the staff name to one staff row. Read its fixed id, `current_session`, `kind`, `parent`, and worktree. Join `current_session` to native pane or process evidence. Require an explicit native id for an unstaffed session. Read its pane or transcript for its current work. Use the staff name for `<unit name>`. For an unstaffed session, choose an explicit unit name.
 2. **Check fit.** Stop and say why when:
    - its work is in a repository other than the production's;
    - it is mid-turn or a form waits (the idle test in `/showrunner:produce` → Compact after a checkpoint): wait for idle;

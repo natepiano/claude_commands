@@ -2094,10 +2094,10 @@ print('two homes isolated; recorder lock retained; caller restored')
             "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
             "UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0", "UNIT_SYNC_WRITES": "0",
         }))
-        # Alias lookup is outside the recorder's evidence check. Hook fixtures
-        # exercise the real live-session resolver with bound socket files.
+        postmaster = fixture_member("producer", name="postmaster", runtime_id=fixture_runtime_id("postmaster"))
+        _ = self.enterContext(patch.object(staff, "local_snapshot", return_value=staff.snapshot()))
         _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[{
-            "name": "postmaster", "sessionId": "postmaster-session", "formerNames": [],
+            "name": "postmaster", "sessionId": postmaster.current_session, "formerNames": [],
             "messagingSocketPath": "/fixture/postmaster/socket",
         }]))
         self.assertTrue(progress_history.record_turn_wait(session, "director", "blocked: waiting on uds:/supplier.sock"))
@@ -2199,6 +2199,24 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual([event["event_type"] for event in waits], ["wait_started", "wait_finished"])
         self.assertEqual(waits[1]["wait_id"], waits[0]["wait_id"])
         self.assertFalse((session / "turn_wait.json").exists())
+
+        from scripts.message import sessions as messaging_sessions
+
+        owner = fixture_member("producer", name="supplier")
+        other = fixture_member("producer", name="other-supplier")
+        records: list[messaging_sessions.SessionRecord] = [{
+            "sessionId": owner.current_session, "name": "other-supplier", "formerNames": ["former-only"],
+            "messagingSocketPath": "/correct.sock", "pid": 123, "updatedAt": 1, "tmux": "",
+        }, {
+            "sessionId": other.current_session, "name": "supplier", "formerNames": [],
+            "messagingSocketPath": "/wrong.sock", "pid": 456, "updatedAt": 1, "tmux": "",
+        }]
+        resolver = session_staff.RowResolver(staff.snapshot())
+        for alias, expected in (("supplier", progress_history.NamedSupplier("uds:/correct.sock")),
+                                ("session:" + owner.current_session, progress_history.NamedSupplier("uds:/correct.sock")),
+                                ("former-only", progress_history.NoNamedSupplier("supplier alias has 0 live addresses"))):
+            with self.subTest(supplier_alias=alias), patch.object(messaging_sessions, "live_sessions", return_value=records):
+                self.assertEqual(progress_history._supplier_address(alias, resolver=resolver), expected)  # pyright: ignore[reportPrivateUsage]
 
     def test_malformed_reply_record_is_rejected_after_one_read_without_sleep(self) -> None:
         session, record, prompt = self.forwarded_supplier_wait("forward-read-malformed")
@@ -7685,7 +7703,7 @@ with patch.object(fcntl, "flock", admission):
         ):
             report = self.run_progress(session_dir, at=started_at + 100)
 
-        note = vault_root / "example-showrunner" / "unit-a.md"
+        note = vault_root / "Example" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         unit = staff.snapshot().by_path("Example/unit-a")
         assert unit is not None
@@ -7697,7 +7715,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertIn("| Phase 3 |", report)
         self.assertEqual(
             [path.relative_to(vault_root) for path in vault_root.rglob("*.md")],
-            [Path("example-showrunner/unit-a.md")],
+            [Path("Example/unit-a.md")],
         )
         self.assertEqual(
             {path.relative_to(self.history_dir) for path in self.history_dir.rglob("*")},
@@ -7764,7 +7782,7 @@ with patch.object(fcntl, "flock", admission):
         )
 
         self.assertEqual(result, "ETA recorded: 13:00 UTC")
-        note = vault_root / "example-showrunner" / "unit-a.md"
+        note = vault_root / "Example" / "unit-a.md"
         self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
         self.assertIn("phase_table: true", note_text)
