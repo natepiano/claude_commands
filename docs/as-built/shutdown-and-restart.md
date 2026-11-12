@@ -458,6 +458,28 @@ The restart option `--why TEXT` replaces that cause.
 The message asks the session to continue its work.
 If Codex message delivery fails after launch, restart reports one anomaly line with the director's name and the first error line.
 The director counts as started and leaves the restart record.
+Restart checks each unit director and showrunner that it starts with a continuation message.
+The check uses the launched account home and native session identity.
+It reads only turns after that director's start.
+The reader leaves a final record without a newline unread until the writer completes it.
+The launch boundary follows the last complete newline.
+A malformed Codex record with a newline makes the transcript unreadable.
+A Claude transcript missing from the current read also makes the transcript unreadable.
+A matching user turn followed by an assistant turn or tool call confirms resumed work.
+All checked directors share one deadline.
+The check ends as soon as every director resumes.
+At the deadline, each failed check prints one of these lines:
+
+- `<name>: restart check: no continuation message`
+- `<name>: restart check: no work after the continuation message`
+- `<name>: restart check: transcript unreadable`
+
+The check then prints `restart check: <passed> of <checked> directors resumed`.
+The check prints nothing when it checks no director.
+It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
+It does not change the exit code, restart record, or staff.
+config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
+
 A paused or exited director stays stopped and keeps its hold record and restart entry.
 A running row gets no continuation message.
 Producers keep their existing start behavior.
