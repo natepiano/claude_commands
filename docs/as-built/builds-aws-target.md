@@ -355,7 +355,12 @@ A nextest archive profile inherits `ci` and includes each shared library through
 The archive retains the workspace's existing archive includes.
 Nextest lists the extracted tests before preparation builds the NixOS closure.
 An archive validation error includes nextest's diagnostic, which names a missing shared library.
-A failed preparation keeps only `prepare.log` and removes the other files and GC root links.
+Each measurement run creates its extraction directory before passing it to nextest through `--extract-to`.
+Nextest 0.9.143 returns setup exit 96 when that directory does not exist.
+A failed preparation copies up to 200 final lines of each failed `nextest.log` into `prepare.log`.
+The reader seeks backward in 64 KiB chunks and reads at most 1 MiB per log.
+It retains diagnostics when a run has no valid status record.
+It then keeps only `prepare.log` and removes the other files and GC root links.
 A successful preparation keeps all trial files.
 
 The service selects the first candidate region with an applied G and VT Spot quota of at least 32.

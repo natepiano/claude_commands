@@ -39,6 +39,28 @@ def fake_tool_path(name: str, *, path: str | None = None) -> str:
     return name
 
 
+class LogReadProbe:
+    """Record bounded reads from an in-memory log."""
+    def __init__(self, payload: bytes) -> None:
+        self.content: BytesIO = BytesIO(payload)
+        self.read_sizes: list[int] = []
+        self.offsets: list[int] = []
+
+    def __enter__(self) -> LogReadProbe:
+        return self
+
+    def __exit__(self, _kind: object, _value: object, _traceback: object) -> None:
+        self.content.close()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self.content.seek(offset, whence)
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        self.offsets.append(self.content.tell())
+        return self.content.read(size)
+
+
 @final
 class GpuTrialTests(unittest.TestCase):
     root: Path = Path()
@@ -125,6 +147,7 @@ elif name == 'cargo':
         print('cargo-nextest fixture')
     else:
         assert args[:2] == ['nextest', 'run'], args
+        assert Path(args[args.index('--extract-to') + 1]).is_dir(), 'The extraction directory must exist'
         config = Path(args[args.index('--config-file') + 1])
         junit = Path(tomllib.loads(config.read_text())['profile']['ci']['junit']['path'])
         junit.write_text('<testsuites/>')
@@ -298,6 +321,79 @@ elif name == 'cargo':
                 trial.prepare(self.root, 'HEAD', folder)
         self.assertEqual(list(folder.iterdir()), [folder / 'prepare.log'])
         self.assertIn('exit 1', (folder / 'prepare.log').read_text())
+
+    def test_prepare_failure_retains_failed_log_tails_before_cleanup(self) -> None:
+        folder = self.root / 'trial'
+
+        def fail() -> int:
+            for machine, status in (('setup-error', 96), ('test-failure', 100), ('passed', 0), ('interrupted', None)):
+                run = folder / 'machines' / machine / '1'
+                run.mkdir(parents=True)
+                if status is not None:
+                    trial.write_json(run / 'run.json', {'status': status})
+                content = ''.join(f'{machine} line {number}\n' for number in range(250))
+                _ = (run / 'nextest.log').write_text(content)
+            return 1
+
+        with (mock.patch.object(trial, 'checked', return_value='a' * 40),
+              mock.patch.object(trial, 'export_source'),
+              mock.patch.object(trial, 'preflight', return_value={}),
+              mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free'),
+              mock.patch.object(merge_gate, 'gate_reservation') as admission):
+            place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
+            popen = cast(mock.MagicMock, place.popen)
+            wait = cast(mock.MagicMock, cast(mock.MagicMock, popen.return_value).wait)
+            wait.side_effect = fail
+            with self.assertRaisesRegex(GateRefused, 'exit 1'):
+                trial.prepare(self.root, 'HEAD', folder)
+        self.assertEqual(list(folder.iterdir()), [folder / 'prepare.log'])
+        diagnostic = (folder / 'prepare.log').read_text()
+        self.assertNotIn('passed line', diagnostic)
+        for machine in ('setup-error', 'test-failure', 'interrupted'):
+            self.assertIn(f'machines/{machine}/1/nextest.log (last 200 lines)', diagnostic)
+            lines = [line for line in diagnostic.splitlines() if line.startswith(machine + ' line ')]
+            self.assertEqual(lines, [f'{machine} line {number}' for number in range(50, 250)])
+
+    def test_failed_log_tail_accepts_short_logs_invalid_text_and_missing_status(self) -> None:
+        run = self.root / 'machines/natedev/2'
+        run.mkdir(parents=True)
+        _ = (run / 'nextest.log').write_bytes(b'nextest setup error\ninvalid: \xff')
+        _ = (run / 'run.json').write_text('invalid JSON')
+        trial.append_failed_nextest_logs(self.root)
+        diagnostic = (self.root / 'prepare.log').read_text()
+        self.assertIn('machines/natedev/2/nextest.log', diagnostic)
+        self.assertIn('nextest setup error\ninvalid: \ufffd', diagnostic)
+
+    def test_nextest_tail_stops_at_the_byte_limit_on_a_large_log(self) -> None:
+        payload = b'outside the byte limit\n' + b'x' * (3 * trial.NEXTEST_LOG_TAIL_BYTES) + b'\nfinal diagnostic\n'
+        reader = LogReadProbe(payload)
+        with mock.patch.object(Path, 'open', return_value=reader) as opened:
+            tail = trial.nextest_log_tail(self.root / 'nextest.log')
+        opened.assert_called_once_with('rb')
+        sizes = reader.read_sizes
+        self.assertEqual(sum(sizes), trial.NEXTEST_LOG_TAIL_BYTES)
+        self.assertTrue(all(0 < size <= trial.NEXTEST_LOG_TAIL_CHUNK_BYTES for size in sizes))
+        offsets = reader.offsets
+        self.assertEqual(min(offsets), len(payload) - trial.NEXTEST_LOG_TAIL_BYTES)
+        self.assertEqual(offsets, sorted(offsets, reverse=True))
+        self.assertTrue(tail.endswith('\nfinal diagnostic\n'))
+        self.assertNotIn('outside the byte limit', tail)
+
+    def test_nextest_tail_stops_after_enough_lines_and_preserves_chunk_boundaries(self) -> None:
+        for ending in ('', '\n'):
+            with self.subTest(ending=ending):
+                lines = [f'{number}: ' + 'x' * 1000 for number in range(500)]
+                payload = ('\n'.join(lines) + ending).encode()
+                reader = LogReadProbe(payload)
+                with mock.patch.object(Path, 'open', return_value=reader):
+                    tail = trial.nextest_log_tail(self.root / 'nextest.log')
+                self.assertEqual(tail, '\n'.join(lines[-200:]) + ending)
+                sizes = reader.read_sizes
+                self.assertLess(sum(sizes), len(payload))
+                self.assertGreater(len(sizes), 1)
+        empty = self.root / 'empty.log'
+        _ = empty.write_bytes(b'')
+        self.assertEqual(trial.nextest_log_tail(empty), '')
 
     def test_preflight_refuses_missing_tools_before_any_hold_wait(self) -> None:
         for missing in ('git', 'nix', 'nix-store', 'python', 'sh', 'cargo', 'rustc',
@@ -515,6 +611,7 @@ elif name == 'cargo':
                 _ = cast(BinaryIO, kwargs['stdout']).write(b'fixture closure')
             else:
                 commands.append(tuple(argv))
+                self.assertTrue(Path(argv[argv.index('--extract-to') + 1]).is_dir())
                 environment = cast(dict[str, str], kwargs['env'])
                 samples = Path(environment['GPU_TRIAL_SAMPLES'])
                 samples.mkdir()

@@ -35,6 +35,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_MODULE = ROOT / 'docs/plans/builds-aws/gpu-trial.nix'
 WRAPPER = Path(__file__).with_name('gpu_trial_wrapper.py')
 ARCHIVE_PROFILE = 'gpu-size-trial-archive'
+NEXTEST_LOG_TAIL_BYTES = 1024 * 1024
+NEXTEST_LOG_TAIL_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,7 @@ def prepare(repo: Path, commit: str, folder: Path) -> None:
     except Exception as error:
         with log.open('a') as output:
             _ = output.write(str(error) + '\n')
+        append_failed_nextest_logs(folder)
         for path in folder.iterdir():
             if path == log:
                 continue
@@ -208,6 +211,42 @@ def prepare(repo: Path, commit: str, folder: Path) -> None:
                 path.unlink()
         raise
     print(folder)
+
+
+def nextest_log_tail(path: Path) -> str:
+    """Read up to 200 final lines within a fixed byte limit."""
+    chunks: list[bytes] = []
+    newlines = 0
+    with path.open('rb') as content:
+        position = content.seek(0, os.SEEK_END)
+        remaining = min(position, NEXTEST_LOG_TAIL_BYTES)
+        while remaining and newlines <= 200:
+            size = min(remaining, NEXTEST_LOG_TAIL_CHUNK_BYTES)
+            position -= size
+            _ = content.seek(position)
+            chunk = content.read(size)
+            chunks.append(chunk)
+            newlines += chunk.count(b'\n')
+            remaining -= size
+    text = b''.join(reversed(chunks)).decode('utf-8', errors='replace')
+    return ''.join(text.splitlines(keepends=True)[-200:])
+
+
+def append_failed_nextest_logs(folder: Path) -> None:
+    """Keep the last 200 lines of failed nextest logs before preparation removes them."""
+    with (folder / 'prepare.log').open('a') as output:
+        for diagnostic in sorted(folder.glob('machines/*/*/nextest.log')):
+            try:
+                if read_json(diagnostic.with_name('run.json')).get('status') == 0:
+                    continue
+            except (OSError, ValueError):
+                # Keep the diagnostic when the runner did not write a valid status.
+                pass
+            _ = output.write('\nNextest diagnostic: ' + str(diagnostic.relative_to(folder)) + ' (last 200 lines)\n')
+            try:
+                _ = output.write(nextest_log_tail(diagnostic) + '\n')
+            except OSError as error:
+                _ = output.write('Could not read the nextest diagnostic: ' + str(error) + '\n')
 
 
 def export_source(repo: Path, commit: str, folder: Path) -> Path:
@@ -399,6 +438,8 @@ def measure_machine(folder: Path, machine: str, source: Path, environment: Mappi
         run_environment = {**environment, 'GPU_TRIAL_SAMPLES': str(run / 'samples'),
                            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER': wrapper,
                            'CARGO_TARGET_DIR': str(run / 'cargo-target')}
+        # Nextest requires the explicit extraction directory to exist.
+        (run / 'archive').mkdir()
         command = [*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'run', *archive_arguments(folder, run_source),
                    '--extract-to', str(run / 'archive'), '--config-file', str(config), '--retries', '0', '--no-fail-fast']
         with (run / 'nextest.log').open('wb') as output:
