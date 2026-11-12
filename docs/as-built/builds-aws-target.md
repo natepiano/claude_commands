@@ -646,25 +646,78 @@ Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
 
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
+The price lock stores the last refresh attempt time.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
+Each read requests all configured gate `instance_types` for Linux/UNIX.
+The controller keeps the latest price for each zone and type.
+It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
+Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
+The price refresh does not change `controller.json`.
+Failed attempts use the same refresh interval.
+The price read remains active when the former builder route is disabled or removed.
+
+A new gate ranks only variants from its deployment.
+Available variants precede variants under a capacity cooldown.
+Within each group, larger vCPU sizes precede smaller sizes.
+Types with equal vCPU counts compete on expected gate cost.
+That cost equals the hourly Spot price times expected gate hours, plus the remote region transfer charge.
+Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
+Without recent durations, it uses `lifetime_minutes`.
+`remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
+Local measurements cover 692 gates with a source bundle, request, and result.
+Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
+The median combined size is 7,107,672 bytes.
+At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+Equal costs keep configured order.
+Missing or stale prices follow fresh prices for the same vCPU count.
+Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+`MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
+Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
+It stops at the first row before the longer of the price-age and cooldown windows.
+The current two-hour window reads 65,536 bytes from a 750,584-byte local history file.
+`launch.json` saves the ranked region, type, subnet, and zone list before the first launch step.
+Resumed launches keep that list and their offset-based ClientToken values.
+Older files with only `variant` retain configured order.
+Refusal handling, regional cost bookings, and the $35 daily and $400 monthly limits remain unchanged.
+
 The prices command prints regional Spot prices without resource identities.
+It reads gate regions, then `spot_candidate_regions`, without duplicates.
+It preserves the configured order within each list.
+`spot_candidate_regions=us-east-2 us-west-2` also supplies the regions for Spot work and later price steering.
+`gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
-`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each configured region.
+`deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
+The price stage of `up` shows this quota for each gate region.
+Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
 A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
-`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 128 vCPUs.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+All three new keys are in `cloud_gate.conf`.
+Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
 It prints the region, desired value, and request status without request, case, or account identifiers.
 A failed call prints only the AWS error code or Python error class and does not stop other regions.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

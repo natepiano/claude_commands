@@ -21,7 +21,7 @@ class TargetedTestTests(MergeGateFixture):
         super().setUp()
         # The fixture's main branch has no merge gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf",
-                                 "landing_branches=fixture-landing\n")
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
