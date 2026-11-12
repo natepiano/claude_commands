@@ -626,9 +626,13 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
                      rule_urls: tuple[str, ...], inherited: dict[str, str]) -> bool:
     """Write the new decision once, with the next free P number."""
     text = template.expanduser().read_text(encoding="utf-8")
+    try:
+        proposer = staff_reference(proposed_by, "showrunner")
+    except Refusal:
+        proposer = staff_reference(proposed_by, "unit")
     values = {
         "AREA": STYLE_AREA, "PROJECT": project, "SHORT": short,
-        "PROPOSED_BY": staff_reference(proposed_by, "showrunner").id,
+        "PROPOSED_BY": proposer.id,
         "DATE": today.isoformat(), "CATEGORY": "refactor", "DEPENDS_ON": "[]",
     }
     text = re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: values.get(match[1], ""), text)

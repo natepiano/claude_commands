@@ -1,6 +1,7 @@
 """Write the status line's counts row for one production: its `For you: …` line, as its footer counts it.
 
 Usage: counts_row.py <notifier instance dir>
+       counts_row.py --unit <staff id>
 
 statusline.sh runs this when a source file changes or a cached deadline passes.
 The cache is `<showrunner state>/counts/<staff id>`:
@@ -9,6 +10,7 @@ The cache is `<showrunner state>/counts/<staff id>`:
   line 2  the epoch second for a deferred question or a failed read retry, empty when neither applies;
   then    each file the counts were read from, one per line. A file that does not exist yet is
           named by its folder, which changes when the file appears.
+  last    `source=unit:<staff id>` for a unit cache.
 
 The cache's time is when the reading began, so a file changed while it ran is newer than it.
 """
@@ -49,7 +51,8 @@ def retry_due(sources: list[Path]) -> str:
         return ""
 
 
-def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None) -> tuple[str, str]:
+def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None,
+        source: str = "") -> tuple[str, str]:
     """Return the counts and deadline, and append each source before reading it."""
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
@@ -69,12 +72,13 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
             raise RegistrationFailure("questions", f"{production.doc}: no showrunner staff row")
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
-        line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""
+        line = footer_counts.counts_line(footer_counts.read_counts(
+            production.doc, record=identities.record, source=source)) or ""
         return line, ""
     sources.append(showrunner_footer.outstanding_path(owner.id, identities=identities))
-    questions = showrunner_footer.open_questions([production], identities=identities)
+    questions = showrunner_footer.open_questions([production], identities=identities, source=source)
     line = footer_counts.counts_line(footer_counts.read_counts(
-        production.doc, questions=questions or 0, record=identities.record)) or ""
+        production.doc, questions=questions or 0, record=identities.record, source=source)) or ""
     due = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
     return line, "" if due is None else str(int(due.timestamp()))
 
@@ -93,6 +97,27 @@ def write(instance: Path) -> Path:
     return cache
 
 
+def write_unit(identity: str) -> Path:
+    """Write the unit's counts from its parent's production document."""
+    cache = cache_path(identity)
+    began = time.time_ns()
+    sources = [staff.record_path()]
+    try:
+        identities = QuestionStaff.read()
+        unit = identities.record.by_id(staff.StaffId(identity))
+        owner = identities.record.parent_of(unit) if unit is not None else None
+        if owner is None:
+            raise ValueError(f"{identity}: no parent production")
+        instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
+        sources.append(instance / "conf")
+        line, due = row(instance, sources, identities=identities, source=identity)
+    except (OSError, ValueError, staff.StaffRefused, showrunner_footer.FooterError):
+        line = ""
+        due = retry_due(sources)
+    write_cache(cache, line, due, sources, began, details=f"source=unit:{identity}")
+    return cache
+
+
 def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
     """Replace the cache with the answer, deadline, source paths, and optional result details."""
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +129,9 @@ def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: in
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "--unit":
+        _ = write_unit(argv[1])
+        return 0
     if len(argv) != 1:
         print(__doc__, file=sys.stderr)
         return 2
