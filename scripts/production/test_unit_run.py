@@ -111,6 +111,7 @@ class UnitRunTests(unittest.TestCase):
                     row = fixture_member("unit", name="history-" + run_id, parent=owner.id,
                                          runtime_id=fixture_runtime_id("history:" + run_id),
                                          worktree=staff.PresentWorktree(remote.local_machine(), normalized))
+                event["owner_staff_id"] = row.id
                 event["main_agent"] = {"family": "claude", "session_id": row.current_session}
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return path

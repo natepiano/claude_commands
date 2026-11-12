@@ -27,10 +27,10 @@ def run_workers(run: Path, record: staff.StaffSnapshot) -> set[staff.StaffId]:
     fields = cast(dict[str, object], passes) if isinstance(passes, dict) else {}
     entries = [fields] if "instance_id" in fields else [cast(dict[str, object], item)
         for item in fields.values() if isinstance(item, dict)]
-    names = {entry.get("worker_name") or entry.get("team_slot") for entry in entries}
-    if names:
-        parent = worker_admission.parent(record, run=run)
-        members.update(row.id for row in record.find(kind="worker", parent=parent.id) if row.name in names)
+    members.update(staff.StaffId(value) for entry in entries
+                   if isinstance(value := entry.get("worker_id"), str) and value)
+    parent = worker_admission.parent(record, run=run)
+    members.intersection_update(row.id for row in record.find(kind="worker", parent=parent.id))
     return members
 
 

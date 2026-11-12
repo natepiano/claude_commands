@@ -555,6 +555,20 @@ Pane labels do not identify a friend.
   Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
   Quota and notifier refresh paths keep their own behavior.
 
+- **For you.** A unit director sees waiting questions, changes, proposals, and efficiency items from that unit.
+  The payload's current session selects the unit staff row.
+  The unit's parent supplies the production document.
+  Counts match the unit's fixed staff id against `asked_by`, `Producer`, `proposed_by`, and `[by: <staff id>]`.
+  Items without a recorded source count for no unit.
+  Unit counts omit unrouted changes.
+  Showrunner sessions retain the full production counts.
+  `counts_row.py --unit <staff id>` writes `<showrunner state>/counts/<unit staff id>`.
+  Each cache retains the counts line, deadline, and watched paths.
+  A unit cache ends with `source=unit:<staff id>`.
+  A source marker mismatch forces a refresh, even when the cache is newer than staff.
+  The status line refreshes only that unit's cache when a watched path changes or the deadline passes.
+  Failed reads use the existing retry deadline.
+
 - **Configured zones.** The status line reads `USER_ZONE`, else `zone=` from `USER_ZONE_CONF` or `config/user_zone.conf`.
   `send_later.py --at` reads the user's zone and sends UTC to systemd.
   `verify.sh` uses the user's zone for recorded results.
@@ -755,7 +769,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   The configured values are 110 and 140 characters.
   With no rows, it prints `no open proposals`.
 
-- **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] — <state>`, open while it ends `proposed` or `deferred`. Printing changes no file but the vault note below.
+- **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] [by: <staff id>] — <state>`, open while it ends `proposed` or `deferred`. `record()` writes the ` [by: <staff id>]` tag only when the caller is a unit director. Printing changes no file but the vault note below.
   Recording prints and flushes new entries before it publishes the complete ledger atomically. An interrupted print leaves them available on retry. A partial final candidate from an interrupted append is replaced on rerun; proposed, deferred, accepted, declined, done and relayed states count as recorded, including the dated outcomes written by `/next`.
   - **Order.** `rank` reads the tag: `N min` or `N h` is user-visible time, `N%` is a share of tokens, and a line with no tag or other words is unmeasured. Time comes before tokens, each largest first; unmeasured lines come last, in the ledger's order. `/next efficiency` takes its candidates and their order from this table.
   - **Pick.** Row one reads `recommended` only when its gain is measured; with nothing measured no row is marked.

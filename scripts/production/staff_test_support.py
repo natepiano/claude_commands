@@ -1036,10 +1036,21 @@ class StaffTestCase(unittest.TestCase):
         """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
+        record = staff.local_snapshot()
+        owner = record.by_current_session(director)
+        if owner is None:
+            owner = next(row for row in record.find(kind="unit") if row.name == unit)
+        participants: dict[str, object] = {}
+        for passed in passes:
+            reference = passed.get("worker_id")
+            member = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+                      next((row for row in record.find(kind="worker", parent=owner.id)
+                            if row.name == passed.get("worker_name")), None))
+            if member is not None and member.parent == staff.ReportsTo(owner.id):
+                participants[str(passed.get("team_slot") or member.id)] = {
+                    **{key: value for key, value in passed.items() if key != "worker_name"}, "worker_id": member.id}
         self.write_json(run / "progress_history_state.json", {
-            "production": production_name, "unit": unit,
-            "main_agent": {"family": "claude", "session_id": director},
-            "pass": {str(passed["worker_name"]): passed for passed in passes},
+            "owner_staff_id": owner.id, "pass": participants,
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:
