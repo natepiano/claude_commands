@@ -20,7 +20,7 @@ from scripts.agents import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
-from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
+from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
 
 from scripts.production import footer_counts
 from scripts.production import next_item
@@ -28,9 +28,8 @@ from scripts.production import tidy_wrapped
 from scripts.hooks import showrunner_footer
 
 
-
 class RegistrationTests(RegistrationFixture):
-    def test_unreadable_timer_reports_and_continues_prompt_adoption(self) -> None:
+    def test_unreadable_timer_reports_and_keeps_generated_prompts_unchanged(self) -> None:
         timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
@@ -46,8 +45,8 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("timer configuration unreadable", result.stderr)
         self.assertIn("decode", result.stderr)
-        self.assertIn(f"rewrote {prompt} from produce.md", result.stdout)
-        self.assertIn(str(self.state / "showrunner" / self.owner_id / "session"), prompt.read_text())
+        self.assertEqual(prompt.read_text(), "old prompt\n")
+        self.assertNotIn("rewrote", result.stdout)
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
@@ -58,7 +57,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
-        self.assertIn("next_due", first.stdout)
+        self.assertIn("automatic reports are off", first.stdout)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
 
@@ -78,6 +77,53 @@ class RegistrationTests(RegistrationFixture):
                          [f"session:{self.fixture_staff_id()}"] * 3)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
+
+    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
+        first = self.run_command("register")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        _ = self.git("commit", "-qam", "reports on demand")
+        before = len(self.notifier_calls())
+        resumed = self.run_command("register")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} registered; automatic reports are off", resumed.stdout)
+        calls = self.notifier_calls()[before:]
+        self.assertIn(["new", f"showrunner-{self.fixture_staff_id()}"], [call[:2] for call in calls])
+        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertNotIn(["remove", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+        again = self.run_command("register")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        # A re-register retargets the timer and stops it again, so it stays stopped.
+        self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
+                         ["new", "stop", "status"])
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+
+    def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
+        _ = self.git("commit", "-qam", "no Updates line")
+        first = self.run_command("register")
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} registered; automatic reports are off", first.stdout)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+        self.assertNotIn("footer", first.stdout)
+
+    def test_a_legacy_interval_keeps_the_registration_stopped(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("every 15 minutes", "every 20 minutes"), encoding="utf-8")
+        _ = self.git("commit", "-qam", "every 20 minutes")
+
+        result = self.run_command("register")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
+        self.assertEqual(updates[updates.index("--every") + 1], str(registration.DEFAULT_MINUTES))
+        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], self.notifier_calls())
+        self.assertIn("automatic reports are off", result.stdout)
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -111,6 +157,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("/agents rename example other", result.stdout)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
+
 
 @final
 class QuestionIdentityTests(RegistrationFixture):
@@ -204,18 +251,18 @@ class QuestionIdentityTests(RegistrationFixture):
         self.migrate()
         with self.forbid_legacy_question_access():
             counts = footer_counts.read_counts(self.doc,
-                                                questions=len(dailies_render.read_outstanding(self.outstanding())))
+                                                questions=len(registration.read_open_items(self.outstanding())))
             sources = footer_counts.sources(self.doc)
         self.assertEqual(counts.questions, 1)
         self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
 
+
     def test_showrunner_footer_reads_migrated_records_without_the_legacy_list(self) -> None:
         self.file_question()
         self.migrate()
         production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
                                                   showrunners.owner_for("example"))
         with self.forbid_legacy_question_access():
             self.assertEqual(showrunner_footer.open_questions([production]), 1)
@@ -397,13 +444,12 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
                                                   showrunners.owner_for("example"))
             errors = io.StringIO()
             with redirect_stderr(errors):
                 self.assertEqual(showrunner_footer.open_questions([production]), 0)
             self.assertIn("questions: unavailable", errors.getvalue())
-            self.assertEqual(dailies_render.read_outstanding(self.outstanding()), [])
+            self.assertEqual(registration.read_open_items(self.outstanding()), [])
             self.assertIn(self.doc, footer_counts.sources(self.doc))
         refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
         self.assertEqual(refused.returncode, 2)

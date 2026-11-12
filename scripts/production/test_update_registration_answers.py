@@ -485,5 +485,6 @@ class RegistrationTests(RegistrationFixture):
         with self.assertRaisesRegex(registration.InputError, "question required"):
             _ = registration.read_open_items(self.outstanding())
 
+
 if __name__ == "__main__":
     _ = unittest.main()

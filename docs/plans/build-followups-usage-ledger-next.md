@@ -9,8 +9,4 @@
   - Completion condition: a per-turn metric on the full store prints well inside the 10 s limit
   - Revealed by: Phase 7
 
-- [ ] **The dailies show the day's usage by role and model**
-  - Target: `scripts/production/dailies_render.py` (the showrunner's area); waits until the user asks for a usage section, because the dailies are kept minimal by the user's rules
-  - Why needed: the user asked to track model stats across showrunners, reviewers, unit directors and workers; the dailies show the live account meters and no token figure
-  - Completion condition: the dailies print a short usage-by-role table read from the store, marked stale when a source was not read in full
-  - Revealed by: Phase 7
+2026-11-11: Dailies retirement removed the proposed dailies usage section.

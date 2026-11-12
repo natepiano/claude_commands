@@ -262,8 +262,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
 
 
 def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
-    review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", os.environ.get(
-        "DAILIES_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py")))))
+    review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py"))))
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "review_watch.lock"
     with lock_path.open("a+") as lock:

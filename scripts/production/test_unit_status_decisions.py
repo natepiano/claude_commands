@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.unit_status_test_support import UnitStatusFixture, setUpModule as setUpModule
+from scripts.production.unit_status import StillWaiting
 
 
 class UnitStatusTests(UnitStatusFixture):
@@ -33,6 +34,8 @@ class UnitStatusTests(UnitStatusFixture):
         outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({"hook": gate}, {"hook": paused}))
         self.assertIn("=== DECISION for you from hook ===", outputs[0])
         self.assertIn("STILL WAITING on you, hook:  — gate: add-on review, item 1 of 2", outputs[1])
+        waiting = self.parse_status(outputs[1])[0].flags
+        self.assertEqual(waiting, (StillWaiting("— gate: add-on review, item 1 of 2"),))
 
     def test_holding_after_gate_prints_no_user_wait(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"
