@@ -511,16 +511,32 @@ Cleanup uses one deadline from `termination_timeout_s` for all boxes.
 Each API call uses the time that remains before this deadline.
 The service stop timeout adds twice `api_timeout_s` to this deadline duration.
 Cleanup records confirmed termination in the cost ledger.
-A stale `GateAbsent` update cannot replace confirmed termination or remove its cost.
+Confirmed termination is final for every later ledger outcome.
+Later running, absent, or terminated updates cannot change its end time or cost.
+A worker rejects an ended booking before checking for a launch file.
+The ledger rejects reservations for closed attempt IDs.
+A retry uses a new attempt ID.
 Cleanup resolves reservations without saved launch arguments as `GateAbsent`.
 The module and coordinator also call this cleanup from `finally` blocks.
 Repeated cleanup does not change resolved reservations.
 AWS failures leave reservations unresolved for later recovery.
 Before reservation, the coordinator cleans expired earlier trials with unresolved reservations.
-The sweep preserves live trials and trial folders.
+The sweep checks each attempt's owner and passes only due attempts to cleanup.
+The sweep preserves boxes with live owners, even when another owner in the same expired trial has ended.
+The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
-Merge gate units keep their existing stop behavior.
+Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+The worker installs no signal handler.
+The ledger records each worker's PID, process start identity, and attempt folder.
+Reconciliation preserves live workers and workers whose identity cannot be read.
+Reconciliation terminates expired attempts and attempts whose recorded worker has ended.
+Each worker reconciles before reusing a saved launch.
+A hard kill without a later start can leave the booking open.
+The ledger continues to estimate its cost for the spending cap.
+The AWS expiry function ends the box.
+The next gate or trial start closes the booking after confirmation.
 Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
 The sweep reads no current lifetime setting.
 A lower lifetime setting leaves existing trials' fixed expiries unchanged.
