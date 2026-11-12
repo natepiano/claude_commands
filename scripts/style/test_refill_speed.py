@@ -81,6 +81,26 @@ class RefillSpeedTests(LedgerTestCase):
             self.assertEqual(reads.call_count, 1)
         self.assertTrue(any(isinstance(site, style_ledger.UnchangedSite) for site in actual.values()))
         self.assertTrue(any(isinstance(site, style_ledger.NeedsJudgment) for site in actual.values()))
+        with self.subTest("two judged commits"):
+            _, (later_id,) = self.hold_parent(ledger, ((2, "fn work() {"),), before="work", after="task")
+            first_anchor = ledger.finding_anchor(findings[0])
+            later_anchor = ledger.finding_anchor(ledger.named_held((later_id,))[0])
+            assert isinstance(first_anchor, style_ledger.FindingAnchor)
+            assert isinstance(later_anchor, style_ledger.FindingAnchor)
+            self.assertNotEqual(first_anchor.commit, later_anchor.commit)
+            tip = self.commit_tip(ledger, {PARENT_FILE: "// latest header\n" + (self.repo / PARENT_FILE).read_text()})
+            identities = (findings[0].finding_id, later_id, findings[1].finding_id)
+            expected_outcomes: list[style_ledger.DeclarationOutcome] = []
+            for identity in identities:
+                with style_ledger.Ledger(self.repo, ledger.database) as single:
+                    expected_outcomes.extend(single.declaration_reading((identity,), lambda _: True).outcomes)
+            reading = ledger.declaration_reading(identities, lambda _: True)
+            self.assertEqual(reading, style_ledger.DeclarationReading(tip, tuple(expected_outcomes)))
+            parsed = cast(dict[tuple[str, str], declarations.DeclaredFile], getattr(ledger, "_declared_files"))
+            self.assertFalse(any(commit == first_anchor.commit for commit, _ in parsed))
+            self.assertFalse(any(commit == later_anchor.commit for commit, _ in parsed))
+            self.assertTrue(any(commit == tip for commit, _ in parsed))
+            self.assertEqual(ledger.declaration_reading(identities, lambda _: True), reading)
 
     def test_built_cache_observes_local_and_external_writes(self) -> None:
         ledger, findings = self.sites()
