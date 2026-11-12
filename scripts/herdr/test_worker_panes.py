@@ -138,7 +138,7 @@ class PaneWorld(herdr.Herdr):
             "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
             "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
             "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
-            "AGENTS_CALLER_FAMILY": "", "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
+            "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
             "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
         })))
         _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))

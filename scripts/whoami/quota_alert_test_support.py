@@ -46,15 +46,13 @@ Notes = list[quota_alert.AgentNote]
 
 REGISTRY = registry_text({
     'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
-                              'design_roles': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+                              'design_roles': 'codex   # a trailing comment'}),
     'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
     'direct.claude': ExactRows({'impl': 'opus:high'}),
     'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
     'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
     'design_roles.codex': ExactRows({'reviewer': 'gpt-6-sol:xhigh'}),
     'design_roles.claude': ExactRows({'reviewer': 'opus:max'}),
-    'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
-    'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
     'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
     'claude.agents': ExactRows({'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}),
 })
@@ -536,7 +534,7 @@ class CodexRerunFixture(CodexZeroEpisodeFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
-            "direct": "codex", "design_roles": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+            "direct": "codex", "design_roles": "codex", "cli": "claude"}))
         _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
         _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
         _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
