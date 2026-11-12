@@ -22,6 +22,7 @@ from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 
 def setUpModule() -> None:
@@ -119,7 +120,9 @@ sys.meta_path.insert(0, NoRepositoryModules())
                     merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
-                    subprocess, "run", side_effect=failure):
+                    merge_gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),
+                                                            DEVNULL=subprocess.DEVNULL,
+                                                            SubprocessError=subprocess.SubprocessError)):
                 with self.assertRaisesRegex(GateRefused, f"main promoted to {self.base}; Mac fast-forward failed"):
                     merge_gate.promote(args)
             self.assertIn(mock.call(self.main, "push", "origin", "main"), checked.call_args_list)
@@ -176,6 +179,18 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(len(ssh_calls), 1)
         self.assertIn("--ff-only", " ".join(ssh_calls[0]["args"]))
         self.assertIn("ff_rc=", " ".join(ssh_calls[0]["args"]))
+
+        with self.subTest(holder="another process"):
+            _ = self.git(self.unit, "fetch", "origin", "integration")
+            _ = self.git(self.unit, "merge", "--ff-only", "origin/integration")
+            self.write(self.unit / "second.txt", "another promotion\n")
+            self.checkpoint = self.commit(self.unit, "another promotion")
+            _ = self.publish_for_promotion()
+            command = [sys.executable, str(Path(merge_gate.__file__)), "--repo", str(self.checkout),
+                       "--merge-branch", "integration", "--promote-only", "--main-repo", str(self.main),
+                       "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
+            _ = publish_after_contender(self, self.main, self.origin, command, self.environment, cwd=self.root)
+            self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promote_only_promotes_the_pushed_merge_branch_without_a_gate(self) -> None:
         self.assertEqual(self.run_gate("--promote").returncode, 0)

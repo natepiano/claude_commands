@@ -23,6 +23,8 @@ from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.agents import detached_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import staff
 
 from scripts.build_hold.override_guard import require_checkout
 
@@ -120,6 +122,9 @@ class HoldEnforcerTests(unittest.TestCase):
         ))
 
     def test_drain_stops_waiting_run_waits_for_working_run_and_releases_owner_once(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        _ = (self.holders / "holder").rename(self.holders / member.id)
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="waiting-owner")
         _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
         _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
@@ -180,8 +185,8 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/private/socket")), \
              mock.patch.object(build_hold, "send_release", side_effect=notify):
-            _ = build_hold.release_cycle(self.holders, "holder")
-            _ = build_hold.release_cycle(self.holders, "holder")
+            _ = build_hold.release_cycle(self.holders, member.id)
+            _ = build_hold.release_cycle(self.holders, member.id)
         self.assertEqual(notices, ["waiting-owner"])
 
     def test_drain_classifies_gate_entry_points_and_work_evidence(self) -> None:
@@ -468,6 +473,13 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(10, "worker", session="holder", environment={"BUILDLOG_CALL_ID": "holder-call"})
         self.write_step("holder-call", step_record.StepState.ON_NATEDEV, 90)
         decision, = self.decisions()
+        self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
+        self.assertEqual(decision.owner, OwningSession("holder"))
+        member = staff.StaffRow(staff.StaffId("fixed-holder"), "producer", "renamed-holder", staff.StaffRoot(),
+                                current_session=staff.StaffId("holder"))
+        _ = (self.holders / "holder").rename(self.holders / member.id)
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
         self.assertEqual(decision.owner, OwningSession("holder"))
 

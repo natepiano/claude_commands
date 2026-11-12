@@ -253,7 +253,9 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id))
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree, staff.ParkedBranch(branch)),
+                                   expected=row.worktree)
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.

@@ -14,7 +14,6 @@ import itertools
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import time
@@ -28,12 +27,11 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Literal, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
@@ -41,7 +39,9 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
 from scripts.agents import remote  # noqa: E402
-from scripts.usage import agents_log  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.usage import agents_log
 
 
 SCHEMA_VERSION = 1
@@ -255,6 +255,8 @@ def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
 
 def _contract_revision() -> ContractRevision:
     """Read the deployed main checkout afresh at each phase boundary."""
+    from scripts.direct.tag_inventory import contract_table_paths
+
     root = Path.home() / ".claude"
     head: ContractMainHead | ContractHeadUnavailable
     try:
@@ -1064,15 +1066,14 @@ class ActiveDispatchUnavailable:
 def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoActiveDispatch | ActiveDispatchUnavailable:
     """Read the active pass through the worker's fixed staff id."""
     try:
-        row = staff.snapshot().by_id(worker_id)
+        membership = staff.snapshot()
+        row = membership.by_id(worker_id)
         if row is None:
             return ActiveDispatchUnavailable(f"worker {worker_id}: staff row is unavailable")
         state = worker_lifecycle.read_json_object(_state_path(run))
-        roster = session_staff.read_worker_roster(run / "mesh_roster.json")
-        names = {row.name, *(name for name, entry in roster.items()
-                           if (_object_dict(entry) or {}).get("staff_id") == worker_id)}
         matches = [item for slot, item in _open_passes(state).items()
-                   if item.get("worker_name", slot) in names]
+                   if (item.get("worker_id") == row.id if item.get("worker_id")
+                       else item.get("worker_name", slot) == row.name)]
         if not matches:
             return NoActiveDispatch()
         if len(matches) != 1:
@@ -1136,6 +1137,8 @@ _dispatch_reads: ContextVar[DispatchReads | ReadDispatches] = ContextVar("dispat
 @contextmanager
 def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generator[None]:
     """Share history reads within one command, without retaining them afterward."""
+    from scripts.usage import agents_log
+
     states: dict[Path, dict[str, object]] = {}
     for run in runs:
         path = run / unit_runs.STATE_FILE
@@ -1153,6 +1156,9 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
 
 def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
     """Read the newest open or finished dispatch across the staff parent's runs."""
+    from scripts.direct import phase_reservation
+    from scripts.usage import agents_log
+
     reads = _dispatch_reads.get()
     if isinstance(reads, ReadDispatches):
         try:
@@ -1631,6 +1637,8 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 
 
 def _start_phase(args: argparse.Namespace) -> None:
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     record = staff.initial_snapshot()
     state = _read_state(session_dir, record=record)
@@ -2275,6 +2283,8 @@ def _arm_review(args: argparse.Namespace) -> None:
     only earns the reviewer a row in the stage table while the writer it
     overlaps is still going.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _arg_string(args, "phase_id")
@@ -2503,6 +2513,8 @@ def _round_metric(value: float) -> float:
 
 
 def _sample_metrics(samples: list[CalibrationSample], current_hold: int) -> dict[str, object]:
+    import statistics
+
     if not samples:
         return {
             "sample_count": 0,
@@ -4237,24 +4249,23 @@ def _current_worker_cells(
 
 
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
-    """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
+    """Show accepted settings for the current staff workers and keep historical windows intact."""
     try:
-        roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
-    except worker_lifecycle.WorkerStateUnreadable:
+        membership = staff.local_snapshot()
+        workers = {row.id for row in session_staff.run_workers(_read_state(session_dir, record=membership), membership)}
+    except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
         return [{**window, "worker": "unavailable"} for window in windows]
-    slots: dict[str, str] = {}
+    models: dict[str, str] = {}
     for path in session_dir.glob("impl_worker_*.json"):
         try:
-            identity = _json_object(path.read_text(encoding="utf-8")) or {}
-        except OSError:
+            identity = worker_lifecycle.read_worker_state(path)
+        except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
             continue
-        slots[_string(identity.get("name"))] = _string(identity.get("slot"))
-    models: dict[str, str] = {}
-    for name, value in roster.items():
-        record = _object_dict(value) or {}
-        settings = worker_lifecycle.recorded_turn_settings(record)
-        if settings.model:
-            slot = slots.get(name) or _string(record.get("slot")) or name
+        if identity.get("staff_id") not in workers:
+            continue
+        settings = worker_lifecycle.recorded_turn_settings(identity)
+        slot = _string(identity.get("slot"))
+        if settings.model and slot:
             models[slot] = _agent_display(settings.model, settings.effort)
     result: list[StageWindow] = []
     for window in windows:
@@ -5705,12 +5716,12 @@ def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[
             "phase_instance_id": _string(phase.get("instance_id"))}
 
 
-def resolve_worker_pass(session_dir: Path, state: dict[str, object],
-                        thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
-    """Use the thread's full roster name, never a server's inherited slot."""
+def resolve_worker_pass(state: dict[str, object], thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
+    """Resolve the current staff worker and its pass in the selected run."""
     phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
     candidates: list[dict[str, object]] = []
-    for record in _open_passes(state).values():
+    passes = list(_open_passes(state).values())
+    for record in passes:
         candidates.append({"run_id": _string(state.get("run_id")),
                            "phase_instance_id": _pass_phase_instance(record),
                            "phase_id": _string((_object_dict(record.get("phase")) or {}).get("id")),
@@ -5720,17 +5731,16 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
     try:
-        roster = session_staff.read_worker_roster(session_dir / "mesh_roster.json")
+        membership = staff.local_snapshot()
+        member = next((row for row in session_staff.run_workers(state, membership)
+                       if thread_id and row.current_session == thread_id), None)
     except (OSError, ValueError) as error:
-        return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
-    membership = staff.local_snapshot()
-    names = [name for name, value in roster.items()
-             if thread_id and session_staff.worker_session(_object_dict(value) or {}, membership) == thread_id]
-    if len(names) != 1:
-        return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
-    matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
+        return UnresolvedWaitAttribution(f"worker staff unavailable: {error}", tuple(candidates))
+    if member is None:
+        return UnresolvedWaitAttribution("worker thread has no staff worker in this run", tuple(candidates))
+    matching = [candidate for record, candidate in zip(passes, candidates) if record.get("worker_id") == member.id]
     if len(matching) != 1:
-        return UnresolvedWaitAttribution(f"worker {names[0]} has {len(matching)} active pass matches",
+        return UnresolvedWaitAttribution(f"worker {member.name} has {len(matching)} active pass matches",
                                          tuple(matching or candidates))
     candidate = matching[0]
     no_phase: dict[str, object] = {}
@@ -5738,7 +5748,7 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
                   and phase.get("status") == "active"), no_phase)
     if not phase or not candidate["pass_instance_id"]:
         return UnresolvedWaitAttribution("worker pass has no active phase or pass id", (candidate,))
-    return ResolvedWorkerPass(phase, _string(candidate["pass_instance_id"]), names[0],
+    return ResolvedWorkerPass(phase, _string(candidate["pass_instance_id"]), _string(candidate["worker_name"]),
                               _string(candidate["team_slot"]))
 
 
@@ -5750,7 +5760,7 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
     instance_id = _optional_arg(args, "phase_instance_id")
     phase_id = _optional_arg(args, "phase_id")
     if hasattr(args, "worker_thread_id"):
-        return resolve_worker_pass(_session_dir(args), state, _optional_arg(args, "worker_thread_id"))
+        return resolve_worker_pass(state, _optional_arg(args, "worker_thread_id"))
     if hasattr(args, "director") and cast(bool, args.director):
         phases = [phase for phase in [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
                   if phase.get("status") == "active"]
@@ -5793,10 +5803,22 @@ def _start_wait(args: argparse.Namespace) -> None:
     if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
-    print(_record_wait(state, args))
+    result = _record_wait(state, args)
+    if isinstance(result, StartedWait):
+        print(result.wait_id)
 
 
-def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+@dataclass(frozen=True)
+class StartedWait:
+    wait_id: str
+
+
+@dataclass(frozen=True)
+class WaitNotRecorded:
+    wait_id: str
+
+
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedWait | WaitNotRecorded:
     holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
@@ -5843,7 +5865,7 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                      requested_phase_id=_optional_arg(args, "phase_id"),
                      requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
     _append_event(state, event)
-    return wait_id
+    return WaitNotRecorded(wait_id) if missing_reason else StartedWait(wait_id)
 
 
 def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
@@ -6040,13 +6062,12 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
         membership = staff.local_snapshot()
         for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
             try:
-                roster = session_staff.read_worker_roster(root / run_id / "mesh_roster.json")
-                thread = session_staff.worker_session(_object_dict(roster.get(name)) or {}, membership)
-                if thread:
-                    threads.add(thread)
+                state = worker_lifecycle.read_json_object(root / run_id / unit_runs.STATE_FILE)
+                threads.update(row.current_session for row in session_staff.run_workers(state, membership)
+                               if row.name == name and row.current_session)
             except (OSError, ValueError):
                 continue
-        return NamedSupplier("codex:" + next(iter(threads))) if len(threads) == 1 else NoNamedSupplier("worker alias has no unique roster thread")
+        return NamedSupplier("codex:" + next(iter(threads))) if len(threads) == 1 else NoNamedSupplier("worker alias has no unique staff thread")
     from scripts.message import sessions
 
     records = sessions.live_sessions()
@@ -6268,8 +6289,8 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         args = argparse.Namespace(session_dir=str(session_dir), missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields,
                                   declaration_id=declaration)
-        wait_id = _record_wait(state, args)
-        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": wait_id}) + "\n")
+        result = _record_wait(state, args)
+        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": result.wait_id}) + "\n")
     return True
 
 
@@ -6539,6 +6560,8 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     workers. When the current phase closes, the most recently started older open
     phase becomes current again.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")

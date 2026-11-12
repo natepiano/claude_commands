@@ -1563,9 +1563,10 @@ elif kind == "hold":
     holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
                                         build_hold.owning_session(), directory)
     if isinstance(holder, build_hold.Holder):
+        session = build_hold.holder_session(holder.key)
         try:
-            UUID(holder.key)
-            owner = holder.key
+            UUID(session)
+            owner = session
         except ValueError:
             owner_flag, owner = "--holder-unit", text(holder.name)
 elif kind in ("mac", "target"):
@@ -1645,7 +1646,8 @@ phase_wait_start() {
     if [[ -n "$holder" ]]; then
         while IFS= read -r flag; do holder_args+=("$flag"); done <<< "$holder"
     fi
-    if [[ -s "$file" ]]; then
+    if [[ -f "$file" ]]; then
+        [[ -s "$file" ]] || return 0
         previous=$(< "$holder_file")
         if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
         read -r id < "$file"
@@ -1665,9 +1667,14 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})" && [[ -n "$id" ]]; then
-        printf '%s' "$holder" > "$holder_file"
-        printf '%s\n' "$id" > "$file"
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
+        if [[ -n "$id" ]]; then
+            printf '%s' "$holder" > "$holder_file"
+            printf '%s\n' "$id" > "$file"
+        else
+            : > "$file"
+            printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+        fi
     else
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
@@ -1675,7 +1682,10 @@ phase_wait_start() {
 phase_wait_finish() {
     if [[ "$1" == token ]]; then PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""; fi
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
-    [[ -s "$file" ]] || return 0
+    if [[ ! -s "$file" ]]; then
+        rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
+        return 0
+    fi
     read -r id < "$file"
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
@@ -2780,7 +2790,7 @@ check_mac_only_result() {
 
 route_test() {
     local name eligibility reason settings platform admission remote_candidates=0 reservation_status
-    local announced_reason="" retry=0 retry_ready
+    local announced_reason="" retry=0 retry_ready reserve_hook
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -2836,7 +2846,8 @@ route_test() {
             step_can_retry || continue
             if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
-            if [[ "$(ssh_reserve_hook "$name" "$settings" "$retry")" == false ]]; then continue; fi
+            reserve_hook=$(ssh_reserve_hook "$name" "$settings" "$retry")
+            if [[ "$reserve_hook" == false ]]; then continue; fi
             remote_candidates=1
             if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" && "$platform" == macos ]]; then
                 retry_ready=0
@@ -2853,7 +2864,7 @@ route_test() {
             fi
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
-            eval "$(ssh_reserve_hook "$name" "$settings" "$retry")" || reservation_status=$?
+            eval "$reserve_hook" || reservation_status=$?
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 ]] \
                 && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then

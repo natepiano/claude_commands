@@ -26,7 +26,7 @@ import sys
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -62,11 +62,28 @@ class DesignUnbound:
 
 
 @dataclass(frozen=True)
+class IndependentCheckout:
+    """The checkout keeps its own path."""
+
+
+@dataclass(frozen=True)
+class UnitCheckout:
+    """The unit's staff row supplies the checkout path."""
+
+    owner: staff.StaffId
+
+
+Checkout = IndependentCheckout | UnitCheckout
+INDEPENDENT_CHECKOUT = IndependentCheckout()
+
+
+@dataclass(frozen=True)
 class DesignBoundToPhase:
     run_directory: str
     phase: str
     repository: str
     output_paths: tuple[str, ...]
+    checkout: Checkout = field(default=INDEPENDENT_CHECKOUT, kw_only=True)
 
 
 Binding = DesignUnbound | DesignBoundToPhase
@@ -173,6 +190,50 @@ class HeldDesign:
     created_at_utc: str
     binding: Binding
     roles: tuple[RoleInstance, ...]
+    checkout: Checkout = field(default=INDEPENDENT_CHECKOUT, kw_only=True)
+
+
+def instance_name(instance: RoleInstance, membership: staff.StaffSnapshot | None = None) -> str:
+    if isinstance(instance.lifecycle, HeldWorker) and instance.lifecycle.staff_id:
+        membership = staff.snapshot() if membership is None else membership
+        member = membership.by_id(instance.lifecycle.staff_id)
+        return member.name if member is not None else ''
+    return instance.name
+
+
+def _checkout_path(repository: str, checkout: Checkout, membership: staff.StaffSnapshot | None = None) -> str:
+    if isinstance(checkout, IndependentCheckout):
+        return repository
+    membership = staff.snapshot() if membership is None else membership
+    owner = membership.by_id(checkout.owner)
+    if owner is None:
+        raise RoleRefused('checkout owner is absent: ' + checkout.owner)
+    worktree = owner.worktree
+    return str(cast(staff.PresentWorktree | staff.RemovedWorktree, worktree).path)
+
+
+def design_repository(design: HeldDesign, membership: staff.StaffSnapshot | None = None) -> str:
+    return _checkout_path(design.repository, design.checkout, membership)
+
+
+def binding_repository(binding: DesignBoundToPhase, membership: staff.StaffSnapshot | None = None) -> str:
+    return _checkout_path(binding.repository, binding.checkout, membership)
+
+
+def _checkout_for(repository: str) -> Checkout:
+    membership = staff.snapshot()
+    owner = membership.by_current_session(staff.runtime_id())
+    if (owner is not None and owner.kind == 'unit'
+            and isinstance(owner.worktree, (staff.PresentWorktree, staff.RemovedWorktree))
+            and Path(repository).resolve() == owner.worktree.path.resolve()):
+        return UnitCheckout(owner.id)
+    return INDEPENDENT_CHECKOUT
+
+
+def _binding_checkout(binding: Binding, repository: str, checkout: Checkout) -> Binding:
+    if isinstance(binding, DesignBoundToPhase) and Path(binding.repository).resolve() == Path(repository).resolve():
+        return replace(binding, checkout=checkout)
+    return binding
 
 
 @dataclass(frozen=True)
@@ -256,7 +317,23 @@ def _lock(directory: Path) -> Generator[None]:
 
 
 def _tag(value: Binding | Lifecycle | ThreadAccessPolicy) -> dict[str, object]:
-    return {'kind': type(value).__name__, **cast(dict[str, object], asdict(value))}
+    fields = {'kind': type(value).__name__, **cast(dict[str, object], asdict(value))}
+    if isinstance(value, DesignBoundToPhase):
+        del fields['checkout']
+        del fields['repository']
+        fields.update(_checkout_fields(value.repository, value.checkout))
+    return fields
+
+
+def _checkout_fields(repository: str, checkout: Checkout) -> dict[str, object]:
+    return {'repository_owner': checkout.owner} if isinstance(checkout, UnitCheckout) else {'repository': repository}
+
+
+def _read_checkout(fields: dict[str, object]) -> tuple[str, Checkout]:
+    if 'repository_owner' in fields:
+        checkout = UnitCheckout(staff.StaffId(_text(fields, 'repository_owner')))
+        return _checkout_path('', checkout), checkout
+    return _text(fields, 'repository'), INDEPENDENT_CHECKOUT
 
 
 def _binding(fields: dict[str, object]) -> Binding:
@@ -267,8 +344,9 @@ def _binding(fields: dict[str, object]) -> Binding:
     paths = fields.get('output_paths')
     if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in cast(list[object], paths)):
         raise RoleRefused('binding needs exact output paths')
+    repository, checkout = _read_checkout(fields)
     return DesignBoundToPhase(_text(fields, 'run_directory'), _text(fields, 'phase'),
-                              _text(fields, 'repository'), tuple(cast(list[str], paths)))
+                              repository, tuple(cast(list[str], paths)), checkout=checkout)
 
 
 def _lifecycle(fields: dict[str, object]) -> Lifecycle:
@@ -327,21 +405,28 @@ def _decode_design(design_id: str, fields: dict[str, object], *,
         claim = entry.get('assignment_claim', '')
         if not isinstance(claim, str):
             raise RoleRefused('invalid assignment claim')
-        instances.append(RoleInstance(role, _text(entry, 'name'), _lifecycle(_object(entry.get('lifecycle'))), claim))
+        lifecycle = _lifecycle(_object(entry.get('lifecycle')))
+        name = '' if isinstance(lifecycle, HeldWorker) and lifecycle.staff_id else _text(entry, 'name')
+        instance = RoleInstance(role, name, lifecycle, claim)
+        instances.append(replace(instance, name=instance_name(instance)))
     if {instance.role for instance in instances} != {'designer', 'reviewer'}:
         raise RoleRefused('design must record both role slots')
-    for key in ('repository', 'document'):
-        if not Path(_text(fields, key)).is_absolute():
+    repository, checkout = _read_checkout(fields)
+    document = _text(fields, 'document')
+    if isinstance(checkout, UnitCheckout):
+        document = str((Path(repository) / document).resolve())
+    for key, value in (('repository', repository), ('document', document)):
+        if not Path(value).is_absolute():
             raise RoleRefused(key + ' must be absolute')
     binding_fields = _object(fields.get('binding'))
     empty_repository = (binding_fields.get('kind') == 'DesignBoundToPhase'
                         and binding_fields.get('repository') == '')
     if empty_repository:
-        binding_fields = {**binding_fields, 'repository': _text(fields, 'repository')}
+        binding_fields = {**binding_fields, **_checkout_fields(repository, checkout)}
     design = HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
-                      _text(fields, 'repository_id'), _text(fields, 'repository'), _text(fields, 'document'),
+                      _text(fields, 'repository_id'), repository, document,
                       _text(fields, 'area'), _text(fields, 'created_at_utc'),
-                      _binding(binding_fields), tuple(instances))
+                      _binding(binding_fields), tuple(instances), checkout=checkout)
     if empty_repository and not repair_empty_repository:
         raise DamagedDesignRecord(path, 'binding.repository')
     return design
@@ -351,6 +436,11 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
     if isinstance(design.binding, DesignBoundToPhase) and not design.binding.repository:
         raise RoleRefused('missing or invalid binding.repository')
     fields = asdict(design)
+    del fields['checkout']
+    del fields['repository']
+    fields.update(_checkout_fields(design.repository, design.checkout))
+    if isinstance(design.checkout, UnitCheckout):
+        fields['document'] = Path(design.document).relative_to(design.repository).as_posix()
     fields['schema'] = 1
     binding_fields = _tag(design.binding)
     if isinstance(design.binding, DesignBoundToPhase):
@@ -359,7 +449,10 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
     roles: list[dict[str, object]] = []
     for role in design.roles:
         lifecycle = _tag(role.lifecycle)
-        roles.append({'role': role.role, 'name': role.name, 'lifecycle': lifecycle, 'assignment_claim': role.assignment_claim})
+        entry: dict[str, object] = {'role': role.role, 'lifecycle': lifecycle, 'assignment_claim': role.assignment_claim}
+        if not isinstance(role.lifecycle, HeldWorker) or not role.lifecycle.staff_id:
+            entry['name'] = role.name
+        roles.append(entry)
     fields['roles'] = roles
     return fields
 
@@ -375,8 +468,13 @@ def _instance(design: HeldDesign, role: Role) -> RoleInstance:
 
 
 def _set_lifecycle(design: HeldDesign, role: Role, lifecycle: Lifecycle) -> HeldDesign:
-    return replace(design, roles=tuple(replace(instance, lifecycle=lifecycle) if instance.role == role else instance
-                                      for instance in design.roles))
+    instances: list[RoleInstance] = []
+    for instance in design.roles:
+        if instance.role == role:
+            instance = replace(instance, lifecycle=lifecycle)
+            instance = replace(instance, name=instance_name(instance))
+        instances.append(instance)
+    return replace(design, roles=tuple(instances))
 
 
 def authority_request(operation: str, payload: dict[str, object]) -> dict[str, object]:
@@ -512,7 +610,7 @@ def _validate_binding(binding: Binding, repository: str, role: Role) -> None:
         raise RoleRefused('a designer needs an authorized phase binding')
     if isinstance(binding, DesignBoundToPhase):
         _ = astra_work.phase_work(binding.run_directory, binding.phase)
-        if Path(binding.repository).resolve() != Path(repository).resolve() or not binding.output_paths:
+        if Path(binding_repository(binding)).resolve() != Path(repository).resolve() or not binding.output_paths:
             raise RoleRefused('binding must name its repository and exact output paths')
         for path in binding.output_paths:
             try:
@@ -563,7 +661,7 @@ def _prompt(design: HeldDesign, role: Role, text: str) -> tuple[Path, Path]:
         instructions = review_prompt(Path(design.document), '')
     work = (astra_work.phase_work(design.binding.run_directory, design.binding.phase)
             if isinstance(design.binding, DesignBoundToPhase) else astra_work.StandaloneWork())
-    header = astra_work.AstraWork('astra-' + role, _instance(design, role).name, design.document,
+    header = astra_work.AstraWork('astra-' + role, instance_name(_instance(design, role)), design.document,
                                  datetime.now(UTC).isoformat(), str(reply), work)
     pending = pending_messages(design.placement.design_id, role)
     message_text = '\n'.join(f'Pending message {message.id} from {message.source}: {message.text}' for message in pending)
@@ -609,12 +707,12 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
         run, phase = design_directory(design.placement.design_id), 'astra-review'
         state = worker_lifecycle.read_worker_state(run / 'progress_history_state.json')
         if not state:
-            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design.repository])
+            _recorder_command(['start-run', '--session-dir', str(run), '--working-dir', design_repository(design)])
         if phase not in recorder_state.open_phase_ids(state):
             _recorder_command(['start-phase', '--session-dir', str(run), '--phase-id', phase,
                                '--phase-title', 'Held Astra review'])
     instance = _instance(design, role)
-    name = instance.name
+    name = instance_name(instance)
     parent = worker_parent(design, role, staff.snapshot())
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
@@ -691,11 +789,14 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
             design = read_design(design_id)
         else:
             checkout = _text(placement, 'checkout')
+            checkout_source = _checkout_for(checkout)
+            binding = _binding_checkout(binding, checkout, checkout_source)
             document_path = str((Path(checkout) / _text(placement, 'document')).resolve())
             design = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')),
                                 repository, checkout, document_path, area, datetime.now(UTC).isoformat(),
                                 binding, tuple(RoleInstance(kind, f'astra-{design_id}-{kind}',
-                                                          RoleNotOpened()) for kind in ('designer', 'reviewer')))
+                                                          RoleNotOpened()) for kind in ('designer', 'reviewer')),
+                                checkout=checkout_source)
             _save(design)
         _check_host(design)
         instance = _instance(design, role)
@@ -707,8 +808,8 @@ def open_role(repository: str, document: str, role: Role, area: str, *,
             else:
                 print(f'creation outcome unknown; run recover for {design_id}/{role}; replacement refused', file=sys.stderr)
             return design
-        _validate_binding(design.binding, design.repository, role)
-    name = instance.name
+        _validate_binding(design.binding, design_repository(design), role)
+    name = instance_name(instance)
     with _lock(directory):
         current = read_design(design_id)
         if current != design:
@@ -769,7 +870,7 @@ def recover(instance_id: str) -> HeldDesign:
             membership = staff.snapshot()
             parent = worker_admission.parent(membership, staff_id=staff.runtime_id(),
                                               run=Path(design.binding.run_directory) if isinstance(design.binding, DesignBoundToPhase) else design_directory(design_id))
-            member = worker_admission.find_worker(membership, parent.id, instance.name)
+            member = worker_admission.find_worker(membership, parent.id, instance_name(instance, membership))
             if member is None:
                 raise RoleRefused('RoleNeedsRecovery: creation outcome unknown; no recorded worker; replacement refused; run end to clear the claim')
             lifecycle = RoleOpen(member.id)
@@ -800,7 +901,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> SubmittedRoleTurn:
         if (directory / 'transition.json').exists():
             raise RoleRefused('RoleNeedsRecovery: binding transition is incomplete')
         _idle(design)
-        _validate_binding(design.binding, design.repository, role)
+        _validate_binding(design.binding, design_repository(design), role)
         generation = design.placement.generation
     prompt, reply = _prompt(design, role, Path(prompt_file).read_text(encoding='utf-8'))
     with _lock(directory):
@@ -849,8 +950,15 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
         fields = _read(directory / 'design.json')
         design = _decode_design(design_id, fields, repair_empty_repository=not isinstance(binding, KeepBinding))
         damaged_binding = _object(fields.get('binding')).get('repository') == ''
-        target = replace(design, binding=design.binding if isinstance(binding, KeepBinding) else binding,
-                         repository=repository or design.repository, document=document or design.document)
+        current_repository = design_repository(design)
+        target_repository = repository or current_repository
+        same_checkout = Path(target_repository).resolve() == Path(current_repository).resolve()
+        checkout = design.checkout if same_checkout else _checkout_for(target_repository)
+        target_binding = (design.binding if isinstance(binding, KeepBinding) and same_checkout else
+                          _binding_checkout(design.binding if isinstance(binding, KeepBinding) else binding,
+                                            target_repository, checkout))
+        target = replace(design, binding=target_binding,
+                         repository=target_repository, checkout=checkout, document=document or design.document)
         # A target must pass the same rules as a saved record before lifecycle effects.
         _ = _decode_design(design_id, _design_fields(target))
         updated = replace(target, placement=replace(target.placement, generation=expected_generation + 1))
@@ -963,11 +1071,11 @@ def end(instance_id: str) -> HeldDesign:
     if unknown_creation:
         membership = staff.snapshot()
         parent = worker_admission.parent(membership, staff_id=staff.runtime_id(), run=run)
-        member = worker_admission.find_worker(membership, parent.id, instance.name)
+        member = worker_admission.find_worker(membership, parent.id, instance_name(instance, membership))
         if member is not None:
             instance = replace(instance, lifecycle=RoleOpen(member.id))
             design = _set_lifecycle(design, role, instance.lifecycle)
-    arguments = ['end', instance.name, '--session-dir', str(run)]
+    arguments = ['end', instance_name(instance), '--session-dir', str(run)]
     if not isinstance(instance.lifecycle, RoleNotOpened):
         arguments.extend(('--parent', str(worker_parent(design, role, staff.snapshot()).id)))
     result = _worker_command(arguments)
@@ -1009,7 +1117,7 @@ def list_roles() -> dict[str, object]:
                 if transition.exists() and not isinstance(lifecycle, (RoleNotOpened, RoleEnded)):
                     lifecycle = RoleNeedsRecovery(lifecycle.staff_id, 'incomplete ' + str(_read(transition).get('reason')))
                 entries.append({'design_id': design.placement.design_id, 'instance_id': design.placement.design_id + '/' + role.role,
-                                'role': role.role, 'name': role.name, 'lifecycle': _tag(lifecycle),
+                                'role': role.role, 'name': instance_name(role), 'lifecycle': _tag(lifecycle),
                                 'binding': _tag(design.binding), 'generation': design.placement.generation,
                                 'document': design.document, 'host': design.placement.host})
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -1028,7 +1136,7 @@ def render_roles(report: dict[str, object]) -> str:
 
 
 def _resolved_binding(binding: Binding, repository: str) -> Binding:
-    if isinstance(binding, DesignBoundToPhase) and not binding.repository:
+    if isinstance(binding, DesignBoundToPhase) and not binding_repository(binding):
         return replace(binding, repository=repository)
     return binding
 
@@ -1096,7 +1204,16 @@ class NotHeldDocument:
 
 def held_document(document: Path) -> HeldDesign | NotHeldDocument:
     target = str(document.resolve())
-    found = [design for design in _read_designs(lambda fields: fields.get('document') == target)
+
+    def relevant(fields: dict[str, object]) -> bool:
+        if 'repository_owner' not in fields:
+            return fields.get('document') == target
+        try:
+            return str((Path(_read_checkout(fields)[0]) / _text(fields, 'document')).resolve()) == target
+        except RoleRefused:
+            return False
+
+    found = [design for design in _read_designs(relevant)
              if design.document == target]
     if len(found) > 1:
         raise RoleRefused('document has more than one held identity; recovery required')
@@ -1136,8 +1253,8 @@ def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) ->
     if not isinstance(design.binding, DesignBoundToPhase):
         raise RoleRefused('designer is unbound')
     binding = design.binding
-    _validate_binding(binding, design.repository, 'designer')
-    root = Path(binding.repository).resolve()
+    _validate_binding(binding, design_repository(design), 'designer')
+    root = Path(binding_repository(binding)).resolve()
     allowed = {(root / name).resolve() for name in binding.output_paths}
     for path in paths:
         candidate = (cwd / path).resolve()
@@ -1165,22 +1282,26 @@ def move_checkout(old_checkout: str, new_checkout: str, *,
         except ValueError:
             return value
 
-    for design in _read_designs(lambda fields: fields.get('repository') == old_checkout, refuse_matching_damage=True):
-        if design.repository not in (old_checkout, new_checkout):
+    for design in _read_designs(lambda fields: (
+            _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) == old_checkout,
+            refuse_matching_damage=True):
+        if design_repository(design) not in (old_checkout, new_checkout):
             continue
         directory = design_directory(design.placement.design_id)
         transition = directory / 'transition.json'
         pending = _read(transition) if transition.exists() else {}
         request = {'old_checkout': old_checkout, 'new_checkout': new_checkout, 'reason': reason}
-        if design.repository == new_checkout:
+        if design_repository(design) == new_checkout and design.document == moved(design.document):
             if all(pending.get(key) == value for key, value in request.items()) and pending.get('target') == _design_fields(design):
                 _ = _finish_rebind(design)
             continue
         binding = design.binding
         if isinstance(binding, DesignBoundToPhase):
-            binding = replace(binding, repository=moved(binding.repository), run_directory=moved(binding.run_directory),
+            binding = replace(binding, repository=moved(binding_repository(binding)), run_directory=moved(binding.run_directory),
                               output_paths=tuple(moved(value) for value in binding.output_paths))
-        updated = replace(design, repository=new_checkout, document=moved(design.document), binding=binding,
+        checkout = _checkout_for(new_checkout)
+        updated = replace(design, repository=new_checkout, checkout=checkout, document=moved(design.document),
+                          binding=_binding_checkout(binding, new_checkout, checkout),
                           placement=replace(design.placement, generation=design.placement.generation + 1))
         fields = _design_fields(updated)
         with _lock(directory):
@@ -1205,13 +1326,14 @@ def checkout_failures(old_checkout: str) -> list[str]:
     """List live document paths that still use the old checkout."""
     failures: list[str] = []
     try:
-        for design in _read_designs(lambda fields: fields.get('repository') == old_checkout):
+        for design in _read_designs(lambda fields: (
+                _read_checkout(fields)[0] if 'repository_owner' in fields else fields.get('repository')) == old_checkout):
             path = design_directory(design.placement.design_id) / 'design.json'
             try:
                 if old_checkout:
-                    values = [design.repository, design.document]
+                    values = [design_repository(design), design.document]
                     if isinstance(design.binding, DesignBoundToPhase):
-                        values.extend((design.binding.repository, design.binding.run_directory,
+                        values.extend((binding_repository(design.binding), design.binding.run_directory,
                                        *design.binding.output_paths))
                     if any(value == old_checkout or value.startswith(old_checkout + '/') for value in values):
                         failures.append(str(path) + ': live binding still names old checkout')
@@ -1290,7 +1412,7 @@ def main(argv: list[str]) -> int:
                 if not argument('run_directory') or not argument('phase'):
                     raise RoleRefused('run-directory and phase are required together')
                 next_binding = DesignBoundToPhase(str(Path(argument('run_directory')).resolve()), argument('phase'),
-                                                 argument('checkout') or current.repository,
+                                                 argument('checkout') or design_repository(current),
                                                  tuple(cast(list[str], args['output_path'])) or
                                                  (current.binding.output_paths if isinstance(current.binding, DesignBoundToPhase) else ()))
             updated = rebind(argument('design_id'), expected_generation=cast(int, args['expected_generation']),

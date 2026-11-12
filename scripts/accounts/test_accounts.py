@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
-from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib import atomic_file, conf, file_lock, unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
@@ -297,6 +297,7 @@ class AccountsTests(unittest.TestCase):
         environment = {
             "AGENT_NOTES_DIR": str(notes),
             "STAFF_FILE": str(self.root / "staff.json"),
+            "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "PATH": os.defpath,
             # The wall times these tests pass are Pacific; the user's zone setting must not change them.
             "USER_ZONE": "America/Los_Angeles",
@@ -306,6 +307,7 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         counts_cache = session_counts_cache()
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
         _ = counts_cache.write_text(json.dumps({"machine": remote.other_machine(),
@@ -794,25 +796,44 @@ class AccountsTests(unittest.TestCase):
 
         self.enterContext(patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.root / "status-history"),
                                                 "UNIT_QUEUE_STATE_DIR": str(self.root / "unit-queues")}))
-        states = [("busy", "", "busy"), ("idle", "", "idle"), ("shell", "", "idle"),
-                  ("busy", "pause", "paused"), ("", "pause", "paused"),
-                  ("busy", "exit", "exited"), ("", "exit", "exited"),
-                  ("busy", "both", "exited"), ("", "both", "exited"), ("", "", "exited")]
+        from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+
+        states = [("busy", "", "busy", "none"), ("idle", "", "idle", "none"), ("shell", "", "idle", "none"),
+                  ("busy", "pause", "paused", "none"), ("", "pause", "paused", "none"),
+                  ("busy", "exit", "exited", "none"), ("", "exit", "exited", "none"),
+                  ("busy", "both", "exited", "none"), ("", "both", "exited", "none"), ("", "", "exited", "none"),
+                  ("idle", "", "busy", "live"), ("idle", "", "idle", "dead"),
+                  ("idle", "pause", "paused", "live"), ("idle", "exit", "exited", "live")]
         for kind in ("unit", "showrunner"):
-            for activity, hold, expected in states:
-                with self.subTest(kind=kind, activity=activity, hold=hold):
+            for activity, hold, expected, supervisor in states:
+                with self.subTest(kind=kind, activity=activity, hold=hold, supervisor=supervisor):
                     source = members[0] if kind == "unit" else next(row for row in membership.rows if row.kind == "showrunner")
                     member = replace(source, paused=staff.Paused("2026-11-08", "fixture", "hold") if hold in ("pause", "both") else staff.Active(),
                                      exited=staff.Exited("2026-11-08", "fixture", "stop") if hold in ("exit", "both") else staff.Active())
                     observed = [sessions.SessionRecord(pid=900, sessionId=member.current_session, name=member.name,
                         messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)] if activity else []
+                    run = self.root / "classification-run"
+                    run_records = run / detached_runs.DETACHED_RUNS_DIR
+                    run_records.mkdir(parents=True, exist_ok=True)
+                    run_path = run_records / "fixture.json"
+                    run_path.unlink(missing_ok=True)
+                    if supervisor != "none":
+                        member = replace(member, run=staff.OpenRun(run))
+                        _ = run_path.write_text(json.dumps({"run_id": "fixture", "status": "running", "pid": 90001,
+                            "staff_id": member.id, "worker": member.name, "command": ["private-check"],
+                            "session_dir": str(run), "label": "check", "started_at": 1, "log": str(run / "fixture.log")}))
                     parent = membership.parent_of(member)
                     snapshot = staff.StaffSnapshot((member, parent) if parent is not None else (member,))
+                    process_args = ["python3", "detached_runs.py", "supervise", str(run_path)] if supervisor == "live" else []
                     with (patch.object(staff, "local_snapshot", return_value=snapshot),
                           patch.object(sessions, "running_sessions", return_value=observed),
                           patch.object(pane_launch, "record_directory", return_value=records),
-                          patch.object(accounts, "_session_config_dir", side_effect=live_directory)):
+                          patch.object(accounts, "_session_config_dir", side_effect=live_directory),
+                          patch.object(detached_run_process, "process_args", return_value=process_args),
+                          patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                         status = accounts.read_status(source=accounts.StoredUsageOnly())
+                    if supervisor != "none":
+                        self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
                     role = "units" if kind == "unit" else "showrunners"
                     label = "claude4" if activity else "claude2"
                     document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
@@ -824,9 +845,13 @@ class AccountsTests(unittest.TestCase):
                         assert parent is not None
                         listing = unit_lookup.LabeledProductions({}, {parent.name: (member.name,)})
                         with (patch.object(staff, "snapshot", return_value=snapshot),
-                              patch.object(sessions, "running_sessions", return_value=observed)):
+                              patch.object(sessions, "running_sessions", return_value=observed),
+                              patch.object(detached_run_process, "process_args", return_value=process_args),
+                              patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                             selected = live_units.units_in(parent.name, listing)
-                            rendered = unit_phases.table(selected, {})
+                        if supervisor != "none":
+                            self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
+                        rendered = unit_phases.table(selected, {}, snapshot=snapshot, pane_rows={})
                         self.assertIn(f"| {member.name} | {expected} |", rendered)
 
     def test_native_codex_counts_share_one_conversation_and_activity_read(self) -> None:
@@ -895,24 +920,77 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows["codex2"]["role_counts"], [
             {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
 
+        from scripts.agents import detached_run_process, detached_runs
+
         claude_worker = fixture_worker("live-claude-worker", member.id)
-        for activity, hold in (("busy", "pause"), ("idle", "exit")):
-            with self.subTest(worker_activity=activity, staff_hold=hold):
-                if hold == "pause":
-                    _ = staff.pause(claude_worker.id, "hold worker")
-                else:
-                    _ = staff.exit(claude_worker.id, "stop worker")
-                observed = sessions.SessionRecord(pid=991, sessionId=claude_worker.current_session, name=claude_worker.name,
-                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)
-                with (patch.object(sessions, "running_sessions", return_value=[observed]),
-                      patch.object(pane_launch, "record_directory", return_value=records),
-                      patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4"))):
-                    reading = accounts.read_status(source=accounts.StoredUsageOnly())
-                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-                worker_account = next(row for row in document["accounts"] if row["label"] == "claude4")
-                self.assertEqual(worker_account["role_counts"][worker_account["roles"].index("workers")],
-                                 {"busy": int(activity == "busy"), "idle": int(activity == "idle"),
-                                  "paused": 0, "exited": 0, "total": 1})
+        run = self.root / "worker-classification"
+        _ = staff.set_run(member.id, staff.OpenRun(run))
+        run_records = run / detached_runs.DETACHED_RUNS_DIR
+        run_records.mkdir(parents=True)
+        run_path = run_records / "fixture.json"
+        cases: tuple[tuple[Literal["busy", "idle"], str, str, str, str], ...] = (
+                 ("busy", "pause", "none", "paused", "recorded"), ("idle", "exit", "none", "exited", "recorded"),
+                 ("idle", "", "live", "busy", "recorded"), ("idle", "", "dead", "idle", "recorded"),
+                 ("idle", "pause", "live", "paused", "recorded"), ("idle", "exit", "live", "exited", "recorded"),
+                 ("idle", "", "live", "busy", "renamed"), ("idle", "", "live", "busy", "fallback"),
+                 ("idle", "", "live", "busy", "saved dispatch"))
+        for family, target, label in (("claude", claude_worker, "claude4"), ("codex", worker, "codex1")):
+            for activity, hold, supervisor, expected, ownership in cases:
+                with self.subTest(family=family, worker_activity=activity, staff_hold=hold, supervisor=supervisor, ownership=ownership):
+                    with patch.object(herdr.Herdr, "retitle_row", return_value=True):
+                        _ = staff.rename(target.id, target.name)
+                    _ = staff.set_run(member.id, staff.OpenRun(run))
+                    _ = staff.resume(target.id)
+                    if hold == "pause":
+                        _ = staff.pause(target.id, "hold worker")
+                    elif hold == "exit":
+                        _ = staff.exit(target.id, "stop worker")
+                    run_path.unlink(missing_ok=True)
+                    current_run = run
+                    if ownership == "fallback":
+                        _ = staff.clear_run(member.id, run)
+                        current_run = worker_panes.worker_run(target, record=staff.local_snapshot(), scanned={})
+                    if ownership == "saved dispatch":
+                        from scripts.direct import progress_history
+
+                        current_run = self.root / ("saved-dispatch-" + family)
+                        current_run.mkdir()
+                        prompt = current_run / "prompt.md"
+                        _ = prompt.write_text("Check the saved dispatch.\n")
+                        _ = (current_run / "progress_history_state.json").write_text(json.dumps({
+                            "owner_staff_id": member.id, "pass": {},
+                            "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active"},
+                            "history_file": str(current_run / "history.jsonl")}))
+                        _ = progress_history.begin_dispatch(current_run, slot=target.name, phase="8", role="impl",
+                            worker_name=target.name, worker_id=target.id, launcher_command=["assign.sh"],
+                            prompt=prompt, kind="impl", lens="")
+                    run_path = current_run / detached_runs.DETACHED_RUNS_DIR / "fixture.json"
+                    run_path.parent.mkdir(parents=True, exist_ok=True)
+                    if supervisor != "none":
+                        _ = run_path.write_text(json.dumps({"run_id": "fixture", "status": "running", "pid": 90001,
+                            "staff_id": target.id, "worker": target.name, "command": ["private-check"],
+                            "session_dir": str(current_run), "label": "check", "started_at": 1, "log": str(current_run / "fixture.log")}))
+                    if ownership == "renamed":
+                        with patch.object(herdr.Herdr, "retitle_row", return_value=True):
+                            _ = staff.rename(target.id, target.name + "2")
+                    observed = sessions.SessionRecord(pid=991, sessionId=target.current_session, name=target.name,
+                        messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)
+                    process_args = ["python3", "detached_runs.py", "supervise", str(run_path)] if supervisor == "live" else []
+                    with (patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
+                          patch.object(sessions, "running_sessions", return_value=[observed] if family == "claude" else []),
+                          patch.object(pane_launch, "record_directory", return_value=records),
+                          patch.object(worker_panes, "observe_parents", return_value={}),
+                          patch.object(detached_run_process, "process_args", return_value=process_args),
+                          patch.object(accounts, "_local_codex_processes", return_value={
+                              target.current_session: accounts.CodexRoleProcess(990, activity)} if family == "codex" else {}),
+                          patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.home / ".codex1")),
+                          patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4"))):
+                        reading = accounts.read_status(source=accounts.StoredUsageOnly())
+                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    worker_account = next(row for row in document["accounts"] if row["label"] == label)
+                    self.assertEqual(worker_account["role_counts"][worker_account["roles"].index("workers")],
+                                     {"busy": int(expected == "busy"), "idle": int(expected == "idle"),
+                                      "paused": int(expected == "paused"), "exited": int(expected == "exited"), "total": 1})
 
 
 
@@ -3188,13 +3266,28 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_launch_never_creates_empty_missing_shared_files(self) -> None:
         for tool, names in (("claude", ("settings.json", "keybindings.json", "history.jsonl")),
-                            ("codex", ("config.toml", "hooks.json", "models_cache.json", "session_index.jsonl"))):
+                            ("codex", ("config.toml", "hooks.json", "models_cache.json", "session_index.jsonl", "history.jsonl"))):
             with self.subTest(tool=tool):
                 destination, shared = self.shared_repair_fixture(tool)
                 self.assert_shared_launch_ready(tool)
                 for name in names:
                     self.assertFalse(os.path.lexists(shared / name), name)
-                    self.assertFalse(os.path.lexists(destination / name), name)
+                    if tool == "codex" and name in accounts.CODEX_WRITE_THROUGH:
+                        local, target = destination / name, shared / name
+                        self.assertTrue(local.is_symlink(), name)
+                        self.assertEqual(os.readlink(local), str(target))
+                        inode = local.lstat().st_ino
+                        self.assertEqual(accounts.check("codex3"), [])
+                        self.assert_shared_launch_ready(tool)
+                        self.assertEqual(local.lstat().st_ino, inode)
+                        self.assertFalse(target.exists())
+                        with local.open("a", encoding="utf-8") as output:
+                            _ = output.write("fixture Codex append\n")
+                        self.assertEqual(target.read_text(), "fixture Codex append\n")
+                        self.assertTrue(local.is_symlink())
+                        self.assertEqual(accounts.check("codex3"), [])
+                    else:
+                        self.assertFalse(os.path.lexists(destination / name), name)
 
     def test_launch_adopts_missing_shared_targets_and_reports_only_on_stderr(self) -> None:
         for tool, file_name in (("claude", "settings.json"), ("codex", "config.toml")):
@@ -5824,8 +5917,12 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(linked.lstat().st_mtime_ns, before.st_mtime_ns)
         self.assertEqual((home / "auth.json").read_bytes(), authentication)
         folders = {"skills", "rules", "plugins", "sessions", "archived_sessions"}
-        self.assertEqual({entry.name for entry in home.iterdir()}, {"config.toml", "auth.json", *folders})
+        self.assertEqual({entry.name for entry in home.iterdir()},
+                         {"config.toml", "auth.json", *folders, "history.jsonl", "session_index.jsonl"})
         self.assertEqual({entry.name for entry in default.iterdir()}, {"config.toml", *folders})
+        for name in ("history.jsonl", "session_index.jsonl"):
+            self.assertTrue((home / name).is_symlink())
+            self.assertEqual(os.readlink(home / name), str(default / name))
 
     def test_codex_setup_refuses_an_occupied_real_file_but_merges_a_disjoint_folder(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
@@ -7800,8 +7897,12 @@ class PaneWorkerMoveTests(unittest.TestCase):
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(sorted(result.lines), sorted((
             f"{opened.name} ({opened.id}): would close its idle pane; the next assign resumes it on codex2",
-            f"{kept.name} ({kept.id}): kept open: a detached run is live; "
-            + "would stop and resume the same conversation on codex2 in its worker pane",
+            f"{kept.name} ({kept.id}): would stop and resume the same conversation on codex2 in its worker pane; "
+            + f"Detached run {kept.name} remains live. "
+            + f"Result: {self.run_dir}/detached_runs/{kept.name}.json; "
+            + f"log: {self.run_dir}/detached_runs/{kept.name}.log. Read it with: "
+            + f"`cat -- {self.run_dir}/detached_runs/{kept.name}.json {self.run_dir}/detached_runs/{kept.name}.log`. "
+            + "Its result follows this worker after the move.",
             f"{locked.name} ({locked.id}): not moved: dispatch lock is held",
             f"{stopped.name} ({stopped.id}): would close its idle pane; the next assign resumes it on codex2",
             f"{unknown.name} ({unknown.id}): would close its idle pane; the next assign resumes it on codex2",
@@ -7822,6 +7923,144 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
         self.assertEqual(self.world.stops, [kept.current_session])
+        prompt = next(command[-1] for command in self.world.commands if command[:2] == ("agent", "prompt"))
+        self.assertIn("moved from codex1 to codex2", prompt)
+        self.assertIn(f"Detached run {kept.name} remains live.", prompt)
+        self.assertIn(f"{self.run_dir}/detached_runs/{kept.name}.json", prompt)
+        self.assertNotIn("ended with no result", prompt)
+
+    def test_idle_worker_with_a_live_run_resumes_and_receives_its_result_on_the_target(self) -> None:
+        from scripts.agents import detached_runs
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.message import send, send_budget
+
+        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
+        for family in families:
+            with self.subTest(family=family):
+                row = self.worker("live-" + family, family=family)
+                row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+                with live_detached_run(self.run_dir, row):
+                    context = detached_runs.resume_context(self.run_dir / "detached_runs", row.name)
+                    moved = self.move(family + "2", why="quota")
+                    self.assertEqual(moved.returncode, 0, moved.stderr)
+                    prompt = next(command[-1] for command in reversed(self.world.commands)
+                                  if command[:2] == ("agent", "prompt"))
+                    self.assertIn(context, prompt)
+                    self.assertIn(f"moved from {family}1 to {family}2", prompt)
+                    self.assertNotIn("ended with no result", prompt)
+                    self.assertEqual(self.world.requests[-1][2]["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"],
+                                     str(self.account_home(family + "2")))
+                    self.assertEqual(accounts.detached_move_context(str(row.id)), context)
+
+                record = cast(detached_runs.RunRecord, json.loads(
+                    (self.run_dir / f"detached_runs/{row.name}.json").read_text()))
+                record.update(session_dir=str(self.run_dir), label="fixture gate", done_message_file="")
+                atomic_file.write_text_atomic(Path(record["log"]), "The detached check passed.\n")
+
+                def deliver(member: staff.StaffRow, membership: staff.StaffSnapshot, text: str,
+                            **options: object) -> send.Result:
+                    del options
+                    self.assertEqual(member.id, row.id)
+                    self.assertEqual(membership.by_id(row.id), member)
+                    pane = next(pane for pane, process in self.world.foreground.items()
+                                if self.world.processes[process[0]].current_identity == member.current_session)
+                    self.assertEqual(self.process_home(self.world.foreground[pane][0],
+                        "CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR", "." + family + "1"),
+                        self.account_home(family + "2"))
+                    self.world.prompt(pane, text, target=str(member.current_session))
+                    return send.Result("sent", "moved worker received the result")
+
+                with (patch.object(detached_runs, "_result_received", return_value=False),
+                      patch.object(send, "deliver_worker_text", side_effect=deliver) as delivery,
+                      patch.object(send_budget, "seconds", return_value=1),
+                      patch.object(detached_runs, "result_text", return_value="The detached check passed.")):
+                    self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+                delivery.assert_called_once()
+                result_prompt = next(command[-1] for command in reversed(self.world.commands)
+                                     if command[:2] == ("agent", "prompt"))
+                self.assertIn(f"Detached run: {row.name}", result_prompt)
+
+    def test_stopped_worker_preview_keeps_its_detached_context(self) -> None:
+        from scripts.agents import detached_runs, inventory
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("stopped-preview", live=False)
+        with (live_detached_run(self.run_dir, row),
+              patch.object(inventory, "listing", return_value=[])):
+            context = detached_runs.resume_context(self.run_dir / "detached_runs", row.name)
+            result = accounts.move(str(row.id), "claude2", dry_run=True)
+        self.assertEqual(result, accounts.MoveDryRun(str(row.id), (
+            f"{row.id}: would resume on claude2 if its saved tab is local; {context}",)))
+
+    def test_worker_name_preview_keeps_the_same_run_context_as_its_staff_id(self) -> None:
+        from scripts.agents import inventory
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        with (live_detached_run(self.run_dir, row),
+              patch.object(inventory, "listing", return_value=[])):
+            context = accounts.detached_move_context(str(row.id))
+            self.assertIn(f"Detached run {row.name} remains live.", context)
+            for reference in (row.name, str(row.id), str(row.current_session)):
+                with self.subTest(reference=reference):
+                    self.assertEqual(accounts.detached_move_context(reference), context)
+                    result = accounts.move(reference, "claude2", dry_run=True)
+                    self.assertEqual(result, accounts.MoveDryRun(reference, (
+                        f"{reference}: would resume on claude2 if its saved tab is local; {context}",)))
+        self.assertEqual(self.world.commands, [])
+        self.assertEqual(self.world.launches, [])
+        self.stop.assert_not_called()
+
+    def test_worker_name_collision_between_units_has_no_detached_context(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        other_unit = fixture_member("unit", name="other-director", parent=self.owner.parent)
+        other_worker = fixture_worker(row.name, other_unit.id)
+        with live_detached_run(self.run_dir, row):
+            self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
+            self.assertEqual(accounts.detached_move_context(row.name), "")
+        self.assertNotEqual(row.id, other_worker.id)
+
+    def test_worker_name_collision_with_a_non_worker_has_no_detached_context(self) -> None:
+        from scripts.herdr.test_worker_panes import live_detached_run
+
+        row = self.worker("w74", live=False)
+        other_member = fixture_member("unit", name=row.name, parent=self.owner.parent)
+        with live_detached_run(self.run_dir, row):
+            self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
+            self.assertEqual(accounts.detached_move_context(row.name), "")
+            self.assertEqual(accounts.detached_move_context(str(other_member.id)), "")
+
+    def test_worker_name_move_puts_the_run_context_in_the_resume_text(self) -> None:
+        from scripts.agents import inventory, pane_record
+        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.lib.script_envelope import script_prompt
+
+        row = self.worker("w74", live=False)
+        self.dispatch(row)
+        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
+            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
+        result_path = self.run_dir / f"detached_runs/{row.name}.json"
+        log_path = result_path.with_suffix(".log")
+        context = (f"Detached run {row.name} remains live. Result: {result_path}; log: {log_path}. "
+                   + f"Read it with: `cat -- {result_path} {log_path}`. Its result follows this worker after the move.")
+        with (live_detached_run(self.run_dir, row),
+              patch.object(inventory, "listing", return_value=[]),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(str(row.current_session))),
+              patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(123)) as launch,
+              patch.object(stop_resume, "_confirm_move_start", return_value=stop_results.ClaudeUp(
+                  str(row.current_session), "w1:p1", "claude2"))):
+            result = accounts.move(row.name, "claude2", why="quota")
+        self.assertIsInstance(result, accounts.MoveStarted, result)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[3], script_prompt(
+            "You were stopped and resumed because quota. You were moved from claude1 to claude2.\n"
+            + f"Continue pass dispatch-{row.name} in this conversation. Keep the same pass id.\n{context}"))
 
     def test_move_workers_catches_the_worker_panes_herdr_failure(self) -> None:
         from scripts.herdr import worker_panes

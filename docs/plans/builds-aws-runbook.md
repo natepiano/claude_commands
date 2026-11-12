@@ -38,7 +38,7 @@ There is no separate charge timer.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
-7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
+7. Run `python3 scripts/aws_target/deploy.py quota-request` to request Standard and G and VT Spot quotas in the configured regions.
 8. Run `python3 scripts/aws_target/deploy.py up --approve-resources` for deployment.
    Deployment refuses a price older than `price_max_age_seconds`.
    Confirm that `notification_email_file` names an existing private file before deployment.
@@ -47,11 +47,56 @@ There is no separate charge timer.
 
 A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The user approved `us-east-2c` (`use2-az3`) at $0.2250/h on 2026-11-03.
 
-A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defaults to 5 vCPU. `m7a.4xlarge` needs 16. A start below the quota fails with "Max spot instance count exceeded".
+On 2026-11-11, the Standard Spot vCPU quota (`L-34B43A08`) in `us-west-2` is 5.
+The largest configured gate needs 32 vCPUs.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+The command uses `spot_quota_request_vcpus=128` from `cloud_gate.conf`.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions=us-east-2 us-west-2`.
+It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+Spot work and later price steering use the same candidate region list.
+The command decrypts the administrator key at the terminal.
+It skips sufficient quotas and existing open requests.
+It prints request status and desired values without request, case, or account identifiers.
+A failed region prints only the AWS error code or Python error class while other regions continue.
+Any regional failure makes the command exit with status 1.
+The external administrator IAM policy needs `servicequotas:GetServiceQuota`, `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`, and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
+
+`deploy.py prices` reads gate regions, then candidate regions, without duplicates.
+It preserves the configured order within each list.
+It adds `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` to the existing price rows.
+All three new keys are in `cloud_gate.conf`.
+
+The controller reads gate Spot prices every `price_refresh_seconds=3600`.
+It reads prices after the tick releases `controller.lock`, in the same process.
+A separate non-blocking `spot-prices.lock` prevents concurrent price refreshes.
+A held price lock makes the tick skip the refresh.
+Slow price reads leave start and stop commands free to acquire the controller lock.
+It reads each candidate region and each deployed gate region once, without duplicates.
+It writes the latest price for each zone and gate type to `spot-prices.json` in the AWS state folder.
+Failed or incomplete reads preserve the previous file and let the controller tick continue.
+The controller also reads prices when the former builder route is disabled or removed.
+
+New gates prefer larger vCPU sizes, then the lowest expected gate cost within each size.
+Expected cost includes the Spot price times expected gate hours and `remote_region_transfer_usd=0.00015` outside the home region.
+Expected hours use recent median `gate_s` values for the same mode, or `lifetime_minutes` when no values exist.
+Prices and duration samples use `price_max_age_seconds=7200`.
+Equal costs keep configured order.
+Missing prices follow fresh prices for the same vCPU count.
+With no fresh prices, gates keep configured order except for capacity cooldowns.
+
+`capacity_cooldown_seconds=1800` moves refused variants to the end; gates can still try them.
+Capacity errors affect one zone and type.
+Spot quota errors affect the whole region.
+The gate reads only the needed history tail in 64 KiB blocks.
+`launch.json` saves the ranked list before launch, so retries keep the same order and ClientToken offsets.
+Older saved offsets keep configured order.
+Both new keys are in `cloud_gate.conf`.
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
 - `RegionFloor` allows only `us-east-1`, `us-east-2` and `us-west-2`. The policy denies most actions in `us-east-1`, the Pricing API included. Use `us-east-2`, and read prices from the public AWS price pages.
+- The region policy is `AdvancedModeRegionRestrictionSecurityControlPolicy`. It had a `UsWest2Partitional` statement that denied EC2 in `us-west-2`. The user removed it on 2026-11-11 for the gate fallback region. `RegionFloor` and `UsEast1Partitional` remain.
 - No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
 - The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
@@ -68,7 +113,8 @@ The command asks for four hidden values and a passphrase confirmation.
 Enter retains an imported or stored value.
 The command removes the plain administrator profile after encryption succeeds.
 It keeps the unattended scaler profile.
-Use the AWS console for placement and quota inspection.
+Use the AWS console for placement inspection.
+Use `deploy.py prices` for quota inspection.
 Do not create a plain administrator profile for CLI inspection.
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.

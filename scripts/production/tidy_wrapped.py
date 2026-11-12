@@ -33,7 +33,7 @@ class TidyRefused(Exception):
 
 def owned_paths(owner: staff.StaffRow) -> tuple[Path, ...]:
     identity = owner.id
-    return (STATE_DIR / "footers-off" / identity, STATE_DIR / "review-paused" / f"{identity}.json",
+    return (STATE_DIR / "footers-off" / identity,
             STATE_DIR / "outstanding" / f"{identity}.answered.jsonl",
             STATE_DIR / "outstanding" / f"{identity}.history.jsonl",
             STATE_DIR / "outstanding" / f"{identity}.lock",

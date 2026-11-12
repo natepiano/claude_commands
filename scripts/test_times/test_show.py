@@ -133,7 +133,9 @@ def write_trend_ledger(directory: Path, reservations: Sequence[ledger.GateReserv
          "usd_per_hour": str(row.usd_per_hour), "allowance_usd": str(row.allowance_usd),
          "applied_usd_per_hour": str(row.rate.usd_per_hour), "rate_source": row.rate.source,
          "instance_type": row.instance_type,
-         "state": {"kind": "terminated", "at": row.state.at, "instance_id": row.state.instance_id}}
+         "state": {"kind": "terminated", "at": row.state.at, "instance_id": row.state.instance_id},
+         **({"booked_allowance": {"usd": str(row.booked_allowance.usd), "source": row.booked_allowance.source}}
+            if isinstance(row.booked_allowance, ledger.GateAllowance) else {})}
         for row in reservations if isinstance(row.state, ledger.GateTerminated)]
     _ = book.path.write_text(json.dumps(document))
 
@@ -142,7 +144,7 @@ def trend_tables(output: str) -> dict[str, list[list[str]]]:
     tables: dict[str, list[list[str]]] = {}
     heading = ""
     for line in output.splitlines():
-        if line.endswith((" full", " affected")):
+        if line.endswith((" merge gates", " targeted tests")):
             heading = line
             tables[heading] = []
         elif not re.fullmatch(r"\d+ of \d+ runs have no cost record\.", line):
@@ -537,9 +539,13 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         else:
             self.fail(f"The report has no {header} column: {output}")
         index = names.index(header)
-        start = headings[index].start()
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(row)
-        return row[start:end].strip()
+        # Use both lines because a number can be wider than its header.
+        width = max(len(line), len(row))
+        layout = "".join(label if label != " " else value
+                         for label, value in zip(line.ljust(width), row.ljust(width), strict=True))
+        cells = list(re.finditer(r"\S.*?(?= {2,}|$)", layout))
+        self.assertEqual(len(cells), len(names), output)
+        return row[cells[index].start():cells[index].end()].strip()
 
     def test_every_gate_discovered_timing_module_loads_tests(self) -> None:
         repo = Path(__file__).resolve().parents[2]
@@ -788,7 +794,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertNotIn("unmeasured:", measured)
         self.assertEqual(self.line(measured, "types/basedpyright"),
                          "types/basedpyright runs nightly, so it is not ranked: last run 50.000 CPU s, 100.000 s")
-        self.assertRegex(self.line(measured, "tools/test_beta.py"), r"^1\s+tools/test_beta\.py\b")
+        self.assertRegex(self.line(measured, "tools/test_beta.py"), r"^ {3}1\s+tools/test_beta\.py\b")
         self.assertRegex(self.line(measured, "sum of median CPU"), r"1 modules; sum of median CPU 3(?:\.0+)? s")
 
     def test_missing_times_and_type_jobs_do_not_show_test_measurements(self) -> None:
@@ -1012,27 +1018,30 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         status, output, errors = report_without_update("trend", "--days", "8")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
-        self.assertEqual(tables["natedev full"][1:], [
+        self.assertEqual(list(tables), ["builder merge gates", "natedev merge gates", "natedev targeted tests"])
+        self.assertEqual(tables["natedev merge gates"][1:], [
             ["2026-11-02", "1", "6", "6", "30", "30", "—", "—", "—"],
             ["2026-11-03", "20", "15", "19", "34", "30", "—", "—", "—"],
         ])
-        self.assertEqual(tables["builder full"][1:], [
+        self.assertEqual(tables["builder merge gates"][1:], [
             ["2026-11-03", "1", "5", "5", "30", "30", "—", "—", "—"]])
-        self.assertEqual(tables["natedev affected"], [
+        self.assertEqual(tables["natedev targeted tests"], [
             ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
              "cost mean", "cost p95", "cost total", "median modules run"],
             ["2026-11-03", "1", "10", "10", "40", "40", "—", "—", "—", "2"]])
-        self.assertEqual(tables["natedev full"][0], tables["builder full"][0])
+        self.assertEqual(tables["natedev merge gates"][0], tables["builder merge gates"][0])
 
     def test_trend_joins_cloud_cost_to_the_attempt_and_uses_the_applied_rate(self) -> None:
         from scripts.build_targets import target_config
 
         state = target_config.ssh_target_state_directory("aws")
         reservations: list[ledger.GateReservation] = []
-        for ordinal, host, selection, hours, rate in (
-                (1, "ip-10-1-1-1.compute.internal", "full", 1, "0.3"),
-                (2, "ip-10-1-1-2", "full", 2, "0.5"),
-                (3, "ip-10-1-1-3.compute.internal", "affected", 1, "0.1")):
+        for ordinal, host, selection, hours, rate, booked_allowance in (
+                (1, "ip-10-1-1-1.compute.internal", "full", 1, "0.3",
+                 ledger.GateAllowance(Decimal("0.01"), "AWS bill 2026-11-03")),
+                (2, "ip-10-1-1-2", "full", 2, "0.5",
+                 ledger.GateAllowance(Decimal(0), "AWS bill 2026-11-03")),
+                (3, "ip-10-1-1-3.compute.internal", "affected", 1, "0.1", ledger.GateAllowanceUnpriced())):
             self.write_run([module_run("test_alpha.py", ordinal * 10)], host=host)
             _ = show.index.update()
             with closing(sqlite3.connect(index_path_in(self.log))) as writer:
@@ -1044,7 +1053,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             reservations.append(ledger.GateReservation(
                 f"attempt-{ordinal}", int(EPOCH), int(EPOCH) + 10000, Decimal("9"), Decimal("0.02"),
                 ledger.GateTerminated(int(EPOCH) + hours * 3600, f"i-{ordinal}"), "m7a.4xlarge",
-                ledger.BoxRate(Decimal(rate), "applied price")))
+                ledger.BoxRate(Decimal(rate), "applied price"), booked_allowance=booked_allowance))
         # A different reservation must not affect any run's cost.
         reservations.append(ledger.GateReservation("unrelated", int(EPOCH), int(EPOCH) + 10000,
             Decimal("100"), Decimal("100"), ledger.GateTerminated(int(EPOCH) + 3600, "i-other"),
@@ -1054,9 +1063,10 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
-        self.assertEqual(tables["aws full"][1:], [
-            ["2026-11-03", "2", "8", "10", "30", "30", "$0.670", "$1.020", "$1.340"]])
-        self.assertEqual(tables["aws affected"][1:], [
+        self.assertEqual(list(tables), ["aws merge gates", "aws targeted tests"])
+        self.assertEqual(tables["aws merge gates"][1:], [
+            ["2026-11-03", "2", "8", "10", "30", "30", "$0.655", "$1.000", "$1.310"]])
+        self.assertEqual(tables["aws targeted tests"][1:], [
             ["2026-11-03", "1", "15", "15", "30", "30", "$0.120", "$0.120", "$0.120", "1"]])
 
         for name, host, source in (
@@ -1078,11 +1088,11 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         write_trend_ledger(state, reservations)
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws full"][1:], [
-            ["2026-11-03", "5", "5", "10", "30", "30", "$0.553", "$1.020", "$1.660"]])
+        self.assertEqual(trend_tables(output)["aws merge gates"][1:], [
+            ["2026-11-03", "5", "5", "10", "30", "30", "$0.543", "$1.000", "$1.630"]])
         self.assertEqual(output.count("2 of 5 runs have no cost record."), 1)
-        self.assertNotIn("aws-build full", output)
-        self.assertNotIn("aws-unpriced full", output)
+        self.assertNotIn("aws-build merge gates", output)
+        self.assertNotIn("aws-unpriced merge gates", output)
 
     def test_trend_updates_missing_cost_on_an_open_day_and_caches_it_after_settling(self) -> None:
         from scripts.build_targets import target_config
@@ -1095,7 +1105,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "1")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws full"][1][-3:], ["—", "—", "—"])
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["—", "—", "—"])
         state = target_config.ssh_target_state_directory("aws")
         state.mkdir(parents=True)
         write_trend_ledger(state, [ledger.GateReservation(
@@ -1104,7 +1114,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             rate=ledger.BoxRate(Decimal("0.2"), "applied price"))])
         status, output, errors = report_without_update("trend", "--days", "1")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws full"][1][-3:], ["$0.220", "$0.220", "$0.220"])
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.220", "$0.220", "$0.220"])
 
         self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-2", epoch=EPOCH - 86400)
         _ = show.index.update()
@@ -1124,7 +1134,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output_buffer):
                 show.trend(reader, 2)
         output = output_buffer.getvalue()
-        self.assertEqual(trend_tables(output)["aws full"][1],
+        self.assertEqual(trend_tables(output)["aws merge gates"][1],
                          ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
         self.assertIn("1 of 2 runs have no cost record.", output)
@@ -1146,7 +1156,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         write_trend_ledger(state, reservations)
         status, output, errors = report_without_update("trend", "--days", "3")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws full"][1][-3:], ["$0.120", "$0.120", "$0.120"])
+        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.120", "$0.120", "$0.120"])
         self.assertIn("2 of 4 runs have no cost record.", output)
 
         reservations = reservations[:1]
@@ -1166,7 +1176,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output_buffer):
                 show.trend(reader, 3)
         output = output_buffer.getvalue()
-        self.assertEqual(trend_tables(output)["aws full"][1],
+        self.assertEqual(trend_tables(output)["aws merge gates"][1],
                          ["2026-11-01", "2", "4", "4", "30", "30", "$0.420", "$0.420", "$0.840"])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
         self.assertNotIn("2026-11-01", "".join(queries))
@@ -1186,7 +1196,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output):
                 show.trend(reader, 2)
         tables = trend_tables(output.getvalue())
-        self.assertEqual(tables["natedev full"][1:], [
+        self.assertEqual(tables["natedev merge gates"][1:], [
             ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"],
             ["2026-11-03", "1", "99", "99", "30", "30", "—", "—", "—"]])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
@@ -1194,12 +1204,12 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertNotEqual(output.getvalue(), first)
         path = self.log / show.TREND_CACHE_NAME
         document = cast(dict[str, object], json.loads(path.read_text()))
-        for damaged in ("not JSON", json.dumps({**document, "version": 2})):
+        for damaged in ("not JSON", json.dumps({**document, "version": 3})):
             with self.subTest(cache=damaged):
                 _ = path.write_text(damaged)
                 status, output, errors = report_without_update("trend", "--days", "2")
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(trend_tables(output)["natedev full"][1][2:4], ["99", "99"])
+                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["99", "99"])
 
     def test_trend_settles_only_after_a_complete_refresh_starts_beyond_the_delay(self) -> None:
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
@@ -1213,13 +1223,13 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "2")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["natedev full"][1][2:4], ["11", "11"])
+        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
         with closing(sqlite3.connect(index_path_in(self.log))) as writer:
             writer.execute("UPDATE gate_modules SET cpu_s=22").close()
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "2")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["natedev full"][1][2:4], ["11", "11"])
+        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
 
     def test_trend_writers_preserve_days_and_a_newer_refresh_from_another_writer(self) -> None:
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
@@ -1296,7 +1306,7 @@ else:
                 self.assertEqual(show.read_trend_cache().completed_refresh_started_at, newer)
                 status, output, errors = report_without_update("trend", "--days", "2")
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(trend_tables(output)["natedev full"][1][2:4], ["77", "77"])
+                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["77", "77"])
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])

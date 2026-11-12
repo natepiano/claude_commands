@@ -105,10 +105,10 @@ def local_details(row: staff.StaffRow, holder: staff.StaffRow) -> MemberDetails:
         else:
             plan = "standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"
         if isinstance(holder.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
-            if (isinstance(holder.worktree, staff.RemovedWorktree) and not holder.worktree.path.exists()
-                    and isinstance(config, unit_config.UnitConfig)
-                    and isinstance(config.retired, unit_config.RetiredSession)):
-                branch = config.retired.branch.value + " (parked)"
+            if isinstance(holder.worktree, staff.RemovedWorktree):
+                branch = (holder.worktree.branch.value + " (parked)"
+                          if isinstance(holder.worktree.branch, staff.ParkedBranch)
+                          else unavailable("the parked branch is not recorded in staff"))
             else:
                 try:
                     branch = read_branch(holder.worktree.path)

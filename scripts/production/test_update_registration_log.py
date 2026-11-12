@@ -77,7 +77,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertNotIn("stale state item", log)
         self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
 
-    def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
+    def test_the_first_call_moves_the_scratchpad_state_without_rewriting_a_legacy_prompt(self) -> None:
         owner = staff.by_id(self.fixture_staff_id())
         assert owner is not None
         timer = self.state / "notifier" / f"showrunner-{owner.id}"
@@ -100,7 +100,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn(f"state-dir: ok — copied unit_status to {target}", result.stdout)
         self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha\n")
         self.assertIn("kept", (target / "showrunner_state.json").read_text(encoding="utf-8"))
-        self.assertIn(f"unit_status.sh {target}/unit_status ", prompt.read_text(encoding="utf-8"))
+        self.assertEqual(prompt.read_text(encoding="utf-8"), "an old prompt with <SCRATCH>/unit_status\n")
 
         again = self.run_command("log", "second event", env=env)
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)

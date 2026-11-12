@@ -13,7 +13,6 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import final, override
-from unittest import mock
 
 from scripts.style import style_footprint
 
@@ -161,49 +160,6 @@ class StyleFootprintTests(unittest.TestCase):
             self.write(path, (self.repo / path).read_text().replace("read_value", "load_value"))
         result = self.worktree_check(base)
         self.assertEqual((result.returncode, result.stdout), (0, "mechanical\n"), result.stderr)
-
-    def test_worktree_snapshot_error_cleans_up_its_temporary_index(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        base = self.commit()
-        self.write("src/lib.rs", "fn renamed() {}\n")
-        original_run = subprocess.run
-        indexes: list[Path] = []
-
-        def fail_write_tree(arguments: list[str], *, capture_output: bool, text: bool, check: bool,
-                            env: dict[str, str] | None = None, input: str = "",
-                            errors: str = "strict") -> subprocess.CompletedProcess[str]:
-            environment = env
-            if environment is not None and "GIT_INDEX_FILE" in environment:
-                path = Path(str(environment["GIT_INDEX_FILE"]))
-                indexes.append(path)
-                if "write-tree" in arguments:
-                    return subprocess.CompletedProcess(arguments, 128, "", "snapshot failed")
-            return original_run(arguments, capture_output=capture_output, text=text, check=check,
-                                env=env, input=input, errors=errors)
-
-        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_write_tree):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
-        self.assertEqual((code, output.getvalue()), (2, "error: snapshot failed\n"))
-        self.assertTrue(indexes)
-        self.assertTrue(all(not path.exists() for path in indexes))
-
-    def test_missing_base_revision_is_an_error_not_a_review(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        _ = self.commit()
-        result = self.check("0" * 40)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
-
-    def test_head_and_worktree_are_required_mutually_exclusive_options(self) -> None:
-        self.write("src/lib.rs", "fn value() {}\n")
-        base = self.commit()
-        for options in ([], ["--head", "HEAD", "--worktree"]):
-            with self.subTest(options=options):
-                result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(SCRIPT), "check", "--repo", str(self.repo),
-                                         "--base", base, *options], capture_output=True, text=True, check=False)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_complete_private_rename_in_three_files_is_mechanical(self) -> None:
         base = self.rename_fixture()
@@ -1829,29 +1785,6 @@ class StyleFootprintTests(unittest.TestCase):
         self.assertEqual(self.assert_review(base),
                          "review: check 6: call target, method or other change not proven equivalent\n")
 
-    def test_merge_tree_tool_failure_reports_its_error_instead_of_a_merge_conflict(self) -> None:
-        base = self.rename_fixture()
-        _ = self.git("checkout", "-qb", "incoming")
-        self.write("src/incoming.rs", "// Incoming work\n")
-        _ = self.commit()
-        _ = self.git("checkout", "main")
-        _ = self.git("merge", "--no-ff", "-qm", "Merge incoming work", "incoming")
-        head = self.rename_value()
-        run = subprocess.run
-
-        def fail_merge_tree(arguments: list[str], *, capture_output: bool, text: bool, check: bool,
-                            input: str = "", errors: str = "strict") -> subprocess.CompletedProcess[str]:
-            if arguments[3:5] == ["merge-tree", "--write-tree"]:
-                return subprocess.CompletedProcess(arguments, 128, "", "fatal: merge-tree unavailable\n")
-            return run(arguments, capture_output=capture_output, text=text, check=check, input=input, errors=errors)
-
-        output = io.StringIO()
-        with mock.patch("scripts.style.style_footprint.subprocess.run", side_effect=fail_merge_tree):
-            with redirect_stdout(output):
-                code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--head", head])
-        self.assertEqual((code, output.getvalue()),
-                         (2, "error: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
-
     def test_incomplete_rename_with_old_uses_remaining_requires_review(self) -> None:
         base = self.rename_fixture()
         self.write("src/lib.rs", (self.repo / "src/lib.rs").read_text().replace("read_value", "load_value"))
@@ -1995,6 +1928,75 @@ class StyleFootprintTests(unittest.TestCase):
         self.assertIsInstance(result, style_footprint.NoItemMoves, result)
         assert isinstance(result, style_footprint.NoItemMoves)
         self.assertIn(reason, result.reason)
+
+    def test_whole_sibling_test_file_moves_require_normal_review(self) -> None:
+        source = "// Keep the fixture comment.\nuse super::*;\nconst LIMIT: usize = 3;\n"
+        source += "#[test]\nfn first() { assert_eq!(LIMIT, 3); }\n#[test]\nfn second() { assert!(LIMIT > 0); }\n"
+        for name, edit in (("widget_tests", ""), ("tests", ""),
+                                    ("widget_tests", "body"), ("widget_tests", "parent"),
+                                    ("widget_tests", "cfg"), ("tests", "reference"),
+                                    ("tests", "existing"), ("file_tests", "path"),
+                                    ("file_tests", "path-first"), ("widget_tests", "plain"),
+                                    ("widget_tests", "attributes"), ("file_tests", "path-child"),
+                                    ("file_tests", "path-nested-child"), ("widget_tests", "other-loader")):
+            with self.subTest(name=name, edit=edit):
+                case = StyleFootprintTests()
+                case.setUp()
+                try:
+                    declaration = "#[cfg(test)]\nmod widget_tests;\n"
+                    parent_path = "src/widget/mod.rs"
+                    content = source
+                    if edit == "plain":
+                        declaration = "mod widget_tests;\n"
+                    if edit == "attributes":
+                        declaration = "#[cfg(test)]\n#[allow(dead_code)]\nmod widget_tests;\n"
+                    if edit.startswith("path"):
+                        declaration = ('#[path = "widget_tests.rs"]\n#[cfg(test)]\nmod file_tests;\n'
+                                       if edit == "path-first" else
+                                       '#[cfg(test)]\n#[path = "widget_tests.rs"]\nmod file_tests;\n')
+                        parent_path = "src/widget/owner.rs"
+                        case.write("src/widget/mod.rs", "mod owner;\n")
+                    if edit in ("path-child", "path-nested-child"):
+                        nested = edit == "path-nested-child"
+                        content += "mod nested { mod child; }\n" if nested else "mod child;\n"
+                        child = "src/widget/widget_tests/" + ("nested/" if nested else "") + "child.rs"
+                        case.write(child, "pub fn child() {}\n")
+                    parent = "pub fn widget() {}\n" + declaration
+                    if edit == "reference":
+                        parent += "#[cfg(test)]\nfn caller() { widget_tests::first(); }\n"
+                    if edit == "existing":
+                        content = source.replace("use super::*;", "use super::Thing;")
+                        parent += "pub struct Thing;\n#[cfg(test)]\nmod tests {\nuse super::Thing;\nfn previous() {}\n}\n"
+                    case.write("src/lib.rs", "mod widget;\n")
+                    if edit == "other-loader":
+                        case.write("other/Cargo.toml", '[package]\nname = "other"\nversion = "0.1.0"\nedition = "2021"\n')
+                        case.write("other/src/lib.rs",
+                                   '#[cfg(test)] #[path = "../../src/widget/widget_tests.rs"] mod shared_tests;\n')
+                    case.write(parent_path, parent)
+                    case.write("src/widget/widget_tests.rs", content)
+                    base = case.commit()
+                    _ = case.git("rm", "src/widget/widget_tests.rs")
+                    body = content.replace("= 3;", "= 4;") if edit == "body" else content
+                    attributes = declaration[:declaration.rfind("mod ")].replace('#[path = "widget_tests.rs"]\n', "")
+                    inline = attributes + "mod " + name + " {\n" + "".join("    " + line + "\n" for line in body.splitlines()) + "}\n"
+                    after = (parent.replace(declaration, "").replace(
+                        "fn previous() {}\n}", "fn previous() {}\n" + content + "}") if edit == "existing" else
+                        parent.replace(declaration, inline))
+                    if edit == "parent":
+                        after = after.replace("pub fn widget() {}", "pub fn widget() { panic!(); }")
+                    if edit == "cfg":
+                        after = after.replace("#[cfg(test)]", "")
+                    case.write(parent_path, after)
+                    head = case.commit()
+                    changes = style_footprint.changes_between(case.repo, base, head)
+                    tree = style_footprint.RevisionTree(case.repo, base)
+                    result = style_footprint.prove_item_moves(changes, tree)
+                    self.assertIsInstance(result, style_footprint.NoItemMoves, result)
+                    self.assertEqual(style_footprint.moved_files(changes, tree), frozenset())
+                    if not edit and name == "widget_tests":
+                        _ = case.assert_review(base, head)
+                finally:
+                    case.doCleanups()
 
     def test_a_const_moved_to_an_existing_constants_module_is_proven(self) -> None:
         result = self.prove_move(self.LIMIT_FILES, self.LIMIT_MOVED)

@@ -112,7 +112,7 @@ def record_fields(record: object) -> PlanCellRecord:
 
 
 def progress_cell(record: object) -> str:
-    """Show phase states and the open phase's repair rounds."""
+    """Show phase states as a colored bar."""
     rows = plan_phase_rows(record_fields(record))
     if not rows:
         return display_cells.NONE
@@ -120,13 +120,8 @@ def progress_cell(record: object) -> str:
     cells: list[str] = []
     for index in range(size):
         states = {row.get("status") for row in rows[index * len(rows) // size:(index + 1) * len(rows) // size]}
-        cells.append("▓" if states & {"running", "open"} else "░" if "todo" in states else "█")
-    result = "".join(cells) + f" {sum(row.get('status') == 'done' for row in rows)}/{len(rows)}"
-    if isinstance(record, phase_table.PhaseRecord) and isinstance(record.current, phase_table.OpenPhase):
-        current = record.current
-        if current.fix_rounds:
-            result += f" · fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else "")
-    return result
+        cells.append("🟨" if states & {"running", "open"} else "⬜" if "todo" in states else "🟩")
+    return "".join(cells)
 
 
 def elapsed_text(seconds: float) -> str:
@@ -146,23 +141,48 @@ def short_time(moment: datetime, *, now: float, zone: ZoneInfo) -> str:
     return local.strftime("%H:%M" if days == 0 else "%a %H:%M" if days <= 6 else "%d %b")
 
 
-def eta_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
-    """Format stated promises and the plan's predicted finish."""
-    if not isinstance(record, phase_table.PhaseRecord):
+def eta_cell(record: object, *, now: float, zone: ZoneInfo,
+             open_run_phases: tuple[phase_table.OpenPhase, ...] = ()) -> str:
+    """Show the promise for open work or the next promised plan phase."""
+    phases = record.phases if isinstance(record, phase_table.PhaseRecord) else []
+    phase_ids = {phase.phase for phase in phases}
+    opened = [phase for phase in open_run_phases if phase.phase in phase_ids]
+    if not opened:
+        opened = [phase for phase in phases if isinstance(phase, phase_table.OpenPhase)]
+    current = record.current if isinstance(record, phase_table.PhaseRecord) else phase_table.NoOpenPhase()
+    selected: phase_table.OpenPhase | phase_table.TodoPhase | phase_table.NoOpenPhase
+    if opened:
+        selected = (current if isinstance(current, phase_table.OpenPhase)
+                    and any(phase.phase == current.phase for phase in opened) else opened[-1])
+    elif open_run_phases:
+        selected = open_run_phases[-1]
+    elif isinstance(current, phase_table.OpenPhase):
+        selected = current
+    else:
+        selected = next((phase for phase in phases if isinstance(phase, phase_table.TodoPhase) and phase.eta_trail),
+                        phase_table.NoOpenPhase())
+    if isinstance(selected, phase_table.NoOpenPhase):
         return display_cells.NONE
-    parts: list[str] = []
-    current = record.current
-    if isinstance(current, phase_table.OpenPhase):
-        if current.eta_trail:
-            promise = current.eta_trail[-1][0]
-            parts.append(short_time(promise, now=now, zone=zone))
-            if now > promise.timestamp():
-                parts.append("late " + elapsed_text(now - promise.timestamp()))
-        else:
-            parts.append("no ETA")
-    if isinstance(record.plan_finish, phase_table.PredictedFinish):
-        parts.append("ends " + short_time(record.plan_finish.at, now=now, zone=zone))
-    return shortened(" · ".join(parts)) if parts else display_cells.NONE
+    if not selected.eta_trail:
+        return "no ETA"
+    promise = selected.eta_trail[-1][0]
+    text = short_time(promise, now=now, zone=zone)
+    if now > promise.timestamp():
+        text += " · late " + elapsed_text(now - promise.timestamp())
+    return shortened(text)
+
+
+def running_plan(record: object) -> bool:
+    """Return whether the record has unfinished plan phases."""
+    return any(phase.get("status") != "done" for phase in plan_phase_rows(record_fields(record)))
+
+
+def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
+    """Show the predicted finish of an unfinished plan."""
+    if (running_plan(record) and isinstance(record, phase_table.PhaseRecord)
+            and isinstance(record.plan_finish, phase_table.PredictedFinish)):
+        return short_time(record.plan_finish.at, now=now, zone=zone)
+    return display_cells.NONE
 
 
 def workers_cell(rows: list[dict[str, object]], *, now: float) -> str:
@@ -195,8 +215,14 @@ def plan_phase_rows(fields: PlanCellRecord) -> list[PlanCellPhase]:
     return fields.get("phases", [])
 
 
-def phase_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
-    """Show the open phase and its task, or the plan's current state."""
+def phase_cell(record: object) -> str:
+    """Show the completed phase count and total."""
+    rows = plan_phase_rows(record_fields(record))
+    return f"{sum(row.get('status') == 'done' for row in rows)}/{len(rows)}" if rows else display_cells.NONE
+
+
+def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
+    """Show the current phase, task, and repair rounds."""
     fields = record_fields(record)
     if not fields:
         return display_cells.NONE
@@ -212,12 +238,17 @@ def phase_cell(record: object, *, read_run: RunEventsReader = read_work_events) 
             return "no phases"
         if done == len(phases):
             return "plan done"
-        return f"between phases, {done} of {len(phases)} done" if done else "not started"
+        return "between phases" if done else "not started"
     phase = current
     task = task_cell(fields, read_run=read_run)
     if task == display_cells.NONE:
         task = str(phase.get("title", ""))
-    return shortened(f"phase {phase.get('phase')} of {phase.get('of')} — {task}")
+    parts = [f"phase {phase.get('phase')} — {task}"]
+    if isinstance(record, phase_table.PhaseRecord) and isinstance(record.current, phase_table.OpenPhase):
+        current = record.current
+        if current.fix_rounds:
+            parts.append(f"fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else ""))
+    return shortened(" · ".join(parts))
 
 
 def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
@@ -394,7 +425,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
           runs_reader: worker_runs.WorkerRuns | None = None) -> str:
     snapshot = staff.snapshot() if snapshot is None else snapshot
-    resolver = session_staff.RowResolver(snapshot)
     if now is None:
         now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
     zone = user_zone() if zone is None else zone
@@ -404,7 +434,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     def read_plan(path: Path) -> list[plan_history.PlanPhase]:
         if path not in plans:
             try:
-                plans[path] = plan_history.plan_phases(path, resolver=resolver)
+                plans[path] = plan_history.plan_phases(path)
             except (OSError, UnicodeError):
                 plans[path] = []
         return plans[path]
@@ -431,9 +461,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             print(f"unit_phases: workers: {error}", file=sys.stderr)
             pane_rows = {}
     machines = display_cells.machine_column([unit.machine for unit in units])
-    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA",
-               worker_heading(), "Non-Phase Work", "Queued")
-    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
+    table_rows: list[tuple[str, ...]] = []
+    show_plan_eta = False
     for index, unit in enumerate(units):
         record = records.get(unit.unit)
         progress_record = record
@@ -441,26 +470,46 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         other = display_cells.NONE
         queued = display_cells.NONE
         workers = display_cells.NONE
+        open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         if isinstance(member, staff.StaffRow):
             run = newest.get(member.id)
             queued_record = record
+            opened = runs.get(member.id, NoOpenUnitRun())
             if not plan_phase_rows(record_fields(record)) and run is not None:
-                queued_record = fallback_plan(member, run, runs.get(member.id, NoOpenUnitRun()),
+                queued_record = fallback_plan(member, run, opened,
                                               record, read_plan=read_plan)
-                if isinstance(runs.get(member.id), OpenUnitRun):
-                    plan = (record_fields(record).get("plan") or queued_record.get("plan")
-                            or str(run.start.get("project_plan_doc") or run.start.get("plan_doc") or ""))
-                    progress_record = phase_table.build_run(Path(plan), read_run(run.path))
-            other = non_phase_cell(record, runs.get(member.id, NoOpenUnitRun()))
+            phase_ids = {phase.get("phase") for phase in plan_phase_rows(record_fields(record))}
+            if isinstance(opened, OpenUnitRun) and (
+                not phase_ids or any(phase.phase_id not in phase_ids for phase in opened.phases)
+            ):
+                plan = (record_fields(record).get("plan") or record_fields(queued_record).get("plan")
+                        or (str(run.start.get("project_plan_doc") or run.start.get("plan_doc") or "")
+                            if run is not None else ""))
+                run_record = phase_table.build_run(Path(plan), read_run(opened.path))
+                open_run_phases = tuple(phase for phase in run_record.phases if isinstance(phase, phase_table.OpenPhase))
+                if not phase_ids:
+                    progress_record = run_record
+            other = non_phase_cell(record, opened)
             queued = queued_cell(member.id, queued_record)
             if (run is not None and isinstance(member.worktree, staff.PresentWorktree)
                     and member.worktree.machine == remote.local_machine()):
                 rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
                                                      snapshot, member.id, read_run(run.path), runs_reader)
                 workers = workers_cell(rows, now=now)
+        notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
+        show_plan_eta = show_plan_eta or running_plan(progress_record)
         cells = (unit.unit, unit.status, *((machines[index],) if machines else ()),
-                 progress_cell(progress_record), phase_cell(record, read_run=read_run),
-                 eta_cell(progress_record, now=now, zone=zone), workers, other, queued)
+                 progress_cell(progress_record), phase_cell(progress_record), notes_cell(notes_record, read_run=read_run),
+                 eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
+                 eta_plan_cell(progress_record, now=now, zone=zone), workers, other, queued)
+        table_rows.append(cells)
+    headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "Notes", "ETA Next",
+               *(("ETA Plan",) if show_plan_eta else ()), worker_heading(), "Non-Phase Work", "Queued")
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(("---",) * len(headers)) + " |"]
+    plan_column = headers.index("ETA Next") + 1
+    for cells in table_rows:
+        if not show_plan_eta:
+            cells = cells[:plan_column] + cells[plan_column + 1:]
         lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -565,7 +614,7 @@ def main(arguments: list[str]) -> int:
                 records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                            if style else production_records(doc))
                 listing = sessions.result()
-                units = listing.units
+                units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
             configured: set[str] = set()
             if not style and style_config.has_style_units(doc.read_text().splitlines()):
                 configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}

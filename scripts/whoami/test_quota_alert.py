@@ -240,29 +240,42 @@ always=always-there
             self.assertEqual(quota_alert.showrunners_now(), [])
 
     def test_retained_notice_recipients_include_configured_sessions_and_showrunners_once(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
+        members = [fixture_member("producer", name=name) for name in ("natedev", "boss of bosses", "new director")]
         with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
               mock.patch.object(quota_alert, "registered_showrunners",
                   return_value=running("natedev", "boss of bosses", "new director"))):
-            self.assertEqual(quota_alert.recipients(quota_alert.load_config()),
-                             ["natedev", "boss of bosses", "new director"])
+            self.assertEqual(quota_alert.recipients(quota_alert.load_config()), [str(row.id) for row in members])
             self.assertEqual(quota_alert.recipients(quota_alert.load_config(), "natedev"),
-                             ["boss of bosses", "new director"])
+                             [str(row.id) for row in members[1:]])
 
     def test_recipient_identity_merges_ids_names_and_the_here_exclusion(self) -> None:
         from scripts.message import sessions
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
-        record: sessions.SessionRecord = {"pid": 998001, "sessionId": "fixture-director", "name": "natedev",
-            "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": ["old director"]}
-        registry = sessions.RegistryRead((sessions.RegistryObservation(record, {}),), ())
+        owner = fixture_member("producer", name="natedev")
+        current = fixture_runtime_id("notice-current-session")
+        owner = staff.update_current_session(owner.current_session, staff.native_id(current))
         config = quota_alert.load_config()
-        config["always"] = ["fixture-director", "session:fixture-director", "old director"]
+        config["always"] = [str(owner.id), f"session:{current}", "natedev"]
         with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
-              mock.patch.object(sessions, "read_registry", return_value=registry),
+              mock.patch.object(sessions, "read_registry", side_effect=AssertionError("no registry name lookup")),
               mock.patch.object(quota_alert, "registered_showrunners", return_value=running("natedev"))):
-            self.assertEqual(quota_alert.recipients(config), ["session:fixture-director"])
-            for here in ("fixture-director", "session:fixture-director", "natedev", "old director"):
+            self.assertEqual(quota_alert.recipients(config), [str(owner.id)])
+            for here in (str(owner.id), f"session:{current}", "natedev"):
                 with self.subTest(here=here):
                     self.assertEqual(quota_alert.recipients(config, here), [])
+            owner = staff.rename(owner.id, "renamed-owner")
+            with self.assertRaisesRegex(ValueError, "natedev: no staff recipient"):
+                _ = quota_alert.recipients(config)
+        with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),
+              mock.patch.object(quota_alert, "registered_showrunners", return_value=running("renamed-owner"))):
+            config["always"] = [str(owner.id), "renamed-owner"]
+            self.assertEqual(quota_alert.recipients(config), [str(owner.id)])
+            config["always"] = [f"session:{current}", "uds:/private.sock"]
+            self.assertEqual(quota_alert.recipients(config), [f"session:{current}", "uds:/private.sock"])
 
     def test_low_recovery_closes_the_episode_without_telling_sessions(self) -> None:
         _ = self.alert([self.note("codex1.md", "active", "1")], self.now)
@@ -285,6 +298,10 @@ always=always-there
         self.assertEqual(self.sent, [])
 
     def test_current_session_is_found_up_the_process_tree(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member
+
+        owner = fixture_member("producer", name="boss of bosses")
         sessions = self.root / "sessions"
         sessions.mkdir()
         parent = os.getppid()
@@ -294,12 +311,15 @@ always=always-there
                 subprocess.CompletedProcess(["ps"], 0, str(grandparent), ""),
                 subprocess.CompletedProcess(["ps"], 0, "1", ""),
                 subprocess.CompletedProcess(["ps"], 0, str(grandparent), ""),
+                subprocess.CompletedProcess(["ps"], 0, str(grandparent), ""),
             ]
         ):
             self.assertIsNone(quota_alert.current_session())
             # Two levels up, so the walk past a parent with no session file is exercised.
-            _ = (sessions / f"{grandparent}.json").write_text(json.dumps({"name": "boss of bosses"}))
+            _ = (sessions / f"{grandparent}.json").write_text(json.dumps({"name": "stale registry label", "sessionId": owner.current_session}))
             self.assertEqual(quota_alert.current_session(), "boss of bosses")
+            _ = staff.rename(owner.id, "renamed-owner")
+            self.assertEqual(quota_alert.current_session(), "renamed-owner")
 
     def test_inactive_above_threshold_unknown_or_reset_notes_are_quiet(self) -> None:
         past = local_reset(self.now - timedelta(hours=1))

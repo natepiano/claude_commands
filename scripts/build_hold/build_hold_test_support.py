@@ -22,6 +22,7 @@ from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_hold import build_hold
+from scripts.buildlog import record, store
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.lib import test_hang_guard
 from scripts.build_hold.override_guard import require_checkout
@@ -30,6 +31,7 @@ require_checkout(Path(__file__))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.production.cli_fixture import process_boundary_for_case
 
 _finish_writers: ContextVar[Callable[[], None] | None] = ContextVar("finish_hold_writers", default=None)
 
@@ -119,6 +121,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         (cls.seed / "proc").mkdir(parents=True)
         (cls.seed / "child-lifetime").mkdir()
         _ = (cls.seed / "child-lifetime/sitecustomize.py").write_text(CHILD_LIFETIME)
+        _ = (cls.seed / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
         (cls.seed / "tools").mkdir()
         systemctl = cls.seed / "tools/systemctl"
         _ = systemctl.write_text("#!/bin/sh\nexit 0\n")
@@ -163,10 +166,53 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
         self.admission_fixture = caller_admission(self, self.scratch, dict(os.environ))
+        if not process_boundary_for_case(self):
+            self.install_recorder_threads()
         token = _finish_writers.set(self.finish_writers)
         self.addCleanup(_finish_writers.reset, token)
         self.addCleanup(self.reap_recorders)
         self.addCleanup(self.wait_for_detached_writers)
+
+    def install_recorder_threads(self) -> None:
+        pending: ContextVar[tuple[Path, threading.Event]] = ContextVar("hold_record_append")
+        original_root = store.root
+        original_append = store.append_line
+
+        def root() -> Path:
+            try:
+                return pending.get()[0]
+            except LookupError:
+                return original_root()
+
+        def append(path: Path, row: object) -> None:
+            try:
+                pending.get()[1].set()
+            except LookupError:
+                pass
+            original_append(path, row)
+
+        def start_recorder(command: list[str]) -> None:
+            log_root = original_root().absolute()
+            ready = threading.Event()
+            arguments = command[2:]
+
+            def write() -> None:
+                token = pending.set((log_root, ready))
+                try:
+                    _ = record.main(arguments)
+                finally:
+                    ready.set()
+                    pending.reset(token)
+
+            threading.Thread(target=write, name="hold-event-recorder", daemon=True).start()
+            # Resolve the row and its path before the caller can change its environment or cwd.
+            # Keep the module bindings unchanged while the file write continues.
+            _ = ready.wait()
+
+        _ = self.enterContext(mock.patch.object(record, "detach"))
+        _ = self.enterContext(mock.patch.object(store, "root", root))
+        _ = self.enterContext(mock.patch.object(store, "append_line", append))
+        _ = self.enterContext(mock.patch.object(build_hold, "start_recorder", start_recorder))
 
     def finish_writers(self) -> None:
         self.reap_recorders()
@@ -201,6 +247,6 @@ class IsolatedBuildHoldTest(unittest.TestCase):
     def reap_recorders(self) -> None:
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
-                # A recorder runs a short subprocess; under load it can take far longer than its usual second.
+                # Wait for each recorder before a test reads its rows or removes its files.
                 thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertFalse(thread.is_alive())

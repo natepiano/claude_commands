@@ -74,7 +74,7 @@ class TidyWrappedTests(unittest.TestCase):
     def state_files(self, production_name: str) -> tuple[Path, ...]:
         owner = self.owner(production_name)
         return tuple(self.write(path, "[]\n") for path in (
-            self.state / "footers-off" / owner.id, self.state / "review-paused" / f"{owner.id}.json",
+            self.state / "footers-off" / owner.id,
             self.state / "outstanding" / f"{owner.id}.json",
             self.state / owner.id / "log-backups" / "log-1.md"))
 
@@ -176,7 +176,7 @@ class TidyWrappedTests(unittest.TestCase):
         other = self.state_files("live")
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(result.stdout, "done: removed 4 state files\n")
+        self.assertEqual(result.stdout, "done: removed 3 state files\n")
         self.assertFalse(any(path.exists() for path in own))
         self.assertFalse((self.state / self.owner("done").id).exists())
         self.assertTrue(all(path.exists() for path in other))
@@ -332,7 +332,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_staff_name_matching_a_shared_folder_removes_only_its_owned_state(self) -> None:
         shared = [self.write(self.state / name / "keep", "shared state\n")
-                  for name in ("footers-off", "review-paused", "outstanding", "counts", "reports")]
+                  for name in ("footers-off", "outstanding", "counts", "reports")]
         other = self.state_files("live")
         for path in shared:
             with self.subTest(name=path.parent.name):
@@ -356,7 +356,7 @@ class TidyWrappedTests(unittest.TestCase):
         removed = self.state_files("done")
         result = self.run_tidy(self.doc("live", "running"), self.doc("done", "wrapped"))
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "done: removed 4 state files\n")
+        self.assertEqual(result.stdout, "done: removed 3 state files\n")
         self.assertTrue(all(path.exists() for path in kept))
         self.assertFalse(any(path.exists() for path in removed))
 

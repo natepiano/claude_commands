@@ -26,6 +26,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
 from scripts.lib import git_exclude
+from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -1054,7 +1055,7 @@ class TranscriptEntry(TypedDict, total=False):
 
 def transcript_lines_from_end(path: Path) -> Iterator[str]:
     """Read newest entries first without loading the whole conversation."""
-    with path.open("rb") as stream:
+    with open_transcript(path) as stream:
         offset = stream.seek(0, os.SEEK_END)
         pending = b""
         while offset:
@@ -1072,7 +1073,7 @@ def transcript_lines_from_end(path: Path) -> Iterator[str]:
 def transcript_model(session_id: str) -> str:
     """The newest real assistant model in the newest transcript for this session."""
     try:
-        matches = list((Path.home() / ".claude/projects").rglob(f"{session_id}.jsonl"))
+        matches = transcript_paths(Path.home() / ".claude/projects", f"**/{session_id}.jsonl")
         if not matches:
             return ""
         path = max(matches, key=lambda path: path.stat().st_mtime)

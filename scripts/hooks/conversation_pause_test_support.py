@@ -45,7 +45,7 @@ RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first a
 ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
 PAUSE_CONTEXT = (
     "Automatic updates for this session are paused while the user talks to you: "
-    "dailies. Leave them off; the session asks the user before they return. "
+    "status reports. Leave them off; the session asks the user before they return. "
     f"If the user asks for them back sooner, run: {RESUME}"
 )
 OTHER_ANSWER_CONTEXT = (

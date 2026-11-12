@@ -231,27 +231,6 @@ class UnknownFinish(NamedTuple):
     """The plan's completion time cannot yet be determined."""
 
 
-class CouldStart(NamedTuple):
-    """Waiting phases whose dependencies are all done."""
-
-    phases: tuple[str, ...]
-
-
-class NothingToStart(NamedTuple):
-    """No waiting phase can start; names what the first one waits on."""
-
-    reason: str
-
-
-class DependenciesUnknown(NamedTuple):
-    """Waiting phases with no `**Depends on:**` line in the plan."""
-
-    phases: tuple[str, ...]
-
-
-ParallelCheck = CouldStart | NothingToStart | DependenciesUnknown
-
-
 class PhaseRecord(NamedTuple):
     """The complete read-only phase view for one worker session."""
 
@@ -260,7 +239,6 @@ class PhaseRecord(NamedTuple):
     current: OpenPhase | NoOpenPhase
     phases: list[DonePhase | OpenPhase | TodoPhase]
     plan_finish: FinishedAt | PredictedFinish | UnknownFinish
-    parallel: ParallelCheck
 
 
 class InstanceFinished(NamedTuple):
@@ -590,74 +568,6 @@ def _open_instance(
     )
 
 
-def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
-    if not runs:
-        return set()
-    opened: dict[str, str] = {}
-    for event in runs[-1]:
-        event_type = _text(event.get("event_type"))
-        instance_id = _text(event.get("phase_instance_id"))
-        if event_type == "phase_started" and instance_id:
-            opened[instance_id] = _text(event.get("phase_id"))
-        elif event_type == "phase_finished":
-            _ = opened.pop(instance_id, None)
-    return set(opened.values())
-
-
-def _parallel_check(
-    phases: list[plan_history.PlanPhase], open_ids: set[str]
-) -> ParallelCheck:
-    states = {
-        phase["id"]: "done"
-        if phase["done"]
-        else "running"
-        if phase["id"] in open_ids
-        else "todo"
-        for phase in phases
-    }
-    waiting = [phase for phase in phases if states[phase["id"]] == "todo"]
-    unknown = tuple(phase["id"] for phase in waiting if phase["depends_on"] is None)
-    if unknown:
-        return DependenciesUnknown(unknown)
-    ready: list[str] = []
-    first_wait = ""
-    for phase in waiting:
-        unmet = [
-            f"Phase {needed} ({states.get(needed, 'not in the plan')})"
-            for needed in phase["depends_on"] or []
-            if states.get(needed) != "done"
-        ]
-        if not unmet:
-            ready.append(phase["id"])
-        elif not first_wait:
-            first_wait = f"Phase {phase['id']} needs {', '.join(unmet)}"
-    if ready:
-        return CouldStart(tuple(ready))
-    return NothingToStart(first_wait or "no phase is waiting")
-
-
-def parallel_line(check: ParallelCheck) -> str:
-    """The checkpoint notice's `Parallel:` line."""
-    if isinstance(check, CouldStart):
-        return f"Parallel: {', '.join(f'Phase {phase}' for phase in check.phases)} could start"
-    if isinstance(check, NothingToStart):
-        return f"Parallel: none — {check.reason}"
-    named = ", ".join(check.phases)
-    which = f"Phase {named} has" if len(check.phases) == 1 else f"Phases {named} have"
-    return (
-        f"Parallel: unknown — {which} no **Depends on:** line; "
-        + "add one under each phase heading and rerun"
-    )
-
-
-def session_parallel_line(session_dir: Path) -> str:
-    """The session's `Parallel:` line; ad hoc work after its plan's removal has no plan to read."""
-    try:
-        return parallel_line(build(session_dir).parallel)
-    except RemovedPlan as removed:
-        return f"Parallel: none — no plan at {removed.plan_path}; the run does ad hoc work"
-
-
 def _normalized_title(title: str) -> str:
     return " ".join(title.replace("`", "").casefold().split())
 
@@ -802,7 +712,7 @@ def _repair_rounds_started_after(
 def _instance_eta_events(
     runs: list[list[dict[str, object]]], instance: PhaseInstance
 ) -> list[dict[str, object]]:
-    """Keep pre-start promises, but exclude other runs and earlier attempts."""
+    """Keep promises before and during an instance, within its run."""
     for events in runs:
         start = next(
             (
@@ -835,8 +745,10 @@ def _instance_eta_events(
         for index in range(start + 1, last):
             event = events[index]
             if (
-                _text(event.get("event_type")) == "phase_started"
-                and _text(event.get("phase_id")) == instance.phase
+                (_text(event.get("event_type")) == "phase_started"
+                 and _text(event.get("phase_id")) == instance.phase)
+                or (_text(event.get("event_type")) == "phase_finished"
+                    and _text(event.get("phase_instance_id")) == instance.instance_id)
             ):
                 last = index
                 break
@@ -944,6 +856,11 @@ def _plan_finish(
         if isinstance(phase, TodoPhase)
         and isinstance(phase.times, PredictedPhaseTiming)
     )
+    projections.extend(
+        phase.eta_trail[-1][0]
+        for phase in phases
+        if isinstance(phase, OpenPhase | TodoPhase) and phase.eta_trail
+    )
     if projections:
         return PredictedFinish(max(projections))
     return UnknownFinish()
@@ -955,6 +872,10 @@ def _phase_history(
     row: DonePhase | OpenPhase | TodoPhase,
 ) -> PhaseHistory:
     instance_ids = {instance.instance_id for instance in instances}
+    prior_instances = [instance for instance in _phase_instances(runs)
+                       if instance.phase == row.phase] if not instances else []
+    prior_eta_events = {id(event) for instance in prior_instances
+                        for event in _instance_eta_events(runs, instance)}
     eta_events = {
         id(event)
         for instance in instances
@@ -966,10 +887,17 @@ def _phase_history(
     findings: dict[str, int] = dict.fromkeys(FINDING_SEVERITIES, 0)
     for events in runs:
         for index, event in enumerate(events):
-            if id(event) in eta_events:
+            if id(event) in eta_events or (
+                not instances
+                and event.get("event_type") == "eta_stated"
+                and event.get("eta_phase_id") == row.phase
+            ):
                 target = _moment(event.get("eta_at"))
                 stated = _moment(event.get("timestamp_epoch"))
-                if target is not None and stated is not None:
+                if target is not None and stated is not None and id(event) not in prior_eta_events and all(
+                    not isinstance(instance.finish, InstanceFinished) or instance.finish.at <= stated
+                    for instance in prior_instances
+                ):
                     trail.append((target, stated))
             if _text(event.get("phase_instance_id")) not in instance_ids:
                 continue
@@ -1041,7 +969,7 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
             record = staff.StaffSnapshot(())
         resolver = session_staff.RowResolver(record)
     try:
-        phases = plan_history.plan_phases(plan_path, resolver=resolver)
+        phases = plan_history.plan_phases(plan_path)
     except FileNotFoundError as error:
         raise RemovedPlan(plan_path) from error
     except (OSError, UnicodeError) as error:
@@ -1054,7 +982,6 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
         [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
-        open_ids=_open_phase_ids(current_run),
     )
 
 
@@ -1094,8 +1021,7 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
     ordered = finished + opened
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,
-         "done": isinstance(instance.finish, InstanceFinished),
-         "depends_on": None}
+         "done": isinstance(instance.finish, InstanceFinished)}
         for instance in ordered
     ]
     return _build_phase_record(
@@ -1111,11 +1037,9 @@ def _build_phase_record(
     run_events: list[list[dict[str, object]]],
     assigned: list[list[PhaseInstance]],
     open_instances: list[OpenPhaseInstance],
-    *, open_ids: set[str] | None = None,
 ) -> PhaseRecord:
     """Apply the same timing and history rules to plan and run phase rows."""
     open_instance = open_instances[-1] if open_instances else NoOpenPhase()
-    open_ids = _open_phase_ids(run_events) if open_ids is None else open_ids
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
     if isinstance(open_instance, OpenPhaseInstance):
@@ -1171,7 +1095,6 @@ def _build_phase_record(
                 instance_id=row_open.phase.instance_id,
             )
             rows.append(current)
-            open_ids.add(phase["id"])
         elif phase["done"]:
             rows.append(_done_phase(phase, related))
         else:
@@ -1268,7 +1191,6 @@ def _build_phase_record(
         current=current,
         phases=rows,
         plan_finish=_plan_finish(rows),
-        parallel=_parallel_check(phases, open_ids),
     )
 
 
@@ -1521,12 +1443,6 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         "plan_finish": plan_finish,
         "current": current_json,
         "phases": [_json_phase(row, zone) for row in record.phases],
-        "parallel": {
-            "could_start": list(record.parallel.phases)
-            if isinstance(record.parallel, CouldStart)
-            else [],
-            "line": parallel_line(record.parallel),
-        },
     }
 
 
@@ -1979,10 +1895,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = show_target.add_argument("--production-doc", type=Path)
     _ = show_parser.add_argument("--zone", default="")
     _ = show_parser.add_argument("--json", action="store_true")
-    parallel_parser = commands.add_parser(
-        "parallel", help="print the checkpoint notice's Parallel: line"
-    )
-    _ = parallel_parser.add_argument("--session-dir", type=Path, required=True)
     refresh_parser = commands.add_parser("refresh")
     _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
     prune_parser = commands.add_parser("prune")
@@ -2006,9 +1918,6 @@ def main() -> int:
     try:
         if command == "refresh":
             refresh(session_dir.expanduser().resolve())
-            return 0
-        if command == "parallel":
-            print(session_parallel_line(session_dir.expanduser().resolve()))
             return 0
         if command == "prune":
             if production_doc is None:

@@ -35,6 +35,23 @@ These logs have no pruning job.
 They remain until someone removes them.
 Older records without a `log` field have SQL NULL in that column.
 
+## Module start and end times
+
+Each executed module attempt records its wall-clock start and end in UTC ISO format.
+`gate_modules.module_started_at` and `gate_modules.module_ended_at` hold those times.
+`gate_modules.started_at` remains the gate run's start for existing keys and window queries.
+Older records have NULL module times because they did not record them.
+Results from older cloud boxes can omit these times.
+A cloud row with only one of the two times records neither.
+Jobs that never start also omit them.
+Index schema 40 rebuilds from the JSON lines without changing them.
+
+Order the latest run's module attempts with this query:
+
+```sh
+buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
+```
+
 ## Cloud gate route
 
 Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
@@ -388,7 +405,8 @@ Types, admission, isolated reruns, and later merge checks keep their existing be
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
 It runs all test modules and basedpyright over `NIGHTLY_TYPE_DIRS`, which names `scripts` and includes hooks.
 The 03:00 timer calls this path.
-Each exit sends `nightly.result`, or `nightly.not_run` when the checks could not start.
+Each green exit sends `nightly.result`.
+An exit before the checks start sends `nightly.not_run`.
 The result names the branch, finish time, type result and full test result.
 The failure text names the reason on one line within the message limit.
 Both pushes use need `note` and the key `nightly-result`.
@@ -396,7 +414,7 @@ The result requires no action. The failure text includes an action.
 The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
 Silence keeps only the newest push on that key and delivers it when silence ends.
 The gate reads `nightly_result_push` and `nightly_result_modules` from `config/merge_gate.conf` at use.
-`nightly_result_push=off` disables both texts. The default is `on`.
+`nightly_result_push=off` disables all nightly result pushes. The default is `on`.
 `nightly_result_modules=8` limits the failed test modules named before `and N more`.
 A push failure does not change the gate result, marker or showrunner notice.
 A run that never reaches merge_gate.py sends no push unless the timer script sends one.
@@ -410,9 +428,39 @@ The marker records the tree, UTC time and failed modules.
 While the marker exists, every merge gate runs all modules until a merge gate passes.
 An unreadable marker also requires all modules in a merge gate.
 A failure of only the type check removes an existing marker and does not require full test runs.
-Every red nightly tells the production's showrunner through the existing messaging path.
+Every red nightly waits for the result lock before it saves its result.
+It then notifies the production owner through the existing messaging path.
+`nightly_owner` selects the owner for both the standing checkout and the notice.
+The gate sends no red result push.
+`${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
+The record holds the branch, tree, finish time, failure lines, receipt time, assignment, and push acceptance.
+The receipt time records successful delivery to the production owner.
+An unconfirmed notice keeps its receipt state empty.
+The notice names the failed test files and includes the result ID.
+After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
+The command requires a unit director under sdlc.
+`UNIT` accepts the staff ID or the unit name.
+The command confirms receipt if the original notice has no delivery confirmation.
+It saves the assignment before it sends `nightly.assigned`.
+The push places the receipt and assignment status before the failure list.
+The phone retains that status when it truncates a long failure list.
+A rerun prints `unchanged` after the sender accepts the push.
+`merge_gate.py nightly-check` sends `nightly.unassigned` when an unassigned result reaches its deadline.
+`nightly_assign_minutes=30` sets that deadline in `config/merge_gate.conf`.
+The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
+It checks results before it restores terminal sessions.
+The fallback push states that sdlc has not assigned the fix yet.
+It reports an unconfirmed receipt when the sdlc notice failed.
+Assignment and fallback use the same file lock and push acceptance state.
+An assignment after a fallback push records the unit without another push.
+A failed send keeps the result pending for the next periodic check.
+Each red result uses the key `nightly-result:<id>`.
+The sender suppresses a second accepted push for the complete `datetime` range.
+This also prevents another push when the gate cannot save its acceptance state.
+Silence retains each red result separately.
+Green and not-run pushes keep the existing `nightly-result` key.
 The type-failure notice includes the first 20 diagnostic lines, the count of omitted lines, and the checker summary.
-Without a calling session, the gate finds the registered production for the merge branch.
+Without a calling session, the gate finds the registered production for the merge branch to select its standing checkout.
 `--production <showrunner name>` can name the production explicitly.
 A failed delivery prints its cause. A test failure keeps its marker after a failed delivery.
 
@@ -615,6 +663,77 @@ Checkpoint integration modules separate inputs, receipts, validation, promotion,
 Ordinary CLI cases use the real parser and handlers in-process.
 Git, executable stand-ins, and selected unit and child-handoff cases retain real subprocesses.
 
+### Queued checkpoint batches
+
+`merge_checkpoint.py --production <name> --batch <file>` lands queued checkpoints in file order.
+Each nonempty line holds the single command's item arguments as shell words.
+The shared parser requires each item's unit, phase, hash, start time, and applicable flags.
+Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge.
+The outer command refuses positional item arguments.
+A batch can contain one item.
+
+1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
+2. Check each item and make its own merge commit.
+3. Test all code paths changed from the published merge branch tip through HEAD once.
+4. Use one `tested_main_push` hold, one push, and one local promotion.
+5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+Shrink and as-built items add no test paths of their own.
+A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
+The published tip is `origin/<merge branch>`.
+An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
+Those paths still select tests when only shrink or as-built items remain.
+Main integration retains the existing retest rule before publication.
+Any item's `--cancel-prior` applies to the shared push.
+Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
+Each merge retains its own review ownership and completion record.
+
+A held or failed item before the push starts drops from the batch.
+Every later item from the same unit drops with it and receives a report that names the stopped item.
+The checkout returns to the starting tip before each retry.
+Retries continue until an attempt passes or no item remains.
+Each stopped attempt removes at least one item, so attempts never exceed the initial item count.
+Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
+Subjects without the closing-item format retain the configured plan.
+An ancestry hold names the first unmerged commit by its short hash and subject.
+Reset aborts an unfinished merge only when no merge was unfinished at batch start.
+An earlier unfinished merge and its staged edits remain unchanged.
+A red test identifies its items through the shared checkpoint test selector.
+Candidates are the code items that select a red command, or all code items when none selects it.
+When no code item remains, every remaining item is a candidate.
+One candidate drops directly.
+For multiple candidates, a binary search finds the first merge that makes the red commands fail.
+Each probe resets the checkout to a candidate's unpublished merge commit.
+It merges the same main commit that the red test tip holds, without another fetch.
+A conflict stops the search and drops every candidate.
+The probe selects test steps again from the batch paths at that tip.
+It runs only unresolved red steps that the tip still selects.
+A red step absent from that selection counts as green.
+Full tests and probes use the same runner and flake rules.
+The starting tip is treated as green; the last candidate is known red.
+Seven candidates need at most three probes.
+Each probe reports its item, merge commit, and green or red result.
+Each batch invocation clears its shared test log once before the first attempt.
+Full tests, probes, main retests, and all retries append to that log.
+The search restores the starting tip and drops the causing item and that unit's later items.
+A cancelled probe or another non-red stop drops every candidate with that stop.
+A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
+Already-merged items receive `resume it alone with the single command`.
+The push start is the boundary for drop, reset, and retry.
+Once the push starts, a failure drops no items and starts no batch reset or retry.
+Only `push_rollback` can undo a failed push after it checks the live origin.
+Each item receives the stop report.
+
+`test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
+It also covers unpublished paths after interruption and a wrapper failure after a successful push.
+The interruption rows include a shrink-only retry.
+The held-batch rows preserve an earlier unfinished merge and its staged edits.
+They also land a clean item after two holds and remove a held unit's later item.
+The history rows merge closing items for an older plan after the configured plan changes.
+The shared-red row uses two probes to identify the middle item and land the other two.
+The main-integration row keeps new main content at every probe and drops the first item.
+The package-rename row skips the renamed test at the earlier tip and drops the second item.
+
 Findings-ledger tests remain in `scripts/direct/test_findings.py`, with `findings_test_support.py` restoring one private fixture seed at the same path for each case. Commands execute the real CLI in-process with a fresh module namespace, so every invocation rereads configuration and all ledger, event, parser and locking code stays active. Stable-ID persistence across invocations and unusable-configuration cases retain real Python subprocesses. All original test bodies and assertions are retained.
 
 Conversation-pause hook behavior tests live in `scripts/hooks/test_conversation_pause.py`; `test_conversation_pause_processes.py` covers alarm budgets, executable exits and concurrent lock/delivery. Both use `conversation_pause_test_support.py` restoring a private fixture seed at the same path for each case. Synchronous behavior cases execute the real hook and CLI entry points and their current Python stand-ins in-process, with isolated input, output, environment, import-time fixture paths and signal handlers. Alarm-budget, concurrent lock/delivery and executable-error cases retain real processes; detached activity calls remain detached. Fixture release and activity waits use file events and a 600-second hang guard in `scripts/lib/test_hang_guard.py`. All original assertions are retained.
@@ -648,6 +767,9 @@ Each class builds a complete Git/worktree fixture once and restores a private co
 Synchronous CLI and formatter fixtures run their actual code in-process; a gate case retains the executable boundary.
 Concurrent refill tests release on observed lock contention and check committed tickets and disjoint files.
 
+The gate's main promotion takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) after its hold and release waits.
+It releases the lock after the local main push and before the Mac pull.
+
 ### Small fixes on main
 
 `commands/unit/fast_track.md` defines the fast-track exception for small fixes.
@@ -670,7 +792,9 @@ Snapshot ref writes and recovery ref deletes use one `update-ref --stdin` batch.
 The change took `test_fast_track` from 7,158 to 6,433 Git processes and the copies tests from 497 to 319 fetches.
 
 A successful check creates a `fast-track(<unit>): <why>` commit with `Fast-Track: <unit>`.
-`main_push_lock` protects its fast-forward push.
+The shared `scripts.lib.main_push_lock` helper protects the final fetch and fast-forward push.
+It also protects local promotion when fast-track calls that step.
+The fast check runs before these holds.
 A moved main causes another application and check within `max_push_attempts`.
 The command then promotes through the production's configured targets and restores the selected source changes.
 A refusal before publication exits 2.
@@ -700,12 +824,19 @@ Temporary checkouts use their own fetches and refs.
   - Inside the call it swaps `os.environ` (cleared, then set to `environment`), `sys.argv`, `sys.path` and cwd, and captures stdout and stderr.
   - Afterwards it restores those, the SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers, and the module's global bindings (`vars(module)`).
   - `SystemExit` becomes the return code; a string code is printed to stderr.
-  - With `production_state=True` it first imports `dailies_render` and `showrunners` in the caller's environment, then patches their import-time paths under the fixture HOME: `CHART_CONF`, `AGENTS_DIR`, `READINGS_LOG`; `CONFIG`, `NOTIFIER_STATE_DIR`, `SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, `SEND`.
+  - With `production_state=True`, it first imports `scripts.production.showrunners` in the caller's environment.
+    It then binds production registry paths and `note_file.AGENTS_DIR` to the fixture environment.
+    The registry paths are `CONFIG`, `NOTIFIER_STATE_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, and `SEND`.
 - `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout plus a bare origin per test class, with `GIT_CONFIG_GLOBAL=/dev/null`. `copy_to(checkout, origin)` copies both trees and repoints the remote, so each case has private refs, config, index and origin without re-running git setup.
 - Converted modules retain a `subprocess_cli=True` case for parsing, exit status, and executable behavior.
   `scripts.mac_test.test_offload` imports `scripts.production.cli_fixture` by package name.
 
-**Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes panes with session labels, pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
+**Session host fakes.** Production, message, and shutdown tests use `scripts/herdr/fake_herdr.py` through `HERDR_BIN`.
+They also use `scripts/production/fake_unit_host.py`.
+It supplies session labels, pane reads, and a fake `/proc`.
+See [herdr-adoption.md](herdr-adoption.md), Test doubles.
+Production suites such as `test_waiting.py` use these fixtures.
+The `ci_points` fake `gh` uses the `GH_STUB` shell and jq fixture in `test_ci_points.py`.
 
 **`scripts/production/test_add_showrunner.py`** keeps its launch, account, trust and registry cases in one module, sharing `add_showrunner_test_support.py`. Each class builds an account/tool seed once and restores private files and symlinks at the same paths before each case. Synchronous commands run the real parser and handlers through `invoke_cli`; the fixture's herdr/systemd, registry and message scripts run in process with their recorded arguments and file effects intact. Git and the fake herdr agent-start command remain subprocesses. One complete launch case and the unset poll-default check retain their Python subprocess boundaries. Registry retries use a controlled clock, recording the requested interval; dummy session processes block on a pipe until cleanup, instead of expiring after 60 seconds.
 
@@ -868,7 +999,15 @@ Lint scope runs in `test_verify_lint_scope.py` (workspace and package fix/judgme
 
 Step routing runs in `test_verify_step_routes.py` (admission and refusals), `test_verify_step_routes_lint.py` (formatting and Mac judgment), `test_verify_step_routes_helpers.py` (helpers after a local mend), `test_verify_step_routes_results.py` (declined, lost and invalid Mac replies), and `test_verify_step_routes_restart.py` (stopped local steps). They share `verify_step_routes_test_support.py`, which reuses the committed Mac fixture contract and builds the route tools once per class, restoring a private copy at the same path for each test. All original assertions, fake-tool observations and the final child-leak check remain. Real Bash routing, admission, record transitions and tool processes remain because the tests prove their process boundaries. Holds change at fake-tool events rather than elapsed intervals; private memory and interpreter state avoid unrelated admission and discovery waits. The 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs. The original module still exports the route stubs for token-wait tests.
 
-Unit status runs in `test_unit_status.py` (registered units, Claude liveness and tick health), `test_unit_status_decisions.py` (new and repeated user gates), `test_unit_status_routing.py` (showrunner and peer gate routing), and `test_unit_status_dailies.py` (pane activity, ETA lines and dailies flags). They share `unit_status_test_support.py`, which builds the copied script tree once per class and restores a private copy at the same paths for each scenario. Static fake-herdr responses are generated as shell dispatch tables with exact output bytes and argv logs; the real status shell, production lookup, session registry and pane readers still run as processes. Unique live registry processes wait for pipe EOF instead of a fixed sleep. Dailies parsing remains in-process. All original assertions remain; the 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
+Unit status tests cover registered units, Claude liveness, tick health, user gates, and routing.
+The modules are `test_unit_status.py`, `test_unit_status_decisions.py`, and `test_unit_status_routing.py`.
+They share `unit_status_test_support.py`.
+It builds one script tree per class and restores private copies at the same paths for each case.
+Shell dispatch tables supply exact fake-herdr replies and argument logs.
+The real status shell, production lookup, session registry, and pane readers remain subprocesses.
+Registry processes wait for pipe EOF during cleanup.
+The 600-second limit in `scripts/lib/test_hang_guard.py` detects hangs.
+Dailies parsing and its separate test module were retired on 2026-11-11.
 
 Example verification runs in `test_verify_untested_examples.py` (clean package) and `test_verify_example_acceptance.py` (accepted examples), `test_verify_example_markers.py` (test attributes and module files), `test_verify_example_manifest.py` (manifest refusal and diagnostic ordering), `test_verify_example_cache.py` (new tests invalidate passes) and `test_verify_example_edits.py` (edits during tests and session writes), `test_verify_example_dependencies.py` (dependency-scoped invalidation), and `test_verify_example_commands.py` (targeted tests and the removed verb), and `test_verify_example_final.py` (final command ordering). They share `verify_examples_test_support.py`, which seeds the private tools once per class and restores a copy at the original paths for every test. The seed pins the interpreter cache, marks its complete toolchain ready and matches its memory budget to its 64 GiB reading. Real Bash verification, Cargo metadata calls, command ordering and pass-cache writes remain exercised. Existing users of the unseeded workspace fixture keep their original lifecycle and environment through compatibility exports; the 600-second hang guard in `scripts/lib/test_hang_guard.py` only guards hangs.
 
@@ -884,7 +1023,9 @@ Example verification runs in `test_verify_untested_examples.py` (clean package) 
 
 - **pidfds stay readable** after the process exits; `wait_until` observes each one once and drops it.
 
-- **Import-time paths.** A module first imported under a fixture HOME computes its import-time paths from it, and restoring bindings then restores the fixture paths. Preload such modules before swapping the environment; `invoke_cli(production_state=True)` and `recorder_fixture.py` do this. Pinned by `test_dailies_render.py::ReportFooterTests::test_cold_imported_production_paths_return_to_the_callers_home_after_each_case`.
+- **Import-time paths.** A module computes its default paths when it is imported.
+  Import it before changing HOME to a fixture path.
+  `invoke_cli(production_state=True)` and `recorder_fixture.py` preserve caller paths this way.
 
 - **Bindings, not containers.** `invoke_cli` restores module bindings, not mutable containers in module globals.
 
@@ -942,7 +1083,8 @@ Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes befor
 
 Tree watcher scope coverage remains in `scripts/direct/test_tree_watch.py`, with `tree_watch_test_support.py` owning one Git fixture seed per class, including the two nested Cargo workspace layouts, and private copies restored at the same paths per test. Key CLI calls run in-process; scope tests run the real watcher loop with an event-controlled sleep, completing explicit snapshot iterations instead of waiting through fixed intervals. All Git snapshots and file publication stay real, and the parent-exit test keeps a real watcher process. Negative checks require two completed observations and a live watcher, followed by the original positive-change proof; the original 2.5-second change and parent-exit bounds remain. Only non-speed setup and cleanup waits use the named 600-second hang guard in `scripts/lib/test_hang_guard.py`.
 
-Dailies input coverage remains in `scripts/production/test_dailies_input.py`, with `dailies_input_test_support.py` building the production document, Git checkout and origin, status, judgment, fake tools and environment once per class. Each test gets private files and Git metadata restored at the seed's original paths. Renderer, ETA-request, review-watch, phase-table and style-ledger commands run their real parsers and handlers in-process; their output, state changes, Git commands and SQLite ledger remain real. The two builder subprocess smoke calls remain. All test bodies and assertions are retained unchanged; this fixture has no fixed sleeps or polling intervals.
+2026-11-11: Dailies input, rendering, and their dedicated test fixtures were retired.
+Use [/showrunner:units](../../commands/showrunner/units.md) to read current unit status.
 
 ## Cloud gate resource names
 

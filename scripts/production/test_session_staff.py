@@ -10,12 +10,11 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, fixture_session, unit_membership
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.pane_launch import PaneLaunch
 
@@ -59,14 +58,20 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
         self.assertEqual(self.staff_state(), before)
 
-    def test_missing_roster_read_creates_nothing_and_a_writer_creates_the_folder(self) -> None:
-        path = self.root / "missing/run/mesh_roster.json"
-        self.assertEqual(labels.read_worker_roster(path), {})
-        self.assertFalse(path.parent.parent.exists())
-        with worker_lifecycle.locked_state(path) as handle:
-            handle.publish('{}')
-        self.assertEqual(path.read_text(), '{}')
-        self.assertEqual(labels.read_worker_roster(path), {})
+    def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
+        fixture = self.row_production()
+        showrunner_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        rows = (fixture.runner, fixture.unit, fixture.worker)
+        before = self.staff_state()
+        for state, membership, expected in (
+            ({"owner_staff_id": fixture.unit.id}, rows, (fixture.worker,)),
+            ({"owner_staff_id": fixture.runner.id}, (*rows[:-1], showrunner_worker), (showrunner_worker,)),
+            ({"main_agent": {"session_id": fixture.unit.current_session}}, rows, (fixture.worker,)),
+            ({}, rows, ()),
+        ):
+            with self.subTest(state=state):
+                self.assertEqual(labels.run_workers(state, staff.StaffSnapshot(membership)), expected)
+        self.assertEqual(self.staff_state(), before)
 
 
     def test_codex_launch_membership_keeps_its_native_environment_without_a_claude_identity(self) -> None:
@@ -78,6 +83,7 @@ class StatusDiscoveryTests(StaffTestCase):
                                    {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
         launch["environment"] = {"CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(launch)).path),
                                  "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
+        fixture_session(fixture.unit.current_session, staff.CodexBackend(self.root / ".codex2"))
         names = LaunchNames(staff.snapshot())
         before = self.staff_state()
         self.assertEqual(names.environment(launch), {
@@ -106,6 +112,7 @@ class StatusDiscoveryTests(StaffTestCase):
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
             {}, ["claude", "--model", "sonnet"])
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
         with mock.patch.object(pane_record, "launches", return_value=[]):
             saved = labels.record_membership(entry)
             self.assertEqual(saved, entry)
@@ -283,7 +290,7 @@ class StatusDiscoveryTests(StaffTestCase):
         morty = fixture_runtime_id("retained-pane-morty")
         from scripts.message import codex_daemon
 
-        sessions = [codex_daemon.DaemonSession(morty, "morty", str(self.root), "idle")]
+        sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
 
         def configured_morty(identity: str) -> bool:
             return identity == morty
