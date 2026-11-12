@@ -15,7 +15,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import remote
 
 from scripts.production import session_labels, session_staff, staff, unit_config
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
 
 class NativeSessionLabelTests(StaffTestCase):
@@ -48,6 +48,7 @@ class NativeSessionLabelTests(StaffTestCase):
 
         fixture = self.row_production()
         self.assertNotEqual(fixture.unit.id, fixture.unit.current_session)
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
         names = LaunchNames(staff.snapshot())
         launch = pane_record.launch("w1:p1", fixture.unit.id, str(fixture.worktree),
             {"STAFF_ID": fixture.unit.id, "SHOWRUNNER_" + "UNIT": "old", "ENABLE_TOOL_SEARCH": "true"},
