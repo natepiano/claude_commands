@@ -31,7 +31,7 @@ from scripts.production import fake_unit_host
 from scripts.message.sessions import SessionRecord
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership
 from scripts.production.cli_fixture import invoke_cli
-from scripts.message import sessions as runtime_sessions
+from scripts.message import session_records
 from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("session_pane.py")
@@ -111,7 +111,7 @@ class SessionPaneTests(unittest.TestCase):
         def live(record: SessionRecord) -> bool:
             return record["pid"] == 998042 or original_live(record)
 
-        for module in (sessions, runtime_sessions):
+        for module in (sessions, session_records):
             _ = self.enterContext(mock.patch.object(module, "process_start", side_effect=started))
             _ = self.enterContext(mock.patch.object(module, "running_session", side_effect=running))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", side_effect=live))
