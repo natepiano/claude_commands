@@ -712,7 +712,7 @@ def _repair_rounds_started_after(
 def _instance_eta_events(
     runs: list[list[dict[str, object]]], instance: PhaseInstance
 ) -> list[dict[str, object]]:
-    """Keep pre-start promises, but exclude other runs and earlier attempts."""
+    """Keep promises before and during an instance, within its run."""
     for events in runs:
         start = next(
             (
@@ -745,8 +745,10 @@ def _instance_eta_events(
         for index in range(start + 1, last):
             event = events[index]
             if (
-                _text(event.get("event_type")) == "phase_started"
-                and _text(event.get("phase_id")) == instance.phase
+                (_text(event.get("event_type")) == "phase_started"
+                 and _text(event.get("phase_id")) == instance.phase)
+                or (_text(event.get("event_type")) == "phase_finished"
+                    and _text(event.get("phase_instance_id")) == instance.instance_id)
             ):
                 last = index
                 break
@@ -854,6 +856,11 @@ def _plan_finish(
         if isinstance(phase, TodoPhase)
         and isinstance(phase.times, PredictedPhaseTiming)
     )
+    projections.extend(
+        phase.eta_trail[-1][0]
+        for phase in phases
+        if isinstance(phase, OpenPhase | TodoPhase) and phase.eta_trail
+    )
     if projections:
         return PredictedFinish(max(projections))
     return UnknownFinish()
@@ -865,6 +872,10 @@ def _phase_history(
     row: DonePhase | OpenPhase | TodoPhase,
 ) -> PhaseHistory:
     instance_ids = {instance.instance_id for instance in instances}
+    prior_instances = [instance for instance in _phase_instances(runs)
+                       if instance.phase == row.phase] if not instances else []
+    prior_eta_events = {id(event) for instance in prior_instances
+                        for event in _instance_eta_events(runs, instance)}
     eta_events = {
         id(event)
         for instance in instances
@@ -876,10 +887,17 @@ def _phase_history(
     findings: dict[str, int] = dict.fromkeys(FINDING_SEVERITIES, 0)
     for events in runs:
         for index, event in enumerate(events):
-            if id(event) in eta_events:
+            if id(event) in eta_events or (
+                not instances
+                and event.get("event_type") == "eta_stated"
+                and event.get("eta_phase_id") == row.phase
+            ):
                 target = _moment(event.get("eta_at"))
                 stated = _moment(event.get("timestamp_epoch"))
-                if target is not None and stated is not None:
+                if target is not None and stated is not None and id(event) not in prior_eta_events and all(
+                    not isinstance(instance.finish, InstanceFinished) or instance.finish.at <= stated
+                    for instance in prior_instances
+                ):
                     trail.append((target, stated))
             if _text(event.get("phase_instance_id")) not in instance_ids:
                 continue

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -116,24 +117,42 @@ class LoaderTests(unittest.TestCase):
 class MechanicalProofTests(unittest.TestCase):
     repo: Path = Path()
     base: str = ""
+    repository_seed: Path = Path()
+    seed_base: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mechanical-seed-")))
+        cls.repository_seed = root / "sample"
+        cls.repository_seed.mkdir()
+        home = root / "home"
+        home.mkdir()
+        fixture = cls(methodName="runTest")
+        fixture.repo = cls.repository_seed
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            _ = fixture.git("init", "-q", "--initial-branch=main")
+            _ = fixture.git("config", "user.name", "Class tests")
+            _ = fixture.git("config", "user.email", "classes@example.invalid")
+            _ = fixture.git("config", "commit.gpgsign", "false")
+            # Detached maintenance can write objects after a test ends.
+            _ = fixture.git("config", "maintenance.auto", "false")
+            _ = fixture.git("config", "gc.auto", "0")
+            fixture.write("Cargo.toml", MANIFEST)
+            fixture.write("src/lib.rs", "mod other;\n\npub fn read() -> usize { 1 }\n\n" + TESTS)
+            fixture.write("src/other.rs", "pub(crate) fn more() -> usize { 2 }\n")
+            cls.seed_base = fixture.commit()
 
     @override
     def setUp(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-home-")))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)})))
         _ = self.enterContext(private_class_catalog(home))
-        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-classes-")))
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("config", "user.name", "Class tests")
-        _ = self.git("config", "user.email", "classes@example.invalid")
-        _ = self.git("config", "commit.gpgsign", "false")
-        # A detached auto maintenance after a commit can still write objects while the folder is removed.
-        _ = self.git("config", "maintenance.auto", "false")
-        _ = self.git("config", "gc.auto", "0")
-        self.write("Cargo.toml", MANIFEST)
-        self.write("src/lib.rs", "mod other;\n\npub fn read() -> usize { 1 }\n\n" + TESTS)
-        self.write("src/other.rs", "pub(crate) fn more() -> usize { 2 }\n")
-        self.base = self.commit()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mechanical-classes-")))
+        self.repo = root / "sample"
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
+        self.base = self.seed_base
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
