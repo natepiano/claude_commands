@@ -22,6 +22,7 @@ Apply only the cited contracts from `commands/unit/direct.md`; do not enter its 
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` |
 | <WritePromptContract/>, <MergeWorkerCommands/>, <MergeWorkerPaths/> | `docs/direct/write_prompt_contract.md` |
 | <AuthorizationContract/> | `docs/direct/authorization.md` |
+| <RestartTakeover/> | `docs/direct/restart_takeover.md` |
 
 Apply <MergeCheckpoint/>, <CIPoint/>, and <PromoteMain/> from `commands/showrunner/produce.md` at their named steps.
 
@@ -188,25 +189,10 @@ Send the final `send <unit>:` result under <MergeCheckpoint/> through the author
 ## Recovery
 
 <MergeRecovery>
-Recover the existing run before new dispatches after startup, restart, compaction, account move, or rename.
-
-1. Receive saved messages for the director's agent:
-
-   - Claude: `scripts/message/send.py pending`.
-   - Codex: `scripts/message/send.py pending "codex:$CODEX_THREAD_ID"`.
-2. Inspect workers with `scripts/production/worker.py list --json`.
-3. Read each held run's dispatch replies and `detached_runs` records.
-4. Reconcile each held run once with `scripts/agents/detached_runs.py reap --session-dir <run>`.
-5. Restore active workers with `scripts/production/worker.py restore`.
-6. Read every unaccepted reply before deciding what to repeat.
-7. Verify the resulting commit, push receipt, gate record, or artifact under <MergeResults/>.
-8. Resume only the authorized work that the evidence proves incomplete.
-
-Keep busy workers and live remote builds running.
-Preserve unknown worker states and report the missing evidence.
-Keep the same worker and dispatch identity during recovery.
-Use the saved launcher receipt before resubmitting any prompt.
-An absent local supervisor does not prove that a remote build or push stopped.
+Apply <RestartTakeover/> before new merge dispatches.
+Compare each operation's evidence with its authorized order under <MergeResults/>.
+Use the saved launcher receipt before resubmitting a prompt.
+Resume pending publication only within the order's destination authorization.
 </MergeRecovery>
 
 ## Reporting

@@ -179,7 +179,8 @@ class RefusalWatchTests(unittest.TestCase):
             return record
         return staff.StaffSnapshot(tuple(staff.StaffRow(
             staff.StaffId(owner["session_id"]), owner["kind"], owner["name"], staff.StaffRoot(),
-            current_session=staff.StaffId(owner["session_id"]))
+            current_session=staff.StaffId(owner["session_id"]),
+            unit_type=staff.UnitDetails("direct") if owner["kind"] == "unit" else staff.NotUnit())
             for owner in self.owners if owner["kind"] in ("unit", "showrunner")))
 
     def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
@@ -2423,8 +2424,8 @@ class RefusalWatchTests(unittest.TestCase):
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         roles = [row.split("|")[3].strip() for row in rows]
-        self.assertIn("units 1 (busy 0, idle 1, paused 0, exited 0)", roles)
-        self.assertIn("showrunners 1 (busy 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("units 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("showrunners 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
         self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 

@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from contextlib import closing
 from pathlib import Path
 from typing import Protocol, TypedDict, cast, final, override
@@ -494,6 +495,7 @@ class AddStyleTests(unittest.TestCase):
             self.assertNotIn("**Pilot scope:**", text)
             self.assertIn(f"global:rust/{family}.md", text)
             self.assertIn("~/.claude/docs/style_production.md", text)
+            self.assertIn(f"--production sample-style sample-style-{family} --unit-type style", text)
             self.assertNotIn("### Phase", text)
             for verb in ("check", "test", "lint"):
                 self.assertIn(f"verify.sh {verb} [<package>]", text)
@@ -737,6 +739,13 @@ class AddStyleTests(unittest.TestCase):
             mock.patch.object(add_unit, "remote_head", return_value=""),
         ):
             ready = add_unit.preflight(request, NamedAccount("test", self.root / "account"))
+            for unit_type in ("direct", "style"):
+                with self.subTest(unit_type=unit_type):
+                    selected = add_unit.preflight(replace(request, unit_type=unit_type),
+                                                  NamedAccount("test", self.root / "account"))
+                    self.assertEqual(add_unit.prompt_for(selected.launch), f"/unit:{unit_type} {plan}")
+                    command = SCRIPT.parents[2] / f"commands/unit/{unit_type}.md"
+                    self.assertTrue(command.is_file())
 
         self.assertEqual(ready.launch.plan_path, plan)
         self.assertEqual(ready.launch.identity.unit, "sample-style-names")
