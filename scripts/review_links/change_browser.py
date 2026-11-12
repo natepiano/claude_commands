@@ -13,7 +13,9 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
-from scripts.production import change_review, change_routing, staff
+from scripts.production import change_review, change_routing, staff, update_registration
+from scripts.production.production_doc import read_production
+from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
@@ -39,9 +41,23 @@ class WaitingChange:
 
 
 @dataclass(frozen=True)
+class WaitingQuestion:
+    """A filed question stays in its owning production's review tab."""
+
+    key: str
+    tab: str
+    record: update_registration.QuestionRecord
+    production: Path | update_registration.QuestionOwnerUnavailable
+    owner: staff.StaffId
+    asker: str
+
+
+@dataclass(frozen=True)
 class PreparedReviews:
     changes: tuple[WaitingChange, ...]
     queues: dict[str, change_review.ChangeQueue]
+    questions: tuple[WaitingQuestion, ...]
+    question_tabs: tuple[str, ...]
 
 
 def page_at(root: Path, path: str) -> ReviewBrowser:
@@ -126,14 +142,36 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         changes.extend(item for item in items if not item.waiting)
         queues[tab] = prepared
     queues = dict(sorted(queues.items(), key=lambda item: not item[1].entries))
-    return PreparedReviews(tuple(changes), queues)
+    identities = update_registration.QuestionStaff.for_record(routing.record)
+    questions: list[WaitingQuestion] = []
+    for document, lines in routing.document_lines.items():
+        for question in update_registration.question_records_for_document(document, identities, include_unrouted=True, lines=lines):
+            if question.status != "open":
+                continue
+            owner = routing.runners.get(question.owner)
+            tab = owner.name if owner is not None else "unrouted"
+            asker = routing.record.by_id(question.asker)
+            questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
+                tab, question, document, question.owner, asker.name if asker is not None else str(question.asker)))
+    known = {item.record.path for item in questions}
+    for question in update_registration.unowned_question_records(identities):
+        if question.status != "open" or question.path in known:
+            continue
+        asker = routing.record.by_id(question.asker)
+        questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
+            "unrouted", question, update_registration.QuestionOwnerUnavailable(question.path), question.owner,
+            asker.name if asker is not None else str(question.asker)))
+    questions.sort(key=lambda item: (item.record.item["since"], item.key))
+    question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
+                                 key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
+    return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs)
 
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
-        return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
+        return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
@@ -142,7 +180,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
-    return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
+    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)} · {html.escape(row.get('Merged', ''))}</div>
 <h1>{html.escape(row.get('Change', ''))}</h1>
@@ -151,19 +189,39 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
 
 
+def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
+    key = html.escape(question.key)
+    form = '<p>No showrunner owns this question.</p>' if question.tab == "unrouted" else f'''<form method="post" action="{change_page.PAGE_NAME}">
+<input type="hidden" name="row" value="{key}">
+<input type="hidden" name="token" value="{row_token(browser, question.key)}">
+<label for="answer-{key}">Answer</label><textarea id="answer-{key}" name="feedback" rows="{feedback_rows}"></textarea>
+<button name="outcome" value="answer">Save answer</button></form>'''
+    return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
+<p class="kind">Question</p><h1>{html.escape(question.record.item["text"])}</h1>
+{change_page.review_text_html(question.record.item.get("question", ""))}
+<p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
+
+
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
     prepared = prepare(browser, status)
-    tabs = ''.join(f'<button type="button" role="tab" data-showrunner="{html.escape(tab)}">'
+    tabs = ''.join(f'<button type="button" role="tab" data-type="changes" data-showrunner="{html.escape(tab)}">'
                    + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
                    for tab in prepared.queues)
+    question_tabs = ''.join(f'<button type="button" role="tab" data-type="questions" data-showrunner="{html.escape(tab)}">'
+        + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab for item in prepared.questions)}</span>)</button>'
+        for tab in prepared.question_tabs)
+    type_tabs = ('<nav role="tablist" aria-label="Review type">'
+        + f'<button type="button" role="tab" data-review-type="questions">Questions (<span data-type-count="questions">{len(prepared.questions)}</span>)</button>'
+        + f'<button type="button" role="tab" data-review-type="changes">Changes (<span data-type-count="changes">{sum(item.waiting for item in prepared.changes)}</span>)</button></nav>')
     content = ('''<style>[hidden]{display:none!important}nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:8px}
 nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
 section+section{border:0;margin:0;padding:0}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
-</style><h1>Changes to review</h1><nav role="tablist" aria-label="Showrunner">''' + tabs + '</nav>'
+</style><h1>Changes to review</h1>''' + type_tabs + '<nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav>'
                + ''.join(section(item, feedback_rows) for item in prepared.changes)
-               + '<p data-left></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
+               + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
+               + '<p data-total></p><p data-left></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
                + '<noscript>Enable JavaScript to review changes and use Next.</noscript>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
     return change_page.document(content)
@@ -177,6 +235,13 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
     if not secrets.compare_digest(fields["token"][0].encode(), row_token(browser, key).encode()):
         raise change_page.AnswerRefused("row or page token does not match this page")
     prepared = prepare(browser, status)
+    if key.startswith("question/"):
+        question = next((item for item in prepared.questions if item.key == key), None)
+        if question is None:
+            raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
+        if fields["outcome"] != ["answer"] or not fields["feedback"][0].strip():
+            raise change_page.AnswerRefused("enter an answer")
+        return submit_question(question, fields["feedback"][0], status)
     found = next((item for item in prepared.changes if item.key == key), None)
     if found is None:
         # A repeated save uses its original signed token.
@@ -210,27 +275,78 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
     return delivery, answer
 
 
+def submit_question(question: WaitingQuestion, answer: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+    """Save through the production API before the existing sender delivers the answer."""
+    if question.tab == "unrouted":
+        raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
+    identities = update_registration.QuestionStaff.read()
+    production = read_production(question.owner, identities.record)
+    item = question.record.item
+    relay = update_registration.answer_relay(production, production.name,
+        update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
+    recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+    message = "From the user (via the review page): " + item["text"]
+    if relay.unit:
+        message += "\nFor: " + relay.unit
+    message += "\n" + answer
+    saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(production.doc),
+        "owner": question.owner, "question": item["text"], "answer": answer, "message": message}
+    page = change_page.UserQuestionPage(question.record.path, production.doc, (question.record.path.stem,), "", saved)
+    # The delivery lock prevents startup recovery from reading an answer during its save.
+    with status.locked():
+        if frontmatter(question.record.path).get("status") != ["open"]:
+            raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
+        attempt = secrets.token_hex()
+        intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
+        status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+        try:
+            relay = update_registration.answer(production, item["text"], identities=identities, only_open=True)
+            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+            intent = replace(intent, recipients=(recipient,))
+            page = replace(page, saved={**saved, "saved": True})
+            status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+        except BaseException as error:
+            try:
+                status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
+            finally:
+                _ = status.request_attempts.pop(attempt, None)
+            if isinstance(error, update_registration.RegistrationFailure):
+                raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
+            raise
+    return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
+
+
 SCRIPT = r'''
 const rows=[...document.querySelectorAll('section[data-key]')];
-const tabs=[...document.querySelectorAll('[data-showrunner]')];
+const allTabs=[...document.querySelectorAll('[data-showrunner]')];
+const types=[...document.querySelectorAll('[data-review-type]')];
+const total=document.querySelector('[data-total]');
 const next=document.querySelector('[data-next]'), left=document.querySelector('[data-left]');
-const remembered=new Map(); let current=null, tab='', navigation=0, shownHash='';
-function waiting(){return rows.filter(r=>r.dataset.tab===tab && r.dataset.pending==='true');}
+const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
+function waiting(){return rows.filter(r=>r.dataset.type===kind && r.dataset.tab===tab && r.dataset.pending==='true');}
 function show(){
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
+ kind=place.get('type') || rows.find(r=>r.dataset.key===requested)?.dataset.type || (rows.some(r=>r.dataset.type==='questions') ? 'questions' : 'changes');
+ const tabs=allTabs.filter(t=>t.dataset.type===kind);
+ types.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.reviewType===kind));
+  t.querySelector('[data-type-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.reviewType && r.dataset.pending==='true').length;});
+ allTabs.forEach(t=>t.hidden=t.dataset.type!==kind);
  tab=place.get('showrunner') || rows.find(r=>r.dataset.key===requested)?.dataset.tab || tabs[0]?.dataset.showrunner;
  if(!tabs.some(t=>t.dataset.showrunner===tab)) tab=tabs[0]?.dataset.showrunner;
- current=rows.find(r=>r.dataset.key===requested && r.dataset.tab===tab) || waiting()[0] || null;
+ current=rows.find(r=>r.dataset.key===requested && r.dataset.tab===tab && r.dataset.type===kind) || waiting()[0] || null;
  rows.forEach(r=>r.hidden=r!==current);
- tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab));
-  t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
- left.textContent=waiting().length+' changes left'; next.hidden=waiting().length===0;
- if(current) remembered.set(tab,current.dataset.key);
- const hash=new URLSearchParams({showrunner:tab || '',row:current?.dataset.key || ''});
- history.replaceState(null,'','#'+hash); shownHash=location.hash; }
-function go(key){navigation++;location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
-tabs.forEach(t=>t.addEventListener('click',()=>{tab=t.dataset.showrunner;go(remembered.get(tab));}));
+ tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab && t.dataset.type===kind));
+  t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.type && r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
+ left.textContent=waiting().length+' '+kind+' left'; total.textContent=rows.filter(r=>r.dataset.pending==='true').length+' waiting'; next.hidden=waiting().length===0;
+ if(current) remembered.set(kind+'/'+tab,current.dataset.key);
+ const hash=new URLSearchParams({type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
+ places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
+function go(key){navigation++;location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
+allTabs.forEach(t=>t.addEventListener('click',()=>{tab=t.dataset.showrunner;go(remembered.get(kind+'/'+tab));}));
+types.forEach(t=>t.addEventListener('click',()=>{navigation++;kind=t.dataset.reviewType;
+ location.hash=places.get(kind) || new URLSearchParams({type:kind});show();}));
 function advance(row){
  const at=rows.indexOf(row), candidates=waiting();
  const following=candidates.find(r=>rows.indexOf(r)>at) || candidates[0];

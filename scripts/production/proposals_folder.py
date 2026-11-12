@@ -27,12 +27,13 @@ def ledger(doc: Path) -> Path | None:
         return None
 
 
-def issues_folder(doc: Path) -> Path | None:
+def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
     """Return the configured folder, or None when the document has no proposals field."""
-    try:
-        lines = doc.read_text(encoding="utf-8").splitlines()
-    except UnicodeError as error:
-        raise OSError(f"{doc}: {error}") from error
+    if lines is None:
+        try:
+            lines = doc.read_text(encoding="utf-8").splitlines()
+        except UnicodeError as error:
+            raise OSError(f"{doc}: {error}") from error
     try:
         folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
     except Refusal:

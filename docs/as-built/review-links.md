@@ -83,6 +83,43 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Questions and Changes
+
+The review page has Questions and Changes type tabs with waiting counts.
+The global waiting count includes both types.
+Each type has staff-based showrunner tabs and one card at a time.
+Switching types retains each type's selected showrunner and card.
+The URL fragment records the type, showrunner, and card.
+Next skips a card without saving an answer.
+
+Questions read the canonical records through `update_registration.question_records_for_document`.
+A question belongs to the showrunner whose record owns it.
+A question without a staff owner uses `unrouted`.
+The reader also scans question folders under the showrunner state root when their owners leave staff.
+Owned cards show the one-line text, full filed text, choices, asker, and an answer box.
+An `unrouted` card shows the question and `No showrunner owns this question.`
+It has no answer form, and the server refuses an answer.
+It has no Validate yourself or Ask a question controls.
+`update_registration.answer` records the answer for its owning production.
+The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
+A unit relay receives the answer directly.
+A transferred unit's showrunner receives the answer with the unit's name.
+An answer without a relay goes to the question's showrunner.
+Each message starts with `From the user (via the review page): ` and names the question.
+
+A saved answer shows **Saved: <answer>** and opens the next waiting question.
+A failed save retains the typed answer and its error.
+An answer to a question already answered elsewhere fails without sending another message.
+Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.
+Private delivery records retain the answer text, message, source record, owning document, and fixed recipient ids for recovery.
+The first delivery record stores `saved: false` before the answer saves.
+The second delivery record stores `saved: true` after the answer saves.
+A save error clears that attempt's delivery intent and releases its claim.
+Recovery sends only answers with `saved: true` whose canonical question record is closed.
+Recovery clears an intent for an open question.
+For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
+The Changes tab retains its existing cards, controls, and count rules.
+
 ### Answering a change review
 
 `change_page.py` publishes one page with every waiting change from every configured showrunner list.
