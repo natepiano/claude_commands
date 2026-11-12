@@ -23,7 +23,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
@@ -166,7 +166,7 @@ class FolderMoveBackend:
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         entry = pane_record.read(self.session)[pane]
-        self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
+        self.fixture.assertIn(pane_launch.reference_id(entry), (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:

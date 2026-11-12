@@ -498,7 +498,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 pane = panes[0]
                 source_pane = pane_launch.ResumeSourcePane(str(pane["pane_id"]))
                 if (row.kind != "producer" and source_client.session == client.session
-                        and (original is None or original["cwd"] == str(folder))
                         and pane.get("terminal_id")
                         and (pane in evidence.scan.found.get(row.id, ())
                              or isinstance(client.pane_activity(str(pane["pane_id"])), herdr.PaneAtShell))):
