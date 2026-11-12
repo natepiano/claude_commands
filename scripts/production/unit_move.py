@@ -666,9 +666,42 @@ def require_outside_run_paths(runs: FolderMoveRuns, folder: Path) -> None:
             raise RenameRefused(f"run path is inside the worktree: {path.resolve()}")
 
 
+class DirectorMoveProcesses(NamedTuple):
+    """Keep the proved director and its pane ancestors through one folder move."""
+    roots: frozenset[int]
+    pane_ancestors: frozenset[int]
+
+
+class DirectorMoveRead(Enum):
+    CURRENT = "read the director processes"
+
+
+def _director_move_processes(row: staff.StaffRow) -> DirectorMoveProcesses:
+    roots: frozenset[int] = frozenset()
+    try:
+        observed = herdr.read_conversation(str(row.current_session))
+        if isinstance(observed, herdr.LiveConversation) and len(observed.pids) == 1:
+            pid = observed.pids[0]
+            if herdr.native_process(pid, observed.kind).current_identity == row.current_session:
+                roots = frozenset({pid})
+                place = herdr.herdr_place_of(pid)
+                if isinstance(place, herdr.HerdrPlace):
+                    shell = pane_record.pane_shell_pid(place)
+                    ancestors: set[int] = set()
+                    while pid > 1 and pid not in ancestors:
+                        ancestors.add(pid)
+                        if pid == shell:
+                            return DirectorMoveProcesses(roots, frozenset(ancestors))
+                        pid = pane_record.process_parent(pid)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+        pass
+    return DirectorMoveProcesses(roots, frozenset())
+
+
 def move_processes_inside(row: staff.StaffRow, folder: Path, *,
-                          preserved_workers: Iterable[staff.StaffRow] = ()) -> list[int]:
-    """Keep worker trees blocking before excluding the caller and the proved director tree."""
+                          preserved_workers: Iterable[staff.StaffRow] = (),
+                          director: DirectorMoveProcesses | DirectorMoveRead = DirectorMoveRead.CURRENT) -> list[int]:
+    """Keep worker trees blocking while excluding the caller and the proved director pane chain."""
     processes = processes_inside(folder)
     if not processes:
         return []
@@ -687,15 +720,7 @@ def move_processes_inside(row: staff.StaffRow, folder: Path, *,
         return found
 
     caller = ancestors(os.getpid())
-    director: set[int] = set()
-    try:
-        observed = herdr.read_conversation(str(row.current_session))
-        if isinstance(observed, herdr.LiveConversation) and len(observed.pids) == 1:
-            pid = observed.pids[0]
-            if herdr.native_process(pid, observed.kind).current_identity == row.current_session:
-                director.add(pid)
-    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
-        pass
+    director = _director_move_processes(row) if isinstance(director, DirectorMoveRead) else director
     workers: set[int] = set()
     for member in preserved_workers:
         try:
@@ -718,9 +743,9 @@ def move_processes_inside(row: staff.StaffRow, folder: Path, *,
         if workers.intersection(lineage):
             blocking.append(pid)
             continue
-        if pid in caller:
+        if pid in caller or pid in director.pane_ancestors:
             continue
-        if not director.intersection(lineage):
+        if not director.roots.intersection(lineage):
             blocking.append(pid)
     return blocking
 
@@ -877,7 +902,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         require_outside_run_paths(runs, old)
         if folder != old:
             require_outside_run_paths(runs, folder)
-        if work := running_work(row, record, folder, runs, move_processes_inside(row, folder)):
+        director = _director_move_processes(row)
+        if work := running_work(row, record, folder, runs, move_processes_inside(row, folder, director=director)):
             print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")
             return False
         if not folder.exists():
@@ -963,7 +989,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             current = staff.snapshot()
             runs = folder_move_runs(row, current)
             require_outside_run_paths(runs, folder)
-            work = list(running_work(row, current, folder, runs, move_processes_inside(row, folder)))
+            work = list(running_work(row, current, folder, runs, move_processes_inside(row, folder, director=director)))
             work.extend(member.name for member in live_members(current.find(kind="worker", parent=unit), current))
             if work:
                 print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")

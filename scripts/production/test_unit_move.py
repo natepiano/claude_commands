@@ -126,12 +126,31 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual(file_versions(self.root), before)
         self.assertEqual((backend.starts, backend.stops), (starts, stops))
 
+    def test_move_processes_inside_keeps_only_the_directors_pane_ancestors(self) -> None:
+        shell, wrapper, director, child, other_shell, above_pane = 998030, 998040, 998041, 998042, 998050, 998020
+        parents = {os.getpid(): 1, shell: above_pane, wrapper: shell, director: wrapper,
+                   child: director, other_shell: shell, above_pane: 1}
+        def parent(pid: int) -> int:
+            return parents.get(pid, 0)
+        for extra in ((), (other_shell,)):
+            with (
+                self.subTest(unrelated_shell=bool(extra)),
+                mock.patch.object(unit_move, "processes_inside", return_value=[shell, wrapper, director, child, above_pane, *extra]),
+                mock.patch.object(pane_record, "process_parent", side_effect=parent),
+                mock.patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (director,))),
+                mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                    herdr.EnvironmentThread(self.owner.current_session), "fixture-start", {})),
+                mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+                mock.patch.object(pane_record, "pane_shell_pid", return_value=shell),
+            ):
+                self.assertEqual(unit_move.move_processes_inside(self.owner, self.source), [above_pane, *extra])
+
     def test_running_unit_stops_moves_and_resumes_current_session(self) -> None:
         from scripts.agents import detached_run_process
         from scripts.lib import unit_runs
 
         with saved_fixture(self.root) as restore:
-            for pending in ("", "rename", "native director and caller", "late detached command", "late pane worker",
+            for pending in ("", "rename", "native director and caller", "wrapped native director", "late detached command", "late pane worker",
                             "late run path", "late run path with lock"):
                 with self.subTest(pending=pending), ExitStack() as scope:
                     restore()
@@ -153,6 +172,22 @@ class UnitFolderMoveTests(FolderRenameFixture):
                         _ = scope.enter_context(mock.patch.object(herdr, "native_process",
                             return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(self.owner.current_session),
                                 "fixture-start", {})))
+                    if pending == "wrapped native director":
+                        parents = {os.getpid(): 1, 998041: 998042, 998042: 998040, 998040: 1, 998043: 998041}
+                        def director_parent(pid: int) -> int:
+                            return parents.get(pid, 0)
+                        def conversation(_identity: str) -> herdr.LiveConversation | herdr.StoppedConversation:
+                            return herdr.LiveConversation("claude", (998041,)) if backend.live else herdr.StoppedConversation()
+                        _ = scope.enter_context(mock.patch.object(unit_move, "processes_inside",
+                            return_value=[998040, 998041, 998042, 998043]))
+                        _ = scope.enter_context(mock.patch.object(pane_record, "process_parent", side_effect=director_parent))
+                        _ = scope.enter_context(mock.patch.object(herdr, "read_conversation", side_effect=conversation))
+                        _ = scope.enter_context(mock.patch.object(herdr, "native_process",
+                            return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(self.owner.current_session),
+                                "fixture-start", {})))
+                        _ = scope.enter_context(mock.patch.object(herdr, "herdr_place_of",
+                            return_value=herdr.HerdrPlace("agents", "w1:p1")))
+                        _ = scope.enter_context(mock.patch.object(pane_record, "pane_shell_pid", return_value=998040))
                     workers = [fixture_worker("late-implementation", self.owner.id)] if pending == "late pane worker" else []
                     late_owners = [fixture_member("unit", name="late-run-owner", parent=self.owner.parent,
                         worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-worktree"))
