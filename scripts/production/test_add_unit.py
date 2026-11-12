@@ -105,7 +105,8 @@ class NativeClaudeUnitTests(StaffTestCase):
             ("fixture", "fable", "claude-fable-selected-fixture"),
             ("fixture", "claude-fable-saved-fixture", "claude-fable-saved-fixture"),
         ):
-            with (self.subTest(director=director_model, saved=saved_model), patch.dict(os.environ, caller),
+            with (self.subTest(director=director_model, saved=saved_model),
+                  patch.dict(os.environ, {**caller, "HERDR_BIN": "/nonexistent/herdr"}),
                   patch.object(herdr, "start_server"), patch.object(herdr, "open_tab", return_value="w1:p1"),
                   patch.object(herdr.Herdr, "run_in_pane"),
                   patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
