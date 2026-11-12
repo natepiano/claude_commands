@@ -2078,12 +2078,15 @@ def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
         "rustfmt": ("rustfmt.toml", ".rustfmt.toml"),
         "mend": ("mend.toml", ".mend.toml"),
     }[tool]
+    manifests = {path: blob for path, blob in tip.blobs.items()
+                 if PurePosixPath(path).name == "Cargo.toml" and tool in ("clippy", "mend")}
+    contents = dict(blob_contents(repo, manifests)) if manifests else {}
     inputs: list[tuple[str, str]] = []
     for path, blob in sorted(tip.blobs.items()):
         if PurePosixPath(path).name in names or (tool == "mend" and path == ".cargo/mend.toml"):
             inputs.append((path, blob))
         if PurePosixPath(path).name == "Cargo.toml" and tool in ("clippy", "mend"):
-            data = _table(tomllib.loads(_git(repo, "show", f"{tip.commit}:{path}")))
+            data = _table(tomllib.loads(contents[path].decode()))
             lints = _table(data.get("workspace")).get("lints")
             mend = _table(_table(data.get("package")).get("metadata")).get("mend")
             inputs.append((path, json.dumps({"lints": lints, "mend": mend if tool == "mend" else None}, sort_keys=True)))
@@ -2349,6 +2352,12 @@ MIGRATIONS = {
 }
 
 
+def _file_blob(tip: RepositoryTip, path: str) -> str | Folder | MissingFile:
+    if path in tip.blobs:
+        return tip.blobs[path]
+    return Folder() if any(name.startswith(path.rstrip("/") + "/") for name in tip.entries) else MissingFile()
+
+
 class GitReadCache:
     """The trees and blob bytes read by one split scan."""
 
@@ -2395,11 +2404,12 @@ class GitReadCache:
 
     def file(self, commit: str, path: str) -> bytes | Folder | MissingFile:
         tip = self.tip(commit)
-        if path not in tip.blobs:
-            return Folder() if any(name.startswith(path.rstrip("/") + "/") for name in tip.entries) else MissingFile()
+        blob = _file_blob(tip, path)
+        if not isinstance(blob, str):
+            return blob
         self.warm(tip.commit)
         self.read(tip.commit, (path,))
-        return self.contents[tip.blobs[path]]
+        return self.contents[blob]
 
     def text(self, commit: str, path: str) -> str:
         content = self.file(commit, path)
@@ -3791,17 +3801,13 @@ class Ledger:
             self._record_rename_block(finding_id, block)
 
     def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
-        """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
+        """Read file bytes or identify a folder or missing path. Raise Git errors."""
         if isinstance(self.git_cache, GitReadCache):
             return self.git_cache.file(commit, path)
-        entry = _git(self.repo, "ls-tree", commit, "--", path)
-        if not entry:
-            return MissingFile()
-        # An entry reads `<mode> <type> <object>\t<path>`.
-        if entry.split()[1] == "tree":
-            return Folder()
-        shown = _git_bytes(self.repo, "show", f"{commit}:{path}")
-        return shown.stdout
+        blob = _file_blob(self._tip(commit), path)
+        if not isinstance(blob, str):
+            return blob
+        return _git_bytes(self.repo, "cat-file", "blob", blob).stdout
 
     def _ticket_arrived(self, ticket: TicketRecord, target: TicketState, commit: str = "", branch: str = "",
                         reservation: tuple[str, str] = ("", "")) -> bool:
@@ -7779,8 +7785,10 @@ class LedgerLocation:
 
 
 def ledger_location(repo: Path) -> LedgerLocation:
-    repo = Path(_git(repo.expanduser().resolve(), "rev-parse", "--show-toplevel"))
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    repo = repo.expanduser().resolve()
+    root, common_directory = _git(repo, "rev-parse", "--path-format=absolute",
+                                 "--show-toplevel", "--git-common-dir").splitlines()
+    repo, common = Path(root), Path(common_directory)
     main_repo = common.parent
     state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
     return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite")
