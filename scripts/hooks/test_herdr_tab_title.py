@@ -75,7 +75,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         entry = pane_record.launch("w3:p7", session_id, str(self.records.parent), {}, ["claude"])
         entry.update(pid=41, proc_start="fixture-start")
         path = pane_record.record_path("agents")
-        write_text_atomic(path, json.dumps({"w3:p7": entry}))
+        pane_record.save("agents", {"w3:p7": entry})
         return path
 
     def renamed_unit(self) -> staff.StaffRow:

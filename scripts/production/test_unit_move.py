@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
-from scripts.herdr import herdr_types
+from scripts.herdr import pane_launch, herdr_types
 
 import io
 import json
@@ -94,7 +94,7 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
                 moved = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, self.env, self.checkout)
             self.assertEqual(moved.returncode, 0, moved.stderr)
             publications = [entry for entry in pane_record.read("agents").values()
-                            if entry["session_id"] in (owner.id, owner.current_session)]
+                            if pane_launch.reference_id(entry) in (owner.id, owner.current_session)]
             self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in publications],
                              [("w7:p3", str(destination))])
 

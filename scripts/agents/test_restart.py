@@ -540,7 +540,7 @@ class RecordedResumeTests(RestartTestCase):
 
     folder: Path = Path("/tmp/recorded-resume")
 
-    def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_record.PaneLaunch:
+    def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_launch.CurrentLaunch:
         return {"kind": kind, "pane_id": "w1:p1", "session_id": "recorded-id",
                 "config_dir": "/account", "cwd": str(self.folder), "name": "recorded-name",
                 "model": model, "remote_control": True, "environment": {}, "flags_read": True,
@@ -2064,7 +2064,7 @@ class RestartTests(RestartTestCase):
         retained["written_at"] = "2026-11-12T00:00:00+00:00"
         pane_record.save("agents", {"w1:p7": retained})
         other = retained.copy()
-        other.update(staff_id=foreign.id, session_id=foreign.current_session,
+        cast(pane_launch.StaffPaneLaunch, other).update(staff_id=foreign.id,
                      written_at="2026-11-12T01:00:00+00:00")
         pane_record.save("other", {"w1:p7": other})
         with (self.subTest(record="another server reuses the pane id"),
@@ -2176,9 +2176,8 @@ class RestartTests(RestartTestCase):
 
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         path = pane_launch.record_directory() / "fixture.json"
-        launch: pane_launch.PaneLaunch = {"pane_id": "w1:own", "session_id": self.rows[0].id,
-            "staff_id": self.rows[0].id, "kind": "claude", "cwd": str(self.root), "model": "fixture",
-            "name": self.rows[0].name, "remote_control": False, "environment": {}, "flags_read": True, "written_at": "fixture-start"}
+        launch: pane_launch.StaffPaneLaunch = {"pane_id": "w1:own", "staff_id": self.rows[0].id,
+            "model": "fixture", "remote_control": False, "environment": {}, "flags_read": True, "written_at": "fixture-start"}
         pane_launch.save(path, {"w1:own": launch})
 
         workspace_label = "saved"
@@ -2266,7 +2265,7 @@ class RestartTests(RestartTestCase):
                 directory.mkdir(exist_ok=True)
                 original = pane_record.launch("old", producer.id, str(self.root),
                                               {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2")}, ["claude"])
-                original["staff_id"] = producer.id
+                original = pane_launch.retained_launch(original, record)
                 cross = scenario in ("cross session", "source unavailable")
                 source_path = directory / ("legacy.json" if cross else "agents.json")
                 pane_launch.save(source_path, {"old": original})
