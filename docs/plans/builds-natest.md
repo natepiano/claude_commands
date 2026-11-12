@@ -3146,7 +3146,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `8f30bce69`. Read-only replay of the affected-test selection on 62 failed cloud merge gates (42 trees) since 11-08. Of 35 trees with a commit, the selection includes every failing module on 25, some on 4 and none on 6; 7 trees have no commit object. Most misses are whole-repository audits and fixtures that read a config file (Phase 176).
 
-### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
+### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: done
 **Depends on:** Phase 175
 
 #### Work Order
@@ -3236,70 +3236,107 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: done
 **Depends on:** Phase 180
 
-#### Work Order
+#### As-built
 
-**Goal:** A repeat of the Phase 180 folder collection over `scripts/direct` gives known coverage for the tests whose only unknown cause is a child from another test, and reports the overlap candidates.
+- Checkpoint `0a6f179eb`. Cause: the collector gave a launch with no seen exit an end of infinity, so it counted as alive at every later test start. `line_collector.py` now wraps spawn and `waitpid` to see child exits, with a monotonic clock; a launch with no exit evidence still counts as alive (the reviewer blocker F001 kept that rule). New rows in `test_coverage_overlap.py` fail on the old code. Repeat run at `0a6f179eb` over 207 `scripts/direct` modules: 1,558 tests, all pass; 617 known (was 0), 941 unknown, 335 candidates; collector 1,665 CPU s, 45.8 min wall. Top candidate modules: `test_progress_history` 124, `test_phase_table` 49, `test_findings` 41, `test_phase_process` 40, `test_phase_reservation` 35. Largest unknown causes: unverified Bash launches 729, shared thread 602, child outlived its test 589 (most from `test_tree_watch` Git and the `test_verify_hold_*` Python children). Candidates are not removal approvals.
 
-**Decision:** user via builds, 2026-11-11 (item 80, approval 2): the folder collection is approved. Phase 180 ran it and got 0 known of 1,558 tests, from a collector defect. The repair and one repeat run finish that approval. Candidates are not removal approvals. No test removal or coverage reduction is approved.
+### Phase 185 — The recorder commands that review launches call import less  · status: done
+**Depends on:** none
 
-**Spec:**
-1. Find the cause. In the Phase 180 run, every test has the cause `child outlived its test`. 618 tests have only that cause. `child_causes` in `scripts/test_times/coverage_overlap.py` uses `math.inf` as the end of a launch with no recorded end. Then that launch is "alive" at the start of every later test in the run. `LineCollector.poll_children` in `scripts/test_times/line_collector.py` records an end only when a held `Popen` returns from `poll()`. Name the launches that have no end in a folder run, and say why (still running, not held, mocked, or other).
-2. Repair the cause in the collector. Do not hide it in the report. A child that still runs at a later test start stays a valid cause for that test. A child with no evidence that it ran at that time is not a cause. Keep each other cause rule as it is.
-3. Add rows to `scripts/test_times/test_coverage_overlap.py` for the defect: one launch with no seen exit, followed by later tests in other modules. Prove the rows fail on the old code.
-4. Run the folder collection again, as in Phase 180 Spec items 1-3, at the new commit, with `COVERAGE_OUT` in `phases/184/`. Report as in Phase 180 Spec items 4-5, plus the count of tests that changed from unknown to known.
+#### As-built
 
-**Files:**
-- `scripts/test_times/coverage_overlap.py` — launch end rules in `child_causes`.
-- `scripts/test_times/line_collector.py` — child end records, if the cause is there.
-- `scripts/test_times/test_coverage_overlap.py` — new rows for the defect.
-- `phases/184/coverage_overlap_report.md`, `phases/184/coverage_overlap.json` — in the session folder.
+- Checkpoint `cbe16dd36`. `progress_history.py` imports `phase_reservation`, `statistics`, `agents_log` and `tag_inventory` inside the functions that use them; function and class logic unchanged; no new module. aws pairs saved 0.43–1.00 CPU s in six caller modules (review launcher, trees, style, `test_assign_claude_follow.py`, `test_verify_wait_holder.py`), about 2.7 s in all; `test_progress_history.py` 0.03 s and `test_verify_mac_only.py` −0.19 s. Local separate runs showed no gain: only pairs decide. Replaces the dropped Phase 182 server design.
 
-**Workers:** 1 writer; the collector and its tests share one cause and cannot split.
-- impl: the cause, the repair, the new rows and the repeat run.
-
-**Constraints from prior phases:**
-- Phase 180: 207 modules, 1,558 tests, all passed; collector CPU 1,711 s, wall 43.5 min; 0 known, 0 candidates; cause counts Bash 729, Cargo 68, Git 361, ps 167, forks 146; every test has `child outlived its test`.
-- Phase 179: three sampled modules gave 5 of 21 tests unknown. The defect shows only in a long run.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.test_times.test_coverage_overlap` passes; the new rows fail on the old code.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- The repeat report and JSON exist, with candidates and unknown coverage in separate tables.
-
-### Phase 185 — The recorder commands that review launches call import less  · status: todo
+### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `progress_history.py check-launch`, `start-pass` and `finish-pass` start faster because they import less, with the same records, output and exit status.
+**Goal:** The full `verify.sh` entries in the verify tests cost less CPU, because a fixed Cargo reply comes from a shell script and not a new Python process, with every test, assertion and full entry kept.
 
-**Decision:** sdlc go via builds, 2026-11-12: the lighter recorder import for these three commands. Paired aws runs measure. Ship any measured saving that keeps the code simple. Land through builds.
+**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check; no test removal. Architect after Phase 183: one shared fixed-reply installer is the next verify step. verify-unit go, 2026-11-12, for the four support files, with conditions 1-5 in Spec 3.
 
 **Spec:**
-1. Measure first: `python3 -X importtime scripts/direct/progress_history.py check-launch --help` (and the other two), and `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_review_launcher.py`. Name the imports that cost the most and which of them the three commands use.
-2. Find the simplest change that makes the three commands import less: for example, move the import that only other commands use into those commands' module, or split the three commands' code into a small module that `review.sh` calls. Pick the one with the fewest new concepts.
-3. Keep: the records each command writes, its stdout and stderr text, its exit status on each failure path, caller identity (`UNIT_PASS_OWNER=launcher`, director and worker thread ids, launcher pid), and pass ownership. Every test and assertion stays.
-4. One owner switches all callers. Add no re-export shim. Do not use a module `__getattr__` or other lazy-attribute trick. Keep Bash 3.2 syntax in shell files.
-5. Measure after with the same commands. The director runs three aws pairs on the review-launcher modules, `test_assign_claude_follow.py` and `test_progress_history.py`; only aws pairs decide.
+1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py direct/test_verify_mac_only.py direct/test_verify_ssh_targets_routing.py direct/test_verify_token_renew.py`. Count the Cargo stub starts and their CPU, and which reply each call needs.
+2. Add one shared installer in `verify_mac_offload_test_support.py` that writes a POSIX shell `cargo` for fixed replies, and use it from the other three support files where they now start Python only for a fixed reply. `CARGO_STUB` (line 306) and the Python path stay for `TEST_CARGO_HOLD`, signals, PID files, edits, custom observers and dynamic event records.
+3. Keep (verify-unit conditions):
+   1. Same event line. Each shell reply writes the same `TEST_CARGO_EVENTS` line as `CARGO_STUB`: the same JSON for `args` and `token_held`, in one write per line. Add one row that runs both paths with arguments that hold a space, a double quote, a backslash, a non-ASCII character and an empty string, and compares the lines byte for byte. An argument the shell path cannot quote goes to the Python path.
+   2. Same order. The `--version` replies (`mend`, `+nightly fmt`, `clippy`) exit before the event write. The metadata reply prints `TEST_METADATA` exactly, with one newline.
+   3. `token_held` is true when the `TEST_TOKEN_RECORD` file exists at the moment of the call.
+   4. The leak marker. Shell replies inherit `TEST_RUNNER_STATE`, so `assert_nothing_outlives` still finds them. Do not exec a binary that clears the environment.
+   5. Python stays for `TEST_CARGO_HOLD`, signals, PID files and the observers.
+4. Keep every test, assertion and full `verify.sh` entry. Keep `RUSTC_STUB` and the token metadata path. Change no production code. Use Bash 3.2-compatible POSIX shell.
+5. Run every importer of the four support files after the change. Measure after with the Spec 1 command. The director runs three aws pairs on the four modules and a sample of importers; only aws pairs decide.
 
 **Files:**
-- `scripts/direct/progress_history.py` — the recorder.
-- `scripts/direct/review.sh` — only if the command it calls changes.
-- `scripts/direct/test_progress_history.py` — rows for any moved code.
-- `scripts/direct/progress_launch.py` — new, only if Spec 2 picks a split; the writer may choose another name in `scripts/direct/`.
+- `scripts/direct/verify_mac_offload_test_support.py` — `CARGO_STUB` and the new shared installer; 42 test importers.
+- `scripts/direct/verify_token_wait_test_support.py` — its Cargo stubs.
+- `scripts/direct/verify_hold_wait_test_support.py` — its `CARGO_STUB` variant.
+- `scripts/direct/verify_ssh_targets_test_support.py` — its Cargo stubs.
+- `scripts/direct/test_verify_mac_only.py` — the byte-for-byte event row, or another verify test module the writer names.
 
-**Workers:** 1 writer; one recorder and its callers cannot split.
+**Workers:** 1 writer; the four support files share one installer and cannot split.
 - impl: all files.
 
 **Constraints from prior phases:**
-- Phase 182: recorder starts cost 46.6 CPU s across 150 starts in the four review modules (34% of their task CPU). A server design was dropped for complexity.
-- Phase 177: 390 recorder starts cost 98.9 CPU s in the census sample.
+- Phase 177: 1,141 Python Cargo tasks cost 25.261 local CPU s across 47 modules (gross ceiling).
+- Phases 181 and 183: aws pairs saved 1.37 s and 0.71 s; the full entries verify named hold most of the cost.
+- Phase 185: the recorder imports less; use matching production code on both sides of each pair.
 
 **State:** none.
 
 **Acceptance gate:**
-- `python3 -m unittest` passes for every `scripts/direct/test_review_launcher*.py` module, `scripts.direct.test_assign_claude_follow` and `scripts.direct.test_progress_history`, with unchanged test counts.
+- `python3 -m unittest` passes for every importer of the four support files, with unchanged test counts.
+- The byte-for-byte event row passes and fails when the shell quoting is broken.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `58aaa15cc`. `task_ids` in `task_cpu.py` reads `/proc/<pid>/status` as bytes and parses only `Tgid:` and `PPid:`. Two rows in `test_module_cost.py`: a `Name:` with byte `0xff` (fails on the old code) and an ordinary status. Nothing else changed.
+
+### Phase 188 — The coverage collector verifies the Python descendants of a Bash launch  · status: done
+**Depends on:** Phase 184
+
+#### As-built
+
+- Dropped; nothing landed. A trial traced each Bash launch with Linux `strace` to prove every descendant (+364 lines, an `strace` dependency). Sample of the 10 modules that hold the 59 tests with only `unverified launch bash`: 2 recovered. With real system binaries (`date`, `mkdir`, `dirname`, `cat`, `rm`, `mv` and others) added as leaves, the projection is 46 of 59, and the folder goes from 617 to 663 known of 1,558. The other 13 stay unknown (the `py` wrapper, fixture executables). The folder records cannot project more. Simple ranks above a 3% coverage gain, and no removal work is approved to use it. Patch: `phases/188/bash_descendant_evidence.patch` in the session folder.
+
+### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: todo
+**Depends on:** Phase 176
+
+#### Work Order
+
+**Goal:** A test module that scans the tree selects on a change under its declared folders only, so a targeted run adds fewer modules with the same containment.
+
+**Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
+
+**Spec:**
+1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 133 of the median 170). For each, read the scan and name the folders it really reads.
+2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
+3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
+4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
+4a. Declare `production/test_merge_checkpoint_batch.py` with the folder of the code its fixture runs as a process: the fixture starts `merge_checkpoint`, which starts `style_sync`, which imports `style_plan`. This closes the Phase 176 replay miss for that module (builds, 2026-11-12: each miss is caught or named out of scope). Add a replay row that proves it.
+5. Add rows to the existing scan test in `scripts/production/test_affected_modules.py`: a declared module selects on a change under its folder and not on a change outside it; an undeclared unresolved scan still selects. Each declared row fails on the Phase 176 code.
+6. Replay the 55 saved runs. Containment holds (no module the old selector picked is dropped). Report the added median and largest, per rule, before and after.
+
+**Files:**
+- `config/merge_gate.conf` — the `scan_roots` key.
+- `scripts/production/affected_modules.py` — declared scan evidence.
+- `scripts/production/test_affected_modules.py` — the new rows.
+
+**Workers:** 1 writer; the key, its reader and its rows are one change.
+- impl: all three files and the replay.
+
+**Constraints from prior phases:**
+- Phase 176: 55 replays keep every old selection; added median 170, largest 476; source-scan rule median 133, largest 458. Builds ruled out the general import closure; full merge gates stay unchanged.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
+- The replay keeps containment for all 55 runs and shows the added median before and after.

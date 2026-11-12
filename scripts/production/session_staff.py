@@ -422,7 +422,7 @@ class RowResolver:
             return LocationUnfilled("the worktree is not recorded")
         retired = isinstance(tree, RemovedWorktree)
         if retired:
-            home = Path.home() if tree.machine == remote.local_machine() else Path("~")
+            home = None if tree.machine == remote.local_machine() else Path("~")
             path = configuration.parked_path(holder.id, home=home)
         else:
             path = tree.path / ".unit.toml"
