@@ -39,10 +39,11 @@ class CompletedNeedRecord(NeedRecord):
 
 @dataclass(frozen=True)
 class MachineNeeds:
-    """The newest open need and all open reasons for one machine."""
+    """The newest need, reasons, and open records for one machine."""
 
     newest: NeedRecord
     reasons: tuple[str, ...]
+    records: tuple[NeedRecord, ...]
 
     def record(self) -> NeedRecord:
         """Return the newest fields with the joined open reasons."""
@@ -122,7 +123,7 @@ def read_needs() -> list[MachineNeeds]:
     summaries: list[MachineNeeds] = []
     for machine in sorted(groups):
         records = sorted(groups[machine], key=lambda record: datetime.fromisoformat(record["created_at"]))
-        summaries.append(MachineNeeds(records[-1], tuple(record["reason"] for record in records)))
+        summaries.append(MachineNeeds(records[-1], tuple(record["reason"] for record in records), tuple(records)))
     return summaries
 
 
