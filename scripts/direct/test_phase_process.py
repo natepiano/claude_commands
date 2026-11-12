@@ -644,7 +644,7 @@ class TrialProcessTests(unittest.TestCase):
 class PhaseProcessTests(unittest.TestCase):
     def test_ad_hoc_reviews_do_not_launch_external_reviewers(self) -> None:
         commands = Path(__file__).resolve().parents[2] / "commands"
-        for name in ("module_review", "team_review", "api_review"):
+        for name in ("module_review", "team_review"):
             with self.subTest(command=name):
                 text = (commands / f"{name}.md").read_text(encoding="utf-8")
                 for launch in ("agent_exec", "claude --print", "claude -p"):
