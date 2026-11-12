@@ -132,6 +132,8 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
         status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
         print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
         return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    except (admin_secrets.SecretsRefused, DeploymentRefused):
+        raise
     except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
         match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
         reason = match[1] if match else type(error).__name__
@@ -389,6 +391,8 @@ class Deployment:
         """Show the regional gate quota without stopping deployment on a failed read."""
         try:
             quota = spot_quota(api)
+        except (admin_secrets.SecretsRefused, DeploymentRefused):
+            raise
         except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             print(f'{api.region}: Spot vCPU quota unknown: {self.admin.redact(str(error))}')
             return
@@ -820,9 +824,12 @@ class Deployment:
 
     def _check_credentials(self) -> None:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        credential_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
-        if not credential_file or stat.S_IMODE(Path(credential_file).expanduser().stat().st_mode) != 0o600:
-            raise DeploymentRefused('AWS_SHARED_CREDENTIALS_FILE must name a private mode 0600 file')
+        try:
+            mode = admin_secrets.credentials_file().stat().st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                raise OSError
+        except OSError:
+            raise DeploymentRefused('credential_file must name a private mode 0600 file') from None
 
     def setup_start(self, *, approve_resources: bool = False) -> dict[str, str]:
         """Restart the deployed instance for user setup while admission stays disabled."""
@@ -975,7 +982,7 @@ class Deployment:
     def _scaler_key(self) -> None:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
-        credential_file = Path(os.environ['AWS_SHARED_CREDENTIALS_FILE']).expanduser()
+        credential_file = admin_secrets.credentials_file()
         previous = credential_file.read_bytes()
         key_id = ''
         checkpoint = self.directory / 'scaler-key.json'
@@ -1284,6 +1291,8 @@ class Deployment:
             try:
                 quota = spot_quota(target, 'L-3819A6DF')
                 print(f'{region}: G and VT Spot quota {quota.normalize():f} vCPUs')
+            except (admin_secrets.SecretsRefused, DeploymentRefused):
+                raise
             except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                 code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
                 reason = code[1] if code else type(error).__name__
@@ -1603,6 +1612,7 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
+    os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
     if sys.argv[1:2] == ['gate-trial']:
         from scripts.aws_target import gate_trial
         settings_path = conf.path('aws_target')

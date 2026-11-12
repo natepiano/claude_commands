@@ -58,7 +58,7 @@ current until it has its answer, also when a more urgent item arrives.
 1. Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show [--kind <kind>] [--order oldest|newest] [--all-below]`.
 2. Add `--production <showrunner name>` outside the showrunner session, for every kind.
 3. Judge the item against current events.
-4. Print its verdict line.
+4. Print its verdict line only for `obsolete` or `in conflict`.
 5. Present the item under its kind's section below.
 
 The command prints the item's kind, then the item or a message that no item waits.
@@ -75,17 +75,18 @@ Check, and stop when the answer is clear:
 2. Merges since the item's date: `git log --since=<date> -- <files it names>`.
 3. The user's recent rulings: your memory and this session.
 
-Print one verdict line with its evidence (commit, plan, ruling or phase):
+Classify the item:
 
-- `current`: nothing since its date changes it.
+- `current`: nothing since its date changes it. Print no verdict line.
 - `obsolete`: the work is done, removed or replaced.
 - `in conflict`: it clashes with work in progress or a ruling, such as a tuning
   proposal for code the user is redoing. Name that work.
 
-Then recommend the kind's own answer from the verdict: for `current`, the answer
-the item deserves; for `obsolete`, close it; for `in conflict`, defer it, decline
-it or reshape it. Show an obsolete item too: the user answers it. The one
-exception is an efficiency item already fixed, which its section records as done.
+For `obsolete` or `in conflict`, print one verdict line with its reason and evidence (commit, plan, ruling or phase).
+Recommend the kind's own answer: for `current`, the answer the item deserves; for `obsolete`, close it.
+For `in conflict`, defer it, decline it or reshape it.
+Show an obsolete item too: the user answers it.
+The one exception is an efficiency item already fixed, which its section records as done.
 
 ## To the end
 
@@ -128,11 +129,11 @@ in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside the
 ledger. Where a cheap check exists (its measurement script, the line it cites),
 confirm the candidate still holds; record one already fixed as done.
 
-Present only this one; never list the backlog. After the verdict, give the line
-as it reads today next to the line as proposed (file:line), then the measured
-gain, then the cost. End with one choice line, its recommendation from the
-verdict: `approve (recommended — reason) / decline / defer / elaborate`. A fix
-that belongs to another session offers `relay` in place of `approve`.
+Present only this item; never list the backlog.
+After the current-events check, give the current and proposed lines (file:line), then the measured gain and the cost.
+End with one choice line, based on that check:
+`approve (recommended — reason) / decline / defer / elaborate`.
+For a fix that belongs to another session, offer `relay` in place of `approve`.
 
 Record the outcome on the candidate's own ledger line as soon as it is decided:
 its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,

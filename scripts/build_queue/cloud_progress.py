@@ -20,6 +20,9 @@ class CloudProgress:
     size_vcpus: int
     failed_modules: int
     updated_at: float
+    stage: str = ""
+    region: str = ""
+    zone: str = ""
 
 
 @dataclass(frozen=True)

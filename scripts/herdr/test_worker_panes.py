@@ -172,7 +172,7 @@ class PaneWorld(herdr.Herdr):
             self.record(row, pane, family)
 
     def record(self, row: staff.StaffRow, pane: str, family: Literal["claude", "codex"] = "claude") -> None:
-        entry: pane_launch.PaneLaunch = {"staff_id": row.id, "session_id": row.id,
+        entry: pane_launch.CurrentLaunch = {"staff_id": row.id, "session_id": row.id,
             "pane_id": pane, "kind": family, "cwd": str(Path.cwd()), "name": row.name,
             "model": "", "remote_control": False, "environment": {}, "flags_read": True,
             "written_at": datetime.now(timezone.utc).isoformat()}
@@ -587,12 +587,13 @@ class WorkerPaneTests(StaffTestCase):
                     path = pane_launch.record_directory() / "agents.json"
                     entries = pane_launch.read(path)
                     for row, pane in ((self.parent, "w1:p0"), (stopped, "w1:p2")):
-                        entries[pane]["staff_id"] = row.id
+                        cast(pane_launch.StaffPaneLaunch, entries[pane])["staff_id"] = row.id
                         self.world.locations[pane]["label"] = other.name
                     if publication == "legacy":
                         for row, pane in ((self.parent, "w1:p0"), (stopped, "w1:p2")):
-                            entries[pane]["session_id"] = row.id
-                            del entries[pane]["staff_id"]
+                            entries[pane] = pane_launch.NativePaneLaunch(pane_id=pane, session_id=row.current_session,
+                                cwd=str(self.root), name=row.name, kind="claude", model="", remote_control=False,
+                                environment={}, flags_read=True, written_at=entries[pane]["written_at"])
                     write_text_atomic(path, json.dumps(entries))
                     _ = self.world.foreground.pop("w1:p0", None)
                 record = staff.snapshot()
@@ -666,7 +667,7 @@ class WorkerPaneTests(StaffTestCase):
                 if retained_launch:
                     saved = pane_record.read_strict("TEST-admission")[result.pane]
                     self.assertNotIn("config_dir", saved)
-                    self.assertEqual(saved["session_id"], result.row.id)
+                    self.assertEqual(saved.get("staff_id"), result.row.id)
 
     def test_recovered_worker_admission_completes_the_started_pane_home(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(pane_record.record_directory())})))
