@@ -424,8 +424,8 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
         entry = retained.get(pane["pane_id"])
         retained_identity = ""
         if entry is not None:
-            owner = record.by_member_reference(entry["session_id"])
-            retained_identity = owner.current_session if owner is not None else entry["session_id"]
+            owner = record.by_member_reference(pane_launch.reference_id(entry))
+            retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
         if isinstance(observed, herdr.StoppedConversation) and retained_identity != identity:
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
@@ -480,8 +480,8 @@ def remove_stray_producer(name: str, session: str) -> int:
                 admission_matches = True
             entry = retained.get(pane.pane)
             if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(entry["session_id"])
-                retained_identity = owner.current_session if owner is not None else entry["session_id"]
+                owner = record.by_member_reference(pane_launch.reference_id(entry))
+                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
                 admission_matches = admission_matches or retained_identity == identity
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
@@ -1688,7 +1688,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)
     return (marked.claude.session_id == session_id and entry is not None
-            and entry["session_id"] == row.id and session_id == row.current_session)
+            and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
     refused = recovery_refusals(unit)

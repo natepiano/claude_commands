@@ -2141,7 +2141,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 del client
                 replacement = pane_launch.read_strict(path)["w1:p2"]
                 attempt = pane_launch.resume_attempt(path, "w1:p2")
-                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                outcome = (pane_launch.VerifiedResume(pane_launch.current_launch(replacement, staff.initial_snapshot()),
+                                                       frozenset({pane_launch.reference_id(original)}))
                            if verified else pane_launch.FailedResume())
                 before = pane_launch.read_strict(path)
                 closed: list[str] = []
@@ -2170,7 +2171,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 def close_destination(pane: str) -> bool:
                     panes[destination.stem].remove(pane)
                     return True
-                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                outcome = (pane_launch.VerifiedResume(pane_launch.current_launch(replacement, staff.initial_snapshot()),
+                                                       frozenset({pane_launch.reference_id(original)}))
                            if verified else pane_launch.FailedResume())
                 pane_launch.finish_restore(path, original, attempt, outcome, close=close_destination,
                                            destination=destination, close_source=close_source)
@@ -2227,6 +2229,29 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             activity.assert_called_once_with("w1:p1")
             retired.assert_called_once_with(path, "w1:p1", entry)
             self.assertEqual(list(pane_launch.read_strict(path)), ["w1:p2"])
+
+        for owner in ("removed", "backend unavailable"):
+            with self.subTest(owner=owner), self.retained() as (client, path, entry):
+                row = staff.StaffRow(staff.StaffId("retired-member"), "unit", "closed-worker", staff.StaffRoot(),
+                                    current_session=staff.StaffId("conversation"),
+                                    worktree=staff.PresentWorktree("natedev", Path("/work")))
+                record = staff.StaffSnapshot(()) if owner == "removed" else staff.StaffSnapshot((row,))
+                observed = cast(pane_launch.CurrentLaunch, entry.copy())
+                observed["staff_id"] = row.id
+                saved = pane_launch.retained_launch(observed, record)
+                other = entry.copy()
+                other["pane_id"] = "w1:p2"
+                pane_launch.save(path, {"w1:p1": saved, "w1:p2": other}, record=record)
+                rows = self.rows()[1:]
+                with (patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(client, "result", return_value={"panes": rows}),
+                      patch.object(client, "panes", return_value=rows),
+                      patch.object(client, "_close_pane") as closed,
+                      patch.object(client, "pane_activity") as activity):
+                    self.assertTrue(client.close_retained_pane("w1:p1", terminal="term-one"))
+                closed.assert_not_called()
+                activity.assert_not_called()
+                self.assertEqual(list(pane_launch.read_strict(path)), ["w1:p2"])
 
     def test_close_refuses_a_terminal_that_changes_before_the_close(self) -> None:
         for terminal in ("term-replacement", ""):
@@ -2772,6 +2797,7 @@ class HerdrTests(unittest.TestCase):
                   redirect_stderr(io.StringIO()) as errors):
                 entry: dict[str, object] = {"session_id": "fixture-session", "written_at": "fixture-time", "environment": {}}
                 if member:
+                    del entry["session_id"]
                     entry["staff_id"] = member
                 write_text_atomic(directory / "fixture.json", json.dumps({"w1:p1": entry}))
                 scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
@@ -6992,6 +7018,15 @@ class SavedLayoutTests(unittest.TestCase):
             self.assertEqual([name for _, name in fresh.spaces], [space for space, _ in self.BEFORE])
             fresh.close_restore_placeholders()
             self.assertEqual(fresh.layout(), self.BEFORE)
+
+        with self.subTest(launch="unrelated removed member"):
+            client = self.running()
+            entry: pane_launch.StaffPaneLaunch = {
+                "staff_id": "retired-member", "pane_id": "retired-pane", "model": "",
+                "remote_control": False, "environment": {}, "flags_read": True, "written_at": "2026-11-02T12:00:00Z"}
+            pane_launch.save(pane_launch.record_directory() / "fixture.json", {entry["pane_id"]: entry}, record=staff.StaffSnapshot(()))
+            client.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
+            self.assertEqual(client.layout(), self.BEFORE)
 
     def test_placeholder_with_a_running_program_survives_cleanup(self) -> None:
         _ = self.running()
