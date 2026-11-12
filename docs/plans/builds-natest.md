@@ -3570,3 +3570,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
 - aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 218 — The unit lookup test module keeps only the tests that pay their way
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_unit_lookup.py` loses every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** User, 2026-11-11: "i really don't feel that all of our tests are paying their way". Rule 2 (user, 2026-11-07): keep a rare-case test only when its defect would show the user a wrong result, damage saved state or lose work. Every main-path test stays. Phase 150 held this module; sdlc freed it on 2026-11-12 (main `4f458f9a0`).
+
+**Spec:**
+1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (staff rows, ledgers, plan docs, Git refs, config) or lose work. Remove each other rare-case test.
+3. Typical removals: exact wording of an error or refusal in an agent-only tool; argument errors that `argparse` already rejects; a second test of a branch that another test already reaches; tests of private helpers that a main-path test already covers; guards against states that no caller can make.
+4. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Check each fixture output the removed test read (Phase 150 gotcha). Do not change production code.
+5. Do not merge tests into table rows in this phase.
+6. Write `phases/218/removed_tests.md` in the unit session: one row per removed test, with test name, kind of rare case and the reason no user harm follows. Give the counts before and after.
+7. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Keep a test whose code a live tool still calls. `unit_lookup.unit_row` feeds `change_review.unit_producer` and the merge gate.
+
+**Files:**
+- `scripts/production/test_unit_lookup.py` — 67 tests.
+
+**Workers:** 1 writer; one module.
+- impl: the module and the removal table.
+
+**Constraints from prior phases:**
+- Phase 86: no test only repeats another test; line overlap does not prove a repeat. Judge by the behavior each test guards.
+- Phases 145–152: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom, and tests whose code a live tool still calls. Spec item 7 carries this.
+
+**Acceptance gate:**
+- The module and every module that imports it pass; basedpyright reports 0 errors and 0 warnings on the edited file.
+- `phases/218/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
