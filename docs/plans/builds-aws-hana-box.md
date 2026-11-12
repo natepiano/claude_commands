@@ -6,7 +6,7 @@ Use one Ohio `m7a.2xlarge` Spot instance with 8 vCPUs, 32 GiB RAM, and retained 
 Route only Hana clippy judgments and check to AWS.
 Keep mend, build, and clippy repairs on natedev.
 Keep nextest on natedev with its GPU and local test binaries.
-The expected daily cost is about USD 2.00–2.81, subject to the trial.
+The expected daily cost is about USD 2.89–3.26, subject to the trial.
 
 ## Placement and lifecycle
 
@@ -137,20 +137,22 @@ The queue and verify owners must confirm that the provider integration preserves
 
 ## Cost and configuration
 
-The trial workload totals 197 steps and 5.7 execution hours per day.
-This covers 67% of the supplied 8.5 daily execution hours.
-Model AWS execution at one to two times that duration, plus idle time.
-Assume 1.3–1.6 idle hours for planning, giving 7–13 running hours.
-The trial must measure actual idle time.
+The eligible workload on 2026-11-11 was 170 steps: 65 clippy judgments and 105 check runs.
+The other 30 clippy runs used `--fix`; they are repairs and stay on natedev.
+A replay of that day's arrival times against one machine gives these estimates:
+- 12–19% of eligible steps arrive while the machine is busy and run on natedev.
+- Steps spread over the day, so the 600-second idle tails add up to 15.9–16.3 running hours and 34–37 starts.
+The replay assumes one to 1.5 times the natedev step time and a 60-second start.
+The trial must measure actual running hours, starts and the busy share.
 The full-day case covers longer idle periods, slower execution, and failed work.
 
 | Daily component | Estimate, USD |
 | --- | ---: |
-| Compute, 7–13 hours at the supplied USD 0.13/hour | 0.91–1.69 |
+| Compute, 16 hours at USD 0.11–0.13/hour | 1.75–2.12 |
 | 340 GiB gp3 at USD 0.08/GiB-month, using 30 days | 0.907 |
-| Public IPv4, 7–13 hours at USD 0.005/hour | 0.035–0.065 |
+| Public IPv4, 16 hours at USD 0.005/hour | 0.08 |
 | Diagnostic transfer, object calls, and query calls, allowance | 0.15 |
-| Total | About 2.00–2.81 |
+| Total | About 2.89–3.26 |
 | Full day at the proposed USD 0.15/hour bid ceiling, including USD 0.12 IPv4 | About 4.78 total |
 
 Prices are planning inputs from the supplied cost study, not guaranteed paid rates.
