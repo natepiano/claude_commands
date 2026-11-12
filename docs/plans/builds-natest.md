@@ -3219,46 +3219,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The full `verify.sh` entries in the verify tests cost less CPU, because a fixed Cargo reply comes from a shell script and not a new Python process, with every test, assertion and full entry kept.
-
-**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check; no test removal. Architect after Phase 183: one shared fixed-reply installer is the next verify step. verify-unit go, 2026-11-12, for the four support files, with conditions 1-5 in Spec 3.
-
-**Spec:**
-1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py direct/test_verify_mac_only.py direct/test_verify_ssh_targets_routing.py direct/test_verify_token_renew.py`. Count the Cargo stub starts and their CPU, and which reply each call needs.
-2. Add one shared installer in `verify_mac_offload_test_support.py` that writes a POSIX shell `cargo` for fixed replies, and use it from the other three support files where they now start Python only for a fixed reply. `CARGO_STUB` (line 306) and the Python path stay for `TEST_CARGO_HOLD`, signals, PID files, edits, custom observers and dynamic event records.
-3. Keep (verify-unit conditions):
-   1. Same event line. Each shell reply writes the same `TEST_CARGO_EVENTS` line as `CARGO_STUB`: the same JSON for `args` and `token_held`, in one write per line. Add one row that runs both paths with arguments that hold a space, a double quote, a backslash, a non-ASCII character and an empty string, and compares the lines byte for byte. An argument the shell path cannot quote goes to the Python path.
-   2. Same order. The `--version` replies (`mend`, `+nightly fmt`, `clippy`) exit before the event write. The metadata reply prints `TEST_METADATA` exactly, with one newline.
-   3. `token_held` is true when the `TEST_TOKEN_RECORD` file exists at the moment of the call.
-   4. The leak marker. Shell replies inherit `TEST_RUNNER_STATE`, so `assert_nothing_outlives` still finds them. Do not exec a binary that clears the environment.
-   5. Python stays for `TEST_CARGO_HOLD`, signals, PID files and the observers.
-4. Keep every test, assertion and full `verify.sh` entry. Keep `RUSTC_STUB` and the token metadata path. Change no production code. Use Bash 3.2-compatible POSIX shell.
-5. Run every importer of the four support files after the change. Measure after with the Spec 1 command. The director runs three aws pairs on the four modules and a sample of importers; only aws pairs decide.
-
-**Files:**
-- `scripts/direct/verify_mac_offload_test_support.py` — `CARGO_STUB` and the new shared installer; 42 test importers.
-- `scripts/direct/verify_token_wait_test_support.py` — its Cargo stubs.
-- `scripts/direct/verify_hold_wait_test_support.py` — its `CARGO_STUB` variant.
-- `scripts/direct/verify_ssh_targets_test_support.py` — its Cargo stubs.
-- `scripts/direct/test_verify_mac_only.py` — the byte-for-byte event row, or another verify test module the writer names.
-
-**Workers:** 1 writer; the four support files share one installer and cannot split.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 177: 1,141 Python Cargo tasks cost 25.261 local CPU s across 47 modules (gross ceiling).
-- Phases 181 and 183: aws pairs saved 1.37 s and 0.71 s; the full entries verify named hold most of the cost.
-- Phase 185: the recorder imports less; use matching production code on both sides of each pair.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest` passes for every importer of the four support files, with unchanged test counts.
-- The byte-for-byte event row passes and fails when the shell quoting is broken.
-- basedpyright on each changed Python file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+- Checkpoint `a8054dadf`. `install_fixed_cargo` in `verify_mac_offload_test_support.py` writes a POSIX shell `cargo` that answers the fixed replies (`--version`, metadata, `nextest run` status) and appends the same `TEST_CARGO_EVENTS` line as the Python stub; it exits 1 when the append fails. Other calls (`TEST_CARGO_HOLD`, signals, PID files, observers) still go to Python. `verify_hold_wait_test_support.py` and `verify_ssh_targets_test_support.py` use it; `verify_token_wait_test_support.py` is unchanged. `test_fixed_cargo_replies_match_python_events` in `test_verify_mac_only.py` compares both stubs byte for byte, including a `/dev/full` row. 145 importers, 2,355 tests pass. Three aws pairs saved about 1.2 CPU s per run: `ssh_targets_routing` 0.63, `wait_holder` 0.39, `token_renew` 0.22, `hold_events` 0.06, `mac_only` −0.01 (one new test), `result_environment` −0.06. The local 25 s figure was load noise: Python stub starts are not the main cost of these modules.
 
 ### Phase 187 — The task CPU measure reads a task whose name holds bytes that are not UTF-8  · status: done
 **Depends on:** none
