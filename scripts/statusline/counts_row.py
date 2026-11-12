@@ -2,12 +2,11 @@
 
 Usage: counts_row.py <notifier instance dir>
 
-statusline.sh runs this only when the cache is older than a file it was read from, or a deferred
-question has fallen due, so a render runs no Python while nothing changed. The cache is
-`<showrunner state>/counts/<staff id>`:
+statusline.sh runs this when a source file changes or a cached deadline passes.
+The cache is `<showrunner state>/counts/<staff id>`:
 
   line 1  the counts line, empty when nothing is counted;
-  line 2  the epoch second the soonest deferred question falls due, empty when none is deferred;
+  line 2  the epoch second for a deferred question or a failed read retry, empty when neither applies;
   then    each file the counts were read from, one per line. A file that does not exist yet is
           named by its folder, which changes when the file appears.
 
@@ -24,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 
+from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
 from scripts.production.update_registration import QuestionStaff
@@ -40,18 +40,23 @@ def watched(path: Path) -> Path:
     return path
 
 
-def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str, str, list[Path]]:
-    """The counts line, the epoch second it next changes by the clock, and the files it was read from."""
-    sources = [instance / "conf"]
+def retry_due(sources: list[Path]) -> str:
+    """Return a retry deadline, or watch the configuration when it is unusable."""
     try:
-        doc = showrunner_footer.production_doc(instance)
-    except (OSError, ValueError):
-        doc = None
-    production = showrunner_footer.read_production(instance)
+        return str(int(time.time()) + conf.read("statusline").whole("counts.retry_seconds"))
+    except conf.Unusable:
+        sources.append(conf.path("statusline"))
+        return ""
+
+
+def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None) -> tuple[str, str]:
+    """Return the counts and deadline, and append each source before reading it."""
+    doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
+    production = showrunner_footer.read_production(instance)
     if production is None:
-        return "", "", sources
+        return "", ""
     from scripts.production import footer_counts
     from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 
@@ -65,25 +70,25 @@ def row(instance: Path, *, identities: QuestionStaff | None = None) -> tuple[str
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
         line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""
-        return line, "", sources
+        return line, ""
     sources.append(showrunner_footer.outstanding_path(owner.id, identities=identities))
     questions = showrunner_footer.open_questions([production], identities=identities)
     line = footer_counts.counts_line(footer_counts.read_counts(
         production.doc, questions=questions or 0, record=identities.record)) or ""
     due = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
-    return line, "" if due is None else str(int(due.timestamp())), sources
+    return line, "" if due is None else str(int(due.timestamp()))
 
 
 def write(instance: Path) -> Path:
     cache = cache_path(instance.name.removeprefix("showrunner-"))
     cache.parent.mkdir(parents=True, exist_ok=True)
     began = time.time_ns()
+    sources = [instance / "conf", staff.record_path()]
     try:
-        line, due, sources = row(instance)
+        line, due = row(instance, sources)
     except (OSError, ValueError, showrunner_footer.FooterError):
-        # Nothing readable to count: the row stays empty until the timer's conf changes.
-        line, due, sources = "", "", [instance / "conf"]
-    cache = cache_path(instance.name.removeprefix("showrunner-"))
+        line = ""
+        due = retry_due(sources)
     write_cache(cache, line, due, sources, began)
     return cache
 
