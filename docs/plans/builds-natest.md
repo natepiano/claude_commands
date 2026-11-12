@@ -3297,3 +3297,46 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Checkpoint `58aaa15cc`. `task_ids` in `task_cpu.py` reads `/proc/<pid>/status` as bytes and parses only `Tgid:` and `PPid:`. Two rows in `test_module_cost.py`: a `Name:` with byte `0xff` (fails on the old code) and an ordinary status. Nothing else changed.
+
+### Phase 188 — The coverage collector verifies the Python descendants of a Bash launch  · status: done
+**Depends on:** Phase 184
+
+#### As-built
+
+- Dropped; nothing landed. A trial traced each Bash launch with Linux `strace` to prove every descendant (+364 lines, an `strace` dependency). Sample of the 10 modules that hold the 59 tests with only `unverified launch bash`: 2 recovered. With real system binaries (`date`, `mkdir`, `dirname`, `cat`, `rm`, `mv` and others) added as leaves, the projection is 46 of 59, and the folder goes from 617 to 663 known of 1,558. The other 13 stay unknown (the `py` wrapper, fixture executables). The folder records cannot project more. Simple ranks above a 3% coverage gain, and no removal work is approved to use it. Patch: `phases/188/bash_descendant_evidence.patch` in the session folder.
+
+### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: todo
+**Depends on:** Phase 176
+
+#### Work Order
+
+**Goal:** A test module that scans the tree selects on a change under its declared folders only, so a targeted run adds fewer modules with the same containment.
+
+**Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
+
+**Spec:**
+1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 133 of the median 170). For each, read the scan and name the folders it really reads.
+2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
+3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
+4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
+4a. Declare `production/test_merge_checkpoint_batch.py` with the folder of the code its fixture runs as a process: the fixture starts `merge_checkpoint`, which starts `style_sync`, which imports `style_plan`. This closes the Phase 176 replay miss for that module (builds, 2026-11-12: each miss is caught or named out of scope). Add a replay row that proves it.
+5. Add rows to the existing scan test in `scripts/production/test_affected_modules.py`: a declared module selects on a change under its folder and not on a change outside it; an undeclared unresolved scan still selects. Each declared row fails on the Phase 176 code.
+6. Replay the 55 saved runs. Containment holds (no module the old selector picked is dropped). Report the added median and largest, per rule, before and after.
+
+**Files:**
+- `config/merge_gate.conf` — the `scan_roots` key.
+- `scripts/production/affected_modules.py` — declared scan evidence.
+- `scripts/production/test_affected_modules.py` — the new rows.
+
+**Workers:** 1 writer; the key, its reader and its rows are one change.
+- impl: all three files and the replay.
+
+**Constraints from prior phases:**
+- Phase 176: 55 replays keep every old selection; added median 170, largest 476; source-scan rule median 133, largest 458. Builds ruled out the general import closure; full merge gates stay unchanged.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
+- basedpyright reports 0 errors and 0 warnings on the changed files.
+- The replay keeps containment for all 55 runs and shows the added median before and after.
