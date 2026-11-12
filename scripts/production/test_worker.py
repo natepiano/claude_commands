@@ -2143,8 +2143,9 @@ class WorkerCommandTests(unittest.TestCase):
                     bind = worker_panes.WorkerLockHold.bind
                     guard = LauncherHangGuard("first assignment ready hooks")
                     with ThreadPoolExecutor(max_workers=4) as hooks:
-                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
-                            bind(hold, row)
+                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, *,
+                                             deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+                            bind(hold, row, deadline=deadline)
                             if current_thread() is assignment_thread and ready_hooks and row.name not in pending:
                                 pending[row.name] = hooks.submit(turn_end.handle,
                                     turn_end.WorkerEvent(str(row.current_session), reply="ready"))
