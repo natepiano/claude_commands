@@ -1130,7 +1130,7 @@ From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is reso
 - `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
 - `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.
 
-### Phase 55 — A large unnamed disk fall starts one folder walk · status: todo
+### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
 
 From builds (not the user), 2026-11-12: go on this phase. "Put the 2 h limit and the fall size in config as new keys. Start the walk only on an unnamed fall beyond cache growth. Land order when green."
 

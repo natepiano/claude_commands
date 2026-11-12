@@ -3134,6 +3134,31 @@ def alert_path(path: str, limit: int) -> str:
     return f"{prefix}…/{leaf}"
 
 
+def unnamed_disk_fall(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
+                      previous: NoFloorRecord | FloorRecord) -> int:
+    unaccounted = max(0, free_fall - cache_growth)
+    if (isinstance(measurement, AvailableDiskMeasurement)
+            and isinstance(measurement.comparison, EarlierDiskMeasurement)
+            and isinstance(previous, FloorRecord) and measurement.measured_at.timestamp() > previous.measured_at):
+        return unaccounted - min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
+    return unaccounted
+
+
+def finish_disk_walk_request(now: float, *, lint_settings: conf.ConfigRead) -> None:
+    request = store.read_disk_walk_request()
+    if isinstance(request, store.DiskWalkRequestState):
+        return
+    measurement = read_disk_measurement()
+    if (isinstance(measurement, AvailableDiskMeasurement)
+            and measurement.measured_at > datetime.fromisoformat(request["requested_at"])):
+        message = fit_alert_text(lambda width: "\n".join([
+            f"Folder walk for the {request['alert_at']} fall:",
+            *disk_measurement_lines(measurement, 0, 0, now, False, width, lint_settings=lint_settings),
+        ]), lint_settings=lint_settings)
+        if send_floor_alert(message, lint_settings=lint_settings).accepted:
+            (store.root() / store.DISK_WALK_REQUEST_NAME).unlink()
+
+
 def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
                            now: float, explain_fall: bool, path_limit: int,
                            previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD, *,
@@ -3159,8 +3184,8 @@ def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_g
         lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
         if explain_fall and not measured_before_fall:
             unaccounted = max(0, free_fall - cache_growth)
-            covered = min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
-            remainder = unaccounted - covered
+            remainder = unnamed_disk_fall(measurement, free_fall, cache_growth, previous)
+            covered = unaccounted - remainder
             coverage = ("cover all of it" if remainder == 0
                         else f"cover {gib(covered)}; {gib(remainder)} came after {pacific_time(measurement.measured_at)} or outside measured folders")
             lines.append(f"Of {gib(unaccounted)} of the fall beyond cache growth, measured folders {coverage}.")
@@ -4059,6 +4084,11 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
         free = after
+        if root_scope and isinstance(policy, NatedevFloor):
+            try:
+                finish_disk_walk_request(time.time(), lint_settings=lint_settings)
+            except OSError as error:
+                print(f"lint sweep: cannot finish the disk walk request: {error}", file=sys.stderr)
         if root_scope:
             try:
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
@@ -4421,6 +4451,27 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             try:
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
+                    free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
+                    cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
+                    same_held_roots = (isinstance(previous, FloorRecord)
+                                       and isinstance(previous.held_roots, KnownHeldRoots)
+                                       and previous.held_roots.roots == frozenset(hold_targets))
+                    same_filesystem = True
+                    if isinstance(filesystem, FilesystemFloor):
+                        same_filesystem = isinstance(previous, FloorRecord) and (
+                            previous.filesystem == filesystem.key and previous.measured_roots == tuple(sorted(idle))
+                            or filesystem.root_device and filesystem.legacy_history_safe and previous.filesystem == "")
+                    if (recent and same_held_roots and same_filesystem
+                            and (not isinstance(filesystem, FilesystemFloor) or filesystem.root_device)
+                            and not (store.root() / store.DISK_WALK_REQUEST_NAME).exists()):
+                        measurement = read_disk_measurement()
+                        unnamed = unnamed_disk_fall(measurement, free_fall, cache_growth, previous)
+                        if (isinstance(measurement, AvailableDiskMeasurement)
+                                and unnamed > lint_settings.whole("sweep_walk_request_fall_bytes")
+                                and now - measurement.measured_at.timestamp() >= lint_settings.number("sweep_walk_request_interval_seconds")):
+                            store.write_disk_walk_request({"requested_at": store.utc_iso(now),
+                                                          "alert_at": store.utc_iso(now), "unnamed_bytes": unnamed})
                     history = base.alert_history
                     push_history = base.push_history
                     alert_interval = lint_settings.number("sweep_alert_interval_seconds")
@@ -4440,19 +4491,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         if delivered.accepted or told:
                             push_history = DeliveredAlert(time.time())
                     elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
-                        free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
-                        cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
-                        recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
-                        same_held_roots = (isinstance(previous, FloorRecord)
-                                           and isinstance(previous.held_roots, KnownHeldRoots)
-                                           and previous.held_roots.roots == frozenset(hold_targets))
                         unexplained_fall = lint_settings.whole("sweep_unexplained_fall_bytes")
                         large_removal = lint_settings.whole("sweep_large_removal_bytes")
-                        same_filesystem = True
-                        if isinstance(filesystem, FilesystemFloor):
-                            same_filesystem = isinstance(previous, FloorRecord) and (
-                                previous.filesystem == filesystem.key and previous.measured_roots == tuple(sorted(idle))
-                                or filesystem.root_device and filesystem.legacy_history_safe and previous.filesystem == "")
                         growth_fired = recent and same_held_roots and same_filesystem and free_fall - cache_growth > unexplained_fall
                         removal_fired = removed > large_removal
                         if growth_fired or removal_fired:
