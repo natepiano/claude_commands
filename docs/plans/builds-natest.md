@@ -3304,35 +3304,38 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: done
 **Depends on:** Phase 193
 
+#### As-built
+
+- Checkpoint `7a5781915`. `CrateRun.advance` (`crate_run.py:977`) looks up the package and its saved stage before frozen checkout acquisition and returns for `ABANDONED` and `INTEGRATED`; the `serial` run lock and the `complete_run` context stay around the return, and the nine other stages still acquire the checkout. The proof (in the checkpoint message) shows that the terminal body, `complete_run`, `copies.workspace`, `copies.end_workspaces` and the `scratch` removal path read the canonical manifest, worker records, holds and the copies registry, never the frozen checkout; the skipped work is the unused `copies.standing` lifetime. One row in an existing terminal cleanup test (`test_crate_run.py:511`) fails on the old code. 96 tests and 587 assertions kept. aws pairs: `test_crate_run.py` 58.06 to 56.15 CPU s (1.91 s); `test_bulk_run.py` unchanged.
+
+### Phase 195 — Profile the copy-guard source scan and name its removable work  · status: todo
+**Depends on:** none
+
 #### Work Order
 
-**Goal:** A crate run that resumes in a terminal stage returns without building the frozen checkout, with every cleanup, lock and evidence check kept.
+**Goal:** A report splits the copy-guard source-scan CPU by step and names any removable work, with a bounded estimate and an owner for each item.
 
-**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R1): only if a terminal resume never reads that checkout; show that proof in the checkpoint. Tell style and queue (owner of `scripts/copies`) before the edit. Paired aws trials decide.
+**Decision:** architect after Phase 193 (next items step 6, item 2): research only; no code change. queue owns `scripts/copies`. Keep both policy tests and every check.
 
 **Spec:**
-1. Prove first: trace every read of the frozen checkout on the terminal path from `style/crate_run.py:974` through `complete_run` (`:1159`) and `copies.end_workspaces`. Write the proof to `phases/194/terminal_proof.md` in the session folder. If any terminal read exists, stop and report; land nothing.
-2. Move only the package lookup and the terminal-stage check before frozen checkout acquisition (`crate_run.py:979,986`). Keep the serial run lock and the `complete_run` context around that return.
-3. Keep every owner, unsaved-file, busy-lock, pending-removal and result-evidence check. Do not skip the checkout for selected, pending, claimed, tested or imported work.
-4. Add one row to an existing terminal test in `test_crate_run.py` that fails if a terminal resume builds the frozen checkout.
-5. Run `test_crate_run` and every importer of `crate_run.py`. The director runs three aws pairs.
+1. Profile `copies/test_copy_guard_sources.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> copies/test_copy_guard_sources.py --tests 10 --commands 10`, two runs.
+2. Split the 22.49 CPU s check scope into `scan_scripts` (`copy_guard.py:1183`), `PythonPolicy` (`:942`), file reads, AST parses and any child processes. Use `cProfile` only to rank steps; use paired runs for numbers (cProfile overstates).
+3. For each step, say whether the tests need it: map each assertion to the work it proves. Name repeated parses or reads of the same file, and work a test repeats that a class fixture could hold.
+4. Give each candidate a bounded estimate (CPU s, kept apart from measurements), its file and line, and its owner (queue for production code, natest for test code).
+5. Change no repository file. Write the report to `phases/195/copy_guard_report.md` in the session folder.
 
 **Files:**
-- `scripts/style/crate_run.py` — the terminal return before checkout acquisition.
-- `scripts/style/test_crate_run.py` — the new row.
-- `phases/194/terminal_proof.md` — in the session folder.
+- `phases/195/copy_guard_report.md` — in the session folder.
 
-**Workers:** 1 writer; the proof and the change are one unit.
-- impl: all files.
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
 
 **Constraints from prior phases:**
-- Phase 191: twenty terminal-entry frozen scopes cost 2.86 CPU s inclusive, in seven tests. Not measured as a saving.
-- Phase 193 changes `test_crate_run.py` fixtures; this phase starts after it lands so the aws pairs measure one change.
+- Phase 74: `copies/test_copy_guard.py` 64.15 to 31.36 CPU s in pairs; do not reopen its fixtures without new evidence.
+- No speed phase is selected from a local estimate; aws pairs decide (architect after Phase 190).
 
 **State:** none.
 
 **Acceptance gate:**
-- The proof shows no read of the frozen checkout on the terminal path.
-- `python3 -m unittest` passes `test_crate_run` and every importer of `crate_run.py`.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
+- The report gives the step split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
+- No repository file changes.
