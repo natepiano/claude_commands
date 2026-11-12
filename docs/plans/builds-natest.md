@@ -3253,7 +3253,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report gives the sample and its CPU share, the program table, the top callers with file, line, module count and owner, and the ranked candidates with measured and estimated labels.
 - `git status` shows no change from the researcher.
 
-### Phase 178 — The coverage report tests run the report in process, and the ledger fixture drops two unused imports  · status: todo
+### Phase 178 — The coverage report tests run the report in process, and the ledger fixture drops two unused imports  · status: done
 **Depends on:** none
 
 #### Work Order

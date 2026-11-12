@@ -18,17 +18,18 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import ClassVar, TypedDict, cast, override
+from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 from unittest import mock
 from scripts.style import rules
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
 from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-from scripts.style import style_plan
 from scripts.style import style_rules
-from scripts.style import declarations
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+if TYPE_CHECKING:
+    from scripts.style import declarations
 
 
 STYLE_UNIT_NAMES = (
@@ -636,6 +637,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def widen(self, *paths: str, ticket: str = "1", reason: str = "the move needs a new file",
               by: str = "showrunner") -> tuple[int, str]:
+        from scripts.style import style_plan
+
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
             result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
@@ -827,6 +830,8 @@ class LedgerTestCase(unittest.TestCase):
     def renamed_binding(self, ledger: style_ledger.Ledger, built_path: str, before: str, after: str) -> str:
         """A filed rename of the binding ws in fn old, a built rename of fn old at built_path, and a tip that renames
         only the fn. The step follows the finding to fn new."""
+        from scripts.style import declarations
+
         function = "pub fn old() {\n    let ws = 1;\n}\n"
         _ = self.commit_tip(ledger, {PARENT_FILE: function, MOVED_FILE: "pub fn caller() {\n    crate::a::old();\n}\n"})
         _, (finding_id,) = self.judge_parent(ledger, ((2, "let ws = 1;"),), before="ws", after="workspace")
@@ -841,6 +846,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_gone_from_file(self, ledger: style_ledger.Ledger, finding_id: str, approved: Callable[[Path], bool]) -> None:
         """The declaration step leaves the filed finding on struct Parent gone from its file and writes nothing."""
+        from scripts.style import declarations
+
         filed = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))[0]
         before = self.held_rows(ledger.database)
         left, = ledger.follow_declarations([finding_id], ledger.synced_commit(), approved).outcomes
@@ -872,6 +879,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_method_rename_built_in_place(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
         """The step builds the filed rename of Parent::old to Parent::new at fn new in impl Parent in a.rs."""
+        from scripts.style import declarations
+
         filed = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == finding_id)
         renamed, = self.follow_approved(ledger, [finding_id])
         self.assertEqual(renamed, style_ledger.DeclarationRenamed(
