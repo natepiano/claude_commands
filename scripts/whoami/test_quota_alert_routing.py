@@ -22,7 +22,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = self.alert(notes, self.now)
         self.assertEqual(self.refuse(), "switched to claude for codex1: direct, design_roles")
         self.assertEqual(self.assignments(),
-                         {"direct": "claude", "cli": "claude", "design_roles": "claude", "ask_a_friend": "caller"})
+                         {"direct": "claude", "cli": "claude", "design_roles": "claude"})
         self.sent.clear()
         _ = self.alert(notes, self.now + timedelta(minutes=30))
         self.assertEqual(self.sent, [])

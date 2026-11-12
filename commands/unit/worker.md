@@ -52,7 +52,7 @@ For assignment, exit 0 means submitted. The pass and any held role stay active.
 The launcher returns at once. End the director turn after any assigned synchronous review.
 The turn hook saves the result, completes the pass, and sends the director its reply path.
 The hook closes the completed pane and keeps its native conversation.
-A live run or pending friend reply retains the same pass without another prompt.
+A live run retains the same pass without another prompt.
 Other codes: `1` check failure, `2` refusal, `4` Codex question, `6` busy, `7` retained, `8` uncertain.
 A Codex delivery returns only after its transcript records the prompt, within `WORKER_SETTLE_SECONDS`; otherwise it returns `8`. A Claude delivery returns before its transcript must contain the prompt.
 A failed delivery command returns an error.

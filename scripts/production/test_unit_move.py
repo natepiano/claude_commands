@@ -127,20 +127,101 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual((backend.starts, backend.stops), (starts, stops))
 
     def test_running_unit_stops_moves_and_resumes_current_session(self) -> None:
+        from scripts.agents import detached_run_process
+        from scripts.lib import unit_runs
+
         with saved_fixture(self.root) as restore:
-            for pending in ("", "rename"):
-                with self.subTest(pending=pending):
+            for pending in ("", "rename", "native director and caller", "late detached command", "late pane worker",
+                            "late run path", "late run path with lock"):
+                with self.subTest(pending=pending), ExitStack() as scope:
                     restore()
-                    if pending:
+                    if pending == "rename" or pending == "late run path with lock":
                         _ = self.git("worktree", "lock", "--reason", f"staff:{self.owner.id}", str(self.source))
                     backend = FolderSessionFixture(self.owner, live=True)
-                    with backend.installed():
-                        result = self.move_folder()
-                        self.assertEqual((result.returncode, result.stderr), (0, ""))
-                        self.assert_moved(backend)
+                    _ = scope.enter_context(mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "runs",)))
+                    path = self.root / "runs" / "current" / "detached_runs" / "late.json"
+                    if pending == "native director and caller":
+                        caller = os.getpid()
+                        parents = {caller: 998042, 998042: 998041, 998043: 998041, 998041: 998040, 998040: 1}
+                        def parent(pid: int) -> int:
+                            return parents.get(pid, 0)
+                        _ = scope.enter_context(mock.patch.object(unit_move, "processes_inside",
+                            return_value=[caller, 998040, 998041, 998042, 998043]))
+                        _ = scope.enter_context(mock.patch.object(pane_record, "process_parent", side_effect=parent))
+                        _ = scope.enter_context(mock.patch.object(herdr, "read_conversation",
+                            return_value=herdr.LiveConversation("claude", (998041,))))
+                        _ = scope.enter_context(mock.patch.object(herdr, "native_process",
+                            return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(self.owner.current_session),
+                                "fixture-start", {})))
+                    workers = [fixture_worker("late-implementation", self.owner.id)] if pending == "late pane worker" else []
+                    late_owners = [fixture_member("unit", name="late-run-owner", parent=self.owner.parent,
+                        worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-worktree"))
+                        ] if pending.startswith("late run path") else []
+                    run = self.source / "late-run"
+                    lock = Path(self.git("rev-parse", "--absolute-git-dir", cwd=self.source)) / "locked"
+                    refusal_files: dict[str, tuple[bytes, int]] = {}
+                    appeared = False
+                    original_owner = staff.by_id(self.owner.id)
+                    assert original_owner is not None
+                    before = file_versions(self.root)
+
+                    def stop(row: staff.StaffRow, client: object) -> bool:
+                        nonlocal appeared
+                        stopped = backend.stop(row, client)
+                        appeared = True
+                        if pending == "late detached command":
+                            write_text_atomic(path, json.dumps({"status": "running", "pid": 998201,
+                                "label": "late fixture gate", "command": ["cat", str(self.source / "kept.txt")]}))
+                        if late_owners:
+                            run.mkdir()
+                            _ = staff.set_run(late_owners[0].id, staff.OpenRun(run))
+                            refusal_files.update(file_versions(self.root))
+                            if pending == "late run path":
+                                _ = refusal_files.pop(str(lock.relative_to(self.root)), None)
+                        return stopped
+
+                    def observe(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+                        return [row for row in rows if row.id == self.owner.id and backend.live
+                                or appeared and any(row.id == worker.id for worker in workers)]
+
+                    with backend.installed(), ExitStack() as running_scope:
+                        if pending.startswith("late "):
+                            _ = running_scope.enter_context(mock.patch.object(restart, "stop_row", side_effect=stop))
+                            _ = running_scope.enter_context(mock.patch.object(restart, "live_members", side_effect=observe))
+                            _ = running_scope.enter_context(mock.patch.object(detached_run_process, "supervises", return_value=True))
+                        if pending == "native director and caller":
+                            arguments = ["move-folder", "--unit", str(self.owner.id), "--to", str(self.destination)]
+                            result = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments,
+                                                dict(os.environ), self.source)
+                        else:
+                            result = self.move_folder()
+                        if late_owners:
+                            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                            self.assertIn(str(run), result.stderr)
+                        else:
+                            self.assertEqual((result.returncode, result.stderr), (0, ""))
                         self.assertEqual(backend.stops, [self.owner.current_session])
                         self.assertEqual(len(backend.starts), 1)
-                        self.assert_finished_rerun(backend)
+                        if pending.startswith("late "):
+                            self.assertTrue(self.source.is_dir())
+                            self.assertFalse(self.destination.exists())
+                            self.assertEqual(staff.by_id(self.owner.id), original_owner)
+                            self.assertTrue(backend.live)
+                            if late_owners:
+                                self.assertEqual(lock.exists(), pending == "late run path with lock")
+                                self.assertEqual(file_versions(self.root), refusal_files)
+                                self.assertEqual(staff.by_id(late_owners[0].id), replace(late_owners[0], run=staff.OpenRun(run)))
+                            else:
+                                after = file_versions(self.root)
+                                _ = after.pop(str(path.relative_to(self.root)), None)
+                                self.assertEqual(after, before)
+                                lines = [line for line in result.stdout.splitlines() if "deferred" in line]
+                                self.assertEqual(len(lines), 1, result.stdout)
+                                self.assertIn(workers[0].name if workers else "late fixture gate", lines[0])
+                        else:
+                            self.assert_moved(backend)
+                            self.assert_finished_rerun(backend)
 
     def test_resume_in_a_new_pane_closes_the_old_terminal_and_keeps_a_reused_pane(self) -> None:
         from scripts.herdr import herdr
@@ -200,14 +281,91 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assert_finished_rerun(backend)
 
     def test_stopped_unit_with_a_closed_pane_stays_stopped(self) -> None:
-        backend = FolderSessionFixture(self.owner, live=False)
-        with backend.installed():
-            result = self.move_folder()
-            self.assertEqual((result.returncode, result.stderr), (0, ""))
-            self.assert_moved(backend)
-            self.assertEqual((backend.starts, backend.stops), ([], []))
-            self.assertFalse(backend.live)
-            self.assert_finished_rerun(backend)
+        from scripts.agents import detached_run_process
+        from scripts.lib import unit_runs
+
+        restore = self.enterContext(saved_fixture(self.root))
+        for state in ("idle", "pane worker", "detached command", "detached cwd", "finished live supervisor"):
+            with self.subTest(state=state), ExitStack() as scope:
+                restore()
+                backend = FolderSessionFixture(self.owner, live=False)
+                _ = scope.enter_context(backend.installed())
+                _ = scope.enter_context(mock.patch.object(unit_move, "processes_inside", return_value=[]))
+                _ = scope.enter_context(mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "runs",)))
+                if state == "pane worker":
+                    worker = fixture_worker("running-implementation", self.owner.id)
+                    def live_worker_members(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+                        return [row for row in rows if row.id == worker.id]
+                    _ = scope.enter_context(mock.patch.object(restart, "live_members",
+                        side_effect=live_worker_members))
+                    evidence = worker.name
+                else:
+                    evidence = "fixture gate"
+                    path = self.root / "runs" / "other-unit" / "detached_runs" / "gate.json"
+                    if state != "idle":
+                        write_text_atomic(path, json.dumps({"status": "finished" if state == "finished live supervisor" else "running", "pid": 998201,
+                            "label": evidence, "command": ["sh", "-c", f"cat '{self.source}/kept.txt'"]
+                                if state != "detached cwd" else ["echo", "fixture"],
+                            "cwd": str(self.source) if state == "detached cwd" else str(self.checkout)}))
+                    _ = scope.enter_context(mock.patch.object(detached_run_process, "supervises", return_value=True))
+                before = file_versions(self.root)
+                result = self.move_folder()
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                if state in ("pane worker", "detached command", "detached cwd", "finished live supervisor"):
+                    self.assertTrue(self.source.is_dir())
+                    self.assertFalse(self.destination.exists())
+                    self.assertEqual(staff.by_id(self.owner.id), self.owner)
+                    self.assertEqual(file_versions(self.root), before)
+                    lines = [line for line in result.stdout.splitlines() if "deferred" in line]
+                    self.assertEqual(len(lines), 1, result.stdout)
+                    self.assertIn(evidence, lines[0])
+                else:
+                    self.assert_moved(backend)
+                    self.assert_finished_rerun(backend)
+                self.assertEqual((backend.starts, backend.stops), ([], []))
+                self.assertFalse(backend.live)
+
+    def test_run_paths_inside_the_worktree_refuse_without_changes(self) -> None:
+        from scripts.lib import unit_runs
+
+        restore = self.enterContext(saved_fixture(self.root))
+        for source in ("staff run", "dispatch record", "supervisor record", "other member run", "other member dispatch"):
+            with self.subTest(source=source):
+                restore()
+                run = self.source / "run"
+                run.mkdir()
+                owner = self.owner
+                if source.startswith("other member"):
+                    owner = fixture_member("unit", name="other", parent=self.owner.parent,
+                        worktree=staff.PresentWorktree(remote.local_machine(), self.root / "other-worktree"))
+                if source in ("staff run", "other member run"):
+                    _ = staff.set_run(owner.id, staff.OpenRun(run))
+                    evidence = run
+                elif source in ("dispatch record", "other member dispatch"):
+                    worker = fixture_worker("implementation", owner.id)
+                    evidence = run / "progress_history_state.json"
+                    write_text_atomic(evidence, "{}")
+                    link = self.staff_file.parent / "dispatches" / str(worker.id)
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(evidence)
+                else:
+                    evidence = run / "supervisor.json"
+                    write_text_atomic(evidence, json.dumps({"status": "finished", "pid": 998201}))
+                    link = self.root / "runs" / "other-unit" / "detached_runs" / "gate.json"
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(evidence)
+                before = file_versions(self.root)
+                backend = FolderSessionFixture(self.owner, live=False)
+                with (backend.installed(),
+                      mock.patch.object(unit_runs, "run_roots", return_value=(self.root / "runs",))):
+                    result = self.move_folder()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn(str(evidence), result.stderr)
+                self.assertEqual(file_versions(self.root), before)
+                self.assertTrue(self.source.is_dir())
+                self.assertFalse(self.destination.exists())
+                self.assertEqual((backend.starts, backend.stops), ([], []))
 
     def test_f002_stopped_unit_at_destination_rerun_changes_nothing(self) -> None:
         _ = self.git("worktree", "move", "--force", "--force", str(self.source), str(self.destination))
@@ -359,7 +517,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual(file_versions(self.root), before)
         self.assertEqual((backend.starts, backend.stops), ([], []))
 
-    def test_move_reads_only_members_and_resumes_their_current_sessions(self) -> None:
+    def test_move_reads_only_members_and_defers_their_current_sessions(self) -> None:
         from scripts.herdr import herdr
         from scripts.message import sessions
 
@@ -395,16 +553,18 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(os, "kill", side_effect=AssertionError("No real signal is allowed"))):
             result = self.move_folder()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual([(action, row.id) for action, row in events],
-            [("stop", self.owner.id), ("stop", worker.id), ("start", self.owner.id), ("start", worker.id)])
+        self.assertEqual(events, [])
+        self.assertIn("folder move deferred", result.stdout)
+        self.assertIn(worker.name, result.stdout)
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertEqual(running, {row.id for row in rows})
         registry.assert_not_called()
         codex.assert_not_called()
         self.assertEqual({call.args[0] for call in read.call_args_list},
                          {self.owner.current_session, worker.current_session})
-        self.assertFalse(self.source.exists())
-        self.assertTrue(self.destination.is_dir())
+        self.assertTrue(self.source.is_dir())
+        self.assertFalse(self.destination.exists())
 
     def test_unsafe_stop_moves_no_folder_and_sends_no_signal(self) -> None:
         from scripts.agents import shutdown
@@ -485,8 +645,8 @@ class UnitFolderMoveTests(FolderRenameFixture):
             agent_start.assert_not_called()
 
 
-    def test_running_unit_stops_pauses_moves_and_resumes_with_its_worker_command(self) -> None:
-        self.test_move_reads_only_members_and_resumes_their_current_sessions()
+    def test_running_unit_defers_with_its_worker_command(self) -> None:
+        self.test_move_reads_only_members_and_defers_their_current_sessions()
 
     def test_held_move_lock_refuses_without_stopping_or_moving(self) -> None:
         import fcntl
@@ -732,7 +892,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.test_running_unit_stops_moves_and_resumes_current_session()
         self.assertEqual(file_versions(self.records), before)
 
-    def test_folder_move_resumes_the_unit_and_keeps_a_live_idle_worker_closed(self) -> None:
+    def test_folder_move_defers_and_keeps_a_live_idle_worker(self) -> None:
         world = PaneWorld()
         world.setup(self)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})))
@@ -769,16 +929,20 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(os, "kill", side_effect=world.signal)):
             result = self.move_folder()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assert_moved(backend)
-        self.assertEqual(backend.stops, [self.owner.current_session])
-        self.assertEqual(len(backend.starts), 1)
-        self.assertIn("idle: closed; its next assign resumes it\n", result.stdout)
+        self.assertTrue(self.source.is_dir())
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
+        self.assertEqual(staff.by_id(idle.id), idle)
+        self.assertEqual((backend.starts, backend.stops), ([], []))
+        self.assertTrue(backend.live)
+        self.assertIn("folder move deferred", result.stdout)
+        self.assertIn(idle.name, result.stdout)
         self.assertIn("w1:p0", world.foreground)
-        self.assertNotIn("w1:p1", world.foreground)
+        self.assertIn("w1:p1", world.foreground)
         self.assertEqual(world.launches, [])
 
-    def test_folder_move_resumes_the_same_worker_thread_with_the_staff_folder(self) -> None:
-        self.test_move_reads_only_members_and_resumes_their_current_sessions()
+    def test_folder_move_keeps_the_same_worker_thread_and_staff_folder(self) -> None:
+        self.test_move_reads_only_members_and_defers_their_current_sessions()
 
 
 
@@ -1457,24 +1621,63 @@ class FolderMoveReviewTests(FolderRenameFixture):
         from scripts.agents import shutdown
 
         _ = write_config_fixture(self.configuration, "RENAME_LIVE_WAIT_SECONDS=0.01\nRENAME_POLL_SECONDS=0.001\n")
-        backend = FolderSessionFixture(self.owner, live=True)
-        with (backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
-              mock.patch.object(restart, "start_row", side_effect=OSError("fixture launch failure")) as start):
-            result = self.command()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        start.assert_not_called()
-        command = f"agents restart --only {self.owner.id}"
-        lines = [line for line in (result.stdout + result.stderr).splitlines() if command in line]
-        self.assertEqual(lines, [])
-        self.assertTrue(backend.live)
-        self.assertEqual(backend.starts, [])
-        self.assertEqual(backend.stops, [])
+        restore = self.enterContext(saved_fixture(self.root))
+        for state in ("idle", "native director and MCP", "native director and MCP with worker",
+                      "native director and MCP with worker caller", "native director and MCP with worker identity unknown"):
+            with self.subTest(state=state), ExitStack() as scope:
+                restore()
+                backend = FolderSessionFixture(self.owner, live=True)
+                workers = [fixture_worker("active", self.owner.id)] if "with worker" in state else []
+                if state.startswith("native director and MCP"):
+                    caller = os.getpid()
+                    parents = {caller: 998044, 998044: 998040, 998040: 1,
+                               998041: 998040, 998042: 998041, 998043: 998041, 998051: 998041}
+                    if state.endswith("worker caller"):
+                        parents[998044] = 998051
+                    def parent(pid: int) -> int:
+                        return parents.get(pid, 0)
+                    def conversation(identity: str) -> herdr.LiveConversation:
+                        return herdr.LiveConversation("claude", (998051 if workers and identity == workers[0].current_session else 998041,))
+                    def native(pid: int, _kind: str) -> herdr.NativeAgentProcess:
+                        if pid == 998051 and state.endswith("identity unknown"):
+                            raise ValueError("fixture worker identity is unknown")
+                        identity = workers[0].current_session if workers and pid == 998051 else self.owner.current_session
+                        return herdr.NativeAgentProcess(herdr.EnvironmentThread(identity), "fixture-start", {})
+                    _ = scope.enter_context(mock.patch.object(unit_move, "processes_inside",
+                        return_value=[caller, 998040, 998041, 998042, 998043, 998044, *([998051] if workers else [])]))
+                    _ = scope.enter_context(mock.patch.object(pane_record, "process_parent", side_effect=parent))
+                    _ = scope.enter_context(mock.patch.object(herdr, "read_conversation", side_effect=conversation))
+                    _ = scope.enter_context(mock.patch.object(herdr, "native_process", side_effect=native))
+                with (backend.installed(), mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
+                      mock.patch.object(restart, "start_row", side_effect=OSError("fixture launch failure")) as start):
+                    result = self.command()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                start.assert_not_called()
+                command = f"agents restart --only {self.owner.id}"
+                lines = [line for line in (result.stdout + result.stderr).splitlines() if command in line]
+                self.assertEqual(lines, [])
+                self.assertTrue(backend.live)
+                self.assertEqual(backend.starts, [])
+                self.assertEqual(backend.stops, [])
+                if workers:
+                    self.assertTrue(self.source.is_dir())
+                    self.assertFalse(self.destination.exists())
+                    self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-source")
+                    self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="destination"))
+                    self.assertEqual(staff.by_id(workers[0].id), workers[0])
+                    self.assertIn("folder and branch kept", result.stdout)
+                else:
+                    self.assertFalse(self.source.exists())
+                    self.assertTrue(self.destination.is_dir())
+                    self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "cargo-liner-destination")
+                    self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="destination",
+                        worktree=staff.PresentWorktree(remote.local_machine(), self.destination)))
 
     def test_f007_no_lifecycle_call_starts_after_the_shared_deadline(self) -> None:
         from scripts.agents import worker_lifecycle
 
-        worker = fixture_worker("live-worker", self.owner.id)
-        running = {self.owner.id, worker.id}
+        _ = fixture_worker("idle-worker", self.owner.id)
+        running = {self.owner.id}
         clock = [100.0]
         calls: list[tuple[str, staff.StaffId, float]] = []
         def observe(rows: Iterable[staff.StaffRow], _record: staff.StaffSnapshot) -> list[staff.StaffRow]:

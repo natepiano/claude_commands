@@ -707,8 +707,8 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
         state = read_object(self.session_dir / "progress_history_state.json")
         passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
-        self.assertEqual((passed["worker_name"], passed["worker_id"], passed["status"]),
-                         ("impl2", opened.row.id, "completed"))
+        self.assertEqual((passed["worker_id"], passed["status"]), (opened.row.id, "completed"))
+        self.assertNotIn("worker_name", passed)
         phase = self.session_dir / "phases/7"
         self.assertEqual((phase / "impl2_status").read_text(), "done\n")
         self.assertIn(self.native.agent.final, (phase / "impl2_summary.txt").read_text())

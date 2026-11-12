@@ -88,7 +88,8 @@ A shared read through `worker_lifecycle.locked_state` creates no missing state f
 `HookCompletion` records completed actions so an interrupted handler can continue.
 An already finished hook event changes no dispatch.
 A missing final transcript record does not erase a matching DONE reply supported by the dispatch prompt.
-A live detached command prevents completion. A pending command result or friend reply keeps the assignment active.
+A live detached command prevents completion.
+A pending command result keeps the assignment active.
 
 Normal DONE closure retains the staff row and native conversation.
 The next assignment resumes that conversation in a new pane.

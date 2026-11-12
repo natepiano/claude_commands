@@ -19,6 +19,7 @@ from scripts.notify import push_reference
 from scripts.message import send
 from scripts.message import sessions
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from scripts.notify.user_action import ActionRequired, NoActionRequired
@@ -80,8 +81,16 @@ class EscalateTests(unittest.TestCase):
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
 
     def run_script(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *registered_arguments(arguments)], env={**self.environment, **environment},
-                              capture_output=True, text=True, check=False)
+        call_environment = {**self.environment, **environment}
+        command_arguments = list(registered_arguments(arguments))
+        if process_boundary_for_case(self):
+            return subprocess.run([sys.executable, str(SCRIPT), *command_arguments], env=call_environment,
+                                  capture_output=True, text=True, check=False)
+        with (patch.object(escalate, "STATE", Path(call_environment["ESCALATE_STATE_DIR"])),
+              patch.object(escalate, "SEND", Path(call_environment["ESCALATE_SEND"])),
+              patch.object(escalate, "NOTIFIER", Path(call_environment["ESCALATE_NOTIFIER"]))):
+            return invoke_cli(escalate, lambda: escalate.main(command_arguments), command_arguments,
+                              call_environment, Path.cwd())
 
     def hold(self, minutes: str = "0") -> subprocess.CompletedProcess[str]:
         return self.run_script("hold", "disk", "--summary", "Disk", "--text", "Disk is full.",
@@ -90,6 +99,7 @@ class EscalateTests(unittest.TestCase):
     def log(self) -> str:
         return (self.root / "log").read_text(encoding="utf-8")
 
+    @process_boundary
     def test_a_hold_starts_the_minute_tick_and_a_second_hold_changes_nothing(self) -> None:
         self.assertEqual(self.hold("15").stdout,
                          "disk: held; sent to the user in 15 min unless they type in a terminal\n")

@@ -554,10 +554,16 @@ def selected_pane(panes: Sequence[Mapping[str, object]], candidates: Sequence[Ma
     return pane
 
 
-def worker_fallback_run(parent: staff.StaffRow) -> Path:
-    """Use the inherited run or the parent's local worker directory."""
-    current = unit_runs.environ("RUN_DIR")
-    return Path(current) if current else unit_runs.state_dir() / "staff" / "workers" / parent.id
+def worker_fallback_run(parent: staff.StaffRow, *,
+                        record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL) -> Path:
+    """Use an inherited run only when its staff owner matches the current parent."""
+    record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+    current = record.by_id(parent.id)
+    if current is not None and (supplied := unit_runs.environ("RUN_DIR")):
+        fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
+        if fields.get(unit_runs.OWNER_FIELD) == current.id:
+            return Path(supplied)
+    return unit_runs.state_dir() / "staff" / "workers" / parent.id
 
 
 def parent_run_index(record: staff.StaffSnapshot) -> dict[str, list[str]]:
@@ -580,41 +586,45 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
         held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
         recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
         found[row.id] = tuple(dict.fromkeys((selected, *(Path(directory) for directory in held),
-                                            *recorded, worker_fallback_run(parent))))
+                                            *recorded, worker_fallback_run(parent, record=record))))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
 
 def worker_run(member: staff.StaffRow, *,
                record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
                scanned: dict[str, list[str]] | None = None) -> Path:
-    """Use the recorded dispatch state before searching the parent's held runs."""
-    parent = member
+    """Find dispatches by fixed worker id within the current parent's runs."""
+    record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
+    current = record.by_id(member.id)
+    if current is None:
+        return unit_runs.state_dir() / "staff" / "workers" / member.id
+    member = current
+    parent = record.parent_of(member) if member.kind == "worker" else member
+    if parent is None:
+        return unit_runs.state_dir() / "staff" / "workers" / member.id
+    if scanned is None:
+        scanned = parent_run_index(record)
+    runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+    if isinstance(parent.run, staff.OpenRun):
+        runs = list(dict.fromkeys((str(parent.run.path), *runs)))
+    if supplied := unit_runs.environ("RUN_DIR"):
+        fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
+        if fields.get(unit_runs.OWNER_FIELD) == parent.id:
+            runs = list(dict.fromkeys((*runs, supplied)))
+    fallback = Path(runs[0]) if runs else worker_fallback_run(parent, record=record)
     if member.kind == "worker":
         from scripts.direct import progress_history
 
         dispatched = progress_history.recorded_dispatch_run(member.id)
-        if isinstance(dispatched, progress_history.RecordedDispatchRun):
-            return dispatched.directory
-        record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
-        parent = record.parent_of(member) or member
-    if scanned is None:
-        record = staff.local_snapshot() if isinstance(record, unit_runs.RunStaffAtUse) else record
-        scanned = parent_run_index(record)
-    runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-    fallback = Path(runs[0]) if runs else worker_fallback_run(parent)
-    if member.kind == "worker":
-        candidates = dict.fromkeys((*(Path(run) for run in runs), fallback))
-        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run))]
+        linked = (dispatched.directory,) if isinstance(dispatched, progress_history.RecordedDispatchRun) else ()
+        candidates = dict.fromkeys((*(Path(run) for run in runs), *linked, fallback))
+        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run, record=record))]
         if passes:
             return max(passes, key=lambda item: _pass_started_at(item[1]))[0]
     return fallback
 
 
-def _passes(run: Path) -> list[dict[str, object]]:
-    path = run / recorder_state.STATE_FILENAME
-    if not path.exists():
-        return []
-    state = worker_lifecycle.read_json_object(path)
+def _passes(state: dict[str, object]) -> list[dict[str, object]]:
     value = state.get("pass", {})
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     return [fields] if "instance_id" in fields else [cast(dict[str, object], item)
@@ -626,11 +636,18 @@ def _pass_started_at(item: dict[str, object]) -> float:
     return value if isinstance(value, (int, float)) else float("-inf")
 
 
-def worker_pass(row: staff.StaffRow, run: Path) -> dict[str, object]:
+def worker_pass(row: staff.StaffRow, run: Path, *,
+                record: staff.StaffSnapshot | None = None) -> dict[str, object]:
+    """Select the fixed participant after checking its current staff parent."""
+    record = staff.local_snapshot() if record is None else record
+    current = record.by_id(row.id)
+    fields = worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+    owner = unit_runs.run_owner(fields, record)
+    if (current is None or current.kind != "worker" or not isinstance(owner, staff.StaffRow)
+            or current.parent != staff.ReportsTo(owner.id)):
+        return {}
     no_pass: dict[str, object] = {}
-    return max((item for item in reversed(_passes(run))
-                if item.get("worker_id") == row.id or item.get("worker_name") == row.name
-                or (not item.get("worker_id") and not item.get("worker_name") and item.get("team_slot") == row.name)),
+    return max((item for item in reversed(_passes(fields)) if item.get("worker_id") == current.id),
                key=_pass_started_at, default=no_pass)
 
 
