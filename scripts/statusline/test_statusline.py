@@ -1060,6 +1060,326 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[:2],
                                  ["For you: 1 question, 1 proposal", ""])
 
+    def test_failed_proposal_and_question_files_retry_and_remain_watched(self) -> None:
+        folder = self.home / "issues"
+        folder.mkdir()
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        question_folder = self.cache.parent.parent / OWNER.id / "questions"
+        question_folder.mkdir(parents=True)
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        proposal = f"---\nstatus: open\ntags: [proposal]\nproposed_by: {OWNER.id}\n---\n# Proposal\n"
+        fields = {"since": "2000-01-01T08:00", "text": "Choose", "question": "Which?", "asked_by": OWNER.id}
+        question = (f"---\nrecord_type: question\nstatus: open\nproduction_id: {OWNER.id}\n"
+                    + f"asked_by: {OWNER.id}\nregistration: {json.dumps(fields)}\n---\n# Choose\n")
+        read_text = Path.read_text
+        for failure in ("unreadable proposal", "invalid proposal encoding", "unreadable question",
+                        "invalid question encoding", "malformed question", "invalid registration",
+                        "late unreadable proposal", "late unreadable question", "late unreadable proposal body",
+                        "invalid proposal urgency", "invalid proposal date"):
+            with self.subTest(failure=failure):
+                for previous in (*folder.glob("*.md"), *question_folder.glob("*.md")):
+                    previous.unlink()
+                is_question = "question" in failure or failure == "invalid registration"
+                _ = doc.write_text(document if is_question else document + f"- **Proposals:** {folder}\n")
+                store = question_folder if is_question else folder
+                path = store / ("question-choice.md" if is_question else "proposal.md")
+                saved = question if is_question else proposal
+                _ = path.write_text(saved)
+                if "encoding" in failure:
+                    _ = path.write_bytes(b"\xff")
+                elif failure == "malformed question":
+                    _ = path.write_text("---\nrecord_type: question\n")
+                elif failure == "invalid registration":
+                    _ = path.write_text(saved.replace(json.dumps(fields), "{"))
+                elif failure == "invalid proposal urgency":
+                    _ = path.write_text(saved.replace("status: open", "status: open\nreview_urgency: invalid"))
+                elif failure == "invalid proposal date":
+                    _ = path.write_text(saved.replace("status: open", "status: open\ndate_created: invalid"))
+
+                reads = 0
+
+                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    nonlocal reads
+                    if path_to_read == path:
+                        reads += 1
+                        readable = 2 if failure == "late unreadable proposal body" else 1
+                        if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > readable):
+                            raise PermissionError(f"{path}: unreadable")
+                    return read_text(path_to_read, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(path), sources)
+                self.assertIn(str(doc), sources)
+                self.assertIn(str(store), sources)
+                _ = path.write_text(saved)
+                self.assertEqual(self.lines()[-1], "For you: 1 question" if is_question else "For you: 1 proposal")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+                path.unlink()
+
+    def test_failed_change_lists_retry_and_remain_watched(self) -> None:
+        listing = self.home / f"change-review - {OWNER.name}.md"
+        saved = "## To review\n\n| # | Change | Urgency |\n| --- | --- | --- |\n| C1 | First | normal |\n"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text() + f"- **Change review:** {listing}\n")
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        read_text = Path.read_text
+        for failure in ("unreadable", "invalid encoding", "malformed table", "invalid urgency", "invalid merge date"):
+            with self.subTest(failure=failure):
+                _ = listing.write_text(saved)
+                if failure == "invalid encoding":
+                    _ = listing.write_bytes(b"\xff")
+                elif failure == "malformed table":
+                    _ = listing.write_text("# Missing table\n")
+                elif failure == "invalid urgency":
+                    _ = listing.write_text(saved.replace("normal", "invalid"))
+                elif failure == "invalid merge date":
+                    _ = listing.write_text(saved.replace("Urgency |", "Urgency | Merged |")
+                                           .replace("--- | --- | --- |", "--- | --- | --- | --- |")
+                                           .replace("normal |", "normal | invalid |"))
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path == listing and failure == "unreadable":
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(listing), sources)
+                self.assertIn(str(doc), sources)
+                _ = listing.write_text(saved)
+                self.assertEqual(self.lines()[-1], "For you: 1 change")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+
+    def test_failed_change_routing_reads_retry_and_remain_watched(self) -> None:
+        from scripts.production import change_routing
+
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        links = self.home / "links"
+        links.mkdir()
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "REVIEW_LINKS_ROOT": str(links)}
+        read_text = Path.read_text
+        list_owner = change_routing.StaffRouting.list_owner
+        for failure in ("validation", "question", "legacy document", "invalid delivery JSON"):
+            with self.subTest(failure=failure):
+                legacy = failure == "legacy document"
+                listing = self.home / ("legacy.md" if legacy else f"change-review - {OWNER.name}.md")
+                _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
+                _ = doc.write_text(document + f"- **Change review:** {listing}\n")
+                delivery = change_routing.delivery_path(links, listing, "C1")
+                fields = ({"question": {"question_id": "q1", "text": "Why?"}} if failure == "question"
+                          else {"validation": {"state": "sent", "attempt": "a1"}})
+                if not legacy:
+                    _ = delivery.write_text("{" if failure == "invalid delivery JSON" else json.dumps(fields))
+                failed = doc if legacy else delivery
+                routing = False
+
+                def owner(router: change_routing.StaffRouting, path: Path) -> str:
+                    nonlocal routing
+                    routing = True
+                    try:
+                        return list_owner(router, path)
+                    finally:
+                        routing = False
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path == failed and failure != "invalid delivery JSON" and (not legacy or routing):
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(change_routing.StaffRouting, "list_owner", owner), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(failed), sources)
+                if not legacy:
+                    delivery.unlink()
+                self.assertEqual(self.lines()[-1], "For you: 1 change")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+                listing.unlink()
+
+    def test_failed_source_folders_retry_and_missing_folders_are_optional(self) -> None:
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        lists, links, proposals = (self.home / name for name in ("lists", "links", "proposals"))
+        questions = self.cache.parent.parent / OWNER.id / "questions"
+        folders = (lists, links, proposals, questions)
+        for folder in folders:
+            folder.mkdir(parents=True)
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "REVIEW_LINKS_ROOT": str(links), "CHANGE_REVIEW_DIR": str(lists)}
+        iterdir = Path.iterdir
+        for folder in folders:
+            with self.subTest(folder=folder.name):
+                # The proposals field also selects the canonical question folder.
+                _ = doc.write_text(document + (f"- **Proposals:** {proposals}\n" if folder == proposals else ""))
+
+                def paths(path: Path):
+                    if path == folder:
+                        raise PermissionError(str(path))
+                    return iterdir(path)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "iterdir", paths), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(folder), sources)
+                folder.rmdir()
+                with patch.dict(os.environ, environment):
+                    cache = counts_row.write(instance)
+                self.assertEqual(cache.read_text().splitlines()[:2], ["", ""])
+                folder.mkdir(parents=True)
+
+    def test_unreadable_routing_config_retries_and_keeps_the_config_source(self) -> None:
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        settings = config / "change_review.conf"
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "CHANGE_REVIEW_DIR": "", "REVIEW_LINKS_ROOT": ""}
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == settings:
+                raise PermissionError(str(path))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        now = int(time.time()) - 100
+        with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                patch.object(time, "time", return_value=now):
+            cache = counts_row.write(instance)
+        line, due, *sources = cache.read_text().splitlines()
+        self.assertEqual((line, due), ("", str(now + 7)))
+        self.assertIn(str(settings), sources)
+        with patch.dict(os.environ, environment):
+            cache = counts_row.write(instance)
+        self.assertEqual(cache.read_text().splitlines()[:2], ["", ""])
+
+    def test_later_config_failure_does_not_count_a_committed_list_directory(self) -> None:
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        live, committed, links = (self.home / name for name in ("live", "committed", "links"))
+        for folder in (live, committed, links):
+            folder.mkdir()
+        settings = config / "change_review.conf"
+        text = f"lists_directory={committed}\nreview_links_directory={links}\n"
+        _ = settings.write_text(text)
+        for arguments in (("init", "--quiet"), ("add", settings.name), ("commit", "--quiet", "-m", "Save fixture settings")):
+            _ = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test",
+                                "-c", "user.email=test@example.invalid", *arguments],
+                               cwd=config, capture_output=True, text=True, check=True)
+        _ = settings.write_text(text.replace(str(committed), str(live)))
+        listing = live / f"change-review - {OWNER.name}.md"
+        stale = committed / listing.name
+        table = "## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n"
+        _ = listing.write_text(table)
+        _ = stale.write_text(table.replace("C1", "C2"))
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "CHANGE_REVIEW_DIR": "", "REVIEW_LINKS_ROOT": ""}
+        read_text = Path.read_text
+        now = int(time.time()) - 100
+        for field, failed_read in ((str(listing), 4), ("", 1)):
+            with self.subTest(field=field, failed_read=failed_read):
+                _ = doc.write_text(document + f"- **Change review:** {field}\n")
+                reads = 0
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    nonlocal reads
+                    if path == settings:
+                        reads += 1
+                        if reads == failed_read:
+                            raise PermissionError(str(path))
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertGreaterEqual(reads, failed_read)
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(settings), sources)
+                self.assertIn(str(doc), sources)
+                if field:
+                    self.assertIn(str(listing), sources)
+                self.assertNotIn(str(stale), sources)
+                with patch.dict(os.environ, environment):
+                    cache = counts_row.write(instance)
+                self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 change", ""])
+
+    def test_unreadable_ledgers_retry_while_footer_readers_keep_available_counts(self) -> None:
+        from scripts.production import footer_counts
+
+        efficiency = self.home / "efficiency.md"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text() + f"- **Efficiency ledger:** {efficiency}\n")
+        _ = self.ledger.write_text("- 2026-10-19 Faster tests (idea.md) — proposed\n")
+        _ = efficiency.write_text("- 2026-10-19 Tests — proposed\n")
+        detail = self.home / "idea.md"
+        _ = detail.write_text("Written 2026-10-19 by writer.\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        read_text = Path.read_text
+        for path in (self.ledger, efficiency, detail):
+            with self.subTest(path=path.name):
+                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path_to_read == path:
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path_to_read, encoding=encoding, errors=errors)
+
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read):
+                    cache = counts_row.write(instance)
+                    counts = footer_counts.read_counts(doc)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual(line, "")
+                self.assertTrue(due.isdigit())
+                self.assertIn(str(path), sources)
+                expected = (0, 1) if path == self.ledger else (1, 0) if path == efficiency else (1, 1)
+                self.assertEqual((counts.proposals, counts.efficiency), expected)
+
     def test_unusable_retry_config_writes_a_cache_and_refreshes_after_a_config_fix(self) -> None:
         self.questions({"since": "2026-10-16T19:00", "text": "A"})
         config = self.home / "config"

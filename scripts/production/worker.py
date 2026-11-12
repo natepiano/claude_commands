@@ -1254,7 +1254,7 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
 def _worker_pane_state(state: worker_panes.WorkerPane,
                        detached: session_state.RunningDetachedWork) -> tuple[str, str]:
     if isinstance(state, worker_panes.OpenWorker):
-        activity = worker_panes.worker_state(state)
+        activity = "starting" if state.status == "starting" else worker_panes.worker_state(state)
         classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
         return "open", activity if activity == "unknown" and classified == "idle" else classified
     if isinstance(state, worker_panes.StoppedWorker):
