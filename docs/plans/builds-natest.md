@@ -3218,7 +3218,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The replay check shows each new selection contains the old one, and names the misses now selected.
 - Two blind reviews.
 
-### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: todo
+### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3295,3 +3295,76 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Checkpoint `b69fac85d`. Read-only answers to item 80 A, B and C; report at `phases/179/gate_size_questions.md`. A: 338 of 414 slow verify tests start the full `verify.sh` (496 launches); at least 32 tests need the real process path. B: no full-folder `coverage_overlap.py` run exists; `scripts/direct` would cost about 2,545 CPU s and 52 serial minutes (estimate). C: a gate with only tests below 0.5 s keeps 604 of 757 modules, about 1,408 CPU s and 60 s wall (estimate; measured full gate 4,827 CPU s, 204 s). dwight: 5 of 43 failed trees (about 12%, a low estimate) fail only on slow tests.
+
+### Phase 180 — Collect line coverage overlap across scripts/direct  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** One read-only `coverage_overlap.py` collection over every test module in `scripts/direct` reports the overlap candidates and the tests with unknown coverage, apart.
+
+**Decision:** user via builds, 2026-11-11 (item 80, approval 2): run the collection (about 52 serial minutes, read-only). Candidates are not removal approvals. No test removal or coverage reduction is approved.
+
+**Spec:**
+1. Run `scripts/test_times/coverage_overlap.py scripts/direct <every test_*.py in scripts/direct>` once, with `COVERAGE_OUT` set to a JSON file in the session phase folder.
+2. Run it in a clean copy of the checkpoint commit through `python3 ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit <commit> -- <command>`, as a detached run. Change no repository file.
+3. If a module fails or hangs under the collector, record it and continue with the rest; do not retry the whole folder.
+4. Report: tests collected, known, unknown (with the cause classes: Bash, Cargo, Git, ps, forks), candidates per module, collector CPU and wall time. Keep candidates apart from unknown coverage. Mark each count measured.
+5. For the top 10 modules by candidate count, list the candidate tests with the kept tests that cover their lines. Do not review assertions for removal.
+
+**Files:**
+- `phases/180/coverage_overlap_report.md` — the report, in the session folder; no repository file changes.
+- `phases/180/coverage_overlap.json` — the collector output, in the session folder.
+
+**Workers:** 1 researcher; one serial collection.
+- impl: the collection and the report.
+
+**Constraints from prior phases:**
+- Phase 179: three sampled modules gave collector multipliers of 1.36 CPU and 1.45 wall; 5 of 21 tests came back unknown. Estimate for the folder: 2,545 CPU s, 52 serial minutes, 207 modules, 1,558 tests.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report and JSON exist, with candidates and unknown coverage in separate tables.
+- `git status` shows no change from the collection.
+
+### Phase 181 — The wait-holder tests call the real wait functions, and keep one full verify.sh run per wait kind  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_wait_holder.py`, the slowest gate module (67.9 CPU s median), costs less CPU with the same 27 tests and every assertion.
+
+**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check and the keep-coverage rule; no test removal. verify-unit go, 2026-11-11, for the module and its fixtures, with four keeps (Spec item 3). panes-unit phase 24 may add rows to this module: start after it lands, or merge it first.
+
+**Spec:**
+1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py`. Name where the CPU goes: full `verify.sh` entries, recorder children, stubs, fixtures.
+2. Map each test's assertions to the code they prove. Where the decision lives in a `verify.sh` function, call the real function through `shell_test_support.shell_functions` (`scripts/lib/shell_test_support.py:17`) in one Bash process. Keep a full `verify.sh` entry where the decision exists only in the dispatch branch or argument wiring.
+3. Keep (verify-unit):
+   1. At least one full `verify.sh` entry test for each wait kind: memory admission, cargo token, Mac busy. Each calls the real `progress_history.py` as a child process.
+   2. The holder-change path (`wait-holder` after `start-wait`) and the NotRecorded stderr lines, with their exact text.
+   3. The owner split: `CODEX_THREAD_ID` gives `--worker-thread-id`; otherwise `--director` with `CLAUDE_CODE_SESSION_ID`.
+   4. The pending phase-close retry for memory waits (`phase-close.*.memory` files).
+4. Keep all 27 tests and every assertion. Change no production code. A missing callable boundary goes to verify-unit as a proposal; do not copy the decision into a fixture.
+5. Shared fixtures (`verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py`) serve other modules: keep their current behavior for those callers, and run each importer.
+6. Measure after with the same command. The director runs three aws pairs; only aws pairs decide.
+
+**Files:**
+- `scripts/direct/test_verify_wait_holder.py` — 27 tests in six classes.
+- `scripts/direct/verify_token_wait_test_support.py` — shared fixture; read first, edit only when a change keeps its other callers.
+- `scripts/direct/verify_hold_wait_test_support.py` — shared fixture; same rule.
+
+**Workers:** 1 writer; one module and its fixtures cannot split.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 179: 26 tests of this module start the full `verify.sh` in the slow-test census.
+- Phase 66 floor: the real `build_targets.py` commands in the wait-holder module run through `verify.sh`; that import hold stays.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.direct.test_verify_wait_holder` passes three times with 27 tests.
+- Every importer of a changed fixture passes.
+- basedpyright on each changed Python file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
