@@ -136,7 +136,9 @@ class RowResolverTests(StaffTestCase):
         abandoned = parked.with_name(f".{parked.name}.99999999.fixture.tmp")
         write_text_atomic(abandoned, "retained recovery bytes")
         before = parked.read_bytes(), parked.stat().st_mtime_ns, abandoned.read_bytes()
-        resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)))
+        dependencies: list[Path] = []
+        resolver = session_staff.RowResolver(staff.StaffSnapshot((fixture.runner, removed)),
+                                             dependencies=dependencies.append)
         with mock.patch.object(unit_config, "read", side_effect=AssertionError("removed worktree read")):
             self.assertEqual(resolver.unit_branch(removed), session_staff.Branch("parked-branch"))
             config = resolver.unit_config(removed)
@@ -146,6 +148,8 @@ class RowResolverTests(StaffTestCase):
         self.assertEqual(config.port, unit_config.AppPort(8712))
         self.assertEqual(config.responsibilities, ("parked",))
         self.assertIsInstance(resolver.unit_state(removed), session_staff.RetiredUnit)
+        self.assertEqual(parked, self.staff_file.parent / "units" / f"{removed.id}.toml")
+        self.assertIn(parked, dependencies)
         self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns, abandoned.read_bytes()), before)
 
     def test_missing_or_malformed_parked_facts_never_use_the_present_folder(self) -> None:

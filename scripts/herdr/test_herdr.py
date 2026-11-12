@@ -2755,6 +2755,29 @@ class HerdrTests(unittest.TestCase):
                             self.assertEqual([command for command in self.commands()
                                               if command[2:4] == ["agent", "prompt"]], [])
 
+    def test_unknown_pane_warning_uses_fixed_staff_id_and_keeps_all_evidence(self) -> None:
+        client = self.herdr
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("scanned-owner")), "producer", "current-name",
+                              staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("scanned-session")))
+        other = staff.native_id(fixture_runtime_id("other-owner"))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "tab_id": "w1:t1", "label": "old-name"}
+        reason = "fixture unreadable process"
+        expected = herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)])
+        notice = f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n"
+        directory = self.root / "warning-records"
+        for member, printed in ((other, False), (owner.id, True), ("", True)):
+            with (self.subTest(member=member),
+                  patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(directory)}),
+                  patch.object(client, "result", side_effect=herdr_types.HerdrFailure(reason)),
+                  redirect_stderr(io.StringIO()) as errors):
+                entry: dict[str, object] = {"session_id": "fixture-session", "written_at": "fixture-time", "environment": {}}
+                if member:
+                    entry["staff_id"] = member
+                write_text_atomic(directory / "fixture.json", json.dumps({"w1:p1": entry}))
+                scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
+            self.assertEqual(scan, expected)
+            self.assertEqual(errors.getvalue(), notice if printed else "")
+
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{
             "pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "terminal", "agent_session": {"value": 7}}]}}))

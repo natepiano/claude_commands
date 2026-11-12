@@ -796,6 +796,12 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(stop_results.claude_up_line(running),
                                  f"worker: unchanged; {agent} runs on {label} in w1:p2")
 
+        for state, text in ((ClaudeStartState.ALREADY_RUNNING, "unchanged; Claude runs on claude3"),
+                            (ClaudeStartState.STARTED, "Claude is up on claude3 (2.5 s)")):
+            with self.subTest(pane="", state=state):
+                result = stop_results.ClaudeUp("worker", "", "claude3", elapsed_seconds=2.5, start_state=state)
+                self.assertEqual(stop_results.claude_up_line(result), f"worker: {text}")
+
 
     def test_unnumbered_accounts_name_no_agent_in_either_result_state(self) -> None:
         for label in ("default", "unknown account", "~/.codex"):
@@ -2488,6 +2494,42 @@ class StopResumeTests(unittest.TestCase):
             self.assertIn(str(folder), arguments)
             self.assertEqual((path.read_bytes(), record.read_bytes(), record.stat().st_mtime_ns), before)
 
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from dataclasses import replace
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
+            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        def native_liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            for pid, process in case.world.processes.items():
+                if process.current_identity == identity:
+                    return sessions.LiveSessionProcess(pid)
+            return sessions.SessionNotLive()
+
+        with (self.subTest(record="reused pane"),
+              patch.object(sessions, "session_liveness", side_effect=native_liveness)):
+            result = stop_resume.resume(owner.id)
+            self.assertIsInstance(result, stop_resume.ClaudeUp)
+            assert isinstance(result, stop_resume.ClaudeUp)
+            self.assertEqual((result.session_id, result.pane_id), (owner.current_session, "w1:p7"))
+            self.assertEqual(case.world.launches, [])
+
+
     def test_stop_returns_as_soon_as_term_takes_effect(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         def exits_soon(_pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
@@ -2502,6 +2544,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production.staff_test_support import unit_membership
 
         row = unit_membership("production", "alpha")
+        row = staff.update_current_session(row.current_session, staff.native_id(self.entry["session_id"]))
         self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
         pane_record.write("agents", self.entry)
         state = self.root / "stall-watch"
@@ -2679,7 +2722,7 @@ class StopResumeTests(unittest.TestCase):
         self.client.native_ids["w1:p2"] = self.entry["session_id"]
         with patch.object(self.client, "open_tab") as opened:
             result = stop_resume.resume("019b3a40-4250-7000-8000-000000000102", why="recovery")
-        self.assertEqual(result, stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "w1:p2", "claude3"))
+        self.assertEqual(result, stop_resume.ClaudeUp("019b3a40-4250-7000-8000-000000000102", "", "claude3", pid=123))
         opened.assert_not_called()
         self.start.assert_not_called()
 

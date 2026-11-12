@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import shutil
@@ -41,6 +42,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
+NATIVE_PANE_CLIENT = herdr.Herdr
 
 
 class RenameDisplays:
@@ -133,6 +135,12 @@ class FolderMoveBackend:
         fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
                                self.environment(self.pid), cwd=self.cwd)
 
+    def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
+        """Use the shared scan with this fixture's process replies."""
+        client = NATIVE_PANE_CLIENT(self.session)
+        with mock.patch.object(client, "result", side_effect=self.result):
+            return client.scan_row_panes(record, panes)
+
     def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
 
@@ -160,7 +168,12 @@ class FolderMoveBackend:
         self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
+        if arguments == ("pane", "process-info", "--pane", "w1:p2"):
+            return {"process_info": {"shell_pid": self.shell_pid,
+                "foreground_process_group_id": self.shell_pid,
+                "foreground_processes": [{"pid": self.shell_pid, "argv": ["zsh"]}]}}
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
         argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
         foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
