@@ -2209,7 +2209,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
-        *([f"When a finding's file, or a file its change edits, is reserved, unmerged or dirty, yield the finding's file with "
+        *([f"First record any reserved, unmerged or dirty file the change needs outside this ticket with "
+           + f"`style_ledger.py ticket need --repo . --id {ticket_id} --finding <finding id> --path <file>`.",
+           f"When a finding's file, or a file its change edits, is reserved, unmerged or dirty, yield the finding's file with "
            + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: its findings stay filed for a "
            + "later ticket, and the gate skips them."] if approved else []),
         (("Apply the approved findings. "
@@ -2358,18 +2360,19 @@ def made_before_decisions(ticket_id: str) -> str:
 
 
 class EditedFiles:
-    """The files that each approved finding's change edits, as the gate lets it edit them, read once per refill at the
-    synced tip and at the unit base, so a reference that the unit's branch added after the sync counts. The tip is read
-    on first use, so a refill that needs no footprint reads no tip.
+    """The computed and recorded edit paths of each approved finding.
 
-    A file rename edits its own file, its new file and each Rust file whose module sites `renamed_text` renames at
-    either commit; a file that names the old module but that `renamed_text` cannot read, or whose `path` attribute it
-    cannot read with certainty, counts as edited, and the second makes the finding wait (`uncertain`). A qualified
-    rename edits its own file and each `.rs` and `.md` file that holds its old name as a word at either commit, the
-    files `approved_reference_file` can take. A restructure of a `.rs` file edits its own file and each Rust file whose
-    `mod` line or `#[path]` string declares it at either commit, as a move of a test file into its owner removes the
-    owner's declaration; a file that names the module but that the scan cannot read, or whose `path` attribute it cannot
-    read with certainty, counts as edited. Any other finding edits its own file only.
+    Read computed paths once per refill at the synced tip and the unit base.
+    Read the tip on first use.
+    A file rename includes its own file, its new file and Rust files with module sites that `renamed_text` changes.
+    Unreadable references count as edited.
+    Uncertain `path` attributes also make the finding wait.
+    A qualified rename includes its own file and Rust or Markdown files that hold the old name as a word.
+    A restructure includes its own Rust file and files whose `mod` lines or `#[path]` strings declare it.
+    Unreadable declarations count as edited.
+    Other findings include their own file.
+    Append recorded need paths for every finding.
+    Recorded needs do not extend the gate's edit approval.
     """
 
     def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
@@ -2384,22 +2387,24 @@ class EditedFiles:
         self.readings: dict[FileRename, tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]] = {}
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
-        """The finding's own file first, then each other file its change edits."""
+        """Return computed files first, then recorded need paths, without duplicates."""
         moved = file_rename(finding.kind, finding.path, finding.after)
+        pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(moved, FileRename):
             edited = (path for path, renamed in self.module_readings(moved)
                       if not isinstance(renamed, RenamedText) or renamed.module_sites)
-            return tuple(dict.fromkeys((finding.path, moved.new, *edited)))
-        pair = approved_rename(finding.kind, finding.before, finding.after)
-        if isinstance(pair, ApprovedRename):
+            computed = (finding.path, moved.new, *edited)
+        elif isinstance(pair, ApprovedRename):
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
-            return (finding.path, *dict.fromkeys(named_files))
-        if finding.kind == "restructure" and finding.path.endswith(".rs"):
+            computed = (finding.path, *named_files)
+        elif finding.kind == "restructure" and finding.path.endswith(".rs"):
             owners = (path for path, text in self.declaring(module_name(finding.path))
                       if path != finding.path and declares_module(self.repo, path, text, finding.path))
-            return (finding.path, *dict.fromkeys(owners))
-        return (finding.path,)
+            computed = (finding.path, *owners)
+        else:
+            computed = (finding.path,)
+        return tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """For a file rename, each file at either commit that names the old module and has a `path` word the rename gate

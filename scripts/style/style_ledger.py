@@ -2350,6 +2350,12 @@ MIGRATIONS = {
             finding_id TEXT PRIMARY KEY, name TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL
         );
     """,
+    39: """
+        CREATE TABLE IF NOT EXISTS finding_needs (
+            finding_id TEXT NOT NULL, path TEXT NOT NULL, recorded_at TEXT NOT NULL,
+            PRIMARY KEY(finding_id, path)
+        );
+    """,
 }
 
 
@@ -3181,6 +3187,27 @@ class Ledger:
                 unjudged.append(UnjudgedTicketCell(rule, path))
         return tuple(unjudged)
 
+    def finding_needs(self, finding_id: str) -> tuple[str, ...]:
+        """Return the recorded edit paths that the finding needs."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT path FROM finding_needs WHERE finding_id=? ORDER BY path", (finding_id,),
+        ).fetchall())
+        return tuple(path for path, in rows)
+
+    @_ticket_operation("need")
+    def ticket_need(self, id: str, finding_id: str, path: str) -> None:
+        """Record an edit path for a finding that the ticket holds."""
+        path = self._path(path)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if (finding_id not in ticket["finding_ids"]
+                    or self._held(finding_id).build_ticket != BuildTicket(id)):
+                raise LedgerError(f"{id}: the ticket does not hold finding {finding_id}")
+            _ = self._connection.execute(
+                "INSERT OR IGNORE INTO finding_needs VALUES (?,?,?)", (finding_id, path, _now()),
+            )
+
     @_ticket_operation("yield")
     def ticket_yield(self, id: str, path: str) -> tuple[str, ...]:
         """Give up the assigned ticket's work on path, and return the proposal findings that the yield frees.
@@ -3589,6 +3616,7 @@ class Ledger:
                 raise LedgerError(f"{ticket['id']}: findings cannot be read")
             for finding in self.named_held(ticket["finding_ids"]):
                 files.add(finding.path)
+                files.update(self.finding_needs(finding.finding_id))
                 moved = file_rename(finding.kind, finding.path, finding.after)
                 pair = approved_rename(finding.kind, finding.before, finding.after)
                 if isinstance(moved, FileRename):
@@ -7949,6 +7977,7 @@ class LedgerArguments(argparse.Namespace):
     proposal: str = ""
     state: HeldStateName | None = None
     finding_ids: str = "[]"
+    finding_id: str = ""
     finding: list[str] = []
     reason: str = ""
     site: str = ""
@@ -8073,7 +8102,7 @@ def main() -> None:
     for command in (record, correction, candidate, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "need", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
@@ -8105,6 +8134,9 @@ def main() -> None:
                     _ = command.add_argument("--session-dir", default="")
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
+                    _ = command.add_argument("--path", required=True)
+                elif action == "need":
+                    _ = command.add_argument("--finding", dest="finding_id", required=True)
                     _ = command.add_argument("--path", required=True)
                 elif action == "refuse":
                     _ = command.add_argument("--finding", action="append", required=True)
@@ -8227,6 +8259,8 @@ def main() -> None:
                 elif args.action == "yield":
                     for finding_id in ledger.ticket_yield(args.id, args.path):
                         print(f"yielded {finding_id}: it stays filed for a later ticket")
+                elif args.action == "need":
+                    ledger.ticket_need(args.id, args.finding_id, args.path)
                 elif args.action == "refuse":
                     _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
                     print(f"{args.id}: named findings refused; remaining findings kept")
