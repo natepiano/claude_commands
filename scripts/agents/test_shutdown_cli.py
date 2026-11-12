@@ -1975,6 +1975,7 @@ class WorkerRenameTests(StaffTestCase):
             TERMINAL_UNKNOWN = "the shell terminal evidence is temporarily incomplete"
             RETIRE_REFUSED = "a live native process prevents retirement"
             CLOSED_CLASH = "the old row has no pane or active dispatch"
+            MISLEADING_LABEL = "another native owner has the old worker display name"
             ACTIVE_CLASH = "the old row has an active dispatch"
             OPEN_CLASH = "the old row has an open pane"
             SHELL_CLASH = "the old row retains its shell pane"
@@ -1999,7 +2000,7 @@ class WorkerRenameTests(StaffTestCase):
                                       QualifiedWorkerCase.UNDECIDED_DASHED_ROLE) else
                                   "cargo-liner-TEST-handler")
                         qualified = fixture.worker(prefix + "-" + bare)
-                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.ACTIVE_CLASH,
+                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL, QualifiedWorkerCase.ACTIVE_CLASH,
                                  QualifiedWorkerCase.OPEN_CLASH, QualifiedWorkerCase.SHELL_CLASH,
                                  QualifiedWorkerCase.RETIRE_REFUSED)
                         bare_twins = [fixture.worker("review")] if scenario in twins else []
@@ -2026,6 +2027,9 @@ class WorkerRenameTests(StaffTestCase):
                             fixture.world.unknown["w1:p9"] = "TEST process evidence unavailable"
                         if scenario is QualifiedWorkerCase.TERMINAL_UNKNOWN:
                             fixture.world.locations["w1:p9"]["terminal_id"] = ""
+                        if scenario is QualifiedWorkerCase.MISLEADING_LABEL:
+                            foreign = fixture_member("showrunner", name="foreign-native-owner")
+                            fixture.world.add(foreign, "w1:foreign", label=qualified.name)
                         before = fixture.staff_file.read_bytes()
                         arguments = ["rename", str(owner.id), owner.name]
                         interruptions = (["before label", "after label"]
@@ -2094,7 +2098,7 @@ class WorkerRenameTests(StaffTestCase):
                                     f"{qualified.name} ({qualified.id}) and {bare_twins[0].name} ({bare_twins[0].id}): kept; "
                                     + f"{qualified.id}: native session is live (pid {os.getpid()}); stop it before removing its row"])
                                 end.assert_called_once()
-                            elif scenario is QualifiedWorkerCase.CLOSED_CLASH:
+                            elif scenario in (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL):
                                 self.assertEqual(staff.snapshot().find(kind="worker", parent=owner.id), bare_twins)
                                 end.assert_called_once()
                                 self.assertEqual(result.stderr, "")

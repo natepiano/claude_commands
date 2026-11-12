@@ -3844,11 +3844,13 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"],
                                            ["--session", "fixture", "workspace", "list"]])
 
-    def test_tab_sessions_omits_panes_without_a_label(self) -> None:
+    def test_tab_sessions_keeps_panes_without_a_label(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1"}, {"pane_id": "w1:p2", "label": None},
             {"pane_id": "w1:p3", "label": "named"}]}}))
-        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p3", "named", "", None)])
+        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p1", "", "", None),
+                                                    herdr.TabSession("w1:p2", "", "", None),
+                                                    herdr.TabSession("w1:p3", "named", "", None)])
 
     def test_tab_sessions_keeps_panes_with_missing_or_unlabelled_workspaces(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
@@ -6861,6 +6863,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
         owner = fixture_member("producer", name="owner")
         other = fixture_member("producer", name="other-owner")
         for case, binding, native, launch_owner in (
@@ -6869,12 +6872,17 @@ class SavedLayoutTests(unittest.TestCase):
                 ("matching native", False, owner.current_session, owner),
                 ("foreign native", True, other.current_session, owner),
                 ("foreign launch", True, owner.current_session, other),
+                ("old workspace title", True, owner.current_session, owner),
+                ("missing pane title", True, owner.current_session, owner),
                 ("reused pane", False, "", owner)):
             with self.subTest(case=case):
                 client = LayoutHerdr("producer-reuse")
                 client.spaces = [("w1", "producers")]
                 _ = client.add_tab("w1", owner.name)
                 shell = client.tabs[0]
+                if case in {"old workspace title", "missing pane title"}:
+                    client.spaces = [("w1", "old-workspace-title"), ("w2", "producers")]
+                    shell["label"] = "old-producer-title" if case == "old workspace title" else ""
                 _ = shell.pop("session_id", None)
                 if native:
                     shell["session_id"] = native
