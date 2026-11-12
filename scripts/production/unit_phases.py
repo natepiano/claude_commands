@@ -17,6 +17,7 @@ import sys
 import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from dataclasses import replace
@@ -33,6 +34,7 @@ from scripts.lib import names as display_names
 from scripts.lib.user_zone import user_zone
 from scripts.production import unit_config
 from scripts.message import session_send
+from scripts.herdr import herdr
 from scripts.lib.process_failure import failure_detail
 
 from scripts.style import style_config
@@ -322,10 +324,7 @@ def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, Newes
     """Find each unit's newest run from its recorded owner."""
     snapshot = staff.StaffSnapshot(staff.active(snapshot, "unit"))
     newest: dict[staff.StaffId, NewestUnitRun] = {}
-    for path in (plan_history.history_root() / "runs").glob("*.jsonl"):
-        started_event = plan_history.run_started_event(path)
-        if started_event is None:
-            continue
+    for path, started_event in plan_history.run_starts():
         try:
             owner = unit_runs.run_owner(started_event, snapshot)
         except staff.StaffUnreadable:
@@ -449,7 +448,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           snapshot: staff.StaffSnapshot | None = None,
           pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
           runs_reader: worker_runs.WorkerRuns | None = None) -> str:
-    snapshot = staff.snapshot() if snapshot is None else snapshot
+    snapshot = plan_history.staff_record() if snapshot is None else snapshot
     if now is None:
         now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
     zone = user_zone() if zone is None else zone
@@ -466,7 +465,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
-            events[path] = display_cells.run_events(path)
+            events[path] = plan_history.read_run_events(path)
         return events[path]
 
     unit_snapshot = staff.StaffSnapshot(tuple(
@@ -554,7 +553,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
 
 def production_records(doc: Path) -> dict[str, object]:
     """Build phase facts once for each configured unit plan."""
-    snapshot = staff.snapshot()
+    snapshot = plan_history.staff_record()
     resolver = session_staff.RowResolver(snapshot)
     records: dict[str, object] = {}
     plans: dict[Path, phase_table.PhaseRecord | dict[str, object]] = {}
@@ -592,7 +591,7 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     from scripts.style import style_ledger
 
     try:
-        rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
+        rows = {row.name: row for row in unit_lookup.doc_units(doc, plan_history.staff_record())}
     except (OSError, staff.StaffRefused) as error:
         print(f"unit_phases: {error}", file=sys.stderr)
         return {}
@@ -641,34 +640,36 @@ def main(arguments: list[str]) -> int:
         case _:
             print("usage: unit_phases.py [--production <staff name>]", file=sys.stderr)
             return 2
-    with session_staff.anomalies() as rendering_lines:
+    with session_staff.anomalies() as rendering_lines, herdr.observation_snapshot():
         try:
-            production = read_production(name)
-            doc = production.doc
-            style = is_style_production(doc)
-            with ThreadPoolExecutor(max_workers=2) as reads:
-                sessions = reads.submit(live_units.read_units, name,
-                                        check=staff_sources.CodexProcessThreads().check)
-                records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
-                           if style else production_records(doc))
-                listing = sessions.result()
-                units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
-            configured: set[str] = set()
-            if not style and style_config.has_style_units(doc.read_text().splitlines()):
-                configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}
-            ticket_units = [unit for unit in units if style or unit.unit in configured]
-            product_units = [unit for unit in units if unit not in ticket_units]
-            paths = style_ledger_paths(doc, ticket_units) if ticket_units else {}
-            if not units:
-                output = "no live units"
-            else:
-                sections: list[str] = []
-                if product_units:
-                    sections.append(table(product_units, records, zone=production.zone))
-                if ticket_units:
-                    from scripts.production import style_units
-                    sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
-                output = "\n\n".join(sections)
+            snapshot = staff.snapshot()
+            with plan_history.history_snapshot(snapshot):
+                production = read_production(name, record=snapshot)
+                doc = production.doc
+                style = is_style_production(doc)
+                with ThreadPoolExecutor(max_workers=2) as reads:
+                    sessions = reads.submit(copy_context().run, live_units.read_units, name, record=snapshot,
+                                            check=staff_sources.CodexProcessThreads().check)
+                    records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
+                               if style else production_records(doc))
+                    listing = sessions.result()
+                    units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
+                configured: set[str] = set()
+                if not style and style_config.has_style_units(doc.read_text().splitlines()):
+                    configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}
+                ticket_units = [unit for unit in units if style or unit.unit in configured]
+                product_units = [unit for unit in units if unit not in ticket_units]
+                paths = style_ledger_paths(doc, ticket_units) if ticket_units else {}
+                if not units:
+                    output = "no live units"
+                else:
+                    sections: list[str] = []
+                    if product_units:
+                        sections.append(table(product_units, records, zone=production.zone))
+                    if ticket_units:
+                        from scripts.production import style_units
+                        sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
+                    output = "\n\n".join(sections)
         except (OSError, ValueError, Refusal) as error:
             print(f"unit_phases: {error}", file=sys.stderr)
             return 1

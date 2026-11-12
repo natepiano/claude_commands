@@ -413,22 +413,6 @@ def _state(session_dir: Path) -> dict[str, object]:
     return state
 
 
-def _events(path: Path) -> list[dict[str, object]]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            lines = handle.read().splitlines()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        return []
-    events: list[dict[str, object]] = []
-    for line in lines:
-        event = _json_object(line)
-        if event is not None:
-            events.append(event)
-    return events
-
-
 def _epoch(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -975,7 +959,8 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
+    run_events = [plan_history.read_run_events(path)
+                  for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     current_run = _current_run_events(run_events, resolver.record)
     open_instance = _newest_open_instance(current_run)
@@ -1488,7 +1473,7 @@ def _production_unit_plans(production: Production, *, resolver: session_staff.Ro
 
 def show_production(production_doc: Path) -> str:
     """Return every live unit's phase record as one JSON object."""
-    resolver = session_staff.RowResolver(staff.snapshot())
+    resolver = session_staff.RowResolver(plan_history.staff_record())
     production = read_production(production_doc, resolver=resolver)
     records: dict[str, object] = {}
     for unit_plan in _production_unit_plans(production, resolver=resolver):

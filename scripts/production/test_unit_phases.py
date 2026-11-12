@@ -41,7 +41,7 @@ from scripts.production import style_units
 from scripts.style import style_ledger
 from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, fixture_worker
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, fixture_worker, recorded_unit
 
 from scripts.direct import phase_table, worker_runs
 from scripts.direct import plan_history
@@ -348,7 +348,7 @@ class UnitPhasesTests(unittest.TestCase):
             event("pass_started", phase_id="1", pass_instance_id="p3", pass_kind="impl", pass_activity="planned task"))
         records["messaging"] = {"plan": str(plan), "current": {"phase": "1", "of": 1, "title": "Planned work"},
                                 "phases": phase_rows("running")}
-        with patch.object(display_cells, "run_events", wraps=display_cells.run_events) as whole_reads:
+        with patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as whole_reads:
             rendered = unit_phases.table([selected], records)
         self.assertEqual([call.args[0] for call in whole_reads.call_args_list], [newest])
         self.assertIn("| messaging | idle | 🟨 | 0/1 |", rendered)
@@ -806,7 +806,7 @@ class UnitPhasesTests(unittest.TestCase):
                     _ = staff.set_run(member.id, staff.OpenRun(folder))
                 if missing:
                     newest.unlink()
-                with (patch.object(display_cells, "run_events", wraps=display_cells.run_events) as reads,
+                with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
                       patch.object(plan_history, "now_epoch", return_value=now)):
                     rendered = unit_phases.table([unit("fallback", None)], records, pane_rows={},
                                                 now=now, zone=ZoneInfo("UTC"))
@@ -1096,6 +1096,63 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIs(plan_history.run_started_event, headers)
         self.assertIs(plan_history.resolve_plan_path, paths)
         self.assertIs(plan_history.plan_runs, scans)
+
+    def test_main_reads_shared_history_once_for_multiple_unit_plans(self) -> None:
+        from scripts.production import session_staff
+
+        doc = self.root / "production.md"
+        _ = doc.write_text("# Production\n")
+        self.production_document(doc)
+        history = self.root / "history" / "runs"
+        history.mkdir(parents=True)
+        run_files: list[Path] = []
+        for name in ("one", "two"):
+            tree = self.root / name
+            member = recorded_unit("show", name, tree, doc, plan="plan.md")
+            _ = (tree / "plan.md").write_text(
+                "# Plan\n### Phase 1 — First work · status: todo\n### Phase 2 — Later work · status: todo\n")
+            folder = self.root / "runs" / name
+            folder.mkdir(parents=True)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+            _ = staff.set_run(member.id, staff.OpenRun(folder))
+            path = history / f"{name}.jsonl"
+            events: list[dict[str, object]] = [
+                {"event_type": "run_started", "owner_staff_id": member.id, "run_id": name,
+                 "working_dir": str(tree), "plan_doc": "plan.md", "run_started_at": 100},
+                {"event_type": "phase_started", "phase_id": "1", "phase_title": "First work",
+                 "phase_instance_id": name, "phase_started_at": 110},
+                {"event_type": "pass_started", "phase_id": "1", "phase_instance_id": name,
+                 "pass_instance_id": name, "pass_kind": "impl", "pass_activity": f"write {name}"},
+            ]
+            _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            run_files.append(path)
+        output = io.StringIO()
+        with (patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
+              patch.object(unit_lookup, "observed_session_labels", return_value=()),
+              patch.object(plan_history, "run_started_event", wraps=plan_history.run_started_event) as headers,
+              patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_reads,
+              patch.object(io, "open", wraps=io.open) as opened,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(unit_phases.main(["--production", "show"]), 0)
+        self.assertCountEqual([call.args[0] for call in headers.call_args_list], run_files)
+        self.assertEqual(staff_reads.call_count, 1)
+        for path in run_files:
+            with self.subTest(run=path.name):
+                reads = sum(call.args[0] == path for call in opened.call_args_list)
+                self.assertEqual(reads - 1, 1, "Read the run events once after the header read.")
+        self.assertEqual(output.getvalue().splitlines(), [
+            "| Unit | Status | Progress | Phase | ETA Next |",
+            "| --- | --- | --- | --- | --- |",
+            "| one | exited | 🟨⬜ | 0/2 | no ETA |",
+            "| two | exited | 🟨⬜ | 0/2 | no ETA |",
+            "",
+            "Progress: 🟩 done · 🟨 open · ⬜ not started",
+            "",
+            "| Unit | Notes | Queued |",
+            "| --- | --- | --- |",
+            "| one | phase 1 — impl: write one | plan: phase 2: Later work |",
+            "| two | phase 1 — impl: write two | plan: phase 2: Later work |",
+        ])
 
     def test_without_a_production_the_callers_staff_name_selects_it(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")

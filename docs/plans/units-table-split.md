@@ -52,7 +52,7 @@ The showrunner's ruling: "Split /showrunner:units into two tables. Table 1: Unit
 
 **Ruled out:** the listed cut order for the work table — it cut Queued to a few characters while Notes kept 80.
 
-### Phase 2 — The units view prints in a few seconds  · status: todo
+### Phase 2 — The units view prints in a few seconds  · status: done
 
 #### Work Order
 
