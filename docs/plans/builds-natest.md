@@ -3474,3 +3474,99 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - All importer modules pass; basedpyright reports 0 errors and 0 warnings.
 - aws paired trial shows a CPU gain with the same tests passing.
 - sdlc sees the diff before land.
+
+### Phase 215 — Worker usage tests call the readout in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/whoami/test_worker_usage.py` call the worker usage readout `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
+
+**Spec:**
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `whoami/test_worker_usage.py`.
+2. In `readout` (`test_worker_usage.py:144`), call the readout `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment()`, the same arguments and the `outside-checkout` cwd.
+3. Bind each module-level path the readout reads from the environment (`HOME`, `USAGE_STATE_DIR`) for each call; restore it after the call.
+4. Keep a real process where a test proves the snapshot, the instrumentation (`script=` calls) or the run from an external directory with cold imports.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the readout, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/whoami/test_worker_usage.py` — `readout`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern. A recorder that runs in a thread calls its main directly (Phase 202 F001).
+- Census: 23 starts, 6.668 local CPU s; upper bound.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 216 — Codex hook installer tests call the installer in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/hooks/test_codex_hooks.py` call the installer `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
+
+**Spec:**
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `hooks/test_codex_hooks.py`.
+2. In `run_installer` (`test_codex_hooks.py:197`), call the installer `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment`, the same action and the same cwd.
+3. Bind each module-level path the installer reads from the environment for each call; restore it after the call.
+4. Keep real processes for the fake app-server and stub processes, the closure cases and one CLI entry test.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the installer, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/hooks/test_codex_hooks.py` — `run_installer`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern.
+- Census: 67 starts, 8.074 local CPU s; upper bound.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 217 — Codex wind-down tests call the wind-down command in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content checks in `scripts/production/test_codex_winddown.py` call the wind-down `main` in process through `invoke_cli`, in place of one Python start per call, and aws pairs show a CPU gain.
+
+**Decision:** architect review 24, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain.
+
+**Spec:**
+1. Refresh the caller profile first: `module_cost.py --commands 15` on `production/test_codex_winddown.py`.
+2. In `run_script` (`test_codex_winddown.py:637`), call the wind-down `main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) with `self.environment` and the same arguments. Use `production_state=True` where the production paths apply.
+3. Bind `STATE`, `NOTIFIER`, the broadcast paths and the production paths from that environment for each call; restore them after the call.
+4. Keep real processes where a test proves a detached child, a signal, a timeout, the caller's pane or process evidence, or the CLI entry.
+5. Keep every test and assertion. Add no new general adapter.
+6. Run the module and every module that imports the wind-down script, and basedpyright on each changed file.
+7. Measure local CPU with `module_cost.py --commands 15` before and after.
+
+**Files:**
+- `scripts/production/test_codex_winddown.py` — `run_script`.
+
+**Workers:** 1 writer; one test module.
+- impl: the file.
+
+**Constraints from prior phases:**
+- Phases 201–204 and 210–212 used the same `invoke_cli` pattern; Phase 212 used `production_state=True`.
+- Census: 21 starts, 7.674 local CPU s; upper bound.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
