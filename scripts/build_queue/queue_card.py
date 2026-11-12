@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from scripts.buildlog import store
-from scripts.build_queue import head_facts, queue_evidence, queue_lines
+from scripts.build_queue import head_facts, queue_evidence, queue_lines, queue_view
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
@@ -49,7 +49,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
         if card:
             add()
         add((Span(f"#{position} of {len(waiting)} · {queue_evidence.step_pid_text(step)} · ", bold=True), *name_spans(step, model.labels),
-             Span(f" · {queue_lines.step_text(step, model.names)} · {step.need / admission_records.GIB:.1f} GiB", bold=True)))
+             Span(f" · {queue_lines.step_text(step, model.names, labels=model.labels)} · {step.need / admission_records.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Queue arrival {clock(model, step.since)}; waiting {age(step.since, model.reading.explanation.now)} min. "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
         add()
@@ -90,7 +90,7 @@ def _waiting_cards(model: QueueModel, matches: Sequence[int], columns: int) -> l
                 if isinstance(priority_order, admission_records.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} {queue_evidence.step_pid_text(ahead)} · "), Span("↑  " if is_moved(model, place) else "   "),
-                     *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead, model.names)}  {detail}")), 6)
+                     *name_spans(ahead, model.labels), Span(f" {queue_lines.step_text(ahead, model.names, labels=model.labels)}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
             joined = 1 + sum(other.since < step.since for other in waiting)
@@ -155,7 +155,14 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
             pid, separator, detail = text.partition(" · ")
             text = pid + separator + machine + separator + detail
         add(prefix + text)
-    if not running_steps:
+    mac_reading = queue_view.read_mac_builds()
+    mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
+    if mac_status:
+        add(mac_status)
+    else:
+        for build in mac_reading.builds:
+            add(f"pid {build.pid} · mac · {build.folder} · " + queue_view.mac_build_status(mac_reading, explanation.now))
+    if not running_steps and not mac_reading.builds and not mac_status:
         add("None.")
     add(f"Total current use: {queue_evidence.gib(explanation.totals.measured)}")
     head = explanation.head
@@ -168,7 +175,7 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         return lines
     add()
     if not head_card:
-        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {queue_lines.step_text(head.waiter, model.names)}; "
+        add(f"First in line: {queue_evidence.step_pid_text(head.waiter)} · {name_text(head.waiter, model)} {queue_lines.step_text(head.waiter, model.names, labels=model.labels)}; "
             + f"queue arrival {clock(model, head.waiter.since)}; "
             + f"waiting {age(head.waiter.since, explanation.now)} min; "
             + f"need {queue_evidence.gib(head.waiter.need)}")
