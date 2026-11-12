@@ -3346,3 +3346,34 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - The report gives the per-case split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
 - No repository file changes.
+
+### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because the Python policy builds a fallback value only when a key is missing, with every policy check kept.
+
+**Decision:** queue go via builds, 2026-11-12: one aws paired trial of `copy_guard.py:797` alone (3 pairs, all 50 policy tests kept). Code lands only on a measured gain. Send the change to queue for review before its checkpoint.
+
+**Spec:**
+1. At `scripts/copies/copy_guard.py:797`, build the fallback only when the key is missing (for example `if key not in mapping` before the allocation, in place of an eager `get(key, <new value>)` or `setdefault`). Read the Phase 195 report section for this candidate first.
+2. Keep the result of every lookup the same for every input. Change nothing else in `copy_guard.py`.
+3. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
+4. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. The director runs three aws pairs.
+
+**Files:**
+- `scripts/copies/copy_guard.py` — the lookup at line 797.
+
+**Workers:** 1 writer; one small change.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 195: Python policy evaluation 15.8–16.2 CPU s locally; this candidate's bound is 0–9.8 s and includes required work. Not measured as a saving.
+
+**State:** none.
+
+**Acceptance gate:**
+- All importers of `copy_guard.py` pass with unchanged test counts; basedpyright reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
+- queue reviews the change before the checkpoint.
