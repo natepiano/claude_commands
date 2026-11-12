@@ -9,8 +9,8 @@ plan into an **as-built doc**: a standalone overview of the feature as it actual
 exists, written for the next implementer who has to touch this code — not a
 process record. Then move it into the repo's as-built directory.
 
-Plans stamped `As-built disposition: amend` (set by the originating review, e.g.
-`/api_review`) invert the emphasis: the shipped work refactored surface that
+Plans stamped `As-built disposition: amend` (set by the originating design doc,
+e.g. `/implement_issue`) invert the emphasis: the shipped work refactored surface that
 existing as-built docs already describe, so the end state is those docs updated
 in place — no new doc, no fragment describing "the cleanup" as if it were a
 feature.
