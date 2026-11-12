@@ -3307,71 +3307,19 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - No gain; nothing landed. Two queue-approved `_union` versions (`copy_guard.py:786`) were measured in aws pairs against `96e8e395f`: a dict used as an ordered set made `copies/test_copy_guard_sources.py` 3.69 CPU s slower (19.21 to 22.90, 3/3 rounds), because frozen dataclass hashes are not cached and walk every nested tuple on each insert; an identity fast path in front of the old list scan made it 0.61 s slower (19.17 to 19.78, 3/3 rounds). `copy_guard.py` is unchanged. Do not retry hashed membership for these value types without a cached hash.
 
-### Phase 199 — Measure repeated target metadata reads within one build-target request  · status: todo
+### Phase 199 — Measure repeated target metadata reads within one build-target request  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A report names the pure metadata reads that `build_targets.py` repeats within one request, with measured CPU per caller and a bound, file, line and owner for each combinable read.
+- Research only; no repository file changed. Report: `phases/199/target_reads_report.md` in the run folder. One target command costs 0.11 to 0.35 local CPU s (`eligible` 0.30–0.35, `reserve` 0.28–0.33, `register-local` 0.14–0.17, `release-wait` 0.11–0.13), so the Phase 177 group cost (541 starts, 90.862 local CPU s) is mostly process start, not repeated reads. Combinable reads are small; bounds overlap and are not savings: parsed settings outside AWS 0–0.378 s (`scripts/mac_test/offload.py:1053`), repository metadata 0–0.328 s (`scripts/buildlog/repository.py:46`), target registry 0–0.309 s (`scripts/build_targets/target_config.py:134`, already cached for `eligible` and `release-wait`), validated maps 0–0.144 s and scalar settings 0–0.050 s (`scripts/lib/conf.py:174,117`), Cargo manifests 0–0.014 s. resources and verify own every candidate; the smallest first trial is the adjacent reads at `offload.py:1057–1058` (0–0.131 s). Two SSH routing trace passes failed one unchanged assertion (an unexpected Mac run seen only under tracing); the CPU pass succeeds.
 
-**Decision:** builds, 2026-11-12: the top job is the most gate CPU s per work hour; rank from the Phase 177 census. This is census rank 2 (target eligibility metadata, gross ceiling 0–149.5 CPU s per gate, about 18.7 per work hour). Research only; no code change. resources owns `build_targets.py`; verify owns its `verify.sh` callers. Code needs both goes.
-
-**Spec:**
-1. Read `phases/177/body_command_census.md` (the `build_targets.py` rows and caller table) in the session folder.
-2. Trace each `build_targets.py` command that `verify.sh:783,2395,2678` and `verify_mac_offload_test_support.py:1022` start. For each, list the files, Git calls and config reads it makes, and which are pure reads of immutable input within one request.
-3. Measure CPU per command and per read step on `direct/test_verify_mac_only.py`, `test_verify_ssh_targets_routing.py` and `test_verify_wait_holder.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> <module> --tests 10 --commands 15`, two runs each, plus in-process timing of the read steps.
-4. Name each repeated pure read that one request could do once, with its bound (kept apart from measurements), file, line and owner. Keep target choice, reservation, release, live probes, ownership and lock checks as behavior.
-5. Change no repository file. Write the report to `phases/199/target_reads_report.md` in the session folder.
-
-**Files:**
-- `phases/199/target_reads_report.md` — in the session folder.
-
-**Workers:** 1 researcher; no repository file changes.
-- impl: the report.
-
-**Constraints from prior phases:**
-- Phase 177: `build_targets.py` 90.9 local CPU s in 541 starts across 31 observed modules; the pure-read share is unknown.
-- Phase 185 moved recorder imports; target calls run through `verify.sh` and stay with verify-unit.
-- No speed phase is selected from a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives measured CPU per command and per read step, and each combinable read with bound, file, line and owner.
-- No repository file changes.
-
-### Phase 200 — Measure repeated Git metadata queries within one caller  · status: todo
+### Phase 200 — Measure repeated Git metadata queries within one caller  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A report names the Git metadata queries that copies and style callers repeat on immutable state within one operation, with measured CPU per caller and a bound, file, line and owner for each combinable query.
-
-**Decision:** builds, 2026-11-12: rank from the Phase 177 census. This is census rank 3 (Git metadata, gross ceiling 0–93.5 CPU s per gate, about 15.6 per work hour). Research only; no code change. queue owns `scripts/copies/`; style owns `scripts/style/git_process.py`; natest owns `ledger_test_support.py`.
-
-**Spec:**
-1. Read `phases/177/body_command_census.md` (the `git rev-parse` rows and caller table) in the session folder.
-2. Trace the `git rev-parse` calls from `copies.py:433,449,474,486`, `style/git_process.py:157` and `style/ledger_test_support.py:283` in the top modules: `style/test_crate_run.py`, `style/test_style_ledger_tickets.py`, `agents/test_models_conf_publish.py`, `style/test_style_ledger_findings.py`, `style/test_bulk_run.py`.
-3. Count calls per operation and mark which read immutable values (common dir, top level, object ids of fixed commits) before refs, index or working tree can change. Measure their CPU with `module_cost.py --tests 10 --commands 15`, two runs per module.
-4. Name each combinable or reusable query with its bound (kept apart from measurements), file, line and owner. Fresh refs and working-tree checks keep fresh reads. Mark the fixture-only part (natest) apart from production (queue, style).
-5. Change no repository file. Write the report to `phases/200/git_metadata_report.md` in the session folder.
-
-**Files:**
-- `phases/200/git_metadata_report.md` — in the session folder.
-
-**Workers:** 1 researcher; no repository file changes.
-- impl: the report.
-
-**Constraints from prior phases:**
-- Phase 177: `git rev-parse` 56.8 local CPU s in 56,622 calls across 94 observed modules.
-- Architect after Phase 197: `style_ledger.py:7787` already makes one `rev-parse` call for the ledger location.
-- No speed phase is selected from a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives measured CPU per caller and each combinable query with bound, file, line and owner.
-- No repository file changes.
+- Research only; no repository file changed. Report: `phases/200/git_metadata_report.md` in the run folder. Measured inclusive caller CPU (do not add): `copies.git` 4,479 calls 4.450 s; `copies.commit_at` 1,321 calls 1.448 s; `copies.main_checkout` and `copies.repository_name` 2,397 calls 2.248 s each; `style.run_git` 8,510 calls 5.873 s; fixture Git wrapper 650 calls 0.371 s. Candidate bounds (not savings): combine commit and tree reads 0–2.039 s (`style_ledger.py:1938–1940`, style); combine publication metadata 0–0.847 s (`models_registry.py:362,536`, `main_push_lock.py:22`, sdlc and devtools); combine the bare-flag query 0–0.755 s, 799 starts (`copies.py:476,478`, queue); reuse a verified commit 0–0.459 s (`style_ledger.py:2709,1939`, style); reuse workspace identity 0–0.216 s and common directory 0–0.147 s (`copies.py:965,982,981`, queue); fixture: reuse stable ledger locations 0–0.157 s (`ledger_test_support.py:355`, natest). Fresh refs and working-tree checks stay live. The first trial is the copies bare-flag query after linked-layout coverage.
 
 ### Phase 201 — Record-content tests call the recorder in process  · status: done
 **Depends on:** none
@@ -3400,3 +3348,71 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Checkpoint `d3269a529`. `scripts/hana_shot/test_hana_shot.py` runs its argument and validation content cases through `hana_shot.main` in process with the shared `invoke_cli` helper. A test helper gives each direct call a private `worker_pool` and `EXIT_SIGNAL_LATCH` and closes the pool after the call. Eighteen cases keep real CLI starts: entry and cold imports, timeout limits, traceback output, background cleanup at exit, keep-awake child lifetime, and signal delivery. All 117 test methods and 575 assertions stay; no production file changed. natedev gave the go; file SHA-256 `fecae85b`. aws pairs: 24.95 to 6.88 CPU s (18.07 s, 3/3 rounds); wall 25.9 to 7.7 s.
+
+### Phase 205 — Measure build-target command starts that tests could run in process
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** A report names each test module that starts `build_targets.py`, counts its starts, separates content cases from cases whose check is the process boundary, and gives the local CPU s the content-call pattern would remove per module.
+
+**Decision:** builds, 2026-11-12: after Phase 199, drop target read caching (0–1.2 s bound); the first lever is the content-call pattern for the verify and mac_test tests that start `build_targets.py`. Ask verify and resources for goes with the measured start count and CPU s. Research only; no code change. verify, 2026-11-12: yes, measure; conditions for code: (a) move only direct test calls that check output content; calls `verify.sh` makes stay real; (b) real starts stay for entry paths, locks between processes, signals, timeouts and the generated reserve queue hook; (c) no state leaks between cases: restore the `build_targets` globals and drop the parsed registry after each call; (d) keep every assertion; a `build_targets.py` change also needs the resources go. Do not change `test_verify_ssh_targets_routing.py` (verify owns its open trace fault).
+
+**Spec:**
+1. Read `phases/177/body_command_census.md` (the `build_targets.py` rows and caller table) and `phases/199/target_reads_report.md` in the session folder.
+2. Find every test module and test helper that starts `build_targets.py`, directly or through `verify.sh` and `verify_mac_offload_test_support.py:1022`. Give file, line, start path and owner.
+3. For each module, count starts per run with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> <module> --tests 10 --commands 15`, and give the local CPU s of those starts.
+4. Classify each start: a content case that can call the command's main in process through `scripts/production/cli_fixture.py:84` `invoke_cli`, or a case whose check is the process boundary (entry path, locks between processes, signals, timeouts, detached children, a shell caller that must stay real). A start inside `verify.sh` stays real unless the test can call the shell's target step directly; say which.
+5. Name the isolation each module needs (module caches, lock files, state folders, signal handlers), with file and line.
+6. Rank modules by removable local CPU s. Name the first module for an aws trial.
+7. Change no repository file. Write the report to `phases/205/content_call_report.md` in the session folder.
+
+**Files:**
+- `phases/205/content_call_report.md` — in the session folder.
+
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
+
+**Constraints from prior phases:**
+- Phase 199: one target command costs 0.11–0.35 local CPU s; the 541 starts (90.9 local CPU s) are mostly process start.
+- Phases 201–204: `invoke_cli` saved 9.85–21.38 CPU s per module; a recorder thread calls its main directly, not through `invoke_cli` (Phase 202 F001).
+- resources owns `build_targets.py`; verify owns `verify.sh` and its tests. Code needs both goes.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives starts, local CPU s and a removable share per module, with file, line and owner, and the first trial module.
+- No repository file changes.
+
+### Phase 206 — Copies asks Git for the bare flag in one query
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/copies/copies.py` reads the bare-repository flag and its paired value with one Git query in place of two, with linked-worktree coverage, and saves measured aws CPU.
+
+**Decision:** queue (owner of `copies.py`), 2026-11-12: go for one aws trial on the combined bare-flag query (`copies.py:476,478`) after linked-worktree coverage; code only on a measured gain; any measured gain ships; send the diff and the paired numbers before land. Phase 200 bound: 0–0.755 local CPU s, 799 starts.
+
+**Spec:**
+1. Read `phases/200/git_metadata_report.md` in the session folder (the rank 3 row and the linked-layout note).
+2. Combine the two Git queries at `copies.py:476,478` into one query that returns both values. Keep each value's meaning, type and error behavior on normal, bare, separate-metadata and linked-worktree repositories.
+3. Add linked-worktree coverage as rows in an existing test in `scripts/copies/test_copies.py` (test growth rule 1). Show the rows pass on the old code and the new code.
+4. Run every module that imports `copies` (`git grep`), and basedpyright on each changed file.
+5. Measure local CPU with `module_cost.py` on the three most affected modules; aws pairs decide.
+
+**Files:**
+- `scripts/copies/copies.py` — the query.
+- `scripts/copies/test_copies.py` — linked-worktree rows.
+
+**Workers:** 1 writer; the change is one function and its test rows.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 200: fresh refs and working-tree checks stay live; only immutable repository metadata may combine.
+
+**State:** none.
+
+**Acceptance gate:**
+- The two values keep their behavior on all four repository layouts; the linked-worktree rows pass.
+- All importer modules pass; basedpyright clean.
+- aws pairs show a gain before land; queue receives the diff and numbers first.
