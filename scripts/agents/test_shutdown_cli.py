@@ -39,7 +39,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.message import sessions, sessions as retirement_sessions, session_send
+from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker
 from scripts.production.production_doc import Production, read_production
@@ -628,6 +628,7 @@ class RetireUnitTests(unittest.TestCase):
         ]
         self.addCleanup(pane_patches.clear)
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [self.config]))
+        _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
     def transcript(self, cwd: Path) -> None:
@@ -1405,7 +1406,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(shutdown, "retirement_run", self.fake_run))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_session", not_marked))
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: self.configs))
-        _ = self.enterContext(mock.patch.object(retirement_sessions, "config_dirs", lambda: self.configs))
+        _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: self.configs))
         _ = cast(MutableMapping[str, str], self.enterContext(
             mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                                        "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
@@ -1493,6 +1494,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.addCleanup(retirement.doCleanups)
         retirement.setUp()
         _ = self.enterContext(mock.patch.object(sessions, "config_dirs", lambda: [retirement.config]))
+        _ = self.enterContext(mock.patch.object(session_records, "config_dirs", lambda: [retirement.config]))
         unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         tip = git(retirement.checkout, "rev-parse", "main")
         code, output = retirement.retire()
@@ -2209,7 +2211,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         before = old_path.read_bytes(), old_path.stat().st_mtime_ns
         displays = support.RenameDisplays(row)
         displays.pane = displays.tab = displays.workspace = row.name
-        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True),
+              mock.patch.object(session_records, "running_session", return_value=True)):
             self.assert_success(self.run_command(row.name, row.name))
             self.assertEqual(json.loads(path.read_text())["name"], row.name)
             settled = path.read_bytes(), path.stat().st_mtime_ns
@@ -2495,7 +2498,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         tip = self.git("rev-parse", "HEAD")
         displays = support.RenameDisplays(row)
         displays.pane = displays.tab = displays.workspace = OLD
-        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True),
+              mock.patch.object(session_records, "running_session", return_value=True)):
             self.assert_success(self.run_rename())
         self.assertEqual(staff.by_id(row.id), replace(row, name=NEW))
         self.assertEqual((displays.pane, displays.tab, displays.workspace), (NEW,) * 3)
@@ -2512,7 +2516,8 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         displays = support.RenameDisplays(row)
         displays.pane = displays.tab = displays.workspace = row.name
         before = self.file_versions()
-        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True),
+              mock.patch.object(session_records, "running_session", return_value=True)):
             result = self.run_command(row.name, row.name)
         self.assert_success(result)
         self.assertEqual(result.stdout.strip(), "unchanged")
@@ -2862,7 +2867,8 @@ class UnitRenameTests(UnitRenameFixture):
         displays = RenameDisplays(row)
         displays.pane = displays.tab = row.name
         before = final_files(self.root)
-        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True)):
+        with (displays.installed(), mock.patch.object(sessions, "running_session", return_value=True),
+              mock.patch.object(session_records, "running_session", return_value=True)):
             self.assert_ok(self.rename(row.name, row.name))
             self.assertEqual(json.loads(path.read_text())["name"], row.name)
             settled = path.read_bytes(), path.stat().st_mtime_ns

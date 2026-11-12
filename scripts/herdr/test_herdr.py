@@ -38,7 +38,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
-from scripts.message import sessions
+from scripts.message import sessions, session_records
 from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
 
@@ -87,7 +87,8 @@ def native_process_commands(pid: int, *, generations: tuple[herdr.AgentProcessId
     with (patch.object(herdr, "run_program", side_effect=run),
           patch.object(ctypes, "CDLL"),
           patch.object(ctypes, "CFUNCTYPE", return_value=Mock(return_value=generation)),
-          patch.object(sessions, "process_start", side_effect=process_start)):
+          patch.object(sessions, "process_start", side_effect=process_start),
+          patch.object(session_records, "process_start", side_effect=process_start)):
         yield
 
 

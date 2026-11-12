@@ -433,7 +433,7 @@ class AccountHoldTests(unittest.TestCase):
             # This queued relay predates log-only Codex notices; new watches never enqueue it.
             send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1", stamp=send.UnavailableSender()),
                          "offline", self.now)
-            self.assertTrue(send.read_queue(send.queue_path("hana")))
+            self.assertTrue(send.read_queue(send.queue_for("hana")))
             chosen = self.readings(2, None)
             b = quota_alert.CodexAlertPassReadings(chosen.workers, chosen.selected_account, ())
             def retire(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
@@ -441,7 +441,7 @@ class AccountHoldTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
             with patch.object(subprocess, "run", side_effect=retire):
                 self.assertEqual(five_hour.watch([], now=self.now, codex_readings=b), [])
-            self.assertEqual(send.read_queue(send.queue_path("hana")), [])
+            self.assertEqual(send.read_queue(send.queue_for("hana")), [])
 
     def test_unknown_selected_identity_preserves_warning_records_and_sends_nothing(self) -> None:
         a = self.readings(1)

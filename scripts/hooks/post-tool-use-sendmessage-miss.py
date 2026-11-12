@@ -57,8 +57,8 @@ def main() -> None:
                 and message_sender_name(name) != name):
             registry = sessions.read_registry()
             if not registry.unreadable and any(
-                item.record["name"] == name
-                and isinstance(live_relay_identity(item.record["pid"], relay_senders_directory()), RelayIdentity)
+                isinstance(identity := live_relay_identity(item.record["pid"], relay_senders_directory()), RelayIdentity)
+                and identity.sender == message_sender_name(name)
                 for item in registry.entries
             ):
                 name = message_sender_name(name)
