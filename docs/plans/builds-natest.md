@@ -3315,37 +3315,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Research; no commit. Local runs: `copies/test_copy_guard_sources.py` 34.1 and 20.2 CPU s (two runs, both pass). Step split: Python policy evaluation 15.8–16.2 s, shell checks 2.8–3.0 s, AST parses 2.0 s, file reads 0.03 s, no child processes. Both tests already share one scan; each file is read and parsed once. Candidates (bounds, not measured; all queue-owned in `scripts/copies/copy_guard.py`): allocate fallbacks only for missing keys (`:797`) 0–9.8 s; combine scope traversals (`:900,1124`) 0–1.8 s; smaller items below 0.4 s. First aws trial: the `:797` change alone, three pairs, all 50 policy tests kept, after queue's go. Report: `phases/195/copy_guard_report.md` in the session folder.
 
-### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: todo
+### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** A report splits the CPU of the four `test_bulk_run.py` interruption cases and their shared setup, and names any repeated preparation, with a bounded estimate and an owner for each item.
-
-**Decision:** architect after Phase 193 (next items step 6, item 3): research only; no code change. style owns `scripts/style/bulk_run.py`. Assign no saving before a controlled trial.
-
-**Spec:**
-1. Profile `style/test_bulk_run.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> style/test_bulk_run.py --tests 10 --commands 10`, two runs.
-2. Separate the four interruption cases at `test_bulk_run.py:713` and their shared setup: admission startup, child processes, Git, journals and recovery.
-3. Map each assertion to the work it proves. Name preparation that each case repeats and a class fixture could hold.
-4. Keep real admission startup, interruption, journals and recovery. Give each candidate a bounded estimate (kept apart from measurements), its file and line, and its owner.
-5. Change no repository file. Write the report to `phases/196/bulk_run_report.md` in the session folder.
-
-**Files:**
-- `phases/196/bulk_run_report.md` — in the session folder.
-
-**Workers:** 1 researcher; no repository file changes.
-- impl: the report.
-
-**Constraints from prior phases:**
-- Phase 194: `test_bulk_run.py` 42.87 CPU s median in aws pairs (108 tests).
-- No speed phase is selected from a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- The report gives the per-case split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
-- No repository file changes.
+- Research; no commit. Local runs: `style/test_bulk_run.py` 34.6 and 35.6 CPU s, 108 tests pass, 11,303 process starts per run. The four interruption subtests at `test_bulk_run.py:713` (one method) use 2.4–2.6 CPU s: cleanup 0.59–0.62, recovery 0.61–0.64, tested-stage 0.53–0.54, startup 0.25–0.26, shared fixtures 0.40–0.43. They already share one repository and staff seed. Candidates (bounds, not measured; natest-owned): prepare findings once before the seed copy (`:716,734`) 0–0.09 s; install fixed tools before the seed copy (`:716,736`) below 0.001 s. Both are below what three aws pairs can detect, so no trial runs; the interruption cases are at their practical floor. The rest of the module's CPU is in the other 104 tests. Report: `phases/196/bulk_run_report.md` in the session folder.
 
 ### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
 **Depends on:** none
@@ -3354,35 +3329,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `90cd75ec3`. `_join_bindings` (`copy_guard.py:797`) builds the `ScalarValue(UnknownArgument(key))` fallback only when a branch lacks the key, in place of the eager `dict.get` default; the values given to `_union` are unchanged (reviewers compared 4,805 and 312 cases with the old code). No test changed; 275 importer tests and all 50 policy tests pass with unchanged counts. aws pairs: `copies/test_copy_guard_sources.py` 28.82 to 19.25 CPU s (9.63 s, 3/3 rounds); `copies/test_copy_guard.py` unchanged. queue reviewed and approved the change; its follow-up suggestion (`_union` linear scan) is Phase 198.
 
-### Phase 198 — The copy-guard policy finds repeated union values by hash, not by a list scan  · status: todo
+### Phase 198 — The copy-guard policy finds repeated union values by hash, not by a list scan  · status: done
 **Depends on:** Phase 197
 
-#### Work Order
+#### As-built
 
-**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because `_union` finds repeated alternatives with a hashed lookup, with every policy check kept.
-
-**Decision:** queue review of Phase 197, 2026-11-12: `_union` does a linear `not in` list check over dataclass values; trial it as a separate change. Code lands only on a measured aws gain. Send the change to queue for review before its checkpoint.
-
-**Spec:**
-1. At `scripts/copies/copy_guard.py:787` (`_union`), replace the `not in` scan of the `alternatives` list with a hashed membership check that keeps first-seen order (for example a `dict` used as an ordered set). The value classes are frozen dataclasses; confirm that every alternative type is hashable for every input before you rely on it.
-2. Keep the result the same for every input: the same alternatives in the same order, a single value when only one remains, and `PossibleValues` otherwise. Change nothing else in `copy_guard.py`.
-3. A fast path for branches that hold the same object is allowed when it gives the same result.
-4. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
-5. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. Measure the source module locally before and after. The director runs three aws pairs.
-
-**Files:**
-- `scripts/copies/copy_guard.py` — `_union` at line 787.
-
-**Workers:** 1 writer; one small change.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 197: the fallback allocation change saved 9.63 CPU s in aws pairs; `copies/test_copy_guard_sources.py` now has a median of 19.25 CPU s on m7a.8xlarge.
-- Phase 195: policy evaluation is most of the module's CPU; the scope traversal candidate at `copy_guard.py:900,1124` has a bound of 0–1.8 s.
-
-**State:** none.
-
-**Acceptance gate:**
-- All importers of `copy_guard.py` pass with unchanged test counts; basedpyright reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
-- queue reviews the change before the checkpoint.
+- No gain; nothing landed. Two queue-approved `_union` versions (`copy_guard.py:786`) were measured in aws pairs against `96e8e395f`: a dict used as an ordered set made `copies/test_copy_guard_sources.py` 3.69 CPU s slower (19.21 to 22.90, 3/3 rounds), because frozen dataclass hashes are not cached and walk every nested tuple on each insert; an identity fast path in front of the old list scan made it 0.61 s slower (19.17 to 19.78, 3/3 rounds). `copy_guard.py` is unchanged. Do not retry hashed membership for these value types without a cached hash.
