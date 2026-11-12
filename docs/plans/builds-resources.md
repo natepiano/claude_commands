@@ -2265,3 +2265,51 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
 
 **Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.
+
+### Phase 107 — A natedev hold never stops a run that holds a live Mac or AWS claim  · status: done
+
+**Depends on:** Phase 106.
+
+**Source (2026-11-12, builds showrunner, from the user via queue):** "nothing is running on the mac yet - that should have never stopped". A plain natedev hold (09:37–09:39 EST) stops runs that only `hold --drain` keeps. Fix: a natedev hold never stops a run with a live Mac or AWS claim. Mac-eligible waiting steps still go to the Mac. One behavior, with no flag for it.
+
+#### Work Order
+
+**Goal:** the hold enforcer keeps every process family that holds a live Mac or AWS claim, for every natedev hold.
+
+**Measured:**
+1. `hold_enforcer.decide_builds()` (`scripts/build_hold/hold_enforcer.py:526`) decides each build-like process. It allows a process only for `protected_reason()` or a holder's `--keep`. It does not read target claims.
+2. `StopBuildsAndTests.stop()` (`:685`) sends TERM to the stop root and to every descendant that is not protected or kept. A claimed `offload.py` under a build-like ancestor gets TERM with that ancestor.
+3. `protected_reason()` (`:483`) gives no permission to a step whose record is missing, stale or unreadable. The 09:37 hold log shows a stopped step with a stale record (`v20261112T135456-3793457-867`).
+4. `claimed_processes()` (`:97`) reads the local claim records and returns the live claimed identities. Only `classify_drain_runs()` (`:114`) uses it. That is the `--drain` rule: "Mac or AWS claim" when the run's family or ancestors hold a claim.
+5. A claim records the `offload.py` process (`scripts/mac_test/offload.py:1330` `claim_arguments`, `--pid os.getpid()`).
+6. `--drain` keeps two more kinds of working run: a cargo child and an admission reservation. It also waits until working runs end. So `--drain` stays a separate behavior after this phase.
+
+**Spec:**
+1. `decide_builds()` takes the live claimed identities as an argument: `claimed: frozenset[build_hold.ProcessIdentity]`.
+   A build-like process is allowed when it, an ancestor or a descendant has a claimed identity.
+   The allowed reason is `holds a live Mac or AWS claim`.
+   Check the claim before `protected_reason()` returns empty and before `keeping_holder()`. The order of the other rules does not change.
+2. `StopBuildsAndTests.stop()` takes the same claimed set. It sends no signal to a claimed process, to an ancestor of one, or to a descendant of one.
+   `kill_survivors()` cancels the kill of a process that became claimed after the TERM decision.
+3. `run()` reads `claimed_processes(proc_root)` once per loop, only while a hold is in force. It passes the same set to `decide_builds()` and `stop()`.
+   `report()`, `scan()` and every other `decide_builds()` caller pass the set. `build_hold.audit_builds` shows the same allowed reason.
+4. Share one family check between `classify_drain_runs()` and `decide_builds()`. Add no second claim reader.
+5. A Mac-eligible step that waits (`waiting_hold` or `waiting_mac`) keeps its controller and its route children alive under a natedev hold. Its route to the Mac runs as before. Add a test row that proves it; change no code for it unless the row fails.
+6. Keep `--drain`. It still stops waiting runs and waits for working runs.
+7. Update `commands/build/hold.md` step 1: runs that hold a live Mac or AWS claim continue. Update the enforcer allow rules in `docs/as-built/builds-aws-target.md`.
+
+**Tests** (`scripts/build_hold/test_hold_enforcer.py`, add rows to existing tests):
+1. A claimed `offload.py` under a `python -m unittest` root: allowed, and `stop()` sends no signal to the root or the child.
+2. A claimed process under a step with a stale record: allowed.
+3. A build-like process with no claim in its family: still stopped.
+4. A Mac-eligible step in `waiting_hold` and its route child with no claim yet: allowed.
+5. A claim that ends: the next loop stops the family as before.
+
+**Files:**
+- `scripts/build_hold/hold_enforcer.py`
+- `scripts/build_hold/build_hold.py` (only if `audit_builds` passes the set)
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_hold/test_build_hold.py` (callers of `decide_builds`)
+- `commands/build/hold.md`
+- `docs/as-built/builds-aws-target.md` — the enforcer allow rules
+
+**Speed:** `claimed_processes()` reads the target config and one claim file per SSH target. It runs once per enforcer second, only during a hold. Name the measured cost in the reply.

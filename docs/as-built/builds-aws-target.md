@@ -108,7 +108,19 @@ An interruption marker reports the instance generation.
 - Unpinned test, check, doc, example, and lint judgments try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
-- `hold_enforcer.protected_reason` protects every step state except `ON_NATEDEV`, so a natedev hold stops only local work.
+- A natedev hold permits a process that holds a live Mac or AWS claim, plus its ancestors and descendants.
+  The reason is `holds a live Mac or AWS claim`, even when the step record is stale or unreadable.
+  The enforcer reads the process table before it reads claims once per pass during a hold.
+  It uses the same claims for decisions and signals.
+  A claim or target config read error prevents TERM and KILL for that pass.
+  The enforcer reports the error once and reports recovery once.
+  Audits and reports show the error and list builds without claim protection.
+  The drain reports the error once and stops no waiting run until claims are readable.
+  If the initial claim read fails, the drain hold keeps every outermost gate.
+  After claims become readable, the drain stops waiting gates and keeps working gates alive.
+  A new claim cancels a pending kill. An ended claim permits the next pass to stop the family.
+  `hold_enforcer.protected_reason` keeps live step controllers and route children alive in `waiting_hold` and `waiting_mac`.
+  `--drain` also waits for cargo children and admission reservations. It still stops waiting runs.
 
 ### Cost ledger and spending guard: `scripts/aws_target/`
 
