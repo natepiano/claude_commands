@@ -205,7 +205,6 @@ def reports_path(name: str, *, identities: QuestionStaff | None = None) -> Path:
     return path.parent.parent / "reports" / path.name
 
 
-
 class InstancePresent(NamedTuple):
     output: str
 
@@ -523,47 +522,11 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
     raise RegistrationFailure("notifier", f"status: {failure_detail(result)}")
 
 
-class ScheduledUpdates(NamedTuple):
-    minutes: int
-    aligned: bool
-
-
 DEFAULT_MINUTES = 15
 
 
-class UpdatesOnDemand(NamedTuple):
-    """The doc's Updates line reads `on demand`, or there is none: a dailies runs only when the user asks for one."""
-
-
-def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
-    line = next((line for line in lines if line.startswith("- **Updates:**")), "")
-    match = re.search(r"every (\d+) minutes", line)
-    # Quiet by default (user, 2026-10-13): only a line asking for a schedule makes one.
-    if match is None or re.search(r"\bon demand\b", line):
-        return UpdatesOnDemand()
-    minutes = int(match.group(1))
-    if minutes <= 0:
-        raise RegistrationFailure("prompt", "Updates interval must be positive")
-    return ScheduledUpdates(minutes, "on the hour" in line)
-
-
-def scheduled_prompt(minutes: int, production: Production) -> str:
-    source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
-    document = source.read_text(encoding="utf-8")
-    if "The prompt:\n" not in document:
-        raise RegistrationFailure("register", "The prompt: marker is missing")
-    tail = document.split("The prompt:\n", 1)[1]
-    if "\n**A tick**" not in tail:
-        raise RegistrationFailure("register", "**A tick** marker is missing")
-    template = tail.split("\n**A tick**", 1)[0]
-    prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
-    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", str(production.zone)).replace("<showrunner name>", production.name)
-    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(production.owner.id)))
-    return prompt
-
-
 def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """Copy missing scratchpad state and update the scheduled prompt."""
+    """Copy missing scratchpad state to the registered owner."""
     done: list[str] = []
     try:
         record = staff.snapshot() if record is None else record
@@ -571,15 +534,7 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
         copied = showrunners.adopt_session_state(identity, record=record)
         if copied:
             done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(identity)}")
-        prompt_file = showrunners.SHOWRUNNER_STATE_DIR / identity / "prompt.txt"
-        if not prompt_file.exists():
-            return done
-        schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
-        minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
-        prompt = scheduled_prompt(minutes, production)
-        if prompt_file.read_text(encoding="utf-8") != prompt:
-            write_text_atomic(prompt_file, prompt)
-            done.append(f"rewrote {prompt_file} from produce.md")
+
     except (OSError, UnicodeError, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
         done.append(f"state move skipped: {error}")
     return done
@@ -598,43 +553,20 @@ def register(production: Production) -> None:
     except Exception as exc:
         # Recording must never interrupt registration.
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
-    schedule = update_schedule(lines)
-    # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
-    minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
-                        else (DEFAULT_MINUTES, False))
-    prompt = scheduled_prompt(minutes, production)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
         raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
     # The staff row owns the timer.
     owner = production.owner
-    state_root = _showrunner_state_root()
-    prompt_file = state_root / owner.id / "prompt.txt"
     updates = f"showrunner-{owner.id}"
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
-        write_text_atomic(prompt_file, prompt)
-    check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {owner.id}"
-    _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(minutes),
-              "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.name}",
-              "--check", check, *(["--aligned"] if aligned else [])])
-    if isinstance(schedule, UpdatesOnDemand):
-        _ = notifier(["stop", updates])
+    _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(DEFAULT_MINUTES),
+                  "--command", "/showrunner:units", "--from", f"showrunner-timer-{production.name}"])
+    _ = notifier(["stop", updates])
     if isinstance(instance("stall-watch"), InstanceAbsent):
         run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
         _ = notifier(["new", "stall-watch", "--every", "1", "--run", run])
-    if isinstance(schedule, UpdatesOnDemand):
-        report("register", "ok", f"{updates} on demand: no scheduled dailies")
-        return
-    status = instance(updates)
-    if isinstance(status, InstanceAbsent):
-        raise RegistrationFailure("register", f"{updates} missing after new")
-    next_due = next((line for line in status.output.splitlines() if line.startswith("next_due=")), "")
-    if not next_due:
-        raise RegistrationFailure("register", f"{updates} status lacks next_due")
-    report("register", "ok", f"{updates} {next_due}")
+    report("register", "ok", f"{updates} registered; automatic reports are off")
 
 
 def production_time(production: Production, stamp: str) -> str:
@@ -1037,6 +969,11 @@ def read_open_items(path: Path | None, *, production: Production | None = None,
     entries = read_open_fields(path, production=production, identities=identities, document=document)
     location = path or document or (production.doc if production is not None else Path("questions"))
     return parse_outstanding_entries(entries, location)
+
+
+def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
+    """Return the items whose deferred time has passed."""
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_all_open_fields() -> list[OutstandingItem]:

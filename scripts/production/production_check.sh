@@ -10,7 +10,7 @@ for line in "${(@f)$(<$doc)}"; do
     doc_status=${${line#*'Status: PRODUCTION — '}%%[^a-z]*}
     case $doc_status in
       running)
-        # One copy of LOG per update tick. A failed copy never changes the check's answer.
+        # Copy a changed LOG during this check. A failed copy does not change the result.
         "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$1" >/dev/null || true
         exit 0 ;;
       wrapped) exit 2 ;;

@@ -451,7 +451,7 @@ print(observed.row.id)
         # Tab sorting consumes the environments resolved by herdr_processes.
         processes = herdr.herdr_processes()
         classifier = herdr.UnitTabClassifier("agents", processes, staff.snapshot())
-        self.assertIsInstance(classifier.classify("show", "organon", ["w4:p1"]), herdr.UnitTab)
+        self.assertIsInstance(classifier.classify(["w4:p1"]), herdr.UnitTab)
         self.assertEqual(herdr.tab_order("show", ["show", "aaa-other", "organon"], [], {"organon"}), [0, 2, 1])
         grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha"].identity, session_staff.LiveSession(owner.current_session))

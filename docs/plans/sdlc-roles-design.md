@@ -797,9 +797,14 @@ The worker finding is a false duplicate, not a removal target. `docs/as-built/se
 
 ### Reporting default and duty-source measurement (former Step 6)
 
-O20-A is recommended; O20-B is the setup/runtime alternative. Ask the user about the source resolution and P-A before changing it. The checked sources are `docs/production_format.md:100–103` (on demand when absent), `commands/showrunner/produce.md:393–394` (15 minutes when absent), `commands/showrunner/produce.md:412–418` (timer creation/stop, already agrees), and `commands/producer/to_production.md:118` (every 15 minutes, contrary to PF). Correct the producer line and SR's introductory absent-default clause against PF. Keep SR's actual setup/stop behavior; it is in the checked acceptance set, not a policy conflict to remove.
-
-Before dispatch, add a typed duty-source measure proposal using `scripts/production/role_terms.toml`, `scripts/production/roles_audit.py` and `scripts/production/test_roles_audit.py`, recording every cited clause, owner and reference. The current baseline does not count D20's source clauses. Print that new before set before fixing a numeric target. The later acceptance set must cover every source clause for agreement with the approved runtime owner and on-demand default, with no clause dropped. A matrix relabel is not a measure. Undo restores the source clauses and registry together and starts no timer.
+2026-11-11: Dailies and their schedule command were retired.
+Remove their setup/runtime source comparison from the pending work.
+Use `/showrunner:units` for unit status on request.
+Keep the historical duty-source counts above as the record of the earlier review.
+For remaining duty-source work, record each cited clause, owner, and reference through the existing role-term audit.
+Print the measured source set before selecting a numeric target.
+Check each retained clause against its approved owner.
+Undo restores the source clauses and registry without starting a timer.
 
 ### Account-move readiness (former Step 7)
 
