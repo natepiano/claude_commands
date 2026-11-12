@@ -59,8 +59,8 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
    | Order | Work | Work split and acceptance |
    | --- | --- | --- |
    | 1 | Phase 205 is done: removable CPU is zero. Direct content tests already run in process; the other 982 starts (167 local CPU s) check shell integration, imports, guards, waits, signals or ownership. | No trial. |
-   | 2 | Phase 207 is done: the cost is registry-reader Python starts, not reads. Phase 208 passes the parsed launch table into the Claude model shell (`models_registry.py:135`; sdlc go; 0–3.39 s). Next candidates: `add_unit.py:459` (0–3.22 s) and `assign.py:418` (0–2.00 s), each on an owner go. | aws pairs decide. |
-   | 3 | Phase 200 Git trials, each on an owner go and a paired measure | Phase 206 (copies bare flag) is done: 1.70 s. Phase 209 combines the style commit and tree reads (0–2.04 s). |
+   | 2 | Phase 207 is done: the cost is registry-reader Python starts, not reads. Phase 208 is done at `ce9febf6d`: the Claude model shell takes the parsed launch table (10.04 s in aws pairs; `notify/test_review.py` alone 7.00 s). Next candidates: `add_unit.py:459` (0–3.22 s) and `assign.py:418` (0–2.00 s), each on an owner go. | aws pairs decide. |
+   | 3 | Phase 200 Git trials, each on an owner go and a paired measure | Phase 206 (copies bare flag) is done: 1.70 s. Phase 209 is done at `72252ade3`: style commit and tree in one read (2.68 s). Next: publication metadata (sdlc go given) and verified-commit reuse (rank 4, 0–0.46 s), each on an owner go. |
 
    Defer copy-guard scope traversal (`copy_guard.py:900,1122`, 0–1.8 s), full bulk-run attribution and crate ownership attribution (`crate_run.py:303`) until measured evidence changes this order (architect after Phase 201).
 
