@@ -1757,10 +1757,16 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
     # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading
     # the answer again under its write lock. The first step after the approval builds it.
-    reading = (style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
-                                                                  if outcome.finding.finding_id not in refused))
-               if dry_run else ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
-                                                          planned.tip, approved_decision))
+    if dry_run:
+        reading = style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
+                                                                   if outcome.finding.finding_id not in refused))
+    elif any(isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRenamed, style_ledger.DeclarationRemoved))
+             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite)
+             for outcome in planned.outcomes):
+        reading = ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
+                                             planned.tip, approved_decision)
+    else:
+        reading = planned
     for outcome in reading.outcomes:
         if not isinstance(outcome, (style_ledger.DeclarationNotRead, style_ledger.DeclarationInPlace,
                                     style_ledger.RenameAwaitingApproval)):

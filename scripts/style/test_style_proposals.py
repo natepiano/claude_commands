@@ -3277,11 +3277,8 @@ class StyleProposalsTests(unittest.TestCase):
                     self.assertIn(f"left {finding.finding_id}", dry_output)
                     self.assertIn("outside rename not proved", dry_output)
                     self.assertIn(f"mapped site {path}:1 declares fn candidate_{index}", dry_output)
-                    self.assertIn(destination, dry_output)
-                    if two_files:
-                        self.assertIn("alpha/src/c.rs", dry_output)
-                    else:
-                        self.assertIn("1/4", dry_output)
+                    candidates = "candidates: 3 (passed: 3);" if two_files else "candidates: 2 (body check failed: 2);"
+                    self.assertIn(candidates, dry_output)
                     self.assertIn("follow 0, built 0, withdraw 0, left", dry_output)
                     self.assertEqual(self.written(ledger), before)
                     self.assertEqual(self.follow(), (dry_code, dry_output))
@@ -3564,6 +3561,8 @@ class StyleProposalsTests(unittest.TestCase):
     def test_follow_refuses_and_builds_nothing_when_a_sync_renames_the_item_after_its_reading(self) -> None:
         with self.ledger() as ledger:
             finding, issue = self.renamed_parent(ledger)
+            self.approve(issue)
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed")})
             reading = style_ledger.Ledger.declaration_reading
             moved = ""
 
@@ -3571,8 +3570,8 @@ class StyleProposalsTests(unittest.TestCase):
                                     approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
                 nonlocal moved
                 result = reading(self_, finding_ids, approved)
-                # The item is in place at the reading; the sync renames it before the write.
-                moved = self.commit_tip(self_, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed")})
+                # The plan builds the approved rename. The sync renames the item again before the write.
+                moved = self.commit_tip(self_, {"alpha/src/a.rs": PARENT.replace("Parent", "RenamedAgain")})
                 return result
 
             before = self.written(ledger)
@@ -3587,11 +3586,18 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(ledger.proposal_findings(issue)[0].finding_id, finding.finding_id)
 
     def test_follow_leaves_a_filed_finding_whose_declaration_is_gone_from_its_kept_file_and_exits_one(self) -> None:
-        finding, code, line = self.left_lines({})
-        self.assertEqual(code, 1)
-        self.assertTrue(line.startswith(f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: outside rename not proved:"))
-        self.assertIn("candidates: alpha/src/a.rs:1 fn other 0/1 body lines", line)
-        self.assertIn("mapped site alpha/src/a.rs:1 declares fn other", line)
+        for files, candidates in (({}, "candidates: none;"),
+                                  ({"alpha/src/b.rs": "pub struct Renamed {\n    different: u64,\n}\n"},
+                                   "candidates: 1 (body check failed: 1);")):
+            with self.subTest(files=files):
+                with mock.patch.object(style_ledger.Ledger, "follow_declarations",
+                                       wraps=style_ledger.Ledger.follow_declarations) as writes:
+                    finding, code, line = self.left_lines(files)
+                writes.assert_not_called()
+                self.assertEqual(code, 1)
+                self.assertTrue(line.startswith(f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: outside rename not proved:"))
+                self.assertIn(candidates, line)
+                self.assertIn("mapped site alpha/src/a.rs:1 declares fn other", line)
 
     def test_an_unfiled_finding_follows_a_proved_outside_rename_with_no_decision(self) -> None:
         with self.ledger() as ledger:
@@ -3666,7 +3672,7 @@ class StyleProposalsTests(unittest.TestCase):
         finding, code, line = self.left_lines({"beta/src/b.rs": PARENT})
         self.assertEqual((code, line), (1, f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: struct Parent "
                                            + "declared in another crate: beta/src/b.rs; mapped site alpha/src/a.rs:1 declares fn other; "
-                                           + "outside rename not proved: zero passing files, keyword differs, body unreadable or empty"))
+                                           + "outside rename not proved: zero passing files"))
 
     def test_a_finding_that_an_assigned_build_ticket_holds_is_kept(self) -> None:
         with self.ledger() as ledger:
