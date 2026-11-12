@@ -348,7 +348,10 @@ The module name is the file stem, or the folder name for `mod.rs`.
 Moving a test file into its owner removes the owner's declaration.
 Unreadable declarations and module files outside a known crate count as edited.
 Uncertain `path` attributes also count.
-These include attributes in inline modules, attributes carried by `cfg_attr`, and attributes that mount inline module folders.
+These include attributes carried by `cfg_attr` and attributes that mount inline module folders.
+A plain file-module path string that ends in another file's name does not declare the requested module file.
+This exclusion also applies inside inline modules.
+A string that ends in the requested file's name remains uncertain inside an inline module.
 `declares_module` reads raw identifiers as plain words through `plain_words`.
 Other findings include only their own file before recorded needs are appended.
 
@@ -367,9 +370,14 @@ A file outside the crate root is scanned only when it names the library, the old
 The ledger keeps that result for its lifetime.
 `EditedFiles.naming` uses one `git ls-tree` per commit.
 One `git cat-file --batch` through `style_ledger.blob_contents` reads named blobs not yet read.
-`renamed_text` or `declares_module` scans each kept path once per distinct blob.
+Restructure findings share one declaration scan per distinct blob during a refill.
+The scan keeps the token check, plain words, item starts, inline modules, and module declarations with their scopes and path attributes.
+`declares_module` reads this syntax for each requested module file.
+`EditedFiles.of` keeps each finding's computed paths and recorded needs for the selection pass.
+A second call for the same finding reads no file text.
+`SplitEditedFiles` shares these scans while its `GitReadCache` supplies the blobs.
 `EditedFiles.module_readings` keeps file rename readings.
-Thus `of` and `uncertain` share one scan.
+For file renames, `of` and `uncertain` share the same readings.
 On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files.
 Under load 20, `of` takes about 1.2 seconds.
 The read takes 0.02 seconds.
