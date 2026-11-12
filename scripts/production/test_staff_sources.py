@@ -24,7 +24,7 @@ from scripts.production import staff, staff_sources, session_staff
 from scripts.production.production_doc import ProductionDocument
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.agents import pane_record, remote
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
 
@@ -62,7 +62,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(staff.by_id(row.id), row)
         saved = pane_record.read("TEST-showrunner")["TEST-pane"]
         self.assertNotIn("config_dir", saved)
-        self.assertEqual(saved["session_id"], row.id)
+        self.assertEqual(saved.get("staff_id"), row.id)
 
     def test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence(self) -> None:
         fixture = self.row_production()
@@ -169,7 +169,9 @@ class StaffSourcesTests(StaffTestCase):
     def director_pane(self, pane_id: str, row: staff.StaffRow, folder: Path, environment: dict[str, str]) -> None:
         self.pane(pane_id, session_id=row.id, environment=environment)
         entries = pane_record.read("agents")
-        entries[pane_id]["cwd"] = str(folder)
+        entry = entries[pane_id]
+        if "session_id" in entry:
+            entry["cwd"] = str(folder)
         pane_record.save("agents", entries)
 
 
@@ -633,7 +635,10 @@ class StaffSourcesTests(StaffTestCase):
                 # The first case is the writer's retained A; the second models a
                 # retained observation already carrying the live conversation C.
                 if reference == third:
-                    launch["session_id"] = reference
+                    launch = pane_launch.NativePaneLaunch(pane_id=launch["pane_id"], session_id=reference,
+                        cwd=str(self.root), name=current.name, kind="claude", model=launch["model"],
+                        remote_control=launch["remote_control"], environment=launch["environment"],
+                        flags_read=launch["flags_read"], written_at=launch["written_at"])
                     pane_record.save("agents", {launch["pane_id"]: launch})
                 before = path.read_bytes(), path.stat().st_mtime_ns
                 record = staff.snapshot()

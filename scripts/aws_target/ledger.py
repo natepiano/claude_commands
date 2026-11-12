@@ -114,6 +114,17 @@ class GateWorkerOwner:
 
 
 @dataclass(frozen=True)
+class NoGateTrial:
+    pass
+
+
+@dataclass(frozen=True)
+class GateTrialBudget:
+    trial_id: str
+    limit_usd: Decimal
+
+
+@dataclass(frozen=True)
 class GateReservation:
     attempt: str
     at: int
@@ -127,6 +138,9 @@ class GateReservation:
     day_rates: tuple[tuple[str, BoxRate], ...] = ()
     booked_allowance: GateAllowance | GateAllowanceUnpriced = GateAllowanceUnpriced()
     owner: GateWorkerOwner | GateOwnerUnknown = GateOwnerUnknown()
+    mode: str = ''
+    trial: GateTrialBudget | NoGateTrial = NoGateTrial()
+    root_gib: int = 0
 
 
 @dataclass(frozen=True)
@@ -158,6 +172,26 @@ class RegionalSpotPrice:
     instance_type: str
     usd_per_hour: Decimal
     read_at: int
+
+
+def regional_spot_prices(region: str, reply: dict[str, object], sizes: Sequence[str],
+                         read_at: int) -> tuple[RegionalSpotPrice, ...]:
+    """Select the latest Linux/UNIX price for each requested type and zone."""
+    if reply.get('NextToken'):
+        raise ValueError('The regional Spot price reply is incomplete')
+    latest: dict[tuple[str, str], tuple[float, RegionalSpotPrice]] = {}
+    for row in rows(reply, 'SpotPriceHistory'):
+        size, zone = text(row, 'InstanceType'), text(row, 'AvailabilityZone')
+        if size not in sizes:
+            continue
+        at = datetime.fromisoformat(text(row, 'Timestamp').replace('Z', '+00:00')).timestamp()
+        price = money(text(row, 'SpotPrice'))
+        if not zone or price < 0:
+            raise ValueError('The regional Spot price reply has invalid rows')
+        key = (zone, size)
+        if key not in latest or at > latest[key][0]:
+            latest[key] = (at, RegionalSpotPrice(region, zone, size, price, read_at))
+    return tuple(price for _, price in latest.values())
 
 
 def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
@@ -499,7 +533,10 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                           text(mapping(item['booked_allowance']), 'source'))
             if item.get('booked_allowance') is not None else GateAllowanceUnpriced(),
             GateWorkerOwner(instant(mapping(item['owner']), 'pid'), text(mapping(item['owner']), 'start'),
-                            text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown()))
+                            text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
+            str(item.get('mode', '')),
+            GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
@@ -546,6 +583,9 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
+             'mode': r.mode, 'root_gib': r.root_gib,
+             'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
+                      if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
                       if isinstance(r.owner, GateWorkerOwner) else None,
              'booked_allowance': {'usd': str(r.booked_allowance.usd), 'source': r.booked_allowance.source}
@@ -1002,6 +1042,18 @@ def day_compute_intervals(start: int, end: int, minimum_seconds: int, rate_for_d
     return tuple(intervals)
 
 
+def trial_gate_cost(reservation: GateReservation, minimum_seconds: int) -> Decimal:
+    """Keep the full maximum for open boxes and book confirmed box costs."""
+    if isinstance(reservation.state, GateAbsent):
+        return Decimal(0)
+    if isinstance(reservation.state, GateTerminated):
+        evidence = LedgerEvidence(gate_reservations=[reservation])
+        return (sum((row.usd for row in gate_compute_intervals(evidence, reservation.state.at, minimum_seconds)), Decimal(0))
+                + gate_allowance(reservation).usd)
+    return (reservation.usd_per_hour * Decimal(max(minimum_seconds, reservation.expires - reservation.at))
+            / Decimal(3600) + reservation.allowance_usd)
+
+
 def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
                            reserve: bool = False) -> tuple[ChargedInterval, ...]:
     intervals: list[ChargedInterval] = []
@@ -1271,7 +1323,7 @@ class CostLedger:
         for row in launches.values():
             day = datetime.fromtimestamp(float(str(row['time'])), ZoneInfo('UTC')).date().isoformat()
             gate_counts[day] = gate_counts.get(day, 0) + 1
-        indexes: dict[tuple[str, str], _BillRates] = {}
+        indexes: dict[tuple[str, str, int], _BillRates] = {}
         needs_root = (any(isinstance(row.state, GateTerminated) for row in state.gate_reservations)
                       and any(row.usage_type.endswith('EBS:VolumeUsage.gp3') and row.quantity > 0
                               for reading in readings for row in reading.usage_types))
@@ -1289,15 +1341,15 @@ class CostLedger:
                          for left, _right in _days(at, max(at + 1, end), ZoneInfo('UTC')))
             regions = (reservation.region,) if reservation.region else configured_regions
             for region in regions:
-                key = (size, region)
+                key = (size, region, reservation.root_gib or root_gib)
                 if key not in indexes:
-                    indexes[key] = _bill_rates(readings, size, now, region, root_gib=root_gib, gate_counts=gate_counts)
-            rates = tuple((day, max((indexes[(size, region)].for_day(day, reservation.usd_per_hour) for region in regions),
+                    indexes[key] = _bill_rates(readings, size, now, region, root_gib=key[2], gate_counts=gate_counts)
+            rates = tuple((day, max((indexes[(size, region, reservation.root_gib or root_gib)].for_day(day, reservation.usd_per_hour) for region in regions),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
             reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates)
             priced.append(replace(reservation, booked_allowance=_book_allowance(
-                reservation, tuple(indexes[(size, region)] for region in regions))))
+                reservation, tuple(indexes[(size, region, reservation.root_gib or root_gib)] for region in regions))))
         state.gate_reservations = priced
         _correct_allowance_estimates(state, readings, now)
 
@@ -1329,6 +1381,21 @@ class CostLedger:
                         return GateAttemptEnded()
                     return GateReserved(previous)
             settings = read_settings(settings_path)
+            if isinstance(request.trial, GateTrialBudget):
+                if request.mode != 'gpu-size-trial' or not request.trial.trial_id or request.trial.limit_usd <= 0:
+                    raise LedgerUnavailable('The GPU trial budget is invalid')
+                previous_trials = [row for row in state.gate_reservations
+                    if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == request.trial.trial_id]
+                limit = min([request.trial.limit_usd, *(row.trial.limit_usd for row in previous_trials
+                                                       if isinstance(row.trial, GateTrialBudget))])
+                trial_id = request.trial.trial_id
+                request = replace(request, trial=GateTrialBudget(trial_id, limit))
+                self._price_gates(state, self.read_bills(), request.at)
+                scoped = [row for row in state.gate_reservations
+                    if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == trial_id]
+                total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
+                if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
+                    return GateCapReached('gpu_size_trial_limit_usd')
             costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
             state.gate_reservations.append(request)
             readings = self.read_bills()

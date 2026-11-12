@@ -554,6 +554,8 @@ fi
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
         [[ "${VERIFY_HELPER_STARTED:-0}" == 0 ]] || return 0
+        # shellcheck source=/dev/null
+        source "$VERIFY_START_DIR/file_lock.sh" || return 2
         VERIFY_HELPER_STARTED=1
         local script="$VERIFY_START_DIR/verify_helper.py" input output
         [[ -f "$script" ]] || return 0
@@ -584,7 +586,7 @@ verify_helper() {
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do forwarded+=("$entry"); done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if flock -x 72 2>/dev/null && (
+        if lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             env -0
             printf '\0%s\0' "$input"

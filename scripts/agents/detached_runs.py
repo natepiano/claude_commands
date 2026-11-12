@@ -676,6 +676,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         "UNIT_RUN_DIR": record["session_dir"],
         "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
         "UNIT_DETACHED_RECORD": str(record_path.resolve()),
+        "BUILDLOG_OWNER_STAFF_ID": record["staff_id"],
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")

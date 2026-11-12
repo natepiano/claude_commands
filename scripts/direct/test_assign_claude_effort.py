@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 import json
+from scripts.direct import assign
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
 from typing import cast
 
@@ -32,6 +33,14 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
                     self.recorded_worker(session_dir).current_session,
                     json.loads(next((self.root / "sessions").glob("*.json")).read_text())["sessionId"],
                 )
+
+        with self.subTest(shell_options="errexit"):
+            environment = self.environment()
+            environment["SHELLOPTS"] = "errexit"
+            self.assertEqual(
+                assign.resolve_model(assign.Arguments(), "impl", environment),
+                ("claude", "sonnet", "", "default"),
+            )
 
 
 if __name__ == "__main__":

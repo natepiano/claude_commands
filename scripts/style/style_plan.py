@@ -27,6 +27,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cached_property
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 
@@ -976,20 +977,104 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     return RenamedText(style_footprint.canonical_code(tuple(renamed), comments), module_sites)
 
 
-def declares_module(repo: Path, path: str, text: str, file: str) -> bool:
-    """Whether the Rust file at path, read as text, declares the module file, or has a token the scan cannot read, or
-    the module file is not in a crate whose modules it can name."""
+@dataclass(frozen=True)
+class DefaultModulePath:
+    """The file module has no path attribute."""
+
+
+@dataclass(frozen=True)
+class LiteralModulePath:
+    """One plain path string belongs to a file module item."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class UncertainDeclarationPath:
+    """The module's path attribute can name any module file."""
+
+
+@dataclass(frozen=True)
+class ModuleDeclaration:
+    """A module item has a name, an inline scope, and a path form."""
+
+    name: str
+    scope: tuple[InlineModule, ...]
+    path: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
+
+
+@dataclass(frozen=True)
+class ModuleDeclarationText:
+    """A readable file's declaration syntax is independent of the requested module file."""
+
+    words: tuple[str, ...]
+    starts: frozenset[int]
+    modules: tuple[InlineModule, ...]
+    declarations: tuple[ModuleDeclaration, ...]
+
+    def declares(self, path: str, module: style_footprint.CrateModule, parent: tuple[str, ...], file: str) -> bool:
+        """Read the kept items for one module file without scanning its owner's text again."""
+        name, filename = module_name(file), PurePosixPath(file).name
+        for declaration in self.declarations:
+            if isinstance(declaration.path, UncertainDeclarationPath):
+                return True
+            if isinstance(declaration.path, LiteralModulePath):
+                named = declaration.path.value
+                if named.rsplit("/", 1)[-1] != filename:
+                    continue
+                if declaration.scope or posixpath.normpath(str(PurePosixPath(path).parent / named)) == file:
+                    return True
+            elif (declaration.name == name and not isinstance(module, style_footprint.OutsideCrate)
+                  and module + tuple(scope.name for scope in declaration.scope) == parent):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class UnreadableDeclarationText:
+    """The token scan cannot read this file's declarations."""
+
+
+def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+    """Scan one file text and keep its words, item starts, inline modules, and declaration paths."""
     try:
         spans = style_footprint.token_spans(text)
     except style_footprint.UnreadableTokenSpans:
-        return True
+        return UnreadableDeclarationText()
+    if len(spans) != len(style_footprint.tokens(text)):
+        return UnreadableDeclarationText()
+    words = plain_words(spans)
+    starts = style_footprint.code_item_starts(words)
+    modules = inline_modules(words, starts)
+    attributes = style_footprint.decorated_items(words)
+    paths: dict[int, LiteralModulePath | UncertainDeclarationPath] = {
+        owner: UncertainDeclarationPath() for owner, decorated in attributes.items()
+        if words[owner] == "mod" and "path" in decorated}
+    attribute_spans = dict(style_footprint.attribute_spans(words))
+    for start, owner in style_footprint.attribute_owners(words).items():
+        named = words[start + 4][1:-1] if attribute_spans[start] == start + 6 else ""
+        if (owner in paths and owner in starts and attributes[owner].count("path") == 1
+                and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
+                and words[owner + 2:owner + 3] == (";",)):
+            paths[owner] = LiteralModulePath(named)
+    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""), enclosing(modules, owner),
+                                           paths.get(owner, DefaultModulePath()))
+                         for owner in sorted(paths.keys() | {index for index, word in enumerate(words)
+                                                              if word == "mod" and index in starts
+                                                              and words[index + 2:index + 3] == (";",)}))
+    return ModuleDeclarationText(words, starts, modules, declarations)
+
+
+def declares_module(repo: Path, path: str, text: str | ModuleDeclarationText | UnreadableDeclarationText, file: str) -> bool:
+    """Read kept declaration syntax, or scan text supplied directly by a caller."""
+    reading = module_declaration_text(text) if isinstance(text, str) else text
     root = crate_root(repo, file)
-    if len(spans) != len(style_footprint.tokens(text)) or isinstance(root, NoCrateRoot):
+    if isinstance(reading, UnreadableDeclarationText) or isinstance(root, NoCrateRoot):
         return True
     module = style_footprint.crate_module(file, root)
     if isinstance(module, style_footprint.OutsideCrate):
         return True
-    return DeclarationScan(path, plain_words(spans), style_footprint.crate_module(path, root), module[:-1], file).declares()
+    return reading.declares(path, style_footprint.crate_module(path, root), module[:-1], file)
 
 
 def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
@@ -2381,6 +2466,9 @@ class EditedFiles:
     A qualified rename includes its own file and Rust or Markdown files that hold the old name as a word.
     A restructure includes its own Rust file and files whose `mod` lines or `#[path]` strings declare it.
     Unreadable declarations count as edited.
+    Each distinct declaration blob is scanned once per refill.
+    A plain file-module path string that ends in another file's name does not declare the requested module file.
+    This exclusion also applies inside inline modules.
     Other findings include their own file.
     Append recorded need paths for every finding.
     Recorded needs also extend the gate's edit approval.
@@ -2396,9 +2484,14 @@ class EditedFiles:
         self.texts: dict[str, str] = {}
         # The renamed_text of each file rename in each file that names its old module.
         self.readings: dict[FileRename, tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]] = {}
+        self.declarations: dict[str, ModuleDeclarationText | UnreadableDeclarationText] = {}
+        self.edited: dict[str, tuple[str, ...]] = {}
+        self.named: dict[str, tuple[tuple[str, str], ...]] = {}
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """Return computed files first, then recorded need paths, without duplicates."""
+        if finding.finding_id in self.edited:
+            return self.edited[finding.finding_id]
         moved = file_rename(finding.kind, finding.path, finding.after)
         pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(moved, FileRename):
@@ -2410,12 +2503,19 @@ class EditedFiles:
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             computed = (finding.path, *named_files)
         elif finding.kind == "restructure" and finding.path.endswith(".rs"):
-            owners = (path for path, text in self.declaring(module_name(finding.path))
-                      if path != finding.path and declares_module(self.repo, path, text, finding.path))
+            owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
+                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
             computed = (finding.path, *owners)
         else:
             computed = (finding.path,)
-        return tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
+        self.edited[finding.finding_id] = tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
+        return self.edited[finding.finding_id]
+
+    def declaration_text(self, blob: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+        """Keep one declaration scan for each blob read during this refill."""
+        if blob not in self.declarations:
+            self.declarations[blob] = module_declaration_text(self.texts[blob])
+        return self.declarations[blob]
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """For a file rename, each file at either commit that names the old module and has a `path` word the rename gate
@@ -2455,17 +2555,31 @@ class EditedFiles:
     def naming(self, name: str) -> tuple[tuple[str, str], ...]:
         """Each Rust file that holds name as a word at either commit, with its text there, read by one batch. A path
         with the same blob at both commits is listed once."""
-        named = {commit: self.ledger.files_naming(commit, name) for commit in self.commits()}
-        self.read(named)
-        versions = dict.fromkeys((path, self.blobs[commit, path]) for commit, paths in named.items() for path in paths)
-        return tuple((path, self.texts[blob]) for path, blob in versions)
+        return tuple((path, self.texts[blob]) for path, blob in self.named_versions(name))
+
+    def named_versions(self, name: str) -> tuple[tuple[str, str], ...]:
+        """Read candidate blobs and keep each distinct path and blob pair."""
+        if name not in self.named:
+            named = {commit: self.ledger.files_naming(commit, name) for commit in self.commits()}
+            self.read(named)
+            self.named[name] = tuple(dict.fromkeys((path, self.blobs[commit, path])
+                                                  for commit, paths in named.items() for path in paths))
+        return self.named[name]
 
     def declaring(self, name: str) -> tuple[tuple[str, str], ...]:
         """Each Rust file at either commit that may declare a module named name, with its text there: one that holds
         name as a word, or a `path` string the scan cannot read with certainty (`UNREAD_PATH_STRING`), which no grep
         for the name finds."""
-        unread = (entry for entry in self.naming("path") if UNREAD_PATH_STRING.search(entry[1]))
-        return tuple(dict.fromkeys((*self.naming(name), *unread)))
+        return tuple(dict.fromkeys((path, self.texts[blob]) for path, blob in self.declaring_versions(name)))
+
+    def declaring_versions(self, name: str) -> tuple[tuple[str, str], ...]:
+        """The path and blob of each candidate module-declaring file at either commit."""
+        return tuple(dict.fromkeys((*self.named_versions(name), *self.unread_path_versions)))
+
+    @cached_property
+    def unread_path_versions(self) -> tuple[tuple[str, str], ...]:
+        """Find unreadable path strings once for the refill."""
+        return tuple(entry for entry in self.named_versions("path") if UNREAD_PATH_STRING.search(self.texts[entry[1]]))
 
     def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
         """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read

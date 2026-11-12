@@ -31,6 +31,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
+        (direct / "file_lock.sh").symlink_to(VERIFY.with_name("file_lock.sh"))
         (direct / "step_record.py").symlink_to(VERIFY.with_name("step_record.py"))
         for directory in ("agents", "build_targets", "build_hold"):
             (scripts / directory).symlink_to(VERIFY.parent.parent / directory, target_is_directory=True)

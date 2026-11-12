@@ -391,6 +391,16 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
+class LiveClaims:
+    identities: frozenset[ProcessIdentity]
+
+
+@dataclass(frozen=True)
+class ClaimsUnreadable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class AuditProcess:
     identity: ProcessIdentity
     parent_pid: int
@@ -419,7 +429,7 @@ FULL_BUILD_AUDIT = FullBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
-BuildClass = Literal["holder", "admitted", "other_session", "no_session"]
+BuildClass = Literal["holder", "admitted", "claimed", "other_session", "no_session"]
 AUDIT_COMMANDS = frozenset({"cargo-tile-real", "cargo", "cargo-nextest", "rustc", "rustdoc"})
 CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 
@@ -559,6 +569,9 @@ def owner_is_sole_holder(owner: session_owner.OwningSession | session_owner.NoOw
 
 class HoldEnforcer(Protocol):
     def admitted_processes(self) -> frozenset[ProcessIdentity]: ...
+    def claimed_processes(self, proc_root: Path = PROC_ROOT) -> LiveClaims | ClaimsUnreadable: ...
+    def holds_claim(self, process: AuditProcess, processes: Mapping[int, AuditProcess],
+                    claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
     def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
     def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
@@ -576,6 +589,10 @@ def hold_enforcer() -> HoldEnforcer:
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
     admitted = hold_enforcer().admitted_processes()
+    claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
+    if isinstance(claims, ClaimsUnreadable):
+        print(f"claims unreadable: {claims.reason}", file=sys.stderr)
+    claimed: frozenset[ProcessIdentity] = claims.identities if isinstance(claims, LiveClaims) else frozenset()
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -595,7 +612,9 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
             continue
         owner = audit_owner(process, ancestors)
         classification: BuildClass
-        if owner_is_sole_holder(owner, holders):
+        if hold_enforcer().holds_claim(process, processes, claimed):
+            classification = "claimed"
+        elif owner_is_sole_holder(owner, holders):
             classification = "holder"
         elif process.in_build_scope or any(item.identity in admitted for item in (process, *ancestors)):
             classification = "admitted"
@@ -618,7 +637,8 @@ def audit_lines(builds: Sequence[AuditedBuild], *, beginning: bool = False) -> l
             continue
         owner = build.owner.session_id if isinstance(build.owner, session_owner.OwningSession) else ""
         command = shlex.join(build.process.argv) or build.process.command
-        lines.append(f"  {build.classification}: {owner}, pid {build.process.identity.pid}: {command}"
+        reason = "holds a live Mac or AWS claim" if build.classification == "claimed" else build.classification
+        lines.append(f"  {reason}: {owner}, pid {build.process.identity.pid}: {command}"
                      + (f" ({len(build.children)} build children)" if build.children else ""))
     if len(lines) == 1:
         lines.append("  No session-owned builds are running.")
@@ -633,7 +653,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
         holders = state.holders if isinstance(state, ActiveHolders) else ()
     builds = audit_builds(proc_root, holders)
     for build in builds:
-        if build.classification in {"holder", "admitted"}:
+        if build.classification in {"holder", "admitted", "claimed"}:
             continue
         for holder in holders:
             hold_enforcer().record_build(build, holder, proc_root, "audit")

@@ -61,7 +61,7 @@ from scripts.review_links import review_link
 FUNCTION_IMPORT_MODULES = (
     "scripts.buildlog.record", "scripts.buildlog.holds", "scripts.build_targets.target_config",
     "scripts.production.production_doc", "scripts.build_hold.override_guard",
-    "scripts.production.change_routing",
+    "scripts.production.change_routing", "scripts.mac_test.offload",
 )
 
 
@@ -261,7 +261,12 @@ class RowProgress(TypedDict):
     unit: Literal["modules", "units", "tests"]
 
 
-class RunRow(TypedDict):
+class RowQueueNotes(TypedDict):
+    head_text: NotRequired[str]
+    priority_text: NotRequired[str]
+
+
+class RunRow(RowQueueNotes):
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
@@ -306,7 +311,7 @@ class SwapReading:
     files_read: int
 
 
-class WaitRow(TypedDict):
+class WaitRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
@@ -318,14 +323,15 @@ class WaitRow(TypedDict):
     fits: bool
 
 
-class CloudWorkRow(TypedDict):
+class CloudWorkRow(RowQueueNotes):
     kind: Literal["cloud"]
+    work_kind: NotRequired[Literal["started on the Mac"]]
     name: str
     showrunner: str
     unit: str
-    pid: int
+    pid: int | admission_records.PidNotRecorded
     detail: str
-    machine: Literal["aws", ""]
+    machine: Literal["aws", "mac", ""]
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
@@ -412,6 +418,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
     cloud_slots: int
@@ -564,14 +571,11 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
-        memory = step.measured
-        if not isinstance(memory, admission_records.ProgressAdjustedMemory):
-            continue
-        counter = memory.counter
+        counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
             reason = counter.reason
             continue
-        if counter.phase.startswith("suites"):
+        if counter.phase == "modules" or counter.phase.startswith("suites"):
             phase, unit = "testing", "modules"
         elif counter.phase.startswith("test:"):
             phase, unit = "testing", "tests"
@@ -583,6 +587,20 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
         return {"kind": "RowProgress", "phase": phase, "done": counter.done,
                 "total": counter.total, "percent": counter.percent, "unit": unit}
     return {"kind": "NoProgress", "reason": reason}
+
+
+def mac_work_row(name: str, unit: str, pid: int | admission_records.PidNotRecorded, started_at: float,
+                 work_kind: Literal["started on the Mac"],
+                 counter: RowProgress | NoProgress, *, showrunner: str = unit_labels.OWNER_NOT_RECORDED,
+                 status: str = "", detail: str = "") -> CloudRunRow:
+    """Show Mac work through the same row as AWS without local memory fields."""
+    progress_text = (f"{counter['done']} of {counter['total']} {counter['unit']}"
+                     if counter["kind"] == "RowProgress" else "Progress unavailable: " + counter["reason"])
+    return {"kind": "cloud", "work_kind": work_kind, "name": name, "showrunner": showrunner,
+        "unit": unit or unit_labels.OWNER_NOT_RECORDED, "pid": pid, "detail": detail or unit,
+        "machine": "mac", "vcpus": queue_view.UnknownCpuCount(),
+        "state": "running", "status": status or f"{work_kind} · {progress_text}", "progress": counter,
+        "stale": False, "late_age": "", "started_at": started_at}
 
 
 def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
@@ -749,7 +767,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             continue
         if path.is_relative_to(CGROUP) and path.name not in SWAP_OWNER_SLICES:
             identity = step_labels(step, labels)
-            name, detail = step_text(step, names), identity.session
+            name, detail = step_text(step, names, labels=labels), identity.session
             if step.step == SWAP_NAMES["between"]:
                 name, detail = identity.session or str(path.name), SWAP_NAMES["between"]
             elif isinstance(memory, admission_records.UnownedSliceMemory):
@@ -836,13 +854,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
         identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
-        name = step_text(step, names) if step is not None else identity.session or hold.memory.owner
+        name = step_text(step, names, labels=labels) if step is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
-        walk.append({"name": name, "showrunner": identity.showrunner, "unit": unit, "between_steps": step is None,
+        walk.append({"name": name, "showrunner": identity.owner_text, "unit": unit, "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
@@ -853,7 +871,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         step = entry.step
         memory = step.measured
         identity = step_labels(step, labels)
-        name, detail = step_text(step, names), identity.unit
+        name, detail = step_text(step, names, labels=labels), identity.unit
         unit, state = detail, ""
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
@@ -916,11 +934,22 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
-        waiters.append({"name": step_text(waiter, names), "showrunner": identity.showrunner, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
+        waiters.append({"name": step_text(waiter, names, labels=labels), "showrunner": identity.owner_text, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room})
     work_rows: list[RunRow | CloudRunRow] = list(walk)
+    mac_reading = queue_view.read_mac_builds()
+    mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
+    if mac_status:
+        work_rows.append(mac_work_row("Mac builds", "", admission_records.PidNotRecorded(), 0,
+            "started on the Mac", {"kind": "NoProgress", "reason": mac_status}, status=mac_status))
+    else:
+        work_rows.extend(mac_work_row(Path(build.folder).name, unit_labels.OWNER_NOT_RECORDED, build.pid, build.started_at,
+            "started on the Mac", {"kind": "NoProgress", "reason": "Mac process has no readable counter"},
+            status=queue_view.mac_build_status(mac_reading, explanation.now), detail=build.folder)
+            for build in mac_reading.builds)
+    work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
     model = queue_view.QueueModel(
         parsed, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
@@ -937,7 +966,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             identity = queue_view.cloud_step_labels(cloud, model)
             values: CloudWorkRow = {"kind": "cloud", "name": model.names.shown(cloud.identity.step),
-                "showrunner": identity.showrunner, "unit": identity.unit, "pid": cloud.owner.pid,
+                "showrunner": identity.owner_text, "unit": identity.unit, "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
@@ -954,6 +983,25 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
+    unmatched_priority_text = ""
+    if isinstance(explanation.priority, admission_records.QueuePriority):
+        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
+                      for entry in explanation.priority.entries}
+        matched_units: set[str] = set()
+        for work_row in (*work_rows, *waiting_rows):
+            if work_row["unit"] in priorities:
+                work_row["priority_text"] = priorities[work_row["unit"]]
+                matched_units.add(work_row["unit"])
+        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
+    if waiting_rows:
+        head_pid = waiting_rows[0]["pid"]
+        if isinstance(explanation.head, admission_records.HeadExplanation):
+            head = explanation.head.waiter
+            head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
+        for waiting_row in waiting_rows:
+            if waiting_row["pid"] == head_pid:
+                waiting_row["head_text"] = queue_view.head_text(model)
+                break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
@@ -980,6 +1028,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
@@ -1003,6 +1052,7 @@ def main(argv: Sequence[str]) -> int:
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
     next_report_at = 0.0
+    next_mac_at = 0.0
     while True:
         if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
@@ -1012,6 +1062,9 @@ def main(argv: Sequence[str]) -> int:
             report = report_reading(configuration.history_days)
             next_report_at = now + configuration.report_refresh_seconds
         try:
+            if now >= next_mac_at:
+                queue_view.refresh_mac_builds()
+                next_mac_at = now + queue_view.mac_activity_refresh_seconds()
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:

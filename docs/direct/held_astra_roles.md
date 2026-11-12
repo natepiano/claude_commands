@@ -7,7 +7,6 @@ Use one `design_roles.py` designer and at most one reviewer per design.
 Held roles use `worker.py` with explicit `astra-designer` or `astra-reviewer` roles.
 Keep the worker's row, native conversation, and pane across rounds, phases, and runs.
 An ad hoc Astra review outside the staff hierarchy uses a consultation pane through `assign.sh`.
-Ask-a-friend opens a consultation pane through `assign.sh` beside its caller.
 The consultation creates no staff row.
 `side_pane.py send|close` uses the same terminal for later questions and closure.
 `design_roles.py` saves each headed prompt and reply. Do not also use `astra_work.py brief` for that role.

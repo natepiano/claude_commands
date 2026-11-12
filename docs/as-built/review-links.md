@@ -83,6 +83,58 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Questions, Changes, and Rebuilds
+
+The review page has Questions, Changes, and Rebuilds type tabs with waiting counts.
+The global waiting count includes all three types.
+The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
+The document title remains Changes to review.
+Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
+Questions and Changes have staff-based showrunner tabs and one card at a time.
+Switching types retains each type's selected showrunner and card.
+The URL fragment records the type, showrunner, and card.
+Next skips a card without saving an answer.
+
+Questions read the canonical records through `update_registration.question_records_for_document`.
+A question belongs to the showrunner whose record owns it.
+A question without a staff owner uses `unrouted`.
+The reader also scans question folders under the showrunner state root when their owners leave staff.
+Owned cards show the one-line text, full filed text, choices, asker, and an answer box.
+An `unrouted` card shows the question and `No showrunner owns this question.`
+It has no answer form, and the server refuses an answer.
+It has no Validate yourself or Ask a question controls.
+`update_registration.answer` records the answer for its owning production.
+The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
+A unit relay receives the answer directly.
+A transferred unit's showrunner receives the answer with the unit's name.
+An answer without a relay goes to the question's showrunner.
+Each message starts with `From the user (via the review page): ` and names the question.
+
+A saved answer shows **Saved: <answer>** and opens the next waiting question.
+A failed save retains the typed answer and its error.
+An answer to a question already answered elsewhere fails without sending another message.
+Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.
+Private delivery records retain the answer text, message, source record, owning document, and fixed recipient ids for recovery.
+The first delivery record stores `saved: false` before the answer saves.
+The second delivery record stores `saved: true` after the answer saves.
+A save error clears that attempt's delivery intent and releases its claim.
+Recovery sends only answers with `saved: true` whose canonical question record is closed.
+Recovery clears an intent for an open question.
+For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
+The Changes tab retains its existing cards, controls, and count rules.
+
+Rebuilds shows one list, with one block per machine in machine order.
+It has no showrunner tabs, card navigation, Next, or answer form.
+Its count is the number of machines with open rebuild needs.
+Each block shows the machine and the first seven characters of its newest need's NixOS commit.
+The block lists each open need from oldest to newest.
+Each need shows its reason and the current name of the staff member it concerns.
+It also shows `requested by <name>` when the requesting staff ID differs from the affected staff ID.
+Unknown staff IDs remain visible as IDs.
+The reader uses the same staff record as the page routing.
+Each render calls `rebuild.need.read_needs()` once.
+An empty or missing needs folder shows `No rebuild is needed.` and a count of 0.
+
 ### Answering a change review
 
 `change_page.py` publishes one page with every waiting change from every configured showrunner list.
@@ -189,7 +241,8 @@ Next selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
 A reload restores that place when the row waits, awaits validation, or has an open question.
 An answered row stays absent from the browser list during delivery and after a reload.
-An empty tab shows **0 changes left** and hides Next.
+An empty showrunner tab shows **No changes are waiting.** or **No questions are waiting.** and hides Next.
+The showrunner tab supplies the count; the card has no separate remaining count.
 Each successful save opens the next waiting change in the same tab.
 Next skips a change without saving an answer.
 The page keeps the current row if the user selects Next or another tab during the save.
@@ -214,7 +267,7 @@ The list file stores cell line breaks as `<br>` and reads them as line breaks.
 A typed `<br>` takes one more backslash in storage and reads back unchanged.
 Every line separator that Python's `splitlines` recognizes is a line break.
 Each row stays on one table line.
-The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
+The user can select Works, Does not work, Validate yourself, Send feedback, or Ask a question.
 The feedback box is a textarea with `feedback_rows` rows.
 The setting starts at 5.
 The box accepts line breaks for every outcome.
@@ -222,7 +275,7 @@ The server converts CRLF, CR, and Unicode line separators to newline characters.
 The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
-Not works with text saves `not works: <text>`.
+Does not work with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
 Its saved verdict removes the row from the page count, including feedback that returns the change to its unit.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.

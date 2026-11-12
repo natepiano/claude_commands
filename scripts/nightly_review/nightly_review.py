@@ -165,7 +165,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
                 candidates = transcript_paths(directory / "projects", f"*/{session}.jsonl")
             for candidate in candidates:
                 if candidate.is_file() and recent_replies(candidate, since):
-                    found.add(candidate)
+                    found.add(candidate.resolve())
         except (OSError, ValueError, TypeError) as error:
             print(f"messages: {path}: {error}", file=sys.stderr)
     return sorted(found)

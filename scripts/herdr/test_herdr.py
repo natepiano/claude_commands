@@ -221,18 +221,19 @@ class NativePaneSessionTests(StaffTestCase):
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
-        for arguments, refusal in ((["codex"], herdr.CodexPaneStarting),
-                          (["codex", "app-server", "--managed-daemon"], ValueError),
-                          (["codex", "exec", "resume", identity], ValueError),
-                          (["codex", "-c", "resume", identity], ValueError)):
+        for arguments, refusal, cause in ((["codex"], herdr.CodexPaneStarting, "pane is starting"),
+                          (["codex", "app-server", "--managed-daemon"], ValueError, "subcommand app-server"),
+                          (["codex", "exec", "resume", identity], ValueError, "subcommand exec"),
+                          (["codex", "-c", "resume", identity], ValueError, "option -c has no =")):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             with (self.subTest(arguments=arguments),
                   patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
                   patch.object(herdr, "_PLATFORM", "linux"),
                   patch.object(sessions, "process_start", return_value="same-process"),
                   patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
-                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable"):
+                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable") as failure:
                     _ = herdr.native_process(998079, "codex")
+                self.assertIn(cause, str(failure.exception))
 
     def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
         identity = fixture_runtime_id("argv-thread")
@@ -289,6 +290,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry.get("pid"), 998070)
 
         for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("fresh-worker", False, ""),
                                         ("wrapper", False, ""), ("wrapper-without-identity", False, ""),
                                         ("two-fresh", False, "Codex launch has no unique foreground process"),
                                         ("invalid-resume", False, "Codex launch identity is unavailable"),
@@ -296,6 +298,10 @@ class NativePaneSessionTests(StaffTestCase):
                                         ("write-failure", True, "Is a directory")):
             with self.subTest(source=source, report=report), tempfile.TemporaryDirectory(dir=self.root) as folder:
                 arguments = ["resume", "invalid"] if source == "invalid-resume" else []
+                if source == "fresh-worker":
+                    arguments = ["--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+                                 "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+                                 "-c", "notice.hide_rate_limit_model_nudge=true"]
                 with (codex_launch_evidence(Path(folder), ["codex", *arguments]) as process_info,
                       patch.object(client, "start_command", return_value=subprocess.CompletedProcess[str]([], 0, "", "")),
                       redirect_stderr(io.StringIO()) as errors):
@@ -332,7 +338,7 @@ class NativePaneSessionTests(StaffTestCase):
                     self.assertIn("legacy launch publication is unavailable:", errors.getvalue())
                     self.assertIn(failure, errors.getvalue())
                     self.assertIn("; launch continues\n", errors.getvalue())
-                elif source == "fresh" and not report:
+                elif source in {"fresh", "fresh-worker"} and not report:
                     self.assertEqual(errors.getvalue(), "herdr codex-worker:w1:p1: pane is starting; pane retained\n")
                     self.assertNotIn("anomaly", errors.getvalue())
                 else:
@@ -473,33 +479,40 @@ class NativePaneSessionTests(StaffTestCase):
                 self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
         pending_launches = (
-            (["codex"], True),
-            (["codex", "Explain this repository"], True),
-            (["codex", "--", "Explain this repository"], True),
-            (["codex", "--model", "test-model", "--no-alt-screen"], True),
-            (["codex", "--config=resume"], False),
-            (["codex", "-cresume"], False),
-            (["codex", '-cmodel="test-model"'], True),
-            (["node", "/opt/@openai/codex/bin/codex.js"], True),
-            (["codex", "resume", "--last"], False),
-            (["codex", "exec"], False),
-            (["codex", "--future-option"], False),
-            (["codex", "--model"], False),
-            (["codex", "--model", "--no-alt-screen"], False),
+            (["codex"], True, ""),
+            (["codex", "--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+              "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+              "-c", "notice.hide_rate_limit_model_nudge=true"], True, ""),
+            (["codex", "Explain this repository"], True, ""),
+            (["codex", "--", "Explain this repository"], True, ""),
+            (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
+            (["codex", "--config=resume"], False, "option --config has no ="),
+            (["codex", "-cresume"], False, "option -c has no ="),
+            (["codex", '-cmodel="test-model"'], True, ""),
+            (["node", "/opt/@openai/codex/bin/codex.js"], True, ""),
+            (["codex", "resume", "--last"], False, "bad resume id"),
+            (["codex", "exec"], False, "subcommand exec"),
+            (["codex", "--future-option"], False, "unknown option --future-option"),
+            (["codex", "--future-option=private-value"], False, "unknown option --future-option"),
+            (["codex", "--model"], False, "option --model has a missing or dash value"),
+            (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
-        for arguments, starting in pending_launches:
+        for arguments, starting, cause in pending_launches:
             with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
                 pane = herdr.json_object(evidence["pane"], "fixture pane")
                 pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
                 info = herdr.json_object(evidence["process_info"], "fixture process info")
                 info.update(shell_pid=998069, foreground_process_group_id=998070)
-                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError):
+                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError) as failure:
                     _ = herdr.codex_resume_thread(998070)
                 identity = herdr.codex_launch_identity(998070, "")
                 if starting:
                     self.assertIsInstance(identity, herdr.StartingCodexPane)
                 else:
                     self.assertIsInstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    assert isinstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    self.assertEqual(identity.reason, f"pid 998070: Codex launch identity is unavailable: {cause}")
+                    self.assertEqual(str(failure.exception), identity.reason)
                 client = herdr.Herdr("agents")
                 with redirect_stderr(io.StringIO()) as notes:
                     scan = client.scan_row_panes(staff.initial_snapshot(), [pane])
@@ -2141,7 +2154,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 del client
                 replacement = pane_launch.read_strict(path)["w1:p2"]
                 attempt = pane_launch.resume_attempt(path, "w1:p2")
-                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                outcome = (pane_launch.VerifiedResume(pane_launch.current_launch(replacement, staff.initial_snapshot()),
+                                                       frozenset({pane_launch.reference_id(original)}))
                            if verified else pane_launch.FailedResume())
                 before = pane_launch.read_strict(path)
                 closed: list[str] = []
@@ -2170,7 +2184,8 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
                 def close_destination(pane: str) -> bool:
                     panes[destination.stem].remove(pane)
                     return True
-                outcome = (pane_launch.VerifiedResume(replacement, frozenset({original["session_id"]}))
+                outcome = (pane_launch.VerifiedResume(pane_launch.current_launch(replacement, staff.initial_snapshot()),
+                                                       frozenset({pane_launch.reference_id(original)}))
                            if verified else pane_launch.FailedResume())
                 pane_launch.finish_restore(path, original, attempt, outcome, close=close_destination,
                                            destination=destination, close_source=close_source)
@@ -2227,6 +2242,29 @@ class ConfirmedPaneCloseTests(unittest.TestCase):
             activity.assert_called_once_with("w1:p1")
             retired.assert_called_once_with(path, "w1:p1", entry)
             self.assertEqual(list(pane_launch.read_strict(path)), ["w1:p2"])
+
+        for owner in ("removed", "backend unavailable"):
+            with self.subTest(owner=owner), self.retained() as (client, path, entry):
+                row = staff.StaffRow(staff.StaffId("retired-member"), "unit", "closed-worker", staff.StaffRoot(),
+                                    current_session=staff.StaffId("conversation"),
+                                    worktree=staff.PresentWorktree("natedev", Path("/work")))
+                record = staff.StaffSnapshot(()) if owner == "removed" else staff.StaffSnapshot((row,))
+                observed = cast(pane_launch.CurrentLaunch, entry.copy())
+                observed["staff_id"] = row.id
+                saved = pane_launch.retained_launch(observed, record)
+                other = entry.copy()
+                other["pane_id"] = "w1:p2"
+                pane_launch.save(path, {"w1:p1": saved, "w1:p2": other}, record=record)
+                rows = self.rows()[1:]
+                with (patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(client, "result", return_value={"panes": rows}),
+                      patch.object(client, "panes", return_value=rows),
+                      patch.object(client, "_close_pane") as closed,
+                      patch.object(client, "pane_activity") as activity):
+                    self.assertTrue(client.close_retained_pane("w1:p1", terminal="term-one"))
+                closed.assert_not_called()
+                activity.assert_not_called()
+                self.assertEqual(list(pane_launch.read_strict(path)), ["w1:p2"])
 
     def test_close_refuses_a_terminal_that_changes_before_the_close(self) -> None:
         for terminal in ("term-replacement", ""):
@@ -2772,6 +2810,7 @@ class HerdrTests(unittest.TestCase):
                   redirect_stderr(io.StringIO()) as errors):
                 entry: dict[str, object] = {"session_id": "fixture-session", "written_at": "fixture-time", "environment": {}}
                 if member:
+                    del entry["session_id"]
                     entry["staff_id"] = member
                 write_text_atomic(directory / "fixture.json", json.dumps({"w1:p1": entry}))
                 scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
@@ -3818,11 +3857,13 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"],
                                            ["--session", "fixture", "workspace", "list"]])
 
-    def test_tab_sessions_omits_panes_without_a_label(self) -> None:
+    def test_tab_sessions_keeps_panes_without_a_label(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1"}, {"pane_id": "w1:p2", "label": None},
             {"pane_id": "w1:p3", "label": "named"}]}}))
-        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p3", "named", "", None)])
+        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p1", "", "", None),
+                                                    herdr.TabSession("w1:p2", "", "", None),
+                                                    herdr.TabSession("w1:p3", "named", "", None)])
 
     def test_tab_sessions_keeps_panes_with_missing_or_unlabelled_workspaces(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
@@ -6835,6 +6876,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
         owner = fixture_member("producer", name="owner")
         other = fixture_member("producer", name="other-owner")
         for case, binding, native, launch_owner in (
@@ -6843,12 +6885,17 @@ class SavedLayoutTests(unittest.TestCase):
                 ("matching native", False, owner.current_session, owner),
                 ("foreign native", True, other.current_session, owner),
                 ("foreign launch", True, owner.current_session, other),
+                ("old workspace title", True, owner.current_session, owner),
+                ("missing pane title", True, owner.current_session, owner),
                 ("reused pane", False, "", owner)):
             with self.subTest(case=case):
                 client = LayoutHerdr("producer-reuse")
                 client.spaces = [("w1", "producers")]
                 _ = client.add_tab("w1", owner.name)
                 shell = client.tabs[0]
+                if case in {"old workspace title", "missing pane title"}:
+                    client.spaces = [("w1", "old-workspace-title"), ("w2", "producers")]
+                    shell["label"] = "old-producer-title" if case == "old workspace title" else ""
                 _ = shell.pop("session_id", None)
                 if native:
                     shell["session_id"] = native
@@ -6992,6 +7039,15 @@ class SavedLayoutTests(unittest.TestCase):
             self.assertEqual([name for _, name in fresh.spaces], [space for space, _ in self.BEFORE])
             fresh.close_restore_placeholders()
             self.assertEqual(fresh.layout(), self.BEFORE)
+
+        with self.subTest(launch="unrelated removed member"):
+            client = self.running()
+            entry: pane_launch.StaffPaneLaunch = {
+                "staff_id": "retired-member", "pane_id": "retired-pane", "model": "",
+                "remote_control": False, "environment": {}, "flags_read": True, "written_at": "2026-11-02T12:00:00Z"}
+            pane_launch.save(pane_launch.record_directory() / "fixture.json", {entry["pane_id"]: entry}, record=staff.StaffSnapshot(()))
+            client.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
+            self.assertEqual(client.layout(), self.BEFORE)
 
     def test_placeholder_with_a_running_program_survives_cleanup(self) -> None:
         _ = self.running()

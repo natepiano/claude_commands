@@ -506,10 +506,10 @@ Wind-down projection keys and count timer commands use staff IDs.
 Count timers resolve the current session through staff when they fire.
 Wind-down starts clear projection state; this change adds no conversion.
 Worker completion notices resolve the director's staff ID after the worker lock releases.
-Friend waits use the native process and the last transcript prompt's reply address.
+Consultation waits use the native process and the last transcript prompt's reply address.
 Consultations need no staff row.
 Unrelated panes with another agent kind do not stop the hook.
-Pane labels do not identify a friend.
+Pane labels do not identify a consultation.
 
 - **User zone.** `scripts.lib.user_zone` supplies `user_zone`, `user_zone_name`, and `zone_label`.
   `config/user_zone.conf` supplies the configured zone.
@@ -554,6 +554,20 @@ Pane labels do not identify a friend.
   Missing or damaged staff data displays `unassigned`.
   Copied `STAFF_ID`, timer targets, folders, and names do not select a row.
   Quota and notifier refresh paths keep their own behavior.
+
+- **For you.** A unit director sees waiting questions, changes, proposals, and efficiency items from that unit.
+  The payload's current session selects the unit staff row.
+  The unit's parent supplies the production document.
+  Counts match the unit's fixed staff id against `asked_by`, `Producer`, `proposed_by`, and `[by: <staff id>]`.
+  Items without a recorded source count for no unit.
+  Unit counts omit unrouted changes.
+  Showrunner sessions retain the full production counts.
+  `counts_row.py --unit <staff id>` writes `<showrunner state>/counts/<unit staff id>`.
+  Each cache retains the counts line, deadline, and watched paths.
+  A unit cache ends with `source=unit:<staff id>`.
+  A source marker mismatch forces a refresh, even when the cache is newer than staff.
+  The status line refreshes only that unit's cache when a watched path changes or the deadline passes.
+  Failed reads use the existing retry deadline.
 
 - **Configured zones.** The status line reads `USER_ZONE`, else `zone=` from `USER_ZONE_CONF` or `config/user_zone.conf`.
   `send_later.py --at` reads the user's zone and sends UTC to systemd.
@@ -608,6 +622,15 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
+  Both tables use `display_cells.fitted(headers, rows, *, cuttable, columns)` before escaping cells.
+  `cuttable` contains original column indexes in cut order, so equal header text does not change the selected columns.
+  The helper omits columns whose cells are all `—`; a table without rows keeps its columns.
+  Both callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
+  The helper measures display columns with `terminal_cells.terminal_width` and allows four columns for the terminal margin.
+  Row width is `1 + sum(width + 3)`, with each width at least three columns.
+  The helper cuts text in the specified order until the rows fit or each cuttable column reaches its header width.
+  A cut adds `…` and never splits a wide character.
+  Fixed columns and minimum text widths can exceed a smaller configured width.
   The command reads terminal metadata, never pane contents.
   - **Status and anomalies:** Both tables derive Status through the shared session classifier and the staff hold fields.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
@@ -654,11 +677,17 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
     Plans above 20 phases use 20 equal groups, with open before not started before done.
     The bar has no text cut, and all three characters use the same display width.
+    When the table keeps Progress, it adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+    `progress_cell` and `progress_legend` use the same `ProgressState` constants for the squares and labels.
+    A table with no Progress bar in any row has no legend; the style table also has no legend.
     Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
     Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
-    Notes limits text to 80 characters and ends longer text with `…`.
+    Notes first limits text to 80 characters and ends longer text with `…`.
+    The table then cuts Queued, Non-Phase Work, Workers, and Notes, in that order, to fit the width.
+    Notes keeps its text while another cuttable column can shrink.
+    Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Non-Phase Work or Queued.
@@ -692,7 +721,8 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     The table shows the oldest assigned or checkpointed ticket.
     Otherwise, it shows `idle (<HH:MM>)` with the last refill time, else `idle`.
     `NoTicket` represents a unit with no such ticket.
-  - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. The full refill outcome appears only in Step, including any sync wait reason. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
+    The table cuts Step before Ticket to fit the width.
+  - **Style step:** `format_step(step, ticket, idle)` says in words what the unit does now. It takes `open_step` on the newest run. When the step's activity text is not empty and is not a generic word, the cell shows that text, for example `building 5 frontend-boundaries moves`. Otherwise it maps the label: `impl` → `writing <ticket work>`, `fix` → `fixing review findings`, `review` → `reviewing`, `test` → `testing`, `checkpoint sent` → `waiting for the showrunner to merge`. Another label shows as it is; an empty label shows `—`. With no open step, an assigned ticket shows `starting <ticket work>`, a checkpointed ticket shows `waiting for the showrunner to merge`, and a unit with no ticket shows `idle — <last refill outcome>` or `idle`. Step includes the refill outcome and any sync wait reason, subject to the table width. The cell never shows a bare `impl` or `checkpoint sent`. ETA (`eta_cell`) is `current.eta.time` as `HH:MM`, else `—`.
   - **Style counts:** The production's `Style units` table assigns families to each unit.
     `style_units.table` sums `FamilyCounts` across those families for each unit row.
     Findings built counts all built findings; Last 24 h counts findings first built in the last 24 hours.
@@ -739,7 +769,7 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   The configured values are 110 and 140 characters.
   With no rows, it prints `no open proposals`.
 
-- **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] — <state>`, open while it ends `proposed` or `deferred`. Printing changes no file but the vault note below.
+- **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] [by: <staff id>] — <state>`, open while it ends `proposed` or `deferred`. `record()` writes the ` [by: <staff id>]` tag only when the caller is a unit director. Printing changes no file but the vault note below.
   Recording prints and flushes new entries before it publishes the complete ledger atomically. An interrupted print leaves them available on retry. A partial final candidate from an interrupted append is replaced on rerun; proposed, deferred, accepted, declined, done and relayed states count as recorded, including the dated outcomes written by `/next`.
   - **Order.** `rank` reads the tag: `N min` or `N h` is user-visible time, `N%` is a share of tokens, and a line with no tag or other words is unmeasured. Time comes before tokens, each largest first; unmeasured lines come last, in the ledger's order. `/next efficiency` takes its candidates and their order from this table.
   - **Pick.** Row one reads `recommended` only when its gain is measured; with nothing measured no row is marked.

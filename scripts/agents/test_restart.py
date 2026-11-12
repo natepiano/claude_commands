@@ -81,6 +81,7 @@ class RestartTestCase(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(home), "CODEX_HOME": str(home / ".codex"),
             "HERDR_PROC": str(home / "proc"), "ROSTER_RUN_ROOT": str(home / "runs"),
+            "HERDR_BIN": "/nonexistent/herdr",
             "UNIT_RUN_DIR": str(home / "run"), "PLAN_DELEGATE_BOARD_DIR": "",
             "XDG_STATE_HOME": str(home / "state"), "SHUTDOWN_STATE_DIR": str(home / "shutdown"),
         })))
@@ -540,7 +541,7 @@ class RecordedResumeTests(RestartTestCase):
 
     folder: Path = Path("/tmp/recorded-resume")
 
-    def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_record.PaneLaunch:
+    def entry(self, kind: Literal["claude", "codex"], model: str) -> pane_launch.CurrentLaunch:
         return {"kind": kind, "pane_id": "w1:p1", "session_id": "recorded-id",
                 "config_dir": "/account", "cwd": str(self.folder), "name": "recorded-name",
                 "model": model, "remote_control": True, "environment": {}, "flags_read": True,
@@ -640,7 +641,7 @@ class MixedRestartTests(ShutdownTestCase):
             "ROSTER_RUN_ROOT": str(root / "runs"), "UNIT_RUN_DIR": str(root / "runs/pane"),
             "CONF_DIR": str(root / "conf"), "SHUTDOWN_PROOF_WORKSPACE": "w1",
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
-            "AGENTS_CALLER_FAMILY": "", "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
+            "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             write_text_atomic(root / "conf" / source.name, source.read_text())
@@ -2064,7 +2065,7 @@ class RestartTests(RestartTestCase):
         retained["written_at"] = "2026-11-12T00:00:00+00:00"
         pane_record.save("agents", {"w1:p7": retained})
         other = retained.copy()
-        other.update(staff_id=foreign.id, session_id=foreign.current_session,
+        cast(pane_launch.StaffPaneLaunch, other).update(staff_id=foreign.id,
                      written_at="2026-11-12T01:00:00+00:00")
         pane_record.save("other", {"w1:p7": other})
         with (self.subTest(record="another server reuses the pane id"),
@@ -2167,18 +2168,21 @@ class RestartTests(RestartTestCase):
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)))
         sibling_identity = str(self.rows[1].current_session)
+        foreign = staff.StaffRow(staff.StaffId("foreign-producer"), "producer", "another-production", staff.STAFF_ROOT,
+                                 current_session=staff.StaffId("foreign-producer-session"))
         read_native = herdr.native_process
 
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
+            if pid == 990102 and kind == "claude":
+                return herdr.NativeAgentProcess(herdr.EnvironmentThread(str(foreign.current_session)), "fixture-start", {})
             if pid == 990101 and kind == "claude":
                 return herdr.NativeAgentProcess(herdr.EnvironmentThread(sibling_identity), "fixture-start", {})
             return read_native(pid, kind)
 
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=native_process))
         path = pane_launch.record_directory() / "fixture.json"
-        launch: pane_launch.PaneLaunch = {"pane_id": "w1:own", "session_id": self.rows[0].id,
-            "staff_id": self.rows[0].id, "kind": "claude", "cwd": str(self.root), "model": "fixture",
-            "name": self.rows[0].name, "remote_control": False, "environment": {}, "flags_read": True, "written_at": "fixture-start"}
+        launch: pane_launch.StaffPaneLaunch = {"pane_id": "w1:own", "staff_id": self.rows[0].id,
+            "model": "fixture", "remote_control": False, "environment": {}, "flags_read": True, "written_at": "fixture-start"}
         pane_launch.save(path, {"w1:own": launch})
 
         workspace_label = "saved"
@@ -2195,7 +2199,9 @@ class RestartTests(RestartTestCase):
                 return {"panes": [own] if own_only else [sibling, own]}
             if arguments[:2] == ("pane", "process-info"):
                 pid = 990101 if arguments[-1] == "w1:sibling" else 990000
-                argv = ["claude"] if pid == 990101 else ["zsh"]
+                if workspace_label == "morty" and own_only:
+                    pid = 990102
+                argv = ["claude"] if pid in (990101, 990102) else ["zsh"]
                 return {"process_info": {"shell_pid": 990000, "foreground_process_group_id": pid,
                     "foreground_processes": [{"pid": pid, "name": argv[0], "argv": argv}]}}
             raise AssertionError(arguments)
@@ -2216,7 +2222,7 @@ class RestartTests(RestartTestCase):
         producer = replace(self.rows[0], kind="producer")
         self.rows = (producer,)
         self.running.clear()
-        record = staff.StaffSnapshot(self.rows)
+        record = staff.StaffSnapshot((*self.rows, foreign))
 
         def resume(row: staff.StaffRow, entry: pane_record.PaneLaunch) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
             del entry
@@ -2266,7 +2272,7 @@ class RestartTests(RestartTestCase):
                 directory.mkdir(exist_ok=True)
                 original = pane_record.launch("old", producer.id, str(self.root),
                                               {"CLAUDE_CONFIG_DIR": str(self.root / ".claude2")}, ["claude"])
-                original["staff_id"] = producer.id
+                original = pane_launch.retained_launch(original, record)
                 cross = scenario in ("cross session", "source unavailable")
                 source_path = directory / ("legacy.json" if cross else "agents.json")
                 pane_launch.save(source_path, {"old": original})

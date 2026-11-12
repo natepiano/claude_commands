@@ -32,7 +32,7 @@ SERVER_TIMEOUT_MS = 60_000
 
 
 def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
-                  original: pane_record.PaneLaunch, entry: pane_record.PaneLaunch, *, reported_unknown: str) -> None:
+                  original: pane_record.PaneLaunch, entry: pane_launch.CurrentLaunch, *, reported_unknown: str) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr_types.HerdrFailure("the pane runs a program")
     kind = pane_launch.saved_kind(entry)
@@ -82,7 +82,8 @@ def restore(session: str, *, dry_run: bool) -> int:
     for saved in sorted(entries.values(), key=lambda entry: entry["written_at"]):
         reference = pane_launch.launch_reference(saved, record)
         if isinstance(reference, pane_launch.StaffLaunchReference):
-            publications[reference.id] = saved
+            if record.by_id(reference.id) is not None:
+                publications[reference.id] = saved
         else:
             for found in pane_launch.reference_panes(reference, record, client, entries):
                 saved_panes.append((herdr.TabSession(str(found["pane_id"]), str(found.get("label") or ""),
@@ -106,7 +107,12 @@ def restore(session: str, *, dry_run: bool) -> int:
             else:
                 print(f"anomaly: {row.name}: session home is unknown; select the normal account", file=sys.stderr)
         if dry_run:
-            entry = names.resume(saved) if saved is not None else None
+            try:
+                entry = names.resume(saved) if saved is not None else None
+            except (ValueError, staff.StaffUnreadable) as error:
+                failures += 1
+                print(f"{row.name}: not resumed: {error}", file=sys.stderr)
+                continue
             home = pane_launch.config_home(entry, record=record) if entry is not None else staff.HomeUnknown()
             account = str(home.path) if isinstance(home, staff.SessionHome) else "normal account"
             identity = str(matches[0]["pane_id"]) if matches else ""

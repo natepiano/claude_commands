@@ -424,8 +424,8 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
         entry = retained.get(pane["pane_id"])
         retained_identity = ""
         if entry is not None:
-            owner = record.by_member_reference(entry["session_id"])
-            retained_identity = owner.current_session if owner is not None else entry["session_id"]
+            owner = record.by_member_reference(pane_launch.reference_id(entry))
+            retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
         if isinstance(observed, herdr.StoppedConversation) and retained_identity != identity:
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
@@ -480,8 +480,8 @@ def remove_stray_producer(name: str, session: str) -> int:
                 admission_matches = True
             entry = retained.get(pane.pane)
             if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(entry["session_id"])
-                retained_identity = owner.current_session if owner is not None else entry["session_id"]
+                owner = record.by_member_reference(pane_launch.reference_id(entry))
+                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
                 admission_matches = admission_matches or retained_identity == identity
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
@@ -489,7 +489,8 @@ def remove_stray_producer(name: str, session: str) -> int:
         processes: list[ProvedStrayProcess] = []
         if isinstance(observed, herdr.LiveConversation):
             conflicts = stop_resume.producer_conflicts(name, client)
-            if not any(found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
+            if not admission_matches and not any(
+                    found == identity or any(place == pane.pane for pane in panes) for found, place in conflicts):
                 raise ValueError(f"{identity}: session has no producer name or pane proof for {name}")
             for pid in observed.pids:
                 native = herdr.native_process(pid, observed.kind)
@@ -1688,7 +1689,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)
     return (marked.claude.session_id == session_id and entry is not None
-            and entry["session_id"] == row.id and session_id == row.current_session)
+            and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
     refused = recovery_refusals(unit)
@@ -2019,8 +2020,16 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 _ = staff.rename(row.id, bare)
                 changed = True
                 continue
-            if not isinstance(observed, worker_panes.ClosedWorker) or any(
-                    pane.get("label") in (row.name, worker_panes.agent_name(owner, row.name)) for pane in client.panes()):
+            if not isinstance(observed, worker_panes.ClosedWorker):
+                print(pair + "the old pane is not closed", file=sys.stderr)
+                continue
+            try:
+                entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+                retained = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client, entries)
+            except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+                print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
+                continue
+            if retained:
                 print(pair + "the old pane is not closed", file=sys.stderr)
                 continue
             runs = [Path(run) for run in unit_runs.held(str(owner.current_session),

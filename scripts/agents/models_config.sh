@@ -280,48 +280,8 @@ _agents_families_inline_from_table() {
     done
 }
 
-# `caller` in [assignments] means the function runs on the family of the agent
-# invoking it, not on a fixed one. ask_a_friend uses it: a friend of the caller's
-# own kind is the only friend that can talk back -- claude reaches claude by
-# SendMessage. Codex uses native pane messages. A Codex friend has
-# no route to a claude caller. A function assigned `caller` has no family switch.
-AGENTS_CALLER_ASSIGNMENT="caller"
-
-# The family of the agent running this shell. codex exports CODEX_THREAD_ID into
-# every shell it spawns and claude exports CLAUDE_CODE_SESSION_ID; codex wins when
-# both are present because a codex process launched from a claude session
-# inherits claude's variable and is still codex. AGENTS_CALLER_FAMILY overrides
-# detection, for tests and for a launcher that already knows. Empty when nothing
-# is detectable.
-_agents_caller_family() {
-    if [[ -n "${AGENTS_CALLER_FAMILY:-}" ]]; then
-        printf '%s' "$AGENTS_CALLER_FAMILY"
-    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
-        printf '%s' codex
-    elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-        printf '%s' claude
-    fi
-}
-
-# An assignment value as the family it means right now: `caller` becomes the
-# running agent's family (or empty), anything else is already a family.
-_agents_concrete_family() {
-    local raw="$1"
-    if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        _agents_caller_family
-    else
-        printf '%s' "$raw"
-    fi
-}
-
-_agents_caller_error() {
-    local context="$1"
-    echo "ERROR: [$context] is assigned '$AGENTS_CALLER_ASSIGNMENT': it runs on the calling agent's family, and no calling agent is detectable here." >&2
-    echo "       Run it from a codex or claude session, or set AGENTS_CALLER_FAMILY=<codex|claude>." >&2
-}
-
 # The assignment a task resolves through today: an exact-task override if one
-# exists, otherwise the function's. Raw -- may be `caller`.
+# exists, otherwise the function's.
 _agents_active_family() {
     _models_registry_read _agents_active_family_from_table "$@"
 }
@@ -333,15 +293,6 @@ _agents_active_family_from_table() {
         family="$(_models_registry_get assignments "$function")"
     fi
     printf '%s' "$family"
-}
-
-# The concrete family a task runs on right now; empty for an undetectable caller.
-_agents_live_family() {
-    _models_registry_read _agents_live_family_from_table "$@"
-}
-
-_agents_live_family_from_table() {
-    _agents_concrete_family "$(_agents_active_family "$1" "$2")"
 }
 
 _agents_effort_allowed() {
@@ -482,7 +433,7 @@ agents_resolve_claude_launcher() {
 }
 
 _agents_resolve_from_table() {
-    local task="$1" function subtask family pair section configured allowed_families
+    local task="$1" function subtask family configured
 
     function="${task%%.*}"
     subtask="${task#*.}"
@@ -500,13 +451,6 @@ _agents_resolve_from_table() {
         echo "ERROR: [$task] no [assignments] entry for '$function'." >&2
         echo "       Configured assignments in $MODELS_CONFIG_FILE: $configured" >&2
         return 1
-    fi
-    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        family="$(_agents_caller_family)"
-        if [[ -z "$family" ]]; then
-            _agents_caller_error "$task"
-            return 1
-        fi
     fi
     _agents_resolve_in_family "$task" "$family"
 }
@@ -704,7 +648,7 @@ agents_list_assignments() {
 }
 
 _agents_list_assignments_from_table() {
-    local filter="${1:-}" assignment key family live matched=0
+    local filter="${1:-}" assignment key family matched=0
     while IFS= read -r assignment; do
         key="${assignment%%=*}"
         models_config_trim "${assignment#*=}" family
@@ -714,23 +658,6 @@ _agents_list_assignments_from_table() {
         matched=1
         if [[ "$key" == *.* ]]; then
             agents_resolve_print "$key" || return 1
-            continue
-        fi
-        if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-            # A caller function has no single answer from outside a session:
-            # show the family that would run from here, or both when nothing
-            # says which.
-            live="$(_agents_caller_family)"
-            if [[ -n "$live" ]]; then
-                _agents_list_function_rows "$key" "$live" || return 1
-                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
-            else
-                for live in codex claude; do
-                    _models_config_has_section "$key.$live" || continue
-                    _agents_list_function_rows "$key" "$live" || return 1
-                done
-                echo "# $key: $AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
-            fi
             continue
         fi
         _agents_list_function_rows "$key" "$family" || return 1
@@ -750,7 +677,7 @@ agents_list_function() {
 
 _agents_list_function_from_table() {
     local function="$1" active family line key subtask pair model effort overrides=""
-    local row_active live tier word_field resolved_model
+    local row_active tier word_field resolved_model
 
     active="$(_models_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
@@ -775,7 +702,7 @@ _agents_list_function_from_table() {
             fi
             effort=""
             [[ "$pair" == *:* ]] && effort="${pair#*:}"
-            if [[ "$(_agents_live_family "$function" "$subtask")" == "$family" ]]; then
+            if [[ "$(_agents_active_family "$function" "$subtask")" == "$family" ]]; then
                 row_active="yes"
             else
                 row_active="no"
@@ -793,14 +720,6 @@ _agents_list_function_from_table() {
         models_config_trim "${line#*=}" pair
         overrides="$overrides, ${key#"$function".}=$pair"
     done < <(_models_config_section_values assignments)
-    if [[ "$active" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        live="$(_agents_caller_family)"
-        if [[ -n "$live" ]]; then
-            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family ($live here)"
-        else
-            active="$AGENTS_CALLER_ASSIGNMENT — the calling agent's family (none detectable here)"
-        fi
-    fi
     if [[ -n "$overrides" ]]; then
         echo "# current family: $active (overrides:${overrides#,})"
     else
@@ -811,20 +730,10 @@ _agents_list_function_from_table() {
 agents_set_assignment() { models_registry_edit _agents_set_assignment "$@"; }
 
 _agents_set_assignment() {
-    local function="$1" family="$2" section line subtask pair tmp_file allowed_families current pinned
+    local function="$1" family="$2" section line subtask pair tmp_file allowed_families pinned
 
     if [[ -z "$function" || "$function" == *.* ]]; then
         echo "ERROR: assignment function must be one segment; got '$function'." >&2
-        return 1
-    fi
-    current="$(_models_registry_get assignments "$function")"
-    if [[ "$current" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        echo "ERROR: '$function' is assigned '$AGENTS_CALLER_ASSIGNMENT': it always runs on the calling agent's family and has no switch." >&2
-        echo "       Edit its rows instead: default_models.sh $function.<subtask> <agent>[:<effort>]" >&2
-        return 1
-    fi
-    if [[ "$family" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        echo "ERROR: '$AGENTS_CALLER_ASSIGNMENT' is not a switch target; it is written by hand in $MODELS_CONFIG_FILE [assignments]." >&2
         return 1
     fi
     pinned="$(_agents_pinned_family "$function")"
@@ -883,10 +792,6 @@ _agents_set_all_assignments() {
     fi
     while IFS= read -r line; do
         key="${line%%=*}"
-        # A caller function is not switched, so it is not validated against the
-        # target either; it already resolves through whichever family asks.
-        models_config_trim "${line#*=}" row
-        [[ "$row" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
         fn="${key%%.*}"
         pinned="$(_agents_pinned_family "$fn")"
         if [[ -n "$pinned" ]]; then
@@ -923,7 +828,7 @@ _agents_set_all_assignments() {
     done < <(_models_config_section_values assignments)
 
     tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
-    if ! awk -v fam="$family" -v caller="$AGENTS_CALLER_ASSIGNMENT" \
+    if ! awk -v fam="$family" \
         -v kept=" $AGENT_KEPT_FUNCTIONS " '
         /^\[/ {
             in_section = ($0 == "[assignments]")
@@ -936,10 +841,7 @@ _agents_set_all_assignments() {
             before_comment = hash ? substr(content, 1, hash - 1) : content
             equals = index(before_comment, "=")
             if (equals) {
-                value = substr(before_comment, equals + 1)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
                 found = 1
-                if (value == caller) { print; next }
                 key = substr(before_comment, 1, equals - 1)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
                 sub(/\..*/, "", key)
@@ -961,19 +863,13 @@ _agents_set_all_assignments() {
     models_registry_store "$tmp_file" "set all assignments to $family" || return $?
 }
 
-# Put every function -- or just <function> -- on one agent, keeping each row's
-# effort. The agent names its own family, as in agents_set_row. Each fixed
-# assignment in scope, exact-task overrides included, switches to that family,
-# and every row of each [<function>.<family>] set takes the agent. A `caller`
-# function keeps its assignment, but its set for that family takes the agent
-# too: that set is live whenever an agent of that family asks. Validated
-# wholesale first -- a missing set, an override with no row, or a kept effort
-# the agent's catalog lacks rejects the change with the file untouched -- then
-# one awk pass writes it. Sets AGENT_SWEEP_FAMILY.
+# Select one agent for every function or one function.
+# Switch its assignments to the agent's family and keep each row's effort.
+# Validate all rows before writing. Set AGENT_SWEEP_FAMILY.
 agents_set_model() { models_registry_edit _agents_set_model "$@"; }
 
 _agents_set_model() {
-    local agent="$1" only="${2:-}" family line key value fn section row pair pinned
+    local agent="$1" only="${2:-}" family line key fn section row pair pinned
     local sections="" matched=0 tmp_file
     AGENT_KEPT_FUNCTIONS=""
 
@@ -996,7 +892,6 @@ _agents_set_model() {
 
     while IFS= read -r line; do
         key="${line%%=*}"
-        models_config_trim "${line#*=}" value
         fn="${key%%.*}"
         [[ -n "$only" && "$fn" != "$only" ]] && continue
         matched=1
@@ -1016,8 +911,6 @@ _agents_set_model() {
         fi
         section="$fn.$family"
         if ! _models_config_has_section "$section"; then
-            # A caller function with no set for this family has nothing to write.
-            [[ "$value" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
             echo "ERROR: cannot assign '$fn' to '$agent': missing [$section]." >&2
             echo "       Allowed families with a configured set: $(_agents_function_families_inline "$fn")" >&2
             return 1
@@ -1047,7 +940,7 @@ _agents_set_model() {
 
     tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
     if ! NEW_AGENT="$agent" awk -v fam="$family" -v only="$only" \
-        -v caller="$AGENTS_CALLER_ASSIGNMENT" -v secs="$sections " \
+        -v secs="$sections " \
         -v kept=" $AGENT_KEPT_FUNCTIONS " '
         /^\[/ {
             name = substr($0, 2, length($0) - 2)
@@ -1076,7 +969,7 @@ _agents_set_model() {
                 fn = substr(before_comment, 1, equals - 1)
                 sub(/\..*/, "", fn)
                 if (index(kept, " " fn " ") > 0) { print; next }
-                if ((only == "" || fn == only) && value != caller) {
+                if (only == "" || fn == only) {
                     print substr(before_comment, 1, equals) fam spacing comment
                     next
                 }
@@ -1092,12 +985,8 @@ _agents_set_model() {
     AGENT_SWEEP_FAMILY="$family"
 }
 
-# Edit one row. The agent names its own family, so the row written is the one
-# the agent could only ever have meant — never the merely-active one. Sets
-# AGENT_ROW_FAMILY (where it landed), AGENT_ROW_ASSIGNMENT (the raw assignment,
-# `caller` included), AGENT_ROW_ACTIVE_FAMILY (what the task resolves through
-# today; empty for an undetectable caller), and AGENT_ROW_ACTIVE (yes when the
-# row's family is the one resolving today).
+# Edit one row in the agent's family.
+# Set AGENT_ROW_FAMILY, AGENT_ROW_ACTIVE_FAMILY and AGENT_ROW_ACTIVE.
 agents_set_row() { models_registry_edit _agents_set_row "$@"; }
 
 _agents_set_row() {
@@ -1183,8 +1072,7 @@ _agents_set_row() {
     models_registry_store "$tmp_file" "set $task to $pair" || return $?
 
     AGENT_ROW_FAMILY="$family"
-    AGENT_ROW_ASSIGNMENT="$active"
-    AGENT_ROW_ACTIVE_FAMILY="$(_agents_concrete_family "$active")"
+    AGENT_ROW_ACTIVE_FAMILY="$active"
     if [[ "$family" == "$AGENT_ROW_ACTIVE_FAMILY" ]]; then
         AGENT_ROW_ACTIVE="yes"
     else

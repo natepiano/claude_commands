@@ -30,7 +30,7 @@ from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import process_group, process_start, atomic_file, conf, unit_runs
@@ -316,7 +316,8 @@ class RetireUnitTests(unittest.TestCase):
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
+                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
+                            + "# whole: 40..\nunits_table_columns=170\n")
         return path
 
 
@@ -926,15 +927,16 @@ class RetireUnitTests(unittest.TestCase):
                     assert isinstance(row.parent, staff.ReportsTo)
                     other = fixture_member("unit", name="TEST-other", parent=row.parent.id,
                                            runtime_id=fixture_runtime_id("TEST-other"))
-                    replacement = pane_record.launch("w1:p1", other.current_session, str(case.root),
-                                                    {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
+                    observed = pane_record.launch("w1:p1", other.current_session, str(case.root),
+                                                 {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
+                    replacement = pane_launch.retained_launch(observed, staff.snapshot())
                     remove = shutdown.retirement_remove
                     def replace_after_cleanup(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
                         result = remove(unit, settings=settings)
                         case.assertEqual(result, [])
                         case.pane_world.locations["w1:p1"]["terminal_id"] = "TEST-new-terminal"
                         case.pane_world.locations["w1:p1"]["label"] = other.name
-                        pane_record.write("alpha", replacement)
+                        pane_record.write("alpha", observed)
                         return result
                     with (mock.patch.object(shutdown, "retirement_remove", side_effect=replace_after_cleanup),
                           mock.patch.object(process_group, "send_process_group") as send):
@@ -1397,7 +1399,7 @@ class ResumeUnitTests(unittest.TestCase):
             # that owner's current conversation, which can differ after /clear.
             owner = staff.by_current_session(DIRECTOR)
             entries = [entry for entry in pane_record.launches()
-                       if owner is not None and entry["session_id"] == owner.id]
+                       if owner is not None and entry.get("staff_id") == owner.id]
             return (unit_lookup.LabeledSession("alpha", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
                                           HerdrPlace("agents", entries[-1]["pane_id"]))
                     if entries else None)
@@ -1974,6 +1976,7 @@ class WorkerRenameTests(StaffTestCase):
             TERMINAL_UNKNOWN = "the shell terminal evidence is temporarily incomplete"
             RETIRE_REFUSED = "a live native process prevents retirement"
             CLOSED_CLASH = "the old row has no pane or active dispatch"
+            MISLEADING_LABEL = "another native owner has the old worker display name"
             ACTIVE_CLASH = "the old row has an active dispatch"
             OPEN_CLASH = "the old row has an open pane"
             SHELL_CLASH = "the old row retains its shell pane"
@@ -1998,7 +2001,7 @@ class WorkerRenameTests(StaffTestCase):
                                       QualifiedWorkerCase.UNDECIDED_DASHED_ROLE) else
                                   "cargo-liner-TEST-handler")
                         qualified = fixture.worker(prefix + "-" + bare)
-                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.ACTIVE_CLASH,
+                        twins = (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL, QualifiedWorkerCase.ACTIVE_CLASH,
                                  QualifiedWorkerCase.OPEN_CLASH, QualifiedWorkerCase.SHELL_CLASH,
                                  QualifiedWorkerCase.RETIRE_REFUSED)
                         bare_twins = [fixture.worker("review")] if scenario in twins else []
@@ -2025,6 +2028,9 @@ class WorkerRenameTests(StaffTestCase):
                             fixture.world.unknown["w1:p9"] = "TEST process evidence unavailable"
                         if scenario is QualifiedWorkerCase.TERMINAL_UNKNOWN:
                             fixture.world.locations["w1:p9"]["terminal_id"] = ""
+                        if scenario is QualifiedWorkerCase.MISLEADING_LABEL:
+                            foreign = fixture_member("showrunner", name="foreign-native-owner")
+                            fixture.world.add(foreign, "w1:foreign", label=qualified.name)
                         before = fixture.staff_file.read_bytes()
                         arguments = ["rename", str(owner.id), owner.name]
                         interruptions = (["before label", "after label"]
@@ -2093,7 +2099,7 @@ class WorkerRenameTests(StaffTestCase):
                                     f"{qualified.name} ({qualified.id}) and {bare_twins[0].name} ({bare_twins[0].id}): kept; "
                                     + f"{qualified.id}: native session is live (pid {os.getpid()}); stop it before removing its row"])
                                 end.assert_called_once()
-                            elif scenario is QualifiedWorkerCase.CLOSED_CLASH:
+                            elif scenario in (QualifiedWorkerCase.CLOSED_CLASH, QualifiedWorkerCase.MISLEADING_LABEL):
                                 self.assertEqual(staff.snapshot().find(kind="worker", parent=owner.id), bare_twins)
                                 end.assert_called_once()
                                 self.assertEqual(result.stderr, "")

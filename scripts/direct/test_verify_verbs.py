@@ -82,6 +82,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
         outside.mkdir()
         script = outside / "verify.sh"
         _ = shutil.copyfile(VERIFY, script)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), outside / "file_lock.sh")
         tools = outside / "tools"
         tools.mkdir()
         sed = shutil.which("sed")
@@ -102,14 +103,17 @@ class VerifyVerbTests(VerifyLintCacheFixture):
             "VERIFY_PY_TRACE": str(outside / "unexpected-trace"),
         }
         _ = environment.pop("IN_NIX_SHELL", None)
-        for arguments in ((), ("-h",), ("--help",), ("help", "test")):
-            with self.subTest(arguments=arguments):
-                result = subprocess.run(
-                    [bash, str(script), *arguments], cwd=outside, env=environment,
-                    capture_output=True, text=True, check=False, timeout=5,
-                )
-                self.assertEqual(result.returncode, 0 if arguments else 2, result.stdout + result.stderr)
-                self.assertIn("Usage:", result.stdout if arguments else result.stderr)
+        for helper_present in (True, False):
+            if not helper_present:
+                (outside / "file_lock.sh").unlink()
+            for arguments in ((), ("-h",), ("--help",), ("help", "test")):
+                with self.subTest(helper_present=helper_present, arguments=arguments):
+                    result = subprocess.run(
+                        [bash, str(script), *arguments], cwd=outside, env=environment,
+                        capture_output=True, text=True, check=False, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0 if arguments else 2, result.stdout + result.stderr)
+                    self.assertIn("Usage:", result.stdout if arguments else result.stderr)
         self.assertFalse(called.exists())
         self.assertEqual(sorted(path.name for path in outside.iterdir()), ["tools", "verify.sh"])
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])

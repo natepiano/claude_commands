@@ -151,10 +151,9 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
                                         "run_started_at": 100}
             if evidence in ("foreign-fallback", "owner-fallback", "unknown"):
                 del event["working_dir"]
+            event["owner_staff_id"] = identity
             if evidence == "legacy":
-                event.update(skill="plan-delegate", main_agent={"session_id": identity})
-            else:
-                event["owner_staff_id"] = identity
+                event["skill"] = "plan-delegate"
             _ = (history / "runs" / f"{identity}.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
         _ = document.write_text("- **Merge branch:** `TEST-production`\n", encoding="utf-8")
         rows.append(staff.StaffRow(production_id, "showrunner", "production", staff.STAFF_ROOT, current_session=production_id,

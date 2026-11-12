@@ -346,6 +346,7 @@ class WorkerCommandTests(unittest.TestCase):
             "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1},
             "pass": {}, "events": [], "project": {}, "unit": "unit",
             "history_file": str(self.run_dir / "history.jsonl"),
+            "owner_staff_id": self.fixture.parent.id,
             "main_agent": {"session_id": str(self.fixture.parent.current_session),
                            "family": "claude", "model": "fixture", "effort": "high"},
         }))
@@ -583,7 +584,9 @@ class WorkerCommandTests(unittest.TestCase):
         idle = self.opened("review", "review")
         self.fixture.dispatch(busy.row, "impl")
         path = self.run_dir / "progress_history_state.json"
-        fields = {"pass": {"impl": {"status": "active", "instance_id": "dispatch-impl", "worker_name": "impl", "launcher_command": ["assign.sh", "same command"]}}}
+        fields = {"owner_staff_id": self.fixture.parent.id,
+                  "pass": {"impl": {"status": "active", "instance_id": "dispatch-impl",
+                                    "worker_id": busy.row.id, "launcher_command": ["assign.sh", "same command"]}}}
         atomic_file.write_text_atomic(path, json.dumps(fields))
         with patch.object(unit_runs, "held", return_value=[str(self.run_dir)]):
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
@@ -1861,16 +1864,16 @@ class WorkerCommandTests(unittest.TestCase):
                     def fail(*_arguments: object, **_options: object) -> str:
                         row, = staff.find(kind="worker", parent=case.fixture.parent.id)
                         rows.append(row)
-                        if family == "claude":
-                            path = case.fixture.root / "pane-records/agents.json"
-                            entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
-                            case.assertEqual(entries, {})
                         raise ValueError("TEST recorder failed")
                     with (patch.object(progress_history, "begin_dispatch", side_effect=fail),
                           patch.object(case.fixture.world, "close_tab_confirmed", side_effect=refuse_empty_target),
                           redirect_stderr(io.StringIO()) as errors):
                         with case.assertRaisesRegex(ValueError, "TEST recorder failed"):
                             _ = case.dispatch()
+                    if family == "claude":
+                        path = case.fixture.root / "pane-records/agents.json"
+                        entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
+                        case.assertEqual(entries, {})
                     row, = rows
                     case.assertEqual(targets, [str(row.current_session)])
                     case.assertIsNone(staff.by_id(row.id))
@@ -2114,8 +2117,9 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(assign("rerun"), worker.ExitCode.OK)
         self.assertNotEqual(self.agent.submitted[1][0], busy)
         self.assertEqual(passes()["review"], held)
-        self.assertEqual((held["worker_name"], held["status"]), ("review", "active"))
-        self.assertEqual((passes()["review2"]["worker_name"], passes()["review2"]["status"]), ("review2", "active"))
+        members = {row.name: row.id for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)}
+        self.assertEqual((held["worker_id"], held["status"]), (members["review"], "active"))
+        self.assertEqual((passes()["review2"]["worker_id"], passes()["review2"]["status"]), (members["review2"], "active"))
 
     def test_add_uses_the_lowest_free_name(self) -> None:
         _ = self.opened("impl")
@@ -2139,8 +2143,9 @@ class WorkerCommandTests(unittest.TestCase):
                     bind = worker_panes.WorkerLockHold.bind
                     guard = LauncherHangGuard("first assignment ready hooks")
                     with ThreadPoolExecutor(max_workers=4) as hooks:
-                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow) -> None:
-                            bind(hold, row)
+                        def queue_ready_hook(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, *,
+                                             deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+                            bind(hold, row, deadline=deadline)
                             if current_thread() is assignment_thread and ready_hooks and row.name not in pending:
                                 pending[row.name] = hooks.submit(turn_end.handle,
                                     turn_end.WorkerEvent(str(row.current_session), reply="ready"))
@@ -2396,6 +2401,40 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.fixture.world.launches), before)
         self.assertNotIn(self.agent.submitted[-1][0], self.fixture.world.foreground)
 
+    def test_herdr_list_shares_history_and_staff_reads_across_workers(self) -> None:
+        expected: dict[str, str] = {}
+        for name, role in (("impl", "impl"), ("review", "review"), ("test", "test")):
+            opened = self.opened(name, role=cast(staff.WorkerRole, role))
+            self.fixture.dispatch(opened.row, cast(staff.WorkerRole, role), completed=True)
+            _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
+            # Preserve each finished pass in its own private run.
+            saved = self.fixture.root / ("history-" + name)
+            saved.mkdir()
+            atomic_file.write_text_atomic(saved / "progress_history_state.json",
+                (self.run_dir / "progress_history_state.json").read_text())
+            expected[name] = role
+        started = time.perf_counter()
+        enumerated: list[Path] = []
+        iterdir = Path.iterdir
+        def read_directory(path: Path) -> Iterator[Path]:
+            if path == self.fixture.root:
+                enumerated.append(path)
+            return iterdir(path)
+        with patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshots, \
+                patch.object(staff, "local_snapshot", wraps=staff.local_snapshot) as local_snapshots, \
+                patch.object(Path, "iterdir", read_directory), \
+                patch.object(agents_log, "assignments", wraps=agents_log.assignments) as roles:
+            code, output, errors = self.command("list", "--json")
+        elapsed = time.perf_counter() - started
+        self.assertEqual(code, 0, errors)
+        rows = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual({str(row["name"]): row["role"] for row in rows}, expected)
+        self.assertEqual(snapshots.call_count, 1)
+        self.assertEqual(local_snapshots.call_count, 0)
+        self.assertEqual(enumerated, [self.fixture.root])
+        self.assertEqual(roles.call_count, 0)
+        print(f"herdr list with three workers: {elapsed:.6f} seconds")
+
     def test_assign_shares_role_history_reads_before_selecting_an_unknown_worker(self) -> None:
         for index, name in enumerate(("impl", "fix", "review", "test"), start=1):
             row = self.fixture.worker(name)
@@ -2415,7 +2454,7 @@ class WorkerCommandTests(unittest.TestCase):
                 slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"])
         self.assertEqual(result, worker.ExitCode.UNCERTAIN)
         self.assertEqual(snapshots.call_count, 0)
-        self.assertEqual(roles.call_count, 1)
+        self.assertEqual(roles.call_count, 0)
         self.assertEqual(enumerated, [self.fixture.root])
         self.assertEqual(self.agent.submitted, [])
 
@@ -2587,8 +2626,8 @@ class WorkerCommandTests(unittest.TestCase):
     def test_list_all_resolves_a_fixed_manager_id_after_its_session_changes(self) -> None:
         first, _second, paths = self.recorded_list_fixture()
         state = cast(dict[str, object], json.loads(paths[0].read_text()))
-        _ = state.pop("owner_staff_id")
-        state["main_agent"] = {"session_id": self.fixture.parent.id}
+        self.assertEqual(state["owner_staff_id"], self.fixture.parent.id)
+        state["main_agent"] = {}
         state["pass"] = {}
         history = self.fixture.root / "legacy-history.jsonl"
         state["history_file"] = str(history)

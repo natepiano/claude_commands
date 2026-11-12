@@ -17,6 +17,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
+from scripts.lib.terminal_cells import terminal_width
 from scripts.production import live_units
 from scripts.production import proposal_issue
 from scripts.production.issues import frontmatter
@@ -257,15 +258,19 @@ class StyleUnitsTests(unittest.TestCase):
                          live_unit("types")._replace(machine=machine)]
                 column = " Machine |" if machine == "mac" else ""
                 separator = " --- |" if machine == "mac" else ""
-                self.assertEqual(self.render(units).splitlines()[:2], [
-                    f"| Unit | Status |{column} Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
-                    f"| --- | --- |{separator} --- | --- | --- | ---: | ---: | ---: |",
+                rendered = self.render(units)
+                self.assertEqual(rendered.splitlines()[:2], [
+                    f"| Unit | Status |{column} Ticket | Step | Findings built | Last 24 h | Findings left |",
+                    f"| --- | --- |{separator} --- | --- | ---: | ---: | ---: |",
                 ])
+                self.assertNotIn("Progress:", rendered)
 
     def test_idle_without_a_refill_uses_idle_in_ticket_and_step(self) -> None:
-        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | idle | — | 0 | 0 | 0 |")
+        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | idle | 0 | 0 | 0 |")
 
     def test_idle_step_shows_the_whole_refill_outcome_once_and_ticket_keeps_its_time(self) -> None:
+        config = self.root / "table-conf/production.conf"
+        _ = config.write_text(config.read_text().replace("units_table_columns=170", "units_table_columns=1000"))
         outcomes = (
             "waiting for structure: cargo-liner",
             "waiting for sync: listed tui_pane names: main touched crates/tui_pane/src/a.rs, crates/tui_pane/Cargo.toml",
@@ -276,14 +281,40 @@ class StyleUnitsTests(unittest.TestCase):
                     _ = connection.execute("DELETE FROM refill_results")
                 self.refill(split_at="", outcome=outcome)
                 row = self.render().splitlines()[2]
-                self.assertEqual(row, f"| names | idle | idle (09:45) | idle — {outcome} | — | 0 | 0 | 0 |")
+                self.assertEqual(row, f"| names | idle | idle (09:45) | idle — {outcome} | 0 | 0 | 0 |")
                 self.assertEqual(row.count(outcome), 1)
+
+    def test_wide_table_cuts_step_before_ticket_and_keeps_eta_and_number_alignment(self) -> None:
+        _ = self.ticket(rule="global:rust/" + "界" * 50 + ".md")
+        decision = self.decision("names", "names")
+        self.findings(decision, "built", 2, built_at="2026-10-28T11:00:00+00:00")
+        self.findings(decision, "filed", 3)
+        config = self.root / "table-conf/production.conf"
+        configured = config.read_text()
+        for columns in (170, 130):
+            with self.subTest(columns=columns):
+                _ = config.write_text(configured.replace("units_table_columns=170", f"units_table_columns={columns}"))
+                lines = self.render_open_step("test", "Check " + "界" * 60,
+                                              eta="2026-10-28T16:15:00+02:00").splitlines()
+                headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+                alignment = [cell.strip() for cell in lines[1].split("|")[1:-1]]
+                cells = [cell.strip() for cell in lines[2].split("|")[1:-1]]
+                values = dict(zip(headers, cells, strict=True))
+                widths = [max(3, terminal_width(header), terminal_width(cell))
+                          for header, cell in zip(headers, cells, strict=True)]
+                self.assertLessEqual(1 + sum(width + 3 for width in widths), columns - 4)
+                self.assertEqual(values["Step"], "Che…")
+                self.assertTrue(values["Ticket"].startswith("#42 · 界"))
+                self.assertTrue(values["Ticket"].endswith("…"))
+                self.assertEqual(values["ETA"], "10:15")
+                self.assertEqual(cells[-3:], ["2", "2", "3"])
+                self.assertEqual(alignment, ["---"] * (len(headers) - 3) + ["---:"] * 3)
 
     def test_built_and_recent_counts_have_separate_cells(self) -> None:
         decision = self.decision("names", "names")
         self.findings(decision, "built", 56, built_at="2026-10-28T11:00:00+00:00")
         self.findings(decision, "built", 1178, built_at="2026-10-20T11:00:00+00:00")
-        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | idle | — | 1,234 | 56 | 0 |")
+        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | idle | 1,234 | 56 | 0 |")
 
     def test_writing_step_uses_the_ticket_count_and_noun(self) -> None:
         for kind, noun in (("proposal", "finding"), ("listed", "site"), ("read", "file"), ("structure", "file")):
@@ -292,11 +323,11 @@ class StyleUnitsTests(unittest.TestCase):
                     with closing(sqlite3.connect(self.database)) as connection, connection:
                         _ = connection.execute("DELETE FROM tickets")
                     _ = self.ticket(kind=kind, count=count)
-                    self.assertIn(f"| writing {count} {noun}{'' if count == 1 else 's'} | — |",
+                    self.assertIn(f"| writing {count} {noun}{'' if count == 1 else 's'} |",
                                   self.render_open_step("impl"))
 
     def test_writing_step_without_a_ticket_says_writing(self) -> None:
-        self.assertIn("| idle | writing | — |", self.render_open_step("impl", "impl"))
+        self.assertIn("| idle | writing |", self.render_open_step("impl", "impl"))
 
     def test_assigned_ticket_without_an_open_step_starts_its_count_and_noun(self) -> None:
         for kind, noun in (("proposal", "findings"), ("listed", "sites"), ("read", "files")):
@@ -304,21 +335,21 @@ class StyleUnitsTests(unittest.TestCase):
                 with closing(sqlite3.connect(self.database)) as connection, connection:
                     _ = connection.execute("DELETE FROM tickets")
                 _ = self.ticket(kind=kind, count=17)
-                self.assertIn(f"| starting 17 {noun} | — |", self.render())
+                self.assertIn(f"| starting 17 {noun} |", self.render())
 
     def test_testing_step_says_testing(self) -> None:
-        self.assertIn("| testing | — |", self.render_open_step("test"))
+        self.assertIn("| testing |", self.render_open_step("test"))
 
     def test_reviewing_step_says_reviewing(self) -> None:
-        self.assertIn("| reviewing | — |", self.render_open_step("review"))
+        self.assertIn("| reviewing |", self.render_open_step("review"))
 
     def test_fixing_step_says_fixing_review_findings(self) -> None:
-        self.assertIn("| fixing review findings | — |", self.render_open_step("fix"))
+        self.assertIn("| fixing review findings |", self.render_open_step("fix"))
 
     def test_specific_step_activity_names_the_host_or_action(self) -> None:
         for kind, activity in (("test", "testing on the Mac"), ("fix", "repairing a merge conflict")):
             with self.subTest(kind=kind):
-                self.assertIn(f"| {activity} | — |", self.render_open_step(kind, activity))
+                self.assertIn(f"| {activity} |", self.render_open_step(kind, activity))
 
     def test_step_uses_the_newest_open_activity_then_returns_to_the_open_pass(self) -> None:
         old = self.root / "old.jsonl"
@@ -333,10 +364,10 @@ class StyleUnitsTests(unittest.TestCase):
         _ = newest.write_text("\n".join(json.dumps(event) for event in events) + "\n")
         record: dict[str, object] = {"plan": str(self.root / "plan.md")}
         with patch.object(plan_history, "plan_runs", return_value=[old, newest]):
-            self.assertIn("| checking the table on the Mac | — |", self.render(records={"names": record}))
+            self.assertIn("| checking the table on the Mac |", self.render(records={"names": record}))
             events.append({"event_type": "activity_finished", "activity_instance_id": "a"})
             _ = newest.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-            self.assertIn("| writing | — |", self.render(records={"names": record}))
+            self.assertIn("| writing |", self.render(records={"names": record}))
 
     def test_checkpointed_ticket_without_an_open_step_waits_for_the_showrunner_to_merge(self) -> None:
         _ = self.ticket(state="checkpointed")
@@ -348,12 +379,12 @@ class StyleUnitsTests(unittest.TestCase):
         record: dict[str, object] = {"plan": str(self.root / "plan.md"), "current": None}
         for runs in ([run], []):
             with self.subTest(runs=runs), patch.object(plan_history, "plan_runs", return_value=runs):
-                self.assertIn("| waiting for the showrunner to merge | — |",
+                self.assertIn("| waiting for the showrunner to merge |",
                               self.render(records={"names": record}))
 
     def test_checkpointed_ticket_with_an_open_step_describes_the_activity(self) -> None:
         _ = self.ticket(state="checkpointed")
-        self.assertIn("| testing on the Mac | — |", self.render_open_step("test", "testing on the Mac"))
+        self.assertIn("| testing on the Mac |", self.render_open_step("test", "testing on the Mac"))
 
     def test_eta_has_its_own_column_in_the_production_zone(self) -> None:
         output = self.render_open_step("test", eta="2026-10-28T16:15:00+02:00")
@@ -363,7 +394,16 @@ class StyleUnitsTests(unittest.TestCase):
     def test_eta_column_shows_a_dash_without_a_valid_recorded_eta(self) -> None:
         for eta in ("", "invalid", "2026-10-28T16:15:00"):
             with self.subTest(eta=eta):
-                self.assertIn("| testing | — | 0 | 0 |", self.render_open_step("test", eta=eta))
+                output = self.render_open_step("test", eta=eta)
+                self.assertIn("| testing | 0 | 0 |", output)
+                self.assertNotIn("ETA", output.splitlines()[0])
+                records: dict[str, object] = {
+                    "names": {"current": {"eta": {"time": eta}}},
+                    "types": {"current": {"eta": {"time": "2026-10-28T16:15:00+02:00"}}},
+                }
+                mixed = self.render([live_unit("names", "names"), live_unit("types")], records)
+                self.assertIn("| names | idle | idle | idle | — | 0 | 0 | 0 |", mixed)
+                self.assertIn("| types | exited | idle | idle | 10:15 | 0 | 0 | 0 |", mixed)
 
     def test_eta_without_an_open_step_keeps_the_idle_step_and_its_own_column(self) -> None:
         record: dict[str, object] = {"plan": str(self.root / "plan.md"),
@@ -423,7 +463,7 @@ class StyleUnitsTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO refill_results(unit,at,outcome,split_at) VALUES (?,'','',?)",
                                    ("names", "2026-10-28T10:00:00+00:00"))
-        self.assertIn("| names | idle | idle | idle | — | 0 | 0 | "
+        self.assertIn("| names | idle | idle | idle | 0 | 0 | "
                       + "0: ready 0 · changed 0 · structure 0 · other 0 (2 h) |", self.render())
 
     def test_a_built_finding_without_a_decision_uses_its_build_ticket_family(self) -> None:
@@ -447,7 +487,7 @@ class StyleUnitsTests(unittest.TestCase):
         write_style_units(self.doc, (style_config.StyleUnitAssignment(
             "cargo-liner-style", ("names", "values", "types", "modules")),))
         output = self.render([live_unit("cargo-liner-style")])
-        self.assertIn("| cargo-liner-style | exited | idle | idle | — | 5 | 5 | 12 |", output)
+        self.assertIn("| cargo-liner-style | exited | idle | idle | 5 | 5 | 12 |", output)
         self.assertIn("All families: 5 findings built · 12 approved findings left · 5 built", output)
 
     def test_total_with_a_rate_counts_all_families_once_and_uses_thousands_commas(self) -> None:
@@ -479,8 +519,8 @@ class StyleUnitsTests(unittest.TestCase):
         _ = unanswered.write_text("---\nstatus: open\n---\n", encoding="utf-8")
         self.findings(unanswered, "filed")
         output = self.render([live_unit("names", "names"), live_unit("types", "types")])
-        self.assertIn("| names | idle | idle | idle | — | 0 | 0 | 1 |", output)
-        self.assertIn("| types | idle | idle | idle | — | 0 | 0 | 0 |", output)
+        self.assertIn("| names | idle | idle | idle | 0 | 0 | 1 |", output)
+        self.assertIn("| types | idle | idle | idle | 0 | 0 | 0 |", output)
         self.assertEqual(output.splitlines()[-1],
                          "All families: 0 findings built · 1 approved findings left of 2 filed · "
                          + "0 built in the last 24 h · no ETA: nothing built in 24 h")
@@ -491,7 +531,7 @@ class StyleUnitsTests(unittest.TestCase):
         _ = unreadable.write_bytes(b"\xff")
         self.findings(unreadable, "filed")
         output = self.render()
-        self.assertIn("| names | idle | idle | idle | — | 0 | 0 | 0 |", output)
+        self.assertIn("| names | idle | idle | idle | 0 | 0 | 0 |", output)
         self.assertEqual(output.splitlines()[-1],
                          "All families: 0 findings built · 0 approved findings left of 2 filed · "
                          + "0 built in the last 24 h · no ETA: nothing built in 24 h")
@@ -586,7 +626,7 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names")], {}, doc=self.doc, now=NOW, zone=ZONE,
                                            ledger_paths={"names": database})
-                self.assertIn("| names | exited | idle | idle | — | 0 | 0 | 0 |", output)
+                self.assertIn("| names | exited | idle | idle | 0 | 0 | 0 |", output)
                 self.assertEqual(database.read_bytes(), before)
         database = self.root / "absent" / "ledger.sqlite"
         output = style_units.table([live_unit("names")], {}, doc=self.doc, now=NOW, zone=ZONE,
@@ -621,7 +661,7 @@ class StyleUnitsTests(unittest.TestCase):
         records: dict[str, object] = {"names": {"unavailable": "plan cannot be read"}}
         with patch.object(style_ledger, "ledger_location", side_effect=AssertionError("the caller resolved the path")):
             output = self.render(records=records)
-        self.assertIn("| names | idle | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | — | 0 | 0 | 7 |", output)
+        self.assertIn("| names | idle | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | 0 | 0 | 7 |", output)
 
     def test_unit_names_come_from_staff_and_ticket_cells_escape_pipes(self) -> None:
         _ = self.ticket(rule="global:rust/a|b.md")

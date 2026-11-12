@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
-EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$")
+EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d (?P<head>.*?) — (?P<status>.*)$")
 
 
 class FooterCounts(NamedTuple):
@@ -33,13 +33,14 @@ def total(each: list[FooterCounts]) -> FooterCounts:
     return FooterCounts(*(sum(column) for column in zip(FooterCounts(), *each)))
 
 
-def change_counts(doc: Path, record: staff.StaffSnapshot) -> tuple[int, int]:
+def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = "") -> tuple[int, int]:
     """Count the production tab and the unrouted tab in one routed pass."""
     try:
         scope = change_review.review_scope(doc, False, record)
         routed = change_review.routed_review_entries(change_review.scope_list(doc, record=record), doc, record=record)
-        return (sum(owner.tab in scope for _, owner, _ in routed),
-                sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
+        return (sum(owner.tab in scope and (not source or row.get("Producer") == source)
+                    for _, owner, row in routed),
+                0 if source else sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except (change_review.ChangeReviewError, OSError):
         return 0, 0
 
@@ -53,14 +54,19 @@ def unrouted_changes(doc: Path) -> int:
     return change_counts(doc, staff.snapshot())[1]
 
 
-def proposals(doc: Path) -> int:
+def proposals(doc: Path, *, source: str = "") -> int:
+    if source:
+        waiting = proposals_table.issue_entries(
+            [issue for issue in proposals_table.scope_issues(doc) if issue.value("proposed_by") == source])[0]
+        return len(waiting)
     return len(proposals_table.waiting_entries(doc)[0])
 
 
-def open_efficiency(line: str) -> bool:
-    """A dated efficiency ledger line whose first status is proposed or deferred."""
+def open_efficiency(line: str, *, source: str = "") -> bool:
+    """Match an open ledger line and its source before the first status delimiter."""
     match = EFFICIENCY_LINE.match(line)
-    return match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
+    return (match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
+            and (not source or match.group("head").rstrip().endswith(f" [by: {source}]")))
 
 
 def efficiency_ledger(doc: Path) -> Path | None:
@@ -71,7 +77,7 @@ def efficiency_ledger(doc: Path) -> Path | None:
         return None
 
 
-def efficiency(doc: Path) -> int:
+def efficiency(doc: Path, *, source: str = "") -> int:
     """Proposed and deferred efficiency proposals in the doc's ledger."""
     try:
         path = efficiency_ledger(doc)
@@ -80,14 +86,15 @@ def efficiency(doc: Path) -> int:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         return 0
-    return sum(open_efficiency(line) for line in lines)
+    return sum(open_efficiency(line, source=source) for line in lines)
 
 
-def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None) -> FooterCounts:
-    """Each count for one production doc; a source that cannot be read counts nothing."""
+def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None,
+                source: str = "") -> FooterCounts:
+    """Count one production, with supplied questions and an optional fixed source staff id."""
     try:
-        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot())
-        return FooterCounts(change_count, proposals(doc), questions, efficiency(doc), unrouted_count)
+        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot(), source=source)
+        return FooterCounts(change_count, proposals(doc, source=source), questions, efficiency(doc, source=source), unrouted_count)
     except OSError:
         return FooterCounts(questions=questions)
 
