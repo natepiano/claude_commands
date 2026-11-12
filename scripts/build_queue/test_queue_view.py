@@ -284,6 +284,28 @@ class CloudQueueViewTests(unittest.TestCase):
                 else:
                     self.assertNotIn("failed module", text)
 
+    def test_cloud_rows_show_stage_and_location(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        for stage, region, zone, detail in (
+            ("tools ready", "", "", "tools ready"),
+            ("tests start", "eu-south-2", "eu-south-2a", "tests start · eu-south-2, zone a"),
+            ("", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
+            ("", "", "eu-south-2a", "zone eu-south-2a"),
+            ("", "eu-south-2", "", "eu-south-2"),
+            ("", "", "", ""),
+        ):
+            with self.subTest(stage=stage, region=region, zone=zone):
+                current = replace(row, progress=replace(row.progress, stage=stage, region=region, zone=zone))
+                self.assertEqual(queue_view.cloud_detail(current), detail)
+                current_model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
+                text = plain(queue_view.render_view(current_model, 240))
+                expected = " · ".join(filter(None, ("running", detail, "7 of 12 modules", "1 failed module")))
+                self.assertIn(expected, text)
+
     def test_cloud_rows_sort_with_local_steps_and_keep_the_local_memory_bars(self) -> None:
         model, fixture = self.cloud_model()
         fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
