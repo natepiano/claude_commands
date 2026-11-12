@@ -647,24 +647,35 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
+It reads gate regions, then `spot_candidate_regions`, without duplicates.
+It preserves the configured order within each list.
+`spot_candidate_regions=us-east-2 us-west-2` also supplies the regions for Spot work and later price steering.
+`gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
-`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each configured region.
+`deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
+The price stage of `up` shows this quota for each gate region.
+Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
 A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
-`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 128 vCPUs.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+It uses `gpu_spot_quota_request_vcpus=4` for one xlarge GPU box.
+All three new keys are in `cloud_gate.conf`.
+Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
 It prints the region, desired value, and request status without request, case, or account identifiers.
 A failed call prints only the AWS error code or Python error class and does not stop other regions.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

@@ -109,6 +109,36 @@ def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
     return conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
 
 
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+    """Request one regional quota unless its value is sufficient or a request is open."""
+    region = api.region
+    closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    try:
+        quota = spot_quota(api, code)
+        if quota >= desired:
+            print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
+            return True
+        history = api.call('list-requested-service-quota-change-history-by-quota',
+            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
+        if opened:
+            for row in opened:
+                status = ledger.text(row, 'Status')
+                value = conf.decimal(str(row['DesiredValue']))
+                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+            return True
+        reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
+            '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
+        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
+        return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+        match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+        reason = match[1] if match else type(error).__name__
+        print(f'{region}: {label} quota request failed: {reason}')
+        return False
+
+
 @dataclass(frozen=True)
 class PreparedDeployment:
     at: int
@@ -1240,13 +1270,15 @@ class Deployment:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
         from scripts.aws_target import cloud_gate
-        configured_types = cloud_gate.settings().words('instance_types')
+        values = cloud_gate.settings()
+        configured_types = values.words('instance_types')
         largest = largest_gate_vcpus(configured_types)
         sizes = tuple(dict.fromkeys([*configured_types,
-                                    'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge']))
+                                    'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge', *values.words('gpu_instance_types')]))
+        regions = tuple(dict.fromkeys([*gate_regions(settings.region), *values.words('spot_candidate_regions')]))
         _ = self.admin.get()
         print('region type zone price')
-        for region in gate_regions(settings.region):
+        for region in regions:
             target = api.in_region(region)
             self._print_spot_quota(target, largest)
             try:
@@ -1272,39 +1304,19 @@ class Deployment:
                     print(region, size, zone, str(row.get('SpotPrice', 'unavailable')))
 
     def quota_request(self) -> bool:
-        """Request the configured Spot vCPU quota without duplicating open requests."""
+        """Request both regional Spot quotas without duplicating open requests."""
         settings = read_deployment_settings(self.settings_path, self.directory)
-        desired = conf.read_or_repository('cloud_gate').whole('spot_quota_request_vcpus')
+        values = conf.read_or_repository('cloud_gate')
         api = self._api(settings)
+        requests = (
+            (gate_regions(settings.region), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+            (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+        )
         success = True
-        closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
-        for region in gate_regions(settings.region):
-            target = api.in_region(region)
-            try:
-                quota = spot_quota(target)
-                if quota >= desired:
-                    print(f'{region}: Spot quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
-                    continue
-                history = target.call('list-requested-service-quota-change-history-by-quota',
-                    '--service-code', 'ec2', '--quota-code', 'L-34B43A08', service='service-quotas')
-                opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
-                if opened:
-                    for row in opened:
-                        status = ledger.text(row, 'Status')
-                        value = conf.decimal(str(row['DesiredValue']))
-                        print(f'{region}: open Spot quota request {value.normalize():f} vCPUs; status {status}')
-                    continue
-                reply = target.call('request-service-quota-increase', '--service-code', 'ec2',
-                    '--quota-code', 'L-34B43A08', '--desired-value', str(desired), service='service-quotas')
-                status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
-                print(f'{region}: Spot quota request {desired} vCPUs; status {status}')
-                if status in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}:
+        for regions, code, desired, label in requests:
+            for region in regions:
+                if not request_spot_quota(api.in_region(region), code, desired, label):
                     success = False
-            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
-                reason = code[1] if code else type(error).__name__
-                print(f'{region}: Spot quota request failed: {reason}')
-                success = False
         return success
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
