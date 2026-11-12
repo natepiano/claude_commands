@@ -2733,9 +2733,13 @@ class WorkerCommandTests(unittest.TestCase):
                 "run_id": run_id, "worker": name,
                 "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
                 "status": status, "pid": pid, "label": label}))
-        for alive, hold, expected, location in ((True, "", "busy", "known"), (False, "", "idle", "known"),
-                (True, "pause", "paused", "known"), (True, "exit", "exited", "known"),
-                (True, "", "busy", "saved dispatch")):
+        for alive, hold, expected, location, activity in (
+                (True, "", "waiting", "known", "idle"), (False, "", "idle", "known", "idle"),
+                (True, "pause", "paused", "known", "idle"), (True, "exit", "exited", "known", "idle"),
+                (True, "", "starting", "known", "starting"), (False, "", "starting", "known", "starting"),
+                (True, "pause", "paused", "known", "starting"), (True, "exit", "exited", "known", "starting"),
+                (True, "", "waiting", "saved dispatch", "idle")):
+            self.fixture.world.locations[opened.pane]["agent_status"] = activity
             if location == "saved dispatch":
                 outside = self.fixture.root / "private" / "saved-dispatch"
                 outside.mkdir(parents=True)
@@ -2757,7 +2761,7 @@ class WorkerCommandTests(unittest.TestCase):
                 return alive and pid == 101
             with patch.object(detached_run_process, "supervises", side_effect=supervises):
                 for scope in ((), ("--all-parents",)):
-                    with (self.subTest(alive=alive, hold=hold, scope=scope, location=location),
+                    with (self.subTest(alive=alive, hold=hold, scope=scope, location=location, activity=activity),
                           patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
                           patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                         code, rows, errors = self.text_command("list", *scope)

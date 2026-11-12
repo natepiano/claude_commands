@@ -715,8 +715,11 @@ class UnitPhasesTests(unittest.TestCase):
         _ = staff.resume(second.id)
         resumed = render()
         self.assertIn("| second | exited | — | — | — | — | — | — | — |", resumed)
-        for activity, hold, expected in (("busy", "", "busy"), ("shell", "", "idle"),
-                                         ("busy", "pause", "paused"), ("busy", "exit", "exited")):
+        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "idle", False),
+                ("busy", "pause", "paused", False), ("busy", "exit", "exited", False),
+                ("idle", "", "waiting", True), ("busy", "", "busy", True),
+                ("starting", "", "starting", False), ("starting", "", "starting", True),
+                ("starting", "pause", "paused", True), ("starting", "exit", "exited", True)):
             with self.subTest(activity=activity, hold=hold):
                 _ = staff.resume(first.id)
                 if hold == "pause":
@@ -726,7 +729,9 @@ class UnitPhasesTests(unittest.TestCase):
                 observed = sessions.SessionRecord(sessionId=first.current_session, pid=1, name="first",
                     status=activity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
                 snapshot = staff.snapshot()
-            with (patch.object(sessions, "running_sessions", return_value=[observed]),
+                with (patch.object(sessions, "running_sessions", return_value=[observed]),
+                      patch.object(session_state, "running_detached_work", return_value=session_state.RunningDetachedWork(
+                          frozenset({first.id}) if detached else frozenset())),
                       patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_read,
                       patch.object(session_state, "classify", wraps=session_state.classify) as states):
                     units = live_units.units_in(owner.name, every)
