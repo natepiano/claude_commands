@@ -549,7 +549,7 @@ def decide_builds(
         if isinstance(kept, build_hold.Holder):
             decisions.append(KeptBuild(process, owner, kept))
             continue
-        owner_key = build_hold.holder_path(Path(), owner.session_id).name if isinstance(owner, OwningSession) else ""
+        owner_key = build_hold.holder_path(Path(), build_hold.holder_of(owner.session_id).key).name if isinstance(owner, OwningSession) else ""
         blocking = [holder for holder in holders if holder.key != owner_key] or list(holders)
         holder = min(blocking, key=lambda item: item.since)
         decisions.append(WouldStopBuild(process, owner, f"test or build outside {holder.name}'s hold for {holder.purpose}",

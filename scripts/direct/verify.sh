@@ -1563,9 +1563,10 @@ elif kind == "hold":
     holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
                                         build_hold.owning_session(), directory)
     if isinstance(holder, build_hold.Holder):
+        session = build_hold.holder_session(holder.key)
         try:
-            UUID(holder.key)
-            owner = holder.key
+            UUID(session)
+            owner = session
         except ValueError:
             owner_flag, owner = "--holder-unit", text(holder.name)
 elif kind in ("mac", "target"):

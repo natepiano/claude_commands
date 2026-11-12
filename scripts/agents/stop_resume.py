@@ -171,25 +171,15 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
         except (OSError, ValueError, herdr_types.HerdrFailure):
             pass
         conflicts.append((identity, pane["pane_id"]))
-    named: list[tuple[str, tuple[int, ...]]] = [
-        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions() if row["name"] == name]
-    homes = {agent_accounts.codex_home(), *(owner.home for owner in codex_daemon.daemons(os.environ))}
-    threads: set[str] = set()
-    for home in sorted(homes):
-        try:
-            lines = (home / "session_index.jsonl").read_text().splitlines()
-        except FileNotFoundError:
-            continue
-        for line in lines:
-            if not line.strip():
-                continue
-            entry = herdr.json_object(cast(object, json.loads(line)), "producer thread index")
-            if entry.get("thread_name") == name:
-                threads.add(herdr.json_text(entry.get("id"), "producer thread id"))
-    if threads:
-        codex = herdr.codex_conversations()
-        named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
     membership = staff.initial_snapshot()
+    member = next((row for row in membership.find(kind="producer") if row.name == name), None)
+    named: list[tuple[str, tuple[int, ...]]] = [
+        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions()
+        if member is not None and row["sessionId"] == member.current_session]
+    if member is not None:
+        codex = herdr.codex_conversations()
+        if member.current_session in codex.live:
+            named.append((member.current_session, codex.live[member.current_session]))
     for daemon in codex_daemon.read_daemons(os.environ):
         if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
             raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")

@@ -884,9 +884,9 @@ def retirement_command_line(pid: int, *, settings: conf.ConfigRead) -> list[str]
 def retirement_hold_directory() -> Path:
     return Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
 
-def retirement_holds(session_ids: set[str]) -> tuple[str, ...]:
-    """The build holds kept under the unit's session ids: build_hold keys a hold by session id."""
-    return tuple(sorted(key for key in session_ids if key and (retirement_hold_directory() / key).is_file()))
+def retirement_holds(holder_ids: set[str]) -> tuple[str, ...]:
+    """Find the build holds kept under the retiring members' fixed staff IDs."""
+    return tuple(sorted(key for key in holder_ids if key and (retirement_hold_directory() / key).is_file()))
 
 def retirement_reservations(worktree: Path) -> tuple[str, ...]:
     if not unit_move.exists(worktree):
@@ -1430,7 +1430,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
                              require_cleanup: bool = False) -> int:
     row = unit.staff_member
     owned = retirement_members(unit, record)
-    for key in retirement_holds({member.current_session for member in owned}):
+    for key in retirement_holds({member.id for member in owned}):
         result = retirement_run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
         if result.returncode:
             print(f"anomaly: {retirement_failure(result)}")
@@ -1446,7 +1446,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
         if pid != os.getpid() and pid not in classified and not retirement_idle_shell(pane, pid):
             for reason in retirement_stop_orphan(unit, pid, row.current_session, settings=settings):
                 print(f"anomaly: {reason}")
-    if ((require_cleanup and (retirement_holds({member.current_session for member in owned})
+    if ((require_cleanup and (retirement_holds({member.id for member in owned})
                               or retirement_live_claims(retirement_mac_claims(unit.worktree))))
             or (unit.worktree.exists() and any(not retirement_idle_shell(pane, pid)
                 for pid in unit_move.processes_inside(unit.worktree)))):
