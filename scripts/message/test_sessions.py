@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
@@ -215,6 +216,12 @@ class SessionLookupTests(ShutdownTestCase):
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
             live = sessions.live_sessions()
         self.assertEqual(sessions.addressed("natedev", live), record)
+        fixed = self.members["sid-real"]
+        self.record("replacement.json", name="replacement-display", session_id="sid-replacement", entrypoint="cli")
+        self.members[fixed.id] = replace(fixed, current_session=staff.StaffId("sid-replacement"))
+        replacement = self.run_cli("member-socket", "session:" + fixed.id)
+        self.assertEqual((replacement.returncode, replacement.stdout, replacement.stderr),
+                         (0, str(self.socket_path) + "\n", ""))
 
     def test_a_saved_pid_identifies_a_live_relay_without_a_name_or_entrypoint_hint(self) -> None:
         self.record("relay.json", name="ordinary-looking-name", session_id="sid-relay")
