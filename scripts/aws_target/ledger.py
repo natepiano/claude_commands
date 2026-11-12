@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
@@ -91,6 +91,17 @@ class BoxRate:
 
 
 @dataclass(frozen=True)
+class GateAllowance:
+    usd: Decimal
+    source: str
+
+
+@dataclass(frozen=True)
+class GateAllowanceUnpriced:
+    """Bill pricing has not established the completed gate's allowance."""
+
+
+@dataclass(frozen=True)
 class GateReservation:
     attempt: str
     at: int
@@ -102,6 +113,7 @@ class GateReservation:
     rate: BoxRate = BoxRate(Decimal(0), 'not priced')
     region: str = ''
     day_rates: tuple[tuple[str, BoxRate], ...] = ()
+    booked_allowance: GateAllowance | GateAllowanceUnpriced = GateAllowanceUnpriced()
 
 
 @dataclass(frozen=True)
@@ -406,7 +418,10 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             BoxRate(money(str(item.get('applied_usd_per_hour', item['usd_per_hour']))),
                     str(item.get('rate_source', 'spot_max_usd_per_hour'))), str(item.get('region', '')),
             tuple((text(rate, 'day'), BoxRate(money(text(rate, 'usd_per_hour')), text(rate, 'source')))
-                  for rate in rows(item, 'day_rates')) if 'day_rates' in item else ()))
+                  for rate in rows(item, 'day_rates')) if 'day_rates' in item else (),
+            GateAllowance(money(text(mapping(item['booked_allowance']), 'usd')),
+                          text(mapping(item['booked_allowance']), 'source'))
+            if item.get('booked_allowance') is not None else GateAllowanceUnpriced()))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
@@ -453,6 +468,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
+             'booked_allowance': {'usd': str(r.booked_allowance.usd), 'source': r.booked_allowance.source}
+                                 if isinstance(r.booked_allowance, GateAllowance) else None,
              'day_rates': [{'day': day, 'usd_per_hour': str(rate.usd_per_hour), 'source': rate.source}
                            for day, rate in r.day_rates],
              'applied_usd_per_hour': str(r.rate.usd_per_hour), 'rate_source': r.rate.source, 'state':
@@ -597,8 +614,9 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         if isinstance(reservation.state, GateAbsent):
             continue
         if window_start <= reservation.at < pricing_end:
-            intervals.append(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
-                                             'gate storage and transfer:' + reservation.attempt, 'fixed'))
+            allowance = gate_allowance(reservation)
+            intervals.append(ChargedInterval(reservation.at, reservation.at, allowance.usd,
+                                             'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed'))
     interval = settings.cost_explorer_interval_seconds
     origin = state.charge_refresh_at + interval if state.charge_refresh_at else inventories[0].at
     first_read = origin + max(0, (window_start - origin + interval - 1) // interval) * interval
@@ -729,21 +747,56 @@ def is_billed_day(reading: ChargeRead) -> bool:
 
 
 @dataclass(frozen=True)
+class _GateCountUnavailable:
+    """The bill day has S3 costs but no recorded gate launches."""
+
+
+@dataclass(frozen=True)
+class _AllowanceRatesUnavailable:
+    """No usable bill rows establish the non-compute rates."""
+
+
+@dataclass(frozen=True)
+class _GateCountsNotRead:
+    """This lookup requests compute rates without S3 allocation."""
+
+
+_GATE_COUNTS_NOT_READ = _GateCountsNotRead()
+
+
+@dataclass(frozen=True)
+class _AllowanceRate:
+    usd_per_hour: Decimal
+    usd_per_gate: Decimal | _GateCountUnavailable
+    source: str
+
+
+@dataclass(frozen=True)
 class _BillRates:
     days: tuple[str, ...]
     rates: tuple[BoxRate, ...]
+    allowance_days: tuple[str, ...] = ()
+    allowances: tuple[_AllowanceRate | _AllowanceRatesUnavailable, ...] = ()
 
     def for_day(self, day: str, fallback: Decimal) -> BoxRate:
         """Select the day's rate without reading the bill history again."""
         return (self.rates[max(0, bisect_right(self.days, day) - 1)] if self.days
                 else BoxRate(fallback, 'spot_max_usd_per_hour'))
 
+    def allowance_for_day(self, day: str) -> _AllowanceRate | _AllowanceRatesUnavailable:
+        """Select non-compute rates with the same bill day rule."""
+        return (self.allowances[max(0, bisect_right(self.allowance_days, day) - 1)] if self.allowance_days
+                else _AllowanceRatesUnavailable())
 
-def _bill_rates(readings: Sequence[ChargeRead], instance_type: str, now: int, region: str = '') -> _BillRates:
+
+def _bill_rates(readings: Sequence[ChargeRead], instance_type: str, now: int, region: str = '', *,
+                root_gib: int = 0,
+                gate_counts: Mapping[str, int] | _GateCountsNotRead = _GATE_COUNTS_NOT_READ) -> _BillRates:
     """Index completed bills once for one type and region."""
     prefixes = {'us-east-1': ('', 'USE1'), 'us-east-2': ('USE2',),
                 'us-west-1': ('USW1',), 'us-west-2': ('USW2',)}
     rates: dict[str, BoxRate] = {}
+    allowances: dict[str, _AllowanceRate | _AllowanceRatesUnavailable] = {}
     for reading in sorted(readings, key=lambda row: row.at):
         if not is_billed_day(reading) or reading.period_end > now:
             continue
@@ -755,8 +808,84 @@ def _bill_rates(readings: Sequence[ChargeRead], instance_type: str, now: int, re
         usd = sum((row.usd for row in rows_for_type), Decimal(0))
         if hours > 0 and usd > 0:
             rates[reading.day] = BoxRate(usd / hours, 'AWS bill ' + reading.day)
+        if isinstance(gate_counts, _GateCountsNotRead):
+            continue
+        def matches(row: UsageTypeCost, usage: str, *, regional: bool = True) -> bool:
+            return row.usage_type.endswith(usage) and (not regional or not region
+                or row.usage_type.removesuffix(usage).removesuffix('-') in prefixes.get(region, ()))
+
+        ipv4 = [row for row in reading.usage_types if matches(row, 'PublicIPv4:InUseAddress')]
+        root = [row for row in reading.usage_types if matches(row, 'EBS:VolumeUsage.gp3')]
+        s3 = [row for row in reading.usage_types if any(matches(row, usage, regional=False)
+              for usage in ('Requests-Tier1', 'Requests-Tier2', 'TimedStorage-ByteHrs', 'DataTransfer-Out-Bytes'))]
+        ipv4_hours = sum((row.quantity for row in ipv4), Decimal(0))
+        root_months = sum((row.quantity for row in root), Decimal(0))
+        s3_usd = sum((row.usd for row in s3), Decimal(0))
+        count = gate_counts.get(reading.day, 0)
+        allowances[reading.day] = _AllowanceRatesUnavailable()
+        if ((ipv4 or root or s3)
+                and not any(row.usd > 0 and row.quantity <= 0 for row in (*ipv4, *root))):
+            month_hours = Decimal(_month_seconds(reading.period_start, ZoneInfo('UTC'))) / Decimal(3600)
+            hourly = (sum((row.usd for row in ipv4), Decimal(0)) / ipv4_hours if ipv4_hours > 0 else Decimal(0))
+            hourly += (sum((row.usd for row in root), Decimal(0)) * root_gib / root_months / month_hours
+                       if root_months > 0 else Decimal(0))
+            share = s3_usd / count if count else Decimal(0) if not s3_usd else _GateCountUnavailable()
+            allowances[reading.day] = _AllowanceRate(hourly, share,
+                                                    'AWS bill ' + reading.day)
     days = tuple(sorted(rates))
-    return _BillRates(days, tuple(rates[day] for day in days))
+    allowance_days = tuple(sorted(allowances))
+    return _BillRates(days, tuple(rates[day] for day in days), allowance_days,
+                      tuple(allowances[day] for day in allowance_days))
+
+
+def gate_allowance(reservation: GateReservation) -> GateAllowance:
+    """Use the booked cost for completed gates and retain the reserve for open gates."""
+    if isinstance(reservation.state, GateTerminated) and isinstance(reservation.booked_allowance, GateAllowance):
+        return reservation.booked_allowance
+    return GateAllowance(reservation.allowance_usd, 'attempt_allowance_usd')
+
+
+def _book_allowance(reservation: GateReservation, indexes: Sequence[_BillRates]) -> GateAllowance | GateAllowanceUnpriced:
+    """Price actual box hours and one share of the launch day's S3 costs."""
+    if not isinstance(reservation.state, GateTerminated):
+        return GateAllowanceUnpriced()
+    total = Decimal(0)
+    sources: list[str] = []
+    spans = tuple(_days(reservation.at, reservation.state.at, ZoneInfo('UTC'))) or ((reservation.at, reservation.at),)
+    for number, (start, end) in enumerate(spans):
+        day = datetime.fromtimestamp(start, ZoneInfo('UTC')).date().isoformat()
+        candidates = [index.allowance_for_day(day) for index in indexes]
+        if not candidates or any(isinstance(rate, _AllowanceRatesUnavailable)
+                or (number == 0 and isinstance(rate.usd_per_gate, _GateCountUnavailable)) for rate in candidates):
+            return GateAllowance(reservation.allowance_usd, 'attempt_allowance_usd')
+        costs = [GateAllowance(rate.usd_per_hour * Decimal(end - start) / Decimal(3600)
+                               + (rate.usd_per_gate if number == 0 and isinstance(rate.usd_per_gate, Decimal)
+                                  else Decimal(0)), rate.source)
+                 for rate in candidates if isinstance(rate, _AllowanceRate)]
+        selected = max(costs, key=lambda cost: cost.usd)
+        total += selected.usd
+        if selected.source not in sources:
+            sources.append(selected.source)
+    return GateAllowance(total, ', '.join(sources))
+
+
+def _correct_allowance_estimates(state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
+    """Recompute obsolete allowance floors where the gate day has its own bill."""
+    billed_starts = sorted(row.at for row in state.gate_reservations
+        if isinstance(row.state, GateTerminated) and isinstance(row.booked_allowance, GateAllowance)
+        and row.booked_allowance.source.startswith('AWS bill '))
+    bills = {(row.period_start, row.period_end): row.actual_usd for row in readings
+             if is_billed_day(row) and row.period_end <= now}
+    corrected: list[CostReconciliation] = []
+    for reading in state.reconciliations:
+        position = bisect_left(billed_starts, reading.period_start)
+        key = (reading.period_start, reading.period_end)
+        if (reading.source == 'Cost Explorer' and key in bills and position < len(billed_starts)
+                and billed_starts[position] < reading.period_end
+                and sum((day.usd for day in reading.established_days), Decimal(0)) > bills[key]):
+            reading = replace(reading, established_days=())
+        corrected.append(reading)
+    state.reconciliations = corrected
 
 
 def box_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Decimal, now: int, day: str, *,
@@ -913,10 +1042,15 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                 for charge in gate_compute.get('gate:' + reservation.attempt, ()):
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
                     include(charge)
-                if latest is None and start <= reservation.at < end:
-                    groups['other'] += reservation.allowance_usd
-                    include(ChargedInterval(reservation.at, reservation.at, reservation.allowance_usd,
-                                             'gate storage and transfer:' + reservation.attempt, 'fixed'))
+        for reservation in state.gate_reservations:
+            if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
+                continue
+            if ((bill is None and latest is None) or
+                    (reserve and isinstance(reservation.state, (GateLaunchPending, GateRunning)))):
+                allowance = gate_allowance(reservation)
+                groups['other'] += allowance.usd
+                include(ChargedInterval(reservation.at, reservation.at, allowance.usd,
+                                         'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed'))
         days.append(DailySpend(key, source, tuple(SpendGroupCost(group, usd) for group, usd in groups.items()),
                               runs, query_usd, tuple(intervals), provisional_bill=bill is not None and bill.provisional))
     return tuple(days)
@@ -1051,10 +1185,20 @@ class CostLedger:
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
-        launches = {str(row.get('attempt', '')): row for row in reversed(self.launches()) if row.get('result') == 'launched'}
+        launch_rows = self.launches()
+        launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
+        gate_counts: dict[str, int] = {}
+        for row in launches.values():
+            day = datetime.fromtimestamp(float(str(row['time'])), ZoneInfo('UTC')).date().isoformat()
+            gate_counts[day] = gate_counts.get(day, 0) + 1
         indexes: dict[tuple[str, str], _BillRates] = {}
-        configured_regions = (conf.read_or_repository('cloud_gate').words('regions')
-                              if any(not row.region for row in state.gate_reservations) else ())
+        needs_root = (any(isinstance(row.state, GateTerminated) for row in state.gate_reservations)
+                      and any(row.usage_type.endswith('EBS:VolumeUsage.gp3') and row.quantity > 0
+                              for reading in readings for row in reading.usage_types))
+        configuration = conf.read_or_repository('cloud_gate') if needs_root or any(
+            not row.region for row in state.gate_reservations) else None
+        configured_regions = configuration.words('regions') if configuration is not None else ()
+        root_gib = configuration.whole('root_gib') if configuration is not None and needs_root else 0
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
@@ -1067,12 +1211,21 @@ class CostLedger:
             for region in regions:
                 key = (size, region)
                 if key not in indexes:
-                    indexes[key] = _bill_rates(readings, size, now, region)
+                    indexes[key] = _bill_rates(readings, size, now, region, root_gib=root_gib, gate_counts=gate_counts)
             rates = tuple((day, max((indexes[(size, region)].for_day(day, reservation.usd_per_hour) for region in regions),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
-            priced.append(replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates))
+            reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates)
+            priced.append(replace(reservation, booked_allowance=_book_allowance(
+                reservation, tuple(indexes[(size, region)] for region in regions))))
         state.gate_reservations = priced
+        _correct_allowance_estimates(state, readings, now)
+
+    def priced_snapshot(self, now: int) -> LedgerEvidence:
+        """Read current bill prices without publishing ledger changes."""
+        state = self.read_snapshot()
+        self._price_gates(state, self.read_bills(), now)
+        return state
 
     def spend_days(self, settings: SpendingSettings, now: int) -> tuple[DailySpend, ...]:
         state = self.read_snapshot()
@@ -1284,6 +1437,7 @@ class CostLedger:
 
     def estimate(self, settings: SpendingSettings, now: int) -> CostEstimate:
         with self._locked() as state:
+            self._price_gates(state, self.read_bills(), now)
             costs = _charges(state, settings, now)
             self._save_estimate(state, costs)
             return costs
@@ -1307,6 +1461,7 @@ class CostLedger:
         try:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
+            self._price_gates(state, self.read_bills(), now)
             costs = _charges(state, settings, now, current_window=True)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
             if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):

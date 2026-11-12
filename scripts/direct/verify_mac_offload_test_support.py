@@ -1162,9 +1162,11 @@ exit 99
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
-        survivors = reap(self.child_marker())
-        if survivors:
+        remaining = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
+        if remaining:
+            survivors = reap(self.child_marker())
+            for pid in remaining:
+                _ = survivors.setdefault(pid, "exited before reap")
             commands = "\n".join(f"{pid}: {command}" for pid, command in sorted(survivors.items()))
             self.fail(f"processes outlived the test:\n{commands}")
 

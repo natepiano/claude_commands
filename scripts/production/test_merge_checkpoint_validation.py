@@ -21,7 +21,7 @@ from scripts.production.production_doc import read_new_production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -99,14 +99,6 @@ with (state / "validation-locks").open("a") as output:
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
                          [str(common / "main-push.lock")] * len(calls))
-    def test_cancel_prior_with_git_push_is_refused_before_merge(self) -> None:
-        sha = self.checkpoint()
-        result = self.run_checkpoint(sha, "--cancel-prior")
-        self.assertEqual(result.process.returncode, 1)
-        self.assertIn("input: failed", result.process.stdout)
-        self.assertIn("--cancel-prior applies only to Push: validate_and_push", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
-        self.assertEqual(self.events("checkpoint-test"), [])
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
         from scripts.production import change_review
 
@@ -231,12 +223,6 @@ with (state / "refreshed-test-locks").open("a") as output:
             self.assertEqual(self.git("rev-parse", "HEAD"), before_refresh)
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), before_refresh)
             self.assertEqual(self.git("status", "--porcelain"), "")
-    def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
-        _ = (self.state / "fail-style_sync.py").touch()
-        result = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("style sync: exit 1", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
     def test_notification_value_error_leaves_the_completed_checkpoint_successful(self) -> None:
         sha = self.checkpoint()
         original_notify = merge_checkpoint.notify_style
@@ -247,7 +233,7 @@ with (state / "refreshed-test-locks").open("a") as output:
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
-                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+                     "--review-trial", TRIAL, "--delivers", DELIVERS]
         output = StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
             merge_checkpoint, "notify_style", side_effect=malformed_notification,

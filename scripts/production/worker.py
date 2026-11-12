@@ -30,6 +30,7 @@ from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
@@ -256,7 +257,7 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
     except ValueError:
         return
     tokens = 0
-    with source.open(encoding="utf-8") as transcript:
+    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
             record = rollouts.decode_rollout(line)
             if record is None:

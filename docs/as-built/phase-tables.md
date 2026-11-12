@@ -49,8 +49,7 @@ archive(production_doc: Path) -> list[Path]
 PhaseRecord(plan: Path, updated: datetime,
             current: OpenPhase | NoOpenPhase,
             phases: list[DonePhase | OpenPhase | TodoPhase],
-            plan_finish: FinishedAt | PredictedFinish | UnknownFinish | GateBlockedFinish,
-            parallel: CouldStart | NothingToStart | DependenciesUnknown)
+            plan_finish: FinishedAt | PredictedFinish | UnknownFinish)
 PhaseHistory(first_eta: datetime | EtaNeverStated, moves: int,
              eta_trail: list[tuple[datetime, datetime]],
              finished_at: datetime | PhaseNotFinished,
@@ -65,29 +64,28 @@ OpenPhase(PhaseHistory)(phase, title, started,
           schedule_end: datetime | EtaUnavailable)
 FirstStatedEtaTarget(time, repair_rounds)
 DonePhase(PhaseHistory)(phase, title, times: CompletedPhaseTiming | PhaseTimingNotRecorded)
-TodoPhase(PhaseHistory)(phase, title, times: PredictedPhaseTiming | PhaseTimingNotPredicted,
-          gate: NoGate | TimedGate | UntimedGate)
+TodoPhase(PhaseHistory)(phase, title, times: PredictedPhaseTiming | PhaseTimingNotPredicted)
 StatedEta(time, range: EtaRange | NoEtaRange, stated_at, basis)
 ProjectedEta(time, earliest, latest, as_of)
-TimedGate(gate, until, waits_on)
-UntimedGate(gate, waits_on)
-GateBlockedFinish(gate, waits_on)
+FinishedAt(at)
+PredictedFinish(at)
+UnknownFinish()
 ```
 
 Every state is a named `NamedTuple`, except the row types, which are frozen dataclasses on the `PhaseHistory` base. Times are aware `datetime`s, and `None` appears only in the JSON. `build_plan` is the one builder. `build` reads the session state file (`plan_history.STATE_FILENAME`) for the plan path only (`project_plan_doc`, else `plan_doc`) and returns `build_plan` of it. `NoState` is a state file that is missing, unreadable or names no plan; `NoPlan` is a plan file that cannot be read, and its message names the path. A plan with no recorded run, or with no open phase, is a normal record.
 
-- **Plan rows.** `plan_history.plan_phases(plan_path) -> list[PlanPhase]` gives the plan's headings in document order (`PlanPhase`: `id`, `title`, `done`, `depends_on`, `blocked_by`). A heading with no status marker counts as done. `depends_on` is the phase ids on the first `**Depends on:**` line before the next heading (`none` gives `[]`, no line gives `None`); `blocked_by` is the `G<k>` of a `**Blocked by:**` line, else `""`.
+- **Plan rows.** `plan_history.plan_phases(plan_path) -> list[PlanPhase]` gives the plan headings in document order. `PlanPhase` has `id`, `title`, and `done`. A heading with no status marker counts as done.
 - **Runs.** `plan_history.plan_runs(plan_path) -> list[Path]` gives the plan's run files, oldest first. A run belongs to the plan when the `working_dir` and `plan_doc` of its `run_started` event resolve to the plan's path.
 - **Matching.** A recorded phase instance attaches to a plan row by its recorded title (casefold, backticks removed, whitespace collapsed) when exactly one row has that title, else by phase id, across every run of the plan.
 - **Done row.** Its times come from the title family of its last completed instance, last by write order: the family's earliest start, that instance's finish, and the family's summed `phase_elapsed_seconds`. A todo row never shows recorded times.
 - **Open phase.** The newest instance with a `phase_started` and no `phase_finished` in the plan's newest run, unless that run has a `run_finished` event. A `phase_finished` of any status closes its instance, and an unfinished instance in an older run is not open. The open row's `started` is the earliest start among the open instance and the earlier instances of that plan row with the same recorded title. An open phase that matches no plan row shows in the heading line and marks no row running.
 - **Stated ETAs of an instance.** `_instance_eta_events(runs, instance)` selects the `eta_stated` events whose `eta_phase_id` (falling back to `phase_id` for events without one) is the instance's phase id, in the same run, after the previous start or finish of that phase id and before its next start. An ETA recorded before its phase starts, such as the checkpoint notice's next-phase ETA, counts for that phase. `_latest_stated_eta` builds on it.
 - **ETA.** The instance's latest stated ETA, even when a progress report came after it. A passed one is advanced to now for scheduling, its range shifted by the same delay, so a phase never ends in the past. With none stated, the projection from its last `progress_reported` event: the report's time plus `plan_history.eta_band_seconds(phase_percent, elapsed, spread)`, with `as_of` the report's time; none exists at 0% or 100%, or with no elapsed time. Otherwise `EtaUnavailable`. `OpenPhase.instance_id` names the instance selected as open. `FirstStatedEtaTarget(time, repair_rounds)` holds the `eta_at` of the instance's first valid `eta_stated` event and the count of repair rounds started strictly after that event's `timestamp_epoch`. A repair round is a `fix_pass` of 1 or more on the instance's `pass_started` events, starts at the earliest such event for that number, and counts once across workers; round 0 and rounds that started before the statement do not count. The state holds across a restatement and after the ETA passes.
-- **History.** Each row carries its `PhaseHistory`, read from its own title family only, so a retired task's attempts under a reused phase number are excluded. `eta_trail` is every `[(eta_at, stated_at)]` promise from `_instance_eta_events`; `first_eta` is its first entry; `moves` counts only time changes, since unchanged restatements are recorded too. `finished_at` and `delta_minutes` (finish minus the last promise) are set on a completed done row. `fix_done` and `fix_open_passes` count finished and open `fix` passes; `findings` counts `finding_opened` events by severity (`blocker`, `minor`, `nit`).
+- **History.** Each row carries its `PhaseHistory`, read from its own title family only, so a retired task's attempts under a reused phase number are excluded. `eta_trail` is every `[(eta_at, stated_at)]` promise from `_instance_eta_events`. A row with no instance takes each `eta_stated` event whose `eta_phase_id` names it, except an event that `_instance_eta_events` gives to an earlier instance with that number, or one stated before that instance's recorded finish. An earlier instance with no finish excludes only its own events. `first_eta` is its first entry; `moves` counts only time changes, since unchanged restatements are recorded too. `finished_at` and `delta_minutes` (finish minus the last promise) are set on a completed done row. `fix_done` and `fix_open_passes` count finished and open `fix` passes; `findings` counts `finding_opened` events by severity (`blocker`, `minor`, `nit`).
 - **Predictions.** The typical duration is the median `seconds` of the completed done rows, else the open phase's ETA minus its start. The gap is the median seconds from a `completed` finish to the next `phase_started` in the same run, 0 with no sample. The open phase's end, `OpenPhase.schedule_end`, is its ETA of either source; with no ETA, the later of the current time and the open start plus the typical duration. The first todo row starts one gap after that end; with no open phase, at the current time. Each later row starts one gap after the row before it finishes, and finishes one typical duration later. With no typical duration every todo row is `PhaseTimingNotPredicted`.
-- **Gates.** Inside a production, a todo row whose plan heading carries `**Blocked by:** G<k>` takes its gate from the production doc's `## Gates` table (`Gate | Waiting | Waits on | Clears when`, read by `_production_gates`). `Clears when` starting `cleared` gives `NoGate`; a `YYYY-MM-DD HH:MM` (first match, user zone) gives `TimedGate(gate, until, waits_on)`, which holds that row's start to `until`; no time, or a gate missing from the table, gives `UntimedGate(gate, waits_on)`, which leaves that row and every later one `PhaseTimingNotPredicted` and carries the gate onto them. Outside a production `Blocked by` is ignored. The Markdown status of a gated row reads `gated until <ddd DD Mon HH:MM>` or `gated by G<k>: <Waits on>`.
-- **Parallel.** `PhaseRecord.parallel` is `CouldStart(phases) | NothingToStart(reason) | DependenciesUnknown(phases)`. A row is running when its id was started and not finished in the newest unfinished run (any open phase, not only the newest), and waiting when it is neither done nor running. Any waiting row with `depends_on` `None` gives `DependenciesUnknown`. Otherwise a waiting row whose dependencies are all done and that has no gate could start; with none, `NothingToStart` names the first waiting row's unmet phases with their state (`running`, `todo`, `not in the plan`) and its gate, or `no phase is waiting`. `parallel_line` prints it as `Parallel: Phase 5, Phase 6 could start`, `Parallel: none — <reason>` or `Parallel: unknown — …`; `phase_table.py parallel --session-dir <dir>` prints that line, and JSON adds `parallel: {could_start, line}`.
-- **Plan finish.** `GateBlockedFinish(gate, waits_on)` when a todo row sits behind an untimed gate; else `FinishedAt` the latest recorded finish when every row is done and one has a recorded finish; `PredictedFinish` the latest of the open ETA and the predicted finishes while a row is unfinished; otherwise `UnknownFinish`.
+- **Plan finish.** A completed plan gives `FinishedAt` at its latest recorded finish.
+  An unfinished plan gives `PredictedFinish` from the latest open ETA, predicted finish, or latest promise of an open or not-started phase.
+  No usable finish gives `UnknownFinish`.
 
 ### Markdown and JSON
 
@@ -123,7 +121,9 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
               first_eta, moves, eta_trail: [[target, stated_at]], finished_at, delta_minutes, fix_rounds, findings}
 ```
 
-The JSON carries no gates and writes a `GateBlockedFinish` plan finish as `null`; the Markdown shows it as `after G<k>`. The Units table reads `build_plan` records for progress and ETA facts.
+JSON writes the finish time for `FinishedAt` and `PredictedFinish`, and `null` for `UnknownFinish`.
+Markdown writes the recorded time, the predicted time with `, predicted`, or `—`, respectively.
+The Units table reads `build_plan` records for progress and ETA facts.
 
 `current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 
@@ -153,7 +153,7 @@ A run whose plan file was removed, as for ad hoc work after the as-built, writes
 - **Hook.** `_refresh_phase_table(session_dir)` follows phase, progress, finish and ETA records.
   It skips a plan with no staff unit. Otherwise it runs `phase_table.py refresh`.
   A failure prints `phase table not written: <reason>` and keeps the recorder's result.
-- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row and gate, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish, `after G<k>` under an untimed gate). `scripts/production/unit_phases.py` builds the Units table from the same record.
+- **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish). `scripts/production/unit_phases.py` builds the Units table from the same record.
 - **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
@@ -182,7 +182,6 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - **Value.** `record_eta_value` writes `time` as `record_clock` gives it (`HH:MM`, with `+N` when the target falls N days after the build's date), `stated`, the range, `percent` (the reported percent or `null`), `first` and `fixes` when the record holds a first stated target, and `why`: a stated ETA's `basis` with whitespace collapsed, or `it is now projected from <N>% done`. The judgment's own `eta` fields overwrite these, and a stale ETA gets `detail: set HH:MM` when the judgment gave none.
 - **Renderer fit.** `record_eta_stated` returns the anchor the renderer reads a bare clock against: the source minute, or the target's own minute when `parse_time(rendered_time, source)` would land elsewhere. `record_eta_range` writes `earliest` and `latest` only when the renderer's `parse_range_end` reads both back as the record's minutes; else `RecordEtaRangeOmitted` and neither end is written.
 - **Repair rounds.** The builder's `FirstStatedEtaTarget(time, repair_rounds)` mirrors the record's. `unit_phase_state` reads `repair_rounds_since_first_stated_eta` only when the first target is not `null`, and requires an `int` (not a `bool`) of 0 or more; anything else raises `ValueError("<where>.current.repair_rounds_since_first_stated_eta: expected a whole number from 0")`. `EtaPassed`, `EtaNone` and an unavailable ETA carry no `fixes`.
-- **Parallel check.** For each kept unit, `run` prints `parallel check: <unit>: Phase <N> could start` per id in the record's `parallel.could_start`; a record without `parallel` prints nothing.
 - **Failure.** A failed or unparsable `show`, or a record that fails decoding, prints `phase tables: unavailable — <reason>` and the build continues from the status capture.
 
 ### Roots and overrides
@@ -261,6 +260,8 @@ The `eta_stated` event names the target through `eta_phase_id`.
 `phase_id` names the phase active when the director recorded the promise.
 The basis is `checkpoint`, `eta-command`, or `stated`.
 An ETA recorded before its phase starts still belongs to that phase.
+An unstarted phase with no instance keeps events whose `eta_phase_id` names it in its `eta_trail`.
+A phase without an instance accepts a promise only after all earlier instances with its phase id finish.
 
 `build_plan` combines phase headings, durable run events, and stated promises.
 History follows each phase's title family across instances.
@@ -268,7 +269,26 @@ It excludes retired work under a reused phase number.
 `eta_trail` holds actual promises; `schedule_end` holds the prediction used for later phases.
 A passed promise remains visible as late, while the schedule advances for future work.
 Typical completed-phase durations and gaps predict the remaining phases.
-The Units table only formats these facts.
+The Units table formats these facts and sorts unit names without case distinctions.
+Progress shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
+It uses at most 20 equal groups, with open before not started before done.
+All three characters use the same display width, and the bar has no text cut.
+Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
+Notes follows Phase and contains the open phase's id, step, and task, or its title without a step.
+Without an open phase, Notes shows the plan state.
+Repair rounds append `fix rounds <n>[ + 1 running]` in Notes when the count exceeds zero.
+Notes joins parts with ` · ` and cuts text at 80 characters with `…`.
+An open run supplies Progress, Phase, and both ETA cells when the plan has no phases.
+Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
+ETA Next follows Notes and shows the open plan phase's latest promise.
+Otherwise, it uses the newest open phase outside the plan, then the next not-started plan phase with a promise.
+A passed promise adds ` · late <elapsed>`.
+Open work without a promise shows `no ETA`; no open work or promised phase gives `—`.
+ETA Plan follows ETA Next only when at least one row has unfinished plan phases.
+It shows the predicted plan finish without `ends`; rows without unfinished plan phases show `—`.
+Both ETA cells use `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`, in the production zone.
+The predicted finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
+The optional Machine column stays directly after Status.
 
 ## The short report
 
