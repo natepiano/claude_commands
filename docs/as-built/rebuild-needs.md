@@ -55,7 +55,12 @@ The JSON output contains the newest record fields with the joined `reason`.
 `read_needs() -> list[MachineNeeds]` gives the page the same summaries as the list command.
 Each `MachineNeeds` contains `newest: NeedRecord` and `reasons: tuple[str, ...]`.
 Its `records: tuple[NeedRecord, ...]` retains each open record, from oldest to newest.
-The review page uses these records to show each reason with its own staff member.
+The review page lists these records newest first under `After the rebuild` for each machine.
+It shows the rebuild instruction before the reasons.
+A closed Details disclosure shows full commits, current staff names and kinds, and different requesters.
+The page counts machines with open needs and has no combined total across review types.
+It shows natedev before the Mac and tells the user to refresh after the rebuild.
+An empty view shows `No rebuilds needed.`
 Its `record()` method returns the newest fields with the joined reason.
 The reader reads only the open JSON files in the needs folder.
 It does not read completed files or run subprocesses.

@@ -122,11 +122,13 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
+            if index:
+                _ = fixture_member("producer", name=name, runtime_id=fixture_runtime_id(f"peer-{index}"))
             connection = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
             address = str(root / f"socket-{index}")
             connection.bind(address)
             _ = (sessions / (f"{os.getpid()}.json" if index == 0 else f"peer-{index}.json")).write_text(json.dumps(
-                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else f"peer-{index}",
+                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else fixture_runtime_id(f"peer-{index}"),
                  "name": name, "messagingSocketPath": address, "updatedAt": 1, "tmux": "", "formerNames": []}))
         _ = (root / "current_socket").write_text("/fixture/showrunner/socket")
         session_lookup = root / "session_lookup.py"
@@ -203,7 +205,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
         for final_line, sender, address in (
             ("blocked: waiting on the showrunner to merge", "showrunner:expected-showrunner", "/fixture/showrunner/socket"),
             ("blocked: waiting on claude-build-followups-other", "claude-build-followups-other", "socket-1"),
-            ("blocked: waiting on session:peer-1", "session:peer-1", "socket-1"),
+            ("blocked: waiting on session:" + fixture_runtime_id("peer-1"), "session:" + fixture_runtime_id("peer-1"), "socket-1"),
         ):
             with self.subTest(final_line=final_line), director_wait_fixture() as fixture:
                 fixture.call(STOP, {"last_assistant_message": final_line}, 1010)

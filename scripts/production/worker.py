@@ -26,7 +26,7 @@ from typing import Literal, cast, final
 from scripts.agents import detached_runs, worker_lifecycle
 from scripts.herdr import herdr_types
 from scripts.accounts import accounts, session_state
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, unit_runs
@@ -874,6 +874,20 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
+    held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
+    selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
+        if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
+            worker_panes.StoppedWorker, worker_panes.ClosedWorker)))) if only != "all" else ()
+    for run in held_runs:
+        for name in selected_workers if only != "all" else ("",):
+            try:
+                reaped = (detached_runs.reap_orphans(str(run), name) if name else
+                          detached_runs.reap_orphans(str(run)))
+                for run_id in reaped:
+                    print(f"{holder.name}: reaped detached run {run_id}")
+            except OSError as error:
+                print(f"anomaly: {run}: {error}", file=sys.stderr)
+                outcome = ExitCode.UNCERTAIN
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
@@ -937,7 +951,97 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
         print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")
+    for result in _finished_worker_results(holder, record, held_runs):
+        print(f"{result.worker}: phase {result.phase}; dispatch {result.dispatch_id}; reply {result.reply_path or 'unavailable'}")
     return outcome
+
+
+def _pass_records(state: dict[str, object]) -> list[dict[str, object]]:
+    raw = state.get("pass", {})
+    if not isinstance(raw, dict):
+        return []
+    slots = cast(dict[str, object], raw)
+    return ([slots] if "instance_id" in slots else
+            [cast(dict[str, object], value) for value in slots.values() if isinstance(value, dict)])
+
+
+def _dispatch_fields(run: str, entry: dict[str, object]) -> dict[str, object]:
+    """Read dispatch evidence from a pass or its recorder event."""
+    completion = progress_history.hook_completion(entry)
+    reply = (completion.reply_file if isinstance(completion, progress_history.HookCompletion) else
+             progress_history.dispatch_delivery(entry).reply_file)
+    if not reply:
+        saved_reply = entry.get("reply_file")
+        reply = saved_reply if isinstance(saved_reply, str) else ""
+    if not reply:
+        command = entry.get("launcher_command")
+        if isinstance(command, list):
+            parts = cast(list[object], command)
+            for index, part in enumerate(parts[:-1]):
+                if part in ("--reply-file", "--reply") and isinstance(parts[index + 1], str):
+                    reply = cast(str, parts[index + 1])
+    return {"dispatch_id": entry.get("instance_id", entry.get("pass_instance_id", "")),
+            "run_path": run,
+            "completion_state": entry.get("status", "active" if entry.get("event_type") == "pass_started" else "unknown"),
+            "reply_path": reply}
+
+
+@dataclass(frozen=True)
+class FinishedWorkerResult:
+    worker: str
+    phase: str
+    dispatch_id: str
+    reply_path: str
+    finished_at: float
+
+
+def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot,
+                             runs: Iterable[Path]) -> list[FinishedWorkerResult]:
+    """List completed passes in open phases without changing the recorder."""
+    wanted = {str(row.id).encode(): row for row in record.find(kind="worker", parent=holder.id)}
+    results: dict[tuple[Path, str], FinishedWorkerResult] = {}
+    for run in runs:
+        try:
+            state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            print(f"anomaly: {run}: {error}", file=sys.stderr)
+            continue
+        if unit_runs.run_owner(state, record) != holder:
+            continue
+        open_ids = set(recorder_state.open_phase_ids(state))
+        if not open_ids:
+            continue
+        parked = state.get(recorder_state.OPEN_PHASES_KEY, [])
+        phases = [*(cast(list[object], parked) if isinstance(parked, list) else []), state.get("phase")]
+        open_instances = {str(phase.get("id")): str(phase.get("instance_id", ""))
+                          for raw in phases if isinstance(raw, dict)
+                          for phase in (cast(dict[str, object], raw),) if phase.get("id") in open_ids}
+        history = state.get("history_file")
+        entries = [*(_worker_history_events(Path(history), wanted, complete=True)
+                     if isinstance(history, str) and history else ()), *_pass_records(state)]
+        for entry in entries:
+            if entry.get("run_id") and state.get("run_id") and entry["run_id"] != state["run_id"]:
+                continue
+            identity = entry.get("worker_id")
+            row = wanted.get(identity.encode()) if isinstance(identity, str) else None
+            if row is None or entry.get("status") != "completed":
+                continue
+            phase = entry.get("phase")
+            phase_id = (cast(dict[str, object], phase).get("id") if isinstance(phase, dict)
+                        else entry.get("phase_id"))
+            phase_instance = (cast(dict[str, object], phase).get("instance_id") if isinstance(phase, dict)
+                              else entry.get("phase_instance_id"))
+            if (isinstance(phase_id, str) and phase_instance and open_instances.get(phase_id)
+                    and phase_instance != open_instances[phase_id]):
+                continue
+            fields = _dispatch_fields(str(run), entry)
+            dispatch_id = fields["dispatch_id"]
+            if not isinstance(phase_id, str) or phase_id not in open_ids or not isinstance(dispatch_id, str) or not dispatch_id:
+                continue
+            stamp = entry.get("finished_at", entry.get("timestamp_epoch", 0))
+            results[run, dispatch_id] = FinishedWorkerResult(row.name, phase_id, dispatch_id,
+                str(fields["reply_path"]), float(stamp) if isinstance(stamp, (int, float)) else 0)
+    return sorted(results.values(), key=lambda result: result.finished_at, reverse=True)
 
 
 def _worker_list_row(row: staff.StaffRow, facts: dict[str, object]) -> dict[str, object]:
@@ -961,14 +1065,15 @@ WORKER_HISTORY_BYTES = 64 * 1024
 type WorkerHistoryTargets = dict[bytes, staff.StaffRow]
 
 
-def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generator[dict[str, object]]:
+def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
+                           complete: bool = False) -> Generator[dict[str, object]]:
     identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
     bad_line_reported = False
     try:
         with path.open("rb") as history:
-            offset = max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
+            offset = 0 if complete else max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
             _ = history.seek(offset - 1 if offset else 0)
-            tail = history.read(WORKER_HISTORY_BYTES + bool(offset))
+            tail = history.read() if complete else history.read(WORKER_HISTORY_BYTES + bool(offset))
         if offset:
             boundary, tail = tail[:1], tail[1:]
             if boundary != b"\n":
@@ -1002,32 +1107,37 @@ class RecordedWorkerDispatches:
     runs: tuple[Path, ...]
 
 
-def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDispatches:
+def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
+                                 runs: Iterable[Path] | Literal["discover"] = "discover") -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
-    runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
-    for parent in parents.values():
-        runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
-        if isinstance(parent.run, staff.OpenRun):
-            runs.append(parent.run.path)
-    if current := unit_runs.environ("RUN_DIR"):
-        runs.append(Path(current))
+    if runs == "discover":
+        runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
+        for parent in parents.values():
+            runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
+            if isinstance(parent.run, staff.OpenRun):
+                runs.append(parent.run.path)
+        if current := unit_runs.environ("RUN_DIR"):
+            runs.append(Path(current))
+    run_paths = tuple(dict.fromkeys(path.resolve() for path in runs))
     found: dict[StaffId, WorkerDispatchRecord] = {}
-    histories: dict[Path, WorkerHistoryTargets] = {}
+    histories: dict[Path, dict[Path, WorkerHistoryTargets]] = {}
+    run_ids: dict[Path, object] = {}
 
-    def keep(row: staff.StaffRow, entry: dict[str, object]) -> None:
+    def keep(row: staff.StaffRow, entry: dict[str, object], run: str) -> None:
         stamp = entry.get("finished_at", entry.get("timestamp_epoch", entry.get("started_at", 0)))
         timestamp = float(stamp) if isinstance(stamp, (int, float)) else 0
         previous = found.get(row.id)
         if previous is None or timestamp > previous.timestamp:
             found[row.id] = WorkerDispatchRecord({
+                **_dispatch_fields(run, entry),
                 "kind": entry.get("kind", entry.get("pass_kind", "")),
                 "activity": entry.get("activity", entry.get("pass_activity", "")),
                 "called_agent": entry.get("called_agent", {}),
                 "status": entry.get("status", "active" if entry.get("event_type") == "pass_started" else "unknown")},
                 timestamp)
 
-    for run in dict.fromkeys(path.resolve() for path in runs):
+    for run in run_paths:
         path = run / unit_runs.STATE_FILE
         try:
             value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -1039,35 +1149,34 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDi
         if not isinstance(value, dict):
             continue
         state = cast(dict[str, object], value)
+        run_ids[run] = state.get("run_id")
         owner = unit_runs.run_owner(state, record)
         parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
         history = state.get("history_file")
         if isinstance(history, str) and history and parent_id in parents:
-            histories.setdefault(Path(history).resolve(), {}).update({str(row.id).encode(): row
-                for row in workers if row.parent == staff.ReportsTo(parent_id)})
-        entries: list[dict[str, object]] = []
-        raw = state.get("pass", {})
-        if isinstance(raw, dict):
-            slots = cast(dict[str, object], raw)
-            entries.extend([slots] if "instance_id" in slots else
-                           [cast(dict[str, object], value) for value in slots.values() if isinstance(value, dict)])
+            histories.setdefault(Path(history).resolve(), {})[run] = {str(row.id).encode(): row
+                for row in workers if row.parent == staff.ReportsTo(parent_id)}
+        entries = _pass_records(state)
         for entry in entries:
             identity = entry.get("worker_id")
             row = record.by_id(StaffId(identity)) if isinstance(identity, str) and identity else None
             if row is None or row.kind != "worker" or row.parent != staff.ReportsTo(parent_id):
                 continue
-            keep(row, entry)
-    for path, targets in histories.items():
-        pending = targets.copy()
+            keep(row, entry, str(run))
+    for path, sources in histories.items():
+        pending = {identity: row for targets in sources.values() for identity, row in targets.items()}
         for entry in _worker_history_events(path, pending):
             identity = entry.get("worker_id")
             target = pending.get(identity.encode()) if isinstance(identity, str) and identity else None
             if target is not None:
-                keep(target, entry)
+                candidates = [run for run, targets in sources.items() if str(target.id).encode() in targets]
+                if identity := entry.get("run_id"):
+                    candidates = [run for run in candidates if run_ids[run] == identity]
+                keep(target, entry, str(candidates[0]) if len(candidates) == 1 else "")
                 del pending[str(target.id).encode()]
             if not pending:
                 break
-    return RecordedWorkerDispatches(found, tuple(runs))
+    return RecordedWorkerDispatches(found, run_paths)
 
 
 class WorkerFilter(Enum):
@@ -1126,7 +1235,9 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
             except (OSError, ValueError) as error:
                 print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         item = _worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
-            "activity": fields.get("activity") or status})
+            "activity": fields.get("activity") or status,
+            **{key: fields.get(key, "unknown" if key == "completion_state" else "")
+               for key in ("dispatch_id", "run_path", "completion_state", "reply_path")}})
         if not as_json:
             item["list_activity"] = activity or item["role"]
             observed = states.get(row.id)
@@ -1143,7 +1254,7 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
 def _worker_pane_state(state: worker_panes.WorkerPane,
                        detached: session_state.RunningDetachedWork) -> tuple[str, str]:
     if isinstance(state, worker_panes.OpenWorker):
-        activity = worker_panes.worker_state(state)
+        activity = "starting" if state.status == "starting" else worker_panes.worker_state(state)
         classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
         return "open", activity if activity == "unknown" and classified == "idle" else classified
     if isinstance(state, worker_panes.StoppedWorker):
@@ -1159,6 +1270,8 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
     detached = session_state.running_detached_work(record)
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record,
                              scanned=detached.launcher_runs.by_session)
+    dispatches = (_recorded_worker_dispatches(record, runs=observed.runs)
+                  if as_json else RecordedWorkerDispatches({}, ()))
     with progress_history.dispatch_reads(record, observed.runs):
         states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
         for state in states:
@@ -1167,6 +1280,10 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
             pane, displayed_state = _worker_pane_state(state, detached)
             work = displayed_state if isinstance(state, worker_panes.OpenWorker) else worker_panes.worker_state(state)
             facts: dict[str, object] = {"state": type(state).__name__, "work": work}
+            if as_json:
+                saved = dispatches.by_worker.get(state.row.id, WorkerDispatchRecord({}, 0)).fields
+                facts.update({key: saved.get(key, "unknown" if key == "completion_state" else "")
+                              for key in ("dispatch_id", "run_path", "completion_state", "reply_path")})
             fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value

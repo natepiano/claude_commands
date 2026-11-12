@@ -225,8 +225,10 @@ class ClaudeLauncherTests(unittest.TestCase):
             with self.subTest(family=family):
                 _ = write_registry(Path(self.environment["MODELS_CONFIG_FILE"]), {"assignments": {"cli": family}})
                 with patch.dict(os.environ, {**self.environment, "MODELS_CONFIG_TIER_ONLY": "1"}):
-                    environment = models_registry.launch_configuration({}).environment(
-                        models_registry.edit_base({}).environment(self.environment))
+                    environment = models_registry.launch_configuration({
+                        **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""}).environment(
+                        models_registry.edit_base({
+                            **os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""}).environment(self.environment))
                 environment.update(TEST_AGENT_ENV=str(recorded), MODELS_CONFIG_TIER_ONLY="1",
                                    CLAUDE_CONFIG_DIR=str(accounts.account_dir("claude1")))
                 result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")],

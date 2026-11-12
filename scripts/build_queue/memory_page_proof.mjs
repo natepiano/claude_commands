@@ -1,4 +1,5 @@
 // Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
+// The optional third argument names the previous page for comparison images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -14,10 +15,12 @@ const callerFolder = process.argv[2];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1]))', folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, stdio:'pipe'});
+  const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
+  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+    .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -31,8 +34,6 @@ try {
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
-  base.walk.find(row => row.queued).started_at = now - 120;
-  base.waiters[0].since = now - 2 * 86400;
   const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
     kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
   const smaller = swapOwners.slice(base.swap_rows);
@@ -87,23 +88,38 @@ try {
   const server = createServer((req, res) => {
     const isData = req.url.startsWith('/memory.json');
     res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : page);
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
-    const profile = await mkdtemp(join(tmpdir(), 'memory-proof-chrome-'));
+    // Chrome needs a short path for its Unix sockets.
+    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
     try {
+      const temporary = join(profile, 'tmp');
+      await mkdir(temporary);
       const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);
       });
       let ws;
+      let debuggerError;
+      const pending = new Map();
+      const events = new Map();
+      const rejectPending = error => {
+        debuggerError ||= error;
+        for (const request of pending.values()) request.reject(debuggerError);
+        for (const event of events.values()) event.reject(debuggerError);
+        pending.clear();
+        events.clear();
+      };
+      chrome.once('exit', () => rejectPending(new Error('Chrome closed during a debugger request.')));
+      chrome.once('error', rejectPending);
       try {
         const endpoint = await new Promise((resolve, reject) => {
           let output = '';
@@ -116,10 +132,9 @@ try {
           chrome.once('exit', () => reject(new Error('Chrome closed before its debugger started.')));
         });
         ws = new WebSocket(endpoint);
-        await once(ws, 'open');
+        ws.addEventListener('close', () => rejectPending(new Error('Chrome debugger connection closed.')));
+        await Promise.race([once(ws, 'open'), exited.then(() => { throw debuggerError; })]);
         let id = 0;
-        const pending = new Map();
-        const events = new Map();
         ws.addEventListener('message', event => {
           const message = JSON.parse(event.data);
           if (message.id) {
@@ -130,10 +145,11 @@ try {
             else request.resolve(message.result);
           } else {
             const key = `${message.sessionId || ''}:${message.method}`;
-            if (events.has(key)) { events.get(key)(message.params); events.delete(key); }
+            if (events.has(key)) { events.get(key).resolve(message.params); events.delete(key); }
           }
         });
         const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+          if (debuggerError) { reject(debuggerError); return; }
           const next = ++id;
           pending.set(next, {resolve,reject});
           ws.send(JSON.stringify({id:next,method,params,...(sessionId ? {sessionId} : {})}));
@@ -151,10 +167,10 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
-        await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/memory_live.html`});
-        await loaded;
-        await evaluate(`(async () => {
+        const navigate = async path => {
+          const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
+          await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
+          await evaluate(`(async () => {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
@@ -164,7 +180,9 @@ try {
           window.render = () => {};
           await document.fonts.ready;
           fitLabels();
-        })()`);
+          })()`);
+        };
+        await navigate('memory_live.html');
 
         const proofs = [];
         const show = async (reading, clearTip=true) => evaluate(`(async () => {
@@ -202,6 +220,7 @@ try {
               const row = document.querySelector('.wrow[data-run]');
               const progress = row.querySelector('.row-progress');
               const cap = document.querySelector('.walk-bud');
+              const table = document.querySelector('.walk-table');
               const color = name => {
                 const probe = document.createElement('span');
                 probe.style.backgroundColor = 'var('+name+')'; document.body.append(probe);
@@ -224,15 +243,20 @@ try {
               const owner = row.querySelector('.owner');
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
-                tables:document.querySelectorAll('#walk table').length,
+                headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
                 answer:text('#answer'),
-                runTime:row.querySelector('.row-time').textContent,
-                waitTime:document.querySelector('.wrow.wait .row-time').textContent,
-                timeFont:getComputedStyle(row.querySelector('.row-time')).fontSize,
-                ownerFont:getComputedStyle(owner).fontSize,
-                runTip:tipText(row.dataset.tip,latest).join(' '),
-                rowBounds:[...document.querySelectorAll('#walk .wrow')].map(row=>({
-                  row:rect(row),label:rect(row.querySelector('.row-label')),track:rect(row.querySelector('.track'))})),
+                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
+                queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
+                queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
+                stages:[...table.querySelectorAll('tbody tr[data-tip] .stage')].map(e=>e.textContent),
+                layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
+                rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
+                  const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
+                    document.querySelector('.wrow.room');
+                  return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
+                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
+                }),
+                machine:table.querySelector('td.machine')?.textContent,
                 cap:rect(document.querySelector('#mark')), room:text('#v-room'),
                 capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
@@ -263,29 +287,15 @@ try {
               };
               return metrics;
             })()`);
-            assert.equal(proof.tables,0,'The running panel retains a table.');
+            assert.deepEqual(proof.headings, ['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.equal(proof.runTime,'2 min');
-            assert.equal(proof.waitTime,'waits 2 days');
-            assert.equal(proof.timeFont,proof.ownerFont);
-            for(const field of ['Place: run','Machine: fixture','vCPU: 32','Unit: fixture-unit','Pid: 50'])
-              assert.ok(proof.runTip.includes(field),field+' is absent from the row tooltip.');
-            for(const shown of [proof.name,proof.owner,proof.runTime])
-              assert.ok(!proof.runTip.includes(shown),'The tooltip repeats a row value: '+shown);
-            for(const bounds of proof.rowBounds) {
-              assert.ok(bounds.label.right<=bounds.track.left,'The label crosses the memory chart.');
-              assert.ok(bounds.label.bottom<=bounds.row.bottom+1,'The row clips its label.');
-            }
-            const clickedTip=await evaluate(`(() => {
-              document.querySelector('.wrow[data-run]').dispatchEvent(new MouseEvent('click',{
-                bubbles:true,clientX:${width / 2},clientY:100}));
-              const tip=document.querySelector('#tip'),bounds=tip.getBoundingClientRect();
-              const result={text:tip.textContent,visible:tip.classList.contains('on'),left:bounds.left,right:bounds.right};
-              hideTip();return result;
-            })()`);
-            assert.ok(clickedTip.visible,'The row click does not open its tooltip.');
-            assert.ok(clickedTip.text.includes('Machine: fixture'),'The row tooltip loses the machine.');
-            assert.ok(clickedTip.left>=0 && clickedTip.right<=width,'The tooltip crosses the viewport edge.');
+            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Stage','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
+            assert.ok(proof.stages.includes('testing'));
+            assert.ok(proof.stages.at(-1)==='');
+            for(const offsets of proof.rowOffsets)
+              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
+            assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
             assert.match(proof.leftover,/pid 46/);
@@ -417,23 +427,27 @@ try {
               ['cloud_empty','']]) {
               await show(readings[name]);
               const detailProof=await evaluate(`(() => {
-                const index=latest.walk.findIndex(row=>row.pid===700001);
-                const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+                const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
+                const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
                 const amounts=chart.querySelector('.amounts');
                 return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
                   ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
                   rootFont:getComputedStyle(document.documentElement).fontSize,
+                  beside:document.querySelector('#walk').classList.contains('beside'),
                   detailRight:amounts.getBoundingClientRect().right,
-                  chartRight:chart.getBoundingClientRect().right,
+                  tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
               const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
               assert.equal(detailProof.text,expected,'The AWS detail text differs.');
               assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
               assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
-              assert.ok(detailProof.detailRight<=detailProof.chartRight+1,'The AWS detail text crosses the chart edge.');
+              if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
+                'The AWS detail text crosses into the table.');
+              assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
               assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
-              if(name==='cloud_region' && theme==='light' && [1400,390].includes(width)) {
+              if(name==='cloud_region' && process.env.MEMORY_PAGE_SHOT) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
@@ -451,20 +465,24 @@ try {
             assert.equal(cloudRow.late_age,lateAge);
             assert.ok(!cloudRow.status.includes('no update for'),'The feed mixes the state and late age.');
             const cloudProof=await evaluate(`(() => {
-              const runIndex=latest.walk.findIndex(row=>row.pid===700001);
-              const waitIndex=latest.waiters.findIndex(row=>row.pid===700002);
-              const runningDetails=document.querySelector('.wrow[data-run="'+runIndex+'"]');
-              const waitingDetails=document.querySelector('.wrow[data-tip="wait:'+waitIndex+'"]');
+              const table=document.querySelector('.walk-table');
+              const rows=[...table.querySelectorAll('tbody tr')];
+              const running=rows.find(row=>row.textContent.includes('700001'));
+              const waiting=rows.find(row=>row.textContent.includes('700002'));
+              const details=row=>row?document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]'):null;
+              const runningDetails=details(running),waitingDetails=details(waiting);
+              const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
               const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
                 element.childElementCount===0 && element.textContent.includes('no update for'));
-              return {tables:document.querySelectorAll('#walk table').length,
-                running:runningDetails?.textContent,waiting:waitingDetails?.textContent,
-                runTip:tipText('row:'+runIndex,latest).join(' '),
-                waitTip:tipText('wait:'+waitIndex,latest).join(' '),
-                runTime:runningDetails?.querySelector('.row-time')?.textContent,
-                waitTime:waitingDetails?.querySelector('.row-time')?.textContent,
+              return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
+                machine:running?.querySelector('.machine')?.textContent,
+                place:waiting?.querySelector('.place')?.textContent,
+                waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
+                vcpus:running?.querySelector('.vcpus')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
-                cloudRows:!!runningDetails && !!waitingDetails,
+                statusInTable:!!running && !!waiting,
                 cloudMemory:!!runningDetails?.querySelector('.reserved-amount,.used-amount,.b:not(.row-progress)'),
                 progressWidth:runningDetails?.querySelector('.row-progress')?.getBoundingClientRect().width,
                 progressTrackWidth:runningDetails?.querySelector('.progress-track')?.getBoundingClientRect().width,
@@ -472,21 +490,21 @@ try {
                 amounts:runningDetails?.querySelector('.amounts')?.textContent,
                 trackText:runningDetails?.querySelector('.track')?.textContent,
                 waitingBar:!!waitingDetails?.querySelector('.row-progress,.progress-track'),
-                tipsMatch:runningDetails?.querySelector('.track')?.dataset.tip===runningDetails?.dataset.tip &&
-                  runningDetails?.querySelector('.row-memory')?.dataset.tip===runningDetails?.dataset.tip,
+                height:runningDetails?.getBoundingClientRect().height,
+                tableHeight:running?.getBoundingClientRect().height,
+                tipsMatch:runningDetails?.querySelector('.track')?.dataset.tip===running?.dataset.tip &&
+                  runningDetails?.querySelector('.row-memory')?.dataset.tip===running?.dataset.tip,
                 localMemory:!!document.querySelector('.wrow .track .seg-used'),
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:document.querySelector('#walk').closest('.card').textContent,
+                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.equal(cloudProof.tables,0,'The running panel retains a table.');
-            assert.ok(cloudProof.cloudRows,'Cloud work is absent from the chart.');
-            for(const field of ['Place: run','Machine: aws','vCPU: 32','Unit: cloud-unit','Pid: 700001'])
-              assert.ok(cloudProof.runTip.includes(field),field+' is absent from the cloud tooltip.');
-            assert.equal(cloudProof.runTime,'4 min');
-            assert.equal(cloudProof.waitTime,'waits 1 min');
+            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
+            assert.equal(cloudProof.machine,'aws');
+            assert.equal(cloudProof.vcpus,'32');
             assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
             for(const value of [modules,failed,'no update for '+cloudRow.late_age])
               assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
@@ -496,9 +514,11 @@ try {
             assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
             assert.equal(cloudProof.trackText,'','The cloud track contains text.');
             assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
+            assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
-            for(const field of ['Place: cloud','Machine: not assigned','vCPU: not assigned','Unit: waiting-unit','Pid: 700002'])
-              assert.ok(cloudProof.waitTip.includes(field),field+' is absent from the cloud wait tooltip.');
+            assert.equal(cloudProof.place,'cloud');
+            assert.equal(cloudProof.waitingMachine,'');
+            assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
             assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
             assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
@@ -540,15 +560,41 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
-            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],['good','']]) {
+            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
+              ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
-              assert.equal(await evaluate("document.querySelector('#priority-line').textContent"),expected);
+              const priority=await evaluate(`(() => {
+                const index=latest.walk.findIndex(row=>row.queued);
+                return tipText('row:'+index,latest).join(' ');
+              })()`);
+              assert.equal(priority.includes("queue priority:"),!!expected);
+              if(expected) assert.ok(priority.includes(expected));
+              const heading=await evaluate("tipText('walkhead',latest).join(' ')");
+              const unmatched=name==='priority_unmatched';
+              assert.equal(heading.includes("queue priority:"),unmatched);
+              if(unmatched) assert.equal(heading.split("queue priority: research (the user's bump)").length-1,1);
+              if(unmatched && theme==='dark' && width===1400) {
+                const clip=await evaluate(`(() => {
+                  const heading=document.querySelector('[data-tip="walkhead"]');
+                  heading.scrollIntoView({block:'start'});
+                  const h=heading.getBoundingClientRect();
+                  heading.dispatchEvent(new MouseEvent('click',{bubbles:true,clientX:h.left+10,clientY:h.bottom}));
+                  const tip=document.querySelector('#tip');
+                  if(!tip.classList.contains('on') || !tip.textContent.includes(latest.unmatched_priority_text))
+                    throw new Error('The heading click loses the unmatched priority.');
+                  const r=heading.closest('.card').getBoundingClientRect();
+                  return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
             await show(base);
 
             const positions=()=>evaluate(`(() => {
-              const row=document.querySelector('.wrow[data-run]');
-              return ['.row-label','.track'].map(selector=>{
+              const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
+              return ['.duration','.unit','.pid'].map(selector=>{
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
@@ -562,24 +608,24 @@ try {
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
-              assert.ok(Math.abs(beforeWait[index].left-afterWait[index].left)<=1,'A waiting row moves the chart.');
-              assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,'A waiting row changes the chart width.');
+              assert.ok(Math.abs(beforeWait[index].left-afterWait[index].left)<=1,'A waiting row moves a table column. '+JSON.stringify({width,theme,beforeWait,afterWait}));
+              if(index===0) assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,
+                'A waiting row changes the Duration width. '+JSON.stringify({width,theme,beforeWait,afterWait}));
             }
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
             await show(absent);
-            const absentFields=await evaluate(`({owner:document.querySelector('.wrow[data-run] .owner').textContent,
-              tip:tipText(document.querySelector('.wrow[data-run]').dataset.tip,latest).join(' ')})`);
-            assert.equal(absentFields.owner,'');
-            assert.match(absentFields.tip,/Unit: not recorded/);
-            assert.match(absentFields.tip,/Machine: not recorded/);
+            const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
+              owner:document.querySelector('.wrow[data-run] .owner').textContent,
+              machine:document.querySelector('.walk-table td.machine').textContent})`);
+            assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
             for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
               await show(readings[name]);
-              const state=await evaluate(`({text:document.querySelector('#wait-reasons').textContent,
+              const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
-              assert.ok(state.text.includes(expected), name+' has no visible reason.');
+              assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
             }
@@ -686,7 +732,48 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,
+        const comparisons = [];
+        if (beforePage) {
+          const review = structuredClone(readings.spacing);
+          review.priority_text = "queue priority: port (the user's bump)";
+          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          const head = review.waiters[0];
+          Object.assign(head, {name:'port nextest',unit:'port',need:1.9,reason:'free memory',
+            head_text:review.head_text,priority_text:review.priority_text});
+          review.waiters.push({...head,name:'trunk nextest',unit:'trunk',pid:201,
+            reason:'head protection · behind #1',head_text:'',priority_text:''});
+          review.waiters.push({...head,name:'fps nextest',unit:'fps',pid:202,
+            reason:'estimate expired',head_text:'',priority_text:''});
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          for (const version of ['after','before']) {
+            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+            await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+            for (const width of [1400,390]) {
+              await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+              await show(review);
+              const comparison = await evaluate(`(() => {
+                const walk=document.querySelector('#walk'),card=walk.closest('.card');
+                const r=card.getBoundingClientRect();
+                return {tables:walk.querySelectorAll('table').length,
+                  lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
+                  layout:walk.classList.contains('beside')?'beside':'stacked',
+                  head:tipText('wait:0',latest).join(' '),
+                  clip:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}};
+              })()`);
+              assert.equal(comparison.tables, version === 'after' ? 1 : 0);
+              assert.equal(comparison.lists, version === 'after' ? 0 : 3);
+              if(version === 'after') {
+                assert.equal(comparison.layout,width===1400?'beside':'stacked');
+                for(const value of [review.head_text,review.priority_text,'free memory'])
+                  assert.equal(comparison.head.split(value).length-1,1);
+              }
+              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:comparison.clip});
+              await writeFile(join(folder,`${version}-${width}.png`),Buffer.from(shot.data,'base64'));
+              comparisons.push({version,width,...comparison});
+            }
+          }
+        }
+        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
       } finally {

@@ -1171,7 +1171,25 @@ While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf`
 
 - A target that goes away during a pass counts as done. The pass finishes with status 0. Its bytes do not count as removed.
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
-- **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
+- **Targets in use.** A target is busy while a build holds its Cargo locks.
+  It is also busy when a live process uses an executable, working directory, or mapped file under it.
+  `process_uses()` checks `/proc/<pid>/exe`, `cwd` and `maps`.
+  A cargo-nextest or `verify.sh` process also keeps its workspace targets busy, including time between test binaries and time in the build queue.
+  The scan recognizes `verify.sh` directly or as the first script argument after options to `bash`, `sh`, `zsh` or `dash`.
+  `workspace_targets()` resolves `--target-dir`, `CARGO_TARGET_DIR`, Cargo config, or a target beside an ancestor of the working directory.
+  The use text is `runs verify.sh in <cwd>`.
+  nextest holds no Cargo lock during tests and executes binaries from `deps/`.
+  A floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
+  `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts the target as held.
+  `sweep_workspace` prints `… skipped` and removes nothing from the busy target.
+  A running app also keeps its target busy.
+  Executable or mapped paths that end with `(deleted)` do not count as use.
+  The sweep cannot remove or damage those files.
+  A process with only deleted files under a target leaves it idle when its working directory is outside.
+  A hung cargo-berth process held 26 GiB of cargo-liner-berth output for three days before this rule changed on 2026-10-21.
+  One scan of `/proc` covers every target and runs only below the floor.
+  A measured scan took 0.21 seconds over 110 targets and about 600 readable processes.
+  Without `/proc`, as on the Mac, the scan finds no use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
 - **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, the hourly `tmp-sweep` job runs `tmp_sweep.py`.
 `modules/darwin/tmp-sweep.nix` in nixos defines this job.

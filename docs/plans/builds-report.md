@@ -1113,3 +1113,64 @@ Raise it to 100800. A changed config value needs the user's go. Sent to the buil
 **Acceptance gate:**
 - `scripts.lint.test_sweep` passes, with the two new rows.
 - `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
+
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
+
+From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is resources' file, and the builds showrunner gave the go for this unit to write the fix.
+
+#### As-built
+
+- `tmp_sweep.judge_entries`: a run keep reason from `run_folder_guards` keeps the run folder and its `tmp/` folder. It no longer keeps the entries inside `tmp/`.
+- Each run `tmp/` entry goes by the 4 h rule, process use (`IN_USE`), `WORKER_USES` and the git check.
+- `RunKeepReason.UNREADABLE_RECORD` and an unreadable session registry (`NO_SESSIONS`) still keep run `tmp/` entries.
+- The module docstring states the rule once.
+- Cause: killed test runs left temp folders in run `tmp/` folders (verify.sh's TMPDIR). On 2026-11-12 the sweep kept 925 such entries in one run; the dry run after the fix selects 55,100 across all runs.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
+- `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.
+
+### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
+
+From builds (not the user), 2026-11-12: put the 2 h limit and the fall size in config as new keys; start the walk only on an unnamed fall beyond cache growth.
+
+Problem: after Phase 52 the folder walk runs once a day, so the 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall.
+
+#### As-built
+
+- New keys in `config/lint.conf`: `sweep_walk_request_fall_bytes=10737418240` and `sweep_walk_request_interval_seconds=7200`.
+- `store.py`: `DISK_WALK_REQUEST_NAME`, the `DiskWalkRequest` TypedDict (`requested_at`, `alert_at`, `unnamed_bytes`), `DiskWalkRequestState` (`ABSENT`, `UNREADABLE`), `read_disk_walk_request` and an atomic `write_disk_walk_request`.
+- `sweep.py` `unnamed_disk_fall` holds the fall arithmetic that `disk_measurement_lines` also uses.
+- The natedev floor pass writes a request when all of these are true:
+  - the previous floor record is recent, with the same build holds and filesystem (the checks the growth alert uses, computed once);
+  - no request file exists;
+  - the unnamed fall is over `sweep_walk_request_fall_bytes`;
+  - the last walk is at least `sweep_walk_request_interval_seconds` old.
+- `disk.py` `snapshot()` walks when the request's `requested_at` is later than the previous `measured_at`. The 03:00 daily walk stays.
+- `finish_disk_walk_request` sends "Folder walk for the <alert_at> fall:" with the growth lines through `send_floor_alert`. It deletes the request only after the send is accepted. It runs only on a natedev root-scope sweep.
+- An unreadable request file prints one stderr line and blocks a new request.
+- Review: F001 (blocker) — a changed build hold could request a walk with no free-space change; fixed by the shared checks above.
+
+**Files:**
+- `config/lint.conf` — the two keys.
+- `scripts/buildlog/store.py` — the request file types and I/O.
+- `scripts/buildlog/disk.py` — the request walk.
+- `scripts/lint/sweep.py` — `unnamed_disk_fall`, the request gate, `finish_disk_walk_request`.
+- `scripts/buildlog/test_disk.py`, `scripts/lint/test_sweep.py` — request, no-request and follow-up rows.
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 56 — Old buildlog indexes go by change time only · status: done
+
+From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahead of Phase 55.
+
+#### As-built
+
+- `cleanup_unused_indexes` compares `st_mtime` alone with the `INDEX_UNUSED_DAYS` cutoff. It does not read `st_atime`.
+- Cause: `complete_gate_index_in` reads every index and refreshes its atime, so the old `max(atime, mtime)` test kept every index (37 GiB held on 2026-11-12).
+- `update_in` sets an index mtime at least each `INDEX_TOUCH_MINUTES`, so an index that a tree updates stays.
+- `config/buildlog.conf` keeps `INDEX_UNUSED_DAYS=2`; its Basis states the mtime rule.
+
+**Files:**
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
+- `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
+- `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.

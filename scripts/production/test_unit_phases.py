@@ -12,6 +12,7 @@ import sqlite3
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from dataclasses import replace
@@ -113,6 +114,48 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
+
+    def test_unit_count_cache_filters_sources_and_retries_failed_reads(self) -> None:
+        from scripts.statusline import counts_row
+        from scripts.production import session_staff
+
+        doc = self.root / "production.md"
+        ledger = self.root / "efficiency.md"
+        _ = doc.write_text("# Production\n\n> **Status: PRODUCTION — running**\n"
+                           + f"- **Efficiency ledger:** {ledger}\n")
+        owner = fixture_member("showrunner", name="cache-owner", doc=staff.LiveDoc("natedev", doc))
+        member = fixture_member("unit", name="cache-unit", parent=owner.id)
+        _ = ledger.write_text(f"- 2026-11-12 config: Own [by: {member.id}] — proposed\n"
+                              + f"- 2026-11-12 config: Other [by: {owner.id}] — proposed\n")
+        notifier = self.root / "notifier"
+        instance = notifier / f"showrunner-{owner.id}"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
+        _ = (self.root / "table-conf/statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        environment = {"HOME": str(self.root), "NOTIFIER_STATE_DIR": str(notifier),
+                       "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
+                       "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links")}
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == ledger:
+                raise PermissionError(str(path))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with (patch.dict(os.environ, environment),
+              patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
+            cache = counts_row.write_unit(member.id)
+            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
+            with patch.object(Path, "read_text", read), patch.object(time, "time", return_value=1000):
+                cache = counts_row.write_unit(member.id)
+            line, due, *sources = cache.read_text().splitlines()
+            self.assertEqual((line, due), ("", "1007"))
+            self.assertIn(str(ledger), sources)
+            self.assertIn(str(doc), sources)
+            self.assertIn(f"source=unit:{member.id}", sources)
+            cache = counts_row.write_unit(member.id)
+            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
 
     def run_file(self, *events: str) -> Path:
         path = self.root / "run.jsonl"
@@ -916,8 +959,11 @@ class UnitPhasesTests(unittest.TestCase):
         _ = staff.resume(second.id)
         resumed = render()
         self.assertIn("| second | exited |", resumed)
-        for activity, hold, expected in (("busy", "", "busy"), ("shell", "", "idle"),
-                                         ("busy", "pause", "paused"), ("busy", "exit", "exited")):
+        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "idle", False),
+                ("busy", "pause", "paused", False), ("busy", "exit", "exited", False),
+                ("idle", "", "waiting", True), ("busy", "", "busy", True),
+                ("starting", "", "starting", False), ("starting", "", "starting", True),
+                ("starting", "pause", "paused", True), ("starting", "exit", "exited", True)):
             with self.subTest(activity=activity, hold=hold):
                 _ = staff.resume(first.id)
                 if hold == "pause":
@@ -927,7 +973,9 @@ class UnitPhasesTests(unittest.TestCase):
                 observed = sessions.SessionRecord(sessionId=first.current_session, pid=1, name="first",
                     status=activity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
                 snapshot = staff.snapshot()
-            with (patch.object(sessions, "running_sessions", return_value=[observed]),
+                with (patch.object(sessions, "running_sessions", return_value=[observed]),
+                      patch.object(session_state, "running_detached_work", return_value=session_state.RunningDetachedWork(
+                          frozenset({first.id}) if detached else frozenset())),
                       patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_read,
                       patch.object(session_state, "classify", wraps=session_state.classify) as states):
                     units = live_units.units_in(owner.name, every)
