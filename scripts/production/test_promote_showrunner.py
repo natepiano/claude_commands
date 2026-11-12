@@ -812,6 +812,26 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertNotIn("--config-dir", output)
         self.assertNotIn("--account", output)
 
+    def test_pending_promotion_keeps_the_original_type_for_recovery(self) -> None:
+        unit = self.staff_unit()
+        fields = cast(dict[str, object], json.loads(self.staff.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], fields["rows"])
+        next(row for row in rows if row["id"] == unit.id)["unit_type"] = "merge"
+        _ = self.staff.staff_file.write_text(json.dumps(fields))
+        self.started = 2
+        code, output, errors = self.run_main()
+        self.assertEqual((code, errors), (1, ""))
+        self.assertIn("--unit-type merge", output)
+        promoted = staff.by_id(unit.id)
+        assert promoted is not None
+        self.assertNotIn("unit_type", promoted.to_json())
+        parent = read_production("parent")
+        promotion = promote_showrunner.checked("demo", "child", self.child_doc)
+        self.assertEqual(promotion.unit_type, "merge")
+        self.assertIn("--unit-type merge", promote_showrunner.restore_line(promotion))
+        saved = cast(dict[str, object], json.loads(promote_showrunner.promotion_record(parent, "demo").read_text()))
+        self.assertEqual(saved["unit_type"], "merge")
+
 
     def test_a_unit_still_running_after_exit_is_not_restarted(self) -> None:
         with mock.patch.object(stop_resume, "stop", return_value=stop_resume.StopFailed(SESSION, "still runs")):
@@ -898,7 +918,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("demo is stopped and did not start as a showrunner.", out)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py --production "
-                      + f"parent demo --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
+                      + f"parent demo --unit-type direct --plan docs/demo.md --resume {SESSION} --cwd {self.worktree}", out)
 
     def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> ProductionDocument:
         child_doc = self.worktree / "builds-production.md"

@@ -1303,7 +1303,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 message += "\n" + detached
         else:
             message = resume_message(why, move=AccountMove(source_label, label) if source_label != label else NO_ACCOUNT_MOVE,
-                                     workers=workers, own_pass=own, detached=detached) if (kind != "codex" or row is not None) and (
+                                     workers=workers, own_pass=own, unit=row, detached=detached) if (kind != "codex" or row is not None) and (
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":

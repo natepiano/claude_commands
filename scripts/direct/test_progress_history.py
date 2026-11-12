@@ -4170,6 +4170,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(progress_history.dispatch_delivery(slots["impl"]), delivery)
         self.assertEqual(slots["impl"]["launcher_command"], ["assign.sh", "--role", "impl"])
         self.assertEqual(len(self.pass_events("hook-completion", "pass_finished")), 1)
+        self.assertEqual(self.pass_events("hook-completion", "pass_finished")[0].get("reply_file"), delivery.reply_file)
 
     def test_dispatch_worker_recovers_the_active_and_completed_worker_without_writes(self) -> None:
         session = self.start_run("dispatch-worker", 41_000)

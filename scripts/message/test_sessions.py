@@ -76,6 +76,7 @@ class SessionLookupTests(ShutdownTestCase):
         _ = (self.sessions / filename).write_text(json.dumps(data))
         if not entrypoint.startswith("sdk-") and not any(row.name == name for row in self.members.values()):
             self.members[session_id] = staff.StaffRow(staff.StaffId(session_id), "unit", name, staff.StaffRoot(),
+                                                     unit_type=staff.UnitDetails("direct"),
                                                      current_session=staff.StaffId(session_id))
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -157,6 +158,7 @@ class SessionLookupTests(ShutdownTestCase):
         data["formerNames"] = ["former label"]
         _ = (self.sessions / "one.json").write_text(json.dumps(data))
         self.members = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "showrunner", staff.StaffRoot(),
+                                               unit_type=staff.UnitDetails("direct"),
                                                current_session=staff.StaffId("sid-123"))}
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
             live = sessions.live_sessions()
@@ -264,7 +266,8 @@ class SessionLookupTests(ShutdownTestCase):
                                           tmux="", formerNames=[])
         records = [record("handler", "bare"), record("modules-unit", "suffixed"), record("modules", "exact")]
         self.members = {row["sessionId"]: staff.StaffRow(staff.StaffId(row["sessionId"]), "unit", row["name"],
-                                                       staff.StaffRoot(), current_session=staff.StaffId(row["sessionId"]))
+                                                       staff.StaffRoot(), unit_type=staff.UnitDetails("direct"),
+                                                       current_session=staff.StaffId(row["sessionId"]))
                         for row in records}
         found = [sessions.named(name, records) for name in ("handler", "handler-unit", "modules-unit", "modules", "gone")]
         self.assertEqual([None if item is None else item["sessionId"] for item in found],

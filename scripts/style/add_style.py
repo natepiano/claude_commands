@@ -219,6 +219,9 @@ def _production_text(style: StyleProduction) -> str:
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
         "## Style units", "", "| Unit | Families | Open tickets |", "| --- | --- | --- |",
         *(f"| {style.name}-{family} | {family} | 1 |" for family in FAMILIES), "",
+        "## Unit launch", "",
+        "Launch each configured unit through `production/add_unit.py --unit-type style`.",
+        "The selected command is `/unit:style`; read `docs/direct/style_unit.md` for ticket contracts.", "",
     ])
 
 
@@ -230,6 +233,9 @@ def _plan_text(style: StyleProduction, assignment: style_config.StyleUnitAssignm
         "> **Standing:** style_plan.py", "", "## Delegation Context", "",
         f"- **Project:** {style.repository.name} — standing {family} style coverage",
         f"- **Repository:** {style.repository}",
+        (f"- **Launch:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py "
+         + f"--production {style.name} {assignment.unit} --unit-type style "
+         + f"--plan {PLAN_DIRECTORY / (assignment.unit + '-unit.md')}`"),
         "- **Stack:** Rust; Python style ledger and ticket planner",
         "- **Layout:** Ticket files are selected at refill; this unit owns no files.",
         "- **Key files:** `~/.claude/docs/style_production.md` — standing procedure, yielding and mechanical criteria",
