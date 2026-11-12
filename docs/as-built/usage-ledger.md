@@ -195,7 +195,19 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 `scripts/usage/context_economy.py` reads context measurements on demand.
 `scripts/usage/context_economy_read.py` holds the readers: `read_claude`, `read_mac`, `read_codex`, `settings_timeline`, `settings_for` and `role_of`.
 `/context_economy` (`commands/context_economy.md`) defaults to `report`, also when its first argument starts with `--`.
-The CLI has `report`, `save`, `compare`, `trend` and `hourly`; `report` takes `--role` and `--by settings|week`.
+The CLI has `report`, `save`, `compare`, `trend`, `hourly` and `changes`; `report` takes `--role` and `--by settings|week`.
+`report` shows the `--where` value in the settings column and omits rows with no samples.
+`changes [--since TIME] [--files] [--detail]` lists tracked settings changes, newest first, after one summary line of verdict counts.
+It compares `changes_window_hours` before and after each change, per machine, family and role.
+A Claude setting is judged only for Claude roles, and a Codex setting only for Codex roles; a tracked file counts for both.
+Each request is split by time and by the settings it ran with. A session counts only on the side with more matching requests.
+Each measure needs `changes_min_sessions` sessions on each side; a role is judged when at least one measure qualifies, and its line names the measures with too few samples.
+Lower is better for all four measures. A change under `changes_min_percent` is noise.
+The verdicts are better, worse, mixed (named measures moved both ways), no clear change, and too few sessions.
+Roles with too few sessions share one `not judged` line. Other settings, model and CLI changes in the window, and file edits grouped per file, share one `also changed` line.
+By default only settings changes are listed; `--files` adds tracked file edits. `--detail` prints every measure with its sample counts.
+The `/context_economy` command does not print this report by default. It writes a short summary: one table per settings change, the other changes, a trust line and a next step. `--raw` prints the report unchanged.
+The verdicts describe observed movement, not proven cause.
 `hourly` reads only the ledger, so it lags by up to one collection. It shows active unit directors and weighted cost for the last `hourly_recent_hours` complete hours. Its normal and busy rows are the median and p75 of the `hourly_baseline_days` before those hours.
 The default window covers the last seven days.
 Bounds use `scripts.lib.user_zone.user_zone`.
@@ -243,7 +255,31 @@ Those requests remain in context quantities and contribute no cost samples.
 Resumes do not split this count or discard compaction pairs.
 
 The Mac reader uses one SSH call.
-It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac prints JSON lines and writes nothing.
+It sends the reader modules to `python3 -c` (`collect.bootstrap_program`); the Mac returns summary JSON lines.
+Both machines keep parsed events and complete-line checkpoints under `~/.cache/context_economy/`.
+A warm read reuses unchanged files; an appended file resumes with its saved parser state.
+Before resuming a grown file, the cache checks its device, inode, saved size, and complete-line offset.
+It compares BLAKE2b hashes of the first 4 KiB and the last 4 KiB before that offset.
+A failed check causes a full parse.
+These anchors assume append-only transcripts; they do not detect edits between the two blocks.
+Unchanged files need no anchor read.
+The cache batches access updates at close and uses durable SQLite WAL transactions for entry writes.
+Parsing holds no database transaction.
+Eviction reads payload lengths only when the cache exceeds its size bound.
+The cache stores all events before the report applies its time window.
+Each report reuses settings lookups for the same start time and machine.
+The cache uses resolved logical paths; `x.jsonl` and `x.jsonl.zst` share one entry.
+Summaries remain available after their transcript files are deleted.
+The cached source mtime still controls the old-file skip rule.
+A compressed file uses its saved entry; a compressed file without an entry uses the shared zstd reader once.
+`TranscriptCache.mark_final(path)` lets the compressor mark a saved summary as final.
+`cache_max_megabytes` in `config/context_economy.conf` bounds reproducible summaries, using least recent access first.
+Entries whose plain source files are compressed or deleted remain protected, even when the cache exceeds that bound.
+Long reads show file progress on stderr, including skipped files and progress from the Mac.
+`progress_seconds` in the same config sets the progress update interval.
+Natedev sends both values in the Mac request.
+The Mac uses these request values without reading the new keys from its checkout config.
+Transcript files remain unchanged.
 `CONTEXT_ECONOMY_MAC_COMMAND` (a JSON list) replaces the SSH command, for tests and a forced failure.
 `mac_timeout_seconds` in `config/context_economy.conf` limits it to 300 seconds by default.
 A failed read prints `mac: <reason>` on `report` and `save`; local measurements remain available.
@@ -450,3 +486,49 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 - **The compaction limit stays 100,000.** In the replay every higher limit used more weighted tokens and sent more requests over 272,000 input tokens; no rule came in at least 5% under the base.
 - **A roster revision, not a comparison of status, turn id and size.** A turn's ending write removes its turn id, so a newer turn that ends with the same status and size would pass a field comparison.
 - **The size after a compaction is a named state.** Codex reports 0 for the compaction turn; storing 0 hides the size, and keeping the size from before would compact the worker before every follow-up.
+
+## Transcript retention
+
+`scripts/usage/transcript_retention.py` acts only on this machine.
+`config/transcript_retention.conf` sets `compress_after_days` to 14 and `delete_after_days` to 60.
+The command uses file mtime for the age rules.
+Only main transcripts of local staff rows of kind `showrunner`, `producer`, or `unit` have a keep rule.
+Live and retired rows keep their main transcript, regardless of its age.
+The staff record has no retirement timestamp.
+A retired row's main transcript stays plain while the row stays in the record.
+A cut for rows retired more than four weeks waits for a retirement time in the staff record.
+When the staff record no longer holds the row, its transcripts follow the age rule.
+A main transcript is `<current_session>.jsonl`, its `.zst` form, or a Codex rollout whose name ends with that session id.
+Subagent files under a session folder and worker transcripts follow the age rule.
+Compression writes a neighboring `.jsonl.zst`, preserves mtime and permissions, then removes the plain file.
+Deletion removes either form after the second age limit.
+A real run prints a flushed start line for each root with its compression and deletion counts.
+Each run prints one summary per transcript root and one total line.
+Each summary gives compression, deletion, and staff skip counts, plus freed GB with two decimals.
+Dry runs and real runs also print `kept plain` counts by staff kind.
+`--files` also prints each file action.
+`--dry-run` reports "would compress", "would delete", and "would free about" without changing transcripts or the summary cache.
+The dry run estimates compression savings from bounded samples instead of compressing every candidate.
+`sample_files` and `sample_bytes` in `config/transcript_retention.conf` limit each root to 20 samples of at most 1 MiB each.
+Deletion sizes remain exact, and a real run measures compression savings exactly.
+The shared `modules/common/transcript-retention.nix` in the nixos repo schedules the command daily at 04:30 local time on both machines.
+
+`scripts/lib/transcripts.py` owns the seekable binary reader for both forms.
+Decompression uses zstd and temporary disk storage rather than holding the transcript in memory.
+Usage collection, context economy, screenshot reports, model study, reply review, nightly review, Codex pacing, inventory, and build-launch collection use it.
+The folder audit uses it for transcript discovery, creation commands, and session start times.
+The screenshot report sends the same reader source to the Mac.
+The hana_shot report reads timing records rather than transcripts and needs no change.
+`usage/rollouts.py` already parses supplied streams and needs no reader change.
+Model-study reports, usage outcomes, and screenshot episode reports read saved measurements and need no transcript change.
+Active hooks, `production/worker_admission.py`, and worker lifecycle readers retain plain reads.
+Recent worker transcripts stay plain through the age rule.
+`message/sessions.py` and `message/rca.py` locate active sessions and do not parse historical transcripts.
+`shot_report/transcripts.py` retains `rg` only for plain-file candidate selection; its archive selection and parsing use the shared reader.
+`nightly_review` sends selected paths to the reply review subprocess, which uses the shared reader.
+The remaining `rg` subprocesses in `production/waiting.py` and `style/candidate_generators.py` inspect checkout files rather than transcripts.
+
+Claude Code 2.1.319's `nt` cleanup keeps subagent folders while the parent transcript remains in the project's file set.
+Thus an old subagent can remain under a recently resumed parent despite the default 30-day period.
+The installed executable contains this condition before its `subagents`, `workflows`, and `remote-agents` loop: `if(!C.has(_.name))`.
+This command applies each file's own mtime independently.

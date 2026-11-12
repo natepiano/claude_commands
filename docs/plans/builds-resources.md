@@ -1919,51 +1919,23 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** a changed push text needs a new approval record before a phone push sends. While approval is stale, the natedev message still sends and the phone receipt stays pending.
 
-### Phase 88 — The hana CI margin key goes after the runner activation  · status: todo
+### Phase 88 — The hana CI margin key goes after the runner activation  · status: done
 
-**Depends on:** Phase 100, queue's 10d (landed 2026-11-10, e9fe34ff1), natedev's confirmation that the runners are active behind the cargo front, and the user's approval of a config key deletion. Source: builds-queue Phase 22, moved to resources by builds on 2026-11-08 (queue had too much work).
+#### As-built
 
-#### Work Order
-
-**Goal:** A registered CI job is charged only through its reservation. The fixed CI margin is gone.
-
-**Spec:**
-
-1. **The wait.** natedev confirms the runner activation. resources then files the key deletion with /unit:question, because a config key deletion needs the user's approval. Do not start before both answers are on the plan.
-2. **The deletion.** `ci_memory_margin_gib` leaves `config/build_admission.conf` and `AdmissionPolicy` (`ci_memory_margin_bytes`, `admission_records.py:77`). `ci_keep_aside` (`scripts/lint/memory_admit.py`) and the mixed rule go with it.
-   The readers of the room's `ci_keep_aside` lose their CI keep-aside text: `scripts/build_queue/queue_evidence.py` (lines 118 and 223-224) and `scripts/build_queue/memory_feed.py` (lines 555 and 828).
-   `memory_feed.py` line 556 prints `CI builds do not wait in the queue yet.` Remove that line, because the runner activation makes it false.
-   The key also leaves the test fixture `scripts/lint/fixtures/build_admission.conf` (line 17).
-3. **The limit.** A CI job that the front cannot cover has no keep-aside. `MemoryMax=34G` is its limit. The notice says so.
-4. **Proof.** Tests: registered jobs still have no keep-aside; an unregistered job counts once in the cap and now takes no margin, so the room rises only in that case. Remove or change the tests of the mixed rule only with an approved assertion change. Three modules hold such tests:
-   - `scripts/lint/test_memory_admit.py`.
-   - `scripts/build_queue/test_queue_evidence.py`: `test_release_advice_retains_the_running_ci_keep_aside` (line 481) expects the running CI margin to keep the head held and the room to fall from 15 GiB to 8 GiB.
-   - `scripts/build_queue/test_queue_view.py`: `test_running_ci_names_its_keep_aside_in_the_view_and_card` (line 609) expects `CI keep-aside 7.0 GiB` in the view and the card.
-
-   No test covers the `hana CI` page text. Add one test in `scripts/build_queue/test_memory_feed.py` with a registered and an unregistered CI job: each job counts once, and the page has no `CI builds do not wait in the queue yet.` line and no CI margin text.
+- Admission keeps no fixed CI margin. `ci_memory_margin_gib` is gone from `config/build_admission.conf` and `scripts/lint/fixtures/build_admission.conf`; `AdmissionPolicy` has no `ci_memory_margin_bytes`; `CIKeepAside`, `MemoryRoom.ci_keep_aside`, `memory_admit.ci_keep_aside` and `NO_CI_KEEP_ASIDE` are gone.
+- Room is free memory minus safety minus run keep-asides. A registered CI job counts in its run reservation. An unregistered CI job counts once, through its live use in the cap. A CI job the cargo front cannot cover has no keep-aside; `MemoryMax=34G` is its limit.
+- The queue view, the queue card and the build memory page show no CI keep-aside. The page has no `ci_kept` or `shown_ci_kept` field and no `CI builds do not wait in the queue yet.` line.
+- The deletion followed the runner activation (both hana Linux runners connect to the admission socket) and the user's approval of the key deletion, both on 2026-11-11.
 
 **Files:**
-- `config/build_admission.conf`
-- `scripts/build_queue/admission_records.py`
-- `scripts/lint/memory_admit.py`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/build_queue/test_queue_evidence.py`
-- `scripts/build_queue/queue_evidence.py`
-- `scripts/build_queue/memory_feed.py`
-- `scripts/build_queue/test_queue_view.py`
-- `scripts/build_queue/test_memory_feed.py`
-- `scripts/lint/fixtures/build_admission.conf`
-- `docs/as-built/build-memory-admission.md`
+- `scripts/lint/memory_admit.py` — the room calculation.
+- `scripts/build_queue/admission_records.py` — policy and room records.
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html` — queue and page text with no CI keep-aside.
+- `docs/as-built/build-memory-admission.md` — the room calculation and the 34 GiB limit.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py`, `scripts/build_queue/test_memory_feed.py` — room, release advice, view and page rows; the page test covers zero, one and two registered jobs.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` owns `config/build_admission.conf`, `admission_records.py`, `memory_admit.py`, `queue_evidence.py`, `memory_feed.py` and the as-built doc.
-- `test` owns `test_memory_admit.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py` and `scripts/lint/fixtures/build_admission.conf`.
-
-**Gate:** the targeted test; `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_evidence.py`, `scripts/build_queue/test_queue_view.py` and `scripts/build_queue/test_memory_feed.py` pass; and `basedpyright` 0/0/0 on each changed file and each caller module.
-
-**Change-Review:** The queue view, the queue card and the build memory page show no CI keep-aside while a hana CI job runs | Open the queue view while a hana CI job runs | No `CI keep-aside` line shows, and the room counts the CI job once.
-
-Registered jobs already take no margin: `test_registered_and_unregistered_jobs_each_enter_the_cap_once` (`test_memory_admit.py:6058`).
+**Gotchas:** the reader ignores the old key in a live config and the old fields in saved records, so no migration runs.
 
 ### Phase 89 — The Mac folder audit reads process use and acts  · status: done
 
@@ -2219,3 +2191,78 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_hold/test_hold_enforcer.py` — the stop test with earlier log lines.
 
 **Gotchas:** an open through `/proc/<pid>/fd/N` makes a new open file description at offset 0; only `O_APPEND` puts a write at the end of a regular file.
+
+### Phase 103 — A build that cannot name its run says so while it waits on a hold  · status: done
+
+#### As-built
+
+- `build_hold.run_resolution(environment) -> RunOwner | NoRunNamed | RunNotInStaff` reads the run folder from `UNIT_RUN_DIR`, `PLAN_DELEGATE_BOARD_DIR`, `UNIT_SESSION_DIR` or `PLAN_DELEGATE_SESSION_DIR` and matches it to a staff row's `OpenRun` path. An unreadable staff snapshot counts as no row. `owning_session` calls it and keeps its return type and behavior.
+- `build_targets.command_wait_local`: when a hold blocks and the run is `RunNotInStaff`, or the owner is `NoOwningSession`, the wait prints one line on stderr, once per wait, right after the `natedev is held by …` announcement: `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` or `<speaker>: build has no session; waits on <holder> hold for <purpose>.` A resolved owner prints nothing new.
+- `tell_wait_holder` sends the same line to `session:<holder key>` through `session_send.send_argv`, with a timeout from `hold_sender_timeout_seconds` (30, range 0.01..300) in `config/build_targets.conf`. A timeout, an `OSError`, an unusable key or a non-zero exit prints `<speaker>: could not tell <holder>: <reason>`; the wait goes on with the same exit status.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — `run_resolution` and its three frozen outcome types.
+- `scripts/build_targets/build_targets.py` — the wait line and `tell_wait_holder`.
+- `config/build_targets.conf` — `hold_sender_timeout_seconds`.
+- `scripts/direct/verify_hold_wait_test_support.py` — `local_hold_environment` patches `build_targets.tell_wait_holder`.
+- `docs/as-built/build-targets.md` — the `wait-local` line and `run_resolution` beside `owning_session`.
+- `scripts/build_hold/test_build_hold.py`, `scripts/build_targets/test_build_targets.py` — rows for each resolution, each line, a resolved owner, a failed send and a missing timeout key.
+
+**Gotchas:** the `local_hold_environment` patch reaches only an in-process wait. A wait that `verify.sh` starts as a child process runs the real `tell_wait_holder`, inside the fixture `HOME` and `XDG_STATE_HOME`.
+
+### Phase 104 — Each hold release notice names its hold, so a repeat guard does not hold it  · status: done
+
+#### As-built
+
+- `release_notice(holders)` adds `Released holds: <name> hold for <purpose>, from <HH:MM:SS zone>; …` to `RELEASE_NOTICE`, one entry for each holder, with the time in the user zone. A holder with no purpose reads `<name> hold, from <time>`. Seconds keep the texts of holds in one minute different.
+- `send_release(entry, socket, notice)` and `send_release_broadcast(notice)` send that text. `send_cycle_notices` makes it from `cycle["holders"]`.
+- `start_hold` writes `{"name", "purpose", "since", "released_at"}` into the cycle holders, because the holder file is gone at release.
+- `ReleaseIntent` has `holder_purpose` and `cycle_holders` (both `NotRequired`). `finish_recorded_notices` uses `cycle_holders` for the recovered cycle and the broadcast. An old intent falls back to its one holder.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — release notice text, cycle holder record, release intent.
+- `scripts/build_hold/test_build_hold.py` — `ReleaseDeliveryTests` rows: current-cycle, old-cycle, multiple-holders, recovered-cycle, broadcast, same-minute.
+- `scripts/build_hold/test_hold_enforcer.py` — the drain test's `send_release` fake takes the notice.
+- `docs/as-built/build-targets.md` — the release notice text.
+
+**Gotchas:** a `side_effect` fake of `send_release` must take three arguments.
+
+**Ruled out:** a start time with minutes only — three holds in one minute give equal texts.
+
+### Phase 105 — The Mac floor alert lists the build output inside each Mac test copy  · status: done
+
+#### As-built
+
+- When the Mac disk falls below the alert line, the alert lists each Mac cargo target with its size in GiB, marks held ones, and recommends the largest target that is not held.
+- `mac_folder_measurement(policy: MacFloor, targets: Sequence[str])` measures each root's direct children and each target in `targets` with `mac_folder_reclaimable_bytes`. It skips targets that no longer exist and symlinked targets. It does not scan the roots again.
+- `FloorOutcome.targets` holds `SearchedFloorTargets` (the target list `_hold_floor_pass` found, filtered by `policy.allows`; a search with no targets gives an empty one) or `FloorTargetsNotSearched`.
+- A Mac crossing alert sends only after a pass that searched for targets. Failure alerts and natedev alerts do not wait for a search.
+- `folder_choice_lines` lists no choice that is inside, or holds, an earlier listed choice.
+- `folder_choices` keeps the Phase 99 rule: a folder with a `Cargo.toml` or `.git` is not a choice.
+
+**Files:**
+- `scripts/lint/sweep.py` — the Mac measurement, `SearchedFloorTargets`, `FloorTargetsNotSearched`, the crossing gate and the choice overlap rule.
+- `scripts/lint/test_sweep.py` — rows for nested, held nested and symlinked targets, overlapping targets, and passes that end before the search.
+- `docs/as-built/build-memory-admission.md` — the Mac measurement paragraph.
+
+**Gotchas:** when the Mac `sweep_floor_gib` falls below `sweep_phone_floor_gib`, a pass with free space between the two values returns before the search, so the Mac crossing alert never sends. Both values are 150 today.
+
+**Ruled out:** a second root scan in the alert path.
+
+### Phase 106 — The hold module has no import cycle  · status: done
+
+#### As-built
+
+- `scripts/build_hold/owning_session.py` owns `OwningSession(session_id: str)` and `NoOwningSession`. It imports no repository module. Every caller imports the types from it; `build_hold` keeps no re-export.
+- `placement.SubmittingSession` and `claim_state.SubmittingSession` are `OwningSession | NoOwningSession`, imported at run time. `placement.py` has no deferred import class.
+- `hold_enforcer.admitted_processes() -> frozenset[ProcessIdentity]` reads the durable grants. It imports `admission_service` inside the function. `build_hold.audit_builds` reads it through `hold_enforcer()`, and the `HoldEnforcer` protocol names it.
+- `build_hold` does not import `admission_service`. `basedpyright` reports no import cycle over the hold, queue, target and Mac test modules.
+
+**Files:**
+- `scripts/build_hold/owning_session.py` — the two session types.
+- `scripts/build_hold/build_hold.py` — imports the types as `session_owner` because its own function is named `owning_session`.
+- `scripts/build_hold/hold_enforcer.py` — `admitted_processes`.
+- `scripts/build_queue/placement.py`, `scripts/build_queue/admission_service.py`, `scripts/build_targets/build_targets.py`, `scripts/mac_test/claim_state.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — import the types from the new module.
+- `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
+
+**Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.

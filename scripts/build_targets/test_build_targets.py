@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Generator, Iterable
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,15 +20,19 @@ from unittest import mock
 import unittest
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold
-from scripts.mac_test import mac_test, offload
+from scripts.mac_test import claim_state, mac_test, offload
 from scripts.build_targets import targets
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
+from scripts.message import session_send
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
 from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -45,6 +49,7 @@ REAL_SUBPROCESS_POPEN = subprocess.Popen
 REAL_PROCESS_START_TIME = build_hold.process_start_time
 REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
 REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
+WAITING_SESSION = OwningSession("waiting-session")
 
 
 @contextmanager
@@ -838,14 +843,14 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
     def test_explicit_session_keeps_the_block_exemption_out_of_the_environment(self) -> None:
         self.write_block()
         target = targets.SshTarget("mac", "macos", self.settings)
-        for session in (build_hold.OwningSession("hana-session"), build_hold.OwningSession("other-session"),
-                        build_hold.NoOwningSession(), build_hold.OwningSession("hana-session")):
+        for session in (OwningSession("hana-session"), OwningSession("other-session"),
+                        NoOwningSession(), OwningSession("hana-session")):
             with self.subTest(session=session), \
                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "service-session"}), \
                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture-mac")):
                 result = build_targets.ssh_target_eligibility(
                     target, self.root, "portable", "test", targets.AnyEligibleTarget(), session=session)
-            if session == build_hold.OwningSession("hana-session"):
+            if session == OwningSession("hana-session"):
                 self.assertEqual(result, targets.EligibleTarget(target))
             else:
                 self.assertEqual(result, targets.ExcludedTarget(target, "blocked"))
@@ -862,6 +867,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
+            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILD_TARGETS_POLL_S": "0.01",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.root / "wait-seconds"),
             "BUILDLOG_HOLD_WAITER_FILE": str(self.root / "waiter"),
@@ -879,11 +885,12 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.sleeps += 1
         _ = build_hold.release_cycle(self.holders, "hana")
 
-    def wait(self) -> tuple[int, str, str]:
+    def wait(self, *, session: OwningSession | NoOwningSession | claim_state.CallingSession
+             = WAITING_SESSION) -> tuple[int, str, str]:
         output = io.StringIO()
         errors = io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
-            code = build_targets.command_wait_local("call-a", pid=12345)
+            code = build_targets.command_wait_local("call-a", pid=12345, session=session)
         return code, output.getvalue(), errors.getvalue()
 
     def test_damaged_cycle_pointer_waits_for_unlink_without_reading_user_zone(self) -> None:
@@ -946,6 +953,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                     process = subprocess.Popen(
                         [str(Path(__file__).resolve().parents[1] / "lib/py"), build_targets.__file__, "wait-local", "--call-id", f"call-{index}"],
                         env={**os.environ, "BUILDLOG_HOLD_WAITER_FILE": str(self.root / f"waiter-{index}"),
+                             "CLAUDE_CODE_SESSION_ID": "waiting-session",
                              "BUILDLOG_HOLD_WAIT_FILE": "", "BUILD_TARGETS_POLL_S": "3600"},
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     )
@@ -988,7 +996,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
              mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN), \
              redirect_stdout(io.StringIO()), redirect_stderr(errors):
-            code = build_targets.command_wait_local("call-a", pid=os.getpid(), leave_hook=leave_hook)
+            code = build_targets.command_wait_local("call-a", pid=os.getpid(), leave_hook=leave_hook,
+                                                    session=OwningSession("waiting-session"))
         return code, errors.getvalue()
 
     def count_sleep(self, _seconds: float) -> None:
@@ -1233,13 +1242,22 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                                 build_hold.holder_path(self.holders, session).unlink()
 
                         with self.subTest(command="wait-local"), \
-                             mock.patch.object(build_targets, "wait_sleep", side_effect=other_releases):
-                            result = self.wait()
+                             mock.patch.object(build_targets, "wait_sleep", side_effect=other_releases), \
+                             mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as send:
+                            result = self.wait(session=claim_state.CALLING_SESSION)
                             self.assertEqual(result, (
                                 0, "", "verify.sh: natedev is held by peer for peer checks; waiting "
-                                + "(tests that can run on the Mac keep running there).\n",
+                                + "(tests that can run on the Mac keep running there).\n"
+                                + ("verify.sh: build has no session; waits on peer hold for peer checks.\n" if not owner else ""),
                             ) if others else (0, "", ""))
                             self.assertEqual(self.sleeps, int(bool(others)))
+                            if others and not owner:
+                                send.assert_called_once_with(session_send.send_argv(
+                                    "--to", "session:peer", "--text",
+                                    "verify.sh: build has no session; waits on peer hold for peer checks."),
+                                    capture_output=True, text=True, errors="replace", timeout=30)
+                            else:
+                                send.assert_not_called()
                 finally:
                     for session in sessions:
                         build_hold.holder_path(self.holders, session).unlink(missing_ok=True)
@@ -1285,6 +1303,74 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             self.assertEqual(self.verify_calls("holder-session"), (10, 10, 0))
         self.assertEqual(self.sleeps, 1)
         self.assertFalse((self.root / "registration").exists())
+        build_hold.holder_path(self.holders, "holder-session").unlink()
+
+        cases = (
+            ("missing-run", True, False, "stale-session", 0, "", "", 30),
+            ("resolved-run", True, True, "stale-session", 0, "", "", 30),
+            ("no-session", False, False, "", 0, "", "", 30),
+            ("refused-send", True, False, "stale-session", 2, "REFUSED: session cannot take messages", "", 30),
+            ("send-timeout", True, False, "stale-session", 2, "", "import time; time.sleep(1)", 0.05),
+            ("invalid-bytes", True, False, "stale-session", 2, "\ufffd", "import os; os.write(2, bytes([255]))", 30),
+            ("unreadable-timeout", True, False, "stale-session", 2, "", "", 30),
+        )
+        for label, named, resolved, shell_session, send_status, send_error, program, timeout in cases:
+            with self.subTest(case=label), isolated_staff_file(self.root / "staff.json", {}):
+                self.sleeps = 0
+                run = self.root / label
+                configuration = self.root / ".claude/config"
+                _ = write_config_fixture(configuration / "build_targets.conf",
+                                         f"# range: 0.01..300\nhold_sender_timeout_seconds={timeout}\n")
+                if label == "unreadable-timeout":
+                    _ = (configuration / "build_targets.conf").write_text(
+                        "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+                sender = [sys.executable, "-c", (program or f"import sys; sys.stderr.write({send_error!r})")
+                          + f"; raise SystemExit({send_status})"]
+                sender_arguments = mock.Mock(return_value=sender)
+                if resolved:
+                    row = fixture_member("showrunner", name="run-owner", runtime_id=fixture_runtime_id("run-owner"))
+                    _ = staff.set_run(row.id, staff.OpenRun(run))
+                self.begin_hold()
+
+                def release_after_two_polls(_seconds: float) -> None:
+                    self.sleeps += 1
+                    if self.sleeps == 2:
+                        build_hold.holder_path(self.holders, "hana").unlink()
+
+                with mock.patch.dict(os.environ, {
+                    "UNIT_RUN_DIR": str(run) if named else "",
+                    "CLAUDE_CODE_SESSION_ID": shell_session,
+                    "CONF_DIR": str(configuration),
+                }), mock.patch.object(build_targets, "wait_sleep", side_effect=release_after_two_polls), \
+                     (mock.patch.object(session_send, "send_argv", sender_arguments)
+                      if program or label == "unreadable-timeout" else nullcontext()), \
+                     mock.patch.object(subprocess, "Popen", REAL_SUBPROCESS_POPEN), \
+                     mock.patch.object(subprocess, "run", side_effect=REAL_SUBPROCESS_RUN if program else None,
+                                       return_value=subprocess.CompletedProcess([], send_status, "", send_error)) as send:
+                    code, output, errors = self.wait(session=claim_state.CALLING_SESSION)
+                self.assertEqual((code, output, self.sleeps), (0, "", 2))
+                announcement = ("verify.sh: natedev is held by hana for render checks; waiting "
+                                + "(tests that can run on the Mac keep running there).\n")
+                if resolved:
+                    self.assertEqual(errors, announcement)
+                    send.assert_not_called()
+                else:
+                    missing = f"no run pointer ({run})" if named else "no session"
+                    line = f"verify.sh: build has {missing}; waits on hana hold for render checks."
+                    failure = (f"verify.sh: could not tell hana: stderr: {send_error}\n" if send_status else "")
+                    if label == "send-timeout":
+                        failure = f"verify.sh: could not tell hana: send timed out after {timeout:g} seconds\n"
+                    if label == "unreadable-timeout":
+                        self.assertIn(announcement + line + "\nverify.sh: could not tell hana: ", errors)
+                        self.assertIn("hold_sender_timeout_seconds", errors)
+                        sender_arguments.assert_not_called()
+                    else:
+                        self.assertEqual(errors, announcement + line + "\n" + failure)
+                    self.assertEqual(errors.count(line), 1)
+                    if label != "unreadable-timeout":
+                        send.assert_called_once_with(sender if program else session_send.send_argv(
+                            "--to", "session:hana", "--text", line),
+                                                     capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()

@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
+from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
 
 from scripts.buildlog import launches
@@ -123,6 +124,23 @@ class LaunchTests(unittest.TestCase):
             },
         }
         _ = (self.root / launches.STATE_NAME).write_text(json.dumps(state))
+
+    def test_compressed_transcripts_keep_launches_and_their_resume_cursor(self) -> None:
+        entry = cast(Record, json.loads(result_line("session-one", "font_features", self.worktree)))
+        del entry["sessionId"]
+        _ = self.transcript.write_text(json.dumps(entry) + "\n")
+        first = self.run_cli("launches")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        records = self.records()
+        self.assertEqual(records[0]["session"], "session-one")
+        _ = compressed_copy(self.transcript)
+        second = self.run_cli("launches")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.records(), records)
+        (self.root / launches.STATE_NAME).unlink()
+        third = self.run_cli("launches")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(self.records(), records)
 
     def test_launches_record_nested_result_and_only_new_complete_lines(self) -> None:
         first = result_line("session-one", "font_features", self.worktree, duration_ms=1_468_425)

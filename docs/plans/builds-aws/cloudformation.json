@@ -1760,6 +1760,24 @@
           "RoleId"
         ]
       }
+    },
+    "GateProfileArn": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateProfile",
+          "Arn"
+        ]
+      }
+    },
+    "GateRoleArn": {
+      "Condition": "Gates",
+      "Value": {
+        "Fn::GetAtt": [
+          "GateRole",
+          "Arn"
+        ]
+      }
     }
   }
 }

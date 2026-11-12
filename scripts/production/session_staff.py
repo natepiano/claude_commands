@@ -6,7 +6,6 @@ except FileNotFoundError:
     pass
 
 import sys
-import fcntl
 import json
 import shlex
 import subprocess
@@ -248,10 +247,14 @@ def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
             for raw in entries.values() if isinstance(raw, dict) and cast(dict[str, object], raw).get("staff_id")}
 
 
-def read_worker_roster(path: Path) -> dict[str, object]:
-    from scripts.agents import worker_lifecycle
-    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
-        return handle.read_object()
+def run_workers(state: Mapping[str, object], record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Read the selected run's workers from the same staff snapshot as its owner."""
+    from scripts.lib import unit_runs
+
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+        return ()
+    return tuple(record.find(kind="worker", parent=owner.id))
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:

@@ -6,6 +6,8 @@ try:
 except FileNotFoundError:
     pass
 
+from scripts.lib.transcripts import open_transcript, uncompressed_path
+
 import argparse
 import fcntl
 import hashlib
@@ -33,7 +35,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import conf_reads, nix_env
+from scripts.lib import conf_reads, models_registry, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -676,8 +678,8 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
 def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
                         timeout: float) -> tuple[str, str]:
     try:
-        result = runner(["bash", "-c", "source ~/.claude/scripts/agents/models_config.sh; " +
-                         "agents_resolve_print message_review.reviewer"],
+        result = runner(["bash", "-c", 'source "$1" && agents_resolve_print message_review.reviewer', "review-model",
+                         str(Path(__file__).resolve().parents[1] / "agents/models_config.sh")],
                         timeout=timeout, env=environment)
         fields = dict(item.split("=", 1) for item in result.stdout.split() if "=" in item)
         if result.returncode == 0 and fields.get("agent") and fields.get("effort"):
@@ -754,10 +756,6 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
         draft_prompt = zone_line() + "\n" + draft_prompt
-        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
-                   "--system-prompt", guide.stdout + "\n" + prompt,
-                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
-                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
         loaded = nix_env.ensure(Path.cwd(), environment)
@@ -766,6 +764,11 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         from scripts.lib.models_registry import agent_environment
 
         environment = agent_environment(loaded.env)
+        model = models_registry.claude_model(model, environment)
+        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
+                   "--system-prompt", guide.stdout + "\n" + prompt,
+                   "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
+                   "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
         result = runner(command, timeout=remaining(), env=environment)
         if result.returncode != 0:
             return Unreviewed(f"reviewer exit {result.returncode}", details())
@@ -1304,7 +1307,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
     replies: list[TranscriptReply] = []
     previous = ""
     seen: set[str] = set()
-    with path.open(encoding="utf-8") as transcript:
+    with open_transcript(path) as transcript:
         for line in transcript:
             try:
                 record = _object(cast(object, json.loads(line)))
@@ -1331,7 +1334,7 @@ def transcript_replies(path: Path, since: datetime) -> list[TranscriptReply]:
             except ValueError:
                 continue
             if stamp >= since:
-                replies.append(TranscriptReply(text, ReplyContext(path, stamp, previous)))
+                replies.append(TranscriptReply(text, ReplyContext(uncompressed_path(path), stamp, previous)))
             previous = text
     return replies
 

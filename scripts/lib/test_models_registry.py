@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pwd
 import subprocess
@@ -133,6 +134,25 @@ def write_registry(path: Path, overrides: RegistryOverrides = NO_OVERRIDES, *,
     return path
 
 
+def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> dict[str, str]:
+    """Create a catalog and CLI fixture for a Claude account."""
+    catalog = directory / "cache/model-catalog/fixture-cc.json"
+    catalog.parent.mkdir(parents=True, exist_ok=True)
+    _ = catalog.write_text(json.dumps({
+        "fetchedAt": 2000,
+        "catalog": {"config": {
+            "provider_alias_targets": {word: {"default": target} for word, target in targets.items()},
+            "models": [{"id": target, "min_claude_code_version": "2.1.319"} for target in targets.values()],
+        }},
+    }))
+    binaries = directory / "bin"
+    binaries.mkdir(exist_ok=True)
+    claude = binaries / "claude"
+    _ = claude.write_text("#!/bin/sh\nprintf '%s\\n' '2.1.319 (Claude Code)'\n")
+    claude.chmod(0o755)
+    return {"CLAUDE_CONFIG_DIR": str(directory), "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", "")}
+
+
 class LaunchSettingsTests(unittest.TestCase):
     root: Path = Path()
     path: Path = Path()
@@ -143,6 +163,7 @@ class LaunchSettingsTests(unittest.TestCase):
         self.path = self.root / "models.conf"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
+            "CLAUDE_CONFIG_DIR": str(self.root / "claude-config"),
             "MODELS_CONFIG_FILE": str(self.path),
             "MODELS_CONFIG_PUBLISH": "0",
             "MODELS_CONFIG_TIER_ONLY": "1",
@@ -213,21 +234,32 @@ class LaunchSettingsTests(unittest.TestCase):
     def test_launch_settings_starts_no_python_registry_process(self) -> None:
         from scripts.lib import models_registry
 
-        _ = write_registry(self.path)
+        _ = write_registry(self.path, {
+            "assignments": {"producers": "claude"},
+            "producers.claude": {"dwight": "fable:max"},
+            "producers": {"dwight": "claude:fable:max"},
+        })
         text = self.path.read_text()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, claude_catalog_environment(
+            self.root / "claude-config", {"fable": "claude-fable-fixture-current"}))))
         log = self.root / "python-processes"
         probe = self.root / "process-probe"
         probe.mkdir()
         _ = (probe / "sitecustomize.py").write_text(
             "import sys\n"
             + f"with open({str(log)!r}, 'a') as output: output.write(sys.argv[0] + '\\n')\n")
-        for comment_length in (0, 70_000):
-            with self.subTest(comment_length=comment_length):
+        for comment_length, section, key, expected_model in (
+            (0, "direct", "impl", "gpt-test"),
+            (70_000, "direct", "impl", "gpt-test"),
+            (0, "producers", "dwight", "fable"),
+        ):
+            with self.subTest(comment_length=comment_length, section=section, key=key):
                 _ = self.path.write_text("#" + "x" * comment_length + "\n" + text)
                 _ = log.write_text("")
                 with patch.dict(os.environ, {"PYTHONPATH": str(probe) + os.pathsep + os.environ.get("PYTHONPATH", "")}):
-                    settings = models_registry.launch_settings("direct", "impl")
-                self.assertEqual(tuple(settings), self.shell_settings("direct", "impl"))
+                    settings = models_registry.launch_settings(section, key)
+                self.assertEqual(settings.model, expected_model)
+                self.assertEqual(tuple(settings), self.shell_settings(section, key))
                 self.assertEqual(log.read_text(), "")
 
     def test_invalid_launch_rows_fail_before_a_launcher_can_use_them(self) -> None:

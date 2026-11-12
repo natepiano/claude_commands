@@ -4248,27 +4248,22 @@ def _current_worker_cells(
 
 
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
-    """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
+    """Show accepted settings for the current staff workers and keep historical windows intact."""
     try:
-        roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
-    except worker_lifecycle.WorkerStateUnreadable:
+        membership = staff.local_snapshot()
+        workers = {row.id for row in session_staff.run_workers(_read_state(session_dir, record=membership), membership)}
+    except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
         return [{**window, "worker": "unavailable"} for window in windows]
-    membership = staff.local_snapshot()
-    owner = unit_runs.run_owner(worker_lifecycle.read_json_object(_state_path(session_dir)), membership)
-    slots: dict[str, str] = {}
-    for path in session_dir.glob("impl_worker_*.json"):
-        identity = worker_lifecycle.read_json_object(path)
-        slots[_string(identity.get("staff_id"))] = _string(identity.get("slot"))
     models: dict[str, str] = {}
-    for value in roster.values():
-        entry = _object_dict(value) or {}
-        reference = _string(entry.get("staff_id"))
-        member = membership.by_id(staff.StaffId(reference))
-        if (member is None or member.kind != "worker" or not isinstance(owner, staff.StaffRow)
-                or member.parent != staff.ReportsTo(owner.id)):
+    for path in session_dir.glob("impl_worker_*.json"):
+        try:
+            identity = worker_lifecycle.read_worker_state(path)
+        except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
             continue
-        settings = worker_lifecycle.recorded_turn_settings(entry)
-        slot = slots.get(reference) or _string(entry.get("slot"))
+        if identity.get("staff_id") not in workers:
+            continue
+        settings = worker_lifecycle.recorded_turn_settings(identity)
+        slot = _string(identity.get("slot"))
         if settings.model and slot:
             models[slot] = _agent_display(settings.model, settings.effort)
     result: list[StageWindow] = []
@@ -5703,13 +5698,8 @@ def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[
             "phase_instance_id": _string(phase.get("instance_id"))}
 
 
-def resolve_worker_pass(session_dir: Path, state: dict[str, object],
-                        thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
+def resolve_worker_pass(state: dict[str, object], thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
     """Select the current staff worker and its recorded dispatch reference."""
-    _ = session_dir
-    membership = staff.local_snapshot()
-    owner = unit_runs.run_owner(state, membership)
-    worker = membership.by_current_session(thread_id) if thread_id else None
     phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
     candidates: list[dict[str, object]] = [{"run_id": _string(state.get("run_id")),
                    "phase_instance_id": _pass_phase_instance(passed),
@@ -5720,8 +5710,13 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
                   for passed in _open_passes(state).values()]
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
-    if (worker is None or worker.kind != "worker" or not isinstance(owner, staff.StaffRow)
-            or worker.parent != staff.ReportsTo(owner.id)):
+    try:
+        membership = staff.local_snapshot()
+        worker = next((row for row in session_staff.run_workers(state, membership)
+                       if thread_id and row.current_session == thread_id), None)
+    except (OSError, ValueError) as error:
+        return UnresolvedWaitAttribution(f"worker staff unavailable: {error}", tuple(candidates))
+    if worker is None:
         return UnresolvedWaitAttribution("worker thread has no matching staff membership", tuple(candidates))
     matching = [candidate for candidate in candidates if candidate.get("worker_id") == worker.id]
     if len(matching) != 1:
@@ -5745,7 +5740,7 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
     instance_id = _optional_arg(args, "phase_instance_id")
     phase_id = _optional_arg(args, "phase_id")
     if hasattr(args, "worker_thread_id"):
-        return resolve_worker_pass(_session_dir(args), state, _optional_arg(args, "worker_thread_id"))
+        return resolve_worker_pass(state, _optional_arg(args, "worker_thread_id"))
     if hasattr(args, "director") and cast(bool, args.director):
         phases = [phase for phase in [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
                   if phase.get("status") == "active"]
@@ -5788,10 +5783,22 @@ def _start_wait(args: argparse.Namespace) -> None:
     if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
-    print(_record_wait(state, args))
+    result = _record_wait(state, args)
+    if isinstance(result, StartedWait):
+        print(result.wait_id)
 
 
-def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+@dataclass(frozen=True)
+class StartedWait:
+    wait_id: str
+
+
+@dataclass(frozen=True)
+class WaitNotRecorded:
+    wait_id: str
+
+
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedWait | WaitNotRecorded:
     holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
@@ -5838,7 +5845,7 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                      requested_phase_id=_optional_arg(args, "phase_id"),
                      requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
     _append_event(state, event)
-    return wait_id
+    return WaitNotRecorded(wait_id) if missing_reason else StartedWait(wait_id)
 
 
 def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
@@ -6266,8 +6273,8 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         args = argparse.Namespace(session_dir=str(session_dir), missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields,
                                   declaration_id=declaration)
-        wait_id = _record_wait(state, args)
-        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": wait_id}) + "\n")
+        result = _record_wait(state, args)
+        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": result.wait_id}) + "\n")
     return True
 
 

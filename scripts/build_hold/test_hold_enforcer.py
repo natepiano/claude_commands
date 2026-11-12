@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.agents import detached_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -152,7 +153,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 shutil.rmtree(self.proc / "21")
                 shutil.rmtree(self.proc / "20")
 
-        with mock.patch.object(build_hold, "admitted_processes", return_value=frozenset()), \
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
              mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()), \
              mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=private_stop), \
              mock.patch.object(hold_enforcer, "drain", side_effect=private_drain), \
@@ -172,7 +173,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(row["stopped_run"], {"pid": 10, "proc_start": "11000"})
         self.assertEqual(row["session"], "waiting-owner")
 
-        def notify(entry: build_hold.ReleaseEntry, socket: str) -> build_hold.ReleaseDelivered:
+        def notify(entry: build_hold.ReleaseEntry, socket: str, _notice: str) -> build_hold.ReleaseDelivered:
             self.assertEqual(socket, "/private/socket")
             notices.append(entry["session_id"])
             return build_hold.ReleaseDelivered()
@@ -200,7 +201,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     with self.subTest(admitted=admitted, claimed=claimed):
                         run, = hold_enforcer.classify_drain_runs(table, admitted, claimed)
                         self.assertIsInstance(run, expected)
-                        self.assertEqual(run.owner, build_hold.OwningSession("gate-owner"))
+                        self.assertEqual(run.owner, OwningSession("gate-owner"))
                 _ = self.process(20, argv[0], parent=10, start=11_001, argv=argv)
                 _ = self.process(21, "runner", parent=10, start=11_002)
                 _ = self.process(30, "cargo", parent=21, start=11_003, argv=("cargo", "test"))
@@ -301,7 +302,7 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertGreater(seconds, 0)
             raise KeyboardInterrupt
 
-        with mock.patch.object(build_hold, "admitted_processes", return_value=frozenset()), \
+        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
              mock.patch.object(hold_enforcer, "claimed_processes", return_value=frozenset()), \
              redirect_stdout(io.StringIO()) as output:
             status = hold_enforcer.drain(holder, self.proc, sleep=interrupt, clock=lambda: self.now)
@@ -366,7 +367,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(pid, "cargo", session="gate-owner",
                                  environment={"BUILDLOG_CALL_ID": "drain-call"})
                 process = self.table()[pid]
-                build = build_hold.AuditedBuild(process, build_hold.OwningSession("gate-owner"), "other_session", ())
+                build = build_hold.AuditedBuild(process, OwningSession("gate-owner"), "other_session", ())
                 if status == "legacy":
                     hold_enforcer.record_build(build, holder, self.proc, "stopped")
                 else:
@@ -468,7 +469,7 @@ class HoldEnforcerTests(unittest.TestCase):
         self.write_step("holder-call", step_record.StepState.ON_NATEDEV, 90)
         decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.AllowedBuild)
-        self.assertEqual(decision.owner, build_hold.OwningSession("holder"))
+        self.assertEqual(decision.owner, OwningSession("holder"))
 
     def test_stopped_run_writes_reason_and_log_registers_notice_then_terms_root_first_and_kills_survivor(self) -> None:
         root = self.process(30, "cargo", argv=("cargo", "check", "--workspace"), session="other")
@@ -518,9 +519,9 @@ class HoldEnforcerTests(unittest.TestCase):
         decisions = {item.process.identity.pid: item for item in self.decisions()}
         self.assertEqual(set(decisions), {20, 21, 31, 40})
         self.assertTrue(all(isinstance(item, hold_enforcer.WouldStopBuild) for item in decisions.values()))
-        self.assertEqual(decisions[21].owner, build_hold.OwningSession("codex-worker"))
+        self.assertEqual(decisions[21].owner, OwningSession("codex-worker"))
         self.assertEqual(decisions[21].process.cwd, "/dev/shm/mac-idle-suite-123/tmp456")
-        self.assertEqual(decisions[40].owner, build_hold.OwningSession("detached-session"))
+        self.assertEqual(decisions[40].owner, OwningSession("detached-session"))
 
     def test_waiting_merge_gate_and_verify_survive_while_their_build_children_stop(self) -> None:
         _ = self.process(30, "python3", argv=("python3", "merge_gate.py", "--checkout", "/tree", "--tests-only"), session="gate")
@@ -575,7 +576,7 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(20, "rust-analyzer", parent=10)
         decision, = self.decisions()
         self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
-        self.assertEqual(decision.owner, build_hold.OwningSession("rename"))
+        self.assertEqual(decision.owner, OwningSession("rename"))
         self.assertEqual(decision.process.identity.pid, 20)
 
     def test_holder_user_terminal_desktop_and_shared_server_pass_but_service_and_marked_terminal_stop(self) -> None:

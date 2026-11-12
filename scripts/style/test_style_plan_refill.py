@@ -448,6 +448,7 @@ class StylePlanTests(StylePlanFixture):
         self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
         self.assertNotEqual(self.tip, branch_tip)
         self.sync()
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
         self.assertEqual(self.count_tickets(), 1)
         self.assertEqual(self.sync_wait_rows(), [])

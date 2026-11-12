@@ -606,13 +606,13 @@ class QueueViewTests(QueueViewFixtureTests):
                     for hidden in ("idle", "2880", "2 days", "Runner.Listener"):
                         self.assertNotIn(hidden, row)
 
-    def test_running_ci_names_its_keep_aside_in_the_view_and_card(self) -> None:
+    def test_running_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
             model = self.ci_service_model(fixture, active=True)
             for source, lines in (("view", queue_view.render_view(model, 400)),
                                   ("card", queue_card.render_card(model, [], 400))):
                 with self.subTest(source=source):
-                    self.assertIn("CI keep-aside 7.0 GiB", plain(lines))
+                    self.assertNotIn("CI keep-aside", plain(lines))
 
     def test_idle_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1164,15 +1164,15 @@ class QueueViewTests(QueueViewFixtureTests):
 
     def test_live_bump_marks_every_unit_row_without_moving_columns(self) -> None:
         model = self.fixture.model()
-        for unit in ("cables", "widget"):
-            priority: admission_records.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor",
-                                            "transition": admission_records.SettledPriority()}
+        for units in (("cables",), ("widget",), ("cables", "widget")):
+            priority = admission_records.QueuePriority(tuple(
+                admission_records.PriorityEntry(unit=unit, why="test", set_at=NOW, set_by="actor") for unit in units))
             bumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=priority)))
             unbumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=admission_records.NoQueuePriority())))
             for columns in (40, 60, 80, 100, 140):
-                with self.subTest(unit=unit, columns=columns):
+                with self.subTest(units=units, columns=columns):
                     baseline = queue_view.render_view(unbumped, columns, you=ASKING_SESSION, selector="widget")
                     with mock.patch.object(head_facts, "queue_moves", side_effect=AssertionError("bump history read")), \
                          mock.patch.object(gate, "read_queue_priority", side_effect=AssertionError("live priority read")):
@@ -1184,7 +1184,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     steps = [row.step for row in queue_view.running_builds(model)] + list(model.reading.view.waiting)
                     self.assertEqual(len(rows), len(steps))
                     for row, before, step in zip(rows, previous, steps):
-                        expected = model.labels[step.session_id].unit == unit
+                        expected = model.labels[step.session_id].unit in units
                         self.assertEqual(sum(span.text == "●" for span in row), int(expected))
                         # The step, minutes, bars and selection mark retain their positions.
                         unit_end = 5 if expected else 4
@@ -1194,7 +1194,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     data = json_form(lines, columns, NOW)
                     self.assertEqual(sum(part["text"] == "●" and part.get("tone") == "warning"
                                          for row in data["lines"] for part in row),
-                                     sum(model.labels[step.session_id].unit == unit for step in steps))
+                                     sum(model.labels[step.session_id].unit in units for step in steps))
 
     def test_no_live_bump_keeps_the_recorded_board_bytes(self) -> None:
         model = self.fixture.cap_model()
@@ -1388,7 +1388,7 @@ class CapViewTests(QueueViewFixtureTests):
         bar = queue_view.cap_bar(room, 60, colour=True)
         self.assertEqual(plain([bar[:9]]), "█" * 9)
         self.assertEqual([span.tone for span in bar],
-            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
+            ["suggestion"] * 9 + ["warning"] * 5 + ["success"] * 12 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)

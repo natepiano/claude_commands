@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -26,7 +27,7 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
-from scripts.aws_target.config import account_settings_path, money, read_settings
+from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.queue_place import defer_cleanup_signals
 from scripts.build_targets import target_config
@@ -64,7 +65,8 @@ def save(path: Path, row: dict[str, object]) -> None:
 
 def capacity_error(reason: str) -> bool:
     return any(code in reason for code in ('InsufficientInstanceCapacity', 'InsufficientSpotCapacity',
-                                           'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded', 'SpotMaxPriceTooLow'))
+                                           'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded', 'SpotMaxPriceTooLow',
+                                           '(Unsupported)', '(InvalidInstanceType)', '(InvalidInstanceType.NotFound)'))
 
 
 def aws_down(reason: str) -> bool:
@@ -156,12 +158,19 @@ class GateWorker:
     def __init__(self, api: AwsCli, book: ledger.CostLedger, settings_path: Path, sidecar: Path, *,
                  clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep) -> None:
         self.api = api
+        self.box_region = api.region
+        self.apis: dict[str, AwsCli] = {api.region: api}
         self.book = book
         self.settings_path = settings_path
         self.sidecar = sidecar
         self.clock = clock
         self.pause = pause
         self.size_vcpus: int = 0
+
+    def regional_api(self, region: str) -> AwsCli:
+        if region not in self.apis:
+            self.apis[region] = self.api.in_region(region)
+        return self.apis[region]
 
     def publish_log(self, folder: Path) -> None:
         text = (folder / 'gate.log').read_text()
@@ -170,11 +179,13 @@ class GateWorker:
             progress_profile.publish_counter(self.sidecar, counter)
         cloud_progress.publish(self.sidecar, log_cloud_progress(text, self.size_vcpus, self.clock()))
 
-    def charges(self) -> None:
+    def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
         now = int(self.clock())
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
-            return fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+            readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+            record_query(sum((reading.query_usd for reading in readings), Decimal(0)))
+            return readings
         _ = self.book.refresh_charges(self.settings_path, now, fetch, gate_workload=True)
 
     def upload(self, bucket: str, key: str, path: Path) -> None:
@@ -190,39 +201,48 @@ class GateWorker:
             raise
 
     def terminate(self, attempt: str, instance: str) -> None:
-        _ = self.api.call('terminate-instances', '--instance-ids', instance)
+        api = self.regional_api(self.box_region)
+        _ = api.call('terminate-instances', '--instance-ids', instance)
         deadline = self.clock() + settings().number('termination_timeout_s')
         while self.clock() < deadline:
-            if self.api.observe(instance, int(self.clock())).state == 'terminated':
+            if api.observe(instance, int(self.clock())).state == 'terminated':
                 self.book.resolve_gate(attempt, ledger.GateTerminated(int(self.clock()), instance))
                 return
             self.pause(settings().number('result_poll_s'))
         raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
 
     def reconcile(self) -> None:
-        """Resolve expired launches and observe known gate instances."""
+        """Resolve expired launches in every region that can own them."""
         for reservation in self.book.read_snapshot().gate_reservations:
+            regions = (reservation.region,) if reservation.region else tuple(settings().words('regions'))
             if isinstance(reservation.state, ledger.GateRunning):
+                api = self.regional_api(reservation.region or self.api.region)
                 instance = reservation.state.instance_id
-                if self.api.observe(instance, int(self.clock())).state == 'terminated':
+                if api.observe(instance, int(self.clock())).state == 'terminated':
                     self.book.resolve_gate(reservation.attempt, ledger.GateTerminated(int(self.clock()), instance))
             elif isinstance(reservation.state, ledger.GateLaunchPending) and reservation.expires <= int(self.clock()):
-                reply = self.api.call('describe-instances', '--filters', 'Name=tag:GateAttempt,Values=' + reservation.attempt)
-                instances = [instance for group in ledger.rows(reply, 'Reservations')
-                             for instance in ledger.rows(group, 'Instances')]
-                if not instances:
+                found = False
+                for region in regions:
+                    api = self.regional_api(region)
+                    reply = api.call('describe-instances', '--filters', 'Name=tag:GateAttempt,Values=' + reservation.attempt)
+                    instances = [instance for group in ledger.rows(reply, 'Reservations')
+                                 for instance in ledger.rows(group, 'Instances')]
+                    if instances:
+                        found = True
+                        instance = ledger.text(instances[0], 'InstanceId')
+                        terminated = ledger.text(ledger.mapping(instances[0]['State']), 'Name') == 'terminated'
+                        self.book.gate_region(reservation.attempt, region)
+                        self.book.resolve_gate(reservation.attempt,
+                            ledger.GateTerminated(int(self.clock()), instance) if terminated else ledger.GateRunning(instance))
+                        break
+                if not found:
                     self.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(self.clock())))
-                else:
-                    instance = ledger.text(instances[0], 'InstanceId')
-                    terminated = ledger.text(ledger.mapping(instances[0]['State']), 'Name') == 'terminated'
-                    self.book.resolve_gate(reservation.attempt,
-                        ledger.GateTerminated(int(self.clock()), instance) if terminated else ledger.GateRunning(instance))
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
                       result: Literal['launched', 'refused', 'finished'], reason: str = '', *, gate_s: float = 0) -> None:
         error_code = launch_error_code(reason)
         row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
-            'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode']}
+            'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode'], 'region': self.box_region}
         if result == 'finished':
             row['gate_s'] = gate_s
         else:
@@ -236,15 +256,23 @@ class GateWorker:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
         if launch.get('instance'):
+            self.box_region = str(launch.get('region', self.api.region))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
-        variants = [(size, row) for size in sizes for row in ledger.rows(deployment, 'subnets')]
+        variants = [(regional, size, row) for regional in ledger.rows(deployment, 'regions')
+                    for size in sizes for row in ledger.rows(regional, 'subnets')]
         index = ledger.instant(launch, 'variant') if launch else 0
-        for offset in range(index, len(variants)):
-            size, subnet = variants[offset]
+        stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
+        for offset in range(index, stop):
             if launch.get('arguments') and offset == index:
                 arguments = ledger.mapping(launch['arguments'])
+                self.box_region = str(launch.get('region', self.api.region))
+                size = ledger.text(arguments, 'InstanceType')
+                zone = str(launch.get('zone', ''))
             else:
+                regional, size, subnet = variants[offset]
+                self.box_region = ledger.text(regional, 'region')
+                zone = ledger.text(subnet, 'zone')
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
@@ -262,28 +290,32 @@ class GateWorker:
                              boot_error=url('PUT', prefix + '/boot-error.json'))
                 if request['source_key']:
                     links['source'] = url('GET', ledger.text(request, 'source_key'))
+                if request.get('task') == 'paired':
+                    links['paired'] = 'true'
                 policy = read_settings(self.settings_path)
                 tags = [{'Key': 'GateDeployment', 'Value': ledger.text(deployment, 'deployment_id')},
                         {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'Name', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': ledger.text(request, 'attempt')},
                         {'Key': 'ExpiresAt', 'Value': str(request['expires'])},
                         {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
                 arguments: dict[str, object] = {
-                    'LaunchTemplate': {'LaunchTemplateId': deployment['template'], 'Version': deployment['version']},
+                    'LaunchTemplate': {'LaunchTemplateId': regional['template'], 'Version': regional['version']},
                     'MinCount': 1, 'MaxCount': 1, 'ClientToken': ledger.text(request, 'attempt') + '-' + str(offset),
                     'InstanceType': size,
                     'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'],
-                                           'Groups': [deployment['security_group']], 'AssociatePublicIpAddress': True}],
+                                           'Groups': [regional['security_group']], 'AssociatePublicIpAddress': True}],
                     'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': gate_box.user_data(links, ledger.text(deployment, 'revision'), lifetime,
+                    'UserData': gate_box.user_data({**links, 'instance_type': size}, ledger.text(deployment, 'revision'), lifetime,
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
-                if deployment.get('image'):
-                    arguments['ImageId'] = ledger.text(deployment, 'image')
-                launch = {'variant': offset, 'arguments': arguments}
+                if regional.get('image'):
+                    arguments['ImageId'] = ledger.text(regional, 'image')
+                launch = {'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
                 save(path, launch)
+            api = self.regional_api(self.box_region)
+            self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock()))
             if self.clock() >= ledger.instant(request, 'expires'):
-                reply = self.api.call('describe-instances', '--filters',
+                reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
                 instances = [instance for group in ledger.rows(reply, 'Reservations')
                              for instance in ledger.rows(group, 'Instances')]
@@ -296,15 +328,15 @@ class GateWorker:
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
                     try:
-                        reply = self.api.call('run-instances', '--cli-input-json', json.dumps(arguments))
-                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'launched')
+                        reply = api.call('run-instances', '--cli-input-json', json.dumps(arguments))
+                        self.record_launch(request, size, zone, 'launched')
                         break
                     except AwsUnavailable as error:
-                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused', str(error))
+                        self.record_launch(request, size, zone, 'refused', str(error))
                         if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
                             raise
                     except subprocess.SubprocessError as error:
-                        self.record_launch(request, size, ledger.text(subnet, 'zone'), 'refused',
+                        self.record_launch(request, size, zone, 'refused',
                                            type(error).__name__ + ': ' + str(error))
                         raise
                 else:
@@ -318,7 +350,7 @@ class GateWorker:
                 if not definite_refusal(str(error)):
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                return LocalFallback(f'{size} in {ledger.text(subnet, "zone")}: {launch_error_code(str(error))}')
+                return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
             instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
@@ -327,7 +359,7 @@ class GateWorker:
             self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-        return LocalFallback('Spot capacity is unavailable at both sizes')
+        return LocalFallback('Spot capacity is unavailable in every configured region')
 
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
@@ -335,8 +367,9 @@ class GateWorker:
         try:
             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock()))
             if not (folder / 'launch.json').exists():
-                self.reconcile()
-                self.charges()
+                if request.get('task') != 'paired':
+                    self.reconcile()
+                    self.charges()
                 reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
                     attempt, int(self.clock()), ledger.instant(request, 'expires'),
                     money(str(settings().number('spot_max_usd_per_hour'))),
@@ -371,15 +404,18 @@ class GateWorker:
                             if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                                 raise ValueError('The final log is absent')
                             result = read(folder / 'remote-result.json')
-                            validate_result(result, request)
+                            validate_result(result, request, instance=instance)
+                            if request.get('task') == 'paired' and any(
+                                    sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
+                                raise ValueError('The sample instance type differs from the launch')
                             self.record_launch(request, ledger.text(arguments, 'InstanceType'), '', 'finished',
                                                gate_s=float(str(result['gate_s'])))
                             row = result
                             self.publish_log(folder)
                             break
-                        state = self.api.observe(instance, int(self.clock())).state
+                        state = self.regional_api(self.box_region).observe(instance, int(self.clock())).state
                         if state not in ('pending', 'running'):
-                            reply = self.api.call('describe-instances', '--instance-ids', instance)
+                            reply = self.regional_api(self.box_region).call('describe-instances', '--instance-ids', instance)
                             stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
                             reason = ledger.mapping(stopped.get('StateReason', {}))
                             detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
@@ -390,19 +426,23 @@ class GateWorker:
                 if not row:
                     raise ValueError('The instance expired without a final result')
             finally:
-                self.terminate(attempt, instance)
+                with defer_cleanup_signals():
+                    self.terminate(attempt, instance)
             return {'status': 'complete', 'instance': instance, 'result': row}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
             if 'arguments' not in launch:
                 self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
-            if row and not gate_box.decode_run(row['gate']).passed:
+            if row and request.get('task') != 'paired' and not gate_box.decode_run(row['gate']).passed:
                 return {'status': 'complete', 'result': row}
             return {'status': 'fallback', 'reason': str(error)}
 
 
-def validate_result(row: dict[str, object], request: dict[str, object]) -> None:
+def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
+    if request.get('task') == 'paired':
+        gate_box.validate_paired_result(row, request, instance)
+        return
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
             raise ValueError('The result differs from the current ' + key)
@@ -510,8 +550,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     deployment_path = directory / 'gate-deployment.json'
     if not deployment_path.exists():
         return LocalFallback('image or stack is absent')
-    deployment = read(deployment_path)
-    if not deployment.get('image') or not deployment.get('template'):
+    home = conf.read(account_settings_path()).text('region')
+    _ = gate_regions(home)
+    deployment = gate_deployment(deployment_path, home)
+    regional = ledger.rows(deployment, 'regions')[0]
+    if not regional.get('image') or not regional.get('template'):
         return LocalFallback('image or stack is absent')
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
@@ -528,16 +571,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             folder = root / uuid4().hex
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
-        credential = str(Path(settings().text('credential_file')).expanduser())
-        command = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=cloud-gate-' + folder.name,
-                   '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
-                   '--setenv=CONF_DIR=' + str(conf.path('aws_target').parent),
-                   '--property=KillMode=control-group', '--property=UMask=0077',
-                   '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
-                   # Run the installed worker with the installed account settings.
-                   '--working-directory=' + str(Path.home() / '.claude'),
-                   sys.executable, '-m', 'scripts.aws_target.cloud_gate', '--worker', str(folder), '--directory', str(directory),
-                   '--sidecar', str(sidecar), '--settings', str(account_settings_path())]
+        command = service_command('scripts.aws_target.cloud_gate',
+            ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
+             '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
         with cloud_reservation(repo, sidecar, mode) as reservation:
             request = (read(folder / 'request.json') if (folder / 'request.json').exists()
                        else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
@@ -547,6 +583,20 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             outcome = run_service(repo, folder, request, command, service)
             reservation.status = int(not outcome.run.passed) if isinstance(outcome, CloudCompleted) else 0
             return outcome
+
+
+def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
+    """Use the installed scaler environment for each gate controller."""
+    credential = str(Path(settings().text('credential_file')).expanduser())
+    configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
+    return ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--unit=' + unit,
+            '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
+            *configuration,
+            '--property=KillMode=' + ('mixed' if paired else 'control-group'), '--property=UMask=0077',
+            '--property=TimeoutStopSec=' + str(settings().number('termination_timeout_s')
+                + 2 * settings().number('api_timeout_s')),
+            '--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE',
+            '--working-directory=' + str(Path.home() / '.claude'), sys.executable, '-m', module, *arguments]
 
 
 def run_service(repo: Path, folder: Path, request: dict[str, object], command: Sequence[str],

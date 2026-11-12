@@ -466,11 +466,11 @@ An ended identity cannot reopen.
 `[roles] new_open=false` in `config/design_roles.conf` preserves existing roles and refuses new ones.
 
 A design role uses `worker.py` operations.
-`worker.py list --json` gives each worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
+`worker.py list all --json` gives each retained worker row `name`, `id`, `current_session`, `state`, `role` and `activity`.
 The staff row supplies `role` and `home`. The `home` folder name supplies the account label.
 `work` is `idle`, `busy` or `unknown`, from `worker_panes.worker_state`.
 An unknown role uses `WorkerRoleUnavailable`. An unknown home uses `AccountUnavailable` and omits `home`.
-`worker.py list --json --all` reads workers for every manager and adds each parent's name as `manager`.
+`worker.py list all --json --all-parents` reads workers for every manager and adds each parent's name as `manager`.
 It needs no caller row and makes no process, pane, or thread read.
 Its `state` uses the saved dispatch status or staff hold.
 Its `activity` uses the saved pass activity, then its status.
@@ -652,7 +652,7 @@ Account moves preserve closed idle workers.
 
 ## Worker account display
 
-`worker.py list --json` gives each worker its name, fixed id, current session, state, role and activity.
+`worker.py list all --json` gives each retained worker its name, fixed id, current session, state, role and activity.
 It computes `work`, `account` and `home` when it reads each worker.
 It stores none of these three fields.
 `worker_panes.worker_state` supplies `work` as `idle`, `busy` or `unknown`.
@@ -660,23 +660,32 @@ It stores none of these three fields.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
 
-`worker.py list` text rows read `<n> <name> <role> <account>[ <machine>] <pane> <state>[ <reason>]`.
-`_worker_pane_state` is the one mapping from an observed worker to its pane and state words.
+`worker.py list [open|closed|all]` defaults to open panes.
+`list closed` shows closed panes. `list all` includes uncertain rows too.
+The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
+The flag still selects saved dispatches from every parent.
+`list all --json --all-parents` needs no caller staff row or live pane read.
+Open and closed filters use current pane evidence, including with `--all-parents`.
+
+Text output has aligned headers: `#`, `Name`, `Account`, `Activity`, `Pane`, `State`, and `Waiting on`.
+Activity uses the active dispatch kind, then the worker's role when no dispatch is active.
+Waiting on uses existing live detached run labels and shows `-` without a specific run.
+Text rows place open panes first and retain the current order inside each group.
+`_worker_pane_state` maps each observed worker to its pane and state words.
 
 | Observed worker | Pane | State |
 | --- | --- | --- |
-| `OpenWorker` | `open` | `paused` or `exited` from the staff row, else `busy`, `idle` or `unknown` |
+| `OpenWorker` | `open` | `paused` or `exited` from staff, else `busy`, `idle` or `unknown` |
 | `StoppedWorker` | `open` | `exited` |
 | `ClosedWorker` | `closed` | `-` |
-| Any other class | `unknown` | `-`, and the row keeps its reason |
+| Any other class | `unknown` | `-`, with its reason |
 
 A row whose pane is not open prints `-` for the account.
-`list --all` prints `-` for the pane and the account, and a state from the dispatch status.
-`display_cells.machine_column` decides the machine field.
-The field shows only when a row uses a machine other than the home machine in `config/build_targets.conf`.
+Saved dispatch rows print `-` for Pane and use their recorded dispatch state.
+`display_cells.machine_column` adds a foreign machine inside the account cell, in parentheses.
 A worker uses the machine of its parent's worktree.
-`list_workers(as_json=False)` replaces the `state` key with the column word, so the key holds the observed class name only in JSON output.
-`list --json` and `list --json --all` have no pane column and no machine field.
+`list_workers(as_json=False)` supplies text values without changing JSON fields.
+JSON retains its existing row order and schema; only the selected filter removes rows.
 
 ## Assignment settings and command files
 

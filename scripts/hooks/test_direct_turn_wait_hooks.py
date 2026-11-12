@@ -173,8 +173,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             parent, = staff.local_snapshot().find(kind="unit")
             worker = fixture_worker("supplier-fix", parent.id,
                                     backend=staff.CodexBackend(fixture.root / "codex"))
-            write_text_atomic(worker_run / "mesh_roster.json", json.dumps({worker.id: {"staff_id": worker.id}}))
-            write_text_atomic(worker_run / "progress_history_state.json", json.dumps({"owner_staff_id": parent.id}))
+            write_text_atomic(worker_run / unit_runs.STATE_FILE, json.dumps({"owner_staff_id": parent.id}))
             _ = staff.rename(worker.id, "renamed-supplier")
             fixture.environment["UNIT_RUN_ROOT"] = str(runs)
             supplier = f"worker:supplier-run/{worker.id}"

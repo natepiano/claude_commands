@@ -32,7 +32,7 @@ from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
-from scripts.herdr.test_worker_panes import PaneWorld
+from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -572,6 +572,8 @@ class DurableRolesTests(HeldRolePaneCase):
     def assign_command(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         result = self.panes.assign(arguments)
         if "--new-worker" in arguments and result.returncode == 0:
+            for row in staff.snapshot().find(kind="worker", parent=self.panes.command_case.fixture.parent.id):
+                idle_transcript(row)
             if self.lose_creation_ack:
                 self.lose_creation_ack = False
                 raise TimeoutError("creation acknowledgement lost")

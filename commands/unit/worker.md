@@ -8,12 +8,22 @@ Run `scripts/lib/py scripts/production/worker.py` from the unit's session.
 The caller's native identity selects the parent.
 Use the supplied arguments: `$ARGUMENTS`.
 
-1. Use `list [--json] [--all]` to show worker rows. Text columns show number, name, role, account, Pane, and State. A machine field follows the account when a row runs off the home machine. Closed panes show `-` for account and State. Uncertain panes show `unknown` and retain their reason. `--all` uses saved dispatches and shows `-` for Pane. JSON output stays unchanged.
+1. Use `list [open|closed|all] [--json] [--all-parents]` to inspect workers. The default shows open panes.
 2. Use `add <role> [--name <name>] [--json]` to create a worker or reconcile named creation.
 3. Use `end <name>` to close a worker and remove its row after confirmed closure.
 4. Use `restore` to reopen only workers with active dispatches on their recorded native sessions.
 5. Use `check` to list workers without running or resumable evidence.
 6. Use `answer <name> --text "<answer>"` to submit an answer in that worker's pane.
+
+The text columns are `#`, `Name`, `Account`, `Activity`, `Pane`, `State`, and `Waiting on`.
+Activity shows the active dispatch kind, or the worker's role without an active dispatch.
+Waiting on shows live detached run labels, or `-`.
+Open panes appear first, with the previous order inside each group.
+An account cell includes a foreign machine in parentheses when needed.
+Use `list all` to inspect closed or uncertain workers too.
+Use `--all-parents` to read saved dispatches for every parent, without a caller staff row.
+Use `list all --json --all-parents` for all saved rows without live pane reads.
+JSON fields keep their current meaning; the selected filter applies.
 
 Use the assignment launcher with the worker pane.
 Pane launchers call `assign <role> <prompt-file>` with these options:

@@ -6,6 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
+
 import argparse
 import json
 import os
@@ -14,6 +15,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from scripts.lib.transcripts import transcript_paths
 from typing import TypedDict, cast
 
 from scripts.model_study.compare import compare, load_turns, markdown as compare_markdown
@@ -100,7 +102,7 @@ def extract(roster: Path, projects_dir: Path, registry_dir: Path, state_dir: Pat
                 *(turn.session for turn in old_turns if turn.name == entry.name),
             ]))
         ids = list(dict.fromkeys([*session_ids(entry, registry_dir), *prior_ids]))
-        files = {session_id: sorted(projects_dir.glob(f"*/{session_id}.jsonl")) for session_id in ids}
+        files = {session_id: transcript_paths(projects_dir, f"*/{session_id}.jsonl") for session_id in ids}
         found = {session_id for session_id, paths in files.items() if paths}
         reads = {session_id: read_session(paths[0], entry.name, entry.director_from_pdt)
                  for session_id, paths in files.items() if paths}

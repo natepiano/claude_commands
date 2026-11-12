@@ -14,11 +14,12 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import conf_reads, git_index
+from scripts.lib import conf_reads, git_index, main_push_lock
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -129,6 +130,31 @@ class LaunchSettings(NamedTuple):
     model: str
     effort: str
     service_tier: str
+
+
+def claude_model(model: str, environment: Mapping[str, str]) -> str:
+    """Resolve a model with the selected launch account's catalog."""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+             str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return model
+    return result.stdout.strip()
+
+
+def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -> list[str]:
+    """Resolve model options after the caller selects the launch account."""
+    resolved = list(arguments)
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--model":
+            resolved[index + 1] = claude_model(arguments[index + 1], environment)
+        elif argument.startswith("--model="):
+            resolved[index] = "--model=" + claude_model(argument.partition("=")[2], environment)
+    return resolved
 
 
 def launch_settings(section: str, key: str) -> LaunchSettings:
@@ -509,7 +535,10 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     target = _publish_repository(path)
     lock_path = (Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
                  if isinstance(target, SharedRegistry) else path.with_name(path.name + ".lock"))
-    with lock_path.open("a") as lock:
+    with ExitStack() as locks:
+        if isinstance(target, SharedRegistry) and _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main":
+            locks.enter_context(main_push_lock.main_push_lock(target.repository))
+        lock = locks.enter_context(lock_path.open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX)
         if isinstance(target, SharedRegistry):
             _ = _publish(target.repository, path, changes, description, additive_catalog)

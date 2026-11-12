@@ -338,7 +338,7 @@ It imports live reservations, saved intents, waiter places, token handoffs, prio
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
-`build_hold` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
+`hold_enforcer` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
 Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
@@ -672,22 +672,18 @@ Each estimate stores its history rule, factors, and failed-peak floor.
 New estimates remain uncut. Historical `CappedAtBudget` and `CapNotRecorded` values remain readable.
 
 Each pass reads the resident working set and swap for service reports.
-CI RAM and unowned scopes reduce host free memory. They do not create a run promise.
+Unregistered CI use and unowned scopes reduce host free memory. They do not create a run promise.
 `ci_memory_slice` names the CI slice. A missing CI reading remains a labelled diagnostic.
-`ci_memory_margin_gib=7` supplies one CI keep-aside while `job_state` is `RunningServiceJob`.
-The service reads that value once with the other policy values.
-`AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
-`MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
-`MemoryRoom.ci_use` stores readable CI use separately from admitted swap-backed use.
-`MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
-Idle CI and unavailable CI readings add no CI keep-aside.
+`MemoryRoom.ci_use` stores readable unregistered CI use separately from admitted swap-backed use.
+`MemoryRoom.kept` includes only run keep-asides.
+Registered CI jobs reserve memory through admission.
+An unregistered CI job has no memory reservation. Its limit is the systemd `MemoryMax=34G` setting, or 34 GiB.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
-The cap text names the CI keep-aside within kept memory.
-The page shows CI use and the CI keep-aside inside the cap.
+The page shows registered CI use with admitted runs and unregistered CI use inside the cap.
 The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
-The page includes both CI amounts in its taken total. Room and admission do not change.
+The page counts each CI job once in its taken total.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 `AnonymousRunUse` stores resident swap-backed memory: anonymous memory plus shared memory, which includes tmpfs files.
 Scope readings use `memory.stat` `anon + shmem`.
@@ -1549,7 +1545,12 @@ The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor
 Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
-When a crossing delivery is pending, the Mac measures each direct folder child under its floor roots.
+When a crossing delivery is pending, the Mac measures each root's direct folder children and each cargo target the floor pass found.
+The target list contains only targets the Mac floor policy allows.
+The Mac crossing alert waits for a pass that searched for targets.
+A completed search with no targets still permits the alert.
+Failure alerts do not wait for the target search.
+The measurement skips targets that no longer exist and does not search the roots again.
 Each size estimates the file blocks that deleting that folder alone frees.
 An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.
@@ -1579,7 +1580,7 @@ Unreadable folders can make the measured sizes incomplete.
 
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − swap-backed use)` plus held slot bytes.
-Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
+Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 GiB.
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
@@ -1655,7 +1656,7 @@ Active records retain this evidence across service restarts and completion.
 Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
 Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
-CI keeps its configured margin until registered CI steps supply counters and profiles.
+Registered CI steps supply counters and profiles through admission.
 `lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
 Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.
 
@@ -1723,12 +1724,10 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
-CI memory keeps the mixed accounting rule during activation.
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
-The CI keep-aside remains while any busy runner has no registered tree.
-The keep-aside applies once to a mix of registered and unregistered jobs.
-`ci_memory_margin_gib` remains in configuration until the approved activation step.
+Unregistered CI use counts once in the cap and has no memory reservation.
+A CI job that admission cannot cover uses the systemd `MemoryMax=34G` limit of 34 GiB.
 
 NixOS activation remains natedev's work.
 The socket uses group `build-admission` and mode `0660`.

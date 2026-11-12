@@ -506,14 +506,15 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     work = {row.owner: cloud_work(row, explanation.now, stale_pushes, interval) for row in cloud}
     local_cpus = os.cpu_count()
     cpus = str(local_cpus) if local_cpus is not None else "—"
-    bumped_unit = "" if isinstance(explanation.priority, admission_records.NoQueuePriority) else explanation.priority["unit"]
+    bumped_units = (() if isinstance(explanation.priority, admission_records.NoQueuePriority)
+                    else tuple(entry["unit"] for entry in explanation.priority.entries))
 
     def names(step: admission_records.WaitingStep | admission_records.RunningStep) -> tuple[str, str, bool]:
         identity = step_labels(step, model.labels)
         show = field(step.session_name if not step.session_id and step.unit else identity.showrunner) or "—"
         unit = field(identity.unit).removeprefix(show + "-")
         unit = unit or "—"
-        return show, unit, bool(bumped_unit and identity.unit == bumped_unit)
+        return show, unit, identity.unit in bumped_units
 
     waiting_names = [names(step) for step in waiting]
     running_names = [names(row.step) for row in running]
