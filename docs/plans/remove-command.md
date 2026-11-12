@@ -42,36 +42,23 @@
 
 ### Phase 2 — Remove /ask_a_friend  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/ask_a_friend` and every part that only it uses are gone; shared parts and permission rules stay.
-
-**Spec:**
-
-Follow `commands/remove_command.md` with `ask_a_friend`, step by step. Post the step 3 table on the board before step 4. Known hits, each classed by the inventory, not by this list:
-
-- `commands/ask_a_friend.md`; `scripts/ask_a_friend/`.
-- `scripts/direct/assign.py`: the `friend` policy and the `consultation-pane` target.
-- `config/models.conf`: `ask_a_friend.consultation`, `[friend.*]` sections, `assignments/friend`.
-- `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`: the caller-family assignment and its comments.
-- Tests: `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/test_quota_alert*.py`, `scripts/whoami/quota_alert_test_support.py`, `scripts/lib/test_models_registry.conf`.
-- Docs and commands: `commands/default_models.md`, the "pending friend reply" lines in `commands/unit/direct.md` and `commands/unit/worker.md`, `docs/direct/held_astra_roles.md`, `docs/as-built/agent-registry.md`.
-- `scripts/herdr/side_pane.py`: keep it if any other caller uses it.
-- `.claude/settings.local.json`, `templates/settings_local.json`: `permission`; leave them.
-
-Step 6 sends the morty notice after the director commits; the worker writes its text in the reply instead of sending it.
+- `/ask_a_friend` is gone: `commands/ask_a_friend.md` and `scripts/ask_a_friend/prepare_session.sh` are deleted.
+- `config/models.conf` has no `ask_a_friend` assignment, no consultation sections and no `caller` assignment mode.
+- `scripts/agents/models_config.sh` and `scripts/agents/default_models.sh` have no caller-family mode (`AGENTS_CALLER_*` and its helpers).
+- `scripts/direct/assign.py` accepts `--policy astra-reviewer|astra-designer` only. The `consultation-pane` target stays, because Astra reviews use it.
+- `scripts/herdr/side_pane.py` has no `open` CLI subcommand. Its `open()` function stays for `assign.py`. `test_side_pane.py` tests `side_pane.open` directly through an `astra-reviewer` policy fixture.
+- Tests, fixtures and docs lost their friend and caller cases. `test_models_registry.py` uses `direct=claude` in place of the removed `caller` value.
+- Five permission rules that name the command stay for the user to remove by hand: `.claude/settings.local.json` and `templates/settings_local.json`.
 
 **Files:**
-- Each `dedicated` and `embedded` hit the inventory finds.
+- `config/models.conf`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh` — no caller mode.
+- `scripts/direct/assign.py`, `scripts/herdr/side_pane.py` — no friend policy, no `open` subcommand.
+- Tests and fixtures under `scripts/agents/`, `scripts/herdr/`, `scripts/lib/`, `scripts/whoami/`, `scripts/direct/` — friend and caller cases removed.
+- `commands/default_models.md`, `commands/unit/direct.md`, `commands/unit/worker.md`, `docs/direct/held_astra_roles.md`, `docs/as-built/*` — references removed.
 
-**Workers:** 1 writer; the removal crosses many small shared files, and one owner keeps them coherent.
-- `impl` — every file in the inventory.
-
-**State:** none.
-
-**Constraints from prior phases:** `commands/remove_command.md` gives the steps and the classes.
-
-**Acceptance gate:** the tests of every changed module pass; basedpyright is clean on every changed Python file; `git grep -n -i 'ask_a_friend\|ask-a-friend'` shows only `history` and `permission` hits.
+**Gotchas:** a test of a removed CLI path can also cover a live function; such tests move to the function.
 
 ### Phase 3 — Amend /remove_command  · status: todo
 
