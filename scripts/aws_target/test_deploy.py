@@ -982,7 +982,7 @@ sys.exit(7)
                 self.assertTrue(set(gpu_types).issubset(sizes))
                 self.assertEqual(len(sizes), len(set(sizes)))
                 reply = {'SpotPriceHistory': [
-                    {'InstanceType': size, 'AvailabilityZone': region + 'a', 'SpotPrice': '.25', 'Timestamp': 'fixture'}
+                    {'InstanceType': size, 'AvailabilityZone': region + 'a', 'SpotPrice': '.25', 'Timestamp': '2026-01-15T00:00:00Z'}
                     for size in ('m7a.8xlarge', *gpu_types)]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         with (mock.patch.object(subject, '_api', return_value=aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)),
@@ -990,7 +990,7 @@ sys.exit(7)
             subject.prices()
         lines = output.getvalue().splitlines()
         self.assertEqual(price_regions, ['us-east-2', 'us-west-2', 'us-east-1'])
-        self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
+        self.assertIn('us-east-2 m7a.8xlarge us-east-2a 0.25', lines)
         for region in ('us-east-2', 'us-west-2', 'us-east-1'):
             self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
             self.assertEqual(lines[lines.index(f'{region}: Spot quota 128 vCPUs') + 1],
@@ -998,7 +998,7 @@ sys.exit(7)
             for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
                 self.assertIn(f'{region} {size} {region}a unavailable', lines)
             for size in gpu_types:
-                self.assertIn(f'{region} {size} {region}a .25', lines)
+                self.assertIn(f'{region} {size} {region}a 0.25', lines)
         self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
 
     def test_prices_and_up_report_regional_quotas_through_the_admin_executor(self) -> None:

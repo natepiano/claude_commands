@@ -75,6 +75,44 @@ python3 scripts/aws_target/deploy.py quota-request
 python3 scripts/aws_target/deploy.py quota-status
 ```
 
+Read the local hourly snapshot without an AWS call or a passphrase:
+
+```sh
+python3 scripts/aws_target/deploy.py spot-table
+```
+
+The rows show configured Standard and GPU machine types.
+The columns show candidate regions and the lowest zone price in USD/h.
+A `-` means the snapshot has no offer for that type and region.
+Wide tables use separate groups of region columns.
+Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
+GPU types use the G and VT quota; other configured types use the Standard quota.
+Old snapshots show a stale mark after `price_max_age_seconds`.
+A regional read failure keeps that region's previous values and age.
+
+The existing enabled `buildlog.timer` runs `buildlog hourly` on natedev every hour.
+The hourly job calls `aws_target.snapshot` after the existing jobs.
+A job failure does not stop the other jobs.
+No new timer, systemd change, or NixOS rebuild is required.
+The old `aws-target.service` stays disabled.
+The reader uses `credentials_profile` from `aws_target.conf` and `credential_file` from `cloud_gate.conf`.
+It uses no administrator passphrase.
+It reads every candidate region and all configured Standard and GPU types.
+It atomically stores prices, quotas, and regional read times together in the AWS state folder's `spot-prices.json`.
+The existing price rows still support the gate ranking fallback.
+`price_refresh_seconds` limits repeated attempts; its value remains unchanged.
+
+After this change reaches the installed scripts:
+
+1. Run `python3 scripts/aws_target/aws_target.py snapshot` to create the first snapshot.
+2. Run `python3 scripts/aws_target/deploy.py spot-table` to inspect the snapshot.
+
+Later reads run through the existing timer.
+`GateGpuTrialScalerPolicy` already allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.
+No `deploy.py up` command is required for this change.
+The snapshot makes only these two read calls.
+It does not use Cost Explorer or create resources.
+
 `prices` reads deployed-region configuration and candidate-region configuration without duplicates.
 It prints current Spot prices and applied Standard and G and VT quotas.
 It includes the GPU types from `gpu_instance_types`.
@@ -150,7 +188,8 @@ The normal module counter replaces the setup stage when tests start.
 Before ranking, the worker reads live Spot prices from all deployed regions in parallel.
 `spot_price_live_read_timeout_s` bounds the complete read.
 Failed regional reads retain applicable hourly prices from `spot-prices.json`.
-`aws_target.py tick` refreshes cached prices and account bills without builder routing.
+`buildlog hourly` refreshes cached prices and quotas through the scaler profile.
+`aws_target.py tick` reads account bills only.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.

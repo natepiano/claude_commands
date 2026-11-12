@@ -230,21 +230,40 @@ Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
-`aws_target.py tick` refreshes gate Spot prices.
-`price_refresh_seconds=3600` limits the refresh frequency.
-The command no longer starts or stops a builder.
-It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
-The price lock stores the last refresh attempt time.
-Slow price reads leave start and stop commands free to acquire the controller lock.
-It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
-Each read requests all configured gate `instance_types` for Linux/UNIX.
-The reader keeps the latest price for each zone and type.
-It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
-Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
-An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
-The price refresh does not change `controller.json`.
-Failed attempts use the same refresh interval.
-The price read remains active when the former builder route is disabled or removed.
+`buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
+The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
+The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+No systemd unit change or NixOS rebuild is required.
+The old `aws-target.service` remains disabled.
+`aws_target.py tick` reads account charges only.
+`price_refresh_seconds` limits snapshot attempts to one per configured interval.
+The snapshot takes `spot-prices.lock` without blocking.
+It reads each distinct `spot_candidate_regions` region once.
+Each regional read requests all `instance_types` and `gpu_instance_types` prices for Linux/UNIX.
+The AWS CLI reads all pages, and the reader selects the latest price for each type and zone.
+The reader also reads applied Standard Spot and G and VT Spot quotas.
+It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
+It removes inherited administrator keys and profiles from the AWS process environment.
+The only API actions are `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota`.
+`GateGpuTrialScalerPolicy` already permits both actions on all resources without regional conditions.
+This change requires no IAM deployment.
+The snapshot atomically writes prices and quota values together in `spot-prices.json`.
+The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
+A regional failure preserves that region's previous prices, quotas, and read time.
+Other regions still refresh, and the command returns a failure status.
+A successful regional read removes previous prices for types or zones absent from the new reply.
+The snapshot does not change `controller.json`.
+
+`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
+It prints machine types as rows and candidate regions as columns.
+Each cell shows the lowest zone price in USD/h, or `-` when the snapshot has no offer.
+It splits wide tables into groups of region columns to fit the terminal.
+Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
+Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
+Standard types use the Standard quota; GPU types use the G and VT quota.
+The box counts divide the quota by the existing type-size vCPU calculation and round downward.
+An absent snapshot shows unknown quotas and box counts without creating files.
 
 A new gate ranks only variants from its deployment.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.
