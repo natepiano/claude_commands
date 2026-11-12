@@ -3087,7 +3087,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The module leaves no process and no folder behind.
 - aws pairs show a CPU gain; with no gain, the phase lands nothing.
 
-### Phase 164 — Measure the shared style Git work in three style modules  · status: todo
+### Phase 164 — Measure the shared style Git work in three style modules  · status: done
 **Depends on:** none
 
 #### Work Order
