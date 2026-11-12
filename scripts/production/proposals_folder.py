@@ -72,16 +72,16 @@ def proposer(issue: Issue) -> str:
     return issue.value("proposed_by")
 
 
-def proposal_issues(doc: Path) -> list[Issue]:
+def proposal_issues(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues in the production's folder, of any proposer."""
     folder = issues_folder(doc)
-    if folder is None or not folder.is_dir():
+    if folder is None or (sources is None and not folder.is_dir()):
         return []
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if issue.value("record_type") != "question"]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG, sources=sources) if issue.value("record_type") != "question"]
 
 
-def open_proposals(doc: Path) -> list[Issue]:
+def open_proposals(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues in the production's folder that are its own. Staff is read only when issues exist."""
-    found = proposal_issues(doc)
+    found = proposal_issues(doc, sources=sources)
     names = owners(doc) if found else frozenset[str]()
     return [issue for issue in found if proposer(issue) in names]

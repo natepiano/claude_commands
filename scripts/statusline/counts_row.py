@@ -21,7 +21,9 @@ except FileNotFoundError:
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
@@ -49,8 +51,9 @@ def retry_due(sources: list[Path]) -> str:
         return ""
 
 
-def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None) -> tuple[str, str]:
-    """Return the counts and deadline, and append each source before reading it."""
+def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None = None,
+        require_complete: bool = False) -> tuple[str, str]:
+    """Return counts and sources. Cache writes require complete reads; library callers retain available counts."""
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
@@ -58,25 +61,42 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     if production is None:
         return "", ""
     from scripts.production import footer_counts
-    from scripts.production.update_registration import QuestionStaff, RegistrationFailure
+    from scripts.production.update_registration import DeferredUntil, QuestionStaff, RegistrationFailure, due, read_open_items
 
-    identities = QuestionStaff.read() if identities is None else identities
-    sources.extend(footer_counts.sources(production.doc, identities=identities))
-    sources.extend(footer_counts.routing_sources(identities.record))
+    read_sources = sources if require_complete else None
+    if identities is None:
+        identities = QuestionStaff.read() if read_sources is None else QuestionStaff.read(sources=read_sources)
+    if require_complete:
+        _ = footer_counts.sources(production.doc, identities=identities, read_sources=read_sources)
+    else:
+        sources.extend(footer_counts.sources(production.doc, identities=identities))
+    sources.extend(footer_counts.routing_sources(identities.record, sources=read_sources))
     try:
         owner = production.owner
         if identities.record.by_id(owner.id) is None:
             raise RegistrationFailure("questions", f"{production.doc}: no showrunner staff row")
     except (RegistrationFailure, staff.StaffRefused) as error:
         print(f"questions: unavailable — {error}", file=sys.stderr)
+        if require_complete:
+            raise showrunner_footer.FooterError(str(error)) from error
         line = footer_counts.counts_line(footer_counts.read_counts(production.doc, record=identities.record)) or ""
         return line, ""
-    sources.append(showrunner_footer.outstanding_path(owner.id, identities=identities))
-    questions = showrunner_footer.open_questions([production], identities=identities)
+    outstanding = showrunner_footer.outstanding_path(owner.id, identities=identities)
+    sources.append(outstanding)
+    if require_complete:
+        items = read_open_items(outstanding, document=production.doc, identities=identities, sources=read_sources)
+        zone = ZoneInfo(production.zone)
+        now = datetime.now(zone).replace(tzinfo=None)
+        questions = len(due(items, now))
+        afters = [item.timing.at for item in items if isinstance(item.timing, DeferredUntil) and item.timing.at > now]
+        deadline = "" if not afters else str(int(min(afters).replace(tzinfo=zone).timestamp()))
+    else:
+        questions = showrunner_footer.open_questions([production], identities=identities)
+        after = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
+        deadline = "" if after is None else str(int(after.timestamp()))
     line = footer_counts.counts_line(footer_counts.read_counts(
-        production.doc, questions=questions or 0, record=identities.record)) or ""
-    due = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
-    return line, "" if due is None else str(int(due.timestamp()))
+        production.doc, questions=questions or 0, record=identities.record, sources=read_sources)) or ""
+    return line, deadline
 
 
 def write(instance: Path) -> Path:
@@ -85,7 +105,7 @@ def write(instance: Path) -> Path:
     began = time.time_ns()
     sources = [instance / "conf", staff.record_path()]
     try:
-        line, due = row(instance, sources)
+        line, due = row(instance, sources, require_complete=True)
     except (OSError, ValueError, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
