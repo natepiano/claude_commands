@@ -3426,9 +3426,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Files:**
 - `scripts/production/add_unit.py` — `director_agent`.
+- `scripts/lib/models_registry.py` — `launch_configuration` takes an optional `registry=` path; `registry_path` takes an optional environment and is the one registry path rule for `director_agent`, `claude_model` and Phase 214 (sdlc, 2026-11-12).
 
-**Workers:** 1 writer; one function, no split.
-- impl: `scripts/production/add_unit.py`.
+**Workers:** 1 writer; it owns the shared `models_registry.py` change.
+- impl: `scripts/production/add_unit.py`, hub: `scripts/lib/models_registry.py`.
 
 **Constraints from prior phases:**
 - Phase 208 sends the table to `claude_model` the same way; its 46 removed add-unit readers are outside this bound (0–3.219 s, 64 starts).
@@ -3460,7 +3461,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 9. Measure `direct/test_assign_claude.py` and `direct/test_assign_claude_follow.py` with `module_cost.py --commands 15` before and after. Report registry-reader starts.
 
 **Files:**
-- `scripts/direct/assign.py` — `resolve_model`.
+- `scripts/direct/assign.py` — `resolve_model` and `call` (an `input=` keyword, sdlc 2026-11-12). It uses `models_registry.registry_path(env)` from Phase 213 and does not edit `models_registry.py`.
 
 **Workers:** 1 writer; one function, no split.
 - impl: `scripts/direct/assign.py`.
