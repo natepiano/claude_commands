@@ -14,6 +14,7 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
+from scripts.buildlog import index
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -325,6 +327,7 @@ class MergeGateFixture(unittest.TestCase):
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -350,6 +353,7 @@ class MergeGateFixture(unittest.TestCase):
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
+            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -531,6 +535,17 @@ class MergeGateFixture(unittest.TestCase):
         self.bind_fixture(root)
         self.bin.mkdir()
         self.state.mkdir()
+        _ = write_config_fixture(self.root / "config/buildlog.conf")
+        _ = write_config_fixture(self.root / "config/merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        # These tests prove gate behavior without a near deadline from their short jobs.
+        history = Path(self.environment["BUILDLOG_DIR"])
+        history.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
+            index.create_schema(connection)
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES ('fixture-normal', '2000-01-01', 'merge-gate', ?, 0, 0, 'full', 1000000)""",
+                (os.cpu_count() or 1,)).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"

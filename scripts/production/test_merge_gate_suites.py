@@ -8,11 +8,19 @@ import contextlib
 import io
 import os
 import sys
+import signal
+import resource
+import time
+import subprocess
+import select
+from types import SimpleNamespace
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import affected_modules, merge_gate
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import process_group
+from scripts.test_times import gate_record
 from scripts.production.gate_modules import discover_test_modules, test_module_name
 from scripts.production.merge_gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -20,6 +28,121 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @gate_suites("hooks")
+    def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
+        now = 0.0
+        process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+
+        def start(*arguments: object) -> merge_gate.RunningGateJob:
+            nonlocal now
+            suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
+            now = 9.98
+            self.write(log, "OK\n")
+            return merge_gate.RunningGateJob(suite, path, process, 0, 0, log.open("r+"), log, path.name)
+
+        def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
+            return (arguments[0] if now >= 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(time, "monotonic", side_effect=lambda: now),
+              mock.patch.object(time, "sleep", side_effect=advance),
+              mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
+              mock.patch.object(os, "wait4", side_effect=reap),
+              mock.patch.object(process_group, "send_process_group"),
+              contextlib.redirect_stdout(io.StringIO())):
+            run = merge_gate.run_suites(self.checkout, machine=merge_gate.WholeMachine(),
+                                       time_limit=gate_record.GateTimeLimit(10))
+        self.assertTrue(run.passed, run.time_limit_report)
+        self.assertEqual(run.jobs[0].returncode, 0)
+        self.assertEqual(run.jobs[0].killed_for, "")
+        self.assertEqual(run.time_limit_report, "")
+
+    def test_time_limit_notice_resolves_staff_ids_and_unit_names(self) -> None:
+        from scripts.message import roster, send
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+
+        report = "time limit: limit 10 s; elapsed 11 s; running modules: hooks/test_busy.py"
+        run = merge_gate.GateRun((), 11, 0, time_limit_report=report)
+        received: list[tuple[str, str]] = []
+
+        with (mock.patch.dict(os.environ, self.environment),
+              isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment)):
+            parent = fixture_member("showrunner", name="fixture-production")
+            owner = fixture_member("unit", name="fixture-unit", parent=parent.id)
+            for position, reference in enumerate((str(owner.id), owner.name)):
+                with self.subTest(owner=reference), mock.patch.object(subprocess, "run", return_value=
+                        subprocess.CompletedProcess([], 0, "SENT: fixture owner", "")) as delivery, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    merge_gate.tell_time_limit(reference, self.checkout, run)
+                    for call in delivery.call_args_list:
+                        arguments = send.parse(cast(list[str], call.args[0])[2:])
+                        route = send.resolve_recipient(arguments.to, send.LocalOnly(), roster.Roster([], []),
+                                                       membership=staff.snapshot(), records=[])
+                        self.assertIsInstance(route, send.QueuedStaffRecipient)
+                        if not isinstance(route, send.QueuedStaffRecipient):
+                            self.fail("The private owner must resolve through its staff row")
+                        received.append((route.address, send.body_text(arguments)))
+                    self.assertEqual(received[position:position + 1], [(f"session:{owner.current_session}", report)])
+        self.assertEqual(len(received), 2)
+
+    def test_cpu_slot_wait_returns_to_the_runner_at_its_deadline(self) -> None:
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        self.addCleanup(os.close, writer)
+        pool = merge_gate.SharedCPUPool(reader, reader, deadline=12)
+        now = 10.0
+        waits: list[float | None] = []
+        def wait(*arguments: object) -> tuple[list[int], list[int], list[int]]:
+            nonlocal now
+            waits.append(cast(float, arguments[3]))
+            now = 13.0
+            return [], [], []
+        with mock.patch.object(time, "monotonic", side_effect=lambda: now), \
+                mock.patch.object(select, "select", side_effect=wait), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(TimeoutError, "gate time limit"):
+                _ = pool.acquire()
+        self.assertEqual(waits, [2.0])
+        self.assertEqual(pool.owned, [])
+
+    def test_deadline_stops_groups_and_keeps_names_and_tracebacks(self) -> None:
+        output = io.StringIO()
+        log = self.root / "timed-module.log"
+        self.write(log, "partial module output")
+        process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+        job = merge_gate.RunningGateJob("hooks", Path("test_busy.py"), process, 10, 10, output, log, "test_busy.py")
+        failed = merge_gate.GateJobResult("message", "test_red.py", 1, 1,
+                                         "Traceback (most recent call last):\nAssertionError: fixture failure")
+        signals: list[tuple[int, int]] = []
+        def send(pid: int, signum: int) -> None:
+            signals.append((pid, signum))
+        with mock.patch.object(time, "monotonic", return_value=11), \
+                mock.patch.object(process_group, "send_process_group", side_effect=send):
+            self.assertEqual(merge_gate.stop_at_time_limit([job], [failed], 10, 12), "")
+        self.assertEqual(signals, [])
+        with mock.patch.object(time, "monotonic", return_value=13), \
+                mock.patch.object(process_group, "send_process_group", side_effect=send), \
+                mock.patch.object(os, "wait4", return_value=(process.pid, signal.SIGTERM, resource.getrusage(resource.RUSAGE_SELF))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            report = merge_gate.stop_at_time_limit([job], [failed], 10, 12)
+        self.assertEqual(signals, [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)])
+        self.assertIn("limit 2 s; elapsed 3.000 s; running modules: hooks/test_busy.py", report)
+        self.assertIn("message/test_red.py", report)
+        self.assertIn("Traceback (most recent call last):\nAssertionError: fixture failure", report)
+        self.assertIn("partial module output", report)
+        self.assertEqual(job.killed_for, report.split("\n", 1)[0])
+        run = merge_gate.GateRun((failed,), 3, 0, time_limit_report=report)
+        self.assertFalse(run.passed)
+        from scripts.message import session_send
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as tell:
+            merge_gate.tell_time_limit("fixture", self.checkout, run)
+        self.assertEqual(tell.call_args.args, (session_send.send_argv(
+            "--to", "fixture", "--from", "merge_gate", "--key", f"gate-time-limit:{self.checkout}", "--text", report),))
+
     @gate_suites("hooks", "message")
     def test_targeted_selection_precedes_the_route_and_survives_fallback(self) -> None:
         from scripts.aws_target import cloud_gate
@@ -336,7 +459,12 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.write(identity, 'VALUE = "checked tree"\n')
         marker = self.state / "plain-python-import"
         self.write(self.checkout / "scripts/message/test_first.py", f'''import subprocess
+import select
 import sys
+import signal
+import resource
+import time
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 

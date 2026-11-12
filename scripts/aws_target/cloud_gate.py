@@ -501,6 +501,12 @@ class GateWorker:
                 lifetime = max(1, (ledger.instant(request, 'expires') - int(self.clock()) + 59) // 60)
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
+                vcpus = int(size.split('.')[1].removesuffix('xlarge')) * 4
+                budget = (gate_record.NoGateTimeLimit('paired trial') if request.get('task') == 'paired'
+                          else gate.read_time_limit(vcpus, cast(list[str], request['modules']), vcpus,
+                              request['mode'] == 'targeted-test' and not request.get('full', False)))
+                seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
+                links['gate_time_limit_s'] = str(seconds)
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
                 signing = gate_box.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                     ledger.text(credentials, 'SessionToken') if 'SessionToken' in credentials else '')
@@ -533,7 +539,8 @@ class GateWorker:
                               settings().number('log_push_s'), float(str(request['module_time_limit_s'])))}
                 if regional.get('image'):
                     arguments['ImageId'] = ledger.text(regional, 'image')
-                launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone}
+                launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone,
+                          'gate_time_limit_s': seconds}
                 save(path, launch)
             api = self.regional_api(self.box_region)
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
@@ -630,11 +637,19 @@ class GateWorker:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
                 cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('setup', self.size_vcpus, 0, self.clock()))
+                limit = float(str(read(folder / 'launch.json').get('gate_time_limit_s', 0)))
+                if not limit and request.get('task') != 'paired':
+                    print(f'Gate time limit disabled: no passing history for {self.size_vcpus} vCPUs', flush=True)
+                began = 0.0
+                deadline = float('inf')
                 while self.clock() < ledger.instant(request, 'expires'):
                     try:
                         bucket = ledger.text(deployment, 'bucket')
                         if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                             self.publish_log(folder)
+                            if not began and 'Runner: ' in (folder / 'gate.log').read_text():
+                                began = time.monotonic()
+                                deadline = began + limit if limit else float('inf')
                         if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
                             raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
                         if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
@@ -660,7 +675,13 @@ class GateWorker:
                             detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
                             raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
                     except subprocess.TimeoutExpired:
-                        continue
+                        pass
+                    if time.monotonic() >= deadline:
+                        text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
+                        row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
+                        with (folder / 'gate.log').open('a') as output:
+                            _ = output.write('\n' + gate_box.decode_run(row['gate']).time_limit_report + '\n')
+                        break
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
@@ -676,6 +697,39 @@ class GateWorker:
             if row and request.get('task') != 'paired' and not gate_box.decode_run(row['gate']).passed:
                 return {'status': 'complete', 'result': row}
             return {'status': 'fallback', 'reason': str(error)}
+
+
+def time_limit_result(request: dict[str, object], text: str, elapsed: float,
+                      limit: float, vcpus: int) -> dict[str, object]:
+    """Keep a red result when the box does not return its own result."""
+    completed = {match[1]: (int(match[2]), float(match[3])) for match in re.finditer(
+        r"(?m)^(\S+) exit=(-?\d+) seconds=(\d+\.\d+)(?: stopped)?$", text)}
+    started = set(re.findall(r"(?m)^Starting module: (\S+)$", text))
+    running = sorted(started - completed.keys())
+    report = (f"time limit: limit {limit:g} s; elapsed {elapsed:.3f} s; "
+              f"running modules: {', '.join(running) or '(none)'}")
+    jobs: list[gate.GateJobResult] = []
+    for path in cast(list[str], request['modules']):
+        name = path.removeprefix('scripts/')
+        suite, module = name.split('/', 1)
+        status, seconds = completed.get(name, (124, elapsed if name in started else 0.0))
+        failure = re.search(r'(?ms)^--- ' + re.escape(name) + r' exit=-?\d+ ---\n(.*?)\n--- end module failure ---', text)
+        output = gate.failure_log_tail(failure[1]) if failure else report if status else ''
+        jobs.append(gate.GateJobResult(suite, module, status, seconds, output,
+                                      killed_for=report if name not in completed else ''))
+    details = [f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}"
+               for job in jobs if job.returncode and not job.killed_for]
+    report = '\n'.join([report, *details])
+    run = gate.GateRun(tuple(jobs), elapsed, 0, executions=tuple(jobs), time_limit_report=report)
+    now = time.time()
+    record = gate_box.completion_record(run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'),
+                                        ledger.text(request, 'tree'), store.host_name(), now - elapsed, now,
+                                        ledger.text(request, 'mode'))
+    record['vcpus'] = vcpus
+    record['max_jobs'] = vcpus
+    return {'attempt': request['attempt'], 'commit': request['commit'], 'tree': request['tree'],
+            'host': record['host'], 'verdict': 'fail', 'gate': gate_box.encode_run(run),
+            'record': record, 'gate_s': elapsed}
 
 
 def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
@@ -820,6 +874,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         with cloud_reservation(repo, sidecar, mode) as reservation:
             request = (read(folder / 'request.json') if (folder / 'request.json').exists()
                        else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
+            request['full'] = full
+            save(folder / 'request.json', request)
             save(current, {'attempt': folder.name, **identity})
             save(folder / 'deployment.json', deployment)
             cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time()))
