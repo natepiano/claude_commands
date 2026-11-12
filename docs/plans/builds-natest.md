@@ -3272,3 +3272,104 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on each changed file reports 0 errors and 0 warnings.
 - The replay check shows each new selection contains the old one, and names the misses now selected.
 - Two blind reviews.
+
+### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report names the child commands and shared fixtures that cost the most CPU inside test bodies across the whole gate, with their callers and owners. No code changes.
+
+**Decision:** builds item 80 (the user, 2026-11-11): aim at the largest gate-time saving per work hour. Phase 174: fixed module costs are about 133 of 4,664 CPU s per gate; test bodies use the rest. Read-only.
+
+**Spec:**
+1. Pick a module sample that covers at least 60% of median cloud gate CPU, from the 209 recent passed cloud full gates in the newest `~/.local/state/buildlog/index-*.sqlite` (read-only). Add 30 random small modules. Record the revision, the sample and its CPU share.
+2. Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --commands 25 --tests 5` on the sample. Run at most four modules at once.
+3. Add up child CPU by program across the sample: `git` by subcommand, `python3` by script or module, shells by script, and others. Give the count and the CPU of each.
+4. For each of the top 15 program rows, find the callers: the fixture or helper, with file and line, and the number of gate modules that use it. Scale each row to the full gate by module CPU share, labelled as an estimate.
+5. For each top caller, say if the child is part of the tested behavior or only setup. For setup, name the cheaper form (a class seed, an in-process call, one combined Git command) and its estimated saving per gate.
+6. Rank the candidates by estimated gate CPU s saved per work hour. Name the owner. Keep measured numbers apart from estimates.
+7. Write the report to `phases/177/body_command_census.md` in the session folder. Change no repository file. Delete saved run output after you read it.
+
+**Files:**
+- `phases/177/body_command_census.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl3: the report.
+
+**Constraints from prior phases:**
+- Phase 174: gate wall time follows CPU over 32 slots (r = 0.994). Admission fixture imports cost up to 36 CPU s across 200 modules. Do not count import costs again.
+- Phase 164 and 169: in the style modules, Git children inside `copies.py` dominate; copies-unit owns them.
+- Phase 166: local CPU numbers overstate; only aws pairs decide a saving.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives the sample and its CPU share, the program table, the top callers with file, line, module count and owner, and the ranked candidates with measured and estimated labels.
+- `git status` shows no change from the researcher.
+
+### Phase 178 — The coverage report tests run the report in process, and the ledger fixture drops two unused imports  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_coverage_report.py` starts the report CLI once in place of 30 times, and `ledger_test_support.py` stops importing two modules it does not use. All tests and assertions stay.
+
+**Decision:** Phase 174 ranks these two changes second and third by gate seconds saved per work hour (ceilings 7.9 and 1.9 CPU s per gate). builds, 2026-11-11: current. style-unit go, 2026-11-11: both files are free; keep one real CLI process and every assertion; aws pairs decide; send the hash on land.
+
+**Spec:**
+1. In `scripts/style/ledger_test_support.py`, remove the imports of `style_plan` (line 27) and `declarations` (line 29). Search the repository first: no importer may read `ledger_test_support.style_plan` or `ledger_test_support.declarations`.
+2. In `scripts/style/test_coverage_report.py`, change `report()` (line 151) to call `coverage_report.main` in process through `invoke_cli` (`scripts/production/cli_fixture.py:91`). It must return the same `subprocess.CompletedProcess[str]` shape: exit code, stdout and stderr.
+3. Keep one test that runs the real CLI through `lib/py`, with its exit code and output assertions. Pick the test that covers the main report path.
+4. Check that `coverage_report.main` reads no process-wide state that the in-process call changes: arguments, environment, working folder, signals, globals and caches. Reset any such state for each call.
+5. Keep every assertion and every analysis, parser and Git call. Change no production code.
+6. Measure local CPU before and after with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 style/test_coverage_report.py`. The director runs three aws pairs on `style/test_coverage_report.py` and the ledger fixture importers; only aws pairs decide.
+
+**Files:**
+- `scripts/style/ledger_test_support.py` — imports at lines 27 and 29.
+- `scripts/style/test_coverage_report.py` — `report()` at line 151; 20 tests.
+
+**Workers:** 1 writer; two small style test files.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 174: the 30 report children cost 8.2 CPU s of 10.1 local; the import probe saved 1.87 CPU s across 42 importers.
+- Phase 78: `invoke_cli` is the shared in-process CLI boundary; `StaffCommandTestCase` runs 72 staff CLI calls through it.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.style.test_coverage_report` passes three times with 20 tests.
+- The ledger fixture importers pass.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
+
+### Phase 179 — Answer three questions on slow verify tests, coverage overlap and a fast-only gate  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a report answers the user's item 80 questions A, B and C with measured numbers and stated limits. Analysis only: no rule change, no test removal, no new test schedule, no aws work.
+
+**Decision:** the user via morty and builds, 2026-11-11. Source numbers: `~/rust/hanadocs/dwight/measurements-2026-11-11.md`, section "Is the full gate too large?" (read it; do not cd into that folder). Keep this apart from the Phase 177 census.
+
+**Spec:**
+1. A. Of the 414 slow verify tests (`scripts/direct/test_verify_*.py`, 0.5 s or more), count the tests that start a real end-to-end `verify.sh` run, and count those processes. Count the tests that prove a path a direct function call cannot prove (process boundary, signals, locks, real shell). Give test counts and process counts apart. Name the distinct behaviors and the limits of the evidence. Ask verify-unit for facts through `send.py` when needed.
+2. B. Find whether `scripts/test_times/coverage_overlap.py` has run across a full folder such as `direct`. If yes, report the candidate counts and the evidence. If no, estimate the time and the cost of a full run from a small measured sample. Do not start a full run.
+3. C. Estimate the gate duration when only tests below 0.5 s stay in the gate. Use the gate records and `module_cost.py` on a sample. Give test time, CPU time and gate wall time apart. Include the fixed cost per module (Phase 174: about 133 CPU s per gate) and modules that stay because one fast test stays. State the limits of selecting by test time.
+4. Write the report to `phases/179/gate_size_questions.md` in the session folder. Change no repository file.
+
+**Files:**
+- `phases/179/gate_size_questions.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl4: the report.
+
+**Constraints from prior phases:**
+- Phase 174: gate wall time follows CPU over 32 slots (r = 0.994); module start times are not recorded.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report answers A, B and C with measured and estimated labels and limits.
+- `git status` shows no change from the researcher.
