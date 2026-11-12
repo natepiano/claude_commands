@@ -3237,41 +3237,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Dropped; nothing landed. A trial traced each Bash launch with Linux `strace` to prove every descendant (+364 lines, an `strace` dependency). Sample of the 10 modules that hold the 59 tests with only `unverified launch bash`: 2 recovered. With real system binaries (`date`, `mkdir`, `dirname`, `cat`, `rm`, `mv` and others) added as leaves, the projection is 46 of 59, and the folder goes from 617 to 663 known of 1,558. The other 13 stay unknown (the `py` wrapper, fixture executables). The folder records cannot project more. Simple ranks above a 3% coverage gain, and no removal work is approved to use it. Patch: `phases/188/bash_descendant_evidence.patch` in the session folder.
 
-### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: todo
+### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: done
 **Depends on:** Phase 176
 
-#### Work Order
+#### As-built
 
-**Goal:** A test module that scans the tree selects on a change under its declared folders only, so a targeted run adds fewer modules with the same containment.
-
-**Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
-
-**Spec:**
-1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 241 of the median 290). For each, read the scan and name the folders it really reads.
-2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
-3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
-4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
-4a. Declare `production/test_merge_checkpoint_batch.py` with the folder of the code its fixture runs as a process: the fixture starts `merge_checkpoint`, which starts `style_sync`, which imports `style_plan`. This closes the Phase 176 replay miss for that module (builds, 2026-11-12: each miss is caught or named out of scope). Add a replay row that proves it.
-5. Add rows to the existing scan test in `scripts/production/test_affected_modules.py`: a declared module selects on a change under its folder and not on a change outside it; an undeclared unresolved scan still selects. Each declared row fails on the Phase 176 code.
-6. Replay the 55 saved runs. Containment holds (no module the old selector picked is dropped). Report the added median and largest, per rule, before and after.
-
-**Files:**
-- `config/merge_gate.conf` — the `scan_roots` key.
-- `scripts/production/affected_modules.py` — declared scan evidence.
-- `scripts/production/test_affected_modules.py` — the new rows.
-
-**Workers:** 1 writer; the key, its reader and its rows are one change.
-- impl: all three files and the replay.
-
-**Constraints from prior phases:**
-- Phase 176: 55 replays keep every old selection; added median 290, largest 478; source-scan rule median 241, largest 460. Builds ruled out the general import closure; full merge gates stay unchanged.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- The replay keeps containment for all 55 runs and shows the added median before and after.
+- Checkpoint `60e5efdf6`. `config/merge_gate.conf` `scan_roots` declares, per tree-scanning test module, the folders and files it reads; `affected_modules.py` selects a declared module only when a change falls under one of them, in place of the whole-tree source scan. An invalid or unknown declaration fails loudly to the full suite; a declared module absent from the tree gives `FullSuite` with a graph error. The declarations for `agents/test_models_conf_publish.py` and `lint/test_style_review.py` were dropped (reads unverified). Two repair rounds: loud failure on a malformed word, five data-path declarations added; the test rows sit in the existing scan test. Evidence over 55 replay rows, bound to the final hashes: 769 selections removed in 21 modules; added execution CPU median 2572.249 to 2519.426 s (largest 3503.011 to 3440.183); selector CPU median 9.77 to 9.96 s. Every row keeps the Phase 175 selections and the 13 recovered Phase 176 misses; 36 unverified pairs stay selected.
 
 ### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: done
 **Depends on:** none
@@ -3315,65 +3286,123 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Research; no commit. Local runs: `copies/test_copy_guard_sources.py` 34.1 and 20.2 CPU s (two runs, both pass). Step split: Python policy evaluation 15.8–16.2 s, shell checks 2.8–3.0 s, AST parses 2.0 s, file reads 0.03 s, no child processes. Both tests already share one scan; each file is read and parsed once. Candidates (bounds, not measured; all queue-owned in `scripts/copies/copy_guard.py`): allocate fallbacks only for missing keys (`:797`) 0–9.8 s; combine scope traversals (`:900,1124`) 0–1.8 s; smaller items below 0.4 s. First aws trial: the `:797` change alone, three pairs, all 50 policy tests kept, after queue's go. Report: `phases/195/copy_guard_report.md` in the session folder.
 
-### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: todo
+### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Local runs: `style/test_bulk_run.py` 34.6 and 35.6 CPU s, 108 tests pass, 11,303 process starts per run. The four interruption subtests at `test_bulk_run.py:713` (one method) use 2.4–2.6 CPU s: cleanup 0.59–0.62, recovery 0.61–0.64, tested-stage 0.53–0.54, startup 0.25–0.26, shared fixtures 0.40–0.43. They already share one repository and staff seed. Candidates (bounds, not measured; natest-owned): prepare findings once before the seed copy (`:716,734`) 0–0.09 s; install fixed tools before the seed copy (`:716,736`) below 0.001 s. Both are below what three aws pairs can detect, so no trial runs; the interruption cases are at their practical floor. The rest of the module's CPU is in the other 104 tests. Report: `phases/196/bulk_run_report.md` in the session folder.
+
+### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint `90cd75ec3`. `_join_bindings` (`copy_guard.py:797`) builds the `ScalarValue(UnknownArgument(key))` fallback only when a branch lacks the key, in place of the eager `dict.get` default; the values given to `_union` are unchanged (reviewers compared 4,805 and 312 cases with the old code). No test changed; 275 importer tests and all 50 policy tests pass with unchanged counts. aws pairs: `copies/test_copy_guard_sources.py` 28.82 to 19.25 CPU s (9.63 s, 3/3 rounds); `copies/test_copy_guard.py` unchanged. queue reviewed and approved the change; its follow-up suggestion (`_union` linear scan) is Phase 198.
+
+### Phase 198 — The copy-guard policy finds repeated union values by hash, not by a list scan  · status: done
+**Depends on:** Phase 197
+
+#### As-built
+
+- No gain; nothing landed. Two queue-approved `_union` versions (`copy_guard.py:786`) were measured in aws pairs against `96e8e395f`: a dict used as an ordered set made `copies/test_copy_guard_sources.py` 3.69 CPU s slower (19.21 to 22.90, 3/3 rounds), because frozen dataclass hashes are not cached and walk every nested tuple on each insert; an identity fast path in front of the old list scan made it 0.61 s slower (19.17 to 19.78, 3/3 rounds). `copy_guard.py` is unchanged. Do not retry hashed membership for these value types without a cached hash.
+
+### Phase 199 — Measure repeated target metadata reads within one build-target request  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report splits the CPU of the four `test_bulk_run.py` interruption cases and their shared setup, and names any repeated preparation, with a bounded estimate and an owner for each item.
+**Goal:** A report names the pure metadata reads that `build_targets.py` repeats within one request, with measured CPU per caller and a bound, file, line and owner for each combinable read.
 
-**Decision:** architect after Phase 193 (next items step 6, item 3): research only; no code change. style owns `scripts/style/bulk_run.py`. Assign no saving before a controlled trial.
+**Decision:** builds, 2026-11-12: the top job is the most gate CPU s per work hour; rank from the Phase 177 census. This is census rank 2 (target eligibility metadata, gross ceiling 0–149.5 CPU s per gate, about 18.7 per work hour). Research only; no code change. resources owns `build_targets.py`; verify owns its `verify.sh` callers. Code needs both goes.
 
 **Spec:**
-1. Profile `style/test_bulk_run.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> style/test_bulk_run.py --tests 10 --commands 10`, two runs.
-2. Separate the four interruption cases at `test_bulk_run.py:713` and their shared setup: admission startup, child processes, Git, journals and recovery.
-3. Map each assertion to the work it proves. Name preparation that each case repeats and a class fixture could hold.
-4. Keep real admission startup, interruption, journals and recovery. Give each candidate a bounded estimate (kept apart from measurements), its file and line, and its owner.
-5. Change no repository file. Write the report to `phases/196/bulk_run_report.md` in the session folder.
+1. Read `phases/177/body_command_census.md` (the `build_targets.py` rows and caller table) in the session folder.
+2. Trace each `build_targets.py` command that `verify.sh:783,2395,2678` and `verify_mac_offload_test_support.py:1022` start. For each, list the files, Git calls and config reads it makes, and which are pure reads of immutable input within one request.
+3. Measure CPU per command and per read step on `direct/test_verify_mac_only.py`, `test_verify_ssh_targets_routing.py` and `test_verify_wait_holder.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> <module> --tests 10 --commands 15`, two runs each, plus in-process timing of the read steps.
+4. Name each repeated pure read that one request could do once, with its bound (kept apart from measurements), file, line and owner. Keep target choice, reservation, release, live probes, ownership and lock checks as behavior.
+5. Change no repository file. Write the report to `phases/199/target_reads_report.md` in the session folder.
 
 **Files:**
-- `phases/196/bulk_run_report.md` — in the session folder.
+- `phases/199/target_reads_report.md` — in the session folder.
 
 **Workers:** 1 researcher; no repository file changes.
 - impl: the report.
 
 **Constraints from prior phases:**
-- Phase 194: `test_bulk_run.py` 42.87 CPU s median in aws pairs (108 tests).
+- Phase 177: `build_targets.py` 90.9 local CPU s in 541 starts across 31 observed modules; the pure-read share is unknown.
+- Phase 185 moved recorder imports; target calls run through `verify.sh` and stay with verify-unit.
 - No speed phase is selected from a local estimate; aws pairs decide.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report gives the per-case split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
+- The report gives measured CPU per command and per read step, and each combinable read with bound, file, line and owner.
 - No repository file changes.
 
-### Phase 197 — The copy-guard policy allocates fallbacks only for missing keys  · status: done
+### Phase 200 — Measure repeated Git metadata queries within one caller  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** `copies/test_copy_guard_sources.py` uses less CPU because the Python policy builds a fallback value only when a key is missing, with every policy check kept.
+**Goal:** A report names the Git metadata queries that copies and style callers repeat on immutable state within one operation, with measured CPU per caller and a bound, file, line and owner for each combinable query.
 
-**Decision:** queue go via builds, 2026-11-12: one aws paired trial of `copy_guard.py:797` alone (3 pairs, all 50 policy tests kept). Code lands only on a measured gain. Send the change to queue for review before its checkpoint.
+**Decision:** builds, 2026-11-12: rank from the Phase 177 census. This is census rank 3 (Git metadata, gross ceiling 0–93.5 CPU s per gate, about 15.6 per work hour). Research only; no code change. queue owns `scripts/copies/`; style owns `scripts/style/git_process.py`; natest owns `ledger_test_support.py`.
 
 **Spec:**
-1. At `scripts/copies/copy_guard.py:797`, build the fallback only when the key is missing (for example `if key not in mapping` before the allocation, in place of an eager `get(key, <new value>)` or `setdefault`). Read the Phase 195 report section for this candidate first.
-2. Keep the result of every lookup the same for every input. Change nothing else in `copy_guard.py`.
-3. Add no test unless the change has a case no existing test covers; then add one row to an existing test.
-4. Run `copies/test_copy_guard_sources.py`, `copies/test_copy_guard.py` and every other importer of `copy_guard.py`, and basedpyright on the changed file. The director runs three aws pairs.
+1. Read `phases/177/body_command_census.md` (the `git rev-parse` rows and caller table) in the session folder.
+2. Trace the `git rev-parse` calls from `copies.py:433,449,474,486`, `style/git_process.py:157` and `style/ledger_test_support.py:283` in the top modules: `style/test_crate_run.py`, `style/test_style_ledger_tickets.py`, `agents/test_models_conf_publish.py`, `style/test_style_ledger_findings.py`, `style/test_bulk_run.py`.
+3. Count calls per operation and mark which read immutable values (common dir, top level, object ids of fixed commits) before refs, index or working tree can change. Measure their CPU with `module_cost.py --tests 10 --commands 15`, two runs per module.
+4. Name each combinable or reusable query with its bound (kept apart from measurements), file, line and owner. Fresh refs and working-tree checks keep fresh reads. Mark the fixture-only part (natest) apart from production (queue, style).
+5. Change no repository file. Write the report to `phases/200/git_metadata_report.md` in the session folder.
 
 **Files:**
-- `scripts/copies/copy_guard.py` — the lookup at line 797.
+- `phases/200/git_metadata_report.md` — in the session folder.
 
-**Workers:** 1 writer; one small change.
-- impl: all files.
+**Workers:** 1 researcher; no repository file changes.
+- impl: the report.
 
 **Constraints from prior phases:**
-- Phase 195: Python policy evaluation 15.8–16.2 CPU s locally; this candidate's bound is 0–9.8 s and includes required work. Not measured as a saving.
+- Phase 177: `git rev-parse` 56.8 local CPU s in 56,622 calls across 94 observed modules.
+- Architect after Phase 197: `style_ledger.py:7787` already makes one `rev-parse` call for the ledger location.
+- No speed phase is selected from a local estimate; aws pairs decide.
 
 **State:** none.
 
 **Acceptance gate:**
-- All importers of `copy_guard.py` pass with unchanged test counts; basedpyright reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
-- queue reviews the change before the checkpoint.
+- The report gives measured CPU per caller and each combinable query with bound, file, line and owner.
+- No repository file changes.
+
+### Phase 201 — Record-content tests call the recorder in process  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/buildlog/test_record.py` runs its record-content cases through `record.main(argv)` in process, keeps a small set of real CLI starts, and saves measured aws CPU.
+
+**Decision:** report, 2026-11-12: go on the test file with three conditions. (1) Each in-process case calls `record.main(argv)` with its environment set as the CLI case set it (patch `os.environ` per case, restore after) and the same working folder; check the return code and the captured stdout and stderr, as the CLI case did. (2) Keep real CLI starts for the entry path (the script through `scripts/lib/py`), an argument error exit code, and one record write that reads stdin, if a case reads stdin now. (3) No production code change in `record.py` for the tests; send report the hash before it lands. Census rank 7 (bound 0-17.7 CPU s per gate).
+
+**Spec:**
+1. Change the `record` helper at `test_record.py:167` so it runs `record.main(argv)` in process for record-content cases. Set `os.environ` from `self.environment(**extra)` and the working folder from `cwd` for the call; restore both after it. Feed `input` through `sys.stdin`. Capture stdout and stderr. Return the same `subprocess.CompletedProcess[str]` shape, so callers stay unchanged.
+2. `record.main` with `step` calls `detach()` (`record.py:450`), which calls `os.setsid()` and closes every descriptor above 2. In process, patch `record.detach` in the test only; never call it in the runner. Patch any other process-wide side effect the same way, and name each one in the reply.
+3. `step-context` runs `step_context.py` (`CONTEXT_SCRIPT`). Run it in process through its own `main` only when it has one with the same contract; otherwise keep it a CLI start.
+4. Keep real CLI starts per condition (2). Name each kept CLI case in the reply.
+5. Keep every assertion. Add no new test method. Keep module-level state between cases from leaking: reload or reset what `record.py` caches from the environment.
+6. Change no production file.
+
+**Files:**
+- `scripts/buildlog/test_record.py` — the `record` helper and the kept CLI cases.
+
+**Workers:** 1 writer; one test file holds the whole change.
+- impl: `scripts/buildlog/test_record.py`.
+
+**Constraints from prior phases:**
+- Phase 177: `buildlog/test_record.py` makes 130 record calls, about 10.8 local CPU s; the module is about 20 CPU s.
+- No speed phase lands on a local estimate; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `buildlog/test_record.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
+- An aws paired trial shows a CPU saving for `buildlog/test_record.py`.
+- report receives the file hash before it lands.

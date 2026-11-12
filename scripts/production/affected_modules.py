@@ -867,8 +867,35 @@ def names_changed_file(graph: SourceGraph, sources: set[str], changed: set[str],
                for source in sources)
 
 
-def scans_repository_changes(graph: SourceGraph, sources: set[str], changed: set[str]) -> bool:
-    """Keep source audits when a matching file changes, including an existing file."""
+def declared_scan_roots(repo: Path, modules: Sequence[Path], words: Sequence[str]) -> dict[str, frozenset[str]]:
+    """Validate declared repository paths for live gate modules."""
+    live_modules = {module.relative_to(repo).as_posix() for module in modules
+                    if is_test_module(module.name) and module.is_file()}
+    roots: dict[str, set[str]] = defaultdict(set)
+    for word in words:
+        if word.count(":") != 1:
+            raise ValueError(f"invalid scan_roots entry {word!r}: expected exactly one ':'")
+        module, folder = word.split(":")
+        module_path, folder_path = PurePosixPath(module), PurePosixPath(folder)
+        if not module.endswith(".py") or module_path.is_absolute() or ".." in module_path.parts:
+            raise ValueError(f"invalid scan_roots entry {word!r}: expected a relative test module path")
+        module_name = f"scripts/{module_path.as_posix()}"
+        if module_name not in live_modules:
+            raise ValueError(f"invalid scan_roots entry {word!r}: test module is not a live gate module")
+        if not folder or folder_path.is_absolute() or ".." in folder_path.parts:
+            raise ValueError(f"invalid scan_roots entry {word!r}: expected a relative repository path")
+        if not (repo / folder_path).exists():
+            raise ValueError(f"invalid scan_roots entry {word!r}: repository path does not exist")
+        roots[module_name].add(folder_path.as_posix())
+    return {module: frozenset(folders) for module, folders in roots.items()}
+
+
+def scans_repository_changes(graph: SourceGraph, sources: set[str], changed: set[str],
+                             module: str, declarations: dict[str, frozenset[str]]) -> bool:
+    """Use declared paths when present, or retain inferred scan evidence."""
+    if module in declarations:
+        return any(PurePosixPath(path).is_relative_to(folder)
+                   for folder in declarations[module] for path in changed)
     for source in sources:
         for scan in graph.repository_scans.get(source, frozenset()):
             for path in changed:
@@ -923,8 +950,10 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
                     state_dir: Path | None = None) -> AffectedSelection | FullSuite:
     try:
+        settings = conf.read("merge_gate")
+        declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
         candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
-        for branch in conf.read("merge_gate").words("landing_branches"):
+        for branch in settings.words("landing_branches"):
             ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD",
                                        f"refs/remotes/origin/{branch}"],
                                       capture_output=True, text=True, check=False)
@@ -981,13 +1010,13 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
             config_changed = bool(configs) and (isinstance(config_reads, NoConfigReadRecord)
                 or bool(config_reads.stems & configs) or bool(static_configs & configs) or "*" in static_configs
                 or isinstance(reads.content_reads, RecordedContentReads) and bool(reads.content_reads.paths & config_paths))
-            folder_changed = has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
+            folder_changed = path not in declarations and has_folder_records and (isinstance(reads.folder_scans, NoFolderScanRecord)
                 or scans_changed_paths(reads.folder_scans, changed, scanned_parents))
             content_changed = bool(content_changes) and has_content_records and (isinstance(reads.content_reads, NoContentReadRecord)
                 or bool(reads.content_reads.paths & content_changes))
             if (path in changed or graph.imports.get(path, set()) & python
                     or old_graph.get(path, set()) & removed or names_changed_file(graph, sources, named, folder_names)
-                    or scans_repository_changes(graph, sources, changed)
+                    or scans_repository_changes(graph, sources, changed, path, declarations)
                     or config_changed or folder_changed or content_changed):
                 selected.append(module)
                 continue
