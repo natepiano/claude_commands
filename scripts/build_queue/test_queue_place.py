@@ -224,7 +224,8 @@ class QueuePlaceFixture(ExitStack):
         self.lifeline_read, self.lifeline_write = os.pipe()
         _ = self.callback(os.close, self.lifeline_read)
         _ = self.callback(os.close, self.lifeline_write)
-        self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(prefix="queue-place-test-")))
+        self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(
+            prefix="queue-place-test-", dir=os.environ.get("TMPDIR"))))
         self.log: Path = self.root / "log"
         self.proc: Path = self.root / "proc"
         self.proc.mkdir()
@@ -365,6 +366,39 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_fixture_removes_child_folders_after_exit_term_int_and_kill(self) -> None:
+        source = """
+from pathlib import Path
+import sys
+from scripts.build_queue.queue_place import queue_place
+with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
+    print(place.sidecar.parent, flush=True)
+    sys.stdin.buffer.read(1)
+"""
+        for ending in (0, signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory(prefix="queue-caller-") as directory:
+                caller = Path(directory)
+                with mock.patch.dict(os.environ, {"TMPDIR": str(caller)}):
+                    with QueuePlaceFixture() as fixture:
+                        child = subprocess.Popen([sys.executable, "-c", source, str(fixture.root)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        assert child.stdout is not None
+                        self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                        folder = Path(cast(bytes, child.stdout.readline()).decode().strip())
+                        self.assertTrue(folder.is_relative_to(fixture.admission.temporary))
+                        self.assertTrue(folder.is_dir())
+                        if ending:
+                            child.send_signal(ending)
+                        else:
+                            assert child.stdin is not None
+                            _ = child.stdin.write(b"G")
+                            child.stdin.flush()
+                        status = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(status, -signal.SIGKILL if ending == signal.SIGKILL
+                                         else 128 + ending if ending else 0)
+                        self.assertEqual(folder.exists(), ending == signal.SIGKILL)
+                    self.assertEqual(list(caller.iterdir()), [])
+
     def test_scope_sampler_uses_the_shared_anonymous_reader_and_skips_unavailable_use(self) -> None:
         from scripts.lint.memory_test_support import admission_configuration_fixture
 
