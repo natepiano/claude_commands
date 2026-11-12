@@ -1178,27 +1178,16 @@ Problem: after Phase 52 the folder walk runs once a day. The 15:23 EST floor ale
 
 ### Phase 56 — Old buildlog indexes go by change time only · status: done
 
-From builds (not the user), 2026-11-12: "The index prune keeps a file while max(atime, mtime) is under 2 days. complete_gate_index_in opens every index file and refreshes its atime, so no old index goes (37 GiB held; resources removed 11.4 GiB by hand). Fix: prune by mtime only. Go now, ahead of phase 55; land order when green." Runs beside Phase 55; the files do not overlap.
+From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahead of Phase 55.
 
-#### Work Order
+#### As-built
 
-**Goal:** An index file of another schema goes once nothing changed it for `INDEX_UNUSED_DAYS`, whoever reads it.
-
-**Spec:**
-- `scripts/buildlog/index.py` `cleanup_unused_indexes`: compare `st_mtime` alone with the cutoff. Do not read `st_atime`.
-- `config/buildlog.conf`: keep `INDEX_UNUSED_DAYS=2`. Rewrite its Basis line: an index that a tree updates gets its mtime set by `update_in` at least each `INDEX_TOUCH_MINUTES`; reads do not keep an index, because `complete_gate_index_in` reads every index and refreshes atime. Keep the user's 2026-11-04 words.
-- Tests in `scripts/buildlog/test_index.py`: add rows to `test_cleanup_reads_the_unused_schema_age_from_config_at_use` or its neighbor. An index with a fresh atime and an old mtime goes; an index with a fresh mtime stays.
+- `cleanup_unused_indexes` compares `st_mtime` alone with the `INDEX_UNUSED_DAYS` cutoff. It does not read `st_atime`.
+- Cause: `complete_gate_index_in` reads every index and refreshes its atime, so the old `max(atime, mtime)` test kept every index (37 GiB held on 2026-11-12).
+- `update_in` sets an index mtime at least each `INDEX_TOUCH_MINUTES`, so an index that a tree updates stays.
+- `config/buildlog.conf` keeps `INDEX_UNUSED_DAYS=2`; its Basis states the mtime rule.
 
 **Files:**
-- `scripts/buildlog/index.py`
-- `scripts/buildlog/test_index.py`
-- `config/buildlog.conf`
-
-**Workers:** `1 writer`
-- writer: all files.
-
-**State:** none.
-
-**Acceptance gate:**
-- `scripts.buildlog.test_index` passes.
-- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
+- `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
+- `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.
