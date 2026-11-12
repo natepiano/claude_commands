@@ -160,6 +160,26 @@ class RegionalSpotPrice:
     read_at: int
 
 
+def regional_spot_prices(region: str, reply: dict[str, object], sizes: Sequence[str],
+                         read_at: int) -> tuple[RegionalSpotPrice, ...]:
+    """Select the latest Linux/UNIX price for each requested type and zone."""
+    if reply.get('NextToken'):
+        raise ValueError('The regional Spot price reply is incomplete')
+    latest: dict[tuple[str, str], tuple[float, RegionalSpotPrice]] = {}
+    for row in rows(reply, 'SpotPriceHistory'):
+        size, zone = text(row, 'InstanceType'), text(row, 'AvailabilityZone')
+        if size not in sizes:
+            continue
+        at = datetime.fromisoformat(text(row, 'Timestamp').replace('Z', '+00:00')).timestamp()
+        price = money(text(row, 'SpotPrice'))
+        if not zone or price < 0:
+            raise ValueError('The regional Spot price reply has invalid rows')
+        key = (zone, size)
+        if key not in latest or at > latest[key][0]:
+            latest[key] = (at, RegionalSpotPrice(region, zone, size, price, read_at))
+    return tuple(price for _, price in latest.values())
+
+
 def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
     """Read the complete regional price snapshot, or return no rows when absent."""
     try:

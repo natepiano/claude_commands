@@ -603,11 +603,13 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
 
-The controller uses the region order in `cloud_gate.conf`.
+The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The default order is us-east-2, then us-west-2.
+The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+`us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-Within each region, it tries each configured type and each public zone.
+The gate ranks deployed types and public zones by size and expected cost before launch.
+Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after every regional variant refuses.
 Paired trials use the same regional launch and cleanup path.
@@ -667,6 +669,13 @@ Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
 
+European deployment needs account and policy changes before the regional stacks can start.
+Enable `eu-south-2` on the AWS Account page and wait until its status is `ENABLED`.
+See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
+Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before deployment.
+Keep the existing home and US region permissions.
+The runbook gives the preparation steps.
+
 The controller reads gate Spot prices every `price_refresh_seconds=3600`.
 It reads prices after the tick releases `controller.lock`, in the same process.
 It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
@@ -683,10 +692,24 @@ Failed attempts use the same refresh interval.
 The price read remains active when the former builder route is disabled or removed.
 
 A new gate ranks only variants from its deployment.
+Before its first ranking, it reads live Spot prices in parallel from each deployed region.
+Each region receives one Linux/UNIX request for all configured `instance_types`.
+`spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.
+The reader selects the latest price for each deployed zone and type.
+Live rows replace matching hourly rows for this ranking only.
+Failed or slow regions retain their hourly rows.
+The live read never writes `spot-prices.json`.
+`launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
+Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Resumed launches keep the saved ranking and evidence without another live read.
 Available variants precede variants under a capacity cooldown.
 Within each group, larger vCPU sizes precede smaller sizes.
 Types with equal vCPU counts compete on expected gate cost.
-That cost equals the hourly Spot price times expected gate hours, plus the remote region transfer charge.
+That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
+It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
+`region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
+Missing regions contribute zero extra seconds.
+`gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
 Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
 Without recent durations, it uses `lifetime_minutes`.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
@@ -712,7 +735,7 @@ Refusal handling, regional cost bookings, and the $35 daily and $400 monthly lim
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
-`spot_candidate_regions=us-east-2 us-west-2` also supplies the regions for Spot work and later price steering.
+`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2` supplies the candidate regions for Spot work and price reads.
 `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
@@ -727,7 +750,7 @@ A failed read prints the quota as unknown with the redacted reason, and the comm
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
 `deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-The default request is 128 vCPUs.
+The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
 It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 All three new keys are in `cloud_gate.conf`.

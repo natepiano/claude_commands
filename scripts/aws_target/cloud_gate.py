@@ -7,6 +7,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -59,6 +60,14 @@ class GateLaunchVariant:
     instance_type: str
     subnet_id: str
     zone: str
+
+
+@dataclass(frozen=True)
+class RegionalLiveSpotRead:
+    region: str
+    seconds: float
+    used: bool
+    prices: tuple[ledger.RegionalSpotPrice, ...] = ()
 
 
 def settings() -> conf.ConfigRead:
@@ -297,6 +306,7 @@ class GateWorker:
         self.clock = clock
         self.pause = pause
         self.size_vcpus: int = 0
+        self.price_read_evidence: tuple[dict[str, object], ...] = ()
 
     def regional_api(self, region: str) -> AwsCli:
         if region not in self.apis:
@@ -415,6 +425,8 @@ class GateWorker:
         error_code = launch_error_code(reason)
         row: dict[str, object] = {'time': self.clock(), 'attempt': request['attempt'], 'instance_type': size,
             'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode'], 'region': self.box_region}
+        if result != 'finished' and self.price_read_evidence:
+            row['spot_price_reads'] = self.price_read_evidence
         if result == 'finished':
             row['gate_s'] = gate_s
         else:
@@ -424,7 +436,51 @@ class GateWorker:
         if result == 'refused':
             print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
 
-    def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str) -> list[GateLaunchVariant]:
+    def live_spot_prices(self, variants: Sequence[GateLaunchVariant]) -> tuple[RegionalLiveSpotRead, ...]:
+        """Read deployed regions concurrently under one launch deadline."""
+        if not variants:
+            return ()
+        values = settings()
+        sizes = values.words('instance_types')
+        regions = tuple(dict.fromkeys(row.region for row in variants))
+        deployed = {(row.region, row.instance_type, row.zone) for row in variants}
+        started = time.monotonic()
+        deadline = started + values.number('spot_price_live_read_timeout_s')
+        read_at = int(self.clock())
+        call_started: dict[str, float] = {}
+
+        def fetch(region: str) -> RegionalLiveSpotRead:
+            begin = time.monotonic()
+            call_started[region] = begin
+            try:
+                remaining = deadline - begin
+                if remaining <= 0:
+                    return RegionalLiveSpotRead(region, 0, False)
+                reply = self.api.in_region(region).call('describe-spot-price-history', '--instance-types', *sizes,
+                    '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(read_at, UTC).isoformat(),
+                    '--no-paginate', '--max-results', '1000', timeout_s=min(self.api.timeout_s, remaining))
+                prices = tuple(row for row in ledger.regional_spot_prices(region, reply, sizes, read_at)
+                               if (row.region, row.instance_type, row.zone) in deployed)
+                ended = time.monotonic()
+                used = bool(prices) and ended <= deadline
+                return RegionalLiveSpotRead(region, ended - begin, used, prices if used else ())
+            except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError,
+                    subprocess.SubprocessError):
+                return RegionalLiveSpotRead(region, time.monotonic() - begin, False)
+
+        pool = ThreadPoolExecutor(max_workers=len(regions))
+        try:
+            pending = {region: pool.submit(fetch, region) for region in regions}
+            done, _ = wait(pending.values(), timeout=max(0, deadline - time.monotonic()))
+            ended = time.monotonic()
+            return tuple(future.result() if future in done else
+                         RegionalLiveSpotRead(region, ended - call_started.get(region, started), False)
+                         for region, future in pending.items())
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
+                      live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
         """Prefer available capacity, larger sizes, and the lowest total gate cost."""
         values = settings()
         policy = conf.read(self.settings_path)
@@ -450,6 +506,7 @@ class GateWorker:
                       if 0 <= now - row.read_at <= max_age}
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
             prices = {}
+        prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
         if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
             return sorted(variants, key=cooled)
         durations: list[float] = []
@@ -465,12 +522,18 @@ class GateWorker:
         hours = (Decimal(str(statistics.median(durations))) / 3600 if durations
                  else Decimal(values.whole('lifetime_minutes')) / 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
+        wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
+        extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
+                         ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
+        if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
+            raise ValueError('The regional gate delay must be nonnegative')
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
             position, variant = item
             size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', variant.instance_type)
             vcpus = (2 if size[1] == 'large' else 4 * int(size[2] or '1')) if size else 0
             key = (variant.region, variant.instance_type, variant.zone)
             cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
+                    + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
             return cooled(variant), -vcpus, key not in prices, cost, position
         return [variant for _, variant in sorted(enumerate(variants), key=order)]
@@ -486,13 +549,17 @@ class GateWorker:
         variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
                     for regional in ledger.rows(deployment, 'regions') for size in sizes for row in ledger.rows(regional, 'subnets')]
         if not path.exists():
-            variants = self.rank_variants(variants, ledger.text(request, 'mode'))
-            launch = {'variant': 0, 'variants': [asdict(row) for row in variants]}
+            readings = self.live_spot_prices(variants)
+            live_prices = [price for reading in readings if reading.used for price in reading.prices]
+            variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
+            launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
+                'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
             save(path, launch)
         elif 'variants' in launch:
             variants = [GateLaunchVariant(ledger.text(row, 'region'), ledger.text(row, 'instance_type'),
                 ledger.text(row, 'subnet_id'), ledger.text(row, 'zone')) for row in ledger.rows(launch, 'variants')]
-        saved_order = {'variants': launch['variants']} if 'variants' in launch else {}
+        saved_order = {key: launch[key] for key in ('variants', 'spot_price_reads') if key in launch}
+        self.price_read_evidence = ledger.rows(launch, 'spot_price_reads') if 'spot_price_reads' in launch else ()
         regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
