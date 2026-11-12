@@ -289,6 +289,13 @@ It removes those plain credentials only after the encrypted write succeeds.
 It preserves the scaler profile and all unrelated sections.
 Enter retains a stored value during replacement.
 
+One resolver selects the scaler credential file for deployment, key creation, and teardown.
+It uses a nonempty `AWS_SHARED_CREDENTIALS_FILE` override before `credential_file` from `cloud_gate.conf`.
+It expands `~` in either path.
+Every `deploy.py` command sets the resolved path in its environment before dispatch.
+AWS CLI subprocesses inherit the same path.
+User deployment commands need no credential environment prefix.
+
 `price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
 `prepare` decrypts only when it must reconcile existing AWS resources.
 `bootstrap` needs no administrator credentials.
@@ -761,6 +768,8 @@ A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
 `deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+Credential refusals print their message once and stop the command with a nonzero exit status.
+AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
