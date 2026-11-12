@@ -150,7 +150,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
-| `scripts/build_hold/build_hold.py` | read | local_snapshot, OpenRun; finds the run owner's current_session |
+| `scripts/build_hold/build_hold.py` | read | local_snapshot, snapshot, initial_snapshot, by_id, by_member_reference, OpenRun; holder keys are fixed staff ids, and the current name, session and message address come from the row |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
@@ -197,6 +197,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
+| `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
 | `scripts/message/morty_identity.py` | read | native_id |
@@ -313,7 +314,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-185 accessor rows: 39 write, 145 read, 1 owner.
+186 accessor rows: 39 write, 146 read, 1 owner.
 
 ## Approved copies
 

@@ -306,6 +306,14 @@ class StopResumeTests(unittest.TestCase):
                         case.client.rows.append({"pane_id": "w1:p4", "terminal_id": "second-terminal",
                             "tab_id": "second-tab", "workspace_id": "w1", "label": "dwight",
                             "agent_session": {"kind": "id", "value": second}})
+                        original_result = case.client.result
+
+                        def second_process(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                            if arguments == ("pane", "process-info", "--pane", "w1:p4"):
+                                return {"process_info": {"foreground_processes": [{"pid": 457, "argv": ["claude"]}]}}
+                            return original_result(*arguments, deadline=deadline)
+
+                        _ = case.enterContext(patch.object(case.client, "result", side_effect=second_process))
                 elif location in ("codex-index", "codex-account-index", "codex-dual-source"):
                     home = case.root / (".codex" if location == "codex-index" else ".codex7")
                     home.mkdir()
@@ -319,6 +327,11 @@ class StopResumeTests(unittest.TestCase):
                     case.client.rows[-1]["label"] = "dwight"
                 else:
                     case.tab_titles["manual-tab"] = "dwight"
+                if location in ("registry", "codex-index", "codex-account-index"):
+                    self.assertEqual(stop_resume.producer_conflicts("dwight", case.client), [])
+                if location in ("registry", "codex-index", "codex-account-index", "two-live"):
+                    # A pane label can still prove an unregistered producer conflict.
+                    case.client.rows[-2 if location == "two-live" else -1]["label"] = "dwight"
                 result = stop_resume.resume("dwight")
                 if location == "two-live":
                     self.assertIsInstance(result, stop_resume.ResumeFailed, result)
@@ -351,6 +364,25 @@ class StopResumeTests(unittest.TestCase):
                 with patch.object(codex_daemon, "read_daemons", return_value=[read]):
                     self.assertEqual(stop_resume.producer_conflicts(reference, world.case.client),
                                      [(world.identity, "outside herdr")] if owned and reference == "dwight" else [])
+
+        for kind in ("claude", "codex"):
+            with self.subTest(renamed_producer=kind), producer_first_fixture(kind) as world:
+                member = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "renamed-producer", staff.StaffRoot(),
+                                        current_session=staff.native_id(world.identity))
+                directory = world.case.root / "sessions"
+                directory.mkdir()
+                _ = (directory / "456.json").write_text(json.dumps({
+                    "pid": 456, "sessionId": world.identity, "name": "old-producer", "cwd": str(world.folder),
+                    "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
+                world.home.mkdir(exist_ok=True)
+                _ = (world.home / "session_index.jsonl").write_text(json.dumps({
+                    "id": world.identity, "thread_name": "old-producer"}) + "\n")
+                with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((member,))), \
+                     patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
+                         {world.identity: (456,)} if kind == "codex" else {}, ())):
+                    self.assertEqual(stop_resume.producer_conflicts(member.name, world.case.client),
+                                     [(world.identity, "outside herdr")])
+                    self.assertEqual(stop_resume.producer_conflicts("old-producer", world.case.client), [])
 
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
@@ -417,12 +449,11 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual({path.name: path.read_text() for path in (world.case.root / "panes").glob(".producer-admission-*")}, receipts)
                 result = stop_resume.resume("dwight")
                 if stage == "named-before-retry":
-                    self.assertIsInstance(result, stop_resume.ResumeFailed, result)
-                    self.assertEqual(staff.initial_snapshot().rows, ())
-                    self.assertEqual(world.arguments, [])
+                    self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+                    assert isinstance(result, stop_resume.ClaudeUp)
+                    self.assertEqual(result.start_state, ClaudeStartState.STARTED)
                     self.assertEqual(len(world.case.client.opened), 1)
                     self.assertEqual(world.case.client.closed, [])
-                    continue
                 if stage in ownership_stages:
                     self.assertNotIn(foreign_pane, world.started_panes)
                     if stage.startswith("foreign-"):

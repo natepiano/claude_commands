@@ -9,6 +9,7 @@ import os
 import signal
 import unittest
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from unittest.mock import call, patch
@@ -88,6 +89,29 @@ class ProducerCommandsTests(unittest.TestCase):
                 self.assertIn(f"{identity}: stopped pid 123", output.getvalue())
                 self.assertEqual(case.client.closed, [])
                 case.doCleanups()
+
+        from scripts.agents.test_shutdown_cli import DIRECTOR, RetireUnitTests
+        from scripts.copies import copies
+        from scripts.lib import conf
+
+        case = RetireUnitTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        unit = shutdown.retirement_find_unit("alpha", "alpha")
+        member = replace(unit.staff_member, id=staff.StaffId(fixture_runtime_id("fixed-retiring-holder")))
+        self.assertNotEqual(member.id, member.current_session)
+        unit = replace(unit, staff_member=member)
+        holds = Path(os.environ["BUILD_HOLD_DIR"])
+        fixed_hold = (holds / DIRECTOR).rename(holds / member.id)
+        with patch.object(shutdown, "retirement_remove", return_value=[]) as remove, \
+             patch.object(copies, "remove_trees") as trees, redirect_stdout(io.StringIO()) as output:
+            code = shutdown.retirement_clear_worktree(unit, settings=conf.read("production"),
+                record=staff.StaffSnapshot((member,)), pane_workers=[], pane=herdr.NoPane("alpha"), require_cleanup=True)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn(["build_hold.py", "release", "--holder", member.id], case.calls)
+        self.assertFalse(fixed_hold.exists())
+        remove.assert_called_once()
+        trees.assert_called_once_with(str(member.id))
 
     def test_remove_stray_preserves_the_real_producer_and_completes_a_rerun(self) -> None:
         for target, failure_step in (("stray", ""), ("current", ""), ("split", ""), ("pane-admission", ""),

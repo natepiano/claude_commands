@@ -64,7 +64,7 @@ def read_current_holds() -> CurrentHolds:
     try:
         block = mac_test.read_claim_block(mac_test.state_paths())
         mac = MacHoldsNow(()) if isinstance(block, mac_test.NoMacBlock) else MacHoldsNow((
-            CurrentHold(block.since.isoformat(), block.holder, block.reason, block.since),
+            CurrentHold(block.since.isoformat(), mac_test.holder_name(block.holder), block.reason, block.since),
         ))
     except (OSError, UnicodeError, mac_test.StateReadError) as error:
         mac = HoldStateUnreadable(str(error))
