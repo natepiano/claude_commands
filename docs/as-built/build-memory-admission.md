@@ -1118,7 +1118,18 @@ The audit calls `hold_enforcer.record_build(..., action="audit")` for each `othe
 
 **Holder key.** A staff holder uses its fixed staff ID as the file key. Without `--holder`, `CLAUDE_CODE_SESSION_ID` must resolve through `staff.snapshot().by_current_session`. A given holder resolves through its fixed ID, current session, or current staff name. An explicit holder outside staff keeps its given text as the key. Registry names and former names do not select holds or release records. `Holder.name` shows the current staff name when the key resolves. `cycle["holders"]` retains the key from `start_hold`. `holder_path` replaces unsafe file-name characters in that key. A recorded release matches the resulting file name and its `since` instant. The deployment converter handles old keys once; runtime readers accept only the fixed key.
 
-**Hold cycle.** `BUILD_HOLD_RELEASE_DIR` defaults to `~/.local/state/build-hold-release`, outside the holder directory. `current` names `<id>/cycle.json`, atomically replaced under `release.lock`. `HoldCycle` stores its id, open time, holders with `{since, released_at}`, recipients by session id, release start and `ReleaseEntry` rows with session id, name and delivery outcome. The first hold with no files opens a cycle without reading an old one. With other holders it joins the cycle; without a readable cycle it writes its file and opens none. Old cycle files with call, generation and gate fields still read; those fields no longer control a build.
+**Hold cycle.** `release_directory()` uses `BUILD_HOLD_RELEASE_DIR` when set.
+Otherwise, it uses a sibling of `holder_directory()` named `<hold folder name>-release`.
+With neither variable set, the release folder remains `~/.local/state/build-hold-release`.
+`current` names `<id>/cycle.json`.
+The writer replaces this file atomically under `release.lock`.
+`HoldCycle` stores its id, open time, and holders with `{since, released_at}`.
+It also stores recipients by session id, release start, and `ReleaseEntry` rows with session id, name, and delivery outcome.
+The first hold with no files opens a cycle without reading an old one.
+With other holders, it joins the cycle.
+Without a readable cycle, it writes its holder file and opens no cycle.
+Readers still accept old cycle files with call, generation, and gate fields.
+These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 

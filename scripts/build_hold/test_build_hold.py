@@ -944,6 +944,21 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
 
     def test_idle_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
+        for variables, expected in (
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds")}, self.scratch / "custom-holds-release"),
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds"),
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": ".",
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": "."}, Path.cwd().with_name(Path.cwd().name + "-release")),
+            ({}, self.scratch / ".local/state/build-hold-release"),
+        ):
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in {"BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR"}}
+            environment.update(variables)
+            with self.subTest(variables=variables), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(build_hold.release_directory(), expected)
+                self.assertFalse(expected.exists())
         release = self.scratch / "release"
         self.assertFalse(release.exists())
         for arguments in (
