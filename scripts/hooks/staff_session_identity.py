@@ -17,6 +17,7 @@ from typing import cast
 from scripts.production import staff
 from scripts.message import sessions
 from scripts.agents import pane_record
+from scripts.herdr import pane_launch
 
 
 @dataclass(frozen=True)
@@ -29,37 +30,68 @@ class ClaudeIdentityHandoff:
     new_id: staff.StaffId
 
 
+@dataclass(frozen=True)
+class ClaudeLaunchObservation:
+    """An ancestor process has this retained launch observation."""
+
+    pid: int
+    entry: pane_launch.PaneLaunch
+
+
+class MissingClaudeLaunch(Enum):
+    MISSING = "no ancestor has a retained launch observation"
+
+
+@dataclass(frozen=True)
+class StaleClaudeLaunch:
+    """An ancestor pid has a launch observation from another generation."""
+
+    entry: pane_launch.PaneLaunch
+
+
+def _launch_observation(host: str) -> ClaudeLaunchObservation | MissingClaudeLaunch | StaleClaudeLaunch:
+    entries = pane_record.read_strict(host).values()
+    pid = os.getppid()
+    stale: StaleClaudeLaunch | MissingClaudeLaunch = MissingClaudeLaunch.MISSING
+    for depth in range(pane_record.ANCESTOR_LIMIT):
+        del depth
+        matches = [entry for entry in entries if entry.get("pid") == pid]
+        if matches:
+            started = sessions.process_start(pid)
+            matching_generation = [entry for entry in matches if entry.get("proc_start") == started]
+            if started and matching_generation:
+                entry = max(matching_generation, key=lambda entry: entry["written_at"])
+                return ClaudeLaunchObservation(pid, entry)
+            if isinstance(stale, MissingClaudeLaunch):
+                stale = StaleClaudeLaunch(max(matches, key=lambda entry: entry["written_at"]))
+        if pid <= 1:
+            break
+        pid = pane_record.process_parent(pid)
+    return stale
+
+
 def prove(payload: Mapping[str, object], environment: Mapping[str, str]) -> ClaudeIdentityHandoff:
     pane = environment.get("HERDR_PANE_ID", "")
     host = environment.get("HERDR_SESSION", "")
     if environment.get("HERDR_ENV") != "1" or not pane or not host:
         raise staff.StaffRefused("clear: exact herdr pane evidence is missing")
-    pid = os.getppid()
-    # Hook commands may run below one shell; walk only to the recorded Claude pid.
-    entry = pane_record.read_strict(host).get(pane)
-    if entry is None:
+    observed = _launch_observation(host)
+    if isinstance(observed, MissingClaudeLaunch):
         raise staff.StaffRefused("clear: old launch observation is missing")
-    recorded_pid = entry.get("pid")
+    if isinstance(observed, StaleClaudeLaunch):
+        raise staff.StaffRefused("clear: Claude process start time differs from the launch observation")
+    pid, entry = observed.pid, observed.entry
     recorded_start = entry.get("proc_start")
-    for depth in range(pane_record.ANCESTOR_LIMIT):
-        del depth
-        if pid == recorded_pid:
-            break
-        if pid <= 1:
-            raise staff.StaffRefused("clear: launch observation belongs to another process")
-        pid = pane_record.process_parent(pid)
-    else:
-        raise staff.StaffRefused("clear: Claude parent pid is not proved")
     started = sessions.process_start(pid)
     if not started or started != recorded_start:
         raise staff.StaffRefused("clear: Claude process start time differs from the launch observation")
     raw = payload.get("session_id")
     if not isinstance(raw, str):
         raise staff.StaffRefused("clear: hook session_id is missing")
-    observed = staff.native_id(entry["session_id"])
     record = staff.initial_snapshot()
-    owner = record.by_member_reference(observed)
-    old = owner.current_session if owner is not None else observed
+    reference = pane_launch.launch_reference(entry, record)
+    old = (record.rows_by_id[reference.id].current_session if isinstance(reference, pane_launch.StaffLaunchReference)
+           else staff.native_id(reference.session))
     current = staff.runtime_id(pid)
     if payload.get("hook_event_name") == "SessionEnd":
         if payload.get("reason") != "clear" or raw != old:
@@ -93,9 +125,12 @@ def handle(payload: Mapping[str, object], environment: Mapping[str, str]) -> Cle
         return ClearIdentityResult.UNSTAFFED
     if not record.rows:
         return ClearIdentityResult.UNSTAFFED
-    entry = pane_record.read_strict(environment.get("HERDR_SESSION", "")).get(
-        environment.get("HERDR_PANE_ID", ""))
-    previous = record.by_member_reference(entry["session_id"]) if entry is not None else None
+    observation = _launch_observation(environment.get("HERDR_SESSION", ""))
+    previous = None
+    if isinstance(observation, (ClaudeLaunchObservation, StaleClaudeLaunch)):
+        reference = pane_launch.launch_reference(observation.entry, record)
+        if isinstance(reference, pane_launch.StaffLaunchReference):
+            previous = record.by_id(reference.id)
     if row is None and previous is None:
         return ClearIdentityResult.UNSTAFFED
     proof = prove(payload, environment)

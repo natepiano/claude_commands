@@ -16,7 +16,7 @@ from threading import Event
 from time import monotonic
 from typing import Literal, cast, final, get_args
 
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr import herdr_types
 from scripts.lib import conf, nix_env
 from scripts.production import staff
@@ -89,22 +89,67 @@ def _caller(panes: list[herdr.PaneIdentity]) -> CallerPane:
     return CallerPane(identity, kind, pane["pane_id"], tab)
 
 
+def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
+    """Exclude another launch or a staffed native owner from name recovery."""
+    identity = pane["pane_id"]
+    entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+    entry = entries.get(identity)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", identity).get("process_info"),
+                             "consultation process info")
+    for value in herdr.json_items(info.get("foreground_processes"), "consultation processes"):
+        process = herdr.json_object(value, "consultation process")
+        arguments = [str(argument) for argument in herdr.json_items(process.get("argv"), "consultation arguments")]
+        kind = "codex" if herdr.is_codex_process(arguments) else "claude" if herdr.is_claude_process(arguments) else ""
+        if not kind:
+            continue
+        try:
+            native = herdr.pane_native_process(info, kind, pane)
+        except herdr.CodexPaneStarting:
+            return entry is None
+        if entry is not None and "staff_id" not in entry and (
+                entry.get("session_id") == native.current_identity
+                or entry.get("pid") == process.get("pid") and entry.get("proc_start") == native.started):
+            return True
+        record = staff.initial_snapshot()
+        if record.by_member_reference(native.current_identity) is not None:
+            return False
+        if entry is None:
+            return True
+        return pane_launch.matching_launch({identity: entry}, herdr.HerdrPlace(client.session, identity),
+                                          native.current_identity) is not None
+    return entry is None
+
+
 def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPane, label: str) -> SidePane:
+    candidates: list[herdr.PaneIdentity] = []
+    activities: dict[str, herdr.PaneAtShell | herdr.PaneRunning] = {}
+    for pane in panes:
+        if pane.get("pane_id") == caller.pane or pane.get("tab_id") != caller.tab or pane.get("label") != label:
+            continue
+        identity = pane["pane_id"]
+        try:
+            activity = client.pane_activity(identity)
+            if isinstance(activity, herdr.PaneAtShell):
+                entry = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json").get(identity)
+                eligible = entry is None or "staff_id" not in entry
+            else:
+                eligible = _helper_process(client, pane)
+            if eligible:
+                candidates.append(pane)
+                activities[identity] = activity
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            return _note(client, identity, str(error))
     try:
-        pane = worker_panes.labelled_pane(panes, caller.tab, label, exclude=caller.pane)
+        pane = worker_panes.labelled_pane(candidates, caller.tab, label, exclude=caller.pane)
     except ValueError as error:
         raise SidePaneRefused(str(error)) from error
     if isinstance(pane, herdr.NoPane):
         return AbsentSidePane()
     identity = str(pane["pane_id"])
     terminal = str(pane["terminal_id"])
-    try:
-        activity = client.pane_activity(identity)
-        if isinstance(activity, herdr.PaneAtShell):
-            return StoppedSidePane(identity, terminal)
-        return OpenSidePane(identity, terminal)
-    except (herdr_types.HerdrFailure, OSError, ValueError) as error:
-        return _note(client, identity, str(error))
+    if isinstance(activities[identity], herdr.PaneAtShell):
+        return StoppedSidePane(identity, terminal)
+    return OpenSidePane(identity, terminal)
 
 
 def _context() -> tuple[herdr.Herdr, list[herdr.PaneIdentity], CallerPane]:
