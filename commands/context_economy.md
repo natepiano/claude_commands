@@ -35,12 +35,11 @@ Long reads show file progress on stderr, including the Mac read.
 `progress_seconds` in the same config sets the update interval.
 
 <ChangesSummary>
-Write in Simplified Technical English. Take each measured number from the output.
+Write in Simplified Technical English, in everyday words. Take each number from the output.
 
-1. For each settings change, write one heading: the date, the machine, and the setting `old -> new`. Under it, put one table with the columns `Role | Verdict | Moved (before -> after)`. Give one row per judged role. Name up to three measures that moved, with their values. For `no clear change`, write `no measure moved`.
-2. Under each table, write one line: `Also changed in this window:` and the other changes, in short words.
-3. Write one line: `Trust:` low, medium or high, and why. Name the session counts, and the other changes that can cause the same movement.
-4. Write one line: `Next step:` one test that separates the change from the confounds. Propose the setting, the days and the sessions on each side.
-
-Changes with no judged role share one line at the end. End with: `Full report: /context_economy changes <same arguments> --raw`.
+1. For each settings change, write one sentence: what changed, whether it helped, and how sure we are. Example: "On 11-07 the compaction window got smaller; we cannot tell yet if it helped, because few sessions ran after it and other settings changed the same day."
+2. Trust is low when a side has fewer than 10 sessions, or another change in the same window can cause the same movement. Otherwise it is medium or high.
+3. Only at medium or high trust, add at most two numbers, `before -> after`. Name each measure in everyday words: "context each call", "cost each call", "context after a compaction", "compactions each hour". At low trust, give no numbers.
+4. Put changes with no judged role in one line.
+5. End with one line, `Next step:`, the one test that would give an answer. Then `Full report: /context_economy changes <same arguments> --raw`.
 </ChangesSummary>
