@@ -27,6 +27,7 @@ try {
     reading.read_at = now;
   }
   const base = readings.good;
+  base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
@@ -46,7 +47,6 @@ try {
   extra.name = 'second nextest'; extra.pid = 222;
   readings.shrink.walk.unshift(extra);
   readings.shrink.waiters = [];
-  readings.shrink.waiting = 0;
   function pngPixels(buffer) {
     let width, height, channels;
     const chunks = [];
@@ -224,6 +224,18 @@ try {
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
                 headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                answer:text('#answer'),
+                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
+                queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
+                queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
+                stages:[...table.querySelectorAll('tbody tr[data-tip] .stage')].map(e=>e.textContent),
+                layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
+                rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
+                  const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
+                    document.querySelector('.wrow.room');
+                  return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
+                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
+                }),
                 machine:table.querySelector('td.machine')?.textContent,
                 cap:rect(document.querySelector('#mark')), room:text('#v-room'),
                 capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
@@ -255,7 +267,14 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+            assert.deepEqual(proof.headings, ['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.answer,'Next step room');
+            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Stage','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
+            assert.ok(proof.stages.includes('testing'));
+            assert.ok(proof.stages.at(-1)==='');
+            for(const offsets of proof.rowOffsets)
+              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
             assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -426,7 +445,7 @@ try {
                 slots:document.querySelector('#walk').closest('.card').textContent,
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -497,10 +516,13 @@ try {
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
+            const withoutWait=structuredClone(base);
+            withoutWait.waiters=[];
+            await show(withoutWait);
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;waiting.waiting=1;
+            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -550,10 +572,11 @@ try {
               }
             }
             await show(readings.shrink);
+            assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
             await evaluate(`showTip('row:${readings.shrink.walk.length-1}',200,200)`);
             const smaller=structuredClone(base);
             smaller.walk=smaller.walk.filter(row=>!row.queued);
-            smaller.waiters=[];smaller.waiting=0;
+            smaller.waiters=[];
             await show(smaller,false);
             const shrink=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
               tooltip:document.querySelector('#tip').textContent, text:document.querySelector('#walk').textContent})`);

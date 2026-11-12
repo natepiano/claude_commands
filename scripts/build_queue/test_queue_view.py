@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 import json
 import os
+import subprocess
+import time
 import unittest
 from typing import Self, cast, override
 from unittest import mock
@@ -24,7 +26,7 @@ from scripts.build_queue.queue_fixture import (
     ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import QueueLines, json_form, plain, wrap
+from scripts.build_queue.queue_lines import QueueLines, cut_tail, json_form, plain, wrap
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
@@ -32,6 +34,78 @@ from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+
+
+class RecordedOwnerQueueTests(unittest.TestCase):
+    def test_parentless_owner_keeps_its_name_without_changing_the_step_name(self) -> None:
+        with QueueFixture() as fixture:
+            model = fixture.model()
+            waiter = replace(model.reading.view.waiting[0], session_id="solo", session_name="solo",
+                             unit="", project="repository", step="check")
+            model = with_waiting(model, [waiter])
+            model = replace(model, labels={"solo": UnitLabels("solo")})
+            lines = queue_view.render_view(model, 120)
+            self.assertIn("solo", plain(lines))
+            self.assertIn("repository check", plain(lines))
+            self.assertNotIn("solo check", plain(lines))
+            self.assertEqual(queue_view.name_text(waiter, model), "solo")
+
+    def test_detached_and_systemd_rows_resolve_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="demo", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            current = fixture_runtime_id("owner-after-session-restart")
+            worker = staff.update_current_session(worker.current_session, staff.native_id(current))
+            model = fixture.model()
+            for source, owner in (("detached", worker), ("systemd", unit)):
+                with self.subTest(source=source), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
+                }), mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
+                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    self.assertEqual(identity.session_id, owner.current_session)
+                    labels = unit_labels.unit_labels_for([identity.session_id], os.environ)
+                    waiter = replace(model.reading.view.waiting[0], session_id=identity.session_id,
+                                     session_name=identity.name, unit=identity.unit)
+                    running = replace(model.reading.view.running[0], session_id=identity.session_id,
+                                      session_name=identity.name, unit=identity.unit)
+                    for step in (waiter, running):
+                        self.assertEqual(queue_evidence.step_labels(step, labels), UnitLabels(owner.name, "hana", "demo"))
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
+                                     UnitLabels(owner.name, "hana", "demo"))
+
+    def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "live-session", "CLAUDE_CODE_SESSION_ID": "",
+                                         "BUILDLOG_OWNER_STAFF_ID": "other-owner"}):
+            self.assertEqual(admission_client.step_identity("nextest", "").session_id, "live-session")
+
+    def test_missing_owner_records_have_explicit_labels_on_every_destination(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production.staff_test_support import isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            model = fixture.model()
+            for reference in ("", "missing-staff-row"):
+                with self.subTest(reference=reference), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": reference,
+                }):
+                    identity = admission_client.step_identity("targeted-test", "")
+                    self.assertEqual(identity.session_id, "")
+                    for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
+                        label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
+                        self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    label = queue_view.cloud_step_labels(cloud, replace(model, labels={}))
+                    self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
 
 
 def queue_json_text(data: QueueLines) -> str:
@@ -72,9 +146,78 @@ def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
         reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)
 
 
+
+
+
+
+def empty_mac_reading(fixture: QueueFixture) -> None:
+    """Keep existing renderer tests on a fresh private Mac reading."""
+    path = fixture.root / "mac-builds.json"
+    _ = path.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+    _ = (fixture.root / "memory_feed.conf").write_text("# whole: 1..\nmac_activity_refresh_seconds=30\n")
+    _ = fixture.enter_context(mock.patch.object(queue_view, "mac_reading_path", return_value=path))
+    _ = fixture.enter_context(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
+
+
+class MacQueueViewTests(unittest.TestCase):
+    def test_periodic_reader_preserves_folders_and_elapsed_days(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            _ = (fixture.root / "mac_test.conf").write_text(
+                "host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\nmirror_root=~/.local/state/mac-test/mirror\n")
+            path = fixture.root / "mac-builds.json"
+            now = NOW
+            for elapsed, seconds in (("03:04", 184), ("02:03:04", 7384), ("1-02:03:04", 93784)):
+                with self.subTest(elapsed=elapsed):
+                    result = subprocess.CompletedProcess(["ssh"], 0,
+                        stdout=f"710001\t{elapsed}\t/Users/nate/mac clone\nrc=0\n", stderr="")
+                    with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
+                          mock.patch.object(subprocess, "run", return_value=result),
+                          mock.patch.object(time, "time", return_value=now)):
+                        queue_view.refresh_mac_builds()
+                        reading = queue_view.read_mac_builds()
+                    self.assertEqual(reading.error, "")
+                    self.assertEqual(reading.read_at, now)
+                    build, = reading.builds
+                    self.assertEqual(build.pid, 710001)
+                    self.assertEqual(build.folder, "/Users/nate/mac clone")
+                    self.assertEqual(build.started_at, now - seconds)
+
+
+
+
+    def test_native_mac_rows_show_the_folder_without_local_memory(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            reading = queue_view.MacBuildReading(now, (queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 45),))
+            with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                text = plain(queue_view.render_view(model, 240))
+            for expected in ("started on the Mac", "mac-clone", "Progress unavailable", "owner not recorded"):
+                self.assertIn(expected, text)
+            row, = [line for line in text.splitlines() if "pid 710001" in line]
+            self.assertIn("mac", row)
+
+    def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
+            for read_at, error in ((now - 90, ""), (now - 30, "Mac unreachable"), (0, "Mac reading missing")):
+                with self.subTest(read_at=read_at, error=error):
+                    reading = queue_view.MacBuildReading(read_at, (build,), error)
+                    with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                        text = plain(queue_view.render_view(model, 240))
+                    self.assertIn("Mac reading is old", text)
+                    self.assertNotIn("pid 710001", text)
+
+
 class CloudQueueViewTests(unittest.TestCase):
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
+        empty_mac_reading(fixture)
         write_memory_config(fixture.root / "build_admission.conf",
             cloud_gate_slots="1", cloud_gate_stale_pushes="3")
         _ = (fixture.root / "cloud_gate.conf").write_text(
@@ -242,6 +385,7 @@ class QueueViewFixtureTests(QueueFixtureTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        empty_mac_reading(self.fixture)
         _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
 
@@ -310,7 +454,7 @@ class QueueViewTests(QueueViewFixtureTests):
             with self.subTest(columns=columns):
                 lines = queue_view.render_view(model, columns)
                 rows = waiting_rows(lines)
-                self.assertIn("nateroids nextest", rows[0])
+                self.assertIn("cables nextest" if columns >= 100 else "cables nexte…", rows[0])
                 for marker in ("pid ",):
                     self.assertEqual(terminal_width(rows[0][:rows[0].index(marker)]),
                                      terminal_width(rows[1][:rows[1].index(marker)]))
@@ -820,8 +964,10 @@ class QueueViewTests(QueueViewFixtureTests):
                 self.assertEqual(len(running), 3)
                 for index, row in enumerate(running):
                     unit = "queue-…" if columns == 60 else "queue-unit"
-                    self.assertEqual(row[:header.index("step")].split(), ["run", "builds", unit])
-                    self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+                    self.assertEqual(row[:header.index("step")].split(),
+                                     ["run", "buil…" if columns == 60 else "builds", unit])
+                    self.assertEqual(row[header.index("step"):header.index("min")].strip(),
+                        cut_tail("queue-unit merge gate", header.index("min") - header.index("step") - 1))
                     self.assertEqual(row[header.index("min"):].split()[0], str(index + 1))
                     self.assertIn("5.0", row)
                     if columns >= 100:
@@ -1464,11 +1610,12 @@ class CapViewTests(QueueViewFixtureTests):
 
     def test_size_bars_show_uncut_needs_with_nearest_eighth_and_zero(self) -> None:
         model = self.fixture.cap_model()
-        for need, expected in ((6.8, "██████▊"), (0, ""), (25, "█" * 25)):
-            with self.subTest(need=need):
+        for columns, need, expected in ((100, 6.8, "██████▊"), (100, 0, ""), (100, 25, "█" * 23),
+                                        (120, 6.8, "██████▊"), (120, 0, ""), (120, 25, "█" * 25)):
+            with self.subTest(columns=columns, need=need):
                 step = replace(model.reading.view.waiting[1], need=int(need * admission_records.GIB))
                 changed = with_waiting(model, [model.reading.view.waiting[0], step])
-                lines = queue_view.render_view(changed, 100, colour=True)
+                lines = queue_view.render_view(changed, columns, colour=True)
                 row = next(line for line in lines if plain([line]).lstrip().startswith("2 "))
                 self.assertEqual("".join(span.text for span in row if span.tone == "warning"), "●" + expected)
                 self.assertTrue(any(f"{need:.1f}" in span.text and span.tone == "inactive" for span in row))
@@ -1485,13 +1632,17 @@ class CapViewTests(QueueViewFixtureTests):
         model = replace(with_waiting(model, [first, second]), labels=labels)
         for columns in (80, 100, 140):
             with self.subTest(columns=columns):
-                rows = waiting_rows(queue_view.render_view(model, columns))
+                lines = queue_view.render_view(model, columns)
+                rows = waiting_rows(lines)
                 self.assertIn("metrics-viewer", rows[0])
                 self.assertNotIn("performance-metrics-viewer", rows[0])
                 self.assertIn("tool-based-ui", rows[1])
                 self.assertEqual(rows[1].split()[2], "—")
                 self.assertNotIn("other-session", rows[1])
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual(rows[0][start:end].strip(), cut_tail("metrics-viewer nextest", end - start - 1))
+                self.assertEqual(rows[1][start:end].strip(), "nextest")
 
     def test_showrunner_prefix_is_removed_from_running_and_queued_units(self) -> None:
         model = self.fixture.cap_model()
@@ -1526,7 +1677,7 @@ class CapViewTests(QueueViewFixtureTests):
         header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
         row, = waiting_rows(lines)
         self.assertEqual(row[:header.index("step")].split()[1:], ["sdlc", "devtools"])
-        self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+        self.assertEqual(row[header.index("step"):header.index("min")].strip(), "devtools merge gate")
 
 
 
@@ -1553,7 +1704,9 @@ class CapViewTests(QueueViewFixtureTests):
                 rows = waiting_rows(narrow)
                 self.assertEqual(len(rows), 2)
                 self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in narrow))
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(narrow).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual([row[start:end].strip() for row in rows], ["cables nexte…", "cables nexte…"])
 
 
 if __name__ == "__main__":
