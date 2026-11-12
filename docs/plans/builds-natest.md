@@ -3149,40 +3149,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: done
 **Depends on:** Phase 175
 
-#### Work Order
+#### As-built
 
-**Goal:** the affected-test selection includes the 12 failing modules that Phase 175 found missed, through general rules, and it drops no module it selects today.
-
-**Decision:** builds showrunner, 2026-11-11 (item 82 follow-up): always select the whole-repository audit modules and link fixture config reads; full merge gates do not change. sdlc go, 2026-11-11: `affected_modules.py` and `test_affected_modules.py` are free; the selector may add modules but never drop one that a full gate runs today.
-
-**Spec:**
-1. For each of the 12 replay misses and the 3 observed targeted-run misses in `phases/175/affected_gate_report.md` (session folder), find why `select_affected` did not select it. Use the Phase 175 replay inputs (`reconstructed_bases.json`, `refined_replay_commands.json`, `select_refined.py`). Write one row per module: the changed files, the missing link, and the rule that closes it.
-2. Whole-repository checks. A test module that scans the source tree (source audits, import inventories, file counts) is selected whenever a file of the kind it scans changes. Detect these modules from code or recorded evidence; a hand list is the last choice. If a list is needed, put it in `config/merge_gate.conf` with the reason on each entry, and read it through the config owner.
-3. Fixture config reads. A test whose fixture copies or reads a repository config file (for example the build_hold target list) is selected when that config file changes. Find why the existing config-read rule (Phase 127) missed these reads and fix the cause.
-4. Fix each other miss at its cause when a general rule exists. When a miss has no general rule, say so in the reply; do not add a special case for one module.
-5. The selector only adds modules. Prove it: for every replay in `phases/175/refined-selections`, the new selection contains the old selection. Report the added module count for each replay (median and largest) and the 15 misses now selected.
-6. Add rows to the existing tests in `scripts/production/test_affected_modules.py`. Add a new test only when no existing test can carry the case. Each new rule has one test that fails on the old code.
-7. Keep the full-suite fallback when no base exists or the graph fails (`affected_modules.py:507-508,566-567`). Change no gate policy.
-
-**Files:**
-- `scripts/production/affected_modules.py` — `select_affected`, lines 519–564, and the read rules.
-- `scripts/production/test_affected_modules.py` — 35 tests.
-- `config/merge_gate.conf` — only if spec item 2 needs a list.
-
-**Workers:** 1 writer; the selector and its tests are one unit.
-- test: all files.
-
-**Constraints from prior phases:**
-- Phase 175: the selector compares HEAD and dirty paths with the candidate base that has the fewest changed paths. Read evidence comes from the newest complete full gate.
-- Phases 116, 123, 127, 130 and 131 added the text, script-call, config-read, folder-scan and folder-content rules. Reuse them; do not add a parallel rule.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.production.test_affected_modules` passes.
-- basedpyright on each changed file reports 0 errors and 0 warnings.
-- The replay check shows each new selection contains the old one, and names the misses now selected.
-- Two blind reviews.
+- Checkpoint `c6a39ab84`. `affected_modules.py` adds rooted source scans, fixture config reads and named paths to targeted-run selection. Scan evidence stays inside the called function and its root, and keeps the scan folder and recursion mode. An unresolved root or pattern selects at any depth under the repository root. An absolute literal under the repository root is a repository path. 55 replays keep every old selection. Of 12 historical misses, 5 are caught, 3 cannot be replayed and 4 remain; builds accepted each (general import closure ruled out; `test_scratch_guard` and `test_quota_alert_delivery` not caused by the change; `test_merge_checkpoint_batch` closes in Phase 189). Added modules per targeted run: median 290, largest 478 (source scan 241). Four repair rounds; the last two fixed regressions only. Full merge gates unchanged.
 
 ### Phase 177 — Find the shared costs inside test bodies across the whole gate  · status: done
 **Depends on:** none
@@ -3315,7 +3284,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
 
 **Spec:**
-1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 133 of the median 170). For each, read the scan and name the folders it really reads.
+1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 241 of the median 290). For each, read the scan and name the folders it really reads.
 2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
 3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
 4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
@@ -3332,7 +3301,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - impl: all three files and the replay.
 
 **Constraints from prior phases:**
-- Phase 176: 55 replays keep every old selection; added median 170, largest 476; source-scan rule median 133, largest 458. Builds ruled out the general import closure; full merge gates stay unchanged.
+- Phase 176: 55 replays keep every old selection; added median 290, largest 478; source-scan rule median 241, largest 460. Builds ruled out the general import closure; full merge gates stay unchanged.
 
 **State:** none.
 
