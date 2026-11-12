@@ -175,8 +175,8 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
         return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
-<div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
+<h1>{html.escape(row.get('Change', ''))}</h1>
+{change_page.change_details(row, change.key)}
 <h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
@@ -184,9 +184,8 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
     return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
-<div class="id">{html.escape(change.key)} · {html.escape(row.get('Merged', ''))}</div>
 <h1>{html.escape(row.get('Change', ''))}</h1>
+{change_page.change_details(row, change.key)}
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
@@ -200,7 +199,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <label for="answer-{key}">Answer</label><textarea id="answer-{key}" name="feedback" rows="{feedback_rows}"></textarea>
 <button name="outcome" value="answer">Save answer</button></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
-<p class="kind">Question</p><h1>{html.escape(question.record.item["text"])}</h1>
+<h1>{html.escape(question.record.item["text"])}</h1>
 {change_page.review_text_html(question.record.item.get("question", ""))}
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
@@ -242,10 +241,10 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     prepared = prepare(browser, status)
     rebuilds = need.read_needs()
     tabs = ''.join(f'<button type="button" role="tab" data-type="changes" data-showrunner="{html.escape(tab)}">'
-                   + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
+                   + f'{html.escape("Owner unavailable" if tab == "unrouted" else tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
                    for tab in prepared.queues)
     question_tabs = ''.join(f'<button type="button" role="tab" data-type="questions" data-showrunner="{html.escape(tab)}">'
-        + f'{html.escape(tab)} (<span data-count>{sum(item.tab == tab for item in prepared.questions)}</span>)</button>'
+        + f'{html.escape("Owner unavailable" if tab == "unrouted" else tab)} (<span data-count>{sum(item.tab == tab for item in prepared.questions)}</span>)</button>'
         for tab in prepared.question_tabs)
     type_tabs = ('<nav role="tablist" aria-label="Review type">'
         + f'<button type="button" role="tab" data-review-type="questions">Questions (<span data-type-count="questions">{len(prepared.questions)}</span>)</button>'
@@ -258,12 +257,13 @@ section+section{border:0;margin:0;padding:0}
 [data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}
 [data-rebuilds] details p{margin:0}[data-rebuilds] details p+p{margin-top:8px}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
-</style><h1 data-review-heading>Changes to review</h1>''' + type_tabs + '<nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav>'
+</style><h1 data-review-heading>Changes to review</h1>''' + type_tabs + '<div data-showrunner-tabs><p>Showrunner</p><nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav></div>'
+               + '<p hidden role="status" data-save-notice></p>'
                + ''.join(section(item, feedback_rows) for item in prepared.changes)
                + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
                + rebuild_list(rebuilds, prepared.record)
-               + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
-               + '<noscript>Enable JavaScript to review changes and use Next.</noscript>'
+               + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
+               + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
     return change_page.document(content)
 
@@ -363,9 +363,10 @@ const rows=[...document.querySelectorAll('section[data-key]')];
 const allTabs=[...document.querySelectorAll('[data-showrunner]')];
 const types=[...document.querySelectorAll('[data-review-type]')];
 const rebuilds=document.querySelector('[data-rebuilds]'), rebuildCount=Number(rebuilds.dataset.count);
-const showrunners=document.querySelector('nav[aria-label="Showrunner"]');
+const showrunners=document.querySelector('[data-showrunner-tabs]');
 const next=document.querySelector('[data-next]'), empty=document.querySelector('[data-empty]');
 const heading=document.querySelector('[data-review-heading]');
+const saveNotice=document.querySelector('[data-save-notice]');
 const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
 function waiting(){return rows.filter(r=>r.dataset.type===kind && r.dataset.tab===tab && r.dataset.pending==='true');}
 function show(){
@@ -384,17 +385,20 @@ function show(){
  if(!tabs.some(t=>t.dataset.showrunner===tab)) tab=tabs[0]?.dataset.showrunner;
  current=rows.find(r=>r.dataset.key===requested && r.dataset.tab===tab && r.dataset.type===kind) || waiting()[0] || null;
  empty.hidden=rebuildMode || current!==null;
- empty.textContent=kind==='questions' ? 'No questions are waiting.' : 'No changes are waiting.';
+ const typeWaiting=rows.some(r=>r.dataset.type===kind && r.dataset.pending==='true');
+ empty.textContent=kind==='questions' ? (typeWaiting ? 'No questions for this showrunner.' : 'No questions to answer.') :
+  (typeWaiting ? 'No changes for this showrunner.' : 'No changes to review.');
  rows.forEach(r=>r.hidden=r!==current);
  tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab && t.dataset.type===kind));
   t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.type && r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
- next.hidden=rebuildMode || waiting().length===0;
+ next.hidden=rebuildMode || !waiting().some(r=>r!==current);
  if(current) remembered.set(kind+'/'+tab,current.dataset.key);
  const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
  places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
-function go(key){navigation++;location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
+function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
+function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
 allTabs.forEach(t=>t.addEventListener('click',()=>{tab=t.dataset.showrunner;go(remembered.get(kind+'/'+tab));}));
-types.forEach(t=>t.addEventListener('click',()=>{navigation++;kind=t.dataset.reviewType;
+types.forEach(t=>t.addEventListener('click',()=>{navigation++;clearNotice();kind=t.dataset.reviewType;
  location.hash=places.get(kind) || new URLSearchParams({type:kind});show();}));
 function advance(row){
  const at=rows.indexOf(row), candidates=waiting();
@@ -403,7 +407,7 @@ function advance(row){
 next.addEventListener('click',()=>advance(current));
 async function save(row,form,outcome){
  if(form.dataset.saving==='true') return;
- form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
+ clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
@@ -415,7 +419,9 @@ async function save(row,form,outcome){
   state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   row.dataset.pending='false';form.hidden=true;
-  if(current===row && tab===row.dataset.tab && navigation===position) advance(row);
+  if(current===row && tab===row.dataset.tab && navigation===position){
+   advance(row);saveNotice.textContent=row.dataset.type==='questions' ? 'Answer saved.' : 'Review saved.';saveNotice.hidden=false;
+  }
   else show();
  }catch(error){
   row.dataset.saveState='failed'; state.textContent='Not saved: '+(error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message);
@@ -426,5 +432,5 @@ rows.forEach(row=>{
  if(!form) return;
  form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
  });
-window.addEventListener('hashchange',()=>{if(location.hash!==shownHash) navigation++;show();});show();
+window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});show();
 '''
