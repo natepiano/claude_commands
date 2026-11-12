@@ -3052,7 +3052,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Checkpoint `f8b27fda5`. Rule 2 removes `test_example_without_a_manifest_has_no_step` from `test_merge_checkpoint.py`: a missing crate manifest gives a visible failure before publication. The three modules go from 53 to 52 tests. The history and batch modules keep all their tests; each guards saved completion records or the checkpoints that lifecycle and CI decisions use.
 - The merge checkpoint family review is complete (Phases 159 and 162).
 
-### Phase 163 — The parallel ETA tests start fewer Python interpreters  · status: todo
+### Phase 163 — The parallel ETA tests start fewer Python interpreters  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3162,3 +3162,40 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on each changed file reports 0 errors and 0 warnings.
 - `phases/165/removed_tests.md` lists every removed test with its reason, and the counts.
 - Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
+
+### Phase 166 — The bulk run tests build their workspace once for each class and the admission window test costs less  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_bulk_run.py` builds the `WorkspaceRunTests` workspace extension once for each class, and `test_admission_window_preserves_only_admission_interrupts` loses the CPU a test change can remove. Every test and assertion stays.
+
+**Decision:** Phase 164 report (next item 6b). style-unit go, 2026-11-11: keep every assertion; aws pairs decide.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 style/test_bulk_run.py`.
+2. `WorkspaceRunTests.setUp` (line 350) extends the copied project in each of 96 tests: it writes the `beta` member, then runs `git add`, `git commit`, `rev-parse HEAD` and `rev-parse HEAD^{tree}` (lines 358–365). Phase 164 measured 0.68 child CPU s for these four calls.
+3. Build the extended repository once in a class seed, after the `CargoProjectTests` setup (`test_bulk_rename.py:92`). Each test copies it to the same absolute path, with `copytree(..., symlinks=True)`, and refreshes the index. Keep `self.base` and `self.tree` equal to the seed's commit and tree.
+4. Keep per test: the environment patch, the `gate_owner` patch, `FakeRunner`, `ScriptedServer` and every per-test file.
+5. Profile `test_admission_window_preserves_only_admission_interrupts` (line 702, 6.6 CPU s, the largest row). Name where its CPU goes. Cut only what a test change can remove: repeated setup, waits, or duplicate process starts. Keep its real admission and interrupt boundaries and every assertion.
+6. Change no production script.
+7. Measure local CPU before and after with the step 1 command. The director runs three aws pairs; only aws pairs decide.
+
+**Files:**
+- `scripts/style/test_bulk_run.py` — all items.
+
+**Workers:** 1 writer; one file.
+- impl3: `scripts/style/test_bulk_run.py`.
+
+**Constraints from prior phases:**
+- Phase 160: a class seed must copy every environment isolation that the old per-test setup made.
+- Phase 158: copied Git indexes need `git update-index --refresh`.
+- Phase 164: `FakeRunner` still runs real Git through `bulk_run.git` (`bulk_run.py:64`); a CLI adapter does not remove that work.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.style.test_bulk_run` passes with 108 tests, three runs.
+- basedpyright on the file reports 0 errors and 0 warnings.
+- The module leaves no process and no folder behind.
+- aws pairs show a CPU gain; with no gain, the phase lands nothing.
