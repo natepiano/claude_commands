@@ -3271,35 +3271,50 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 185 — The recorder commands that review launches call import less  · status: done
 **Depends on:** none
 
+#### As-built
+
+- Checkpoint `cbe16dd36`. `progress_history.py` imports `phase_reservation`, `statistics`, `agents_log` and `tag_inventory` inside the functions that use them; function and class logic unchanged; no new module. aws pairs saved 0.43–1.00 CPU s in six caller modules (review launcher, trees, style, `test_assign_claude_follow.py`, `test_verify_wait_holder.py`), about 2.7 s in all; `test_progress_history.py` 0.03 s and `test_verify_mac_only.py` −0.19 s. Local separate runs showed no gain: only pairs decide. Replaces the dropped Phase 182 server design.
+
+### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: todo
+**Depends on:** none
+
 #### Work Order
 
-**Goal:** `progress_history.py check-launch`, `start-pass` and `finish-pass` start faster because they import less, with the same records, output and exit status.
+**Goal:** The full `verify.sh` entries in the verify tests cost less CPU, because a fixed Cargo reply comes from a shell script and not a new Python process, with every test, assertion and full entry kept.
 
-**Decision:** sdlc go via builds, 2026-11-12: the lighter recorder import for these three commands. Paired aws runs measure. Ship any measured saving that keeps the code simple. Land through builds.
+**Decision:** user via builds, 2026-11-11 (item 80, approval 1): slow `verify.sh` tests are natest's top priority; quicker only; keep every check; no test removal. Architect after Phase 183: one shared fixed-reply installer is the next verify step. verify-unit go, 2026-11-12, for the four support files, with conditions 1-5 in Spec 3.
 
 **Spec:**
-1. Measure first: `python3 -X importtime scripts/direct/progress_history.py check-launch --help` (and the other two), and `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_review_launcher.py`. Name the imports that cost the most and which of them the three commands use.
-2. Find the simplest change that makes the three commands import less: for example, move the import that only other commands use into those commands' module, or split the three commands' code into a small module that `review.sh` calls. Pick the one with the fewest new concepts.
-3. Keep: the records each command writes, its stdout and stderr text, its exit status on each failure path, caller identity (`UNIT_PASS_OWNER=launcher`, director and worker thread ids, launcher pid), and pass ownership. Every test and assertion stays.
-4. One owner switches all callers. Add no re-export shim. Do not use a module `__getattr__` or other lazy-attribute trick. Keep Bash 3.2 syntax in shell files.
-5. Measure after with the same commands. The director runs three aws pairs on the review-launcher modules, `test_assign_claude_follow.py` and `test_progress_history.py`; only aws pairs decide.
+1. Measure first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 direct/test_verify_wait_holder.py direct/test_verify_mac_only.py direct/test_verify_ssh_targets_routing.py direct/test_verify_token_renew.py`. Count the Cargo stub starts and their CPU, and which reply each call needs.
+2. Add one shared installer in `verify_mac_offload_test_support.py` that writes a POSIX shell `cargo` for fixed replies, and use it from the other three support files where they now start Python only for a fixed reply. `CARGO_STUB` (line 306) and the Python path stay for `TEST_CARGO_HOLD`, signals, PID files, edits, custom observers and dynamic event records.
+3. Keep (verify-unit conditions):
+   1. Same event line. Each shell reply writes the same `TEST_CARGO_EVENTS` line as `CARGO_STUB`: the same JSON for `args` and `token_held`, in one write per line. Add one row that runs both paths with arguments that hold a space, a double quote, a backslash, a non-ASCII character and an empty string, and compares the lines byte for byte. An argument the shell path cannot quote goes to the Python path.
+   2. Same order. The `--version` replies (`mend`, `+nightly fmt`, `clippy`) exit before the event write. The metadata reply prints `TEST_METADATA` exactly, with one newline.
+   3. `token_held` is true when the `TEST_TOKEN_RECORD` file exists at the moment of the call.
+   4. The leak marker. Shell replies inherit `TEST_RUNNER_STATE`, so `assert_nothing_outlives` still finds them. Do not exec a binary that clears the environment.
+   5. Python stays for `TEST_CARGO_HOLD`, signals, PID files and the observers.
+4. Keep every test, assertion and full `verify.sh` entry. Keep `RUSTC_STUB` and the token metadata path. Change no production code. Use Bash 3.2-compatible POSIX shell.
+5. Run every importer of the four support files after the change. Measure after with the Spec 1 command. The director runs three aws pairs on the four modules and a sample of importers; only aws pairs decide.
 
 **Files:**
-- `scripts/direct/progress_history.py` — the recorder.
-- `scripts/direct/review.sh` — only if the command it calls changes.
-- `scripts/direct/test_progress_history.py` — rows for any moved code.
-- `scripts/direct/progress_launch.py` — new, only if Spec 2 picks a split; the writer may choose another name in `scripts/direct/`.
+- `scripts/direct/verify_mac_offload_test_support.py` — `CARGO_STUB` and the new shared installer; 42 test importers.
+- `scripts/direct/verify_token_wait_test_support.py` — its Cargo stubs.
+- `scripts/direct/verify_hold_wait_test_support.py` — its `CARGO_STUB` variant.
+- `scripts/direct/verify_ssh_targets_test_support.py` — its Cargo stubs.
+- `scripts/direct/test_verify_mac_only.py` — the byte-for-byte event row, or another verify test module the writer names.
 
-**Workers:** 1 writer; one recorder and its callers cannot split.
+**Workers:** 1 writer; the four support files share one installer and cannot split.
 - impl: all files.
 
 **Constraints from prior phases:**
-- Phase 182: recorder starts cost 46.6 CPU s across 150 starts in the four review modules (34% of their task CPU). A server design was dropped for complexity.
-- Phase 177: 390 recorder starts cost 98.9 CPU s in the census sample.
+- Phase 177: 1,141 Python Cargo tasks cost 25.261 local CPU s across 47 modules (gross ceiling).
+- Phases 181 and 183: aws pairs saved 1.37 s and 0.71 s; the full entries verify named hold most of the cost.
+- Phase 185: the recorder imports less; use matching production code on both sides of each pair.
 
 **State:** none.
 
 **Acceptance gate:**
-- `python3 -m unittest` passes for every `scripts/direct/test_review_launcher*.py` module, `scripts.direct.test_assign_claude_follow` and `scripts.direct.test_progress_history`, with unchanged test counts.
+- `python3 -m unittest` passes for every importer of the four support files, with unchanged test counts.
+- The byte-for-byte event row passes and fails when the shell quoting is broken.
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
