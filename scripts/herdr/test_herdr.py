@@ -510,6 +510,24 @@ class NativePaneSessionTests(StaffTestCase):
                     self.assertNotIn("starting", notes.getvalue())
 
 
+    def test_cached_starting_pane_reports_once_in_each_run(self) -> None:
+        with codex_launch_evidence(self.root, ["codex"]) as evidence:
+            pane = herdr.json_object(evidence["pane"], "fixture pane")
+            pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
+            info = herdr.json_object(evidence["process_info"], "fixture process info")
+            info.update(shell_pid=998069, foreground_process_group_id=998070)
+            client = herdr.Herdr("agents")
+            with patch.object(client, "result", wraps=client.result) as reads:
+                for run in range(2):
+                    with self.subTest(run=run), herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as notes:
+                        first = client.scan_row_panes(staff.initial_snapshot(), [pane])
+                        second = client.scan_row_panes(staff.initial_snapshot(), [pane])
+                        self.assertEqual(first.found, {})
+                        self.assertEqual(first.unknown, [herdr.UnknownPane("w1:p1", "w1:t1", "starting")])
+                        self.assertEqual(second, first)
+                        self.assertEqual(notes.getvalue(), "herdr agents:w1:p1: pane is starting\n")
+                        self.assertEqual(reads.call_count, run + 1)
+
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
@@ -3599,29 +3617,50 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
 
     def test_report_batches_shell_pids_for_several_panes(self) -> None:
-        panes = [{"pane_id": f"w1:p{n}", "workspace_id": "w1"} for n in range(3)]
+        panes: list[dict[str, object]] = [{"pane_id": f"w1:p{n}", "terminal_id": f"terminal-{n}",
+                                          "workspace_id": "w1"} for n in range(3)]
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
         for n in range(3):
             self.configure_herdr(["pane", "process-info", "--pane", f"w1:p{n}"],
                 json.dumps({"result": {"process_info": {"shell_pid": 998070 + n}}}))
+        process_reads: list[str] = []
         def server(*_arguments: object) -> object:
             replies = io.StringIO()
             def send(data: bytes) -> None:
                 request = cast(dict[str, object], json.loads(data.splitlines()[0]))
                 params = cast(dict[str, object], request["params"])
                 pane = str(params["pane_id"])
+                process_reads.append(pane)
                 _ = replies.write(json.dumps({"id": pane, "result": {"process_info": {
                     "shell_pid": 998070 + int(pane[-1])}}}) + "\n")
                 _ = replies.seek(0)
             return nullcontext(SimpleNamespace(connect=Mock(), sendall=send, settimeout=Mock(),
                                                 makefile=Mock(return_value=replies)))
 
-        with patch("socket.socket", side_effect=server) as connection:
-            with herdr.observation_snapshot(), herdr.pane_snapshot():
-                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
-                self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
-            self.assertEqual(connection.call_count, len(panes))
+        for repeated_scope in (False, True):
+            with self.subTest(repeated_scope=repeated_scope):
+                self.log.unlink(missing_ok=True)
+                process_reads.clear()
+                with patch("socket.socket", side_effect=server) as connection:
+                    with herdr.pane_evidence_run():
+                        with herdr.observation_snapshot(), herdr.pane_snapshot():
+                            self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+                            self.assertEqual(herdr._pane_shell_pids("fixture"), list(range(998070, 998073)))  # pyright: ignore[reportPrivateUsage]
+                            if repeated_scope:
+                                pane = panes[0]
+                                with redirect_stderr(io.StringIO()):
+                                    scan = self.herdr.scan_row_panes(staff.StaffSnapshot(()), [pane])
+                                self.assertEqual([item.pane for item in scan.unknown], ["w1:p0"])
+                        if repeated_scope:
+                            with herdr.observation_snapshot():
+                                _ = self.herdr.result("pane", "process-info", "--pane", "w1:p1")
+                    if repeated_scope:
+                        self.assertEqual(process_reads.count("w1:p0"), 1)
+                        self.assertEqual(connection.call_count, 2 * len(panes) - 1)
+                        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]] * 2)
+                    else:
+                        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
+                        self.assertEqual(connection.call_count, len(panes))
 
     def test_report_lists_copy_changed_rows_without_deep_copies(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
@@ -3941,11 +3980,10 @@ class HerdrTests(unittest.TestCase):
                 "process_info": {"shell_pid": 990000 + index, "foreground_process_group_id": pid,
                     "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-11:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["pane", "list"],
             ["pane", "process-info", "--pane", "w1:p1"], ["pane", "process-info", "--pane", "w1:p2"],
-            ["workspace", "list"], ["tab", "list"], ["pane", "list"],
-            ["pane", "process-info", "--pane", "w1:p1"], ["pane", "process-info", "--pane", "w1:p2"]])
+            ["workspace", "list"], ["tab", "list"], ["pane", "list"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", layout_row_ids(["boss", "alpha"]))])
@@ -6202,6 +6240,21 @@ class RowTabTests(StaffTestCase):
         for pane, tab in (("p1", "t0"), ("p2", "t1")):
             self.assertEqual(sum(pane in line and tab in line for line in notes), 1)
         self.assertEqual(self.bindings(), [("old-production", self.rows["unit"].id)])
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved), herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors:
+                self.client.unknown.add("p1")
+                self.client.record_layout(record=record)
+                if resolved:
+                    self.client.unknown.remove("p1")
+                    self.assertIsInstance(herdr.Herdr.pane_activity(self.client, "p1"), herdr.PaneRunning)
+                else:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, "private process facts are unavailable"):
+                        _ = herdr.Herdr.pane_activity(self.client, "p1")
+                self.client.record_layout(record=record)
+                latest = self.client.scans[-1]
+                self.assertEqual(any(pane["pane_id"] == "p1" for pane in latest.found.get(self.rows["split"].id, [])), resolved)
+                self.assertEqual(any(item.pane == "p1" for item in latest.unknown), not resolved)
+                self.assertEqual(sum("p1 tab t0" in line for line in errors.getvalue().splitlines()), 1)
 
     def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
         self.client.unknown.add("p2")
@@ -6482,13 +6535,22 @@ class RowTabTests(StaffTestCase):
         self.assertEqual(self.client.commands, [])
 
     def test_sort_preserves_worker_columns(self) -> None:
-        before = [(pane["pane_id"], pane["tab_id"], pane["terminal_id"]) for pane in self.client.tabs]
-        _ = self.client.sort_tabs()
-        self.assertCountEqual(before, [(pane["pane_id"], pane["tab_id"], pane["terminal_id"])
-                                      for pane in self.client.tabs])
-        self.client.commands.clear()
-        _ = self.client.sort_tabs()
-        self.assertFalse(any(command[0] == "tab.move" for command in self.client.commands))
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                self.client.unknown = {"p1"} if unknown else set()
+                with (patch.object(self.client, "result", wraps=self.client.result) as reads,
+                      redirect_stderr(io.StringIO()) as errors):
+                    before = [(pane["pane_id"], pane["tab_id"], pane["terminal_id"]) for pane in self.client.tabs]
+                    _ = self.client.sort_tabs()
+                    self.assertCountEqual(before, [(pane["pane_id"], pane["tab_id"], pane["terminal_id"])
+                                                  for pane in self.client.tabs])
+                    self.client.commands.clear()
+                    _ = self.client.sort_tabs()
+                    self.assertFalse(any(command[0] == "tab.move" for command in self.client.commands))
+                if unknown:
+                    self.assertEqual(sum(call.args == ("pane", "process-info", "--pane", "p1")
+                                         for call in reads.call_args_list), 2)
+                    self.assertEqual(len(errors.getvalue().splitlines()), 2)
 
     def test_ordering_retry_keeps_split_tabs_and_closes_only_the_placeholder(self) -> None:
         self.assertTrue(self.client.move_row_tabs(self.rows["unit"].id))

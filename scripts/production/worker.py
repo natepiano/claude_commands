@@ -616,6 +616,7 @@ def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.Wo
         return worker_panes.start_or_resume(parent, WorkerName.parse(name) if name else _free_name(parent, role, staff.snapshot()), role)
 
 
+@herdr.pane_evidence_run()
 def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path, slot: str,
            phase: str, kind: str, launcher_command: list[str], lens: str = "", name: str = "",
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
@@ -860,6 +861,7 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",

@@ -51,6 +51,9 @@ from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
+CODEX_CONVERSATIONS = herdr.codex_conversations
+NATIVE_PROCESS = herdr.native_process
+HERDR_RESULT = herdr.Herdr.result
 READ_PANES = herdr.Herdr.panes
 
 
@@ -2478,7 +2481,8 @@ class RestartTests(RestartTestCase):
         self.assertEqual((self.stops, self.launches), ([], []))
 
     def test_live_rows_proves_a_codex_resume_without_an_open_rollout_from_its_pane(self) -> None:
-        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED)
+        row = replace(self.rows[0], kind="producer", name="TEST-brain", worktree=staff.WORKTREE_UNFILLED,
+                      current_session=staff.StaffId(str(uuid5(NAMESPACE_URL, "codex-resume-without-rollout"))))
         self.rows = (row,)
         self.running.clear()
         pane = {"pane_id": "w1:p0", "workspace_id": "w1", "tab_id": "w1:t0",
@@ -2493,14 +2497,36 @@ class RestartTests(RestartTestCase):
                     "foreground_processes": [{"pid": 990100, "argv": ["codex", "resume", str(row.current_session)]}]}}
             return result(*arguments)
 
-        with (patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
-                    {}, ("TEST-brain (Codex thread unknown)",))),
-              patch.object(herdr.Herdr, "result", side_effect=layout),
-              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
-                    herdr.LaunchArgument(str(row.current_session)), "fixture-start", {})),
-              redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [row])
-        self.assertEqual(errors.getvalue(), "")
+        def run(*arguments: str) -> str:
+            return json.dumps({"result": layout(*arguments)})
+
+        def codex_inventory() -> herdr.CodexConversations:
+            return herdr.CodexConversations({}, ("TEST-brain (Codex thread unknown)",))
+
+        def native_process(*arguments: object) -> herdr.NativeAgentProcess:
+            del arguments
+            return herdr.NativeAgentProcess(herdr.LaunchArgument(str(row.current_session)), "fixture-start", {})
+
+        for inventory in (False, True):
+            with self.subTest(inventory=inventory):
+                proc = {"HERDR_PROC": os.environ["HERDR_PROC"]}
+                fake_unit_host.process(proc, 990100, 1, ["codex", "resume", str(row.current_session)], {})
+                with (patch.object(herdr, "codex_conversations", CODEX_CONVERSATIONS if inventory else codex_inventory),
+                      patch.object(herdr.Herdr, "result", HERDR_RESULT),
+                      patch.object(herdr.Herdr, "run", side_effect=run) as reads,
+                      patch.object(herdr.Herdr, "socket_request", side_effect=OSError("private socket unavailable")),
+                      patch.object(herdr, "native_process", NATIVE_PROCESS if inventory else native_process),
+                      patch.object(herdr, "herdr_places", return_value={990100: herdr.HerdrPlace("agents", "w1:p0")}),
+                      patch.object(herdr, "codex_resume_thread", return_value=str(row.current_session)),
+                      patch.object(herdr, "_process_birth", return_value="fixture-start"),
+                      patch.object(herdr, "process_environment", return_value={}),
+                      patch.object(codex_daemon, "read_daemons", return_value=[]),
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), [row])
+                self.assertEqual(errors.getvalue(), "")
+                if inventory:
+                    self.assertEqual(sum(call.args == ("pane", "process-info", "--pane", "w1:p0")
+                                         for call in reads.call_args_list), 1)
 
     def test_restart_all_starts_each_row_in_its_saved_tab(self) -> None:
         with (patch.object(herdr.Herdr, "save_layout") as save,
