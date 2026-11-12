@@ -3301,7 +3301,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `c2bc18282`. `test_crate_run.py` adds one single-file frozen class seed (`paths=("src/lib.rs",)`) for thirteen setup calls and moves seven setup-only cases onto the default `frozen_tests` seed; each test restores its private files and opens its own ledger. `test_standing_checkpoint.py` routes the direct publish and gate helpers through `run_style_command` for `style_plan` calls only; Git calls keep their lock descriptors, and one publication-to-footprint child path and both notification CLI calls stay. The manifest, custom-source, changed-manifest, shared-proposal, dry-run, loader and pre-freeze cases keep their live paths. 111 tests and 687 assertion nodes kept. aws pairs: `test_crate_run.py` 58.29 to 57.86 CPU s (0.43 s), `test_standing_checkpoint.py` 10.25 to 9.27 (0.98 s).
 
-### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: todo
+### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: done
 **Depends on:** Phase 193
 
 #### Work Order
