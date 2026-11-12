@@ -3150,7 +3150,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - No process or folder stays behind.
 - Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
 
-### Phase 171 — The crate run tests share one default frozen state  · status: todo
+### Phase 171 — The crate run tests share one default frozen state  · status: done
 **Depends on:** none
 
 #### Work Order
