@@ -3523,6 +3523,80 @@ class FloorTests(SweepCase):
         self.assertIn("stale", message)
         self.assertFalse((base / "repo" / "target" / "debug" / "deps" / f"repo-{APP}").exists())
 
+        now = time.time()
+        for case, walk_age, growth, threshold, interval, seed, remains, sends in (
+            ("unnamed fall", 7201, 0, 3, 7200, "", True, 0),
+            ("threshold boundary", 7201, 0, 5, 7200, "", False, 0),
+            ("explained fall", 30, 5, 3, 0, "", False, 0),
+            ("young walk", 7199, 0, 3, 7200, "", False, 0),
+            ("changed build hold", 7201, 0, 3, 7200, "", False, 0),
+            ("old floor record", 7201, 0, 3, 7200, "", False, 0),
+            ("changed filesystem", 7201, 0, 3, 7200, "", False, 0),
+            ("existing request", 7201, 0, 3, 7200, "pending", True, 0),
+            ("completed walk", 1, 5, 3, 7200, "completed", False, 1),
+            ("refused follow-up", 1, 5, 3, 7200, "refused", True, 1),
+            ("unreadable request", 7201, 0, 3, 7200, "unreadable", True, 0),
+        ):
+            with self.subTest(case=case), mock.patch.object(time, "time", return_value=now):
+                base = self.base()
+                _ = write_config_fixture(conf.path("lint"),
+                    f"sweep_walk_request_fall_bytes={threshold * GIB}\n"
+                    + f"sweep_walk_request_interval_seconds={interval}\n")
+                self.prior(14 * GIB, 0)
+                protected: dict[str, sweep.BuildHoldTarget] = {}
+                if case == "changed build hold":
+                    held_tree, _ = cargo_target(base, "held", DEMO, now - DAY)
+                    protected[str(held_tree.parent)] = sweep.BuildHoldTarget("build-speed")
+                    self.prior(9 * GIB, 35 * GIB)
+                elif case == "old floor record":
+                    self.prior(14 * GIB, 0, age=int(conf.read("lint").number("sweep_growth_window_seconds")) + 1)
+                elif case == "changed filesystem":
+                    sweep.write_floor_record(sweep.floor_record_path(), sweep.FloorRecord(
+                        now - 60, 14 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                        sweep.KnownHeldRoots(frozenset()), filesystem="previous-device"))
+                _ = (store.root() / store.DISK_NAME).write_text(json.dumps({
+                    "measured_at": store.utc_iso(now - walk_age),
+                    "previous_measured_at": store.utc_iso(now - walk_age - 600),
+                    "outside_build_cache_totals": [{"label": "/tmp", "bytes": 8 * GIB, "growth_bytes": growth * GIB}],
+                    "outside_build_caches": [{"path": "/tmp/traces", "bytes": 8 * GIB, "growth_bytes": growth * GIB,
+                                              "largest_child_path": None, "largest_child_growth_bytes": None}],
+                }))
+                request_path = store.root() / store.DISK_WALK_REQUEST_NAME
+                request: store.DiskWalkRequest = {"requested_at": store.utc_iso(now - 10),
+                                                  "alert_at": store.utc_iso(now - 10), "unnamed_bytes": 5 * GIB}
+                if seed == "unreadable":
+                    _ = request_path.write_text("{")
+                elif seed:
+                    store.write_disk_walk_request(request)
+                saved = request_path.read_bytes() if seed else b""
+                errors = io.StringIO()
+                delivery = FAILED_NATEDEV_ALERT if seed == "refused" else DELIVERED_NATEDEV_ALERT
+                with (mock.patch.object(sweep, "send_floor_alert", return_value=delivery) as followup,
+                      mock.patch.object(sweep, "build_hold_targets", return_value=protected),
+                      redirect_stderr(errors)):
+                    self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=True)[0], 0)
+                    self.assertEqual(followup.call_count, sends)
+                    self.assertEqual(request_path.exists(), remains)
+                    if sends:
+                        text = cast(str, followup.call_args.args[0])
+                        self.assertTrue(text.startswith(f"Folder walk for the {request['alert_at']} fall:\n"))
+                        self.assertIn("/tmp/traces: grew 5.0 GiB", text)
+                    if seed and remains:
+                        self.assertEqual(request_path.read_bytes(), saved)
+                    if case == "unnamed fall":
+                        self.assertEqual(store.read_disk_walk_request(), {
+                            "requested_at": store.utc_iso(now), "alert_at": store.utc_iso(now), "unnamed_bytes": 5 * GIB,
+                        })
+                        saved = request_path.read_bytes()
+                    if seed == "completed" or case == "unnamed fall":
+                        self.assertEqual(self.hold(base, 10 * GIB, [11 * GIB], recorded=True)[0], 0)
+                        self.assertEqual(followup.call_count, sends)
+                        if remains:
+                            self.assertEqual(request_path.read_bytes(), saved)
+                if seed == "unreadable":
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn(str(request_path), errors.getvalue())
+
     def test_target_deleted_during_the_scan_is_no_unexplained_fall(self) -> None:
         """natedev 2026-10-25 23:06 AST: 298.1 GiB free at the previous sweep, 293.5 GiB before the
         scan; during the scan another process deleted 117.9 GiB of targets, and free read after it
