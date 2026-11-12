@@ -272,7 +272,8 @@ class PaneRestoreTests(unittest.TestCase):
     def live_sessions(self) -> list[dict[str, str]]:
         return [{"sessionId": session_id} for session_id in self.live]
 
-    def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+    def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+        del member
         self.opened.append((name, space, title, cwd, environment))
         return "w1:p3"
 
@@ -1138,7 +1139,8 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         published = False
         publishing = False
 
-        def open_tab(session: str, space: str, name: str, cwd: str, environment: dict[str, str]) -> str:
+        def open_tab(session: str, space: str, name: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+            del member
             client.opened.append((session, space, name, cwd, environment.copy()))
             client.rows.append({"pane_id": "w1:p3", "label": name, "workspace_id": "w1"})
             return "w1:p3"
