@@ -1091,46 +1091,71 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         from scripts.accounts import accounts
         from scripts.agents import stop_resume
 
-        backend = self.folder_backend("claude", live=False)
-        fixture_launch_transcript(self.root, {"session_id": self.owner.current_session,
-            "pane_id": "w1:p1", "kind": "claude", "cwd": str(self.old_folder), "name": self.owner.name,
-            "config_dir": str(backend.config), "model": "", "remote_control": False, "environment": {},
-            "flags_read": True, "written_at": "fixture"}, staff.StaffSnapshot((self.owner,)))
-        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(backend.config)}))
-        original = pane_record.read("agents")["w1:p1"]
-        original["ended"] = False
-        pane_record.write("agents", original)
-        client = FakeClient([])
+        def recover(self: CodexPaneRestoreTests, reused: bool) -> None:
+            backend = self.folder_backend("claude", live=False)
+            fixture_launch_transcript(self.root, {"session_id": self.owner.current_session,
+                "pane_id": "w1:p1", "kind": "claude", "cwd": str(self.old_folder), "name": self.owner.name,
+                "config_dir": str(backend.config), "model": "", "remote_control": False, "environment": {},
+                "flags_read": True, "written_at": "fixture"}, staff.StaffSnapshot((self.owner,)))
+            self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(backend.config)}))
+            original = pane_record.read("agents")["w1:p1"]
+            original["ended"] = False
+            pane_record.write("agents", original)
+            client = FakeClient([{"pane_id": "w1:p1", "workspace_id": "w1", "label": "foreign",
+                "agent_session": {"value": "019b3a40-4250-7000-8000-000000000199"}}] if reused else [])
+            if reused:
+                from scripts.production.staff_test_support import fixture_member
 
-        def open_tab(_space: str, name: str, cwd: str, _environment: dict[str, str]) -> str:
-            self.assertEqual(cwd, str(self.old_folder))
-            client.rows.append({"pane_id": "w1:p3", "workspace_id": "w1", "label": name})
-            return "w1:p3"
+                foreign = fixture_member("unit", name="foreign-pane-owner", parent=self.owner.parent)
+                client.process_info = {"shell_pid": 998042, "foreground_process_group_id": 998043,
+                    "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}
+                native = herdr.native_process
 
-        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
-                  _account: str, _message: str) -> runtime_sessions.LiveSessionProcess:
-            replacement = pane_record.launch(tab.pane_id, self.owner.current_session, entry["cwd"],
-                {"CLAUDE_CONFIG_DIR": str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)}, ["claude", "--resume", self.owner.current_session])
-            pane_record.write("agents", replacement)
-            return runtime_sessions.LiveSessionProcess(backend.pid)
+                def current_process(pid: int, kind: str,
+                                    reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
+                    if pid == 998043:
+                        return herdr.NativeAgentProcess(herdr.EnvironmentThread(foreign.current_session), "fixture-start", {})
+                    return native(pid, kind, reported)
+                _ = self.enterContext(mock.patch.object(herdr, "native_process", side_effect=current_process))
 
-        with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
-              mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
-              mock.patch.object(herdr, "Herdr", return_value=client),
-              mock.patch.object(client, "open_tab", side_effect=open_tab),
-              mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),
-              mock.patch.object(stop_resume, "_start_session", side_effect=start),
-              mock.patch.object(stop_resume, "_detach"),
-              mock.patch.object(sessions, "process_start", return_value="fixture-start"),
-              mock.patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
-                  self.old_folder, backend.config / ".claude.json", self.old_folder))):
-            result = stop_resume.resume(self.owner.id, why="fixture recovery")
-        self.assertIsInstance(result, stop_resume.ClaudeUp)
-        with (mock.patch.object(backend, "panes", return_value=[])):
-            moved = self.finished_move_rerun()
-        self.assertEqual(moved.returncode, 0, moved.stderr)
-        owners = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
-        self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
+            def open_tab(_space: str, name: str, cwd: str, _environment: dict[str, str]) -> str:
+                self.assertEqual(cwd, str(self.old_folder))
+                client.rows.append({"pane_id": "w1:p3", "workspace_id": "w1", "label": name})
+                return "w1:p3"
+
+            def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
+                      _account: str, _message: str) -> runtime_sessions.LiveSessionProcess:
+                replacement = pane_record.launch(tab.pane_id, self.owner.current_session, entry["cwd"],
+                    {"CLAUDE_CONFIG_DIR": str(cast(staff.SessionHome, pane_launch.config_home(entry)).path)}, ["claude", "--resume", self.owner.current_session])
+                pane_record.write("agents", replacement)
+                return runtime_sessions.LiveSessionProcess(backend.pid)
+
+            with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
+                  mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+                  mock.patch.object(herdr, "Herdr", return_value=client),
+                  mock.patch.object(client, "open_tab", side_effect=open_tab),
+                  mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),
+                  mock.patch.object(stop_resume, "_start_session", side_effect=start),
+                  mock.patch.object(stop_resume, "_detach"),
+                  mock.patch.object(sessions, "process_start", return_value="fixture-start"),
+                  mock.patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
+                      self.old_folder, backend.config / ".claude.json", self.old_folder))):
+                result = stop_resume.resume(self.owner.id, why="fixture recovery")
+            self.assertIsInstance(result, stop_resume.ClaudeUp)
+            if reused:
+                self.assertNotIn("w1:p1", client.closed)
+            with (mock.patch.object(backend, "panes", return_value=[])):
+                moved = self.finished_move_rerun()
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+            owners = [entry for entry in pane_record.read("agents").values() if entry["session_id"] == self.owner.id]
+            self.assertEqual([(entry["pane_id"], pane_record.resume_launch(entry)["cwd"]) for entry in owners], [("w1:p3", str(self.new_folder))])
+
+        for reused in (False, True):
+            with self.subTest(reused=reused):
+                case = CodexPaneRestoreTests("runTest")
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                recover(case, reused)
 
 
     def moved_codex(self) -> tuple[FolderMoveBackend, Path]:
