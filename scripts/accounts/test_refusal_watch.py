@@ -2424,8 +2424,8 @@ class RefusalWatchTests(unittest.TestCase):
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         roles = [row.split("|")[3].strip() for row in rows]
-        self.assertIn("units 1 (busy 0, idle 1, paused 0, exited 0)", roles)
-        self.assertIn("showrunners 1 (busy 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("units 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("showrunners 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
         self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 
