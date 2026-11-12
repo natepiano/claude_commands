@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.lib import unit_runs
+from scripts.agents import remote
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
@@ -19,6 +20,19 @@ from scripts.herdr import herdr, pane_launch
 
 
 class StatusDiscoveryTests(StaffTestCase):
+    def test_local_fact_scope_keeps_remote_documents_unavailable_without_ssh(self) -> None:
+        fixture = self.row_production()
+        foreign = replace(fixture.runner, doc=staff.LiveDoc(remote.other_machine(), fixture.doc))
+        record = staff.StaffSnapshot((foreign, fixture.unit, fixture.worker))
+        resolver = labels.RowResolver(record, scope=labels.FactReadScope.LOCAL)
+        with mock.patch("scripts.production.session_staff.subprocess.run", side_effect=AssertionError("remote read")):
+            unavailable = resolver.production_doc(fixture.unit)
+            self.assertIsInstance(unavailable, labels.DocumentUnavailable)
+            self.assertEqual(resolver.production_doc(fixture.unit), unavailable)
+        local = labels.RowResolver(staff.StaffSnapshot((fixture.runner, fixture.unit)),
+                                   scope=labels.FactReadScope.LOCAL)
+        self.assertIsInstance(local.production_doc(fixture.unit), labels.ProductionDoc)
+
     def test_worker_home_uses_the_recorded_account_with_shared_sessions(self) -> None:
         fixture = self.row_production()
         shared = Path.home() / ".codex" / "sessions"

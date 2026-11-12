@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Mapping, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -334,13 +335,20 @@ def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
     return facts
 
 
+class FactReadScope(Enum):
+    LOCAL = "local"
+    CONNECTED = "connected"
+
+
 class RowResolver:
     """Resolve row facts from one snapshot without changing files."""
 
     def __init__(self, record: staff.StaffSnapshot, *,
                  dependencies: Callable[[Path], None] | None = None,
-                 rows: Iterable[staff.StaffRow] | None = None) -> None:
+                 rows: Iterable[staff.StaffRow] | None = None,
+                 scope: FactReadScope = FactReadScope.CONNECTED) -> None:
         self.record: staff.StaffSnapshot = record
+        self.scope: FactReadScope = scope
         self.dependencies: Callable[[Path], None] | None = dependencies
         self._remote_facts: dict[str, tuple[str, str]] = {}
         self._remote_read: bool = False
@@ -381,6 +389,8 @@ class RowResolver:
             if key not in self._local_facts:
                 self._local_facts[key] = _read_facts([key])[kind + ":" + str(path)]
             return self._local_facts[key]
+        if self.scope is FactReadScope.LOCAL:
+            return "unavailable", f"machine {machine}: remote facts are not available to this reader"
         if machine != remote.other_machine():
             return "unavailable", f"machine {machine} has no configured connection"
         if not self._remote_read:

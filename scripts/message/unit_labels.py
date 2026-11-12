@@ -214,6 +214,25 @@ class StaffDiagnostics:
         return {anomaly.row.current_session for anomaly in self.anomalies.values()}
 
 
+@dataclass(frozen=True)
+class AllProductionOwners:
+    """Read every production owner for a full roster."""
+
+
+ALL_PRODUCTION_OWNERS = AllProductionOwners()
+
+
+def label_owners(wanted: set[str], record: staff.StaffSnapshot) -> frozenset[staff.StaffId]:
+    owners: set[staff.StaffId] = set()
+    for session in wanted:
+        member = record.by_current_session(session)
+        if member is not None:
+            owner = record.parent_of(member) if member.kind == "worker" else member
+            if owner is not None:
+                owners.add(owner.id)
+    return frozenset(owners)
+
+
 def newest_sessions() -> list[SessionRecord]:
     newest: dict[str, SessionRecord] = {}
     for record in running_sessions():
@@ -226,6 +245,7 @@ def registered_showrunners(
     *, known_sessions: Mapping[str, SessionRecord] | showrunners.DiscoverSessions = showrunners.DISCOVER_SESSIONS,
     membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
     resolver: session_staff.RowResolver | None = None,
+    owners: frozenset[staff.StaffId] | AllProductionOwners = ALL_PRODUCTION_OWNERS,
 ) -> list[showrunners.Showrunner]:
     record = (resolver.record if resolver is not None else
               staff.snapshot() if isinstance(membership, showrunners.DiscoverMembership) else membership)
@@ -235,6 +255,8 @@ def registered_showrunners(
     sessions_by_id = {item["sessionId"]: item for item in records}
     registered: list[showrunners.Showrunner] = []
     for row in staff.active(record, "showrunner"):
+        if not isinstance(owners, AllProductionOwners) and row.id not in owners:
+            continue
         doc = resolver.production_doc(row)
         if not isinstance(doc, session_staff.ProductionDoc):
             diagnostics.document(row, doc)
@@ -287,6 +309,7 @@ def production_places(
     ledger_workers: set[str],
     diagnostics: StaffDiagnostics,
     *, record: staff.StaffSnapshot, resolver: session_staff.RowResolver | None = None,
+    owners: frozenset[staff.StaffId] | AllProductionOwners = ALL_PRODUCTION_OWNERS,
 ) -> dict[str, ProductionPlace]:
     """Join native session identities to their current staff parents."""
     places: dict[str, ProductionPlace] = {}
@@ -295,6 +318,8 @@ def production_places(
     readable_parents: set[staff.StaffId] = set()
     unreadable_parents: set[staff.StaffId] = set()
     for row in staff.active(record, "unit"):
+        if not isinstance(owners, AllProductionOwners) and row.id not in owners:
+            continue
         identity = row.current_session
         if identity in ledger_workers or not isinstance(row.parent, staff.ReportsTo):
             continue
@@ -327,27 +352,29 @@ def production_places(
     return places
 
 
-def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) -> dict[str, UnitLabels]:
+def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str], *,
+                    scope: session_staff.FactReadScope = session_staff.FactReadScope.CONNECTED) -> dict[str, UnitLabels]:
     """Resolve Claude and Codex holders from files, without process scans or account reads."""
     del environment
     wanted = set(session_ids)
     if not wanted:
         return {}
     try:
-        record = staff.snapshot()
-        resolver = session_staff.RowResolver(record)
+        record = staff.local_snapshot() if scope is session_staff.FactReadScope.LOCAL else staff.snapshot()
+        resolver = session_staff.RowResolver(record, scope=scope)
+        owners = label_owners(wanted, record)
         records = newest_sessions()
         problems: list[str] = []
         diagnostics = StaffDiagnostics(problems)
         registered = registered_showrunners(diagnostics,
                                             known_sessions={record["sessionId"]: record for record in records},
-                                            membership=record, resolver=resolver)
+                                            membership=record, resolver=resolver, owners=owners)
         runners = showrunner_ids(records, registered, membership=record)
         directors: dict[str, str] = {
             row.current_session: parent.current_session for row in record.find(kind="worker")
             if (parent := record.parent_of(row)) is not None}
         places = production_places(records, set(directors), diagnostics,
-                                   record=record, resolver=resolver)
+                                   record=record, resolver=resolver, owners=owners)
         # Read names from staff for the native sessions in this registry.
         names: dict[str, str] = {
             item["sessionId"]: member.name if (member := record.by_current_session(item["sessionId"])) is not None else ""
@@ -475,8 +502,10 @@ def codex_unit_labels(
     names = {item["sessionId"]: item["name"] for item in records}
     labels: dict[str, UnitLabels] = {}
     for member in membership.find(kind="worker"):
+        if member.current_session not in wanted:
+            continue
         evidence = session_staff.worker_backend(membership, member.id)
-        if (member.current_session not in wanted or not isinstance(evidence, session_staff.RecordedWorker)
+        if (not isinstance(evidence, session_staff.RecordedWorker)
                 or not isinstance(evidence.backend, staff.CodexBackend)):
             continue
         director, showrunner = staff_relationships(membership, member, names,

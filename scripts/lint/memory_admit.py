@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
@@ -33,6 +33,10 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
+
+if TYPE_CHECKING:
+    from scripts.production.session_staff import FactReadScope
+    from scripts.production.staff import StaffRow, StaffSnapshot
 
 from scripts.lib.test_phase import (
     CallRecord,
@@ -369,25 +373,93 @@ class PriorityRoster(Protocol):
     def ThisMachine(self) -> object: ...
     def roster(self, environment: Mapping[str, str], scope: object) -> PriorityRosterRows: ...
     def unit_labels(self, entries: Iterable[object]) -> Mapping[str, UnitMembership]: ...
-    def unit_labels_for(self, session_ids: list[str], environment: Mapping[str, str]) -> Mapping[str, UnitMembership]: ...
+    def unit_labels_for(self, session_ids: list[str], environment: Mapping[str, str], *,
+                        scope: FactReadScope) -> Mapping[str, UnitMembership]: ...
 
 
-def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMembership]:
+@dataclass(frozen=True)
+class PriorityUnitEligibility:
+    """A background read validated this unit and its production document."""
+
+    unit_id: str
+    owner_id: str
+    document_machine: str
+    document_path: Path
+
+    def matches(self, unit: StaffRow, owner: StaffRow) -> bool:
+        from scripts.production import staff
+
+        return (unit.id == self.unit_id and owner.id == self.owner_id
+                and unit.kind == "unit" and owner.kind == "showrunner"
+                and unit.parent == staff.ReportsTo(owner.id)
+                and not isinstance(unit.worktree, staff.RemovedWorktree)
+                and not isinstance(unit.doc, staff.WrappedDoc)
+                and isinstance(owner.doc, staff.LiveDoc)
+                and owner.doc.machine == self.document_machine and owner.doc.path == self.document_path)
+
+
+def priority_unit_eligibility(labels: Mapping[str, UnitMembership],
+                              membership: StaffSnapshot) -> tuple[PriorityUnitEligibility, ...]:
+    from scripts.production import staff
+
+    evidence: dict[str, PriorityUnitEligibility] = {}
+    for session, label in labels.items():
+        member = membership.by_current_session(session)
+        if member is None:
+            continue
+        unit = membership.parent_of(member) if member.kind == "worker" else member
+        owner = membership.parent_of(unit) if unit is not None and unit.kind == "unit" else None
+        if (unit is not None and owner is not None and owner.kind == "showrunner"
+                and label.unit == unit.name and isinstance(owner.doc, staff.LiveDoc)):
+            candidate = PriorityUnitEligibility(unit.id, owner.id, owner.doc.machine, owner.doc.path)
+            if candidate.matches(unit, owner):
+                evidence[unit.id] = candidate
+    return tuple(evidence.values())
+
+
+def priority_labels(session_ids: list[str] | RosterUnits, *,
+                    unit_eligibility: tuple[PriorityUnitEligibility, ...] = ()) -> Mapping[str, UnitMembership]:
     roster = cast(PriorityRoster, cast(object, importlib.import_module("scripts.message.roster")))
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
         from scripts.message import unit_labels
-        from scripts.production import staff
+        from scripts.production import session_staff, staff
+        from scripts.agents import remote
 
         recorded: dict[str, UnitMembership] = {}
         try:
-            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+            membership = staff.local_snapshot()
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), membership))
+            sessions = unit_labels.newest_sessions()
+            registered = {row["sessionId"] for row in sessions} & recorded.keys()
+            if registered:
+                eligible_units = {item.unit_id: item for item in unit_eligibility}
+                workers: set[str] = {row.current_session for row in membership.find(kind="worker")}
+                places = unit_labels.production_places(
+                    sessions, workers, unit_labels.StaffDiagnostics(), record=membership,
+                    resolver=session_staff.RowResolver(membership, scope=session_staff.FactReadScope.LOCAL),
+                    owners=unit_labels.label_owners(registered, membership))
+                for session in registered:
+                    member = membership.by_current_session(session)
+                    assert member is not None
+                    owner = membership.parent_of(member) if member.kind == "worker" else member
+                    place = places.get(owner.current_session) if owner is not None else None
+                    if place is not None:
+                        recorded[session] = unit_labels.make_labels(member.name, place.showrunner, place.director)
+                    else:
+                        parent = membership.parent_of(owner) if owner is not None and owner.kind == "unit" else None
+                        remote_eligible = (parent is not None and parent.kind == "showrunner"
+                            and isinstance(parent.doc, staff.LiveDoc) and parent.doc.machine != remote.local_machine()
+                            and owner is not None and owner.id in eligible_units
+                            and eligible_units[owner.id].matches(owner, parent))
+                        if not remote_eligible:
+                            recorded[session] = unit_labels.UnitLabels(member.name)
         except (OSError, ValueError):
-            pass
+            recorded.clear()
         missing = [session for session in session_ids if session not in recorded]
         if missing:
-            recorded.update(roster.unit_labels_for(missing, os.environ))
+            recorded.update(roster.unit_labels_for(missing, os.environ, scope=session_staff.FactReadScope.LOCAL))
         labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}

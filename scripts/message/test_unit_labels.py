@@ -20,6 +20,57 @@ if TYPE_CHECKING:
 
 
 class FileOnlyLabelTests(unittest.TestCase):
+    def test_requested_owners_do_not_read_an_unrelated_remote_document(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import session_staff
+
+        with tempfile.TemporaryDirectory() as directory:
+            document = Path(directory) / "production.md"
+            _ = document.write_text("# Production\n")
+            owner = staff.StaffRow(
+                staff.StaffId("owner"), "showrunner", "production", staff.StaffRoot(),
+                current_session=staff.StaffId("owner-session"),
+                doc=staff.LiveDoc(remote.local_machine(), document))
+            member = staff.StaffRow(staff.StaffId("unit"), "unit", "chosen", staff.ReportsTo(owner.id),
+                                    current_session=staff.StaffId("session"))
+            foreign_owner = staff.StaffRow(
+                staff.StaffId("foreign-owner"), "showrunner", "foreign", staff.StaffRoot(),
+                current_session=staff.StaffId("foreign-owner-session"),
+                doc=staff.LiveDoc(remote.other_machine(), Path("/unavailable/production.md")))
+            foreign_member = staff.StaffRow(
+                staff.StaffId("foreign-unit"), "unit", "foreign-unit", staff.ReportsTo(foreign_owner.id),
+                current_session=staff.StaffId("foreign-session"))
+            record = staff.StaffSnapshot((owner, member, foreign_owner, foreign_member))
+            reads: list[Path] = []
+            resolver = session_staff.RowResolver(record, dependencies=reads.append)
+            with mock.patch("scripts.production.session_staff.subprocess.run", side_effect=AssertionError("remote read")):
+                places = unit_labels.production_places(
+                    [], set(), unit_labels.StaffDiagnostics(), record=record, resolver=resolver,
+                    owners=unit_labels.label_owners({member.current_session}, record))
+            self.assertEqual(set(places), {member.current_session})
+            self.assertEqual(reads, [document])
+
+    def test_local_label_lookup_never_reads_remote_staff_or_documents(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import session_staff
+
+        owner = staff.StaffRow(
+            staff.StaffId("owner"), "showrunner", "remote", staff.StaffRoot(),
+            current_session=staff.StaffId("owner-session"),
+            doc=staff.LiveDoc(remote.other_machine(), Path("/unavailable/production.md")))
+        member = staff.StaffRow(staff.StaffId("unit"), "unit", "chosen", staff.ReportsTo(owner.id),
+                                current_session=staff.StaffId("session"))
+        native: SessionRecord = {
+            "pid": os.getpid(), "sessionId": member.current_session, "name": member.name,
+            "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": []}
+        with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((owner, member))), \
+                mock.patch.object(staff, "snapshot", side_effect=AssertionError("remote staff read")), \
+                mock.patch.object(unit_labels, "newest_sessions", return_value=[native]), \
+                mock.patch("scripts.production.session_staff.subprocess.run", side_effect=AssertionError("remote read")):
+            self.assertEqual(unit_labels.unit_labels_for(
+                [member.current_session], {}, scope=session_staff.FactReadScope.LOCAL),
+                {member.current_session: unit_labels.UnitLabels(member.name)})
+
     def test_recorded_owner_without_a_parent_shows_its_session_name(self) -> None:
         from scripts.message import unit_labels
         from scripts.production.staff_test_support import fixture_member, isolated_staff_file

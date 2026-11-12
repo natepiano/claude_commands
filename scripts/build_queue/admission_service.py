@@ -354,6 +354,7 @@ class ServiceState:
     placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
+    priority_unit_eligibility: tuple[gate.PriorityUnitEligibility, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -811,14 +812,21 @@ class NoPendingPriorityRoster:
 @dataclass(frozen=True)
 class PendingPriorityRoster:
     change: OrderedQueueChange
-    result: Future[Mapping[str, gate.UnitMembership]]
+    result: Future[tuple[Mapping[str, gate.UnitMembership], tuple[gate.PriorityUnitEligibility, ...]]]
 
 
-def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake: int) -> None:
+def read_priority_roster(result: Future[tuple[Mapping[str, gate.UnitMembership], tuple[gate.PriorityUnitEligibility, ...]]], wake: int) -> None:
     """Read the roster without changing service state."""
     try:
         try:
-            result.set_result(gate.priority_labels(gate.RosterUnits()))
+            from scripts.production import staff
+
+            try:
+                membership = staff.local_snapshot()
+            except (OSError, ValueError):
+                membership = staff.StaffSnapshot(())
+            labels = gate.priority_labels(gate.RosterUnits())
+            result.set_result((labels, gate.priority_unit_eligibility(labels, membership)))
         except Exception as error:
             result.set_exception(error)
         os.eventfd_write(wake, 1)
@@ -976,6 +984,7 @@ class AdmissionServer:
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: records.QueuePriority | records.NoQueuePriority = records.NO_QUEUE_PRIORITY
+        self.priority_unit_eligibility: tuple[gate.PriorityUnitEligibility, ...] = ()
         self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
         self.queue_changes: deque[OrderedQueueChange] = deque()
         self.last_diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
@@ -1043,6 +1052,7 @@ class AdmissionServer:
             self.placement_requests = state.placement_requests
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
+            self.priority_unit_eligibility = state.priority_unit_eligibility
             self._persisted = wire.encode_record(state)
             if not isinstance(self.override, records.NoHeadAdmissionOverride):
                 self.override_reconnect_until = ReconnectAwaitingListener()
@@ -1100,7 +1110,7 @@ class AdmissionServer:
                            or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments)
+            self.placement_requests, self.assignments, self.current_assignments, self.priority_unit_eligibility)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
 
         def encoded_record(name: str, key: str, value: object) -> DurableRecordEncoding:
@@ -1206,7 +1216,7 @@ class AdmissionServer:
         rows = self._ordered_waiters()
         sessions = [row.get("session_id", "") for _, row in rows if not row.get("unit")]
         labels: Mapping[str, gate.UnitMembership] = (
-            gate.priority_labels(sessions)
+            gate.priority_labels(sessions, unit_eligibility=self.priority_unit_eligibility)
             if sessions and not isinstance(self.priority, records.NoQueuePriority) else {})
         return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
 
@@ -2388,7 +2398,7 @@ class AdmissionServer:
             self.queue_changes.append(OrderedQueueChange(request, connections))
             return []
         if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
-            result: Future[Mapping[str, gate.UnitMembership]] = Future()
+            result: Future[tuple[Mapping[str, gate.UnitMembership], tuple[gate.PriorityUnitEligibility, ...]]] = Future()
             self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), result)
             threading.Thread(target=read_priority_roster, args=(result, os.dup(self.priority_events)),
                              daemon=True, name="priority-roster").start()
@@ -2400,8 +2410,12 @@ class AdmissionServer:
         if not isinstance(pending, PendingPriorityRoster) or not pending.result.done():
             return
         self.pending_priority = NoPendingPriorityRoster()
+        def apply() -> list[wire.Reply]:
+            labels, self.priority_unit_eligibility = pending.result.result()
+            return self._apply_queue_change(pending.change.request, labels)
+
         self._complete_queue_change(pending.change,
-            lambda: self._apply_queue_change(pending.change.request, pending.result.result()))
+            apply)
         self._continue_queue_changes()
 
     def _continue_queue_changes(self) -> None:

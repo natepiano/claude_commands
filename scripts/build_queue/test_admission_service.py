@@ -922,9 +922,51 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 
 class PendingPriorityTests(unittest.TestCase):
+    def test_priority_labels_match_the_original_lookup_for_registered_units(self) -> None:
+        from scripts.agents import remote
+        from scripts.message import roster, unit_labels
+        from scripts.message.sessions import SessionRecord
+        from scripts.production import staff, showrunners
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = root / "production.md"
+            _ = document.write_text("# Production\n")
+            producer = staff.StaffRow(
+                staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
+                current_session=staff.StaffId("producer-session"),
+                doc=staff.LiveDoc(remote.local_machine(), document))
+            director = staff.StaffRow(
+                staff.StaffId("director"), "unit", "chosen", staff.ReportsTo(producer.id),
+                current_session=staff.StaffId("director-session"))
+            native: SessionRecord = {
+                "pid": os.getpid(), "sessionId": director.current_session, "name": "old-name",
+                "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": []}
+            for case in ("available", "unavailable", "renamed", "parentless"):
+                owner = replace(producer, doc=staff.LiveDoc(remote.local_machine(), root / "missing.md")) \
+                    if case == "unavailable" else producer
+                member = (replace(director, name="renamed") if case == "renamed" else
+                          replace(director, parent=staff.StaffRoot()) if case == "parentless" else director)
+                membership = staff.StaffSnapshot((owner, member))
+                for registered in (False, True):
+                    with self.subTest(case=case, registered=registered), \
+                            mock.patch.object(staff, "snapshot", return_value=membership), \
+                            mock.patch.object(staff, "local_snapshot", return_value=membership), \
+                            mock.patch.object(unit_labels, "newest_sessions", return_value=[native] if registered else []), \
+                            mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root / "timers"):
+                        original = roster.unit_labels_for([director.current_session], os.environ)
+                        expected = {session: label for session, label in original.items()
+                                    if label.unit and label.unit != "—"}
+                        with mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("slow lookup")):
+                            self.assertEqual(gate.priority_labels([director.current_session]), expected)
+                            self.assertEqual(gate.priority_labels(
+                                [director.current_session], unit_eligibility=(gate.PriorityUnitEligibility(
+                                    director.id, producer.id, remote.local_machine(), document),)), expected)
+                        self.assertEqual(bool(expected), not registered or case in ("available", "renamed"))
+
     def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
         from scripts.message import roster
-        from scripts.production import staff
+        from scripts.production import session_staff, staff
 
         producer = staff.StaffRow(staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
                                  current_session=staff.StaffId("producer-session"))
@@ -935,19 +977,47 @@ class PendingPriorityTests(unittest.TestCase):
         snapshot = staff.StaffSnapshot((producer, director, worker))
         expected = {"director-session": UnitLabels("chosen", "production", "chosen"),
                     "worker-session": UnitLabels("builder", "production", "chosen")}
-        with mock.patch.object(staff, "snapshot", return_value=snapshot), \
+        with mock.patch.object(staff, "local_snapshot", return_value=snapshot), \
                 mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
             self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)
         for unreadable in (False, True):
             with self.subTest(unreadable=unreadable), \
-                    mock.patch.object(staff, "snapshot", side_effect=OSError("unreadable") if unreadable else None,
+                    mock.patch.object(staff, "local_snapshot", side_effect=OSError("unreadable") if unreadable else None,
                                       return_value=snapshot), \
                     mock.patch.object(roster, "unit_labels_for", return_value={**expected,
                                       "unrecorded": UnitLabels("old", unit="other")}) as fallback:
                 actual = gate.priority_labels(["director-session", "worker-session", "unrecorded"])
                 self.assertEqual(actual, {**expected, "unrecorded": UnitLabels("old", unit="other")})
                 fallback.assert_called_once_with(
-                    ["director-session", "worker-session", "unrecorded"] if unreadable else ["unrecorded"], os.environ)
+                    ["director-session", "worker-session", "unrecorded"] if unreadable else ["unrecorded"], os.environ,
+                    scope=session_staff.FactReadScope.LOCAL)
+
+    def test_remote_priority_documents_never_block_admission_or_views(self) -> None:
+        from scripts.agents import remote
+        from scripts.message import unit_labels
+        from scripts.message.sessions import SessionRecord
+        from scripts.production import staff
+
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            owner = staff.StaffRow(
+                staff.StaffId("remote-owner"), "showrunner", "production", staff.StaffRoot(),
+                current_session=staff.StaffId("remote-owner-session"),
+                doc=staff.LiveDoc(remote.other_machine(), Path("/unavailable/production.md")))
+            member = staff.StaffRow(
+                staff.StaffId("remote-unit"), "unit", "remote-unit", staff.ReportsTo(owner.id),
+                current_session=staff.StaffId(request.identity.session_id))
+            native: SessionRecord = {
+                "pid": os.getpid(), "sessionId": member.current_session, "name": member.name,
+                "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": []}
+            fixture.server.priority = records.QueuePriority(({
+                "unit": member.name, "why": "urgent", "set_at": fixture.clock.now(), "set_by": "director"},))
+            with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((owner, member))), \
+                    mock.patch.object(staff, "snapshot", side_effect=AssertionError("remote staff read")), \
+                    mock.patch.object(unit_labels, "newest_sessions", return_value=[native]), \
+                    mock.patch("scripts.production.session_staff.subprocess.run", side_effect=AssertionError("remote read")):
+                _ = only_admitted(fixture.server.handle_request(request))
+                self.assertIsInstance(fixture.server.handle_request(wire.ViewRequest())[0], wire.ViewReply)
 
     def test_explicit_waiter_units_keep_order_without_a_roster_lookup(self) -> None:
         with AdmissionFixture() as fixture:
@@ -968,6 +1038,85 @@ class PendingPriorityTests(unittest.TestCase):
             assert isinstance(fixture.server.last_inputs, records.QueueInputs)
             self.assertEqual(fixture.server.last_inputs.ordered,
                              [(path, records.stored_waiter(row)) for path, row in expected[0]])
+
+    def test_remote_document_priority_reuses_the_background_roster_before_and_after_restart(self) -> None:
+        from scripts.agents import remote
+        from scripts.message import roster, unit_labels
+        from scripts.message.sessions import SessionRecord
+        from scripts.production import staff
+
+        with AdmissionFixture() as fixture:
+            _ = fixture.occupy_host()
+            fixture.free(16 * GIB)
+            fixture.hold_starts()
+            older = fixture.request(need=12 * GIB, since=fixture.clock.now() - 60)
+            chosen = fixture.request(need=12 * GIB)
+            owner = staff.StaffRow(
+                staff.StaffId("remote-owner"), "showrunner", "production", staff.StaffRoot(),
+                current_session=staff.StaffId("remote-owner-session"),
+                doc=staff.LiveDoc(remote.other_machine(), Path("/remote/production.md")))
+            member = staff.StaffRow(
+                staff.StaffId("remote-unit"), "unit", "remote-unit", staff.ReportsTo(owner.id),
+                current_session=staff.StaffId(chosen.identity.session_id))
+            native: SessionRecord = {
+                "pid": os.getpid(), "sessionId": member.current_session, "name": member.name,
+                "messagingSocketPath": "", "updatedAt": 0, "tmux": "", "formerNames": []}
+            worker = staff.StaffRow(
+                staff.StaffId("remote-worker"), "worker", "worker", staff.ReportsTo(member.id),
+                current_session=staff.StaffId("another-unit-session"))
+            labels = {worker.current_session: UnitLabels(worker.name, owner.name, member.name)}
+            with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((owner, member, worker))) as local_staff, \
+                    mock.patch.object(unit_labels, "newest_sessions", return_value=[native]), \
+                    mock.patch.object(roster, "roster", return_value=roster.Roster([], [])), \
+                    mock.patch.object(roster, "unit_labels", return_value=labels), \
+                    mock.patch("scripts.production.session_staff.subprocess.run", side_effect=AssertionError("remote read")):
+                _ = fixture.server.handle_request(older)
+                _ = fixture.server.handle_request(chosen)
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "remote-priority", member.name, "urgent", "director")), [wire.Ok()])
+                for restart in (False, True):
+                    with self.subTest(restart=restart):
+                        if restart:
+                            fixture.restart()
+                            _ = fixture.server.handle_request(older)
+                            _ = fixture.server.handle_request(chosen)
+                        inputs = fixture.server.last_inputs
+                        assert isinstance(inputs, records.QueueInputs)
+                        self.assertEqual([row["pid"] for _, row in inputs.ordered],
+                                         [chosen.owner.pid, older.owner.pid])
+                evidence = fixture.server.priority_unit_eligibility
+                self.assertEqual(evidence, (gate.PriorityUnitEligibility(
+                    member.id, owner.id, remote.other_machine(), Path("/remote/production.md")),))
+                for case in ("same-name-other-showrunner", "removed-worktree", "changed-document", "changed-owner"):
+                    current_owner, current_member = owner, member
+                    if case in ("same-name-other-showrunner", "changed-owner"):
+                        current_owner = replace(owner, id=staff.StaffId("other-owner"), name="other-production")
+                        current_member = replace(member, parent=staff.ReportsTo(current_owner.id))
+                        if case == "same-name-other-showrunner":
+                            current_member = replace(current_member, id=staff.StaffId("other-unit"))
+                    elif case == "removed-worktree":
+                        current_member = replace(member, worktree=staff.RemovedWorktree(
+                            remote.local_machine(), Path("/removed/unit")))
+                    else:
+                        current_owner = replace(owner, doc=staff.LiveDoc(
+                            remote.other_machine(), Path("/remote/changed.md")))
+                    rows = (current_owner, current_member)
+                    if case == "same-name-other-showrunner":
+                        rows += (owner, replace(member, current_session=staff.StaffId("validated-director")))
+                    local_staff.return_value = staff.StaffSnapshot(rows)
+                    with self.subTest(exclusion=case):
+                        self.assertEqual(gate.priority_labels(
+                            [member.current_session], unit_eligibility=evidence), {})
+                        _ = fixture.server.run_pass()
+                        inputs = fixture.server.last_inputs
+                        assert isinstance(inputs, records.QueueInputs)
+                        self.assertEqual([row["pid"] for _, row in inputs.ordered],
+                                         [older.owner.pid, chosen.owner.pid])
+                local_staff.return_value = staff.StaffSnapshot((owner, member, worker))
+                _ = fixture.server.run_pass()
+                inputs = fixture.server.last_inputs
+                assert isinstance(inputs, records.QueueInputs)
+                self.assertEqual([row["pid"] for _, row in inputs.ordered], [chosen.owner.pid, older.owner.pid])
 
     def test_runner_retry_cannot_attach_to_a_pending_priority_request(self) -> None:
         with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
@@ -1003,7 +1152,9 @@ class PendingPriorityTests(unittest.TestCase):
     def delayed_roster(self, session_id: str = "worker") -> Generator[tuple[threading.Event, threading.Event]]:
         entered, finish = threading.Event(), threading.Event()
 
-        def read_roster(sessions: list[str] | gate.RosterUnits) -> dict[str, UnitLabels]:
+        def read_roster(sessions: list[str] | gate.RosterUnits, *,
+                        unit_eligibility: tuple[gate.PriorityUnitEligibility, ...] = ()) -> dict[str, UnitLabels]:
+            del unit_eligibility
             if isinstance(sessions, gate.RosterUnits):
                 entered.set()
                 _ = finish.wait()
@@ -1145,7 +1296,9 @@ class PendingPriorityTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             request = wire.PrioritySetRequest("roster-retry", "chosen", "urgent", "director")
 
-            def unreadable_roster(sessions: list[str] | gate.RosterUnits) -> dict[str, UnitLabels]:
+            def unreadable_roster(sessions: list[str] | gate.RosterUnits, *,
+                                  unit_eligibility: tuple[gate.PriorityUnitEligibility, ...] = ()) -> dict[str, UnitLabels]:
+                del unit_eligibility
                 if isinstance(sessions, gate.RosterUnits):
                     raise ValueError("roster unreadable")
                 return {}
