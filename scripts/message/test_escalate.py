@@ -19,7 +19,7 @@ from scripts.notify import push_reference
 from scripts.message import send
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from scripts.notify.user_action import ActionRequired, NoActionRequired
 
@@ -534,6 +534,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(send, "STATE", self.root / "messages"),
               patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
+            _ = fixture_member("producer", name="offline")
             a = self.select_codex(1)
             for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
                 send.enqueue(send.Message("offline", "quota_alert", "", "low window", key, stamp=send.UnavailableSender()), "offline", datetime.now(timezone.utc))
@@ -546,11 +547,10 @@ class EscalateTests(unittest.TestCase):
                 _ = send.retire(command[command.index("--to") + 1], "quota_alert", command[command.index("--key") + 1])
                 return subprocess.CompletedProcess(command, 0, "", "")
             with (patch.object(subprocess, "run", side_effect=retire),
-                  patch.object(escalate, "load_settings", return_value={"always": ["offline"]}),
-                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(()))):
+                  patch.object(escalate, "load_settings", return_value={"always": ["offline"]})):
                 _ = escalate.due(10**12)
             deliver.assert_not_called()
-            self.assertEqual([item["key"] for item in send.read_queue(send.queue_path("offline"))], ["5-hour Claude"])
+            self.assertEqual([item["key"] for item in send.read_queue(send.queue_for("offline"))], ["5-hour Claude"])
             self.assertEqual(list((escalate.STATE / "held").glob("*.json")), [])
 
     def test_any_other_arguments_print_the_usage(self) -> None:

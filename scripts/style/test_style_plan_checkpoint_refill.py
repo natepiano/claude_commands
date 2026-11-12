@@ -281,8 +281,8 @@ class TicketWorkerTests(AssignLauncherFixture):
             "Type Design Contract: ~/.claude/docs/type_design.md applies to the code you change.",
             "Edit only the listed paths.",
             "Run no git add, commit, stash, reset or checkout.",
-            "Start no detached run you will not wait on.",
-            "Finish your summary before you end your turn.",
+            "After you start a detached run, end your turn. Its result arrives as your next message.",
+            "Write your summary after the last result arrives.",
         ):
             self.assertIn(sentence, prompt.read_text())
 

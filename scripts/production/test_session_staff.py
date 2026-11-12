@@ -288,7 +288,7 @@ class StatusDiscoveryTests(StaffTestCase):
         morty = fixture_runtime_id("retained-pane-morty")
         from scripts.message import codex_daemon
 
-        sessions = [codex_daemon.DaemonSession(morty, "morty", str(self.root), "idle")]
+        sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
 
         def configured_morty(identity: str) -> bool:
             return identity == morty

@@ -3166,3 +3166,109 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Checkpoint `8c7e63ab5`. `show.py` `gate_costs()` adds `ledger.gate_allowance(row).usd` to the box-hour cost. `read_snapshot()` already decodes `booked_allowance`, so no `priced_snapshot` call is needed. `TREND_CACHE_VERSION` is 4, so each cached day is priced again once. The trend cost tests carry booked allowances that differ from `allowance_usd`.
+
+### Phase 174 — Rank the test work by gate seconds saved per work hour  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a measured report ranks the candidate test speed work by gate seconds saved per work hour, with shared per-module costs measured. No code changes.
+
+**Decision:** builds showrunner item 80, from the user, 2026-11-11: aim at the largest gate-time saving per work hour. dwight measured a median full gate of 197 s and 4,663 CPU s on 32 vCPUs; the slowest 12 modules use 11% of CPU and about 746 others use 89%. Earlier shared changes saved 38.7, 49, 42 and 127 CPU s per gate; single-module phases save 1–13 CPU s. Read-only.
+
+**Spec:**
+1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only (`file:...?mode=ro`), tables `gate_runs` and `gate_modules`. Use passed cloud full gates (`host != 'natedev'`, `selection = 'full'`, `status = 0`) since 2026-11-08. Record the gate count and the database file.
+2. Gate shape. Use the method of `~/rust/hanadocs/dwight/tools/m.py`: wall, CPU, slots, time to the first module, time after the last module start, and the modules that end last. Say whether gate wall time follows total CPU over the slots or the tail.
+3. Fixed cost per module. Measure about 20 small modules across suites with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 5 --commands 10`. Split the cost into interpreter start, the `module_run.py` supervisor, package bootstrap, shared support imports and test setup. Use `python3 -X importtime` to attribute import CPU to shared modules. Multiply by the gate module count for a gate estimate, labelled as an estimate.
+4. Shared support. Rank shared fixtures and support modules by the number of gate modules that use them times their measured CPU. Name the top 10, with file, line and owner.
+5. Scheduling. Find where the gate orders modules (file and line). Estimate the wall time saved by longest-first order or by splitting the tail modules.
+6. Find the source of the earlier shared savings (38.7, 49, 42 and 127 CPU s) in `git log` where you can, and say what kind of change each was.
+7. For each candidate give: measured cost (gate CPU s and gate wall s), estimated saving, estimated work hours, gate seconds saved per work hour, owner, and a measured or estimated label on each number. Include the open single-module work from next item 6b for comparison.
+8. Write the report to `phases/174/gate_value_ranking.md` in the session folder. Change no repository file. Delete saved run output after you read it.
+
+**Files:**
+- `phases/174/gate_value_ranking.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- impl3: the report.
+
+**Constraints from prior phases:**
+- Phase 166: local CPU numbers overstate; only aws pairs decide a saving. Keep measured costs separate from estimated savings.
+- Phase 168: entry imports cost 0.02–0.50 s per child; lock waits cost almost no CPU.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report gives the gate shape, the fixed cost per module by part, the top 10 shared costs with owners, the scheduling estimate, and the ranked table with measured and estimated labels.
+- `git status` shows no change from the researcher.
+
+### Phase 175 — Check whether affected-only merge gates would have caught the recorded failures  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a report says, for each failed cloud merge gate since 2026-11-08, whether the affected-test selection for that merge includes each recorded failing module. Analysis only: no aws cost and no gate-policy change.
+
+**Decision:** builds showrunner item 82, from the user, 2026-11-11. dwight found 523 full gates on 489 trees since 11-08; 62 failed on 42 trees; only one failed tree also has an affected run (`~/rust/hanadocs/dwight/tools/n.py`). Read-only.
+
+**Spec:**
+1. Read the newest `~/.local/state/buildlog/index-*.sqlite` read-only, tables `gate_runs` and `gate_modules`. List cloud `merge-gate` runs since 2026-11-08, the failed runs and their distinct trees. Record the database file and the counts.
+2. Find the affected-test selection that `targeted-test` uses (`scripts/production/merge_gate.py` and its callers). Explain the algorithm and the base it compares the merge result against, with file and line.
+3. For each failed tree, find the merge commit and its base in the local repository objects. Run the selection code in process on the changed files; run no tests. When the selection needs the tree at that commit, use `python3 ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit <C> -- <cmd>`. Do not fetch with a ref write; use `git fetch --no-write-fetch-head` only when an object is absent.
+4. Compare each recorded failing module with the selection. Put each failed tree in one class: all failures selected, partial coverage, no failure selected, no failing module recorded (infrastructure or abort), or missing evidence (commit absent or no module records).
+5. Mark each tree that also passed a full gate as a test that fails only sometimes, apart from trees that never passed. Name the infrastructure cause from the records where you can.
+6. List the missed modules, the failed trees with no selected failure, and the trees with partial coverage.
+7. State the limit: selection coverage does not prove that an affected run would reproduce a failure.
+8. Write the report to `phases/175/affected_gate_report.md` in the session folder. Change no repository file. Start no gate and no aws work.
+
+**Files:**
+- `phases/175/affected_gate_report.md` — the report, in the session folder; no repository file changes.
+
+**Workers:** 1 researcher; read-only.
+- test: the report.
+
+**Constraints from prior phases:** none.
+
+**State:** none.
+
+**Acceptance gate:**
+- The report explains the selection and its base, classifies every failed tree, and lists missed modules, uncovered trees and partial trees.
+- `git status` shows no change from the researcher.
+
+### Phase 176 — A targeted test run selects the whole-repository checks and the tests whose fixtures read a changed config  · status: todo
+**Depends on:** Phase 175
+
+#### Work Order
+
+**Goal:** the affected-test selection includes the 12 failing modules that Phase 175 found missed, through general rules, and it drops no module it selects today.
+
+**Decision:** builds showrunner, 2026-11-11 (item 82 follow-up): always select the whole-repository audit modules and link fixture config reads; full merge gates do not change. sdlc go, 2026-11-11: `affected_modules.py` and `test_affected_modules.py` are free; the selector may add modules but never drop one that a full gate runs today.
+
+**Spec:**
+1. For each of the 12 replay misses and the 3 observed targeted-run misses in `phases/175/affected_gate_report.md` (session folder), find why `select_affected` did not select it. Use the Phase 175 replay inputs (`reconstructed_bases.json`, `refined_replay_commands.json`, `select_refined.py`). Write one row per module: the changed files, the missing link, and the rule that closes it.
+2. Whole-repository checks. A test module that scans the source tree (source audits, import inventories, file counts) is selected whenever a file of the kind it scans changes. Detect these modules from code or recorded evidence; a hand list is the last choice. If a list is needed, put it in `config/merge_gate.conf` with the reason on each entry, and read it through the config owner.
+3. Fixture config reads. A test whose fixture copies or reads a repository config file (for example the build_hold target list) is selected when that config file changes. Find why the existing config-read rule (Phase 127) missed these reads and fix the cause.
+4. Fix each other miss at its cause when a general rule exists. When a miss has no general rule, say so in the reply; do not add a special case for one module.
+5. The selector only adds modules. Prove it: for every replay in `phases/175/refined-selections`, the new selection contains the old selection. Report the added module count for each replay (median and largest) and the 15 misses now selected.
+6. Add rows to the existing tests in `scripts/production/test_affected_modules.py`. Add a new test only when no existing test can carry the case. Each new rule has one test that fails on the old code.
+7. Keep the full-suite fallback when no base exists or the graph fails (`affected_modules.py:507-508,566-567`). Change no gate policy.
+
+**Files:**
+- `scripts/production/affected_modules.py` — `select_affected`, lines 519–564, and the read rules.
+- `scripts/production/test_affected_modules.py` — 35 tests.
+- `config/merge_gate.conf` — only if spec item 2 needs a list.
+
+**Workers:** 1 writer; the selector and its tests are one unit.
+- test: all files.
+
+**Constraints from prior phases:**
+- Phase 175: the selector compares HEAD and dirty paths with the candidate base that has the fewest changed paths. Read evidence comes from the newest complete full gate.
+- Phases 116, 123, 127, 130 and 131 added the text, script-call, config-read, folder-scan and folder-content rules. Reuse them; do not add a parallel rule.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_affected_modules` passes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- The replay check shows each new selection contains the old one, and names the misses now selected.
+- Two blind reviews.
