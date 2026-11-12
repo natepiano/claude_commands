@@ -288,6 +288,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry.get("pid"), 998070)
 
         for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("wrapper", False, ""), ("wrapper-without-identity", False, ""),
                                         ("two-fresh", False, "Codex launch has no unique foreground process"),
                                         ("invalid-resume", False, "Codex launch identity is unavailable"),
                                         ("herdr-failure", True, "Codex launch process info"),
@@ -299,6 +300,9 @@ class NativePaneSessionTests(StaffTestCase):
                       redirect_stderr(io.StringIO()) as errors):
                     if not report:
                         herdr.json_object(process_info["pane"], "fixture pane")["session_id"] = ""
+                    if source in {"wrapper", "wrapper-without-identity"}:
+                        write_text_atomic(Path(folder) / "codex-launch-proc" / "998070" / "cmdline",
+                                          "/bin/sh\0fixture-wrapper\0")
                     if source == "two-fresh":
                         processes = herdr.json_object(process_info["process_info"], "fixture process info")
                         foreground = herdr.json_items(processes["foreground_processes"], "fixture foreground processes")
@@ -310,6 +314,17 @@ class NativePaneSessionTests(StaffTestCase):
                         (pane_launch.record_directory() / f"{client.session}.json").mkdir(parents=True)
                     outcome = client.start_agent("codex-worker", "w1:p1", "codex", arguments,
                                                  herdr.NoOpeningPrompt(), 1_000)
+                    if source == "wrapper-without-identity":
+                        processes = herdr.json_object(process_info["process_info"], "fixture process info")
+                        processes.update(shell_pid=998069, foreground_process_group_id=998070)
+                        pane = herdr.json_object(process_info["pane"], "fixture pane")
+                        pane["tab_id"] = "w1:t1"
+                        with redirect_stderr(io.StringIO()) as later_errors:
+                            scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
+                        reason = "pid 998070: Codex launch identity is unavailable"
+                        self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
+                        self.assertEqual(later_errors.getvalue(),
+                            f"herdr agents:w1:p1 tab w1:t1: pane evidence is unknown: {reason}; row placement retained\n")
                 self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
                 if failure:
                     self.assertEqual(len(errors.getvalue().splitlines()), 1)

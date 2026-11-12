@@ -3625,7 +3625,7 @@ def _process_birth(pid: int) -> str:
 
 
 class CodexSessionPending(ValueError):
-    """A fresh Codex process has no session report yet."""
+    """A fresh Codex process or its wrapper has no session report yet."""
 
 
 def codex_resume_thread(pid: int) -> str:
@@ -3654,7 +3654,7 @@ def codex_resume_thread(pid: int) -> str:
                         raise ValueError(f"pid {pid}: Codex launch identity is unavailable") from error
                 break
         raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
-    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+    raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
 
 
 def _codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessionReport:
