@@ -508,7 +508,10 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual((worker / "pending.txt").read_text(), "keep unsaved work\n")
         self.assertEqual(self.batch.read(), manifest)
         (worker / "pending.txt").unlink()
-        _ = self.finish_run()
+        with (self.subTest(resume="without frozen checkout"),
+              mock.patch.object(self.batch, "frozen_checkout",
+                                side_effect=AssertionError("terminal resume builds the frozen checkout"))):
+            _ = self.finish_run()
         self.assertFalse(worker.exists())
 
     def test_pending_run_survives_expiry_and_terminal_resume_ends_its_task(self) -> None:
