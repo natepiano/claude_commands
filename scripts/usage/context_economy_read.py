@@ -12,11 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import sqlite3
 import subprocess
-import sys
-import threading
 from typing import Literal, cast
 
 from scripts.lib import conf
@@ -104,20 +101,6 @@ class ReportSettingsTimeline(list[SettingsSet]):
     def __init__(self, entries: Sequence[SettingsSet]) -> None:
         super().__init__(entries)
         self.by_start: dict[datetime, SettingsSet | SettingsUnknown] = {}
-
-
-@dataclass(frozen=True)
-class MacSessions:
-    sessions: list[Session]
-    timeline: list[SettingsSet]
-
-
-@dataclass(frozen=True)
-class MacReadFailed:
-    reason: str
-
-
-MacRead = MacSessions | MacReadFailed
 
 
 @dataclass
@@ -497,19 +480,19 @@ def _session_data(session: Session) -> dict[str, object]:
 
 def _wire_object(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise ValueError("Mac data must contain an object")
+        raise ValueError("Cached transcript data must contain an object")
     return cast(dict[str, object], value)
 
 
 def _wire_list(value: object) -> list[object]:
     if not isinstance(value, list):
-        raise ValueError("Mac data must contain a list")
+        raise ValueError("Cached transcript data must contain a list")
     return cast(list[object], value)
 
 
 def _wire_text(value: object) -> str:
     if not isinstance(value, str):
-        raise ValueError("Mac data must contain text")
+        raise ValueError("Cached transcript data must contain text")
     return value
 
 
@@ -519,14 +502,14 @@ def _wire_optional_text(value: object) -> str | None:
 
 def _wire_count(value: object) -> int:
     if type(value) is not int or value < 0:
-        raise ValueError("Mac data must contain a whole number")
+        raise ValueError("Cached transcript data must contain a whole number")
     return value
 
 
 def _wire_time(value: object) -> datetime:
     at = parse_timestamp(_wire_text(value))
     if at is None:
-        raise ValueError("Mac data has an invalid timestamp")
+        raise ValueError("Cached transcript data has an invalid timestamp")
     return at
 
 
@@ -541,7 +524,7 @@ def _wire_compaction(value: object) -> CompactionEvent:
     row = _wire_object(value)
     kind = row["kind"]
     if kind not in ("precomputed", "normal", "unknown"):
-        raise ValueError("Mac data has an invalid compaction kind")
+        raise ValueError("Cached transcript data has an invalid compaction kind")
     pre, post = row["pre_tokens"], row["post_tokens"]
     return CompactionEvent(_wire_time(row["at"]), _wire_optional_text(row["trigger"]),
         SizeNotReported() if pre is None else _wire_count(pre),
@@ -552,7 +535,7 @@ def _wire_start(value: object) -> Start:
     row = _wire_object(value)
     source = row["source"]
     if source not in ("startup", "resume"):
-        raise ValueError("Mac data has an invalid start source")
+        raise ValueError("Cached transcript data has an invalid start source")
     return Start(_wire_time(row["at"]), source,
                  _wire_optional_text(row["cli_version"]))
 
@@ -560,7 +543,7 @@ def _wire_start(value: object) -> Start:
 def _wire_session(row: dict[str, object]) -> Session:
     family = row["family"]
     if family not in ("claude", "codex"):
-        raise ValueError("Mac data has an invalid session family")
+        raise ValueError("Cached transcript data has an invalid session family")
     first = row["first_record_at"]
     return Session(_wire_text(row["machine"]), family,
         _wire_text(row["session_id"]), _wire_text(row["agent_id"]),
@@ -568,27 +551,6 @@ def _wire_session(row: dict[str, object]) -> Session:
         [_wire_compaction(value) for value in _wire_list(row["compactions"])],
         [_wire_start(value) for value in _wire_list(row["starts"])],
         SessionBeginningUnknown.UNRECORDED if first is None else _wire_time(first))
-
-
-def _mac_reply(output: str) -> MacSessions:
-    sessions: list[Session] = []
-    timeline: list[SettingsSet] = []
-    timeline_read = False
-    for line in output.splitlines():
-        row = _wire_object(cast(object, json.loads(line)))
-        if row["type"] == "timeline" and not timeline_read:
-            for value in _wire_list(row["entries"]):
-                entry = _wire_object(value)
-                timeline.append(SettingsSet(_wire_time(entry["at"]), _wire_text(entry["commit"]),
-                                            _wire_object(entry["values"])))
-            timeline_read = True
-        elif row["type"] == "session" and timeline_read:
-            sessions.append(_wire_session(row))
-        else:
-            raise ValueError("Mac data has an invalid record type or order")
-    if not timeline_read:
-        raise ValueError("Mac data has no timeline")
-    return MacSessions(sessions, timeline)
 
 
 def timeline_start(sessions: Sequence[Session], since: datetime) -> datetime:
@@ -601,98 +563,3 @@ def timeline_start(sessions: Sequence[Session], since: datetime) -> datetime:
         elif isinstance(session.first_record_at, datetime):
             anchors.append(session.first_record_at)
     return min(anchors)
-
-
-def emit_mac(request: dict[str, object]) -> None:
-    """Read both families and the checkout timeline in the remote process."""
-    since, until = _wire_time(request["since"]), _wire_time(request["until"])
-    projects = _wire_text(request["projects_root"])
-    checkout = _wire_text(request["checkout"])
-    roots = [Path(_wire_text(value)) for value in _wire_list(request["codex_roots"])]
-    settings = TranscriptReadSettings(_wire_count(request["cache_max_megabytes"]),
-                                      _wire_count(request["progress_seconds"]))
-    sessions = read_claude(Path(projects) if projects else Path.home() / ".claude/projects", since, until, "mac",
-                           settings=settings)
-    sessions.extend(read_codex(roots or sorted(Path.home().glob(".codex*/sessions")), since, until, "mac",
-                              settings=settings))
-    timeline = settings_timeline(Path(checkout) if checkout else configured_checkout(), timeline_start(sessions, since), until)
-    print(json.dumps({"type": "timeline", "entries": [
-        {"at": entry.at.isoformat(), "commit": entry.commit, "values": entry.values} for entry in timeline]}), flush=True)
-    for session in sessions:
-        print(json.dumps(_session_data(session)), flush=True)
-
-
-def _mac_payload(since: datetime, until: datetime) -> str:
-    settings = read_settings()
-    root = Path(__file__).resolve().parents[2]
-    modules = {name: (root / path).read_text(encoding="utf-8") for name, path in (
-        ("scripts.lib.conf_reads", "scripts/lib/conf_reads.py"),
-        ("scripts.lib.conf", "scripts/lib/conf.py"),
-        ("scripts.lib.transcripts", "scripts/lib/transcripts.py"),
-        ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
-        ("scripts.usage.context_economy_cache", "scripts/usage/context_economy_cache.py"),
-        ("scripts.usage.context_economy_read", "scripts/usage/context_economy_read.py"),
-    )}
-    return json.dumps({"modules": modules, "since": since.isoformat(), "until": until.isoformat(),
-        "cache_max_megabytes": settings.cache_max_megabytes, "progress_seconds": settings.progress_seconds,
-        "projects_root": os.environ.get("CONTEXT_ECONOMY_MAC_PROJECTS_ROOT", ""),
-        "codex_roots": _wire_list(cast(object, json.loads(os.environ.get("CONTEXT_ECONOMY_MAC_CODEX_ROOTS", "[]")))),
-        "checkout": os.environ.get("CONTEXT_ECONOMY_MAC_CHECKOUT", "")})
-
-
-def _mac_command() -> list[str]:
-    from scripts.usage.collect import MAC_HOST, bootstrap_program
-
-    program = bootstrap_program("sys.modules['scripts.usage.context_economy_read'].emit_mac(request)")
-    configured = os.environ.get("CONTEXT_ECONOMY_MAC_COMMAND", "")
-    if configured:
-        return [*(_wire_text(value) for value in _wire_list(cast(object, json.loads(configured)))), program]
-
-    return ["ssh", "-o", "BatchMode=yes", os.environ.get("CONTEXT_ECONOMY_MAC_HOST", MAC_HOST),
-            shlex.join(("python3", "-c", program))]
-
-
-def _run_mac(command: list[str], payload: str) -> subprocess.CompletedProcess[str]:
-    """Forward remote progress while collecting only the result document."""
-    read_descriptor, write_descriptor = os.pipe()
-    try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=write_descriptor, text=True, encoding="utf-8")
-    except BaseException:
-        os.close(read_descriptor)
-        raise
-    finally:
-        os.close(write_descriptor)
-    errors: list[str] = []
-
-    def relay() -> None:
-        with os.fdopen(read_descriptor, encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                errors.append(line)
-                print(line, end="", file=sys.stderr, flush=True)
-
-    forwarding = threading.Thread(target=relay)
-    forwarding.start()
-    try:
-        with process:
-            try:
-                output = process.communicate(payload,
-                    timeout=conf.read("context_economy").whole("mac_timeout_seconds"))[0]
-            except subprocess.TimeoutExpired:
-                process.kill()
-                output = process.communicate()[0]
-                raise
-    finally:
-        forwarding.join()
-    return subprocess.CompletedProcess(command, process.returncode, output, "".join(errors))
-
-
-def read_mac(since: datetime, until: datetime) -> MacRead:
-    """Use one remote process and return a failure without discarding local sessions."""
-    try:
-        result = _run_mac(_mac_command(), _mac_payload(since, until))
-        if result.returncode:
-            return MacReadFailed(result.stderr.strip() or f"remote reader exited {result.returncode}")
-        return _mac_reply(result.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
-        return MacReadFailed(str(error))
