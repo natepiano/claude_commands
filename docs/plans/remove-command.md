@@ -60,7 +60,7 @@
 
 **Gotchas:** a test of a removed CLI path can also cover a live function; such tests move to the function.
 
-### Phase 3 — Amend /remove_command  · status: todo
+### Phase 3 — Amend /remove_command  · status: done
 
 #### Work Order
 
