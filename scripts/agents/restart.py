@@ -554,7 +554,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
                 reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                                   live.reason if isinstance(live, herdr.UnknownConversation) else ""),
-                codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT)
+                codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, client=client)
         if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
             raise ClaudeTrustWriteFailed(result.outcome.reason)
         if isinstance(result.outcome, herdr.PromptNotSubmitted):
@@ -876,16 +876,17 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             if row not in selected:
                 selected.append(row)
         if dry_run:
-            positions = {tab.get("row_id"): f"workspace {space['name']}, tab {index} ({tab['name']})"
+            positions = {tab["staff_id"]: f"workspace {space['name']}, tab {index} ({record.rows_by_id[staff.StaffId(tab['staff_id'])].name})"
                          for space in herdr.saved_layout(client.session)["workspaces"]
-                         for index, tab in enumerate(space["tabs"], 1) if tab.get("row_id")}
+                         for index, tab in enumerate(space["tabs"], 1) if staff.StaffId(tab["staff_id"]) in record.rows_by_id}
             visible = row_panes(list(record.rows) if stop_all and not only and isinstance(account, AllRestartAccounts) else selected, client)
             for row, pane in visible:
                 if row not in selected:
                     continue
                 try:
-                    workspace, index, tab = client.pane_tab(pane)
-                    positions[str(row.id)] = f"workspace {workspace}, tab {index} ({tab['name']})"
+                    workspace, index, position = client.pane_tab(pane)
+                    del position
+                    positions[str(row.id)] = f"workspace {workspace}, tab {index} ({row.name})"
                 except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                     _anomaly(row, error)
             for row in selected:

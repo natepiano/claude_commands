@@ -275,8 +275,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                            environment: herdr.PreparedAgentEnvironment, family: str, arguments: list[str],
                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str,
                            reported_unknown: str = "", codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            kind: Literal["claude", "codex"] = kind) -> herdr.AgentLaunched:
-                    _ = (session, opening, timeout, agent, codex)
+                    _ = (session, opening, timeout, agent, codex, client)
                     self.assertEqual(reported_unknown, "")
                     self.assertFalse(backend.live)
                     self.assertEqual(target, herdr.ExistingPane("w1:p1", "kept-terminal"))

@@ -385,8 +385,9 @@ class HerdrSessionsTests(unittest.TestCase):
     def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_orders_split_tabs(self) -> None:
         from scripts.herdr.test_herdr import LayoutHerdr
         members = {name: unit_membership("boss", name) for name in ("mike", "zulu")}
-        members.update({name: fixture_member("showrunner", name=name)
-                        for name in ("boss", "apple", "split", "zebra", "alpha")})
+        members.update({name: fixture_member("showrunner", name=name) for name in ("boss", "split")})
+        for name, parent in (("apple", "boss"), ("zebra", "split"), ("alpha", "split")):
+            members[name] = fixture_member("worker", name=name, parent=members[parent].id)
         self.respond(["agents"])
         self.server(100, "agents")
         client = LayoutHerdr("agents")
@@ -402,7 +403,7 @@ class HerdrSessionsTests(unittest.TestCase):
         path = herdr.layout_path("agents")
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps(herdr.SavedLayout(at=100.0, workspaces=[herdr.SavedSpace(
-            name="boss", seen=100.0, tabs=[herdr.SavedName(name=members[pane["label"]].id, seen=100.0)
+            name="boss", seen=100.0, tabs=[herdr.SavedMemberTab(staff_id=members[pane["label"]].id, seen=100.0)
                                          for pane in client.tabs[:4]])])))
         running = herdr.live_sessions()
         with (fake_unit_host.private_process_registry(), patch.object(herdr, "Herdr", return_value=client),
@@ -410,7 +411,7 @@ class HerdrSessionsTests(unittest.TestCase):
             self.assertEqual(self.call("sort-tabs"), (0, "", ""))
         self.assertEqual(client.commands, [("tab.move", before["p8"], "1"), ("tab.move", before["p14"], "1")])
         self.assertEqual({pane["pane_id"]: pane["tab_id"] for pane in client.tabs}, before)
-        saved = {space["name"]: [tab["name"] for tab in space["tabs"]] for space in herdr.saved_layout("agents")["workspaces"]}
+        saved = {space["name"]: [tab["staff_id"] for tab in space["tabs"]] for space in herdr.saved_layout("agents")["workspaces"]}
         self.assertEqual(saved, {space: [members[title].id for title in titles] for space, titles in
                                  {"boss": ["boss", "mike", "zulu", "apple"], "split": ["split", "alpha", "zebra"]}.items()})
 
@@ -651,7 +652,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             (Path(__file__).resolve().parents[2] / "config/script_prompts.conf").read_text())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {"CLAUDE_CONFIG_DIR": ""}))
         self.responses = {"default": {"stdout": json.dumps({"result": {
-            "workspaces": [], "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
+            "workspaces": [], "workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": [], "panes": [],
         }}), "code": 0}}
         _ = (home / ".claude.json").write_text(json.dumps({"projects": {
             str(self.root): {"hasTrustDialogAccepted": True},
@@ -770,7 +771,7 @@ class StandaloneLaunchTests(unittest.TestCase):
                 pane_reads = self.commands().count(["--session", "agents", "pane", "list"])
                 opened: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
                                              "label": title, "agent_session": {"value": member.current_session}}
-                pane_lists: list[list[dict[str, object]]] = [list[dict[str, object]]() for _ in range(pane_reads + 1)] + [[opened]]
+                pane_lists: list[list[dict[str, object]]] = [list[dict[str, object]]() for _ in range(pane_reads + 2)] + [[opened]]
                 self.responses["--session agents pane list"] = [
                     CommandResponse(code=0, stdout=json.dumps({"result": {"panes": panes}}))
                     for panes in pane_lists]

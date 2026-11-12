@@ -309,18 +309,20 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
         raise ValueError(f"session {identity}, pane {pane}: producer adoption is unproved: {error}") from error
 
 
-def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str) -> ResumeResult:
+def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
+                                  client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Serialize first admission before the producer has a staff row."""
     _ = _producer_admission_path(request.name)
     with staff.slot_operation("producer-first-" + request.name, request.name):
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
         if row is not None and not _producer_admission_path(request.name).exists():
-            return _resume(str(row.id), to=to)
-        return _first_producer_resume(request, to=to)
+            return _resume(str(row.id), to=to, client=client)
+        return _first_producer_resume(request, to=to, client=client)
 
 
-def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> ResumeResult:
+def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
+                           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
     from scripts.agents import remote
 
@@ -330,7 +332,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
             raise ValueError(f"producer README is unavailable: {request.folder / 'README.md'}")
         starter = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
         kind, arguments = starter.producer_first_arguments(request.name)
-        client = herdr.Herdr(herdr.shared_session())
+        client = herdr.Herdr(herdr.shared_session()) if isinstance(client, herdr.LaunchClientSource) else client
         path = _producer_admission_path(request.name)
         recovering_admission = path.exists()
         conflicts = producer_conflicts(request.name, client)
@@ -1028,7 +1030,8 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
                    and reference.casefold() in row.name.casefold()})[:5]
 
 
-def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "") -> ResumeResult:
+def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     from scripts.production import staff
 
     try:
@@ -1038,7 +1041,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
     except conf.Unusable as error:
         return ResumeFailed(session, str(error))
     with staff.row_operation(session):
-        return _resume(session, why=why, to=to, requester=requester)
+        return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
 def _codex_name_ids(name: str) -> list[str]:
@@ -1079,7 +1082,8 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
     return pane_record.launch("", identity, folder, environment, [kind, *arguments], kind=kind)
 
 
-def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "") -> ResumeResult:
+def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
     record = names.tab_record
     member = record.by_member_reference(session)
@@ -1097,13 +1101,13 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
         if member.kind == "producer" and _producer_admission_path(member.name).exists():
             folder = (member.worktree.path if isinstance(member.worktree, staff.PresentWorktree)
                       else _producer_folder(member.name))
-            return _locked_first_producer_resume(ProducerFirstStart(member.name, folder), to=to or "")
+            return _locked_first_producer_resume(ProducerFirstStart(member.name, folder), to=to or "", client=client)
         session = member.current_session
     else:
         if (session and Path(session).name == session and session not in {".", ".."}
                 and _producer_admission_path(session).exists()):
             try:
-                return _locked_first_producer_resume(ProducerFirstStart(session, _producer_folder(session)), to=to or "")
+                return _locked_first_producer_resume(ProducerFirstStart(session, _producer_folder(session)), to=to or "", client=client)
             except (OSError, ValueError) as error:
                 return ResumeFailed(session, str(error))
         try:
@@ -1117,7 +1121,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
                 folder = _producer_folder(session)
                 if ((folder / "README.md").is_file()
                         or isinstance(_tab_of(session, names=names), SessionNotFound)):
-                    return _locked_first_producer_resume(ProducerFirstStart(session, folder), to=to or "")
+                    return _locked_first_producer_resume(ProducerFirstStart(session, folder), to=to or "", client=client)
             except (OSError, ValueError) as error:
                 return ResumeFailed(session, str(error))
         identities = _codex_name_ids(session)
@@ -1125,7 +1129,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
             return ResumeFailed(session, "ambiguous name; candidates: " + ", ".join(identities))
         if identities:
             session = identities[0]
-    result = _resume_once(session, why=why, to=to, requester=requester, names=names)
+    result = _resume_once(session, why=why, to=to, requester=requester, names=names, client=client)
     if isinstance(result, SessionNotFound) and not matches:
         nearby = _nearby_resume_names(session, names)
         suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
@@ -1147,7 +1151,8 @@ def heal_account_trust(
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 names: LaunchNames) -> ResumeResult:
+                 names: LaunchNames,
+                 client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     began = monotonic()
     identity = session
     original: pane_launch.LaunchPublication | None = None
@@ -1157,7 +1162,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     start_scope = ExitStack()
     try:
         tab = _tab_of(session, names=names)
-        client = herdr.Herdr(herdr.shared_session())
+        client = herdr.Herdr(herdr.shared_session()) if isinstance(client, herdr.LaunchClientSource) else client
         row = names.tab_record.by_current_session(identity)
         if isinstance(tab, herdr.TabSession):
             identity = tab.session_id or identity
@@ -1319,7 +1324,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             attempt_pane = tab.pane_id
             launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
                 trust_arguments(kind, entry["cwd"], resume_arguments(entry)), herdr.NoOpeningPrompt(),
-                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000), agent=entry["name"] or identity)
+                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000),
+                agent=entry["name"] or identity, client=client)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
             if message:
@@ -1603,12 +1609,13 @@ def _confirm_move_start(result: ClaudeUp, requester: str, why: str) -> ClaudeUp 
     return ResumeFailed(identity, failure) if failure else result
 
 
-def _resume_move(identity: str, target: str, requester: str, why: str, began: float) -> ResumeResult:
+def _resume_move(identity: str, target: str, requester: str, why: str, began: float,
+                 client: herdr.Herdr) -> ResumeResult:
     token = _move_resume.set(True)
     try:
         try:
-            result = (resume(identity, why=why, to=target, requester=requester) if requester else
-                      resume(identity, why=why, to=target))
+            result = (resume(identity, why=why, to=target, requester=requester, client=client) if requester else
+                      resume(identity, why=why, to=target, client=client))
         except Exception as error:
             result = ResumeFailed(identity, str(error))
         if isinstance(result, ClaudeUp):
@@ -1716,7 +1723,8 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                     stopped.append(result)
                 except Exception as error:
                     stopped.append(StopFailed(session, str(error)))
-            resumes = {pool.submit(_resume_move, result.session_id, target, requester, why, began): (index, result.session_id)
+            client = herdr.Herdr(herdr.shared_session())
+            resumes = {pool.submit(_resume_move, result.session_id, target, requester, why, began, client): (index, result.session_id)
                        for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
             outcomes: dict[int, ClaudeUp | StopFailed | SessionNotFound | ResumePending] = {}
             for index, result in enumerate(stopped):
