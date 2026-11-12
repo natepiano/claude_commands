@@ -3108,3 +3108,122 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - Checkpoint `b73561f05`. Read-only. `test_crate_run.py`: 96 tests, 55.3 CPU s; 13,638 Git starts inside `copies.py` cost 26.3 child CPU s. A larger project seed removes no checkout work: `copies.fresh_tree()` makes a checkout for each standing request, and `freeze()` makes none. Test-only step: one default frozen-state seed for 28 tests (about 1.3 CPU s). copies-unit proposals: one fetch for refs and the exact base (2.2 s ceiling), one metadata query (0.8 s ceiling). Results are in next item 6b.
+
+### Phase 170 — The four unheld lock-contention tests use forked children  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** four tests that start fresh Python children for lock contention start forked children instead. Every test, assertion, real handler and contention boundary stays.
+
+**Decision:** Architect review after Phase 168, finding 1 (next item 6b, phase 1). Phase 168 ceiling: 2.18 CPU s. sdlc go, 2026-11-11: the three files are free.
+
+**Spec:**
+1. Convert these tests to forked children that call the real handler or `main` (the Phase 163 pattern, `scripts/production/test_waiting.py` `eta_request_processes`):
+   - `scripts/production/test_ci_points.py:1009`, `test_simultaneous_watch_calls_claim_only_one_first_alert`: 2 children; both reach the held review lock; one alert and one log record.
+   - `scripts/agents/test_detached_runs.py:381`, `test_parallel_starts_cannot_exceed_one_configured_place`: 4 children; real admission lock; statuses `[0, 4, 4, 4]`; one saved run.
+   - `scripts/usage/test_agents_log.py:343`, `test_concurrent_default_registration_writes_one_assignment_and_returns_one_true`: 6 children; one returns true; one saved assignment.
+   - `scripts/usage/test_agents_log.py:530`, `test_concurrent_processes_append_complete_json_lines`: 4 children; 80 complete records.
+2. In each child: call `os.setpgid(0, 0)`, close inherited parent lock descriptors before the contention starts, and keep the intended child patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor). Do not let a child depend on an unrelated parent patch.
+3. Give each child its own output capture. In cleanup, kill each group through `send_process_group` (`scripts/lib/process_group.py`), join the child and close every descriptor. Never call `os.killpg` directly.
+4. Keep every existing assertion. Use no threads.
+5. If a child cannot keep its boundary in a fork, leave that test as it is and say why.
+
+**Files:**
+- `scripts/production/test_ci_points.py` — item 1, CI watch.
+- `scripts/agents/test_detached_runs.py` — item 1, admission.
+- `scripts/usage/test_agents_log.py` — item 1, registration and append.
+
+**Workers:** 1 writer; one pattern across three files.
+- impl4: all three files.
+
+**Constraints from prior phases:**
+- Phase 163: the fork pattern and its process-group cleanup; `scripts/lib/test_process_group_sources.py` refuses a direct `os.killpg`.
+- Phase 168: lock waits cost almost no CPU; the saving is interpreter start and entry imports.
+- Phase 166: local CPU numbers are a guide only; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.production.test_ci_points scripts.agents.test_detached_runs scripts.usage.test_agents_log scripts.lib.test_process_group_sources` passes three times with 126 tests in the three modules.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- No process or folder stays behind.
+- Three aws pairs per module with unchanged test counts and a positive summed paired median saving.
+
+### Phase 171 — The crate run tests share one default frozen state  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the 28 `test_crate_run.py` tests that use the default `freeze()` only as a prerequisite copy one frozen-state seed in place of freezing again. All 96 tests and every assertion stay.
+
+**Decision:** Architect review after Phase 168, finding 4 (next item 6b, phase 3). Phase 169 report: about 1.31 CPU s local ceiling. style-unit go, 2026-11-11: the file is free; keep the seed in a `tempfile.TemporaryDirectory`; send the hash on land.
+
+**Spec:**
+1. Read the Phase 169 assertion map at `phases/169/crate_copy_report.md` in the unit session. It marks the 28 F cases: each uses the default freeze as a prerequisite and makes no checkout, clone or fetch during it.
+2. Extend the class seed from `test_crate_run.py:105` to the state after the default `freeze()` (line 205), built once for each class in a `tempfile.TemporaryDirectory`. Each F test copies it.
+3. Rebuild live ownership, locks and other per-process state in each test. Copy Git indexes and worktree links so they stay valid, as the existing seed does.
+4. Keep manifest-creation tests and every non-F test on the current path. Keep every later worker, validation, import and publication call (`crate_run.py:1123,1392`; `test_crate_run.py:1017,2288`).
+5. Do not seed the three judgment continuations at lines 947–959 in this phase.
+6. Keep every assertion. Change no production code.
+7. Measure local CPU before and after with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> --tests 10 style/test_crate_run.py`. The director runs three aws pairs; only aws pairs decide.
+
+**Files:**
+- `scripts/style/test_crate_run.py` — all items.
+
+**Workers:** 1 writer; one file.
+- impl3: `scripts/style/test_crate_run.py`.
+
+**Constraints from prior phases:**
+- Phase 169: a larger project seed alone removes no checkout work; `copies.fresh_tree()` makes each standing checkout at `copies.py:673`.
+- Phase 153: `CargoProjectTests` builds the project seed once for each class.
+- Phase 166: local CPU numbers overstate; aws pairs decide.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.style.test_crate_run` passes three times with 96 tests.
+- basedpyright on the file reports 0 errors and 0 warnings.
+- No process or folder stays behind.
+- Three aws pairs show a CPU gain with an unchanged test count; with no gain, the phase lands nothing.
+
+### Phase 172 — The Pushover notice tests keep only the tests that pay their way  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `notify/test_pushover.py` loses every rare-case test that cannot show the user a wrong result, damage saved state or lose work.
+
+**Decision:** Architect review after Phase 168, finding 2 (next item 11, message diagnostics family). Rule 2 (user, 2026-11-07). sdlc go, 2026-11-11: `test_pushover.py` is free; `message/test_send.py` stays held and goes to a later phase.
+
+**Spec:**
+1. For each test, decide main path or rare case. A main path is the behavior the tool exists for, as its users call it. A rare case is an edge, refusal, malformed input, failure path, message wording, defensive branch or internal detail.
+2. Keep each main-path test. Keep a rare-case test when its defect would show the user a wrong result, damage saved state (ledgers, tickets, plan docs, Git refs, waits, assignments, checkpoints) or lose work. Remove each other rare-case test.
+3. Keep tests that protect delivery, saved records, meaningful status, repair actions or private data. Judge each assertion, not the test name.
+4. Keep the coverage of message delivery, retries, priority and saved send records.
+5. When a removal leaves a fixture, helper, constant or import with no user, remove it too. Do not change production code.
+6. Do not merge tests into table rows in this phase.
+7. Write `phases/172/removed_tests.md` in the unit session: one row per removed test, with module, test name, kind of rare case, the fixture outputs it used and the reason no user harm follows. Give the counts before and after for each module.
+8. Before each removal, check where the guarded value goes and who calls the code. Keep a refusal whose value reaches a saved record, a file delete or a hand-written parser. Check that another module is the real remaining cover before you cite it.
+9. Run the required checks on the final tree, and name the tested revision in the report.
+
+**Files:**
+- `scripts/notify/test_pushover.py` — 86 tests.
+
+**Workers:** 1 writer; one file.
+- test: `scripts/notify/test_pushover.py`.
+
+**Constraints from prior phases:**
+- Phase 167: the style-plan selection family reached its floor (1 of 73 removed).
+- Phase 165: review returned the only removal; its full file-list assertion guarded a busy-file assignment.
+- Phase 159: check where a tested step sits before state writes, not only what the test asserts.
+- Phases 145–156: reviews returned refusals whose value reaches a saved record, a file delete or admission headroom. Spec item 8 carries this.
+- Phase 156: run the checks on the final tree. Spec item 9 carries this.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.notify.test_pushover` passes.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- `phases/172/removed_tests.md` lists every removed test with its reason, and the counts.
+- Two blind reviews check each removal against Rule 2. A removal a reviewer shows to guard user harm goes back.
