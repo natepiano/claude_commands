@@ -79,7 +79,7 @@
 - `commands/showrunner/produce.md`, `commands/showrunner/report_interval.md`, `docs/as-built/session-notifier.md` — delivery-time prompt.
 - `scripts/message/test_notifier.py`, `scripts/production/test_codex_winddown.py`, `test_update_registration.py`, `test_update_registration_log.py`, `test_update_registration_commands.py` — tick, registration and prompt rows.
 
-### Phase 4 — Astra design records keep staff ids  · status: todo
+### Phase 4 — Astra design records keep staff ids  · status: done
 
 **Depends on:** none.
 
