@@ -3376,33 +3376,6 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 201 — Record-content tests call the recorder in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/buildlog/test_record.py` runs its record-content cases through `record.main(argv)` in process, keeps a small set of real CLI starts, and saves measured aws CPU.
-
-**Decision:** report, 2026-11-12: go on the test file with three conditions. (1) Each in-process case calls `record.main(argv)` with its environment set as the CLI case set it (patch `os.environ` per case, restore after) and the same working folder; check the return code and the captured stdout and stderr, as the CLI case did. (2) Keep real CLI starts for the entry path (the script through `scripts/lib/py`), an argument error exit code, and one record write that reads stdin, if a case reads stdin now. (3) No production code change in `record.py` for the tests; send report the hash before it lands. Census rank 7 (bound 0-17.7 CPU s per gate).
-
-**Spec:**
-1. Change the `record` helper at `test_record.py:167` so it runs `record.main(argv)` in process for record-content cases. Set `os.environ` from `self.environment(**extra)` and the working folder from `cwd` for the call; restore both after it. Feed `input` through `sys.stdin`. Capture stdout and stderr. Return the same `subprocess.CompletedProcess[str]` shape, so callers stay unchanged.
-2. `record.main` with `step` calls `detach()` (`record.py:450`), which calls `os.setsid()` and closes every descriptor above 2. In process, patch `record.detach` in the test only; never call it in the runner. Patch any other process-wide side effect the same way, and name each one in the reply.
-3. `step-context` runs `step_context.py` (`CONTEXT_SCRIPT`). Run it in process through its own `main` only when it has one with the same contract; otherwise keep it a CLI start.
-4. Keep real CLI starts per condition (2). Name each kept CLI case in the reply.
-5. Keep every assertion. Add no new test method. Keep module-level state between cases from leaking: reload or reset what `record.py` caches from the environment.
-6. Change no production file.
-
-**Files:**
-- `scripts/buildlog/test_record.py` — the `record` helper and the kept CLI cases.
-
-**Workers:** 1 writer; one test file holds the whole change.
-- impl: `scripts/buildlog/test_record.py`.
-
-**Constraints from prior phases:**
-- Phase 177: `buildlog/test_record.py` makes 130 record calls, about 10.8 local CPU s; the module is about 20 CPU s.
-- No speed phase lands on a local estimate; aws pairs decide.
-
-**State:** none.
-
-**Acceptance gate:**
-- `buildlog/test_record.py` and every importer of its helpers pass; basedpyright reports 0 errors and 0 warnings on the changed file.
-- An aws paired trial shows a CPU saving for `buildlog/test_record.py`.
-- report receives the file hash before it lands.
+- Checkpoint `1674a8375`. `scripts/buildlog/test_record.py` runs its record-content cases through `recorder.main` and `step_context.main` in process with one `invoke_cli` helper (`test_record.py:169`). The helper sets the full environment, working folder, argv, stdin and captured output per call, maps `SystemExit` to the status, patches `recorder.detach` (`setsid` and descriptor closure), and restores all of them after the call. Real CLI starts stay for `test_step_record_fields`, the metadata stdin case, the entry-point case (now with an argument-error status) and the shell integration cases. All 84 test methods and every assertion stay; no production file changed. report approved the file at SHA-256 `feb6fcda`. aws pairs: `buildlog/test_record.py` 22.90 to 11.50 CPU s (11.40 s, 3/3 rounds); `test_record_rerun.py` 0.25 s; `test_step_row.py` unchanged.
