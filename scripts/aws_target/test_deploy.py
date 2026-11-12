@@ -1219,6 +1219,49 @@ sys.exit(7)
                 self.assertNotIn('arn:', output.getvalue())
                 self.assertNotIn('123456789012', output.getvalue())
 
+    def test_quota_request_without_an_environment_override_reaches_aws_with_the_configured_file(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        text_setting(gates, 'credential_file', str(self.credentials))
+        expected = str(Path(conf.read(gates).text('credential_file')).expanduser())
+        subject = self.deployment()
+        calls: list[str] = []
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(capture_output and text)
+            self.assertFalse(check)
+            self.assertGreater(timeout, 0)
+            self.assertIsNotNone(env)
+            self.assertEqual(cast(dict[str, str], env)['AWS_SHARED_CREDENTIALS_FILE'], expected)
+            self.assertIn('get-service-quota', arguments)
+            calls.append(arguments[arguments.index('--region') + 1])
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 300}}), '')
+
+        subject.execute = execute
+        with (mock.patch.dict(os.environ), mock.patch.object(deploy, 'Deployment', return_value=subject),
+              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors):
+            _ = os.environ.pop('AWS_SHARED_CREDENTIALS_FILE', None)
+            self.assertEqual(deploy.main(), 0, errors.getvalue())
+            self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], expected)
+        self.assertTrue(calls)
+
+    def test_quota_request_prints_one_credential_refusal_and_stops_before_aws(self) -> None:
+        message = 'Run deploy.py secrets in a terminal to restore the encrypted credentials'
+        for error in (admin_secrets.SecretsRefused(message), deploy.DeploymentRefused(message)):
+            with self.subTest(error=type(error).__name__):
+                subject = self.deployment()
+                with (mock.patch.object(subject.admin, 'get', side_effect=error) as get,
+                      mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')) as execute,
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                get.assert_called_once_with()
+                execute.assert_not_called()
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
+
     def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
         get_quota = 'get-service-quota'
         history = 'list-requested-service-quota-change-history-by-quota'
@@ -3107,7 +3150,7 @@ else: raise AssertionError(args)
 
     def test_price_command_requires_private_credentials_before_any_aws_read(self) -> None:
         self.credentials.chmod(0o644)
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'AWS_SHARED_CREDENTIALS_FILE'):
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'mode 0600'):
             _ = self.deployment().price()
         self.assertEqual(self.commands(), [])
 

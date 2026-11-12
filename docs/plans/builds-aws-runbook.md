@@ -132,9 +132,11 @@ The account (created 2026-11-03) is a project account. The user activated advanc
 
 Create or update the encrypted administrator file at your terminal.
 Never send a credential or passphrase to a session.
+`deploy.py` reads the scaler file path from `credential_file` in `cloud_gate.conf` and expands `~`.
+`AWS_SHARED_CREDENTIALS_FILE` overrides that path when its value is nonempty.
+Every deployment command gives AWS subprocesses the same resolved file path.
 
 ```sh
-export AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials"
 python3 scripts/aws_target/deploy.py secrets
 ```
 
@@ -248,7 +250,7 @@ Keep the encrypted administrator file and the private Budget address file in pla
 Run this command at your terminal:
 
 ```sh
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py up --approve-resources
+python3 scripts/aws_target/deploy.py up --approve-resources
 ```
 
 The command runs eleven ordered stages through activation and routing proof.
@@ -560,11 +562,13 @@ The guard and Budget do not remove that data automatically.
 
 Keep offload and control enabled until stopped evidence is confirmed.
 `Controller._action` returns immediately when offload is off, including manual stop.
+Direct controller and AWS CLI commands need the resolved scaler path in their environment.
+The resolver below reads only the configured path.
 
 ```sh
 cd "$HOME/.claude"
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" \
-  python3 scripts/aws_target/aws_target.py stop
+export AWS_SHARED_CREDENTIALS_FILE="$(python3 -c 'from scripts.aws_target.admin_secrets import credentials_file; print(credentials_file())')"
+python3 scripts/aws_target/aws_target.py stop
 aws --profile build-scaler ec2 describe-instances --region REGION \
   --instance-ids INSTANCE_ID \
   --query 'Reservations[].Instances[].State.Name'
@@ -641,7 +645,9 @@ Keep `routing.json`, `deployment.json`, and `up.json` outside the repository.
 1. Run `deploy.py secrets` in your terminal before the first encrypted deployment.
 2. Enter the AWS administrator key and Tailscale OAuth values without echo.
 3. Enter the encryption passphrase twice.
-4. Run `deploy.py up --approve-resources` with the scaler credential file environment.
+4. Run `deploy.py up --approve-resources`.
+
+Deployment commands use `credential_file` from `cloud_gate.conf` unless `AWS_SHARED_CREDENTIALS_FILE` overrides it.
 
 The default encrypted path is `~/.config/aws-build/admin.gpg`.
 The helper uses symmetric AES256 encryption and disables the GPG symmetric passphrase cache.
@@ -668,7 +674,7 @@ The plan states that the `/home` build cache is lost.
 Run the approved removal at your terminal.
 
 ```sh
-AWS_SHARED_CREDENTIALS_FILE="$HOME/.config/aws-build/credentials" python3 scripts/aws_target/deploy.py down --approve-destroy
+python3 scripts/aws_target/deploy.py down --approve-destroy
 ```
 
 The helper disables routing and the controller before checking jobs that still run.
