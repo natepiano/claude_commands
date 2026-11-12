@@ -27,7 +27,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, cl
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
-from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
+from scripts.build_queue.scope_activity import RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
 from scripts.lib.build_steps import read_step_names
@@ -136,6 +136,28 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
             "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+
+    def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
+        cgroup = self.root / "ci"
+        (cgroup / "github-runner-fixture.service").mkdir(parents=True)
+        for busy in (False, True):
+            with self.subTest(busy=busy):
+                runner = {"unit": "github-runner-fixture.service", "name": "fixture",
+                          "state": "busy" if busy else "idle", "used": 0.125, "pid": 701,
+                          "started_at": 199_000, "job": "tests"}
+                step = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
+                    admission_records.UnownedSliceMemory(admission_records.GIB // 8,
+                        cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
+                        job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
+                reading = captured_reading(running=(step,))
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
+                    page = memory_feed.reading()
+                row, = [row for row in page["walk"] if row.get("ci")]
+                self.assertEqual(row["ci_runners"][0]["state"], "busy" if busy else "idle")
+                self.assertEqual(page["ci_ram"], 0.125)
+                self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
+                self.assertEqual(page["taken"], 0.125)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
