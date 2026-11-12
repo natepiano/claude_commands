@@ -18,7 +18,7 @@ The status line's `For you:` row shows how many efficiency proposals wait on the
 - `counts_line` orders production counts as questions, changes, efficiency, proposals. It omits zero counts. "efficiency" has no plural. Every kind is available through `/next`.
 - The status line puts the session's adhoc count first, then questions, changes, rebuild items, efficiency and proposals. Example: `For you: 3 adhoc items, 1 question, 2 changes, 130 efficiency`.
 - `scripts/statusline/adhoc_items.py` reads one number from `~/.local/state/adhoc_review/<session id>`. Pink text shows the count in any Claude session during `/adhoc_review`. The number is bold. Zero removes the file and the part.
-- `scripts/hooks/showrunner_footer.py`, `scripts/statusline/counts_row.py` and the dailies footer (`dailies_render.py`) pass `FooterCounts` through without change.
+- `scripts/hooks/showrunner_footer.py` and `scripts/statusline/counts_row.py` pass `FooterCounts` through without change.
 - Tests: `scripts/production/test_footer_counts.py` covers the parser, missing and non-UTF-8 ledgers, sources and render order. `scripts/statusline/test_statusline.py` covers the count end to end in the status line.
 
 ### The study layout (`~/.local/state/nightly-review/token-study/`)

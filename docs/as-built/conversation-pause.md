@@ -2,7 +2,7 @@
 
 ## What it is
 
-Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports, a showrunner's dailies among them. After the reply ends and fifteen quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, read each unit's run state for the stall watch from its run records, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
+Conversation pause keeps a session quiet while the user talks to it. It stops that session's scheduled reports. After the reply ends and fifteen quiet minutes pass, the session asks whether automatic updates may return. A yes restores them, a no leaves them off, and no answer restores them after another five minutes. The related contracts keep closing unit work visible, read each unit's run state for the stall watch from its run records, allow corrections to stale as-built docs, and send every phone alert through `scripts/message/send.py --to user`.
 
 ## How it works
 
@@ -60,7 +60,7 @@ PauseRecord(
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances that this pause switched off. A record written while reply footers existed (before 2026-10-18) also has `footers`, which nothing reads now.
 
-`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `worker-*` status reports, `showrunner-*` dailies, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
+`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `worker-*` status reports, other targeted reports, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
 
 `ensure_watcher()` creates or repairs the run-only `conversation-pause` notifier instance:
 
@@ -69,7 +69,7 @@ notifier.sh new conversation-pause --every 1 \
   --run "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/hooks/conversation_pause.py tick"
 ```
 
-`tick(now: int) -> tuple[str, ...]` looks up each session with `scripts/message/sessions.py`, observes open review records from `scripts/production/review_pause.py`, asks the return question through `scripts/message/send.py`, restores updates after timeouts or a session exit, and removes the watcher when no pause record remains. `sessions.read_session(path) -> SessionRecord | UnreadableSessionRecord`; `sessions.py socket` exits 0 for a live match, 1 for no live match and 3 when the registry cannot answer. An uncertain lookup never counts as a dead session. `scripts/production/broadcast.py` also skips an unreadable session record instead of dropping the rest of a broadcast.
+`tick(now: int) -> tuple[str, ...]` looks up each session with `scripts/message/sessions.py`, asks the return question through `scripts/message/send.py`, restores updates after timeouts or a session exit, and removes the watcher when no pause record remains. `sessions.read_session(path) -> SessionRecord | UnreadableSessionRecord`; `sessions.py socket` exits 0 for a live match, 1 for no live match and 3 when the registry cannot answer. An uncertain lookup never counts as a dead session. `scripts/production/broadcast.py` also skips an unreadable session record instead of dropping the rest of a broadcast.
 
 The timers are:
 
@@ -80,7 +80,7 @@ UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
 ```
 
-Fifteen minutes after a reply ends, `tick` sends the question as `conversation-pause`. Delivery changes `QuestionPending` to `Asked`. A typed `yes` runs the equivalent of `resume`; a typed `no` changes the record to `KeptOff`. Five unanswered minutes restore the recorded items. If no reply ever ends, the question becomes due after 30 minutes. While an `/adhoc_review` record is open, `tick` neither asks nor restores.
+Fifteen minutes after a reply ends, `tick` sends the question as `conversation-pause`. Delivery changes `QuestionPending` to `Asked`. A typed `yes` runs the equivalent of `resume`; a typed `no` changes the record to `KeptOff`. Five unanswered minutes restore the recorded items. If no reply ever ends, the question becomes due after 30 minutes.
 
 The pause stops a timer with `notifier.sh pause <instance>`, which writes `PAUSED=1` into its state, and resumes it with `notifier.sh unpause <instance>`, which re-enables it without changing `NEXT_DUE` only while that mark is there; missed work runs on the next tick and future work keeps its former time. Any explicit `start`, `resume`, `stop` or `restart` clears the mark. Resume failures leave only the unrestored items in the record for the next tick.
 
@@ -146,7 +146,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - The pause question is recognized by sender identity, never by copied or relayed text.
 - A bare yes or no is consumed only while it can still answer the return question.
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
-- An open review suspends question and return actions. Each pause mechanism restores only what it changed.
+- A pause restores only what it changed.
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
 - `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
@@ -167,7 +167,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 
 ## Why
 
-- Pausing every targeted notifier instance gives status reports, dailies and build reports one rule, including later report types.
+- Pausing every targeted notifier instance gives status reports and build reports one rule, including later report types.
 - Recording only changed instances prevents one pause mechanism from undoing another person's or feature's choice.
 - Keeping `NEXT_DUE` on resume avoids shifting a four-hour report by four hours after every conversation.
 - Sender identity protects the return question from wording changes and relays.

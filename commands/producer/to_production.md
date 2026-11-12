@@ -105,7 +105,6 @@ production format, with status `planned`:
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
   These tests find failures across packages. Give a command, never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.
-- **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
   named for the top-level showrunner that will run it (a child production uses
   its root's list); `change_review.py showrunner --production <showrunner name>` prints the

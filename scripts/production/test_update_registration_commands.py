@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
-import shutil
 import subprocess
 import unittest
 from typing import ClassVar, cast
@@ -53,23 +52,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(len(records), 1)
         self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
         self.assertNotIn("lens", records[0])
-
-    def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
-        for marker in ("The prompt:", "**A tick**"):
-            with self.subTest(marker=marker):
-                script = self.copied_command()
-                template = script.parents[2] / "commands/showrunner/produce.md"
-                _ = template.write_text(template.read_text(encoding="utf-8").replace(marker, "", 1), encoding="utf-8")
-                before = self.doc.read_bytes()
-                result = self.run_copy(script, "register", "--session", "resumed-showrunner")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("register: failed", result.stdout)
-                self.assertIn(marker, result.stdout)
-                self.assertEqual(self.doc.read_bytes(), before)
-                self.assertFalse(self.config.exists())
-                self.assertEqual(self.notifier_calls(), [])
-                self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-                shutil.rmtree(script.parents[2])
 
 
 if __name__ == "__main__":
