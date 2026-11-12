@@ -39,7 +39,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertIn("switch to claude undone: moved back from Claude to Codex: direct; left alone, "
                       + "re-assigned since the switch: design_roles", log)
         self.assertEqual(self.assignments(),
-                         {"direct": "codex", "cli": "claude", "design_roles": "codex", "ask_a_friend": "caller"})
+                         {"direct": "codex", "cli": "claude", "design_roles": "codex"})
         self.assertEqual(self.sent, [])
         self.assertEqual(self.routing_entries()[-1]["kind"], "routed back")
 
