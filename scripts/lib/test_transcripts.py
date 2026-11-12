@@ -2,6 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript, transcript_paths
@@ -23,10 +24,14 @@ class TranscriptTests(unittest.TestCase):
             path = root / "session.jsonl"
             content = b'{"message":"one"}\n{"message":"two"}\n'
             _ = path.write_bytes(content)
-            for compressed in (False, True):
-                with self.subTest(compressed=compressed):
-                    source = compressed_copy(path) if compressed else path
-                    self.assertEqual(transcript_paths(root), [source])
+            for storage in ("plain", "compressed", "both"):
+                with self.subTest(storage=storage):
+                    source = compressed_copy(path) if storage == "compressed" else path
+                    if storage == "both":
+                        _ = path.write_bytes(content)
+                    with mock.patch.object(Path, "resolve", autospec=True, side_effect=Path.resolve) as resolve:
+                        self.assertEqual(transcript_paths(root), [source])
+                    resolve.assert_not_called()
                     for name in {path, source}:
                         with open_transcript(name) as stream:
                             self.assertEqual(stream.read(3), content[:3])

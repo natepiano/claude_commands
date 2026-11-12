@@ -807,7 +807,7 @@ print(observed.row.id)
         if row is None:
             row = fixture_member("unit", name="history-" + name, parent=owner.id,
                                  worktree=staff.PresentWorktree(remote.local_machine(), worktree.resolve()))
-        events = [{"event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
+        events = [{"owner_staff_id": row.id, "event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
                   *({"event_type": kind} for kind in later)]
         path = runs / f"{name}.jsonl"
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
@@ -848,6 +848,7 @@ print(observed.row.id)
         assert parent is not None
         _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
             "history_file": str(history), "owner_staff_id": row.id}))
+        first["owner_staff_id"] = row.id
         first["main_agent"] = {"session_id": director}
         later = history.read_text().splitlines()[1:]
         _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")

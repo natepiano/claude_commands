@@ -37,10 +37,9 @@ def matching_start(run_id: str, event: object, worktree: str, *,
     if not isinstance(event, dict):
         return NoMatchingRun()
     fields = cast(dict[str, object], event)
-    agent = fields.get("main_agent")
-    identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
     record = staff.snapshot() if record is None else record
-    row = record.by_member_reference(identity) if isinstance(identity, str) else None
+    owner = unit_runs.run_owner(fields, record)
+    row = owner if isinstance(owner, staff.StaffRow) else None
     started = fields.get("run_started_at")
     if (fields.get("event_type") != "run_started" or row is None
             or isinstance(row.worktree, staff.WorktreeUnfilled) or row.worktree.path != Path(worktree).expanduser().resolve()

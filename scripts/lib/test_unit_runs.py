@@ -45,6 +45,8 @@ class UnitRunsTest(StaffTestCase):
                 self.assertTrue(unit_runs.run_is_open(path, record=record))
             for fields, pointer, expected in (
                 ({unit_runs.OWNER_FIELD: owner.id}, staff.OpenRun(path), True),
+                ({"main_agent": {"session_id": "unrelated-saved-session"}}, staff.OpenRun(path), True),
+                ({"main_agent": {"session_id": owner.current_session}}, staff.NoRun(), False),
                 ({unit_runs.OWNER_FIELD: owner.id, "status": "active"}, staff.NoRun(), False),
                 ({unit_runs.OWNER_FIELD: owner.id, "status": "completed"}, staff.OpenRun(path), True),
             ):
@@ -56,19 +58,19 @@ class UnitRunsTest(StaffTestCase):
                         _ = staff.clear_run(owner.id, path)
                     self.assertEqual(unit_runs.run_is_open(path), expected)
 
-    def test_showrunner_run_resolves_both_session_and_fixed_owner_records(self) -> None:
+    def test_showrunner_run_uses_only_fixed_owner_records(self) -> None:
         owner = fixture_member("showrunner", name="production-owner")
         run = self.root / "production-run"
         run.mkdir()
         record = staff.snapshot()
         states = (
-            {"main_agent": {"session_id": owner.current_session}},
-            {unit_runs.OWNER_FIELD: owner.id},
+            ({"main_agent": {"session_id": owner.current_session}}, ""),
+            ({unit_runs.OWNER_FIELD: owner.id}, owner.current_session),
         )
-        for state in states:
+        for state, expected in states:
             with self.subTest(state=state):
                 self.write_json(run / unit_runs.STATE_FILE, state)
-                self.assertEqual(unit_runs.director(run, record=record), owner.current_session)
+                self.assertEqual(unit_runs.director(run, record=record), expected)
 
         from scripts.astra import design_roles
 
