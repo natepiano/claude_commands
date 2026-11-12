@@ -3216,7 +3216,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `cbe16dd36`. `progress_history.py` imports `phase_reservation`, `statistics`, `agents_log` and `tag_inventory` inside the functions that use them; function and class logic unchanged; no new module. aws pairs saved 0.43–1.00 CPU s in six caller modules (review launcher, trees, style, `test_assign_claude_follow.py`, `test_verify_wait_holder.py`), about 2.7 s in all; `test_progress_history.py` 0.03 s and `test_verify_mac_only.py` −0.19 s. Local separate runs showed no gain: only pairs decide. Replaces the dropped Phase 182 server design.
 
-### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: todo
+### Phase 186 — The verify test fixtures answer fixed Cargo calls from a shell script, not a Python start  · status: done
 **Depends on:** none
 
 #### Work Order
