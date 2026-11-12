@@ -3488,33 +3488,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Three pane summary cases in `scripts/direct/test_assign_claude_panes.py` call `claude_worker._summary` directly through one `summary_turn` fixture method and the `WRITE_SUMMARY` constant (sdlc asked for both). The cleanup-before-cut case keeps the whole launcher. Launcher starts fell from 4 to 1. Three launcher exit checks became checks of the unchanged source log bytes, because `_summary` returns None; the launcher case still checks the exit. All 4 tests and 12 assertions stay. aws pairs, 3 rounds: `direct/test_assign_claude_panes.py` 8.26 → 2.46 CPU s (5.80 s saved); peak memory 157.7 → 164.0 MiB. sdlc approved the diff. Checkpoint `dcaafbc0c`.
 
-### Phase 221 — Follow and records tests make content calls in process  · status: todo
+### Phase 221 — Follow and records tests make content calls in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the content calls in `scripts/direct/test_assign_claude_follow.py` and `scripts/direct/test_assign_claude_records.py` run the assignment in process through the existing adapter (`assign_claude_test_support.py:445`, `run_assignment`), and aws pairs show a CPU gain.
-
-**Decision:** architect reviews 25 and 26, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Refresh the profiles first: `module_cost.py --tests 10 --commands 15` on both modules.
-2. Turn on `direct_cli_calls` for the content cases (`test_assign_claude_follow.py:23,118,175,201`; `test_assign_claude_records.py:35,72,185`). Use `process_boundary_for_case` to keep a real process where a case proves it.
-3. Keep real processes for injected startup hooks, child observations, recorder failures and status-order observations.
-4. Keep every test and assertion. Change no shared support file unless the adapter cannot serve a case; then report the case and stop.
-5. Run both modules, every module that imports `assign_claude_test_support.py`, and basedpyright on each changed file.
-
-**Files:**
-- `scripts/direct/test_assign_claude_follow.py`
-- `scripts/direct/test_assign_claude_records.py`
-
-**Workers:** 1 writer; both modules use the same adapter.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 214: `resolve_model` reads the launch table in process; test environments carry the tier-only guard.
-- Census: follow 0–6.539 s (12 assignment tasks), records 0–6.299 s (16 tasks); ceilings, not savings.
-
-**Acceptance gate:**
-- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
-- aws pairs show a gain per module; sdlc sees the diff before land.
+- Each setUp in `scripts/direct/test_assign_claude_follow.py` and `test_assign_claude_records.py` turns on the existing `run_assignment` adapter. Nine cases keep real processes for startup hooks, child observations, recorder failures and status order. Both fixtures set `MODELS_CONFIG_TIER_ONLY=1`, so in-process calls start no catalog sync. All 18 tests and 136 assertions stay. aws pairs, 3 rounds: records 31.52 → 25.96 CPU s (5.56 s saved), peak 167.0 → 173.2 MiB; follow 32.16 → 30.92 CPU s (0.96 s saved), peak 220.2 → 225.1 MiB. sdlc approved the diff; move the repeated setUp into the shared launcher fixture when a third module adopts it. Checkpoint `a5bce07e7`.
