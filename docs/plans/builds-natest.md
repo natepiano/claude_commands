@@ -3194,7 +3194,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The report gives per-module CPU, the per-candidate split (start and imports, handler, waits), and the removable CPU for each candidate.
 - `git status` shows no change from the researcher.
 
-### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: todo
+### Phase 169 — Measure removable crate-copy preparation in the crate run tests  · status: done
 **Depends on:** none
 
 #### Work Order
