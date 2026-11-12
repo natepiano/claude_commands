@@ -100,7 +100,30 @@ class CrateRunTests(CargoProjectTests):
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
     frozen_seed: ClassVar[Path]
+    single_file_frozen_seed: ClassVar[Path]
+    single_file_frozen_tests: ClassVar[frozenset[str]] = frozenset({
+        "test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker",
+        "test_owner_removal_preserves_each_nonterminal_crate_worker",
+        "test_owner_removal_requires_readable_run_evidence_after_git_or_folder_deletion",
+        "test_owner_removal_removes_only_workers_with_terminal_run_evidence",
+        "test_pending_run_survives_expiry_and_terminal_resume_ends_its_task",
+        "test_blocking_reservation_is_pending_with_holder_and_keeps_the_same_ticket",
+        "test_released_reservation_executes_once_without_a_second_ticket",
+        "test_restart_keeps_manifest_pending_until_the_writer_releases",
+        "test_pending_writer_can_become_a_clear_read_claim",
+        "test_pending_finding_released_after_planning_is_admitted_in_the_same_invocation",
+        "test_terminal_atomic_group_refusal_removes_its_reservation_pending_outcome",
+        "test_writer_arriving_at_execution_keeps_the_claim_and_rolls_back_private_edits",
+        "test_planner_refusal_survives_post_plan_base_abort_before_claim_release",
+    })
     frozen_tests: ClassVar[frozenset[str]] = frozenset({
+        "test_worker_names_separate_run_and_package_at_the_last_dot",
+        "test_crate_trees_keep_ownership_and_use_two_standing_caches",
+        "test_one_crate_has_canonical_branch_before_assignment_and_preserves_checkpoint_ancestry",
+        "test_two_crates_integrate_serially_without_reselecting",
+        "test_empty_selection_names_holding_tickets_and_finding_count_per_crate",
+        "test_moved_destination_invalidates_prepared_combined_proof",
+        "test_other_crate_refresh_cannot_publish_stale_tested_candidate",
         "test_queue_refusal_keeps_the_claimed_run_and_its_tickets",
         "test_repeated_refusal_after_format_restores_claimed_record_and_bytes",
         "test_failed_refusal_recovery_never_abandons_crate_on_retry",
@@ -137,6 +160,7 @@ class CrateRunTests(CargoProjectTests):
         seeds = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-")))
         cls.fixture_seed = seeds / "initial"
         cls.frozen_seed = seeds / "frozen"
+        cls.single_file_frozen_seed = seeds / "single-file-frozen"
         fixture = cls(methodName="runTest")
         environment = os.environ.copy()
         try:
@@ -150,6 +174,13 @@ class CrateRunTests(CargoProjectTests):
             fixture.freeze()
             fixture.authority.close()
             _ = shutil.copytree(fixture.root, cls.frozen_seed, symlinks=True)
+            shutil.rmtree(fixture.root)
+            _ = shutil.copytree(cls.fixture_seed, fixture.root, symlinks=True)
+            fixture.authority = fixture.ledger()
+            del fixture.batch
+            fixture.freeze(paths=("src/lib.rs",))
+            fixture.authority.close()
+            _ = shutil.copytree(fixture.root, cls.single_file_frozen_seed, symlinks=True)
         finally:
             fixture.doCleanups()
 
@@ -160,7 +191,12 @@ class CrateRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         self.root: Path = self.fixture_root
-        seed = self.frozen_seed if self._testMethodName in self.frozen_tests else self.fixture_seed
+        if self._testMethodName in self.single_file_frozen_tests:
+            seed = self.single_file_frozen_seed
+        elif self._testMethodName in self.frozen_tests:
+            seed = self.frozen_seed
+        else:
+            seed = self.fixture_seed
         _ = shutil.copytree(seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
         self.repo: Path = self.root / "project"
@@ -247,7 +283,6 @@ class CrateRunTests(CargoProjectTests):
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
 
     def test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         for existing in (True, False):
             with self.subTest(existing=existing):
                 batch = crates.CrateRun(self.authority, "legacy-" + str(existing))
@@ -308,7 +343,6 @@ class CrateRunTests(CargoProjectTests):
         return manifest
 
     def test_owner_removal_preserves_each_nonterminal_crate_worker(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         for kind in ("native", "adopted", "changed-task", "interrupted-removal"):
             with self.subTest(kind=kind):
                 batch = crates.CrateRun(self.authority, "owner-" + kind)
@@ -366,7 +400,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertIn(str(worker), scratch.holds())
 
     def test_owner_removal_requires_readable_run_evidence_after_git_or_folder_deletion(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(run, "WorkspaceIntent", side_effect=RuntimeError("after registration")):
             with self.assertRaisesRegex(RuntimeError, "after registration"):
                 _ = self.advance("bulk_sample")
@@ -398,7 +431,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.batch.path.read_text(), manifest)
 
     def test_owner_removal_removes_only_workers_with_terminal_run_evidence(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(copies, "end_workspaces"):
             manifest = self.finish_run()
         worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
@@ -480,7 +512,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertFalse(worker.exists())
 
     def test_pending_run_survives_expiry_and_terminal_resume_ends_its_task(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             manifest = self.reservation_advance()
         worker = Path(manifest["crates"]["bulk_sample"]["checkout"])
@@ -525,7 +556,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertTrue(any(not path.exists() for path in observed))
 
     def test_worker_names_separate_run_and_package_at_the_last_dot(self) -> None:
-        self.freeze()
         # Reuse the real package metadata with only its validated package name changed.
         original = coverage_report.workspace(self.authority, self.base)
         members = tuple(replace(member, package_name=name)
@@ -540,7 +570,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual([Path(path).name for path in paths], ["crate-first-beta.gamma", "crate-first.beta-gamma"])
 
     def test_crate_trees_keep_ownership_and_use_two_standing_caches(self) -> None:
-        self.freeze()
         original = self.git("rev-parse", "HEAD")
         manifest = self.batch.read()
         with self.batch.frozen_checkout(manifest) as frozen:
@@ -749,7 +778,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertFalse(self.batch.folder.exists())
 
     def test_blocking_reservation_is_pending_with_holder_and_keeps_the_same_ticket(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             result = self.reservation_advance()
         record = result["crates"]["bulk_sample"]
@@ -767,7 +795,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertIn("let old", (Path(record["checkout"]) / "src/lib.rs").read_text())
 
     def test_released_reservation_executes_once_without_a_second_ticket(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             pending = self.reservation_advance()["crates"]["bulk_sample"]
         claims = pending.get("tickets", {})
@@ -784,7 +811,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
 
     def test_restart_keeps_manifest_pending_until_the_writer_releases(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             before = self.reservation_advance()["crates"]["bulk_sample"]
         with ledger_api.Ledger(self.repo, self.authority.database) as ledger:
@@ -799,7 +825,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
     def test_pending_writer_can_become_a_clear_read_claim(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
             blocked = self.reservation_advance()
         self.assertEqual(blocked["crates"]["bulk_sample"]["stage"], "waiting for reservations")
@@ -809,7 +834,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
     def test_pending_finding_released_after_planning_is_admitted_in_the_same_invocation(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         boards = iter((berth_board.Board((self.other_writer,)),))
         def released(_repo: Path) -> berth_board.Board:
             return next(boards, berth_board.Board(()))
@@ -922,7 +946,6 @@ class CrateRunTests(CargoProjectTests):
             self.assertIn("let number", self.git("show", self.destination + ":" + path))
 
     def test_terminal_atomic_group_refusal_removes_its_reservation_pending_outcome(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         def atomic(checkout: Path, ledger: ledger_api.Ledger, base: str,
                    selected: run.Selection, availability: run.PlanningFileAvailability,
                    definition: rules.Rule) -> run.PlannedEdits:
@@ -950,7 +973,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.commands.calls, [])
 
     def test_writer_arriving_at_execution_keeps_the_claim_and_rolls_back_private_edits(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         reads = iter((berth_board.Board(()),))
         def writer_arrives(_repo: Path) -> berth_board.Board:
             return next(reads, berth_board.Board((self.other_writer,)))
@@ -1029,7 +1051,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(result["crates"]["bulk_sample"].get("machine_judgments", [])[0]["finding_identity"], frozen["finding_identity"])
 
     def test_one_crate_has_canonical_branch_before_assignment_and_preserves_checkpoint_ancestry(self) -> None:
-        self.freeze()
         assign = self.authority.ticket_assign
         def assigned(ticket: str, branch: str) -> None:
             self.assertEqual(self.git("rev-parse", branch), self.base)
@@ -1052,7 +1073,6 @@ class CrateRunTests(CargoProjectTests):
             self.assertEqual(self.authority.ticket_base(ticket), self.base)
 
     def test_two_crates_integrate_serially_without_reselecting(self) -> None:
-        self.freeze()
         with (mock.patch.object(copies, "standing", wraps=copies.standing) as standing,
               mock.patch.object(run, "validate", wraps=run.validate) as validate):
             first = self.advance("bulk_sample")
@@ -1099,7 +1119,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.commands.calls, [])
 
     def test_empty_selection_names_holding_tickets_and_finding_count_per_crate(self) -> None:
-        self.freeze()
         findings = self.authority.held_findings(ledger_api.AllHeldFindings())
         primary = next(finding for finding in findings if finding.path == "src/lib.rs")
         assert isinstance(primary.state, ledger_api.Filed)
@@ -1787,7 +1806,6 @@ class CrateRunTests(CargoProjectTests):
             self.assert_admission_refusal_survives_abort(renamed, fixture_execute, "later validation abort")
 
     def test_planner_refusal_survives_post_plan_base_abort_before_claim_release(self) -> None:
-        self.freeze(paths=("src/lib.rs",))
         identity = self.batch.read()["crates"]["bulk_sample"]["selected"][0]["id"]
         reason = "planner refused bad"
         expected = [{"finding_id": identity, "reason": reason}]
@@ -2267,7 +2285,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertIn("let number", self.git("show", tip + ":src/lib.rs"))
 
     def test_moved_destination_invalidates_prepared_combined_proof(self) -> None:
-        self.freeze()
         proof = run.test_tree
         def interrupted(repo: Path, commit: str, tree: str, runner: run.Runner,
                         times: dict[str, float], *, owner: str = "") -> run.CommandResult:
@@ -2296,7 +2313,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
 
     def test_other_crate_refresh_cannot_publish_stale_tested_candidate(self) -> None:
-        self.freeze()
         checkout = self.root / "publication"
         _ = self.git("worktree", "add", str(checkout),
                      self.destination.removeprefix("refs/heads/"))

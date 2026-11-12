@@ -3290,36 +3290,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 192 — The fast-track tests run the zone drain through its real handler in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_fast_track.py` uses less CPU, with all 50 tests, every assertion, the full CLI case and every interruption case kept.
+- Checkpoint `46b4a770b`. In synchronous function cases, `FastTrackTests.command` runs the known `zone.py drain` through the real `zone.main` with `invoke_cli` and restores the environment, `user_zone.CONF`, cwd, stdout, stderr and exit status on success, nonzero exit and exception. The class seed keeps its common Git directory and first main commit. The full CLI case and every interruption, concurrent-process and deadline case stay real processes. 50 tests and 308 assertions kept. aws pairs: 53.77 to 51.19 CPU s (2.63 s per run); `lib/test_zone.py` unchanged. Local unpaired runs showed no gain.
 
-**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R2 and R6): direct zone handler calls; keep the CLI and interruption cases. Tell devtools before the edit. Paired aws trials decide; ship any measured gain.
-
-**Spec:**
-1. R2. In `FastTrackTests.command` (`test_fast_track.py:316`), intercept only the known `zone.py drain --pulled ...` command in synchronous function cases. Run `zone.main` through the shared `invoke_cli` fixture with the real queue and Git work. Restore the environment, `user_zone.CONF`, cwd, stdout, stderr and the exit status. Do not replace the drain with a fixed reply.
-2. Keep the full fast-track CLI case (`test_fast_track.py:1000`) and every interruption, concurrent-process and deadline case as real processes.
-3. R6. Store the class seed's common Git directory and initial main commit as class fixture values (`test_fast_track.py:238,275,298`). Copy them into the instance after the private tree is restored. Read mutable refs again in every production operation and assertion.
-4. Change no production code. Keep every test and assertion.
-5. Run `test_fast_track`, the zone tests and the promotion tests that cover queued-zone delivery. The director runs three aws pairs.
-
-**Files:**
-- `scripts/production/test_fast_track.py` — the command helper and the class seed.
-
-**Workers:** 1 writer; one test file.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 191: zone drain parent calls 2.06 CPU s (36 calls); seed Git metadata 0.27 s. Estimates bound the saving; they are not measured.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest` passes `test_fast_track` (50 tests) and the zone and promotion tests that cover queued-zone delivery.
-- basedpyright on the changed file reports 0 errors and 0 warnings.
-- Three aws pairs show a CPU gain with all 50 tests passing; with no gain, the phase lands nothing.
-
-### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: todo
+### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: done
 **Depends on:** none
 
 #### Work Order
