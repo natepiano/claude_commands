@@ -3280,34 +3280,110 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Research; no commit. Target commands cost 28.462 CPU s in `test_verify_wait_holder.py` (7.420), `test_verify_mac_only.py` (11.064) and `test_verify_ssh_targets_routing.py` (9.978), all required eligibility, probe, reserve and release work. Repeats that read unchanged data: `target_platform` (`verify.sh:2628`), `target_for_settings` (`verify.sh:2639`), and the reserve command that `route_test` builds twice per attempt (`verify.sh:2848,2865`). Estimate, not measured: 0–0.22 CPU s for 446 excess reads. Owner proposal sent to verify-unit via builds: build `ssh_reserve_hook` once per `route_test` attempt; natest recommends no action at this gain. Report: `phases/190/target_command_report.md` in the session folder. Architect after Phase 190: the tested verify harness changes are at a practical floor; the next verify step is a startup-reuse owner trial (next items).
 
-### Phase 191 — Profile the three slowest test modules outside verify and name their removable work  · status: todo
+### Phase 191 — Profile the three slowest test modules outside verify and name their removable work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Local profiles (161 tests pass): `test_fast_track.py` 46.1 CPU s (Git 21.3 s in 7,596 starts, `fast_track.py` CLI 11.0 s), `test_crate_run.py` 55.5 s (26,619 processes), `test_standing_checkpoint.py` 6.9 s (the 39.9 s rolling median is not a paired baseline). All three already use class fixtures; most Git work supplies race and recovery proofs. Bounded estimates, not measured: zone handler called directly in function cases (`test_fast_track.py:316`, natest) 0–2.06 s; skip frozen checkout preparation for terminal resumes (`style/crate_run.py:979`, style-unit with copies-unit review) 0–2.86 s; single-file frozen seed (`test_crate_run.py:135`) 0–1.09 s; command adapter for direct publication helpers (`test_standing_checkpoint.py:237`) 0–0.78 s; extended frozen seed (`test_crate_run.py:102`) 0–0.57 s; fixed seed Git metadata (`test_fast_track.py:275,298`) 0–0.26 s. First aws trial: the zone handler change, after the test owner's go. Report: `phases/191/module_profile_report.md` in the session folder.
+
+### Phase 192 — The fast-track tests run the zone drain through its real handler in process  · status: done
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report names the removable CPU in `production/test_fast_track.py`, `style/test_crate_run.py` and `style/test_standing_checkpoint.py`, kept apart from required work, with an owner for each change.
+**Goal:** `production/test_fast_track.py` uses less CPU, with all 50 tests, every assertion, the full CLI case and every interruption case kept.
 
-**Decision:** architect after Phase 190 (next items step 6); builds go, 2026-11-12: aws pairs first, each owner's go before code. Verify harness work is at a practical floor. natest measures; production owners decide production changes (fast-track Git: devtools-unit; crate-run sync: copies-unit and style-unit).
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R2 and R6): direct zone handler calls; keep the CLI and interruption cases. Tell devtools before the edit. Paired aws trials decide; ship any measured gain.
 
 **Spec:**
-1. For each module, run `python3 scripts/test_times/module_cost.py --tree <worktree> --tests 10 --commands 10 <folder>/<file>`. Report CPU, process starts, execs, wall, the ten costliest tests and fixtures, and the ten costliest commands.
-2. For each costly command family, mark it as required work (the proof needs it) or removable (repeated setup, a fixture built per test where per class gives the same proof, a real Git or process boundary that a function test already proves). Name the file and line.
-3. Estimate removable CPU per change, bounded by the measured operations it changes. Keep estimates apart from measurements.
-4. Name, per change, the owner (natest alone for test-only fixture changes; the production owner otherwise) and the smallest change.
-5. Rank the changes by estimated CPU saved. Name which one natest should trial first in aws pairs.
-6. Keep every test, assertion and real boundary that supplies a proof.
+1. R2. In `FastTrackTests.command` (`test_fast_track.py:316`), intercept only the known `zone.py drain --pulled ...` command in synchronous function cases. Run `zone.main` through the shared `invoke_cli` fixture with the real queue and Git work. Restore the environment, `user_zone.CONF`, cwd, stdout, stderr and the exit status. Do not replace the drain with a fixed reply.
+2. Keep the full fast-track CLI case (`test_fast_track.py:1000`) and every interruption, concurrent-process and deadline case as real processes.
+3. R6. Store the class seed's common Git directory and initial main commit as class fixture values (`test_fast_track.py:238,275,298`). Copy them into the instance after the private tree is restored. Read mutable refs again in every production operation and assertion.
+4. Change no production code. Keep every test and assertion.
+5. Run `test_fast_track`, the zone tests and the promotion tests that cover queued-zone delivery. The director runs three aws pairs.
 
 **Files:**
-- `phases/191/module_profile_report.md` — in the session folder.
+- `scripts/production/test_fast_track.py` — the command helper and the class seed.
 
-**Workers:** 1 researcher; one report.
-- impl: the measurement and the report.
+**Workers:** 1 writer; one test file.
+- impl: all files.
 
 **Constraints from prior phases:**
-- Phase 186: local totals said 25 s and aws pairs 1.2 s. Local numbers name operations only; aws control and trial pairs decide any saving.
-- Rolling gate medians: `test_fast_track.py` 48.2 s (50 tests), `test_crate_run.py` 47.6 s (96 tests), `test_standing_checkpoint.py` 39.9 s (15 tests). These are not paired baselines.
+- Phase 191: zone drain parent calls 2.06 CPU s (36 calls); seed Git metadata 0.27 s. Estimates bound the saving; they are not measured.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report has per-module profiles, the required and removable split with file and line, a bounded estimate per change, an owner per change and the first trial.
+- `python3 -m unittest` passes `test_fast_track` (50 tests) and the zone and promotion tests that cover queued-zone delivery.
+- basedpyright on the changed file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain with all 50 tests passing; with no gain, the phase lands nothing.
+
+### Phase 193 — The crate-run and standing-checkpoint tests reuse class seeds and the command adapter  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_crate_run.py` and `style/test_standing_checkpoint.py` use less CPU, with every test, assertion, path and proof kept.
+
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R3, R4 and R5): frozen seeds and the command adapter. Tell style before the edit. Paired aws trials decide; ship any measured gain.
+
+**Spec:**
+1. R3. Add one single-file frozen class seed (`paths=("src/lib.rs",)`) for the thirteen first-statement setup calls the Phase 191 report lists (`test_crate_run.py:135,161,242`). The real fixture writers run once per class. Keep all fixture paths, private ledgers, refs, workspaces, cached properties and per-test cleanup.
+2. R5. Use the existing default `frozen_tests` seed for the seven setup-only cases the report lists (`test_crate_run.py:102,161`). Keep `test_manifest_pins_exact_selection_rule_and_result_paths` (line 1401) and the custom source, changed manifest, shared proposal, dry-run, loader and pre-freeze edit cases on their current paths.
+3. R4. Route the direct `publish` helper (`test_standing_checkpoint.py:237`) and the direct gate call (`:305`) through `run_style_command`, as the CLI helper at `:176` does. Keep one original publication-to-footprint child path and both notification CLI calls at `:539`. Keep real Git, publication locks, candidate checkouts, index bytes, crash journals and verification callbacks.
+4. Change no production code. Keep every test and assertion.
+5. Run both modules and the importers of `style_plan_test_support.py` that the change touches. The director runs three aws pairs per module.
+
+**Files:**
+- `scripts/style/test_crate_run.py` — the R3 seed and the R5 cases.
+- `scripts/style/test_standing_checkpoint.py` — the R4 adapter calls.
+
+**Workers:** 1 writer; the two files are small changes in one fixture family.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 191 bounds: R3 0–1.09 s, R5 0–0.57 s, R4 0–0.78 s. Not measured. `test_standing_checkpoint.py` measured 6.9 CPU s locally.
+
+**State:** none.
+
+**Acceptance gate:**
+- `python3 -m unittest` passes both modules with unchanged test counts.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- Three aws pairs per module show a CPU gain with unchanged test counts; a module with no gain lands nothing.
+
+### Phase 194 — A terminal crate-run resume skips frozen checkout preparation  · status: todo
+**Depends on:** Phase 193
+
+#### Work Order
+
+**Goal:** A crate run that resumes in a terminal stage returns without building the frozen checkout, with every cleanup, lock and evidence check kept.
+
+**Decision:** sdlc go via builds, 2026-11-12 (Phase 191 R1): only if a terminal resume never reads that checkout; show that proof in the checkpoint. Tell style and queue (owner of `scripts/copies`) before the edit. Paired aws trials decide.
+
+**Spec:**
+1. Prove first: trace every read of the frozen checkout on the terminal path from `style/crate_run.py:974` through `complete_run` (`:1159`) and `copies.end_workspaces`. Write the proof to `phases/194/terminal_proof.md` in the session folder. If any terminal read exists, stop and report; land nothing.
+2. Move only the package lookup and the terminal-stage check before frozen checkout acquisition (`crate_run.py:979,986`). Keep the serial run lock and the `complete_run` context around that return.
+3. Keep every owner, unsaved-file, busy-lock, pending-removal and result-evidence check. Do not skip the checkout for selected, pending, claimed, tested or imported work.
+4. Add one row to an existing terminal test in `test_crate_run.py` that fails if a terminal resume builds the frozen checkout.
+5. Run `test_crate_run` and every importer of `crate_run.py`. The director runs three aws pairs.
+
+**Files:**
+- `scripts/style/crate_run.py` — the terminal return before checkout acquisition.
+- `scripts/style/test_crate_run.py` — the new row.
+- `phases/194/terminal_proof.md` — in the session folder.
+
+**Workers:** 1 writer; the proof and the change are one unit.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 191: twenty terminal-entry frozen scopes cost 2.86 CPU s inclusive, in seven tests. Not measured as a saving.
+- Phase 193 changes `test_crate_run.py` fixtures; this phase starts after it lands so the aws pairs measure one change.
+
+**State:** none.
+
+**Acceptance gate:**
+- The proof shows no read of the frozen checkout on the terminal path.
+- `python3 -m unittest` passes `test_crate_run` and every importer of `crate_run.py`.
+- basedpyright on each changed file reports 0 errors and 0 warnings.
+- Three aws pairs show a CPU gain; with no gain, the phase lands nothing.
