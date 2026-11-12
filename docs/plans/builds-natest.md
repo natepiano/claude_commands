@@ -3240,38 +3240,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 189 — A targeted test run uses the declared scan folders of the tests that scan the tree  · status: done
 **Depends on:** Phase 176
 
-#### Work Order
+#### As-built
 
-**Goal:** A test module that scans the tree selects on a change under its declared folders only, so a targeted run adds fewer modules with the same containment.
-
-**Decision:** sdlc, 2026-11-12: go for explicit scan declarations in `config/merge_gate.conf`. An undeclared unresolved scan still selects, so a missing line costs time, not safety. No recorded reads (tracing) for now. The checkpoint message shows the median added modules before and after.
-
-**Spec:**
-1. From the Phase 176 replay, list the test modules whose source-scan evidence adds the most modules (the source-scan rule is 241 of the median 290). For each, read the scan and name the folders it really reads.
-2. Add one key `scan_roots` to `config/merge_gate.conf`, with a comment and a type line like the other keys. Each word is `<folder>/<test file>:<repository path>`; repeat the test file for each folder. A path selects on a change to any file under it, at any depth.
-3. In `scripts/production/affected_modules.py`, a module named in `scan_roots` uses only its declared folders as scan evidence. A module not named keeps the Phase 176 rules unchanged, including the rule that an unresolved scan selects.
-4. Declare the modules from step 1 whose scans the selector cannot resolve or resolves to the repository root.
-4a. Declare `production/test_merge_checkpoint_batch.py` with the folder of the code its fixture runs as a process: the fixture starts `merge_checkpoint`, which starts `style_sync`, which imports `style_plan`. This closes the Phase 176 replay miss for that module (builds, 2026-11-12: each miss is caught or named out of scope). Add a replay row that proves it.
-5. Add rows to the existing scan test in `scripts/production/test_affected_modules.py`: a declared module selects on a change under its folder and not on a change outside it; an undeclared unresolved scan still selects. Each declared row fails on the Phase 176 code.
-6. Replay the 55 saved runs. Containment holds (no module the old selector picked is dropped). Report the added median and largest, per rule, before and after.
-
-**Files:**
-- `config/merge_gate.conf` — the `scan_roots` key.
-- `scripts/production/affected_modules.py` — declared scan evidence.
-- `scripts/production/test_affected_modules.py` — the new rows.
-
-**Workers:** 1 writer; the key, its reader and its rows are one change.
-- impl: all three files and the replay.
-
-**Constraints from prior phases:**
-- Phase 176: 55 replays keep every old selection; added median 290, largest 478; source-scan rule median 241, largest 460. Builds ruled out the general import closure; full merge gates stay unchanged.
-
-**State:** none.
-
-**Acceptance gate:**
-- `python3 -m unittest scripts.production.test_affected_modules` passes; each declared row fails on the Phase 176 code.
-- basedpyright reports 0 errors and 0 warnings on the changed files.
-- The replay keeps containment for all 55 runs and shows the added median before and after.
+- Checkpoint `60e5efdf6`. `config/merge_gate.conf` `scan_roots` declares, per tree-scanning test module, the folders and files it reads; `affected_modules.py` selects a declared module only when a change falls under one of them, in place of the whole-tree source scan. An invalid or unknown declaration fails loudly to the full suite; a declared module absent from the tree gives `FullSuite` with a graph error. The declarations for `agents/test_models_conf_publish.py` and `lint/test_style_review.py` were dropped (reads unverified). Two repair rounds: loud failure on a malformed word, five data-path declarations added; the test rows sit in the existing scan test. Evidence over 55 replay rows, bound to the final hashes: 769 selections removed in 21 modules; added execution CPU median 2572.249 to 2519.426 s (largest 3503.011 to 3440.183); selector CPU median 9.77 to 9.96 s. Every row keeps the Phase 175 selections and the 13 recovered Phase 176 misses; 36 unverified pairs stay selected.
 
 ### Phase 190 — Measure the repeated target-command work in three verify test modules  · status: done
 **Depends on:** none
