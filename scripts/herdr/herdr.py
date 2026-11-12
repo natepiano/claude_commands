@@ -46,7 +46,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
@@ -345,6 +345,20 @@ class TranscriptUnreadable:
     """A matching transcript file could not be read; absence of a turn is unproven."""
 
 
+def complete_transcript_offset(stream: BinaryIO) -> int:
+    """Find the byte after the last complete transcript record."""
+    position = stream.seek(0, os.SEEK_END)
+    while position:
+        start = max(0, position - 4096)
+        _ = stream.seek(start)
+        chunk = stream.read(position - start)
+        newline = chunk.rfind(b"\n")
+        if newline >= 0:
+            return start + newline + 1
+        position = start
+    return 0
+
+
 @dataclass
 class TranscriptCursor:
     """The complete new turns seen by one submission, with per-file byte positions."""
@@ -353,6 +367,7 @@ class TranscriptCursor:
     since: datetime
     offsets: dict[Path, int] = field(default_factory=dict)
     sizes: dict[Path, int] = field(default_factory=dict)
+    current_paths: tuple[Path, ...] = field(default=(), init=False)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
 
@@ -365,24 +380,14 @@ class TranscriptCursor:
             for path in paths:
                 with path.open("rb") as stream:
                     size = stream.seek(0, os.SEEK_END)
-                    position = size
-                    offset = 0
-                    while position:
-                        start = max(0, position - 4096)
-                        _ = stream.seek(start)
-                        chunk = stream.read(position - start)
-                        newline = chunk.rfind(b"\n")
-                        if newline >= 0:
-                            offset = start + newline + 1
-                            break
-                        position = start
-                    self.offsets[path] = offset
+                    self.offsets[path] = complete_transcript_offset(stream)
                     self.sizes[path] = size
         except OSError:
             self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
+        self.current_paths = ()
         # A session id is a file component, never a glob supplied by a caller.
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
             return []
@@ -391,6 +396,7 @@ class TranscriptCursor:
         except OSError:
             self.readability = TranscriptUnreadable()
             paths = ()
+        self.current_paths = paths
         for path in paths:
             try:
                 with path.open("rb") as stream:
@@ -1249,6 +1255,11 @@ SUBMIT_UNPROVED = SubmitUnproved()
 
 
 @dataclass(frozen=True)
+class PaneSessionsStarting:
+    """The Codex pane starts without a current session identity."""
+
+
+@dataclass(frozen=True)
 class PaneSessionsUnknown:
     """The process evidence cannot establish the pane's current sessions."""
 
@@ -1259,7 +1270,7 @@ class PaneSessionsUnknown:
 class PaneEvidenceRun:
     """Share decoded pane evidence and printed reasons within one run."""
 
-    sessions: dict[tuple[str, str, str], frozenset[str] | PaneSessionsUnknown] = field(default_factory=dict)
+    sessions: dict[tuple[str, str, str], frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown] = field(default_factory=dict)
     reported: set[tuple[str, str, str]] = field(default_factory=set)
     lock: RLock = field(default_factory=RLock)
 
@@ -1792,7 +1803,7 @@ class Herdr:
                 self.save_layout()
             return True
 
-    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> frozenset[str] | PaneSessionsUnknown:
+    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
         with run.lock:
             if key in run.sessions:
@@ -1801,7 +1812,9 @@ class Herdr:
                 info = json_object(self.result("pane", "process-info", "--pane",
                     json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
                 _ = _pane_process_ids(info, "native pane processes")
-                sessions: frozenset[str] | PaneSessionsUnknown = frozenset(_pane_sessions(info, pane))
+                sessions: frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown = frozenset(_pane_sessions(info, pane))
+            except CodexPaneStarting:
+                sessions = PaneSessionsStarting()
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 sessions = PaneSessionsUnknown(str(error))
             run.sessions[key] = sessions
@@ -1816,15 +1829,19 @@ class Herdr:
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
             sessions = self._row_pane_sessions(pane, run)
-            if isinstance(sessions, PaneSessionsUnknown):
-                unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), sessions.reason)
+            if isinstance(sessions, (PaneSessionsStarting, PaneSessionsUnknown)):
+                reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
+                unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
                 notice = (self.session, unread.pane, unread.reason)
                 with run.lock:
                     if notice in run.reported:
                         continue
-                    print(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
-                          + f"{' '.join(unread.reason.splitlines())}; row placement retained", file=sys.stderr)
+                    if isinstance(sessions, PaneSessionsStarting):
+                        print(f"herdr {self.session}:{unread.pane}: pane is starting", file=sys.stderr)
+                    else:
+                        print(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
+                              + f"{' '.join(unread.reason.splitlines())}; row placement retained", file=sys.stderr)
                     run.reported.add(notice)
             else:
                 for identity in sessions:
@@ -2242,8 +2259,11 @@ class Herdr:
                 entry["name"] = name
                 directory = pane_launch.record_directory()
                 pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
-            except CodexSessionPending:
-                pass
+            except (CodexPaneStarting, CodexSessionPending) as error:
+                if isinstance(error, CodexPaneStarting) or isinstance(opening, OpeningPrompt):
+                    print(f"herdr {name}:{pane}: pane is starting; pane retained", file=sys.stderr)
+                return (PromptNotSubmitted("pane is starting; prompt retained", never_typed=True)
+                        if isinstance(opening, OpeningPrompt) else PromptSubmissionNotRequired())
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
@@ -2862,6 +2882,13 @@ def pane_native_process(info: dict[str, object], kind: str,
             raise HerdrFailure("native process pid is unavailable")
         try:
             observed = native_process(pid, kind, reported) if kind == "codex" else native_process(pid, kind)
+        except CodexPaneStarting as error:
+            report = pane.get("agent_session")
+            value = cast(dict[str, object], report).get("value") if isinstance(report, dict) else pane.get("session_id")
+            if (not codex_without_session(info) or report is not None and not isinstance(report, dict)
+                    or value is not None and value != ""):
+                raise HerdrFailure("Codex launch identity is unavailable") from error
+            raise
         except (OSError, ValueError) as error:
             raise HerdrFailure(str(error)) from error
         if (kind == "codex" and codex_without_session(info) and "pane_id" in pane
@@ -2973,6 +3000,9 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
             if isinstance(composer, ComposerInput) and composer.text.strip() and not composer.contains(text):
                 raise HerdrFailure(f"would overwrite unsaved input in session {target}", "wrong_target")
         return True
+    except CodexPaneStarting:
+        print(f"herdr {name}: pane is starting; target retained", file=sys.stderr)
+        return False
     except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target":
             raise
@@ -3609,6 +3639,33 @@ class UnreportedResume:
 
 
 @dataclass(frozen=True)
+class StartingCodexPane:
+    """A fresh interactive Codex launch has no conversation report yet."""
+
+    pid: int
+
+
+@dataclass(frozen=True)
+class CodexLaunchIdentityUnknown:
+    """The launch evidence cannot identify a conversation or prove a fresh launch."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class CodexWrapperPending(CodexLaunchIdentityUnknown):
+    """The Codex pane still exposes a wrapper with no conversation identity."""
+
+
+class CodexPaneStarting(BlockingIOError):
+    """A caller needs a conversation while a proved fresh Codex pane starts."""
+
+    def __init__(self, state: StartingCodexPane) -> None:
+        super().__init__(f"pid {state.pid}: Codex launch identity is unavailable; pane is starting")
+        self.state: StartingCodexPane = state
+
+
+@dataclass(frozen=True)
 class NativeAgentProcess:
     """Conversation evidence from one process with a stable start time."""
 
@@ -3637,42 +3694,75 @@ class CodexSessionPending(ValueError):
 
 def codex_resume_thread(pid: int) -> str:
     """Read the Codex thread from its resume arguments."""
+    launch = _codex_launch_argument(pid)
+    if isinstance(launch, LaunchArgument):
+        return launch.id
+    if isinstance(launch, (StartingCodexPane, CodexWrapperPending)):
+        raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
+    raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+
+
+def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | CodexLaunchIdentityUnknown:
+    """Classify the launch arguments without requiring a conversation identity."""
+    unknown = CodexLaunchIdentityUnknown(f"pid {pid}: Codex launch identity is unavailable")
     if _platform() == "darwin":
         process = next((process for process in _darwin_processes() if process.pid == pid), None)
         if process is None or isinstance(process.arguments, UnreadableProcessArguments):
-            raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
+            return unknown
         arguments = list(process.arguments.argv)
     else:
         arguments = _process_arguments(_proc_root() / str(pid))
     if is_codex_process(arguments):
         options = iter(arguments[2:] if Path(arguments[0]).name in {"node", "nodejs"} else arguments[1:])
+        fresh = True
+        value_options = {"-c", "--config", "--enable", "--disable", "-m", "--model",
+                         "-C", "--cd", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
+                         "--local-provider", "-i", "--image", "--add-dir", "--remote", "--remote-auth-token-env"}
         for option in options:
-            if option in {"-c", "--config", "--enable", "--disable", "-m", "--model",
-                          "-C", "--cd", "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
-                          "--local-provider", "-i", "--image", "--add-dir", "--remote", "--remote-auth-token-env"}:
-                _ = next(options, "")
+            option_name, separator, option_value = option.partition("=")
+            if separator and option_name in value_options:
+                option = option_name
+            elif len(option) > 2 and option[:2] in {"-c", "-m", "-C", "-p", "-s", "-a", "-i"}:
+                option, option_value = option[:2], option[2:].removeprefix("=")
+            elif option in value_options:
+                option_value = next(options, "")
+            if option in value_options:
+                if not option_value or option_value.startswith("-"):
+                    fresh = False
+                if option in {"-c", "--config"} and "=" not in option_value:
+                    fresh = False
             elif option == "--":
-                break
+                return StartingCodexPane(pid) if fresh else unknown
             elif not option.startswith("-"):
                 if option == "resume":
                     try:
-                        return staff.native_id(next(options, ""))
-                    except staff.StaffRefused as error:
-                        raise ValueError(f"pid {pid}: Codex launch identity is unavailable") from error
-                break
-        raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
-    raise CodexSessionPending(f"pid {pid}: Codex launch identity is unavailable")
+                        return LaunchArgument(staff.native_id(next(options, "")))
+                    except staff.StaffRefused:
+                        return unknown
+                if option in {"exec", "e", "review", "fork", "login", "logout", "mcp", "mcp-server",
+                              "app-server", "app", "completion", "sandbox", "debug", "apply", "a",
+                              "cloud", "features", "help"}:
+                    return unknown
+                return StartingCodexPane(pid) if fresh else unknown
+            elif option in {"--no-daemon", "--no-alt-screen", "--full-auto", "--search", "--oss",
+                            "--dangerously-bypass-approvals-and-sandbox"}:
+                continue
+            else:
+                fresh = False
+        else:
+            if fresh:
+                return StartingCodexPane(pid)
+    else:
+        return CodexWrapperPending(unknown.reason)
+    return unknown
 
 
-def _codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessionReport:
-    """Use the resume argument or the new conversation's pane report."""
-    try:
-        resume = codex_resume_thread(pid)
-    except ValueError:
-        if not reported:
-            raise
-        return PaneSessionReport(reported)
-    return PaneSessionReport(reported) if reported == resume else LaunchArgument(resume)
+def codex_launch_identity(pid: int, reported: str) -> LaunchArgument | PaneSessionReport | StartingCodexPane | CodexLaunchIdentityUnknown:
+    """Distinguish a known identity, a fresh launch, and incomplete launch evidence."""
+    launch = _codex_launch_argument(pid)
+    if isinstance(launch, LaunchArgument):
+        return PaneSessionReport(reported) if reported == launch.id else launch
+    return PaneSessionReport(reported) if reported else launch
 
 
 def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
@@ -3686,6 +3776,8 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
         if not isinstance(pane, NoPane):
             try:
                 return pane_native_process(info, "codex", pane)
+            except CodexPaneStarting:
+                raise
             except HerdrFailure as error:
                 if isinstance(error.__cause__, CodexSessionPending):
                     raise error.__cause__
@@ -3704,7 +3796,7 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
     started = _process_birth(pid)
     environment = process_environment(pid)
     if kind == "codex":
-        identity = _codex_launch_identity(pid, reported if isinstance(reported, str) else "")
+        identity = codex_launch_identity(pid, reported if isinstance(reported, str) else "")
     elif kind == "claude":
         try:
             current = staff.runtime_id(pid)
@@ -3717,6 +3809,12 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
         raise ValueError(f"pid {pid}: unknown agent kind {kind}")
     if _process_birth(pid) != started:
         raise ValueError(f"pid {pid}: native process start changed")
+    if isinstance(identity, StartingCodexPane):
+        raise CodexPaneStarting(identity)
+    if isinstance(identity, CodexWrapperPending):
+        raise CodexSessionPending(identity.reason)
+    if isinstance(identity, CodexLaunchIdentityUnknown):
+        raise ValueError(identity.reason)
     return NativeAgentProcess(identity, started, environment)
 
 
@@ -3729,7 +3827,11 @@ def check_native_target(pid: int, kind: str, expected: NativeAgentProcess) -> bo
     place = herdr_place_of(pid)
     if isinstance(place, HerdrPlace):
         forget_pane_evidence(place.session, place.pane)
-    if native_process(pid, kind) != expected:
+    try:
+        observed = native_process(pid, kind)
+    except CodexPaneStarting:
+        return False
+    if observed != expected:
         return False
     return check_target(target, action="signal")
 
@@ -3994,7 +4096,12 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
                 live[identity] = (*live.get(identity, ()), pid)
         except ProcessLookupError:
             continue
-        except (HerdrFailure, OSError, ValueError):
+        except (HerdrFailure, OSError, ValueError) as error:
+            observations = _pane_observations.get()
+            if (isinstance(error, CodexPaneStarting) and observations is not None
+                    and pid in observations.process_places):
+                print(f"herdr pid {pid}: pane is starting", file=sys.stderr)
+                continue
             if environment is not None:
                 if "--no-daemon" not in arguments:
                     home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
@@ -4995,6 +5102,9 @@ def _process_marks(pid: int, environment: dict[str, str], arguments: list[str], 
         try:
             observed = codex_pane_process(pid, place) if kind == "codex" else native_process(pid, kind)
             marks["CODEX_THREAD_ID" if kind == "codex" else "CLAUDE_CODE_SESSION_ID"] = observed.current_identity
+        except CodexPaneStarting:
+            _ = marks.pop("CODEX_THREAD_ID", None)
+            return marks
         except (HerdrFailure, OSError, ValueError):
             return marks
     return marks

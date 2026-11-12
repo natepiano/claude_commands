@@ -456,7 +456,8 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(report["warnings"], ["bad: the production document is not recorded"])
         self.assertEqual(errors, ["could not read: warning: bad: the production document is not recorded"])
         self.assertIn("unit-one", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
-        self.assertNotIn("free-claude", [entry["name"] for entry in cast(list[dict[str, object]], report["entries"])])
+        self.assertNotIn(f"session:{bad.current_session}",
+                         [entry["address"] for entry in cast(list[dict[str, object]], report["entries"])])
 
     def test_docless_staff_row_does_not_block_a_peer_name(self) -> None:
         _ = fixture_member("showrunner", name="bad", runtime_id="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
@@ -679,7 +680,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner,
-                         roster.UnderShowrunner("receiving", "receiving-runner", "session:522e6367-86e1-5829-ada8-2c71b5c28c97"))
+                         roster.UnderShowrunner("receiving", "receiving", "session:522e6367-86e1-5829-ada8-2c71b5c28c97"))
         self.assertNotIn("unit-one", doc.read_text())
 
     def test_full_roster_reads_the_staff_owner_once(self) -> None:
@@ -863,7 +864,7 @@ class RosterTests(unittest.TestCase):
             status="working", reach=roster.Messageable("session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
             cwd=str(self.home / "projects" / "unit-one"),
             showrunner=roster.UnderShowrunner(
-                "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
+                "alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
             ),
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
@@ -892,7 +893,7 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(entries[name].director, roster.UnderDirector(
                     "unit-one", "unit-one", "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b"))
                 self.assertEqual(entries[name].showrunner, roster.UnderShowrunner(
-                    "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
+                    "alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
                 self.assertEqual(entries[name].reach, roster.Messageable(f"worker:unit-one/{name}"))
         self.assertEqual(
             entries["alpha-research"].assignment,
@@ -1960,7 +1961,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner, roster.UnderShowrunner(
-            "alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
+            "alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0",
         ))
         for name in ("alpha-test", "alpha-impl", "review:adversary"):
             with self.subTest(worker=name):
@@ -2013,7 +2014,7 @@ class RosterTests(unittest.TestCase):
             director = self._entries()["unit-one"]
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
-        self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
+        self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"))
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
 
     def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
@@ -2158,7 +2159,7 @@ class RosterTests(unittest.TestCase):
             (director.role, director.showrunner),
             (
                 "unit director",
-                roster.UnderShowrunner("alpha", "runner", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"),
+                roster.UnderShowrunner("alpha", "alpha", "session:acd50bad-5afa-5d3d-b155-3766b7d113e0"),
             ),
         )
         self.assertEqual(

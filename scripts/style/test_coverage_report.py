@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -19,6 +20,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.style import coverage_report, style_config
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.style.ledger_test_support import write_style_units
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -150,11 +152,16 @@ class CoverageReportTests(unittest.TestCase):
                           input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("coverage_report.py")),
-             "--repo", str(self.repo), *arguments],
-            check=False, capture_output=True, text=True,
-        )
+        command = ["--repo", str(self.repo), *arguments]
+        if process_boundary_for_case(self):
+            result = subprocess.run(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"),
+                 str(Path(__file__).with_name("coverage_report.py")), *command],
+                check=False, capture_output=True, text=True,
+            )
+        else:
+            result = invoke_cli(coverage_report, lambda: coverage_report.main(sys.argv[1:]),
+                                command, dict(os.environ), Path.cwd())
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -258,6 +265,7 @@ class CoverageReportTests(unittest.TestCase):
         self.assertEqual(rows["manifests"].current, "1 of 2 crates")
         self.assertEqual(rows["structure"].current, "1 of 4 files")
 
+    @process_boundary
     def test_rows_cover_each_counted_tier_and_held_and_waived_judgments_still_finish_a_rule(self) -> None:
         _ = self.rule("lint", "tier: A\nmechanism: clippy\n")
         listed = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")

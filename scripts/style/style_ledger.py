@@ -731,7 +731,8 @@ def sibling_test_file_destinations(sources: style_footprint.RevisionTree) -> dic
             crate = sources.crate(file)
             module = style_footprint.file_module(file, crate, sources)
             if (isinstance(module, style_footprint.OutsideCrate)
-                    or style_footprint.module_chain(module, sources, crate, {}) is not None):
+                    or style_footprint.module_chain(
+                        module, sources, crate, {}, conditions=style_footprint.ModulePathConditions.ALLOW_CFG) is not None):
                 continue
             parent = PurePosixPath(file)
             for item in modules:
@@ -4527,6 +4528,13 @@ class Ledger:
         # The first id names the site. When a different change holds it, the change gets the second id, which also names
         # the change, so a call never returns a row that holds a different change.
         finding_ids = (_finding_id(site), _finding_id((*site, *change)))
+
+        def held_site(finding_id: str) -> HeldFinding:
+            finding = self._held(finding_id)
+            if isinstance(finding.state, (Unfiled, Filed)) and self._fold_test_file_findings(finding):
+                return self._held(finding_id)
+            return finding
+
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             _ = self._check_pin(ticket, rule, rule_blob)
@@ -4560,7 +4568,7 @@ class Ledger:
                                    _finding_id((*site, *change, same[0], "replacement")))
                     continue
                 _ = self._connection.execute(take_over, (*judgment_values, _now(), same[0], ticket))
-                return self._held(same[0])
+                return held_site(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
             # again, so that change returns the followed finding, the one with the nearest line.
             followed = cast(list[tuple[str, int]], self._connection.execute(
@@ -4570,7 +4578,7 @@ class Ledger:
             if followed:
                 nearest = min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0]
                 _ = self._connection.execute(take_over, (*judgment_values, _now(), nearest, ticket))
-                return self._held(nearest)
+                return held_site(nearest)
             free = [finding_id for finding_id in finding_ids if finding_id not in changes]
             if not free:
                 raise LedgerError(f"{rule}: other changes hold both finding ids of {path}:{line}")
@@ -4582,7 +4590,7 @@ class Ledger:
                  anchor),
             )
             # Every return reads its row before the commit, so a write after the commit cannot change what it returns.
-            return self._held(free[0])
+            return held_site(free[0])
 
     def _held(self, finding_id: str) -> HeldFinding:
         rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str, str, str]], self._connection.execute(
@@ -5054,6 +5062,20 @@ class Ledger:
                     groups.setdefault((finding.rule, finding.path), []).append(finding)
             return tuple(result for findings in groups.values() for result in self._fold_test_file_group(tuple(findings)))
 
+    def _fold_test_file_findings(self, finding: HeldFinding) -> tuple[FoldedTestFile, ...]:
+        """Select and fold the unclaimed group for one sibling test file finding."""
+        if finding.path.endswith("_tests.rs") and isinstance(finding.build_ticket, NoBuildTicket):
+            definitions = {rule.rule_id: rule for rule in self._load_rules()}
+            definition = definitions.get(base_rule(finding.rule))
+            if definition is not None and definition.family == "modules":
+                identities = cast(list[tuple[str]], self._connection.execute(
+                    "SELECT finding_id FROM held_findings WHERE rule=? AND path=? "
+                    + "AND state IN ('unfiled','filed') AND build_ticket='' ORDER BY created_at,finding_id",
+                    (finding.rule, finding.path),
+                ).fetchall())
+                return self._fold_test_file_group(tuple(self._held(identity) for identity, in identities))
+        return ()
+
     def file_held(self, finding_id: str, proposal: Path) -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -5063,19 +5085,10 @@ class Ledger:
                 if retained.text.startswith("Move the whole file "):
                     finding = retained
                     finding_id = finding.finding_id
-            if finding.path.endswith("_tests.rs") and isinstance(finding.build_ticket, NoBuildTicket):
-                definitions = {rule.rule_id: rule for rule in self._load_rules()}
-                definition = definitions.get(base_rule(finding.rule))
-                if definition is not None and definition.family == "modules":
-                    identities = cast(list[tuple[str]], self._connection.execute(
-                        "SELECT finding_id FROM held_findings WHERE rule=? AND path=? "
-                        + "AND state IN ('unfiled','filed') AND build_ticket='' ORDER BY created_at,finding_id",
-                        (finding.rule, finding.path),
-                    ).fetchall())
-                    folded = self._fold_test_file_group(tuple(self._held(identity) for identity, in identities))
-                    if folded:
-                        finding_id = folded[0].finding_id
-                        finding = self._held(finding_id)
+            folded = self._fold_test_file_findings(finding)
+            if folded:
+                finding_id = folded[0].finding_id
+                finding = self._held(finding_id)
             if isinstance(finding.state, Filed) and finding.state.proposal == proposal:
                 return
             if not isinstance(finding.state, Unfiled):

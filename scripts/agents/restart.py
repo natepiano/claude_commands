@@ -17,8 +17,9 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from threading import Event
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from importlib import import_module
@@ -26,11 +27,11 @@ from importlib import import_module
 from scripts.herdr import herdr
 from scripts.herdr import herdr_types
 from scripts.message import sessions, codex_daemon
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.transcripts import transcript_paths
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.agents.codex_trust import trust_arguments
@@ -84,6 +85,122 @@ class WorkerRestartScope(Enum):
 class RestartDisposition(Enum):
     RESTORED = "the row started or already runs"
     HELD = "the row keeps its pause or exit record"
+
+
+class ResumeCheckState(Enum):
+    NO_MESSAGE = "no continuation message"
+    NO_WORK = "no work after the continuation message"
+    UNREADABLE = "transcript unreadable"
+    RESUMED = "resumed"
+
+
+@dataclass
+class CodexResumeTranscript:
+    """Read new turns in the account and thread used at launch."""
+
+    transcript: herdr.SessionTranscript
+    since: datetime
+    offsets: dict[Path, int] = field(default_factory=dict)
+
+    def skip_existing_turns(self) -> None:
+        try:
+            source = worker_admission.codex_transcript_source(self.transcript.session_id, self.transcript.config_dir)
+            with open_transcript(source) as stream:
+                self.offsets[source] = herdr.complete_transcript_offset(stream)
+        except (OSError, ValueError):
+            pass
+
+    def progress(self, text: str) -> ResumeCheckState:
+        state = ResumeCheckState.NO_MESSAGE
+        try:
+            source = worker_admission.codex_transcript_source(self.transcript.session_id, self.transcript.config_dir)
+            offset = self.offsets.get(source, 0)
+            if source.stat().st_size < offset:
+                offset = 0
+            for row in worker_admission.transcript_records(
+                    source, offset=offset, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES):
+                if isinstance(row, worker_admission.TornTranscriptRecord):
+                    return ResumeCheckState.UNREADABLE
+                stamp = row.get("timestamp")
+                if not isinstance(stamp, str):
+                    continue
+                at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if at.tzinfo is None or at <= self.since:
+                    continue
+                entry = worker_admission.transcript_entry(row, set())
+                if entry.startswith("user:\n") and text in entry:
+                    state = ResumeCheckState.NO_WORK
+                elif state is ResumeCheckState.NO_WORK:
+                    raw = row.get("payload")
+                    if isinstance(raw, dict):
+                        payload = cast(dict[str, object], raw)
+                        if (payload.get("role") == "assistant"
+                                or payload.get("type") in ("agent_message", "function_call", "custom_tool_call")):
+                            return ResumeCheckState.RESUMED
+            return state
+        except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+            return ResumeCheckState.UNREADABLE
+
+
+@dataclass
+class DirectorResumeCheck:
+    name: str
+    text: str
+    reader: herdr.TranscriptCursor | CodexResumeTranscript
+
+    def progress(self) -> ResumeCheckState:
+        if isinstance(self.reader, CodexResumeTranscript):
+            return self.reader.progress(self.text)
+        turns = self.reader.read_turns()
+        if isinstance(self.reader.readability, herdr.TranscriptUnreadable) or not self.reader.current_paths:
+            return ResumeCheckState.UNREADABLE
+        state = ResumeCheckState.NO_MESSAGE
+        for turn in sorted(turns, key=lambda turn: turn[0]):
+            row = turn[1]
+            if state is ResumeCheckState.NO_WORK and row.get("type") == "assistant":
+                return ResumeCheckState.RESUMED
+            if (row.get("type") == "user" and not row.get("isMeta", False)
+                    and self.text in worker_admission.transcript_entry(row, set())):
+                state = ResumeCheckState.NO_WORK
+        return state
+
+
+class NoDirectorResumeChecks(Enum):
+    CURRENT = "this caller does not check director progress"
+
+
+@dataclass
+class DirectorResumeChecks:
+    checks: list[DirectorResumeCheck] = field(default_factory=list)
+
+    def report(self) -> None:
+        if not self.checks:
+            return
+        try:
+            settings = conf.read("shutdown")
+            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
+            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+        except (OSError, ValueError):
+            for check in self.checks:
+                print(f"{check.name}: restart check: {ResumeCheckState.UNREADABLE.value}")
+            print(f"restart check: 0 of {len(self.checks)} directors resumed")
+            return
+        states = [ResumeCheckState.NO_MESSAGE] * len(self.checks)
+        while True:
+            for index, check in enumerate(self.checks):
+                if states[index] is not ResumeCheckState.RESUMED:
+                    states[index] = check.progress()
+            if all(state is ResumeCheckState.RESUMED for state in states):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+        for check, state in zip(self.checks, states):
+            if state is not ResumeCheckState.RESUMED:
+                print(f"{check.name}: restart check: {state.value}")
+        passed = sum(state is ResumeCheckState.RESUMED for state in states)
+        print(f"restart check: {passed} of {len(self.checks)} directors resumed")
 
 
 class ClaudeTrustWriteFailed(OSError):
@@ -307,7 +424,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               resolver: session_staff.RowResolver | None = None,
               worker_scope: WorkerRestartScope = WorkerRestartScope.FOLLOW_OWNER,
               observed: RestartObservations | None = None,
-              opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE) -> str:
+              opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
+              resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
@@ -388,8 +506,30 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         settings = conf.read("shutdown")
         start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
+        check: DirectorResumeCheck | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT
         if isinstance(opening, herdr.OpeningPrompt):
-            opening = replace(opening, transcript=herdr.SessionTranscript(selected_home, str(row.current_session)))
+            transcript = herdr.SessionTranscript(selected_home, str(row.current_session))
+            opening = replace(opening, transcript=transcript)
+            if row.kind in ("unit", "showrunner") and isinstance(resume_checks, DirectorResumeChecks):
+                since = datetime.now(timezone.utc)
+                reader = (herdr.TranscriptCursor(transcript, since) if kind == "claude" else
+                          CodexResumeTranscript(transcript, since))
+                reader.skip_existing_turns()
+                check = DirectorResumeCheck(row.name, opening.text, reader)
+                if isinstance(reader, herdr.TranscriptCursor):
+                    cursor = reader
+                    before_prompt = opening.before_prompt
+
+                    def native_transcript(actual: herdr.SessionTranscript) -> object:
+                        if actual != cursor.transcript:
+                            cursor.transcript = actual
+                            cursor.offsets.clear()
+                            cursor.sizes.clear()
+                            cursor.turns.clear()
+                            cursor.skip_existing_turns()
+                        return before_prompt(actual)
+
+                    opening = replace(opening, before_prompt=native_transcript)
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
@@ -440,6 +580,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
             _ = (_restore_workers(row, record) if observed is None else
                  _restore_workers(row, record, observed=observed))
+        if isinstance(resume_checks, DirectorResumeChecks) and isinstance(check, DirectorResumeCheck):
+            resume_checks.checks.append(check)
         print(f"{row.name}: restarted")
         return result.pane
 
@@ -829,6 +971,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    resume_checks = DirectorResumeChecks()
+
     def start_holder(holder: staff.StaffRow, focus: bool) -> RestartDisposition:
         with staff.row_operation(str(holder.id)):
             current_record = staff.initial_snapshot()
@@ -854,11 +998,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 _ = start_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
-                              opening=opening)
+                              opening=opening, resume_checks=resume_checks)
             else:
                 _ = start_row(current, current_record, client, present=focus, resolver=facts,
                               target_account="" if isinstance(account, AllRestartAccounts) else account,
-                              worker_scope=worker_scope, observed=observed, opening=opening)
+                              worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
             return RestartDisposition.RESTORED
 
     if holders:
@@ -888,6 +1032,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             _ = client.sort_tabs()
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    resume_checks.report()
     return exit_code
 
 

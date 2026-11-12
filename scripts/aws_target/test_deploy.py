@@ -1017,7 +1017,9 @@ sys.exit(7)
             args = list(arguments)
             region = args[args.index('--region') + 1]
             if 'get-service-quota' in args:
-                reply: dict[str, object] = {'Quota': {'Value': 128}}
+                code = args[args.index('--quota-code') + 1]
+                self.assertIn(code, ('L-34B43A08', 'L-3819A6DF'))
+                reply: dict[str, object] = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
             elif 'describe-availability-zones' in args:
                 reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
             else:
@@ -1031,6 +1033,8 @@ sys.exit(7)
         self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
         for region in ('us-east-2', 'us-west-2'):
             self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
+            self.assertEqual(lines[lines.index(f'{region}: Spot quota 128 vCPUs') + 1],
+                             f'{region}: G and VT Spot quota 48 vCPUs')
             for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
                 self.assertIn(f'{region} {size} {region}a unavailable', lines)
         self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
@@ -1057,7 +1061,7 @@ sys.exit(7)
                     text_setting(gates, 'instance_types', instance_types)
                     subject = self.deployment()
                     subject.admin.credentials = subject.admin.get()
-                    calls: list[str] = []
+                    calls: list[tuple[str, str]] = []
                     execute = subject.execute
 
                     def quota_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
@@ -1065,14 +1069,18 @@ sys.exit(7)
                                       env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                         region = arguments[arguments.index('--region') + 1] if '--region' in arguments else ''
                         if 'get-service-quota' in arguments:
+                            code = arguments[arguments.index('--quota-code') + 1]
                             self.assertNotIn('--profile', arguments)
                             self.assertIsNotNone(env)
                             self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
                             self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
                             self.assertEqual(list(arguments[arguments.index('service-quotas'):]),
                                 ['service-quotas', 'get-service-quota', '--service-code', 'ec2',
-                                 '--quota-code', 'L-34B43A08', '--output', 'json'])
-                            calls.append(region)
+                                 '--quota-code', code, '--output', 'json'])
+                            calls.append((region, code))
+                            if code == 'L-3819A6DF':
+                                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 48}}), '')
+                            self.assertEqual(code, 'L-34B43A08')
                             quota = quotas[region]
                             if quota == 'timeout':
                                 raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
@@ -1100,7 +1108,11 @@ sys.exit(7)
                             output = captured.getvalue()
                             self.assertIn('us-east-1 r7a.8xlarge us-east-1a unavailable', output)
                         count_vcpus.assert_called_once_with(tuple(instance_types.split()))
-                    self.assertEqual(calls, list(quotas))
+                    codes = ('L-34B43A08', 'L-3819A6DF') if command == 'prices' else ('L-34B43A08',)
+                    self.assertEqual(calls, [(region, code) for region in quotas for code in codes])
+                    self.assertEqual([line for line in output.splitlines() if ': G and VT' in line],
+                                     [f'{region}: G and VT Spot quota 48 vCPUs' for region in quotas]
+                                     if command == 'prices' else [])
                     lines = [line for line in output.splitlines()
                              if ': Spot' in line or ': cannot run' in line or ': gate vCPU' in line]
                     expected: list[str] = []
@@ -1146,7 +1158,48 @@ sys.exit(7)
         with mock.patch.object(subject.admin, 'get', side_effect=unlock), redirect_stdout(StringIO()) as captured:
             subject.prices()
         lines = captured.getvalue().splitlines()
-        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs'])
+        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs',
+                                'us-east-1: G and VT Spot quota 300 vCPUs'])
+
+    def test_prices_continues_after_a_failed_g_quota_read_without_error_details(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        for failure, reason in (('denied', 'AccessDeniedException'), ('timeout', 'TimeoutExpired'), ('malformed', 'KeyError')):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    args = list(arguments)
+                    region = args[args.index('--region') + 1]
+                    reply: dict[str, object]
+                    if 'get-service-quota' in args:
+                        code = args[args.index('--quota-code') + 1]
+                        if code == 'L-3819A6DF' and region == 'us-east-1':
+                            if failure == 'denied':
+                                return subprocess.CompletedProcess(args, 1, '',
+                                    'An error occurred (AccessDeniedException) when calling GetServiceQuota: '
+                                    + 'fixture-admin-secret arn:aws:iam::123456789012:user/private')
+                            if failure == 'timeout':
+                                raise subprocess.TimeoutExpired('fixture-admin-secret', 1)
+                            reply = {}
+                        else:
+                            reply = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
+                    elif 'describe-availability-zones' in args:
+                        reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
+                    else:
+                        self.assertIn('describe-spot-price-history', args)
+                        reply = {'SpotPriceHistory': []}
+                    return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    subject.prices()
+                lines = output.getvalue().splitlines()
+                self.assertIn(f'us-east-1: G and VT Spot quota unknown: {reason}', lines)
+                self.assertIn('us-west-2: G and VT Spot quota 48 vCPUs', lines)
+                self.assertIn('us-west-2 r7a.8xlarge us-west-2a unavailable', lines)
+                self.assertNotIn('fixture-admin-secret', output.getvalue())
+                self.assertNotIn('arn:', output.getvalue())
+                self.assertNotIn('123456789012', output.getvalue())
 
     def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
         get_quota = 'get-service-quota'
