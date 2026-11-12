@@ -305,26 +305,14 @@ class Controller:
                     raw = api.in_region(region).call('describe-spot-price-history', '--instance-types', *sizes,
                         '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(now, UTC).isoformat(),
                         '--no-paginate', '--max-results', '1000')
-                    if raw.get('NextToken'):
-                        raise ValueError('The regional Spot price reply is incomplete')
-                    latest: dict[tuple[str, str], tuple[float, ledger.RegionalSpotPrice]] = {}
-                    for row in ledger.rows(raw, 'SpotPriceHistory'):
-                        size, zone = ledger.text(row, 'InstanceType'), ledger.text(row, 'AvailabilityZone')
-                        if size not in sizes:
-                            continue
-                        at = datetime.fromisoformat(ledger.text(row, 'Timestamp').replace('Z', '+00:00')).timestamp()
-                        price = money(ledger.text(row, 'SpotPrice'))
-                        if not zone or price < 0:
-                            raise ValueError('The regional Spot price reply has invalid rows')
-                        key = (zone, size)
-                        if key not in latest or at > latest[key][0]:
-                            latest[key] = (at, ledger.RegionalSpotPrice(region, zone, size, price, now))
+                    regional_prices = ledger.regional_spot_prices(region, raw, sizes, now)
+                    keys = {(row.zone, row.instance_type) for row in regional_prices}
                     zones = {ledger.text(subnet, 'zone') for row in deployed if row['region'] == region
                              for subnet in ledger.rows(row, 'subnets')}
-                    if (not latest or set(sizes) - {size for _, size in latest}
-                            or any((zone, size) not in latest for zone in zones for size in sizes)):
+                    if (not regional_prices or set(sizes) - {size for _, size in keys}
+                            or any((zone, size) not in keys for zone in zones for size in sizes)):
                         raise ValueError('The regional Spot price reply omits a type or deployed zone')
-                    prices.extend(price for _, price in latest.values())
+                    prices.extend(regional_prices)
                 ledger.write_spot_prices(self.directory, prices)
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
                 print('aws_target: gate price read unavailable: ' + type(error).__name__, file=sys.stderr)
