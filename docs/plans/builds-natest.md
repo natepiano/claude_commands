@@ -3308,34 +3308,41 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Checkpoint `7a5781915`. `CrateRun.advance` (`crate_run.py:977`) looks up the package and its saved stage before frozen checkout acquisition and returns for `ABANDONED` and `INTEGRATED`; the `serial` run lock and the `complete_run` context stay around the return, and the nine other stages still acquire the checkout. The proof (in the checkpoint message) shows that the terminal body, `complete_run`, `copies.workspace`, `copies.end_workspaces` and the `scratch` removal path read the canonical manifest, worker records, holds and the copies registry, never the frozen checkout; the skipped work is the unused `copies.standing` lifetime. One row in an existing terminal cleanup test (`test_crate_run.py:511`) fails on the old code. 96 tests and 587 assertions kept. aws pairs: `test_crate_run.py` 58.06 to 56.15 CPU s (1.91 s); `test_bulk_run.py` unchanged.
 
-### Phase 195 — Profile the copy-guard source scan and name its removable work  · status: todo
+### Phase 195 — Profile the copy-guard source scan and name its removable work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Research; no commit. Local runs: `copies/test_copy_guard_sources.py` 34.1 and 20.2 CPU s (two runs, both pass). Step split: Python policy evaluation 15.8–16.2 s, shell checks 2.8–3.0 s, AST parses 2.0 s, file reads 0.03 s, no child processes. Both tests already share one scan; each file is read and parsed once. Candidates (bounds, not measured; all queue-owned in `scripts/copies/copy_guard.py`): allocate fallbacks only for missing keys (`:797`) 0–9.8 s; combine scope traversals (`:900,1124`) 0–1.8 s; smaller items below 0.4 s. First aws trial: the `:797` change alone, three pairs, all 50 policy tests kept, after queue's go. Report: `phases/195/copy_guard_report.md` in the session folder.
+
+### Phase 196 — Profile the bulk-run interruption tests and name their repeated preparation  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** A report splits the copy-guard source-scan CPU by step and names any removable work, with a bounded estimate and an owner for each item.
+**Goal:** A report splits the CPU of the four `test_bulk_run.py` interruption cases and their shared setup, and names any repeated preparation, with a bounded estimate and an owner for each item.
 
-**Decision:** architect after Phase 193 (next items step 6, item 2): research only; no code change. queue owns `scripts/copies`. Keep both policy tests and every check.
+**Decision:** architect after Phase 193 (next items step 6, item 3): research only; no code change. style owns `scripts/style/bulk_run.py`. Assign no saving before a controlled trial.
 
 **Spec:**
-1. Profile `copies/test_copy_guard_sources.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> copies/test_copy_guard_sources.py --tests 10 --commands 10`, two runs.
-2. Split the 22.49 CPU s check scope into `scan_scripts` (`copy_guard.py:1183`), `PythonPolicy` (`:942`), file reads, AST parses and any child processes. Use `cProfile` only to rank steps; use paired runs for numbers (cProfile overstates).
-3. For each step, say whether the tests need it: map each assertion to the work it proves. Name repeated parses or reads of the same file, and work a test repeats that a class fixture could hold.
-4. Give each candidate a bounded estimate (CPU s, kept apart from measurements), its file and line, and its owner (queue for production code, natest for test code).
-5. Change no repository file. Write the report to `phases/195/copy_guard_report.md` in the session folder.
+1. Profile `style/test_bulk_run.py` with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> style/test_bulk_run.py --tests 10 --commands 10`, two runs.
+2. Separate the four interruption cases at `test_bulk_run.py:713` and their shared setup: admission startup, child processes, Git, journals and recovery.
+3. Map each assertion to the work it proves. Name preparation that each case repeats and a class fixture could hold.
+4. Keep real admission startup, interruption, journals and recovery. Give each candidate a bounded estimate (kept apart from measurements), its file and line, and its owner.
+5. Change no repository file. Write the report to `phases/196/bulk_run_report.md` in the session folder.
 
 **Files:**
-- `phases/195/copy_guard_report.md` — in the session folder.
+- `phases/196/bulk_run_report.md` — in the session folder.
 
 **Workers:** 1 researcher; no repository file changes.
 - impl: the report.
 
 **Constraints from prior phases:**
-- Phase 74: `copies/test_copy_guard.py` 64.15 to 31.36 CPU s in pairs; do not reopen its fixtures without new evidence.
-- No speed phase is selected from a local estimate; aws pairs decide (architect after Phase 190).
+- Phase 194: `test_bulk_run.py` 42.87 CPU s median in aws pairs (108 tests).
+- No speed phase is selected from a local estimate; aws pairs decide.
 
 **State:** none.
 
 **Acceptance gate:**
-- The report gives the step split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
+- The report gives the per-case split with measured CPU, the assertion map, and each candidate with bound, file, line and owner.
 - No repository file changes.
