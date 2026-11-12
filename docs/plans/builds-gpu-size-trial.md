@@ -1,7 +1,7 @@
 # GPU size trial
 
-Phase 1 provides local preparation, a test wrapper, comparison, and a NixOS system module.
-Phase 2 provides the AWS service and deployment changes.
+The implementation provides local preparation, a test wrapper, comparison, and a NixOS system module.
+The implementation also provides the AWS service and deployment changes.
 The director runs real preparation after review.
 
 ## Purpose
@@ -47,12 +47,22 @@ nix develop .#default -c cargo nextest archive --profile ci --locked --workspace
 Build one GPU system closure from the deployment host's locked nixpkgs input.
 The system module lives beside the existing NixOS patch: `docs/plans/builds-aws/gpu-trial.nix`.
 It includes the production NVIDIA driver, Vulkan, the Hana runtime closure, and the Rust toolchain.
+The Rust tools and nextest come from Nix store paths.
+Old preparations require a new `prepare` run before the service can use them.
+Use the Hana toolchain output when it exists.
+Otherwise, use the pinned host nixpkgs and Rust overlay.
+A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
+Fetch dependencies into a private Cargo cache.
+Never copy the user's Rust or Cargo directories.
+Check the toolchain wrappers for home paths.
+Test Cargo with an empty `HOME`.
 The L4 and T4 boxes use the official NixOS image that gates already use.
-Phase 2 imports the closure through signed URLs, runs `switch-to-configuration boot`, and reboots once.
+Each box imports the closure through signed URLs, runs `switch-to-configuration boot`, and reboots once.
+The [Nix manual](https://nix.dev/manual/nix/2.34/command-ref/nix-store/import.html) describes the closure import format.
 A systemd unit starts the installed trial runner after the reboot.
 Record the boot, import, reboot, and runner start times.
 
-## Online rules for phase 2
+## Online rules
 
 Select the first configured region with an applied G and VT Spot quota of at least 32.
 Refuse the run when no configured region qualifies.
@@ -78,6 +88,11 @@ The existing daily and monthly limits still apply.
 The box extra is USD0.05 for disk, IPv4, and transfer.
 
 Run one box at a time.
+Retain the trial ID, budget, region, and type order across restarts.
+A saved budget stop ends the trial.
+Use the original trial folder for a restart.
+The estimated GPU root size is `gpu_size_trial_root_gib=100`.
+The estimate includes the driver, runtime, archive extraction, and two test runs.
 Count boot, import, reboot, tests, and delivery within the 60-minute lifetime.
 Use early termination and expiry tags.
 An uncertain termination blocks the next launch.
@@ -96,11 +111,11 @@ python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
 `prepare` also accepts `--repo` and `--trial-folder` for local fixtures and explicit destinations.
 The folder must not exist.
 
-Phase 2 adds these user commands:
+The user runs these commands:
 
 ```sh
 python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
-python3 scripts/aws_target/deploy.py gpu-size-trial run --approve-resources
+python3 scripts/aws_target/deploy.py gpu-size-trial run --trial-folder DIR --approve-resources
 ```
 
 The first command adds the configured GPU types to the scaler policy.

@@ -27,17 +27,34 @@
   # Phase 2 installs this command before the single reboot.
   systemd.services.gpu-size-trial = {
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
+    after = [ "network-online.target" "gpu-trial-expiry-arm.service" ];
+    requires = [ "gpu-trial-expiry-arm.service" ];
     wants = [ "network-online.target" ];
     unitConfig.ConditionPathIsExecutable = "/var/lib/gpu-size-trial/run";
+    unitConfig.ConditionPathExists = "/var/lib/gpu-size-trial/stop-at";
     environment.WGPU_BACKEND = "vulkan";
     serviceConfig = {
       Type = "oneshot";
       User = "gpu-trial";
       WorkingDirectory = "/var/lib/gpu-size-trial";
+      ExecStartPre = "+${pkgs.coreutils}/bin/chown -R gpu-trial:users /var/lib/gpu-size-trial";
       ExecStart = "/var/lib/gpu-size-trial/run";
       KillMode = "control-group";
     };
+  };
+  systemd.services.gpu-trial-expiry-arm = {
+    before = [ "gpu-size-trial.service" ];
+    unitConfig.ConditionPathExists = "/var/lib/gpu-size-trial/stop-at";
+    path = with pkgs; [ systemd coreutils ];
+    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+    script = ''
+      deadline=$(cat /var/lib/gpu-size-trial/stop-at)
+      if [ "$deadline" -le "$(date +%s)" ]; then
+        shutdown -h now
+        exit 1
+      fi
+      systemd-run --unit=gpu-trial-expiry --on-calendar=@"$deadline" ${pkgs.systemd}/bin/shutdown -h now
+    '';
   };
   services.openssh.enable = lib.mkForce false;
 }

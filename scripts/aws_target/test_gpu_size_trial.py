@@ -4,7 +4,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stdout
 from dataclasses import asdict
-from io import StringIO
+from io import BytesIO, StringIO
+import base64
+from datetime import UTC, datetime
+from decimal import Decimal
+import tarfile
 import json
 import os
 from pathlib import Path
@@ -17,7 +21,9 @@ from typing import BinaryIO, cast, final, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import gpu_size_trial as trial
+from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
+from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import merge_gate
@@ -66,6 +72,73 @@ class GpuTrialTests(unittest.TestCase):
         for payload in (cpu, HARDWARE + cpu, '', 'deviceType = unknown'):
             with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, 'CPU adapters are refused'):
                 _ = trial.hardware_vulkan(payload)
+
+    def test_generated_guest_executes_both_runs_and_publishes_results(self) -> None:
+        folder = self.root / 'guest'
+        folder.mkdir()
+        source = self.root / 'guest-source'
+        (source / '.config').mkdir(parents=True)
+        _ = (source / '.config/nextest.toml').write_text('[profile.ci]\n')
+        with tarfile.open(folder / 'source.tar', 'w') as archive:
+            archive.add(source / '.config', arcname='.config')
+        downloaded_archive = self.root / 'downloaded-archive'
+        _ = downloaded_archive.write_bytes(b'fixture archive')
+        trial.write_json(folder / 'request.json', {'commit': 'a' * 40})
+        trial.write_json(folder / 'manifest.json', {'nextest': 'cargo-nextest fixture', 'sha256': {
+            'source.tar': trial.digest(folder / 'source.tar'),
+            'hana-tests.tar.zst': trial.digest(downloaded_archive)}})
+        trial.write_json(folder / 'setup.json', {'boot': 2, 'import_start': 3, 'import_end': 4, 'reboot': 5})
+        uploaded = self.root / 'uploaded'
+        uploaded.mkdir()
+        trial.write_json(folder / 'links.json', {'started': '1', 'archive': str(downloaded_archive),
+            'instance_type': 'g6.xlarge', 'result-1': str(uploaded / 'result-1.tar.gz'),
+            'result-2': str(uploaded / 'result-2.tar.gz'), 'finished': str(uploaded / 'finished.json')})
+        tools = self.root / 'guest-tools'
+        tools.mkdir()
+        fake = '''import json, os, shutil, sys, tomllib
+from pathlib import Path
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+if name == 'vulkaninfo':
+    print('deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\ndeviceName = Fixture GPU')
+elif name == 'curl':
+    if '-T' in args:
+        shutil.copyfile(args[args.index('-T') + 1], args[-1])
+    else:
+        index = args.index('-o')
+        shutil.copyfile(args[index - 1], args[index + 1])
+elif name == 'cargo':
+    if '--version' in args:
+        print('cargo-nextest fixture')
+    else:
+        assert args[:2] == ['nextest', 'run'], args
+        config = Path(args[args.index('--config-file') + 1])
+        junit = Path(tomllib.loads(config.read_text())['profile']['ci']['junit']['path'])
+        junit.write_text('<testsuites/>')
+        samples = Path(os.environ['GPU_TRIAL_SAMPLES'])
+        samples.mkdir()
+        (samples / 'test.json').write_text(json.dumps({'binary': 'fixture', 'test': 'test',
+            'status': 0, 'wall_s': 1, 'largest_process_peak_rss_kib': 1024}))
+'''
+        for name in ('cargo', 'vulkaninfo', 'curl'):
+            executable = tools / name
+            _ = executable.write_text('#!' + sys.executable + '\n' + fake)
+            executable.chmod(0o700)
+        guest = folder / 'guest.py'
+        _ = guest.write_text(trial.guest_program().replace(
+            "root = Path('/var/lib/gpu-size-trial')", 'root = Path(' + repr(str(folder)) + ')', 1))
+        result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+            env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ.get('PATH', ''),
+                 'GPU_TRIAL_CARGO': str(tools / 'cargo')})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        finished = trial.read_json(uploaded / 'finished.json')
+        self.assertEqual(finished['status'], 'complete', finished)
+        for number in (1, 2):
+            with tarfile.open(uploaded / f'result-{number}.tar.gz') as bundle:
+                names = bundle.getnames()
+            self.assertIn('machines/g6.xlarge/vulkan.txt', names)
+            self.assertIn(f'machines/g6.xlarge/{number}/samples/test.json', names)
+            self.assertIn(f'machines/g6.xlarge/{number}/junit.xml', names)
 
     def test_environment_removes_software_overrides(self) -> None:
         with mock.patch.dict(os.environ, {'VK_DRIVER_FILES': 'lavapipe.json', 'LIBGL_ALWAYS_SOFTWARE': '1',
@@ -210,19 +283,20 @@ class GpuTrialTests(unittest.TestCase):
             if argv[0] == 'git':
                 with mock.patch.object(subprocess, 'run', real_run):
                     return real_checked(argv, cwd, environment=environment)
-            if argv[:2] == ['rustup', 'which']:
-                return '/nix/store/fixture-rust/bin/rustc'
             if argv[:2] == ['nix', 'eval']:
                 return '/nix/store/fixture-nixpkgs'
-            if argv[:3] == ['nix', 'store', 'add-path']:
-                return '/nix/store/fixture-rust'
             if argv[:2] == ['nix', 'print-dev-env']:
                 return 'export LD_LIBRARY_PATH=/nix/store/fixture-runtime/lib'
             if argv[:2] == ['nix', 'build']:
-                self.assertIn('gpu-trial.nix', argv[-1])
-                return '/nix/store/fixture-system'
+                return '/nix/store/fixture-system' if 'gpu-trial.nix' in argv[-1] else '/nix/store/fixture-rust'
             if argv[0] == 'nix-store':
                 return '/nix/store/fixture-system\n/nix/store/fixture-runtime\n/nix/store/fixture-rust'
+            if argv[0] == '/nix/store/fixture-rust/bin/cargo' and '--version' in argv:
+                self.assertEqual(list(Path(environment['HOME']).iterdir()), [])
+            if 'fetch' in argv:
+                fresh = Path(environment['CARGO_HOME']) / 'registry'
+                fresh.mkdir()
+                _ = (fresh / 'dependency').write_text('fresh source')
             if 'vulkaninfo' in argv:
                 return HARDWARE
             if 'archive' in argv:
@@ -250,6 +324,7 @@ class GpuTrialTests(unittest.TestCase):
 
         with (mock.patch.object(trial, 'checked', side_effect=checked),
               mock.patch.object(subprocess, 'run', side_effect=execute),
+              mock.patch.object(trial, 'scan_toolchain_wrappers'),
               mock.patch.dict(os.environ, {'CARGO_HOME': str(cache)})):
             trial.prepare_worker(folder)
         manifest = trial.read_json(folder / 'manifest.json')
@@ -258,7 +333,8 @@ class GpuTrialTests(unittest.TestCase):
         for name, value in trial.mapping(manifest['sha256']).items():
             self.assertEqual(trial.digest(folder / name), value)
         self.assertFalse((folder / 'cargo-home/credentials.toml').exists())
-        self.assertTrue((folder / 'cargo-home/registry/dependency').exists())
+        self.assertEqual((folder / 'cargo-home/registry/dependency').read_text(), 'fresh source')
+        self.assertFalse(any('rustup' in command or 'add-path' in command for command in commands))
         runs = [command for command in commands if 'run' in command]
         self.assertEqual(len(runs), 2)
         self.assertTrue(all(command[command.index('--retries') + 1] == '0' for command in runs))
@@ -284,6 +360,23 @@ class GpuTrialTests(unittest.TestCase):
         (machine / 'machine.json').unlink()
         self.assertIn('| incomplete |', trial.compare(folder))
 
+    def test_toolchain_wrapper_has_no_home_dependency_and_uses_empty_home(self) -> None:
+        toolchain = self.root / 'toolchain'
+        (toolchain / 'bin').mkdir(parents=True)
+        cargo = toolchain / 'bin/cargo'
+        _ = cargo.write_text('#!/bin/sh\nprintf "cargo fixture-version\\n"\n')
+        cargo.chmod(0o700)
+        trial.scan_toolchain_wrappers(toolchain)
+        empty = self.root / 'empty-home'
+        empty.mkdir()
+        result = trial.checked([str(cargo), '--version'], self.root,
+                               environment={**os.environ, 'HOME': str(empty)})
+        self.assertEqual(result, 'cargo fixture-version')
+        self.assertEqual(list(empty.iterdir()), [])
+        _ = cargo.write_text('#!/bin/sh\nexec /home/fixture/.cargo/bin/cargo-tile-capture "$@"\n')
+        with self.assertRaisesRegex(ValueError, 'depends on a user home'):
+            trial.scan_toolchain_wrappers(toolchain)
+
     def test_bad_measurements_are_incomplete(self) -> None:
         run = self.root / 'run'
         (run / 'samples').mkdir(parents=True)
@@ -293,6 +386,294 @@ class GpuTrialTests(unittest.TestCase):
             trial.write_json(run / 'samples/test.json', {'binary': 'fixture', 'test': 'test',
                 'status': 0, 'wall_s': value, 'largest_process_peak_rss_kib': 123})
             self.assertEqual(trial.read_run(run), {})
+
+
+@final
+class FakeGpuAws:
+    def __init__(self, manifest: dict[str, object], types: Sequence[str], region: str) -> None:
+        self.manifest = manifest
+        self.types = tuple(types)
+        self.region = region
+        self.now = 1768478400.0
+        self.quotas: dict[str, int] = {region: 32}
+        self.missing: set[str] = set()
+        self.expensive: set[str] = set()
+        self.events: list[str] = []
+        self.objects: dict[str, bytes] = {}
+        self.instances: dict[str, str] = {}
+        self.launches: list[dict[str, object]] = []
+        self.fail_result = False
+        self.unconfirmed = False
+
+    def clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.now += max(1, seconds)
+
+    def results(self, attempt: str, size: str) -> None:
+        for number in (1, 2):
+            payloads = {'machine.json': {'commit': self.manifest['commit'],
+                                        'archive_sha256': trial.mapping(self.manifest['sha256'])['hana-tests.tar.zst']},
+                        str(number) + '/run.json': {'status': 0},
+                        str(number) + '/samples/test.json': {'binary': 'fixture', 'test': 'test',
+                            **asdict(trial.TestSample(0, 1.0, 4096))}}
+            output = BytesIO()
+            with tarfile.open(fileobj=output, mode='w:gz') as archive:
+                files = {name: json.dumps(value).encode() for name, value in payloads.items()}
+                files.update({'vulkan.txt': HARDWARE.encode(), str(number) + '/junit.xml': b'<testsuites/>'})
+                for name, data in files.items():
+                    entry = tarfile.TarInfo('machines/' + size + '/' + name)
+                    entry.size = len(data)
+                    archive.addfile(entry, BytesIO(data))
+            self.objects['artifacts/gpu-size-trial/' + attempt + '/result-' + str(number) + '.tar.gz'] = output.getvalue()
+        self.objects['artifacts/gpu-size-trial/' + attempt + '/finished.json'] = b'{"status":"complete"}'
+
+    def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
+                timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        del capture_output, text, timeout, check, env
+        if arguments[0] != 'aws':
+            raise AssertionError('Unexpected external command: ' + str(arguments))
+        offset = arguments.index('--region')
+        region, service, operation = arguments[offset + 1:offset + 4]
+        self.events.append(operation)
+        reply: dict[str, object]
+        if operation == 'get-service-quota':
+            self.events[-1] += ':' + region
+            reply = {'Quota': {'Value': self.quotas.get(region, 0)}}
+        elif operation == 'describe-instance-type-offerings':
+            size = arguments[arguments.index('--filters') + 1].split('Values=')[1]
+            reply = {'InstanceTypeOfferings': [] if size in self.missing else [
+                {'InstanceType': size, 'Location': region + 'a'}]}
+        elif operation == 'describe-spot-price-history':
+            size = arguments[arguments.index('--instance-types') + 1]
+            maximum = trial.settings().spot_max_usd_per_hour[size]
+            reply = {'SpotPriceHistory': [{'InstanceType': size, 'AvailabilityZone': region + 'a',
+                'SpotPrice': str(maximum * (2 if size in self.expensive else Decimal('0.5'))),
+                'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat()}]}
+        elif operation == 'put-object':
+            key = arguments[arguments.index('--key') + 1]
+            self.objects[key] = Path(arguments[arguments.index('--body') + 1]).read_bytes()
+            reply = {}
+        elif operation == 'get-object':
+            if self.fail_result:
+                self.fail_result = False
+                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (AccessDenied) when calling GetObject')
+            key = arguments[arguments.index('--key') + 1]
+            self.events[-1] += ':' + key.rsplit('/', 1)[-1]
+            if key not in self.objects:
+                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (NoSuchKey) when calling GetObject')
+            _ = Path(arguments[arguments.index('--key') + 2]).write_bytes(self.objects[key])
+            reply = {}
+        elif operation == 'export-credentials' and service == 'configure':
+            reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
+        elif operation == 'run-instances':
+            if any(state != 'terminated' for state in self.instances.values()):
+                raise AssertionError('The next box started before confirmed termination')
+            launch = trial.mapping(cast(object, json.loads(arguments[arguments.index('--cli-input-json') + 1])))
+            self.launches.append(launch)
+            size = str(launch['InstanceType'])
+            self.events[-1] += ':' + size
+            instance = 'i-fixture-' + str(len(self.launches))
+            self.instances[instance] = 'running'
+            self.results(str(launch['ClientToken']), size)
+            reply = {'Instances': [{'InstanceId': instance}]}
+            self.now += 60
+        elif operation == 'terminate-instances':
+            for instance in arguments[arguments.index('--instance-ids') + 1:arguments.index('--output')]:
+                if not self.unconfirmed:
+                    self.instances[instance] = 'terminated'
+            reply = {}
+        elif operation == 'describe-instances':
+            if '--filters' in arguments:
+                reply = {'Reservations': []}
+            else:
+                ids = arguments[arguments.index('--instance-ids') + 1:arguments.index('--output')]
+                reply = {'Reservations': [{'Instances': [{'InstanceId': instance, 'State': {'Name': self.instances[instance]}}
+                                                         for instance in ids]}]}
+        else:
+            raise AssertionError('Unexpected AWS command: ' + str(arguments))
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+
+@final
+class GpuOnlineTests(CostFixture):
+    folder: Path = Path()
+    book: ledger.CostLedger = ledger.CostLedger(Path())
+    fake: FakeGpuAws = cast(FakeGpuAws, object())
+    worker: trial.GpuTrialWorker = cast(trial.GpuTrialWorker, object())
+    deployment: dict[str, object] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        candidates = conf.read('cloud_gate').words('spot_candidate_regions')
+        region = candidates[0]
+        self.folder = self.root / 'gpu-trial'
+        self.folder.mkdir()
+        limits = trial.settings()
+        prices = dict(list(limits.spot_max_usd_per_hour.items())[:2])
+        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_spot_max_usd_per_hour='
+                                  + json.dumps({key: str(value) for key, value in prices.items()}))
+        for name in ('source.tar', 'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json', 'gpu_trial_wrapper.py',
+                     'hana-tests.tar.zst', 'closure.export'):
+            _ = (self.folder / name).write_text('fixture ' + name)
+        (self.folder / 'cargo-home').mkdir()
+        trial.write_json(self.folder / 'inventory.json', {'tests': [{'binary': 'fixture', 'test': 'test'}]})
+        manifest: dict[str, object] = {'schema': 2, 'toolchain_source': 'nix', 'state': 'prepared', 'trial': 'stable-fixture-trial', 'commit': 'a' * 40,
+            'system': '/nix/store/fixture-system', 'toolchain': '/nix/store/fixture-rust',
+            'limits': {'limit_usd': str(limits.limit_usd)},
+            'sha256': {name: trial.digest(path) for path in self.folder.iterdir() if path.is_file()
+                       for name in (path.name,)}}
+        trial.write_json(self.folder / 'manifest.json', manifest)
+        self.fake = FakeGpuAws(manifest, tuple(prices), region)
+        api = AwsCli('fixture-scaler', 'us-east-1', 5, self.fake.execute)
+        self.book = ledger.CostLedger(self.state)
+        self.book.record_inventory(ledger.ResourceInventory(int(self.fake.now) - 1, (), 'fixture', builder_removed=True))
+        gates = cloud_gate.GateWorker(api, self.book, self.settings, self.folder / 'sidecar',
+                                     clock=self.fake.clock, pause=self.fake.pause)
+        _ = self.enterContext(mock.patch.object(gates, 'charges'))
+        self.worker = trial.GpuTrialWorker(gates)
+        self.deployment = {'bucket': 'fixture-bucket', 'deployment_id': 'fixture-deployment', 'regions': [
+            {'region': candidate, 'template': 'lt-fixture', 'version': '1', 'image': 'ami-nixos',
+             'security_group': 'sg-fixture', 'subnets': [{'id': 'subnet-fixture', 'zone': candidate + 'a'}]}
+            for candidate in candidates]}
+
+    def execute(self) -> None:
+        with redirect_stdout(StringIO()):
+            self.worker.execute(self.folder, self.deployment)
+
+    def test_old_preparation_requires_the_nix_toolchain_fix(self) -> None:
+        manifest = trial.read_json(self.folder / 'manifest.json')
+        manifest['schema'] = 1
+        _ = manifest.pop('toolchain_source')
+        trial.write_json(self.folder / 'manifest.json', manifest)
+        with self.assertRaisesRegex(ValueError, 'Prepare the trial again with the Nix toolchain'):
+            self.execute()
+        self.assertEqual(self.fake.events, [])
+
+    def test_no_region_granted_stops_before_upload_or_launch(self) -> None:
+        self.fake.quotas.clear()
+        with self.assertRaisesRegex(ValueError, 'No configured region has an applied G and VT Spot quota'):
+            self.execute()
+        self.assertEqual(self.fake.launches, [])
+        self.assertNotIn('put-object', self.fake.events)
+        regions = conf.read('cloud_gate').words('spot_candidate_regions')
+        self.assertEqual(self.fake.events, ['get-service-quota:' + region for region in regions])
+
+    def test_not_offered_type_is_reported_and_next_type_runs(self) -> None:
+        first, second = self.fake.types
+        self.fake.missing.add(first)
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [second])
+        self.assertEqual(trial.read_json(self.folder / 'boxes' / first / 'outcome.json')['status'], 'not offered')
+
+    def test_price_above_max_is_reported_without_launch(self) -> None:
+        first, second = self.fake.types
+        self.fake.expensive.add(first)
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [second])
+        self.assertEqual(trial.read_json(self.folder / 'boxes' / first / 'outcome.json')['status'], 'price above max')
+
+    def test_results_and_resolution_precede_next_launch(self) -> None:
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], list(self.fake.types))
+        events = self.fake.events
+        first, second = self.fake.types
+        self.assertLess(events.index('get-object:result-2.tar.gz'), events.index('terminate-instances'))
+        self.assertLess(events.index('describe-instances'), events.index('run-instances:' + second))
+        rows = self.book.read_snapshot().gate_reservations
+        self.assertTrue(all(isinstance(row.state, ledger.GateTerminated) for row in rows))
+        self.assertTrue(all(row.mode == 'gpu-size-trial' for row in rows))
+        for size in (first, second):
+            self.assertTrue((self.folder / 'machines' / size / '2/samples/test.json').exists())
+        for launch in self.fake.launches:
+            bootstrap = base64.b64decode(str(launch['UserData'])).decode()
+            self.assertIn('switch-to-configuration', bootstrap)
+            self.assertIn('reboot', bootstrap)
+            self.assertNotIn('fixture-secret', bootstrap)
+            self.assertNotIn('AWS_SHARED_CREDENTIALS_FILE', bootstrap)
+            self.assertEqual(launch['ImageId'], 'ami-nixos')
+            self.assertEqual(trial.mapping(trial.mapping(launch['InstanceMarketOptions'])['SpotOptions'])['MaxPrice'],
+                             str(trial.settings().spot_max_usd_per_hour[str(launch['InstanceType'])]))
+            self.assertEqual(trial.mapping(trial.mapping(cast(list[object], launch['BlockDeviceMappings'])[0])['Ebs'])['VolumeSize'],
+                             conf.read('cloud_gate').whole('gpu_size_trial_root_gib'))
+
+    def test_budget_counts_previous_open_reservation(self) -> None:
+        with mock.patch.object(self.worker, 'artifacts', side_effect=ValueError('fixture stops before artifacts')):
+            with self.assertRaisesRegex(ValueError, 'fixture stops before artifacts'):
+                self.execute()
+        limits = trial.settings()
+        first = self.fake.types[0]
+        next_cost = limits.spot_max_usd_per_hour[first] * limits.lifetime_minutes / 60 + limits.box_extra_usd
+        remaining = limits.limit_usd - next_cost / 2
+        reservation = ledger.GateReservation('older-attempt', int(self.fake.now), int(self.fake.now) + 3600,
+            remaining, Decimal(0), mode='gpu-size-trial', region=self.fake.region,
+            trial=ledger.GateTrialBudget('stable-fixture-trial', limits.limit_usd))
+        self.assertIsInstance(self.book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+        self.execute()
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(trial.read_json(self.folder / 'boxes' / first / 'outcome.json')['status'], 'budget stop')
+        self.assertEqual(len(self.book.read_snapshot().gate_reservations), 1)
+        self.execute()
+        self.assertEqual(self.fake.launches, [])
+
+    def test_restart_reuses_trial_and_does_not_repeat_the_first_launch(self) -> None:
+        self.fake.fail_result = True
+        with self.assertRaises(AwsUnavailable):
+            self.execute()
+        first = self.book.read_snapshot().gate_reservations[0]
+        self.assertIsInstance(first.state, ledger.GateTerminated)
+        uploads = self.fake.events.count('put-object')
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], list(self.fake.types))
+        self.assertEqual(self.fake.events.count('put-object'), uploads)
+        rows = self.book.read_snapshot().gate_reservations
+        self.assertEqual({row.trial.trial_id for row in rows if isinstance(row.trial, ledger.GateTrialBudget)},
+                         {'stable-fixture-trial'})
+        self.assertEqual(rows[0].attempt, first.attempt)
+
+    def test_restart_cleans_the_booked_instance_without_local_launch_files(self) -> None:
+        self.fake.fail_result = True
+        self.fake.unconfirmed = True
+        with self.assertRaisesRegex(ValueError, 'termination remains unconfirmed'):
+            self.execute()
+        first = self.fake.types[0]
+        box = self.folder / 'boxes' / first
+        (box / 'request.json').unlink()
+        (box / 'launch.json').unlink()
+        self.fake.unconfirmed = False
+        self.execute()
+        self.assertTrue(all(value == 'terminated' for value in self.fake.instances.values()))
+        self.assertEqual(len(self.fake.launches), len(self.fake.types))
+
+    def test_uncertain_termination_prevents_next_launch(self) -> None:
+        self.fake.unconfirmed = True
+        with self.assertRaisesRegex(ValueError, 'termination remains unconfirmed'):
+            self.execute()
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateRunning)
+
+    def test_guest_program_is_standalone_and_has_no_aws_client(self) -> None:
+        guest = trial.guest_program()
+        _ = compile(guest, 'guest.py', 'exec')
+        self.assertNotIn('scripts.aws_target', guest)
+        self.assertNotIn('signal.signal', guest)
+        self.assertIn('publish(run)', guest)
+
+    def test_service_has_scaler_credentials_and_stop_cleanup(self) -> None:
+        commands: list[list[str]] = []
+        def execute(arguments: Sequence[str]) -> int:
+            commands.append(list(arguments))
+            return 0
+        credential = self.root / 'override-credentials'
+        with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': str(credential)}):
+            self.assertEqual(trial.start_service(self.folder, self.state, self.settings, execute), 0)
+        command, = commands
+        cleanup, = [value for value in command if value.startswith('--property=ExecStopPost=')]
+        self.assertIn('--cleanup', cleanup)
+        self.assertIn('scripts.aws_target.gpu_size_trial', cleanup)
+        self.assertIn('--setenv=AWS_SHARED_CREDENTIALS_FILE=' + str(credential), command)
 
 
 if __name__ == '__main__':
