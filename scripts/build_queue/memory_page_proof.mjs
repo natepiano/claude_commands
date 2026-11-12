@@ -31,6 +31,8 @@ try {
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
+  base.walk.find(row => row.queued).started_at = now - 120;
+  base.waiters[0].since = now - 2 * 86400;
   const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
     kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
   const smaller = swapOwners.slice(base.swap_rows);
@@ -200,7 +202,6 @@ try {
               const row = document.querySelector('.wrow[data-run]');
               const progress = row.querySelector('.row-progress');
               const cap = document.querySelector('.walk-bud');
-              const table = document.querySelector('.walk-table');
               const color = name => {
                 const probe = document.createElement('span');
                 probe.style.backgroundColor = 'var('+name+')'; document.body.append(probe);
@@ -223,20 +224,15 @@ try {
               const owner = row.querySelector('.owner');
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
-                headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                tables:document.querySelectorAll('#walk table').length,
                 answer:text('#answer'),
-                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
-                queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
-                queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
-                stages:[...table.querySelectorAll('tbody tr[data-tip] .stage')].map(e=>e.textContent),
-                layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
-                rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
-                  const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
-                    document.querySelector('.wrow.room');
-                  return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
-                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
-                }),
-                machine:table.querySelector('td.machine')?.textContent,
+                runTime:row.querySelector('.row-time').textContent,
+                waitTime:document.querySelector('.wrow.wait .row-time').textContent,
+                timeFont:getComputedStyle(row.querySelector('.row-time')).fontSize,
+                ownerFont:getComputedStyle(owner).fontSize,
+                runTip:tipText(row.dataset.tip,latest).join(' '),
+                rowBounds:[...document.querySelectorAll('#walk .wrow')].map(row=>({
+                  row:rect(row),label:rect(row.querySelector('.row-label')),track:rect(row.querySelector('.track'))})),
                 cap:rect(document.querySelector('#mark')), room:text('#v-room'),
                 capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
@@ -267,15 +263,29 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.tables,0,'The running panel retains a table.');
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Stage','Unit','Pid','Machine','vCPU']);
-            assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
-            assert.ok(proof.stages.includes('testing'));
-            assert.ok(proof.stages.at(-1)==='');
-            for(const offsets of proof.rowOffsets)
-              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
-            assert.equal(proof.machine, 'fixture');
+            assert.equal(proof.runTime,'2 min');
+            assert.equal(proof.waitTime,'waits 2 days');
+            assert.equal(proof.timeFont,proof.ownerFont);
+            for(const field of ['Place: run','Machine: fixture','vCPU: 32','Unit: fixture-unit','Pid: 50'])
+              assert.ok(proof.runTip.includes(field),field+' is absent from the row tooltip.');
+            for(const shown of [proof.name,proof.owner,proof.runTime])
+              assert.ok(!proof.runTip.includes(shown),'The tooltip repeats a row value: '+shown);
+            for(const bounds of proof.rowBounds) {
+              assert.ok(bounds.label.right<=bounds.track.left,'The label crosses the memory chart.');
+              assert.ok(bounds.label.bottom<=bounds.row.bottom+1,'The row clips its label.');
+            }
+            const clickedTip=await evaluate(`(() => {
+              document.querySelector('.wrow[data-run]').dispatchEvent(new MouseEvent('click',{
+                bubbles:true,clientX:${width / 2},clientY:100}));
+              const tip=document.querySelector('#tip'),bounds=tip.getBoundingClientRect();
+              const result={text:tip.textContent,visible:tip.classList.contains('on'),left:bounds.left,right:bounds.right};
+              hideTip();return result;
+            })()`);
+            assert.ok(clickedTip.visible,'The row click does not open its tooltip.');
+            assert.ok(clickedTip.text.includes('Machine: fixture'),'The row tooltip loses the machine.');
+            assert.ok(clickedTip.left>=0 && clickedTip.right<=width,'The tooltip crosses the viewport edge.');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
             assert.match(proof.leftover,/pid 46/);
@@ -315,7 +325,6 @@ try {
             const shot = await call('Page.captureScreenshot', {format:'png', captureBeyondViewport:true,
               clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
             const pixels = Buffer.from(shot.data,'base64');
-            await writeFile(join(folder, `${theme}-${width}.png`),pixels);
             const pixel=pngPixels(pixels);
             const expected=proof.progressColor.match(/[0-9.]+/g).slice(0,3).map(Number);
             const x=Math.floor(proof.progress.left+proof.progress.width/2);
@@ -408,27 +417,23 @@ try {
               ['cloud_empty','']]) {
               await show(readings[name]);
               const detailProof=await evaluate(`(() => {
-                const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
-                const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
+                const index=latest.walk.findIndex(row=>row.pid===700001);
+                const chart=document.querySelector('.wrow[data-run="'+index+'"]');
                 const amounts=chart.querySelector('.amounts');
                 return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
                   ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
                   rootFont:getComputedStyle(document.documentElement).fontSize,
-                  beside:document.querySelector('#walk').classList.contains('beside'),
                   detailRight:amounts.getBoundingClientRect().right,
-                  tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
-                  chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
+                  chartRight:chart.getBoundingClientRect().right,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
               const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
               assert.equal(detailProof.text,expected,'The AWS detail text differs.');
               assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
               assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
-              if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
-                'The AWS detail text crosses into the table.');
-              assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
+              assert.ok(detailProof.detailRight<=detailProof.chartRight+1,'The AWS detail text crosses the chart edge.');
               assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
-              if(name==='cloud_region') {
+              if(name==='cloud_region' && theme==='light' && [1400,390].includes(width)) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
@@ -446,24 +451,20 @@ try {
             assert.equal(cloudRow.late_age,lateAge);
             assert.ok(!cloudRow.status.includes('no update for'),'The feed mixes the state and late age.');
             const cloudProof=await evaluate(`(() => {
-              const table=document.querySelector('.walk-table');
-              const rows=[...table.querySelectorAll('tbody tr')];
-              const running=rows.find(row=>row.textContent.includes('700001'));
-              const waiting=rows.find(row=>row.textContent.includes('700002'));
-              const details=row=>row?document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]'):null;
-              const runningDetails=details(running),waitingDetails=details(waiting);
-              const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
+              const runIndex=latest.walk.findIndex(row=>row.pid===700001);
+              const waitIndex=latest.waiters.findIndex(row=>row.pid===700002);
+              const runningDetails=document.querySelector('.wrow[data-run="'+runIndex+'"]');
+              const waitingDetails=document.querySelector('.wrow[data-tip="wait:'+waitIndex+'"]');
               const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
                 element.childElementCount===0 && element.textContent.includes('no update for'));
-              return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
-                running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
-                machine:running?.querySelector('.machine')?.textContent,
-                place:waiting?.querySelector('.place')?.textContent,
-                waitingMachine:waiting?.querySelector('.machine')?.textContent,
-                waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
-                vcpus:running?.querySelector('.vcpus')?.textContent,
+              return {tables:document.querySelectorAll('#walk table').length,
+                running:runningDetails?.textContent,waiting:waitingDetails?.textContent,
+                runTip:tipText('row:'+runIndex,latest).join(' '),
+                waitTip:tipText('wait:'+waitIndex,latest).join(' '),
+                runTime:runningDetails?.querySelector('.row-time')?.textContent,
+                waitTime:waitingDetails?.querySelector('.row-time')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
-                statusInTable:!!running && !!waiting,
+                cloudRows:!!runningDetails && !!waitingDetails,
                 cloudMemory:!!runningDetails?.querySelector('.reserved-amount,.used-amount,.b:not(.row-progress)'),
                 progressWidth:runningDetails?.querySelector('.row-progress')?.getBoundingClientRect().width,
                 progressTrackWidth:runningDetails?.querySelector('.progress-track')?.getBoundingClientRect().width,
@@ -471,10 +472,8 @@ try {
                 amounts:runningDetails?.querySelector('.amounts')?.textContent,
                 trackText:runningDetails?.querySelector('.track')?.textContent,
                 waitingBar:!!waitingDetails?.querySelector('.row-progress,.progress-track'),
-                height:runningDetails?.getBoundingClientRect().height,
-                tableHeight:running?.getBoundingClientRect().height,
-                tipsMatch:runningDetails?.querySelector('.track')?.dataset.tip===running?.dataset.tip &&
-                  runningDetails?.querySelector('.row-memory')?.dataset.tip===running?.dataset.tip,
+                tipsMatch:runningDetails?.querySelector('.track')?.dataset.tip===runningDetails?.dataset.tip &&
+                  runningDetails?.querySelector('.row-memory')?.dataset.tip===runningDetails?.dataset.tip,
                 localMemory:!!document.querySelector('.wrow .track .seg-used'),
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
@@ -482,10 +481,12 @@ try {
                 slots:document.querySelector('#walk').closest('.card').textContent,
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
-            assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
-            assert.equal(cloudProof.machine,'aws');
-            assert.equal(cloudProof.vcpus,'32');
+            assert.equal(cloudProof.tables,0,'The running panel retains a table.');
+            assert.ok(cloudProof.cloudRows,'Cloud work is absent from the chart.');
+            for(const field of ['Place: run','Machine: aws','vCPU: 32','Unit: cloud-unit','Pid: 700001'])
+              assert.ok(cloudProof.runTip.includes(field),field+' is absent from the cloud tooltip.');
+            assert.equal(cloudProof.runTime,'4 min');
+            assert.equal(cloudProof.waitTime,'waits 1 min');
             assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
             for(const value of [modules,failed,'no update for '+cloudRow.late_age])
               assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
@@ -495,11 +496,9 @@ try {
             assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
             assert.equal(cloudProof.trackText,'','The cloud track contains text.');
             assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
-            assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
-            assert.equal(cloudProof.place,'cloud');
-            assert.equal(cloudProof.waitingMachine,'');
-            assert.equal(cloudProof.waitingVcpus,'');
+            for(const field of ['Place: cloud','Machine: not assigned','vCPU: not assigned','Unit: waiting-unit','Pid: 700002'])
+              assert.ok(cloudProof.waitTip.includes(field),field+' is absent from the cloud wait tooltip.');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
             assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
             assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
@@ -548,8 +547,8 @@ try {
             await show(base);
 
             const positions=()=>evaluate(`(() => {
-              const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
-              return ['.duration','.unit','.pid'].map(selector=>{
+              const row=document.querySelector('.wrow[data-run]');
+              return ['.row-label','.track'].map(selector=>{
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
@@ -563,18 +562,18 @@ try {
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
-              assert.ok(Math.abs(beforeWait[index].left-afterWait[index].left)<=1,'A waiting row moves a table column. '+JSON.stringify({width,theme,beforeWait,afterWait}));
-              if(index===0) assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,
-                'A waiting row changes the Duration width. '+JSON.stringify({width,theme,beforeWait,afterWait}));
+              assert.ok(Math.abs(beforeWait[index].left-afterWait[index].left)<=1,'A waiting row moves the chart.');
+              assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,'A waiting row changes the chart width.');
             }
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
             await show(absent);
-            const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
-              owner:document.querySelector('.wrow[data-run] .owner').textContent,
-              machine:document.querySelector('.walk-table td.machine').textContent})`);
-            assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+            const absentFields=await evaluate(`({owner:document.querySelector('.wrow[data-run] .owner').textContent,
+              tip:tipText(document.querySelector('.wrow[data-run]').dataset.tip,latest).join(' ')})`);
+            assert.equal(absentFields.owner,'');
+            assert.match(absentFields.tip,/Unit: not recorded/);
+            assert.match(absentFields.tip,/Machine: not recorded/);
 
             for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
               await show(readings[name]);
@@ -687,7 +686,8 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,failures},null,2)+'\n');
+        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,
+          failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
       } finally {
         if(ws) ws.close();
