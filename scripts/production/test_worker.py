@@ -32,6 +32,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
 from scripts.lib import atomic_file, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
@@ -405,16 +406,33 @@ class WorkerCommandTests(unittest.TestCase):
                 worker_name=state.row.name, worker_id=state.row.id, launcher_command=["assign.sh"],
                 prompt=self.prompt, kind="impl", lens="")
             _ = self.fixture.world.stop(state.row, self.fixture.world)
-        record = staff.snapshot()
-        runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
-        with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
-              patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
-              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
-        self.assertEqual(active.call_count, 2)
-        self.assertEqual(searches.call_count, 0)
-        self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id):
+                    _ = self.fixture.world.stop(row, self.fixture.world)
+                pane = "w1:p-unread"
+                self.fixture.world.locations[pane] = {"pane_id": pane, "terminal_id": "unread-terminal",
+                    "workspace_id": "w1", "tab_id": "w1:t1", "label": "unread"}
+                if unknown:
+                    self.fixture.world.unknown[pane] = "private process facts are unavailable"
+                else:
+                    del self.fixture.world.locations[pane]
+                before = self.fixture.world.process_reads.count(pane)
+                with redirect_stderr(io.StringIO()) as errors:
+                    record = staff.snapshot()
+                    runs = {str(self.fixture.parent.current_session): [str(first), str(self.run_dir)]}
+                    with (patch.object(unit_runs, "held_by_session", return_value=runs) as searches,
+                          patch.object(progress_history, "active_dispatch", wraps=progress_history.active_dispatch) as active,
+                          patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(worker.restore(self.fixture.parent.id, record=record, runs=runs), worker.ExitCode.OK)
+                    self.assertEqual(active.call_count, 2)
+                    self.assertEqual(searches.call_count, 0)
+                    self.assertEqual([call.args[1] for call in active.call_args_list], [self.run_dir, self.run_dir])
+                if unknown:
+                    self.assertEqual(self.fixture.world.process_reads.count(pane) - before, 1)
+                    self.assertEqual(sum("pane evidence is unknown" in line
+                                         for line in errors.getvalue().splitlines()), 1)
 
     def test_restore_resumes_a_stopped_idle_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=False)
@@ -940,6 +958,29 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(self.agent.compactions, expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
                 self.agent.compactions.clear()
+
+        with self.subTest(storage="compressed"):
+            self.agent.compact_error = ""
+            current = self.opened("impl-compact-saved")
+            backend = staff.backend(current.row)
+            assert isinstance(backend, staff.CodexBackend)
+            source = worker_admission.transcript_source(current.row, backend)
+            with source.open("a") as stream:
+                _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+            content = source.read_bytes()
+            _ = compressed_copy(source)
+            before = len(self.agent.submitted)
+
+            def resume_transcript() -> None:
+                atomic_file.write_bytes_atomic(source, content)
+
+            with patch.object(staff, "backend", return_value=backend):
+                result = worker.dispatch_turn(self.fixture.parent.id, current, self.fixture.world,
+                    "End your final reply with DONE compressed-dispatch", "compressed-dispatch",
+                    run=self.run_dir, on_submission=resume_transcript)
+            self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+            self.assertEqual(self.agent.compactions, [(current.pane, before)])
 
     def test_long_dispatch_waits_without_submitting_again(self) -> None:
         self.agent.finish_after = 3

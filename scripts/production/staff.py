@@ -134,7 +134,7 @@ def runtime_id(pid: int | None = None) -> str:
     """Read the exact Claude registry pid, or the caller's Codex runtime identity."""
     import subprocess
     from scripts.agents import worker_lifecycle
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
 
     if pid is None and (thread := os.environ.get("CODEX_THREAD_ID", "")):
         try:
@@ -1044,7 +1044,8 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each home."""
-    from scripts.message import sessions
+    from scripts.lib.transcripts import transcript_paths, uncompressed_path
+    from scripts.message import session_records as sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
     observe_home = cast(Callable[[], object], accounts.observe_workers_home)
@@ -1059,8 +1060,8 @@ def _found_backends(rows: Sequence[StaffRow],
     for home in dict.fromkeys(homes):
         try:
             for folder in ("sessions", "archived_sessions"):
-                for path in (home / folder).rglob("*.jsonl"):
-                    identity = wanted.get(StaffId(path.stem[-36:]))
+                for path in transcript_paths(home / folder):
+                    identity = wanted.get(StaffId(uncompressed_path(path).stem[-36:]))
                     if identity is not None:
                         codex_sessions.add(identity)
                         if recorded_homes.get(identity) == home:
@@ -1744,7 +1745,7 @@ def require_stopped(identity: StaffId) -> None:
     target = record.by_id(identity)
     if target is None:
         return
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
     observed = sessions.session_liveness(target.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
         raise StaffRefused(f"{identity}: native session is live (pid {observed.pid}); stop it before removing its row")
@@ -1792,7 +1793,7 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
         if not children:
             break
         selected.update(children)
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
 
     for candidate in selected.values():
         locations = _location_paths(candidate)

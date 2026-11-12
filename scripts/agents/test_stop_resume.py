@@ -31,6 +31,7 @@ from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import restart, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, unit_runs
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
 from scripts.agents.stop_results import ClaudeStartState, StopResult
 
@@ -42,7 +43,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 from scripts.usage import agents_log
 from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, shutdown
-from scripts.message import sessions
+from scripts.message import codex_daemon, session_records, sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history
@@ -237,10 +238,11 @@ class WorkerResumeTests(unittest.TestCase):
 @final
 class StopResumeTests(unittest.TestCase):
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
-        cases: tuple[tuple[Literal["claude", "codex"], bool, str], ...] = (
-            ("claude", False, "opus"), ("codex", False, "gpt-test"), ("claude", True, "opus"),
-            ("claude", False, "claude-opus-producer-fixture"))
-        for kind, existing, expected_model in cases:
+        cases: tuple[tuple[Literal["claude", "codex"], bool, str, bool], ...] = (
+            ("claude", False, "opus", False), ("codex", False, "gpt-test", False), ("claude", True, "opus", False),
+            ("claude", False, "claude-opus-producer-fixture", False),
+            ("claude", False, "opus", True))
+        for kind, existing, expected_model, check_binding in cases:
             with self.subTest(kind=kind, existing=existing, model=expected_model), producer_first_fixture(kind) as world:
                 if expected_model == "claude-opus-producer-fixture":
                     environment = claude_catalog_environment(world.case.root / "caller-claude",
@@ -269,6 +271,10 @@ class StopResumeTests(unittest.TestCase):
                 publication = pane_record.read("agents")["w1:p3"]
                 self.assertEqual(publication["session_id"], row.id)
                 self.assertTrue(publication.get("producer_binding", False))
+                if check_binding:
+                    self.assertEqual([(tab.get("row_id"), tab.get("terminal_id"))
+                        for space in herdr.saved_layout("agents")["workspaces"] for tab in space["tabs"]],
+                        [(row.id, world.case.client.rows[-1]["terminal_id"])])
                 for reference in ("dwight", str(row.id)):
                     self.assertIsInstance(stop_resume.resume(reference), stop_resume.ClaudeUp)
                 self.assertEqual(len(world.arguments), 1)
@@ -331,6 +337,19 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(world.arguments, [])
                 self.assertEqual(case.client.opened, [])
                 self.assertEqual(list((case.root / "panes").glob(".producer-admission-*")), [])
+
+        for reference, owned in (("dwight", True), ("old producer title", True), ("dwight", False)):
+            with self.subTest(daemon_name=reference, owned=owned), producer_first_fixture("codex") as world:
+                if owned:
+                    member = fixture_member("producer", name="dwight", runtime_id=fixture_runtime_id("fixed-producer"))
+                    member = staff.update_current_session(member.current_session, staff.native_id(world.identity))
+                    self.assertNotEqual(member.id, member.current_session)
+                read = codex_daemon.DaemonRead(
+                    codex_daemon.CodexDaemon(world.home, world.home / "daemon.sock"),
+                    [codex_daemon.DaemonSession(world.identity, str(world.folder), "idle")])
+                with patch.object(codex_daemon, "read_daemons", return_value=[read]):
+                    self.assertEqual(stop_resume.producer_conflicts(reference, world.case.client),
+                                     [(world.identity, "outside herdr")] if owned and reference == "dwight" else [])
 
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
@@ -417,7 +436,10 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(staff.initial_snapshot().rows[0].current_session, world.identity)
                 self.assertEqual(len(staff.initial_snapshot().rows), 1)
                 self.assertEqual(len(world.arguments), 2 if stage in resumed_stages else 1)
-                self.assertEqual(len(world.case.client.opened), 2 if stage in lost_stages | first_ownership_stages else 1)
+                self.assertEqual(len(world.case.client.opened), 2 if stage in lost_stages | first_ownership_stages | {"unrecorded"} else 1)
+                if stage == "unrecorded":
+                    self.assertEqual([pane["pane_id"] for pane in world.case.client.rows
+                                      if pane["pane_id"] in world.started_panes or pane["label"] == "dwight"], [world.pane])
                 self.assertTrue(pane_record.read("agents")[world.pane].get("producer_binding", False))
                 self.assertEqual(list((world.case.root / "panes").glob(".producer-admission-*")), [])
                 if stage in resumed_stages:
@@ -920,34 +942,38 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("observer anomaly:", errors)
 
     def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
-        identity = self.saved_codex_name()
-        source = self.root / ".codex2"
-        for target in (None, "codex3"):
-            expected = target or "codex1"
-            with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
-                  patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
-                      "codex1", self.root / ".codex1")) as role,
-                  patch.object(self.client, "open_tab", return_value="w1:p2"),
-                  patch.object(self.client, "prompt") as prompt,
-                  patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
-                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
-                      self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
-                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
-                      "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                result = stop_resume.resume("saved-worker", to=target)
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                assert isinstance(result, stop_resume.ClaudeUp)
-                self.assertEqual((result.session_id, result.account), (identity, expected))
-                self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
-                self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
-                self.assertEqual(launch.call_args.args[3], "codex")
-                self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
-                prompt.assert_not_called()
-                self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
-                if target is None:
-                    role.assert_called_once_with("workers")
-                else:
-                    role.assert_not_called()
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                identity = self.saved_codex_name()
+                source = self.root / ".codex2"
+                if compressed:
+                    _ = compressed_copy(source / "sessions" / f"rollout-{identity}.jsonl")
+                for target in (None, "codex3"):
+                    expected = target or "codex1"
+                    with (self.subTest(target=target), patch.dict(os.environ, {"CODEX_HOME": str(source)}),
+                          patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount(
+                              "codex1", self.root / ".codex1")) as role,
+                          patch.object(self.client, "open_tab", return_value="w1:p2"),
+                          patch.object(self.client, "prompt") as prompt,
+                          patch.object(self.client, "tab_sessions", return_value=[herdr.TabSession("w1:p2", "saved-worker", "w1", "")]),
+                          patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                              self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
+                          patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                              "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
+                        result = stop_resume.resume("saved-worker", to=target)
+                        self.assertIsInstance(result, stop_resume.ClaudeUp)
+                        assert isinstance(result, stop_resume.ClaudeUp)
+                        self.assertEqual((result.session_id, result.account), (identity, expected))
+                        self.assertEqual(prepare.call_args.args[1], str(self.root / "project"))
+                        self.assertEqual(prepare.call_args.args[2]["CODEX_HOME"], str(self.root / f".{expected}"))
+                        self.assertEqual(launch.call_args.args[3], "codex")
+                        self.assertIsInstance(cast(object, launch.call_args.args[5]), herdr.NoOpeningPrompt)
+                        prompt.assert_not_called()
+                        self.assertEqual(launch.call_args.args[4][-2:], ["resume", identity])
+                        if target is None:
+                            role.assert_called_once_with("workers")
+                        else:
+                            role.assert_not_called()
 
     def test_unknown_codex_process_does_not_block_a_stopped_thread_without_a_pane(self) -> None:
         identity = self.saved_codex_name()
@@ -1717,7 +1743,8 @@ class StopResumeTests(unittest.TestCase):
         cases.extend(("morty", False, ("editor",), False, True, False, family, True, ResumeCaller.OTHER_PANE)
                      for family in ("claude", "codex"))
         cases.append(("producers", False, ("python3",), False, False, False, "claude", False, ResumeCaller.TARGET_PANE))
-        for workspace, shared, commands, refuse_close, metadata, cross, family, stale, caller in cases:
+        cases.append(("producers", False, (), False, False, False, "claude", False, ResumeCaller.OTHER_PANE))
+        for case, (workspace, shared, commands, refuse_close, metadata, cross, family, stale, caller) in enumerate(cases):
             shell = not commands
             with self.subTest(workspace=workspace, shared=shared, commands=commands, refuse_close=refuse_close,
                               family=family, stale=stale, caller=caller):
@@ -1729,6 +1756,11 @@ class StopResumeTests(unittest.TestCase):
                 saved = self.entry.copy()
                 saved.update(kind=family, environment={variable: str(source_home)})
                 self.client.rows[:] = [dict(retained)]
+                if workspace == "producers" and not shared and shell:
+                    herdr._write_layout("agents", herdr.SavedLayout(at=time.time(), workspaces=[  # pyright: ignore[reportPrivateUsage]
+                        herdr.SavedSpace(name="producers", seen=time.time(), tabs=[herdr.SavedName(
+                            name=row.id, row_id=row.id, terminal_id=herdr.json_text(retained["terminal_id"], "producer terminal"),
+                            seen=time.time())])]))
                 if metadata:
                     self.client.rows[0]["agent_session"] = {"kind": "id", "value": current}
                 self.client.closed.clear()
@@ -1752,7 +1784,7 @@ class StopResumeTests(unittest.TestCase):
                 def close_source(pane: str) -> bool:
                     source.close_tab_of(pane)
                     return True
-                self.tab_titles["w1:t9"] = row.name
+                self.tab_titles["w1:t9"] = "another-producer" if case == len(cases) - 1 else row.name
                 if shared:
                     self.client.rows.append({"pane_id": "w1:p3", "tab_id": "w1:t9", "label": "other work",
                                              "workspace_id": "w1", "agent_session": {"kind": "none"}})
@@ -1979,6 +2011,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
+        _ = self.enterContext(patch.object(session_records, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
             herdr.PaneSessionReport("019b3a40-4250-7000-8000-000000000102"), "generation-1", {})))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))

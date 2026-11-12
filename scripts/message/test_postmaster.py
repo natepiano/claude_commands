@@ -16,6 +16,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.message import postmaster
+from scripts.production import staff
 from scripts.message import sessions
 
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
@@ -96,7 +97,8 @@ class PostmasterTests(unittest.TestCase):
         self.write(self.path("claimed"), {"id": ENTRY_ID, "claimed_ms": int(self.clock.time() * 1000), "run": "fake-worker"})
 
     def attempt(self, sender: str = "Sender") -> postmaster.Attempt:
-        return postmaster.attempt(self.state, self.recipient, sender, ENTRY_ID, TEXT, self.live)
+        return postmaster.attempt(self.state, self.recipient, sender, ENTRY_ID, TEXT, self.live,
+                                  reply_identity="session:sender" if sender == "Sender" else "")
 
     def no_id_files(self) -> None:
         self.assertEqual([path for path in self.directory.rglob("*") if ENTRY_ID in path.name], [])
@@ -333,12 +335,21 @@ class PostmasterTests(unittest.TestCase):
         self.no_id_files()
 
     def test_reply_destination_uses_only_one_current_name(self) -> None:
-        self.assertEqual(postmaster.reply_destination("Sender", self.live), postmaster.ReplyToSession("sender"))
-        self.assertEqual(postmaster.reply_destination("script", self.live), postmaster.ReplyUnroutable())
-        self.assertEqual(postmaster.reply_destination("Sender", [self.sender, session("other", "Sender")]), postmaster.ReplyUnroutable())
-        former = session("renamed", "New name")
-        former["formerNames"] = ["Sender"]
-        self.assertEqual(postmaster.reply_destination("Sender", [former]), postmaster.ReplyUnroutable())
+        member = staff.StaffRow(staff.StaffId("fixed-sender"), "producer", "Staff sender", staff.StaffRoot(),
+                                current_session=staff.StaffId("sender"))
+        record = staff.StaffSnapshot((member,))
+        renamed = self.sender.copy()
+        renamed.update(name="Changed title", formerNames=["Sender"])
+        for identity, live, expected in (
+            ("staff:fixed-sender", self.live, postmaster.ReplyToSession("sender")),
+            ("staff:fixed-sender", [renamed], postmaster.ReplyToSession("sender")),
+            ("session:sender", [renamed], postmaster.ReplyToSession("sender")),
+            ("Sender", self.live, postmaster.ReplyUnroutable()),
+            ("script", self.live, postmaster.ReplyUnroutable()),
+            ("staff:fixed-sender", [session("other", "Sender")], postmaster.ReplyUnroutable()),
+        ):
+            with self.subTest(identity=identity, live=live):
+                self.assertEqual(postmaster.reply_destination(identity, live, membership=record), expected)
 
     def test_written_wire_entry_has_exact_fields_and_recipient_identity(self) -> None:
         for sender, destination in (("Sender", "sender"), ("script", "")):

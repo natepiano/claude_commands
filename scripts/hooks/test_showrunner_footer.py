@@ -18,7 +18,7 @@ from typing import cast
 from scripts.hooks import showrunner_footer
 from scripts.production.update_registration import QuestionStaff
 from scripts.production import update_registration as registration
-from scripts.production.dailies_render import due
+from scripts.production.update_registration import due
 from scripts.production.cli_fixture import production_paths
 from scripts.production import staff
 from scripts.production.staff_test_support import (
@@ -102,7 +102,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as read_staff:
                     production = showrunner_footer.read_production(instance)
                 self.assertEqual(production, showrunner_footer.Production(
-                    owner.name, doc, "UTC", showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED, owner))
+                    owner.name, doc, "UTC", owner))
                 read_staff.assert_called_once_with()
 
     def test_deferred_time_reports_missing_owner_and_keeps_a_known_owner(self) -> None:
@@ -169,13 +169,11 @@ class QuestionLibraryTests(unittest.TestCase):
                   mock.patch.dict(os.environ, environment)):
                 owner = fixture_member("showrunner", name="display-name", runtime_id=fixture_runtime_id("footer-owner"))
                 _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("footer-current")))
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
                 self.assertEqual(showrunner_footer.outstanding_path(owner.id),
                                  root / "showrunner/outstanding" / f"{owner.id}.json")
                 _ = staff.rename(owner.id, "renamed-owner")
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
+                self.assertEqual(showrunner_footer.outstanding_path(owner.id),
+                                 root / "showrunner/outstanding" / f"{owner.id}.json")
 
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -247,7 +245,7 @@ class QuestionLibraryTests(unittest.TestCase):
         ]
         with (tempfile.TemporaryDirectory() as scratch,
               canonical_outstanding(Path(scratch), entries) as path):
-            items = registration.read_open_items(path)
+            items = registration.parse_outstanding_entries(entries, path)
             self.assertIsInstance(items[0], registration.OutstandingReminder)
             awaiting = items[1]
             self.assertIsInstance(awaiting, registration.OutstandingQuestion)
@@ -296,7 +294,7 @@ class QuestionLibraryTests(unittest.TestCase):
             with self.subTest(fields=fields), tempfile.TemporaryDirectory() as scratch:
                 with canonical_outstanding(Path(scratch), [{"since": AT, "text": "route", **fields}]) as path:
                     with self.assertRaises(registration.InputError):
-                        _ = registration.read_open_items(path)
+                        _ = registration.parse_outstanding_entries([{"since": AT, "text": "route", **fields}], path)
 
 
 if __name__ == "__main__":

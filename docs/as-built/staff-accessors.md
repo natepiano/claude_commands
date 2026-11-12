@@ -200,6 +200,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
 | `scripts/message/morty_identity.py` | read | native_id |
+| `scripts/message/postmaster.py` | read | snapshot, StaffSnapshot, by_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
@@ -216,7 +217,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/change_routing.py` | read | staff.json path |
 | `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
-| `scripts/production/dailies_input.py` | read | snapshot |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
 | `scripts/production/fake_showrunner.py` | write | native_id, update_current_session |
@@ -274,7 +274,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/waiting.py` | read | snapshot |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
-| `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine; session_staff.RowResolver reads branches and production docs |
+| `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
 | `scripts/review_links/change_page.py` | read | snapshot |
 | `scripts/agents/inventory.py` | read | local_snapshot |
@@ -311,7 +311,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-183 accessor rows: 40 write, 142 read, 1 owner.
+183 accessor rows: 39 write, 143 read, 1 owner.
 
 ## Approved copies
 

@@ -38,7 +38,7 @@ The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines
 | Staff workers | Staff membership and backend evidence | Fixed staff id, current native session and pane state |
 | Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` | Held Astra role lifecycle and staff reference |
 | Review state | `<run>/<worker>_status[_<lens>]`, `<run>/<worker>_pid[_<lens>]` | running blind reviewers |
-| Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
+| Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: native id, cwd, status, owning daemon |
 | Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex exec processes and reviewer descendants |
 
 The roster reads staff membership and pane evidence.
@@ -46,6 +46,14 @@ The roster reads staff membership and pane evidence.
 The worker command preserves staff identity when it closes a worker.
 The held assignment launcher retains its thread and allocation helpers until round 2b.
 The roster uses the staff row's current native session.
+Each roster name comes from the staff row that owns the native session.
+A native session without a staff row has an empty roster name.
+Its native address still accepts messages.
+The roster reads one staff snapshot and passes it to each entry reader.
+Codex thread titles and herdr labels do not become recipient names.
+The native registry helpers live in `scripts/message/session_records.py`.
+`sessions.py` exports those helpers and adds staff recipient lookup.
+Staff imports the native helpers directly, so neither module imports the other.
 
 ### How each row's role is derived
 
@@ -64,13 +72,20 @@ Codex rows:
   `session_staff.worker_directory` supplies the working directory.
   Staff parents supply the director and showrunner relationships.
 - **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
-  Staff supplies the current thread and the role's parent.
-  The role store supplies the design repository, instance name, and lifecycle.
+  Staff supplies the current thread, worker name, role parent, and owned checkout path.
+  The role store supplies lifecycle and checkout ownership.
+  Independent checkouts retain their stored paths.
   A missing backend prints an anomaly and skips that role.
   The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
   The holder adds pending messages through `design_roles.py`.
   The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
-- **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
+- **Blind reviewer.** `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`.
+  A `codex exec` descendant supplies kind `codex`.
+  Otherwise, a `claude` descendant supplies kind `claude`.
+  Without either descendant, the roster adds no reviewer.
+  A known native registry identity supplies its current staff name.
+  Other reviewers have an empty name.
+  The assignment remains `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
   A native Codex pane uses its reported session when available.
   Without a report, `native_pane_process(...).current_identity` supplies its thread.
@@ -423,7 +438,8 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 - `process_start(pid) -> str | None` is the one process-start reader: Linux reads `/proc/<pid>/stat` as bytes, splits after the last `)` and returns field 22 when all digits; macOS runs `ps -o lstart= -p <pid>` under `LC_ALL=C`, `TZ=UTC`, 5 s timeout. `scripts/agents/inventory.py` imports it as `_process_start`.
 - `running_session(record)`: the pid exists and a nonempty `procStart` equals `process_start(pid)`, socket or not; a record with no `procStart` is running when its messaging socket exists. `messaging_socket_exists(record)`; `live_session(record) = running_session and messaging_socket_exists`.
 - `_readable_records()` yields every readable record; `running_sessions()` and `live_sessions()` each filter it through their own predicate per record, newest `updatedAt` first.
-- `addressed(to, records)` resolves `uds:`, `session:`, a current name, or a former name only one session had.
+- `addressed(to, records)` resolves `uds:`, `session:`, or a staff name through its current session.
+  Registry names and former names do not resolve.
 
 ### `process_table.py`
 
@@ -700,3 +716,9 @@ Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.p
 
 For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
 Filing a question alone never sends a push.
+
+Postmaster replies use a fixed `staff:<id>` or an explicit `session:<id>`.
+A fixed staff ID selects the row's `current_session`.
+The sender label remains message text and does not select a reply destination.
+The relay miss hook uses the relay process identity and its recorded sender.
+A registry name does not prove a relay identity.

@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 from scripts.direct import phase_process as process, plan_history
 from scripts.usage import collect
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 DIRECTOR = process.DirectorSession("claude", "director")
@@ -306,15 +307,26 @@ class TrialProcessTests(unittest.TestCase):
             request_record(28, "later", 900, []),
             transcript_record("system", 100, subtype="compact_boundary"),
         ]
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "director.jsonl"
-            _ = path.write_text("\n".join(json.dumps(record) for record in records))
-            before = path.read_bytes()
-            transcript = process.read_transcript(path)
-            self.assertEqual(path.read_bytes(), before)
-        phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
-        self.assertEqual(process.measure_reloads(phase, transcript, frozenset(("commands/unit/direct.md",))),
-                         process.PhaseReloads(1, (450,)))
+        for storage in ("plain", "compressed", "both"):
+            with self.subTest(storage=storage), tempfile.TemporaryDirectory() as folder:
+                home = Path(folder)
+                path = home / ".claude/projects/project/director.jsonl"
+                path.parent.mkdir(parents=True)
+                _ = path.write_text("\n".join(json.dumps(record) for record in records))
+                before = path.read_bytes()
+                if storage != "plain":
+                    compressed = compressed_copy(path)
+                    if storage == "both":
+                        _ = path.write_bytes(before)
+                    else:
+                        path = compressed
+                saved = path.read_bytes()
+                transcript = process.read_transcript(path)
+                self.assertEqual(path.read_bytes(), saved)
+                self.assertEqual(process.read_director_transcripts(home, (DIRECTOR,)), {DIRECTOR: transcript})
+                phase = process.PhaseBoundary("run", "phase", "1", 10, 100)
+                self.assertEqual(process.measure_reloads(phase, transcript, frozenset(("commands/unit/direct.md",))),
+                                 process.PhaseReloads(1, (450,)))
 
     def test_step_read_after_route_is_a_reload_and_second_compaction_has_no_reload(self) -> None:
         phase = process.phase_boundaries(trial_events(NEW_HASH), WINDOW)[0]

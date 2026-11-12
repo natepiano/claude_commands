@@ -1064,10 +1064,9 @@ def retirement_live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]
 def retirement_runs_of(owner: staff.StaffRow, record: staff.StaffSnapshot) -> list[Path]:
     """Read run ownership through the staff row's session identities."""
     found: list[Path] = []
-    for root in unit_runs.run_roots(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
-        for folder in sorted(root.iterdir()) if root.is_dir() else ():
-            if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
-                found.append(folder)
+    for folder in unit_runs.run_folders(os.environ.get("RETIRE_UNIT_RUN_ROOT") or None):
+        if record.by_member_reference(unit_runs.director(folder, record=record)) == owner:
+            found.append(folder)
     return found
 
 def retirement_session_of(pid: int) -> int:
@@ -1947,6 +1946,72 @@ def rename_move_branch(move: DocBranchMove) -> bool:
     return True
 
 
+def rename_qualified_workers(owner: staff.StaffRow) -> bool:
+    """Migrate one owner's old worker names without removing retained work."""
+    changed = False
+    client = herdr.Herdr(herdr.shared_session())
+    for row in staff.snapshot().find(kind="worker", parent=owner.id):
+        prefix, separator, bare = row.name.rpartition("-")
+        stem = row.name.rstrip("0123456789")
+        for role in staff.WORKER_ROLES:
+            if "-" in role and (stem == role or stem.endswith("-" + role)):
+                bare = role + row.name[len(stem):]
+                prefix = row.name[:-len(bare)].removesuffix("-")
+                break
+        if not prefix or not separator:
+            continue
+        if prefix != owner.name and not prefix.endswith("-" + owner.name):
+            print(f"{row.name}: kept; prefix does not end with {owner.name}; run /agents rename {row.id} {bare}", file=sys.stderr)
+            continue
+        name = staff.WorkerName.parse(row.name)
+        with worker_panes.worker_lock(owner.id, name, blocking=True) as hold:
+            record = staff.snapshot()
+            twins = [other for other in record.find(kind="worker", parent=owner.id) if other.name == bare]
+            pair = (f"{row.name} ({row.id}) and {twins[0].name} ({twins[0].id}): kept; "
+                    if twins else f"{row.name} ({row.id}): kept; ")
+            if isinstance(hold, worker_panes.Kept):
+                print(pair + hold.blocker, file=sys.stderr)
+                continue
+            observed = worker_panes.observe_worker(owner.id, row, record)
+            if not twins:
+                if not isinstance(observed, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
+                    reason = observed.value if isinstance(observed, worker_panes.WorkerNotObserved) else observed.reason
+                    print(pair + " ".join(reason.splitlines()), file=sys.stderr)
+                    continue
+                if isinstance(observed, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+                    title = worker_panes.agent_name(owner, bare)
+                    if isinstance(observed, worker_panes.OpenWorker):
+                        _ = client.run("agent", "rename", observed.pane, title)
+                    _ = client.retitle(observed.pane, title, tab=False)
+                _ = staff.rename(row.id, bare)
+                changed = True
+                continue
+            if not isinstance(observed, worker_panes.ClosedWorker) or any(
+                    pane.get("label") in (row.name, worker_panes.agent_name(owner, row.name)) for pane in client.panes()):
+                print(pair + "the old pane is not closed", file=sys.stderr)
+                continue
+            runs = [Path(run) for run in unit_runs.held(str(owner.current_session),
+                                                       os.environ.get("ROSTER_RUN_ROOT"), record=record)]
+            runs.append(worker_panes.worker_run(row, record=record))
+            for run in dict.fromkeys(runs):
+                dispatch = progress_history.active_dispatch(row.id, run)
+                if isinstance(dispatch, progress_history.ActiveDispatch):
+                    print(pair + f"active dispatch {dispatch.instance_id}", file=sys.stderr)
+                    break
+                if isinstance(dispatch, progress_history.ActiveDispatchUnavailable):
+                    print(pair + dispatch.reason, file=sys.stderr)
+                    break
+            else:
+                try:
+                    if worker.end(owner.id, name, lock=hold) == worker.ExitCode.OK:
+                        changed = True
+                    else:
+                        print(pair + "worker end is incomplete", file=sys.stderr)
+                except staff.StaffRefused as error:
+                    print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
+    return changed
+
+
 def rename_owner(row: staff.StaffRow, name: str) -> staff.StaffRow:
     """Keep the old owner name until every worker pane has its new name."""
     client = herdr.Herdr(herdr.shared_session())
@@ -2014,6 +2079,8 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         move = request.move
         row = request.member
         changed = row.name != request.name
+        if not changed:
+            changed = rename_qualified_workers(row)
         row = rename_owner(row, request.name)
         if isinstance(move, DocBranchMove):
             try:
@@ -2061,6 +2128,7 @@ def rename_apply_unit(request: RenamePlan, *, reference: str) -> RenamePlan:
                 and pending.branch != request.move.branch):
             pending_branch = pending.branch if isinstance(pending.branch, str) else pending.branch.value
             raise ValueError(f"{row.name}: finish the pending move to branch {pending_branch}")
+        worker_names_changed = rename_qualified_workers(row) if not changed else False
         rename_prepare_notice(row, request.name)
         journal = rename_notice_path(row.id)
         original_name = row.name
@@ -2113,7 +2181,7 @@ def rename_apply_unit(request: RenamePlan, *, reference: str) -> RenamePlan:
             fields = unit_move.json_object(read_json(journal))
             if not fields.get("pending"):
                 journal.unlink()
-        print("done" if changed else "unchanged")
+        print("done" if changed or worker_names_changed else "unchanged")
         return request
 
 
