@@ -2285,3 +2285,54 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `commands/build/hold.md`, `docs/as-built/builds-aws-target.md` — the rule text
 
 **Gotchas:** read the process table before the claim records. The reverse order lets a claim taken between the two reads receive TERM.
+
+### Phase 108 — The floor keeps the build output of a copy with a live or waiting verify.sh build  · status: done
+
+**Depends on:** none.
+
+**Source (2026-11-12, builds showrunner):** "(b) is yours: the floor treats a copy with a live or queued verify.sh build as in use. Go now; land order when green, with ETA."
+
+#### Work Order
+
+**Goal:** the disk floor treats a cargo target as in use while a `verify.sh` process runs in the workspace that owns it, also while that `verify.sh` waits in the build queue.
+
+**Measured:**
+1. At 15:23 EST the floor took 20.9 GiB from `/tmp/claude/scratch/until-2026-11-13T1207Z-double-sided-info-37p-3b01f2/checkout/target`. A `bash ~/.claude/scripts/direct/verify.sh build hana` (pid 1180249, start 15:02) had its cwd in that checkout. It waited in a 1-second loop and held no cargo lock.
+2. `process_uses()` (`scripts/lint/sweep.py:1208`) counts a process when its exe, cwd or a mapped file lies under the target, or when it is a cargo-nextest run whose workspace owns the target (`:1263`). The `verify.sh` cwd is the checkout, beside `target/`, so the floor saw no use.
+3. `verify.sh` works on `git rev-parse --show-toplevel` of its cwd (`scripts/direct/verify.sh:510`).
+4. `nextest_targets()` (`sweep.py:1533`) resolves the target of a process from `--target-dir`, `CARGO_TARGET_DIR`, cargo config, or the target beside a folder that holds the cwd.
+5. A waiting `verify.sh` is a live process for its whole wait. Its queue entry belongs to that process or to a child of it.
+
+**Spec:**
+1. In `process_uses()`, count a `verify.sh` process the same way as a cargo-nextest run. A process is a `verify.sh` process when one of these is true:
+   - the basename of argv[0] is `verify.sh`;
+   - the basename of argv[0] is `bash`, `sh`, `zsh` or `dash`, and the first argument that does not start with `-` has the basename `verify.sh`.
+2. Resolve its targets with the same function that resolves a nextest run. Rename `nextest_targets` to `workspace_targets` and update every caller. Keep one function.
+3. The use text is `runs verify.sh in <cwd>`. The floor prints `lint sweep: pid <pid> runs verify.sh in <cwd>; <target> left alone`.
+4. The rule applies to every `process_uses()` caller: the floor, the floor alert choices and the hand cleanup. Add no flag and no config key.
+5. Update the `process_uses()` docstring and the concurrency paragraph of the module docstring.
+6. Update the "Targets in use" bullet in `docs/as-built/build-memory-admission.md`.
+
+**Tests** (`scripts/lint/test_sweep.py`, add rows beside `test_a_nextest_run_uses_its_workspace_target_between_test_binaries` and use its fake `/proc`):
+1. `bash /x/verify.sh build hana` with cwd in `<workspace>/crates/app`: the workspace target is in use, with the text `runs verify.sh in <cwd>`.
+2. argv[0] `/x/verify.sh` with the workspace as cwd: in use.
+3. `bash -e /x/verify.sh test`: in use.
+4. `bash /x/other.sh` with the workspace as cwd: not in use.
+5. `bash /x/verify.sh build` with `CARGO_TARGET_DIR=<other>`: the other target is in use.
+6. A `verify.sh` process with cwd in another workspace: this target is not in use.
+
+**Files:**
+- `scripts/lint/sweep.py`
+- `scripts/lint/test_sweep.py`
+- `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.lint.test_sweep`.
+2. Lint: `basedpyright` on `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py`, once after the edits.
+3. Live check (director, read-only): call `process_uses()` on the real `/proc` for a target whose workspace has a live `verify.sh`. The result names the `verify.sh` pid. Delete nothing.
+
+**Speed:** one argv check per process in the existing `/proc` scan. The environ file is read only for a matching process. Name the measured scan time before and after in the reply.

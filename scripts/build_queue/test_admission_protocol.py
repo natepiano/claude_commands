@@ -4,10 +4,10 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
 from scripts.lint.memory_test_support import admission_policy_fixture
 
-from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
 import io
@@ -18,14 +18,12 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
-from types import ModuleType
 from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts import build_queue
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
@@ -379,36 +377,28 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             build = fixture.request(step="build")
             assert isinstance(build.profile, records.StepProfile)
             self.assertEqual(wire.VERSION, 3)
-            legacy_records = ModuleType("phase33_legacy_records")
-            legacy_protocol = ModuleType("phase33_legacy_protocol")
-            with mock.patch.dict(sys.modules, {legacy_records.__name__: legacy_records,
-                                               legacy_protocol.__name__: legacy_protocol}):
-                for module, name in ((legacy_records, "admission_records"), (legacy_protocol, "admission_protocol")):
-                    source = subprocess.run(["git", "show", f"a3b063bfe:scripts/build_queue/{name}.py"],
-                        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
-                    with mock.patch.object(build_queue, "admission_records", legacy_records):
-                        exec(compile(source, f"phase33_legacy_{name}.py", "exec"), module.__dict__)
-                decode_legacy = cast(Callable[[str], object], getattr(legacy_protocol, "parse_request"))
-                for share in (0, 10, 50):
-                    shaped = replace(build, profile=replace(build.profile,
-                        peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, share))))
-                    self.assertEqual(wire.parse_record(wire.encode_record(shaped), wire.AdmitRequest), shaped)
-                    for version in (1, 2):
-                        with self.subTest(share=share, shape_version=version):
-                            envelope = cast(dict[str, object], json.loads(wire.encode_request(shaped)))
-                            envelope["v"] = version
-                            data = cast(dict[str, object], envelope["data"])
-                            profile = cast(dict[str, object], data["profile"])
-                            peak = cast(dict[str, object], profile["peak"])
-                            basis = cast(dict[str, object], peak["basis"])
-                            if share == 10:
-                                self.assertEqual(basis["kind"], "ShapeP90")
-                                self.assertNotIn("share_percent", basis)
-                                self.assertEqual(codec.snapshot_value(decode_legacy(json.dumps(envelope))), data)
-                            else:
-                                self.assertEqual((basis["kind"], basis["share_percent"]), ("ShapeRankedPeak", share))
-                            self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
-                            self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
+            for share in (0, 10, 50):
+                shaped = replace(build, profile=replace(build.profile,
+                    peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, share))))
+                self.assertEqual(wire.parse_record(wire.encode_record(shaped), wire.AdmitRequest), shaped)
+                for version in (1, 2):
+                    with self.subTest(share=share, shape_version=version):
+                        envelope = cast(dict[str, object], json.loads(wire.encode_request(shaped)))
+                        envelope["v"] = version
+                        data = cast(dict[str, object], envelope["data"])
+                        profile = cast(dict[str, object], data["profile"])
+                        peak = cast(dict[str, object], profile["peak"])
+                        basis = cast(dict[str, object], peak["basis"])
+                        if share == 10:
+                            self.assertEqual(basis["kind"], "ShapeP90")
+                            self.assertNotIn("share_percent", basis)
+                            self.assertEqual(codec.snapshot_value(decode_legacy(json.dumps(envelope))), data)
+                        else:
+                            self.assertEqual((basis["kind"], basis["share_percent"]), ("ShapeRankedPeak", share))
+                            with self.assertRaises(ValueError):
+                                _ = decode_legacy(json.dumps(envelope))
+                        self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
+                        self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:
