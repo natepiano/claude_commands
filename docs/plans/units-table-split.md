@@ -35,29 +35,51 @@ The showrunner's ruling: "Split /showrunner:units into two tables. Table 1: Unit
 
 ### Phase 1 — The units view prints two tables  · status: done
 
+#### As-built
+
+- `unit_phases.table()` prints a status table, `Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan]`, then the Progress legend when a row has a bar, a blank line, and a work table, `Unit | Notes | <Workers heading> | Non-Phase Work | Queued`. Both tables use the same unit order. With no rows, both tables keep their headers.
+- Each table calls `display_cells.fitted()` on its own with `units_table_columns`; the all-`—` column removal applies per table. The status table has no cuttable column.
+- `display_cells.CutOrder` selects the cut order: `LISTED` (the default, used by the style table) or `WIDEST_FIRST` (the work table). `WIDEST_FIRST` cuts the widest cuttable column one character per step; on equal widths it takes the first in `cuttable` (Queued, Non-Phase Work, Workers, Notes).
+- `non_phase_cell(record, run, *, notes_record=...)` leaves out the open phase that Notes shows. `queued_cell(staff_id, record, *, notes=...)` leaves out each queue item equal to the Notes text; `+N more` counts only the items that stay.
+
+**Files:**
+- `scripts/production/unit_phases.py` — the two tables and both repeat rules.
+- `scripts/production/display_cells.py` — `CutOrder` and `fitted(..., cut_order=)`.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the two-table layout, fitting and repeat rules.
+- `scripts/production/test_unit_phases.py`, `scripts/agents/test_shutdown_cli.py` — table rows.
+
+**Gotchas:** `OpenUnitRun` holds at least one open phase; apply a phase exclusion when the cell is made, never by building a run with no phases.
+
+**Ruled out:** the listed cut order for the work table — it cut Queued to a few characters while Notes kept 80.
+
+### Phase 2 — The units view prints in a few seconds  · status: todo
+
 #### Work Order
 
-**Goal:** `/showrunner:units` for a phase production prints a status table and a work table. In a 170-column terminal, the user reads Notes, Workers, Non-Phase Work and Queued in full whenever they fit.
+**Goal:** `/showrunner:units` prints in a few seconds. Today `scripts/lib/py scripts/production/unit_phases.py --production sdlc` takes 77 to 105 s wall time on natedev, on main and on this branch.
+
+The sdlc showrunner's ruling on 2026-11-12: "make /showrunner:units fast. 77 to 105 s is far too slow for a status command. Measure where the time goes (paired runs, not cProfile alone), fix the slowest parts, and give before/after wall times. Target: a few seconds."
 
 **Spec:**
 
-1. **Two tables.** `table()` prints table 1, `Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan]`, then the Progress legend when shown, then a blank line, then table 2, `Unit | Notes | <Workers heading> | Non-Phase Work | Queued`. The Machine and ETA Plan rules stay as they are. Both tables use the same unit order.
-2. **Fitting.** Each table calls `display_cells.fitted()` on its own columns with `units_table_columns`. Table 1 has no cuttable column. Table 2 cuts only when table 2 alone still exceeds the width. It cuts the widest cuttable column first, one character per step, so cut text spreads across the text columns; on equal widths it cuts in the order Queued, Non-Phase Work, Workers, Notes. The style table keeps its listed cut order. (Changed at repair round 1: the listed order cut Queued to a few characters while Notes kept 80.) The all-`—` column removal applies to each table.
-3. **No repeated text.** Non-Phase Work leaves out each open phase whose id is the phase Notes shows for that row. When nothing is left, the cell is `—`. Queued leaves out each queue item whose text equals the row's Notes text. Find any other cell text in table 2 that repeats another cell of the same row, and remove the repeat by the same rule; name each one in your summary.
-4. **Docs.** Update the phase productions item in `docs/as-built/showrunner-automation.md` (about line 670): the two tables, their columns, the per-table fitting and the repeat rule. Update the same commit.
+1. **Measure.** Find where the wall time goes for `--production sdlc`. Use paired wall-time runs (the same command before and after one change, run alternately, at least 3 pairs). A profiler (`cProfile`, `py-spy`) may point at candidates, but a gain is named only from paired wall times. Look at subprocess calls (git, herdr, ssh, `ps`), repeated file reads (run histories, staff, plan docs, queue files) and work repeated per unit or per row. Run each heavy probe under `systemd-run --user --scope -p MemoryMax=2G`.
+2. **Fix the slowest parts.** Remove repeated work: read each file and run each subprocess once per command, and skip work whose result no cell shows. Keep every cell's content the same. Fix a cause in the module where it lives, also when that module is outside `scripts/production/`.
+3. **Report.** Give the before and after wall times (median of the pairs) and the share of each fixed cause, in the summary.
 
 **Files:**
-- `scripts/production/unit_phases.py` — the two tables and the repeat rule.
-- `docs/as-built/showrunner-automation.md` — the phase productions item.
+- `scripts/production/unit_phases.py` — the units view.
+- `scripts/production/display_cells.py` — shared cells.
 - `scripts/production/test_unit_phases.py` — rows.
 
+Other modules on the slow path are in scope when the measurement names them; name each one in the summary.
+
 **Workers:** `1 writer + 1 tester`
-- `impl` — `unit_phases.py` and the as-built doc.
-- `test` — rows in the existing table tests: the output has two tables with the columns above; table 2 text is not cut when table 2 fits; a Non-Phase Work phase equal to the Notes phase shows `—`; a different non-plan phase still shows.
+- `impl` — measures, then fixes the slowest parts in the production modules.
+- `test` — measures the baseline independently at the phase baseline commit with paired runs, keeps the test lane green, and adds rows only where a fix changes a function's contract. Reports its own before/after wall times when `impl` posts `done`.
 
 **State:** none.
 
 **Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes.
-2. The Test command passes for the test lane.
-3. Live: `scripts/lib/py scripts/production/unit_phases.py --production sdlc` from this worktree prints two tables, and table 2 rows show Notes, Non-Phase Work and Queued without `…` when they fit in 170 columns.
+1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
+2. The Test command passes for the test lane and for the tests of each changed module.
+3. Live: `scripts/lib/py scripts/production/unit_phases.py --production sdlc` prints the same two tables as before the change (time-dependent cells aside), and its median wall time over 3 runs is a few seconds.
