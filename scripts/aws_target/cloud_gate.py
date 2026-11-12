@@ -27,7 +27,7 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import gate_box, ledger
+from scripts.aws_target import admin_secrets, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -911,7 +911,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
 
 def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
     """Use the installed scaler environment for each gate controller."""
-    credential = str(Path(settings().text('credential_file')).expanduser())
+    credential = str(admin_secrets.credentials_file())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
     cleanup: list[str] = []
     stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')

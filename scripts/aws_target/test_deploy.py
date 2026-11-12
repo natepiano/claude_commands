@@ -26,7 +26,7 @@ from unittest import mock
 from urllib.request import Request
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -1520,7 +1520,8 @@ sys.exit(7)
         self.assertIn('fixture-owner', query)
         self.assertIn('Name=name,Values=fixture-nixos', query)
         resources = ledger.mapping(deploy.region_gate_template()['Resources'])
-        self.assertEqual(len(resources), 8)
+        self.assertEqual(len(resources), 9)
+        self.assertIn('GateGpuTrialScalerPolicy', resources)
         self.assertNotIn('GateBucket', resources)
         self.assertNotIn('GateProfile', resources)
         for name, key in (('GateExpiryRole', 'RoleName'), ('GateExpiryFunction', 'FunctionName')):
@@ -1676,6 +1677,8 @@ sys.exit(7)
         for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
+        self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
+                         ','.join(gpu_size_trial.settings().spot_max_usd_per_hour))
         self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
         self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
         saved = remote.read_record(self.state / 'gate-deployment.json')
@@ -1685,6 +1688,48 @@ sys.exit(7)
         after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output')
+        with mock.patch.object(gpu_size_trial, 'start_service', return_value=0) as service:
+            with self.assertRaisesRegex(deploy.DeploymentRefused, '--approve-resources'):
+                _ = subject.gpu_size_trial(self.root / 'trial')
+            service.assert_not_called()
+            with mock.patch.object(subject, '_check_credentials') as credentials:
+                self.assertTrue(subject.gpu_size_trial(self.root / 'trial', approve_resources=True))
+            credentials.assert_called_once_with()
+        service.assert_called_once()
+
+    def test_gpu_trial_cli_routes_the_approved_run(self) -> None:
+        folder = self.root / 'trial'
+        argv = ['deploy.py', 'gpu-size-trial', 'run', '--trial-folder', str(folder),
+                '--settings', str(self.settings), '--directory', str(self.state), '--approve-resources']
+        with (mock.patch.object(sys, 'argv', argv),
+              mock.patch.object(deploy.Deployment, 'gpu_size_trial', return_value=True) as run):
+            self.assertEqual(deploy.main(), 0)
+        run.assert_called_once_with(folder, approve_resources=True)
+
+    def test_gpu_trial_permission_preserves_normal_gate_scope(self) -> None:
+        source = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(source['Resources'])
+        properties = [ledger.mapping(ledger.mapping(resources[name])['Properties'])
+                      for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')]
+        statements = tuple(row for policy in properties for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement'))
+        scopes = [ledger.mapping(ledger.mapping(row['Condition'])['StringEquals'])
+                  for row in statements if row.get('Condition')
+                  and 'ec2:InstanceType' in ledger.mapping(ledger.mapping(row['Condition']).get('StringEquals', {}))]
+        self.assertEqual([row['ec2:InstanceType'] for row in scopes],
+                         [{'Ref': 'GateInstanceTypes'}, {'Ref': 'GateGpuInstanceTypes'}])
+        for row in scopes:
+            self.assertEqual(row['aws:RequestTag/Workload'], 'cloud-claude-gate')
+            self.assertEqual(row['ec2:InstanceMarketType'], 'spot')
+        regional = deploy.region_gate_template()
+        self.assertIn('GateGpuInstanceTypes', ledger.mapping(regional['Parameters']))
+        self.assertIn('GateGpuTrialScalerPolicy', ledger.mapping(regional['Resources']))
+        gpu_statements = ledger.rows(ledger.mapping(properties[1]['PolicyDocument']), 'Statement')
+        gpu_instance = gpu_statements[0]
+        self.assertEqual(ledger.mapping(ledger.mapping(gpu_instance['Condition'])['Null'])['aws:RequestTag/GpuSizeTrial'], 'false')
+        self.assertIn('ec2:InstanceProfile', ledger.mapping(ledger.mapping(gpu_instance['Condition'])['ArnEquals']))
 
     def test_gate_deployment_rejects_a_change_to_a_rust_resource(self) -> None:
         subject, commands = self.gate_fixture('Instance')

@@ -770,3 +770,77 @@ CREATE reservation failures and UPDATE failures include current failed resource 
 A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
 The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
 The same administrator session reads failure details without another passphrase prompt.
+
+## GPU size trial
+
+The trial compares one prepared Hana archive on natedev and the configured GPU types.
+The complete trial has a USD6 reservation limit.
+The existing daily and monthly limits also apply.
+
+The session runs these local commands:
+
+```sh
+python3 -m scripts.aws_target.gpu_size_trial prepare --commit SHA
+python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
+```
+
+`prepare` prints the trial folder.
+It waits for build admission and a natedev hold release.
+It builds the archive and NixOS closure, then runs the archive twice on natedev.
+Use that same folder for the online run and each restart.
+
+The Rust tools come from Nix.
+Old preparations require a new `prepare` run before the service can use them.
+The trial uses the Hana flake's toolchain when that output exists.
+Otherwise, the pinned host nixpkgs and Rust overlay supply the toolchain.
+A `rust-toolchain.toml` selects its version when the file exists.
+The trial fetches dependencies into a private Cargo cache.
+It does not copy `~/.rustup` or `~/.cargo`.
+Preparation checks Cargo with an empty `HOME`.
+
+The user runs these commands at their terminal after review:
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py gpu-size-trial run --trial-folder DIR --approve-resources
+```
+
+The first command adds the configured GPU types to the scaler policy.
+The GPU permission requires the existing gate tags and a `GpuSizeTrial` tag.
+The existing gate policy remains unchanged.
+The separate GPU policy permits quota and offering reads.
+
+The second command checks the private scaler credential file and starts a transient service.
+The service selects the first configured candidate region with an applied G and VT quota of at least 32.
+It reports `not offered` for missing types.
+It reports `price above max` when no offered zone fits the configured maximum.
+It never substitutes another type or region.
+
+The service uploads the archive, closure, manifest, and runtime files to the home-region bucket.
+Boxes receive signed URLs.
+They receive no AWS credential file.
+Each box imports the prepared NixOS closure and reboots once.
+The system unit then starts the runner.
+The setup record includes boot, import, reboot, and total setup seconds.
+
+The service runs one box at a time.
+It starts termination five minutes before the configured lifetime ends.
+The expiry tag triggers two minutes before the lifetime ends.
+An unconfirmed termination blocks the next box.
+The service's `ExecStopPost` command repeats cleanup after a failure.
+
+The ledger reserves the type maximum multiplied by the lifetime hours, plus the configured box extra.
+It counts completed costs and open reservations against the same trial ID.
+It stops before the next reservation would exceed USD6.
+A restart cannot increase the trial's saved budget.
+The ledger uses the configured extra estimate until bill data establishes the completed cost.
+
+`gpu_size_trial_root_gib=100` estimates space for the driver, runtime, archive extraction, and two runs.
+This size is an estimate, rather than a measured closure requirement.
+The box extra remains `gpu_size_trial_box_extra_usd=0.05`.
+
+Each machine runs every selected test twice with zero retries.
+The report retains both statuses, wall times, and largest-process peak RSS values.
+Different statuses on one machine mean `flaky`.
+A flaky natedev test makes the comparison `inconclusive`.
+Missing measurements mean `incomplete`.
