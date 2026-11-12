@@ -615,6 +615,13 @@ They store no separate backend record.
 
 Native dispatch identity comes from the recorder's pass and history records.
 The held Claude launcher stores the fixed staff reference and slot in `impl_worker_<slot>.json`.
+It stores no worker name or backend family.
+Mesh roster entries use fixed staff IDs as keys and retain dispatch telemetry.
+Pass selection uses the fixed worker ID and checks the current staff parent.
+Run selection searches the current parent's runs.
+A supplied run folder must name that parent's fixed staff ID.
+A dispatch link supplies dispatch detail only.
+Current membership comes from the staff parent, rather than the presence of a record.
 `worker_state.worker_record_path` resolves the staff member before it selects the slot file.
 `worker_admission.parent` reads the run owner from the state file.
 

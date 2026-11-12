@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
-EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$")
+EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d (?P<head>.*?) — (?P<status>.*)$")
 
 
 class FooterCounts(NamedTuple):
@@ -34,7 +34,8 @@ def total(each: list[FooterCounts]) -> FooterCounts:
     return FooterCounts(*(sum(column) for column in zip(FooterCounts(), *each)))
 
 
-def change_counts(doc: Path, record: staff.StaffSnapshot, *, sources: list[Path] | None = None) -> tuple[int, int]:
+def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = "",
+                  sources: list[Path] | None = None) -> tuple[int, int]:
     """Count the production tab and the unrouted tab in one routed pass."""
     try:
         scope = change_review.review_scope(doc, False, record)
@@ -44,8 +45,9 @@ def change_counts(doc: Path, record: staff.StaffSnapshot, *, sources: list[Path]
             routed = change_review.routed_review_entries(listing, doc, record=record)
         else:
             routed = change_review.routed_review_entries(listing, doc, record=record, sources=sources)
-        return (sum(owner.tab in scope for _, owner, _ in routed),
-                sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
+        return (sum(owner.tab in scope and (not source or row.get("Producer") == source)
+                    for _, owner, row in routed),
+                0 if source else sum(isinstance(owner, change_routing.UnroutedChange) for _, owner, _ in routed))
     except OSError:
         if sources is not None:
             raise
@@ -63,14 +65,20 @@ def unrouted_changes(doc: Path) -> int:
     return change_counts(doc, staff.snapshot())[1]
 
 
-def proposals(doc: Path, *, sources: list[Path] | None = None) -> int:
+def proposals(doc: Path, *, source: str = "", sources: list[Path] | None = None) -> int:
+    if source:
+        waiting = proposals_table.issue_entries(
+            [issue for issue in proposals_table.scope_issues(doc, sources=sources)
+             if issue.value("proposed_by") == source], sources=sources)[0]
+        return len(waiting)
     return len(proposals_table.waiting_entries(doc, sources=sources)[0])
 
 
-def open_efficiency(line: str) -> bool:
-    """A dated efficiency ledger line whose first status is proposed or deferred."""
+def open_efficiency(line: str, *, source: str = "") -> bool:
+    """Match an open ledger line and its source before the first status delimiter."""
     match = EFFICIENCY_LINE.match(line)
-    return match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
+    return (match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
+            and (not source or match.group("head").rstrip().endswith(f" [by: {source}]")))
 
 
 def efficiency_ledger(doc: Path) -> Path | None:
@@ -81,7 +89,7 @@ def efficiency_ledger(doc: Path) -> Path | None:
         return None
 
 
-def efficiency(doc: Path, *, sources: list[Path] | None = None) -> int:
+def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None) -> int:
     """Proposed and deferred efficiency proposals in the doc's ledger."""
     try:
         path = efficiency_ledger(doc)
@@ -101,16 +109,17 @@ def efficiency(doc: Path, *, sources: list[Path] | None = None) -> int:
         if sources is not None:
             raise
         return 0
-    return sum(open_efficiency(line) for line in lines)
+    return sum(open_efficiency(line, source=source) for line in lines)
 
 
 def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None,
-                sources: list[Path] | None = None) -> FooterCounts:
+                source: str = "", sources: list[Path] | None = None) -> FooterCounts:
     """Read counts. A source collector requires complete reads; other callers retain available counts."""
     try:
-        change_count, unrouted_count = change_counts(doc, record if record is not None else staff.snapshot(), sources=sources)
-        return FooterCounts(change_count, proposals(doc, sources=sources), questions,
-                            efficiency(doc, sources=sources), unrouted_count)
+        change_count, unrouted_count = change_counts(
+            doc, record if record is not None else staff.snapshot(), source=source, sources=sources)
+        return FooterCounts(change_count, proposals(doc, source=source, sources=sources), questions,
+                            efficiency(doc, source=source, sources=sources), unrouted_count)
     except OSError:
         if sources is not None:
             raise

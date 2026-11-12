@@ -176,13 +176,28 @@ class StaffRouting:
         return self.runners_by_name.get(name)
 
     @cached_property
+    def document_lines(self) -> dict[Path, list[str]]:
+        """Share one document read across list and question routing."""
+        documents: dict[Path, list[str]] = {}
+        for doc in dict.fromkeys(self.documents.values()):
+            if self.sources is not None:
+                self.sources.append(doc)
+            try:
+                documents[doc] = doc.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                if self.sources is not None:
+                    raise
+                continue
+        return documents
+
+    @cached_property
     def list_paths(self) -> dict[str, Path]:
         paths: dict[str, Path] = {}
         for doc in dict.fromkeys(self.documents.values()):
             if self.sources is not None:
                 self.sources.append(doc)
             try:
-                lines = doc.read_text(encoding="utf-8").splitlines()
+                lines = self.document_lines.get(doc, [])
                 listing = Path(production_field(lines, "Change review")).expanduser()
                 for name, known in self.documents.items():
                     if known == doc:

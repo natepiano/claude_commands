@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, gate_trial, ledger
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant
+from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 
 
@@ -57,6 +58,48 @@ class LedgerTests(CostFixture):
     def running(self, at: int) -> None:
         self.inventory(at)
         self.observe(at, "running")
+
+    def test_gpu_trial_budget_counts_booked_cost_and_open_maximum(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        limits = conf.read('cloud_gate')
+        limit = conf.decimal(limits.text('gpu_size_trial_limit_usd'))
+        scope = ledger.GateTrialBudget('gpu-trial', limit)
+        first = ledger.GateReservation('gpu-first', self.start, self.start + 3600, limit / 3, Decimal(0),
+                                       region='us-east-2', mode='gpu-size-trial', trial=scope)
+        second = replace(first, attempt='gpu-second')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, first), ledger.GateReserved)
+        self.book.resolve_gate(first.attempt, ledger.GateTerminated(self.start + 3600, 'i-first'))
+        self.assertIsInstance(self.book.reserve_gate(self.settings, second), ledger.GateReserved)
+        next_box = replace(first, attempt='gpu-third', usd_per_hour=limit / 2)
+        decision = self.book.reserve_gate(self.settings, next_box)
+        self.assertEqual(decision, ledger.GateCapReached('gpu_size_trial_limit_usd'))
+        rows = self.book.read_snapshot().gate_reservations
+        self.assertEqual(len(rows), 2)
+        self.assertIsInstance(rows[0].state, ledger.GateTerminated)
+        self.assertIsInstance(rows[1].state, ledger.GateLaunchPending)
+
+    def test_gpu_trial_restart_cannot_increase_its_budget(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        limit = conf.decimal(conf.read('cloud_gate').text('gpu_size_trial_limit_usd'))
+        first = ledger.GateReservation('gpu-first', self.start, self.start + 3600, limit / 3, Decimal(0),
+            region='us-east-2', mode='gpu-size-trial', trial=ledger.GateTrialBudget('same-trial', limit / 2))
+        self.assertIsInstance(self.book.reserve_gate(self.settings, first), ledger.GateReserved)
+        restarted = ledger.CostLedger(self.state)
+        second = replace(first, attempt='gpu-second', trial=ledger.GateTrialBudget('same-trial', limit))
+        self.assertEqual(restarted.reserve_gate(self.settings, second), ledger.GateCapReached('gpu_size_trial_limit_usd'))
+        self.assertEqual(restarted.read_snapshot().gate_reservations[0].trial, first.trial)
+
+    def test_gpu_trial_still_obeys_the_daily_limit(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'stopped')
+        limit = conf.decimal(conf.read('cloud_gate').text('gpu_size_trial_limit_usd'))
+        self.costs({'daily_limit_usd': str(limit / 3), 'limit_reserve_usd': '0'})
+        request = ledger.GateReservation('gpu-daily', self.start, self.start + 3600, limit / 2, Decimal(0),
+            mode='gpu-size-trial', region='us-east-2', trial=ledger.GateTrialBudget('trial', limit))
+        self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
 
     def test_repeated_observations_and_restart_charge_each_running_second_once(self) -> None:
         self.running(self.start)
@@ -1114,6 +1157,28 @@ class LedgerTests(CostFixture):
 
 
 class SpotPriceEvidenceTests(CostFixture):
+    def test_regional_reply_selects_the_latest_price_for_each_requested_zone_and_type(self) -> None:
+        first: dict[str, object] = dict(InstanceType='m7a.8xlarge', AvailabilityZone='eu-south-2a',
+            SpotPrice='.3', Timestamp='2026-01-15T00:00:00Z')
+        reply: dict[str, object] = {'SpotPriceHistory': [
+            {**first, 'SpotPrice': '.2', 'Timestamp': '2026-01-15T01:00:00Z'}, first,
+            {**first, 'InstanceType': 'c7a.8xlarge'}, {**first, 'AvailabilityZone': 'eu-south-2b'}]}
+        self.assertEqual(ledger.regional_spot_prices('eu-south-2', reply, ('m7a.8xlarge',), 123), (
+            ledger.RegionalSpotPrice('eu-south-2', 'eu-south-2a', 'm7a.8xlarge', Decimal('.2'), 123),
+            ledger.RegionalSpotPrice('eu-south-2', 'eu-south-2b', 'm7a.8xlarge', Decimal('.3'), 123)))
+
+    def test_regional_reply_rejects_incomplete_pages_and_invalid_prices(self) -> None:
+        first: dict[str, object] = dict(InstanceType='m7a.8xlarge', AvailabilityZone='eu-south-2a',
+            SpotPrice='.3', Timestamp='2026-01-15T00:00:00Z')
+        replies: tuple[dict[str, object], ...] = (
+            {'SpotPriceHistory': [first], 'NextToken': 'next'},
+            *({'SpotPriceHistory': [{**first, 'SpotPrice': price}]} for price in ('-1', 'NaN', 'Infinity')),
+            {'SpotPriceHistory': [{**first, 'Timestamp': 'invalid'}]},
+            {'SpotPriceHistory': [{**first, 'AvailabilityZone': ''}]})
+        for reply in replies:
+            with self.subTest(reply=reply), self.assertRaises(ValueError):
+                _ = ledger.regional_spot_prices('eu-south-2', reply, ('m7a.8xlarge',), 123)
+
     def test_regional_prices_round_trip_without_changing_cost_evidence(self) -> None:
         prices = (ledger.RegionalSpotPrice('us-east-2', 'us-east-2a', 'm7a.8xlarge', Decimal('.425'), 1700000000),)
         self.assertEqual(ledger.read_spot_prices(self.state), ())

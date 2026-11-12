@@ -62,6 +62,35 @@ def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Gener
 
 
 class QuestionLibraryTests(unittest.TestCase):
+    def test_open_questions_filters_the_asker_and_excludes_deferred_items(self) -> None:
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "Owner question", "question": "Choose the layout?"},
+            {"since": AT, "text": "Legacy reminder"},
+        ]
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{path.stem}"
+            production = showrunner_footer.read_production(timer)
+            assert production is not None
+            own = fixture_member("unit", name="own", parent=production.owner.id)
+            other = fixture_member("unit", name="other", parent=production.owner.id)
+            empty = fixture_member("unit", name="empty", parent=production.owner.id)
+            folder = Path(scratch) / "issues"
+            for index, (source, after) in enumerate(((own.id, ""), (own.id, ""),
+                                                    (other.id, ""), ("unknown-staff", ""),
+                                                    (own.id, "2099-01-02T08:00"))):
+                fields = {"since": AT, "text": f"Question {index}", "question": "Choose the route?",
+                          "asked_by": source}
+                if after:
+                    fields["after"] = after
+                _ = (folder / f"question-source-{index}.md").write_text(
+                    "---\nrecord_type: question\nstatus: open\n"
+                    + f"production_id: {production.owner.id}\nasked_by: {source}\n"
+                    + f"registration: {json.dumps(fields)}\n---\n")
+            for source, expected in (("", 6), (own.id, 2), (other.id, 1), (empty.id, 0)):
+                with self.subTest(source=source):
+                    self.assertEqual(showrunner_footer.open_questions([production], source=source), expected)
+
     def test_invalid_timer_text_does_not_hide_a_valid_staff_timer(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

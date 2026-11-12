@@ -4401,9 +4401,20 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertEqual(gate.reservation_need(row, reading), 4 * GIB)
         self.assertEqual(row["need"], 4 * GIB)
         text = gate.progress_text(adjusted)
-        self.assertIn("suites:1, 80% done", text)
+        self.assertIn("suites:1, 80.0% done", text)
         self.assertIn("need 1.5 GiB", text)
-        self.assertIn("highest anonymous use in the next 20%", text)
+        self.assertIn("highest anonymous use in the next 20.0%", text)
+
+    def test_progress_text_rounds_down_until_the_counter_is_complete(self) -> None:
+        for done, total, expected in (
+            (835, 836, "99.8%"), (836, 836, "100.0%"),
+            (10**18 - 1, 10**18, "99.9%"), (0, 836, "0.0%"),
+        ):
+            with self.subTest(done=done, total=total):
+                reading = admission_records.ProgressAdjustedMemory(GIB,
+                    counter=progress.ProgressCounter("build:1", done, total),
+                    window=progress.NoMatchingProfile("private fixture"), remaining_need=GIB)
+                self.assertIn(f"build:1, {expected} done", gate.progress_text(reading))
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
         first = self.reservation("merge-gate")

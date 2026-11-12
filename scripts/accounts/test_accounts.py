@@ -4024,14 +4024,46 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
     def test_piped_status_keeps_an_unrepresented_helper_warning(self) -> None:
         original = accounts.account_statuses
-        def inspect() -> list[accounts.AccountStatus]:
-            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
-            return original()
-        with patch.object(accounts, "account_statuses", side_effect=inspect):
-            code, output, error = self.run_cli("status", "--stored", "--json")
-        self.assertEqual((code, error), (0, ""))
-        lines = cast(list[str], json.loads(output)["problems"])
-        self.assertIn("accounts: read warning; usage store: could not claim the read; read without a hold", lines)
+        retain_raw = accounts.StatusDiagnostics.retain_raw
+        repeated = tuple(f"anomaly: session-{index}: herdr pane list: server_not_running" for index in range(23))
+        cases = (
+            (("usage store: could not claim the read; read without a hold",),
+             ("accounts: read warning; usage store: could not claim the read; read without a hold",)),
+            (repeated + (repeated[0],),
+             ("accounts: read warning; herdr pane list: server_not_running (23 sessions)",)),
+            ((repeated[0], "anomaly: session-other: herdr pane list: server_not_running",
+              "anomaly: session-0: herdr pane list: permission denied",
+              "anomaly: session-other: herdr pane list: permission denied"),
+             ("accounts: read warning; herdr pane list: server_not_running (2 sessions)",
+              "accounts: read warning; herdr pane list: permission denied (2 sessions)")),
+            ((repeated[0],),
+             ("accounts: read warning; anomaly: session-0: herdr pane list: server_not_running",)),
+            (("anomaly: /tmp/claude/run-a: this run has no owner because progress_history_state.json names no staff row",
+              "anomaly: /tmp/claude/run-b: this run has no owner because progress_history_state.json names no staff row"),
+             ("accounts: read warning; anomaly: /tmp/claude/run-a: this run has no owner because progress_history_state.json names no staff row",
+              "accounts: read warning; anomaly: /tmp/claude/run-b: this run has no owner because progress_history_state.json names no staff row")),
+            (("anomaly: shared server unavailable", "anomaly: another server unavailable"),
+             ("accounts: read warning; anomaly: shared server unavailable",
+              "accounts: read warning; anomaly: another server unavailable")),
+        )
+        for warnings, expected in cases:
+            for flags in ((), ("--json",)):
+                with self.subTest(warnings=warnings, flags=flags):
+                    raw: list[str] = []
+                    def inspect() -> list[accounts.AccountStatus]:
+                        for warning in warnings:
+                            print(warning, file=sys.stderr)
+                        return original()
+                    def retain(diagnostics: accounts.StatusDiagnostics, text: str, *, delivered: bool) -> None:
+                        retain_raw(diagnostics, text, delivered=delivered)
+                        raw.extend(diagnostics.raw)
+                    with (patch.object(accounts, "account_statuses", side_effect=inspect),
+                          patch.object(accounts.StatusDiagnostics, "retain_raw", new=retain)):
+                        code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines()
+                    self.assertEqual(tuple(line for line in lines if line.startswith("accounts: read warning;")), expected)
+                    self.assertEqual(tuple(raw), warnings)
 
     def test_piped_status_preserves_unknown_reader_and_renderer_warnings(self) -> None:
         original = accounts.render_status_json
@@ -7675,6 +7707,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         runner = fixture_member("showrunner", name="showrunner")
         self.owner_id = fixture_member("unit", name="director", parent=runner.id,
                                        worktree=staff.PresentWorktree("natedev", self.root)).id
+        atomic_file.write_text_atomic(self.run_dir / unit_runs.STATE_FILE,
+                                      json.dumps({unit_runs.OWNER_FIELD: self.owner_id}))
         self.world.add(self.owner, "w1:p0")
         config = self.root / "conf"
         config.mkdir()
@@ -7766,9 +7800,10 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def dispatch(self, row: staff.StaffRow, role: str = "impl", status: str = "active") -> None:
         if role in staff.WORKER_ROLES:
             _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(role))
+        _ = staff.set_run(self.owner.id, staff.OpenRun(self.run_dir))
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
-            "owner_session": self.owner.current_session, "history_file": str(self.run_dir / "history.jsonl"),
-            "pass": {row.name: {"worker_name": row.name, "team_slot": row.name, "kind": role,
+            "owner_staff_id": self.owner.id, "history_file": str(self.run_dir / "history.jsonl"),
+            "pass": {row.name: {"worker_id": row.id, "team_slot": row.name, "kind": role,
                                  "status": status, "started_at": time.time(), "instance_id": "dispatch-" + row.name,
                                  "launcher_command": ["assign.sh", "--to", row.name]}}}))
         if status == "active":
@@ -7797,12 +7832,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_busy_move_keeps_the_pane_and_conversation_and_rerun_changes_nothing(self) -> None:
         row = self.worker()
+        row = staff.set_home(row.id, staff.SessionHome(self.root / ".claude1"))
         _ = self.fixture.worker_run("a-first", "unit", self.owner.current_session, director_run=True,
-            passes=({"worker_name": row.name, "kind": "review", "status": "active", "started_at": 0,
+            passes=({"worker_id": row.id, "kind": "review", "status": "active", "started_at": 0,
                      "instance_id": "old-dispatch", "launcher_command": ["assign.sh", "--old"]},))
         self.run_dir = self.fixture.worker_run("z-own", "unit", self.owner.current_session)
         self.dispatch(row)
-        before = self.fixture.staff_state()
+        before = staff.snapshot()
         result = self.move("claude2", why="quota")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
@@ -7812,6 +7848,12 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertIn("moved from claude1 to claude2", prompt[-1])
         self.assertEqual(self.target_check.call_args.args[0], row.current_session)
         self.assertEqual(cast(herdr.HerdrPlace, self.target_check.call_args.kwargs["place"]).pane, "w1:p1")
+        moved = staff.by_id(row.id)
+        assert moved is not None
+        self.assertEqual(moved.home, staff.SessionHome(self.root / ".claude2"))
+        self.assertEqual(tuple(replace(member, home=row.home) if member.id == row.id else member
+                               for member in staff.snapshot().rows), before.rows)
+        after_move = self.fixture.staff_state()
         journal = moves.store_file().read_bytes()
         with patch.object(moves, "append_move", wraps=moves.append_move) as append:
             rerun = self.move("claude2")
@@ -7819,7 +7861,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(rerun.returncode, 0)
         self.assertEqual(moves.store_file().read_bytes(), journal)
         self.assertEqual(len(self.world.launches), 1)
-        self.assertEqual(self.fixture.staff_state(), before)
+        self.assertEqual(self.fixture.staff_state(), after_move)
         self.assertEqual(self.world.closed, [])
         self.assertIn("w1:p0", self.world.foreground)
         self.assertEqual([item["kind"] for item in moves.read_moves()], ["requested", "confirmed"])

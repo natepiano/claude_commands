@@ -930,6 +930,76 @@ class CountsRowTests(unittest.TestCase):
                          "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
                          + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
 
+    def test_a_unit_session_shows_its_source_counts_and_refreshes_only_its_cache(self) -> None:
+        unit = replace(UNIT, current_session=staff.StaffId("73073af3-56ea-48e9-8548-a39963c92e53"))
+        other = replace(UNIT, id=staff.StaffId("c5214833-d70b-4058-983f-c851b92d0350"), name="other",
+                        current_session=staff.StaffId("0ccfca18-c7d4-434b-9ea6-27c0bf484f10"))
+        doc = self.home / "docs/plans/show-production.md"
+        folder = self.home / "issues"
+        folder.mkdir()
+        listing = self.home / "change-review - show.md"
+        _ = listing.write_text(
+            "## To review\n\n| # | Change | How to check | Producer |\n"
+            + "| --- | --- | --- | --- |\n"
+            + f"| C1 | Own | Read | {unit.id} |\n| C2 | Other | Read | {other.id} |\n"
+            + "| C3 | Legacy | Read | |\n")
+        efficiency = self.home / "efficiency.md"
+        _ = efficiency.write_text(
+            f"- 2026-11-12 config: Own [by: {unit.id}] — proposed\n"
+            + f"- 2026-11-12 config: Other [by: {other.id}] — deferred\n"
+            + "- 2026-11-12 config: Legacy — proposed\n")
+        _ = self.ledger.write_text("- 2026-11-12 Legacy plan — proposed\n")
+        _ = doc.write_text(doc.read_text() + f"- **Change review:** {listing}\n"
+                           + f"- **Proposals:** {folder}\n- **Efficiency ledger:** {efficiency}\n")
+        record = self.home / ".local/state/staff/staff.json"
+        for source in (unit, other):
+            fields = {"since": "2000-01-01T08:00", "text": source.name, "question": "Choose the route?",
+                      "asked_by": source.id}
+            _ = (folder / f"question-{source.id}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {OWNER.id}\nasked_by: {source.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
+            _ = (folder / f"proposal-{source.id}.md").write_text(
+                f"---\nstatus: open\ntags: [proposal]\nproposed_by: {source.id}\n---\n")
+        self.questions({"since": "2000-01-01T08:00", "text": "Legacy reminder"})
+        own_cache = self.cache.with_name(unit.id)
+        other_cache = self.cache.with_name(other.id)
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        for cache in (self.cache, other_cache):
+            _ = cache.write_text(f"For you: 99 proposals\n\n{record}\n{doc}\n")
+            os.utime(cache, ns=(1, 1))
+        explicit_session = unit.to_json()
+        default_session = explicit_session.copy()
+        del default_session["current_session"]
+        for unit_fields, session_id, previous_session in (
+                (explicit_session, unit.current_session, unit.id),
+                (default_session, unit.id, unit.current_session)):
+            _ = record.write_text(json.dumps({"schema": 1, "rows": [
+                replace(OWNER, doc=staff.LiveDoc(remote.local_machine(), doc)).to_json(),
+                unit_fields, other.to_json(), WORKER.to_json()]}))
+            for shell in SHELLS:
+                with self.subTest(session_id=session_id, shell=shell):
+                    before = {cache: cache.stat().st_mtime_ns for cache in (self.cache, other_cache)}
+                    self.assertEqual(self.lines(session_id, shell=shell)[-1],
+                                     "For you: 1 question, 1 change, 1 efficiency, 1 proposal")
+                    self.assertEqual({cache: cache.stat().st_mtime_ns for cache in before}, before)
+                    line, due, *sources = own_cache.read_text().splitlines()
+                    self.assertEqual((line, due), ("For you: 1 question, 1 change, 1 efficiency, 1 proposal", ""))
+                    for path in (record, doc, listing, efficiency, folder / f"question-{unit.id}.md"):
+                        self.assertIn(str(path), sources)
+                    built = own_cache.stat().st_mtime_ns
+                    self.assertEqual(self.lines(session_id, shell=shell)[-1], line)
+                    self.assertEqual(own_cache.stat().st_mtime_ns, built)
+                    self.assertFalse(any(line.startswith("For you:") for line in self.lines(previous_session, shell=shell)))
+                    self.assertFalse(any(line.startswith("For you:") for line in self.lines(WORKER.current_session, shell=shell)))
+                    _ = efficiency.write_text(efficiency.read_text()
+                                              + f"- 2026-11-12 config: More [by: {unit.id}] — proposed\n")
+                    self.assertEqual(self.lines(session_id, shell=shell)[-1],
+                                     "For you: 1 question, 1 change, 2 efficiency, 1 proposal")
+                    self.assertEqual(self.lines(shell=shell)[-1],
+                                     "For you: 3 questions, 3 changes, 4 efficiency, 3 proposals")
+                    _ = efficiency.write_text(efficiency.read_text().split("- 2026-11-12 config: More")[0])
+
     def test_the_row_counts_efficiency_and_refreshes_when_the_ledger_changes(self) -> None:
         ledger = self.home / "efficiency.md"
         doc = self.home / "docs/plans/show-production.md"

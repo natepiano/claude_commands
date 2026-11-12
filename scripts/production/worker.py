@@ -963,7 +963,6 @@ type WorkerHistoryTargets = dict[bytes, staff.StaffRow]
 
 def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generator[dict[str, object]]:
     identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
-    name_pattern = re.compile(rb'"(?:worker_name|team_slot)"\s*:\s*("(?:[^"\\]|\\.)*")')
     bad_line_reported = False
     try:
         with path.open("rb") as history:
@@ -978,11 +977,7 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generato
             if b'"pass_started"' not in line and b'"pass_finished"' not in line:
                 continue
             identity = identity_pattern.search(line)
-            if identity is not None and identity[1]:
-                if identity[1] not in wanted:
-                    continue
-            elif not any(name[1] == json.dumps(row.name).encode()
-                         for name in name_pattern.finditer(line) for row in wanted.values()):
+            if identity is None or not identity[1] or identity[1] not in wanted:
                 continue
             try:
                 value = cast(object, json.loads(line))
@@ -1010,7 +1005,6 @@ class RecordedWorkerDispatches:
 def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
-    names = {(row.parent.id, row.name): row for row in workers if isinstance(row.parent, staff.ReportsTo)}
     runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
     for parent in parents.values():
         runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
@@ -1045,11 +1039,8 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDi
         if not isinstance(value, dict):
             continue
         state = cast(dict[str, object], value)
-        agent = state.get("main_agent", {})
-        session = cast(dict[str, object], agent).get("session_id", "") if isinstance(agent, dict) else ""
-        reference = state.get(unit_runs.OWNER_FIELD) or session or state.get("owner_session") or state.get("director_session")
-        owner = record.owner_of(reference) if isinstance(reference, str) else None
-        parent_id = owner.id if owner is not None else StaffId("")
+        owner = unit_runs.run_owner(state, record)
+        parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
         history = state.get("history_file")
         if isinstance(history, str) and history and parent_id in parents:
             histories.setdefault(Path(history).resolve(), {}).update({str(row.id).encode(): row
@@ -1062,9 +1053,8 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDi
                            [cast(dict[str, object], value) for value in slots.values() if isinstance(value, dict)])
         for entry in entries:
             identity = entry.get("worker_id")
-            row = (record.by_id(StaffId(identity)) if isinstance(identity, str) and identity else
-                   names.get((parent_id, str(entry.get("worker_name") or entry.get("team_slot") or ""))))
-            if row is None or row.kind != "worker":
+            row = record.by_id(StaffId(identity)) if isinstance(identity, str) and identity else None
+            if row is None or row.kind != "worker" or row.parent != staff.ReportsTo(parent_id):
                 continue
             keep(row, entry)
     for path, targets in histories.items():
@@ -1072,11 +1062,6 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDi
         for entry in _worker_history_events(path, pending):
             identity = entry.get("worker_id")
             target = pending.get(identity.encode()) if isinstance(identity, str) and identity else None
-            if target is None and not identity:
-                matches = [pair for pair in pending.values()
-                           if pair.name == (entry.get("worker_name") or entry.get("team_slot"))]
-                if len(matches) == 1:
-                    target = matches[0]
             if target is not None:
                 keep(target, entry)
                 del pending[str(target.id).encode()]

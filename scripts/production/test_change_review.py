@@ -1075,7 +1075,7 @@ class ReadyListTests(ProducerFixture):
                 row = (next(row for row in rows if row["Change"] == branch)
                        if owner_record == "inner-unrecorded" else rows[-1])
                 self.assertEqual(row["Change"], branch)
-                self.assertEqual(row["Producer"], self.unit.id)
+                self.assertEqual(row["Producer"], "" if owner_record == "legacy-session" else self.unit.id)
                 if owner_record == "inner-unrecorded":
                     row = next(row for row in rows if row["Change"] == f"side-{branch}")
                     self.assertEqual(row["Producer"], "")

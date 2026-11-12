@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
+import runpy
 import signal
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, override
+from typing import Callable, Literal, cast, override
 from unittest.mock import patch
 
 from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
@@ -19,6 +22,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.direct import assign
+from scripts.agents import pane_record
 from scripts.production.test_worker import PaneCommandRouter
 
 
@@ -39,6 +43,7 @@ class SidePaneTests(StaffTestCase):
         super().setUp()
         _ = self.write_document({"schema": 2, "rows": []})
         self.world = PaneWorld()
+        self.world.publish_claude_start = False
         self.openings = []
         self.signals = self.world.signals
         self.launch_limits = []
@@ -118,6 +123,56 @@ class SidePaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 2)
 
     def test_a_friend_launches_with_the_worker_permissions_for_both_families(self) -> None:
+        with self.subTest(publication="Claude SessionStart arguments"):
+            case = SidePaneTests()
+            case.setUp()
+            try:
+                namespace = runpy.run_path(str(Path(__file__).parents[1] / "hooks/session-start-pane-record.py"))
+                record_start = cast(Callable[[], None], namespace["main"])
+
+                def launch(name: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                           prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                           reported_unknown: str = "") -> herdr.AgentLaunched:
+                    result = case.world.launch(name, destination, prepared, kind, arguments, opening, timeout_ms,
+                                               agent=agent, reported_unknown=reported_unknown)
+                    pid = case.world.foreground[result.pane][0]
+                    identity = case.world.processes[pid].current_identity
+                    with (patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_SESSION": name,
+                              "HERDR_PANE_ID": result.pane}),
+                          patch.object(sys, "stdin", io.StringIO(json.dumps({
+                              "source": "startup", "session_id": identity, "cwd": str(prepared.directory)}))),
+                          patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()),
+                          patch.object(pane_record, "claude_arguments", return_value=["claude", *arguments]),
+                          patch.object(os, "getppid", return_value=pid),
+                          patch.object(staff, "runtime_id", return_value=identity)):
+                        record_start()
+                    return result
+
+                with patch.object(herdr, "launch_prepared_agent", side_effect=launch):
+                    result = side_pane.open("native-argument-name", assign.pane_policy("friend"), cwd=case.root)
+                entry = next(iter(pane_launch.read(pane_launch.record_directory() / "agents.json").values()))
+                self.assertEqual(entry.get("name"), "native-argument-name")
+                self.assertIsInstance(result, side_pane.OpenSidePane)
+            finally:
+                case.doCleanups()
+
+        for shown in (None, "old-helper-title"):
+            with self.subTest(helper_title=shown):
+                case = SidePaneTests()
+                case.setUp()
+                try:
+                    opened = case.start("native-helper")
+                    case.world.locations[opened.pane]["label"] = shown
+                    foreign = fixture_member("showrunner", name="other-helper")
+                    case.world.add(foreign, "w1:p8", label="native-helper")
+                    before = len(case.world.commands)
+                    self.assertEqual(side_pane.send("native-helper", "Read the native helper."), opened)
+                    self.assertEqual(case.world.commands[before:][0][2], opened.pane)
+                    self.assertEqual(case.world.closed, [])
+                finally:
+                    case.doCleanups()
+
         for family in ("claude", "codex"):
             with self.subTest(family=family):
                 self.caller(family)
@@ -223,6 +278,10 @@ class SidePaneTests(StaffTestCase):
                 self.assertIn("send.py --to " + address, prompts[-1][3])
                 self.assertEqual(output, "done\n")
                 pane = next(pane for pane, row in self.world.locations.items() if row["label"] == label)
+                if family == "codex":
+                    with self.subTest(transition="first prompt proves the thread"):
+                        saved = pane_launch.read(pane_launch.record_directory() / "agents.json").get(pane)
+                        self.assertEqual(saved.get("name") if saved is not None else None, label)
                 self.assertEqual(self.world.requests[-1][0], family)
                 code, _, errors = self.command("send", label, "--message-file", str(message))
                 self.assertEqual(code, 0, errors)
@@ -239,6 +298,32 @@ class SidePaneTests(StaffTestCase):
             self.assertEqual(command[command.index("--target") + 1], "consultation-pane")
             self.assertEqual(command[command.index("--policy") + 1], "friend")
         self.assertIn("w1:p0", self.world.locations)
+
+    def test_codex_question_keeps_a_delayed_thread_and_replaces_a_stopped_launch(self) -> None:
+        self.caller("codex")
+        self.world.report_reads_before_publish = 2
+        first = side_pane.open("delayed-friend", assign.pane_policy("friend"), question="Review.", cwd=self.root)
+        self.assertIsInstance(first, side_pane.OpenSidePane)
+        assert isinstance(first, side_pane.OpenSidePane)
+        saved = pane_launch.read(pane_launch.record_directory() / "agents.json").get(first.pane)
+        self.assertIsNotNone(saved)
+        self.assertEqual(side_pane.send("delayed-friend", "Continue."), first)
+        self.world.end_agent(first.pane)
+        _ = self.world.locations[first.pane].pop("agent_session", None)
+        self.world.report_reads_before_publish = 2
+        activate = self.world.activate
+        def restarted(identity: str, pane: str, family: Literal["claude", "codex"]) -> None:
+            del identity
+            activate(fixture_runtime_id("restarted-delayed-friend"), pane, family)
+        with patch.object(self.world, "activate", side_effect=restarted):
+            second = side_pane.open("delayed-friend", assign.pane_policy("friend"), question="Review again.", cwd=self.root)
+        self.assertEqual(second, first)
+        replacement = pane_launch.read(pane_launch.record_directory() / "agents.json")[first.pane]
+        self.assertEqual(replacement.get("session_id"), fixture_runtime_id("restarted-delayed-friend"))
+        self.assertEqual(side_pane.send("delayed-friend", "Continue again."), first)
+        prompts = [command[3] for command in self.world.commands if command[:3] == ("agent", "prompt", first.pane)]
+        self.assertTrue(any("Review again." in text for text in prompts))
+        self.assertEqual(len(self.world.launches), 2)
 
     def test_open_sends_the_whole_question_after_start_without_reading_the_composer(self) -> None:
         question = "Review the design.\nExplain the result."
@@ -354,7 +439,7 @@ class SidePaneTests(StaffTestCase):
         self.world.locations["w1:p8"] = {**self.world.locations[result.pane], "pane_id": "w1:p8", "terminal_id": "other"}
         code, _, errors = self.command("close", "friend")
         self.assertEqual(code, 2)
-        self.assertIn("duplicate", errors)
+        self.assertIn("several panes match", errors)
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.stops, [])
 

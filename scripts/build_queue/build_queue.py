@@ -19,7 +19,6 @@ import time
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
 from scripts.build_queue.queue_lines import json_form
-from scripts.build_queue.queue_evidence import step_labels
 from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
 from scripts.build_queue.queue_lines import Span
 from scripts.buildlog.mac_idle_alert import alert_line, state_dir
@@ -71,7 +70,8 @@ def bump(selector: str, actor: str) -> int:
         print(f"build queue: no waiting step matches {selector}")
         return 3
     selected_place = matches[0]
-    unit = step_labels(reading.view.waiting[selected_place - 1], labels).unit
+    step = reading.view.waiting[selected_place - 1]
+    unit = memory_admit.queue_unit(step.unit, step.session_id, labels)
     if unit == unit_labels.UnitLabels("").unit or not unit:
         print(f"build queue: waiting step #{selected_place} has no unit")
         return 3
@@ -81,7 +81,7 @@ def bump(selector: str, actor: str) -> int:
         return 3
     reading = memory_admit.queue_read()
     first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
-                  if step_labels(step, labels).unit == unit), NoWaitingStep())
+                  if memory_admit.queue_unit(step.unit, step.session_id, labels) == unit), NoWaitingStep())
     detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
     priority = reading.explanation.priority
     units = ([entry["unit"] for entry in priority.entries]

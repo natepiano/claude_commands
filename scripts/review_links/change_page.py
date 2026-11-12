@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import change_review as change_review
 from scripts.production import unit_lookup
+from scripts.production import update_registration
 from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
 from scripts.production.delivery_state import (
     AnsweredQuestion as AnsweredQuestion, DeliveryIntent as DeliveryIntent, DeliverySlots as DeliverySlots,
@@ -93,6 +94,17 @@ class StoredDeliverySlots(TypedDict, total=False):
     validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
     question: StoredOpenQuestion | StoredAnsweredQuestion
+    user_answer: StoredUserAnswer
+
+
+class StoredUserAnswer(TypedDict):
+    saved: bool
+    source: str
+    production: str
+    owner: str
+    question: str
+    answer: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -119,8 +131,19 @@ class AssignedReviewPage(ReviewPage):
     owner: change_routing.ChangeOwner
 
 
+@dataclass(frozen=True)
+class UserQuestionPage(ReviewPage):
+    """A filed user question and its saved answer share one delivery record."""
+
+    saved: StoredUserAnswer
+
+
 class AnswerRefused(ValueError):
     """An invalid answer must not change the review record."""
+
+
+class QuestionAnswerRefused(AnswerRefused):
+    """Another session already answered this user question."""
 
 
 class FeatureLogFailed(RuntimeError):
@@ -194,6 +217,8 @@ class DeliveryStatus:
     def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots) -> None:
         """Write both slots while the caller holds the delivery lock."""
         fields: StoredDeliverySlots = {}
+        if isinstance(page, UserQuestionPage):
+            fields["user_answer"] = page.saved
         if isinstance(slots.validation, DeliveryIntent):
             fields["validation"] = {**stored_intent(slots.validation), "feedback": slots.validation.feedback}
         elif isinstance(slots.validation, ValidationRequested):
@@ -321,7 +346,7 @@ ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
-button{font:inherit;margin:0 8px 8px 0;padding:6px 12px}button[aria-pressed=true]{outline:2px solid currentColor}
+button{font:inherit;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 </style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
 
 
@@ -341,7 +366,7 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row = notice.row if notice.row in page.rows else page.rows[0]
     row_id = html.escape(row)
     buttons: list[str] = []
-    for value, label in (("works", "Works"), ("not works", "Not works"),
+    for value, label in (("works", "Works"), ("not works", "Does not work"),
                          ("validate", "Validate yourself"), ("feedback", "Send feedback"), ("question", "Ask a question")):
         if value == "question" and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
@@ -493,11 +518,12 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
     queue = next_item.change_queue(page.production)
     moved = urgency.ended(queue.name)
     if saved or any(queue_key(page, row) in moved for row in page.rows):
-        sections.append(f'<p>{len(queue.entries)} changes left</p>')
         if queue.entries:
             sections.append(f'''<form method="post">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
 <button name="outcome" value="next">Next</button></form>''')
+        else:
+            sections.append('<p>No changes are waiting.</p>')
     return document("".join(sections))
 
 
@@ -786,6 +812,7 @@ def alert_delivery_failures(delivery: MessageDelivery, failures: list[DeliveryFa
 
 def recover_pending(status: DeliveryStatus) -> None:
     """Find pending messages through one scan of the current review lists."""
+    recover_question_answers(status)
     paths = status.read_view().paths
     if not paths:
         return
@@ -846,6 +873,50 @@ def recover_pending(status: DeliveryStatus) -> None:
                             ownership = status.request_attempts.get(attempt)
                             if ownership is not None and ownership.state == "claimed":
                                 _ = status.request_attempts.pop(attempt, None)
+
+
+def recover_question_answers(status: DeliveryStatus) -> None:
+    """Recover saved user answers through the existing delivery claims and retry budget."""
+    for path in status.read_view().paths:
+        claimed: tuple[str, ...] = ()
+        try:
+            with status.locked():
+                if any(owner.row_file == path for owner in status.request_attempts.values()):
+                    continue
+                fields = cast(StoredDeliverySlots, json.loads(path.read_text()))
+                saved = fields.get("user_answer")
+                if saved is None:
+                    continue
+                slots = delivery_state.decode_value(fields)
+                intents = slots.intents()
+                if not intents:
+                    continue
+                page = UserQuestionPage(Path(saved["source"]), Path(saved["production"]),
+                                        (Path(saved["source"]).stem,), "", saved)
+                identities = update_registration.QuestionStaff.read()
+                question = next((item for item in update_registration.question_records_for_document(page.production, identities)
+                                 if item.path == page.review_list), None)
+                if question is None or question.status != "closed":
+                    status.clear_locked(page, page.rows[0], slots, "verdict")
+                    continue
+                if not saved.get("saved", False):
+                    status.clear_locked(page, page.rows[0], slots, "verdict")
+                    print(f"review-links recovery {path.name}: answer save state unknown; not sent", file=sys.stderr)
+                    continue
+                claimed = tuple(intent.attempt for intent in intents)
+                for attempt in claimed:
+                    status.request_attempts[attempt] = AttemptOwnership(path, "claimed")
+            for intent in intents:
+                deliver(MessageDelivery(page, page.rows[0], intent.recipients, saved["message"], intent.attempt,
+                                        (staff.StaffId(saved["owner"]),)), status)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
+        finally:
+            with status.locked():
+                for attempt in claimed:
+                    owner = status.request_attempts.get(attempt)
+                    if owner is not None and owner.state == "claimed":
+                        del status.request_attempts[attempt]
 
 
 def publish_browser(initial: str = "") -> str:

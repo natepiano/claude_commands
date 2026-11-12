@@ -350,40 +350,68 @@ def question_asker(fields: OutstandingItem | AnsweredItem,
     return ShowrunnerAsker() if name == SHOWRUNNER_ASKER else UnitAsker(name)
 
 
-def relay_line(production: Production, name: str, asker: QuestionAsker,
-               identities: QuestionStaff | None = None) -> str:
+@dataclass(frozen=True)
+class NoAnswerRelay:
+    """The owning showrunner receives the page answer."""
+
+
+@dataclass(frozen=True)
+class AnswerRelay:
+    """The CLI line and fixed recipient describe the same relay decision."""
+
+    line: str
+    recipient: staff.StaffId | NoAnswerRelay
+    unit: str = ""
+
+
+def answer_relay(production: Production, name: str, asker: QuestionAsker,
+                 identities: QuestionStaff | None = None) -> AnswerRelay:
+    identities = identities if identities is not None else QuestionStaff.read()
+
+    def target(line: str, reference: str = "", unit: str = "") -> AnswerRelay:
+        row = identities.record.by_member_reference(reference) if reference else None
+        if row is None and reference:
+            row = next((member for member in identities.record.rows
+                        if member.kind == "showrunner" and member.name == reference), None)
+        return AnswerRelay(line, row.id if row is not None else NoAnswerRelay(), unit)
+
     owner = "this production" if name == production.name else f"{name}, below this production"
     if isinstance(asker, OpenItemWithoutAsker):
-        return f"relay: none; the item belongs to {owner}"
+        return target(f"relay: none; the item belongs to {owner}")
     if isinstance(asker, AskerNotRecorded):
-        return f"relay: none; {asker.reason}; the item belongs to {owner}"
+        return target(f"relay: none; {asker.reason}; the item belongs to {owner}")
     if isinstance(asker, StaffAsker):
-        identities = identities if identities is not None else QuestionStaff.read()
         row = identities.record.by_member_reference(asker.member_id)
         if row is None:
-            return f"relay: none; staff member {asker.member_id} is unavailable"
+            return target(f"relay: none; staff member {asker.member_id} is unavailable")
         current_owner = production.owner
         current_name, label = identities.display(row)
         if row.kind == "showrunner":
             if row.id == current_owner.id:
-                return "relay: none; this showrunner asked it"
+                return target("relay: none; this showrunner asked it")
             loaded = names.runtime_names()
             label = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
         elif row.parent == staff.ReportsTo(current_owner.id):
             current_name = production.name
         if current_name != production.name:
-            return f"relay: to the showrunner of {current_name}, for {label} (staff {row.id})"
-        return f"relay: to {label} (staff {row.id})"
+            return target(f"relay: to the showrunner of {current_name}, for {label} (staff {row.id})", current_name, label)
+        return target(f"relay: to {label} (staff {row.id})", row.id, label)
     if name != production.name:
         if isinstance(asker, UnitAsker):
             label = asker.unit
         else:
             loaded = names.runtime_names()
             label = loaded.job("showrunner") if isinstance(loaded, names.Names) else "requesting role (display name unavailable)"
-        return f"relay: to the showrunner of {name}, for {label}"
+        return target(f"relay: to the showrunner of {name}, for {label}", name, label)
     if isinstance(asker, ShowrunnerAsker):
-        return "relay: none; this showrunner asked it"
-    return f"relay: to {asker.unit}"
+        return target("relay: none; this showrunner asked it")
+    return target(f"relay: to {asker.unit}", asker.unit, asker.unit)
+
+
+
+def relay_line(production: Production, name: str, asker: QuestionAsker,
+               identities: QuestionStaff | None = None) -> str:
+    return answer_relay(production, name, asker, identities).line
 
 
 def answered_items(outstanding: Path, now: datetime) -> list[AnsweredItem]:
@@ -771,13 +799,14 @@ class QuestionOwnerUnavailable:
     document: Path
 
 
-def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder | QuestionOwnerUnavailable:
+def question_folder(document: Path, identities: QuestionStaff, *,
+                    lines: list[str] | None = None) -> QuestionFolder | QuestionOwnerUnavailable:
     """Select the production's question folder from its document and staff context."""
     owner = identities.record.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
-    folder = issues_folder(owner.doc.path)
+    folder = issues_folder(owner.doc.path, lines=lines)
     root = _showrunner_state_root()
     return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
@@ -797,23 +826,40 @@ def question_records(production: Production, identities: QuestionStaff) -> list[
     return question_records_for_document(production.doc, identities)
 
 
-def question_records_for_document(doc: Path, identities: QuestionStaff, *,
+def question_records_for_document(doc: Path, identities: QuestionStaff, *, include_unrouted: bool = False,
+                                  lines: list[str] | None = None,
                                   sources: list[Path] | None = None) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
-    folder = question_folder(doc, identities)
+    folder = question_folder(doc, identities, lines=lines)
     if isinstance(folder, QuestionOwnerUnavailable):
-        return []
+        source = issues_folder(doc, lines=lines) if include_unrouted else None
+        if source is None:
+            return []
+    else:
+        source = folder.path
     from scripts.production.issues import source_paths
 
     issues = [Issue(path, frontmatter(path, sources=sources))
-              for path in sorted(source_paths(folder.path, "question-*.md", sources=sources))]
+              for path in sorted(source_paths(source, "question-*.md", sources=sources))]
+    if isinstance(folder, QuestionFolder):
+        issues = [issue for issue in issues if issue.value("production_id") == folder.owner]
+    return _question_records(issues)
+
+
+def unowned_question_records(identities: QuestionStaff) -> list[QuestionRecord]:
+    """Read state folders whose owners have no live showrunner row."""
+    owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
+    paths = sorted(_showrunner_state_root().glob("*/questions/question-*.md"))
+    return _question_records([Issue(path, frontmatter(path)) for path in paths if path.parent.parent.name not in owners])
+
+
+def _question_records(issues: list[Issue]) -> list[QuestionRecord]:
+    """Read canonical question fields from their issue records."""
     questions = [issue for issue in issues if issue.value("record_type") == "question"]
     if not questions:
         return []
     records: list[QuestionRecord] = []
     for issue in questions:
-        if issue.value("production_id") != folder.owner:
-            continue
         path = issue.path
         try:
             raw = cast(object, json.loads(issue.value("registration")))
@@ -830,7 +876,7 @@ def question_records_for_document(doc: Path, identities: QuestionStaff, *,
         status = issue.value("status")
         if status not in {"open", "closed"}:
             raise RegistrationFailure("questions", f"{path}: question status must be open or closed")
-        records.append(QuestionRecord(path, folder.owner, staff.StaffId(asker), item, status))
+        records.append(QuestionRecord(path, staff.StaffId(issue.value("production_id")), staff.StaffId(asker), item, status))
     return records
 
 
@@ -1223,7 +1269,8 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
 
 
-def answer(production: Production, words: str, *, identities: QuestionStaff | None = None) -> None:
+def answer(production: Production, words: str, *, identities: QuestionStaff | None = None,
+           only_open: bool = False) -> AnswerRelay:
     """Answer one item and resolve its asker's current staff row for relay."""
     identities = identities if identities is not None else QuestionStaff.read()
     wanted = words.strip()
@@ -1232,7 +1279,7 @@ def answer(production: Production, words: str, *, identities: QuestionStaff | No
     answered_exact: list[AnsweredItem] = []
     answered_partial: list[AnsweredItem] = []
     now = datetime.now(production.zone)
-    names = identities.names(production.name, below=True)
+    names = [production.name] if only_open else identities.names(production.name, below=True)
     for name in names:
         for item in read_open_items(outstanding_file(name, identities=identities),
                                     production=production if name == production.name else None, identities=identities):
@@ -1248,18 +1295,21 @@ def answer(production: Production, words: str, *, identities: QuestionStaff | No
                 answered_exact.append(saved)
             elif wanted and (wanted in saved["text"] or wanted in saved.get("question", "")):
                 answered_partial.append(saved)
-    found = exact or answered_exact or partial or answered_partial
+    found = exact if only_open else exact or answered_exact or partial or answered_partial
     if len(found) != 1:
         raise RegistrationFailure("answer", f"{len(found)} open items match {wanted!r}; name one by its text")
     selected = found[0]
     if not isinstance(selected, tuple):
         replay_answer(production, selected, identities)
-        return
+        return answer_relay(production, selected["name"], question_asker(
+            selected, AskerNotRecorded("asked_by not recorded in answered record"), identities), identities)
     name, text = selected
     removed = remove_open_item(production, name, text, identities, "answer",
                                lambda path, item, now: record_answer(path, name, item, now))
-    print(relay_line(production, name, question_asker(removed, OpenItemWithoutAsker(), identities), identities))
+    relay = answer_relay(production, name, question_asker(removed, OpenItemWithoutAsker(), identities), identities)
+    print(relay.line)
     report("answer", "ok", f"{name}: {text}")
+    return relay
 
 
 def remove_open_item(production: Production, name: str, text: str, identities: QuestionStaff, verb: str,
@@ -1575,7 +1625,7 @@ def main() -> int:
         elif action == "mark-important":
             mark_important(production, cast(str, args.item))
         elif action == "answer":
-            answer(production, cast(str, args.item))
+            _ = answer(production, cast(str, args.item))
         elif action == "withdraw":
             withdraw(production, cast(str, args.item))
         elif action == "ask":

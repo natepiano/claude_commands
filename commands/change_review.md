@@ -132,7 +132,36 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 When the user asks to review changes, follow [Bare command](#bare-command).
 
-The page contains every waiting change, with staff-based showrunner tabs.
+The page has Questions, Changes, and Rebuilds tabs with waiting counts.
+Questions and Changes keep their own staff-based showrunner tabs and one card at a time.
+The global waiting count includes all three types.
+The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
+An empty showrunner tab shows `No questions are waiting.` or `No changes are waiting.`
+The selected showrunner tab supplies the count; the card has no separate remaining count.
+A question stays with the showrunner whose question list holds it.
+An unknown question owner appears under `unrouted`.
+Owned question cards show the filed text, choices, asker, and an answer box.
+An `unrouted` card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
+Save answer records the answer and opens the next waiting question.
+Next skips a question without saving.
+Questions have no Validate yourself or Ask a question controls.
+A stale question refuses an answer if another session already answered it.
+Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
+The delivery record stores `saved: false` before the answer saves and `saved: true` after it saves.
+A save error clears the delivery intent and releases its claim.
+Recovery sends only `saved: true` answers for closed questions.
+Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
+The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
+
+Rebuilds shows one block per machine, in machine order, without showrunner tabs, card navigation, Next, or an answer form.
+Its count is the number of machines with open needs.
+Each block shows the newest need's short NixOS commit and every open reason, from oldest to newest.
+Each reason names its affected staff member and a different requesting staff member when recorded.
+Unknown staff IDs appear as IDs.
+An empty view shows `No rebuild is needed.`
+
+The Changes tab contains every waiting change.
+The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
 Reviewed rows keep the production name recorded at the verdict.

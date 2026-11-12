@@ -426,7 +426,7 @@ class PaneRestoreTests(unittest.TestCase):
                 self.opened.clear()
                 self.workspace = "demo"
                 self.entry(cwd="/old/alpha")
-                client = FakeClient([{ "pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
+                client = FakeClient([{ "pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1", "terminal_id": ""}])
                 activity = herdr.PaneRunning(("other work",)) if not other_conversation else herdr.PaneAtShell()
 
                 def fresh_activity(pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
@@ -441,11 +441,13 @@ class PaneRestoreTests(unittest.TestCase):
                           opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
                           timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
                     result = original_start(name, pane, kind, agent_arguments, opening, timeout_ms)
+                    client.rows[0]["terminal_id"] = "w1:p2-terminal"
                     if other_conversation:
                         client.rows[0]["agent_session"] = {"kind": "id", "value": "another-conversation"}
                     return result
 
-                with (mock.patch.object(client, "pane_activity", side_effect=fresh_activity),
+                with (mock.patch.object(client, "saved_row_tab", return_value=herdr.NewTab("producers", self.row.name)),
+                      mock.patch.object(client, "pane_activity", side_effect=fresh_activity),
                       mock.patch.object(client, "start_agent", side_effect=start)):
                     code, output = self.run_restore(client)
                 self.assertEqual(code, 0, output)
