@@ -41,7 +41,7 @@ from scripts.production.staff_sources import ensure_staff_showrunner as ensure_s
 from scripts.production import showrunners
 from scripts.production import showrunner_tree
 from scripts.production.production_doc import ProductionDocument, Refusal, read_new_production, read_production
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
@@ -160,13 +160,19 @@ def checked(child: ProductionDocument, caller: str, ending: EndingTab = NO_ENDIN
 
 
 def herdr_tab_open(name: str, ending: EndingTab) -> bool:
-    """Whether a tab named `name` remains in the shared herdr session after `ending`."""
+    """Find the showrunner's native pane or retained shell after the ending pane closes."""
     shared = herdr.shared_session()
     if not any(session["name"] == shared for session in herdr.live_sessions()):
         return False
-    return any(pane.get("label") == name
-               and (not isinstance(ending, EndingUnitTab) or pane["pane_id"] != ending.pane_id)
-               for pane in herdr.Herdr(shared).panes())
+    client = herdr.Herdr(shared)
+    record = staff.initial_snapshot()
+    entries = pane_launch.read(pane_launch.record_directory() / f"{shared}.json")
+    references = pane_launch.named_references(name, record, entries)
+    return any(not isinstance(ending, EndingUnitTab) or pane["pane_id"] != ending.pane_id
+               for reference in references
+               if isinstance(reference, pane_launch.NativeLaunchReference)
+               or (owner := record.by_id(reference.id)) is not None and owner.kind == "showrunner"
+               for pane in pane_launch.reference_panes(reference, record, client, entries))
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:
@@ -303,10 +309,8 @@ def _main(argv: list[str]) -> int:
                     _ = ensure_staff_showrunner(child, caller, runtime_id=identity.session_id)
                     print(f"{child.name} already started")
                     return showrunners.main(["attach", child.name, caller])
-                if isinstance(place, herdr.HerdrPlace) and not any(
-                    pane["pane_id"] == place.pane and pane.get("label") == child.name
-                    for pane in herdr.Herdr(place.session).panes()
-                ):
+                if (isinstance(place, herdr.HerdrPlace)
+                        and herdr.Herdr(place.session).native_session(place.pane, "claude", 90) != identity.session_id):
                     raise Refusal(f"session {identity.session_id} does not own {child.name}'s tab")
         ending = EndingUnitTab(place.pane) if isinstance(place, herdr.HerdrPlace) else NO_ENDING_TAB
         checked(child, caller, ending=ending, start_in=cwd, config_dir=account_directory(selected))

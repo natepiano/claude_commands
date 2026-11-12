@@ -41,7 +41,7 @@ from scripts.production import proposals_table
 from scripts.production.issues import Issue, frontmatter, open_issues
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id
 from scripts.style.style_proposals import FilingResult
-from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member, fixture_runtime_id
 from scripts.production import staff, unit_names
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
@@ -2340,6 +2340,15 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(self.file(ledger), ())
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
             self.assertEqual(sum(call[0] == "create" for call in self.calls), 4)
+
+    def test_a_unit_caller_records_its_fixed_id_on_a_style_proposal(self) -> None:
+        unit = proposal_issue.staff_reference("names", "unit")
+        unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("style-restarted")))
+        with self.ledger() as ledger, mock.patch.object(staff, "caller_identity", return_value=unit.current_session):
+            finding = self.hold(ledger)
+            issue, = self.file(ledger)
+            self.assertEqual(frontmatter(issue)["proposed_by"], [unit.id])
+            self.assertEqual([item.finding_id for item in ledger.proposal_findings(issue)], [finding.finding_id])
 
     def test_file_reads_workspace_once_for_many_findings_in_multiple_crates(self) -> None:
         with self.ledger() as ledger:

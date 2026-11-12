@@ -245,6 +245,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ".index.json", ".INDEX.JSON", ".Index.Json",
                 ".index.lock", ".INDEX.LOCK", ".Index.Lock",
                 ".review-link-x", ".REVIEW-LINK-X", ".Review-Link-x",
+                ".review-link-delivery-user-answer.json",
             ):
                 with self.subTest(folder=folder.name, filename=filename):
                     _ = (folder / filename).write_text(private, encoding="utf-8")

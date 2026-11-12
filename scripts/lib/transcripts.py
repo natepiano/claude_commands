@@ -35,8 +35,13 @@ def transcript_paths(root: Path, pattern: str = "**/*.jsonl") -> list[Path]:
     found: dict[Path, Path] = {}
     for suffix in (".zst", ""):
         for path in root.glob(pattern + suffix):
-            found[uncompressed_path(path.resolve())] = path
+            found[uncompressed_path(path)] = path
     return sorted(found.values(), key=str)
+
+
+def distinct_files(paths: Iterable[Path]) -> list[Path]:
+    """Merge aliases in a small list of transcript matches."""
+    return sorted({path.resolve() for path in paths})
 
 
 @contextmanager

@@ -91,7 +91,7 @@ Every other foreground process prevents the pane report from proving a sole Code
 
 `worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
-A pending run reply or friend reply keeps the pass active without another prompt.
+A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
 A worker puts its question in its reply and ends the turn.
@@ -254,7 +254,7 @@ An accepted retry prints `unchanged`.
 The launcher retains its original prompt identity and its dispatch record.
 `review.sh` has no pending dispatch check and does not restore a saved extract.
 
-### Claude coordinator and friends
+### Claude coordinator
 
 `assign.py.execute_herdr` sends normal assignments through `worker.py` and native worker panes.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.

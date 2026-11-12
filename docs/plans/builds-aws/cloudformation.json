@@ -156,6 +156,11 @@
         180,
         365
       ]
+    },
+    "GateGpuInstanceTypes": {
+      "Type": "CommaDelimitedList",
+      "Default": "",
+      "Description": "GPU types for the size trial"
     }
   },
   "Conditions": {
@@ -1679,6 +1684,86 @@
           "Fn::GetAtt": [
             "GateExpirySchedule",
             "Arn"
+          ]
+        }
+      }
+    },
+    "GateGpuTrialScalerPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Condition": "Gates",
+      "Properties": {
+        "ManagedPolicyName": {
+          "Fn::Sub": "cloud-claude-gate-${DeploymentId}-gpu-trial"
+        },
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:RequestTag/Workload": "cloud-claude-gate",
+                  "ec2:InstanceType": {
+                    "Ref": "GateGpuInstanceTypes"
+                  },
+                  "ec2:InstanceMarketType": "spot"
+                },
+                "Null": {
+                  "aws:RequestTag/GateAttempt": "false",
+                  "aws:RequestTag/ExpiresAt": "false",
+                  "aws:RequestTag/GpuSizeTrial": "false"
+                },
+                "ArnEquals": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  },
+                  "ec2:InstanceProfile": {
+                    "Fn::GetAtt": [
+                      "GateProfile",
+                      "Arn"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DescribeSpotPriceHistory"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "service-quotas:GetServiceQuota"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:AbortMultipartUpload"
+              ],
+              "Resource": {
+                "Fn::Sub": "${GateBucket.Arn}/requests/gpu-size-trial/*"
+              }
+            }
           ]
         }
       }

@@ -10,7 +10,7 @@ import argparse
 import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -1328,9 +1328,21 @@ class Deployment:
                     success = False
         return success
 
+    def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
+        """Check terminal approval and start the scaler service."""
+        from scripts.aws_target import cloud_gate, gpu_size_trial
+        self._authorize(approve_resources)
+        limits = gpu_size_trial.settings()
+        timeout = (limits.lifetime_minutes * 60 * (len(limits.spot_max_usd_per_hour) + 2)
+                   + cloud_gate.settings().number('termination_timeout_s') * len(limits.spot_max_usd_per_hour))
+        def execute(arguments: Sequence[str]) -> int:
+            return self.execute(arguments, capture_output=False, text=True, timeout=timeout, check=False).returncode
+        return gpu_size_trial.start_service(folder.expanduser().resolve(), self.directory.resolve(),
+                                            self.settings_path.resolve(), execute) == 0
+
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        from scripts.aws_target import cloud_gate, gate_trial
+        from scripts.aws_target import cloud_gate, gate_trial, gpu_size_trial
         self._authorize(approve_resources)
         with control_lock(self.directory / 'gate-up'):
             settings = read_deployment_settings(self.settings_path, self.directory)
@@ -1351,6 +1363,7 @@ class Deployment:
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets),
                 'GateInstanceTypes': ','.join(values.words('instance_types')),
+                'GateGpuInstanceTypes': ','.join(gpu_size_trial.settings().spot_max_usd_per_hour),
                 'GateRootGiB': str(values.whole('root_gib')),
                 'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
                 'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
@@ -1486,7 +1499,7 @@ class Deployment:
 def region_gate_template() -> dict[str, object]:
     """Reuse the home gate bodies without regional copies of global resources."""
     source = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
-    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateScalerPolicy', 'GateExpiryRole',
+    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateScalerPolicy', 'GateGpuTrialScalerPolicy', 'GateExpiryRole',
              'GateExpiryFunction', 'GateExpiryLog', 'GateExpirySchedule', 'GateExpiryPermission')
     resources = ledger.mapping(source['Resources'])
     def rewrite(value: object) -> object:
@@ -1505,12 +1518,13 @@ def region_gate_template() -> dict[str, object]:
             return {key: rewrite(item) for key, item in row.items() if not (key == 'Condition' and item == 'Gates')}
         return value
     regional = {name: rewrite(resources[name]) for name in names}
-    policy = ledger.mapping(ledger.mapping(ledger.mapping(regional['GateScalerPolicy'])['Properties'])['PolicyDocument'])
     actions = {'ec2:RunInstances', 'ec2:CreateTags', 'ec2:TerminateInstances', 'iam:PassRole'}
-    policy['Statement'] = [row for row in ledger.rows(policy, 'Statement') if set(cast(list[str], row['Action'])) & actions]
+    for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy'):
+        policy = ledger.mapping(ledger.mapping(ledger.mapping(regional[name])['Properties'])['PolicyDocument'])
+        policy['Statement'] = [row for row in ledger.rows(policy, 'Statement') if set(cast(list[str], row['Action'])) & actions]
     parameters = ledger.mapping(source['Parameters'])
     needed = ('VpcId', 'DeploymentId', 'CostTagKey', 'CostTagValue', 'RootDeviceName', 'GateImage', 'GateSubnets',
-              'GateInstanceTypes', 'GateRootGiB', 'GateSpotMaxPrice', 'GateExpiryMinutes', 'GateExpiryTimeout',
+              'GateInstanceTypes', 'GateGpuInstanceTypes', 'GateRootGiB', 'GateSpotMaxPrice', 'GateExpiryMinutes', 'GateExpiryTimeout',
               'GateExpiryMemory', 'GateLogDays')
     definitions = {key: parameters[key] for key in needed}
     definitions.update({key: {'Type': 'String'} for key in ('HomeGateProfileArn', 'HomeGateRoleArn', 'ScalerUserName')})
@@ -1609,6 +1623,8 @@ class DeploymentArguments(argparse.Namespace):
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
+        self.trial_action: str | None = None
+        self.trial_folder: Path = Path()
 
 
 def main() -> int:
@@ -1619,7 +1635,9 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'remove-builder', 'remove-images', 'price', 'prices', 'quota-request', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'price', 'prices', 'quota-request', 'prepare', 'apply', 'setup-start', 'bootstrap'))
+    _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
+    _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
@@ -1629,6 +1647,10 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
+        if args.command == 'gpu-size-trial':
+            if args.trial_action != 'run' or args.trial_folder == Path():
+                raise DeploymentRefused('Use gpu-size-trial run --trial-folder DIR --approve-resources')
+            return 0 if deploy.gpu_size_trial(args.trial_folder, approve_resources=args.approve_resources) else 1
         if args.command == 'secrets':
             with step('secrets', 'saving encrypted credentials', args.settings):
                 admin_secrets.configure(args.settings)

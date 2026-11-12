@@ -170,6 +170,18 @@ def launch_reference(entry: Mapping[str, object], record: staff.StaffSnapshot) -
     return StaffLaunchReference(owner.id) if owner is not None else NativeLaunchReference(str(entry.get("session_id", "")))
 
 
+def named_references(name: str, record: staff.StaffSnapshot,
+                     entries: Mapping[str, PaneLaunch]) -> set[StaffLaunchReference | NativeLaunchReference]:
+    """Resolve a staff name or a retained native name without reading display labels."""
+    references: set[StaffLaunchReference | NativeLaunchReference] = {
+        StaffLaunchReference(row.id) for row in record.rows
+        if name in (row.name, row.id, row.current_session)}
+    references.update(reference for entry in entries.values()
+        if isinstance(reference := launch_reference(entry, record), NativeLaunchReference)
+        and name in (reference.session, entry.get("name")))
+    return references
+
+
 class UnknownNativePane(Protocol):
     @property
     def pane(self) -> str: ...
@@ -210,28 +222,36 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     owner = record.by_id(reference.id) if isinstance(reference, StaffLaunchReference) else None
     if isinstance(reference, StaffLaunchReference) and owner is None:
         return []
+    panes: Sequence[Mapping[str, object]]
+    found: Mapping[staff.StaffId, Sequence[Mapping[str, object]]]
     if isinstance(evidence, ReadNativePanes):
         panes = [dict(pane) for pane in client.panes()]
-        evidence = NativePaneEvidence(panes, client.scan_row_panes(record, panes))
-    unknown = {item.pane for item in evidence.scan.unknown}
-    if isinstance(reference, StaffLaunchReference):
-        matches = evidence.scan.found.get(reference.id, ())
+        scan = client.scan_row_panes(record, [dict(pane) for pane in panes])
+        found = scan.found
+        unknown = {item.pane for item in scan.unknown}
     else:
-        matches = [pane for pane in evidence.panes if str(pane["pane_id"]) not in unknown
-                   and reference.session in _pane_native_sessions(client, pane)]
+        panes = evidence.panes
+        found = evidence.scan.found
+        unknown = {item.pane for item in evidence.scan.unknown}
+    decoded: dict[str, set[str]] = {}
+    if isinstance(reference, StaffLaunchReference):
+        matches = found.get(reference.id, ())
+    else:
+        decoded = {str(pane["pane_id"]): native_sessions(client, pane) for pane in panes
+                   if str(pane["pane_id"]) not in unknown}
+        matches = [pane for pane in panes if reference.session in decoded.get(str(pane["pane_id"]), set())]
     if matches:
         return [dict(pane) for pane in matches]
     retained = {pane for pane, entry in entries.items() if launch_reference(entry, record) == reference
                 or isinstance(reference, NativeLaunchReference) and entry.get("session_id") == reference.session}
-    occupied = {str(pane["pane_id"]) for matches in evidence.scan.found.values() for pane in matches}
-    candidates = [pane for pane in evidence.panes
+    occupied = {str(pane["pane_id"]) for matches in found.values() for pane in matches}
+    candidates = [pane for pane in panes
                   if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
                   and str(pane["pane_id"]) not in unknown]
     if owner is not None:
         return [dict(pane) for pane in candidates
                 if _retained_native_owner(client, pane, owner, record)]
-    return [dict(pane) for pane in candidates if not any(record.by_member_reference(identity) is not None
-            for identity in _pane_native_sessions(client, pane))]
+    return [dict(pane) for pane in candidates if not decoded[str(pane["pane_id"])]]
 
 
 class NativePaneDecoder(Protocol):
@@ -241,7 +261,7 @@ class NativePaneDecoder(Protocol):
                             pane: Mapping[str, object]) -> CurrentProcessEvidence: ...
 
 
-def _pane_native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
+def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
     info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
     decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
     identities: set[str] = set()
@@ -257,7 +277,7 @@ def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
                            owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
     """Keep the retained pane unless another staffed owner runs there."""
     return all(current is None or current.id == owner.id
-               for identity in _pane_native_sessions(client, pane)
+               for identity in native_sessions(client, pane)
                for current in (record.by_member_reference(identity),))
 
 
@@ -307,11 +327,11 @@ def native_kind(row: staff.StaffRow) -> str:
     """Read the current backend from its native pane or Claude registry."""
     module = import_module("scripts.herdr.herdr")
     session = cast(Callable[[], str], module.shared_session)()
-    client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-    native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-    codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-    claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
     try:
+        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
+        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
+        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
+        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")

@@ -1966,6 +1966,17 @@ class CloudRouteTests(CostFixture):
                 command = cloud_gate.service_command('scripts.aws_target.gate_trial', ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                 self.assertFalse(any(argument.startswith('--setenv=CONF_DIR=') for argument in command))
 
+    def test_service_command_preserves_credential_override(self) -> None:
+        credential = self.root / 'override-credentials'
+        for paired in (False, True):
+            with (self.subTest(paired=paired),
+                  mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': str(credential)})):
+                command = cloud_gate.service_command('scripts.aws_target.gate_trial',
+                    ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
+                overrides = [argument for argument in command
+                             if argument.startswith('--setenv=AWS_SHARED_CREDENTIALS_FILE=')]
+                self.assertEqual(overrides, ['--setenv=AWS_SHARED_CREDENTIALS_FILE=' + str(credential)])
+
     def test_service_command_preserves_caller_conf_dir(self) -> None:
         configuration = cloud_gate.settings()
         for paired in (False, True):
