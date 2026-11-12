@@ -209,27 +209,24 @@ class LaunchSettingsTests(unittest.TestCase):
                             self.assertEqual((settings.kind, settings.model, settings.effort, settings.service_tier),
                                              self.shell_settings(reference_section, reference_key))
 
-    def test_registry_changes_affect_the_next_launch_without_changing_caller_context(self) -> None:
+    def test_registry_changes_affect_the_next_launch(self) -> None:
         from scripts.lib import models_registry
 
-        with patch.dict(os.environ, {"AGENTS_CALLER_FAMILY": "claude", "AGENTS_CALLER_ASSIGNMENT": "caller"}):
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            first = models_registry.launch_settings("direct", "impl")
-            _ = write_registry(self.path, {"assignments": {"direct": "caller"},
-                                          "direct.claude": {"impl": "sonnet:max"}})
-            second = models_registry.launch_settings("direct", "impl")
-            self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
-            self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
-                             self.shell_settings("direct", "impl"))
-            self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
-            self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        first = models_registry.launch_settings("direct", "impl")
+        _ = write_registry(self.path, {"assignments": {"direct": "claude"},
+                                      "direct.claude": {"impl": "sonnet:max"}})
+        second = models_registry.launch_settings("direct", "impl")
+        self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
+        self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
+                         self.shell_settings("direct", "impl"))
 
-            configuration = models_registry.launch_configuration(os.environ)
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            for inherited, expected in ((False, first), (True, second)):
-                environment = configuration.environment(os.environ) if inherited else dict(os.environ)
-                with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
-                    self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
+        configuration = models_registry.launch_configuration(os.environ)
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        for inherited, expected in ((False, first), (True, second)):
+            environment = configuration.environment(os.environ) if inherited else dict(os.environ)
+            with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
+                self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
 
     def test_launch_settings_starts_no_python_registry_process(self) -> None:
         from scripts.lib import models_registry

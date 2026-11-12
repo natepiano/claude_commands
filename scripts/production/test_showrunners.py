@@ -24,6 +24,7 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 
 from scripts.production import fake_unit_host
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production import showrunners, staff_sources
 from scripts.message.sessions import SessionRecord
 from scripts.production.fake_unit_host import HostedUnit
@@ -187,8 +188,12 @@ raise SystemExit(1)
     @override
     def cli(self, *args: str, pane: str = "", caller: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
         del code
-        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args], env=self.environment(pane, caller),
-                              capture_output=True, text=True, check=False)
+        if pane or caller:
+            return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
+                                  env=self.environment(pane, caller), capture_output=True, text=True, check=False)
+        arguments = list(args)
+        return invoke_cli(showrunners, lambda: showrunners.main(arguments), arguments,
+                          self.environment(pane, caller), Path.cwd(), production_state=True)
 
     def successful(self, *args: str, pane: str = "", caller: str = "") -> str:
         result = self.cli(*args, pane=pane, caller=caller)

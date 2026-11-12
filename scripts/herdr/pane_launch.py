@@ -327,11 +327,11 @@ def native_kind(row: staff.StaffRow) -> str:
     """Read the current backend from its native pane or Claude registry."""
     module = import_module("scripts.herdr.herdr")
     session = cast(Callable[[], str], module.shared_session)()
-    client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-    native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-    codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-    claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
     try:
+        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
+        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
+        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
+        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")

@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
-from scripts.usage import collect, weights
+from scripts.usage import collect, usage_report, weights
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
@@ -111,6 +112,10 @@ class ReportFixture(OutcomeFixture):
         return environment
 
     def report(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        if not process_boundary_for_case(self):
+            argv = ["--db", str(self.db_path), "--production-docs", str(self.production_docs), *arguments]
+            return invoke_cli(usage_report, lambda: usage_report.main(argv), argv,
+                              self.report_environment(), REPOSITORY)
         return subprocess.run([str(REPOSITORY / "scripts/lib/py"), str(REPORT), "--db", str(self.db_path),
                                "--production-docs", str(self.production_docs), *arguments],
                               env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
@@ -253,27 +258,11 @@ class UsageReportTests(ReportFixture):
 
     def test_activity_reads_the_same_through_a_general_aggregate(self) -> None:
         self.activity_requests()
-        script = """
-import argparse
-from contextlib import redirect_stdout
-from io import StringIO
-from pathlib import Path
-from scripts.usage.usage_report import METRICS, Metric, ReportFormat, TurnAggregate, main
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--db', type=Path, required=True)
-parser.add_argument('--production-docs', type=Path, required=True)
-paths = parser.parse_args()
-METRICS['wait_share'] = Metric('wait_share', METRICS['wait_share'].description,
-    TurnAggregate('wait', "sum(CASE WHEN activity = 'wait' THEN weighted ELSE 0 END)", weighted=True),
-    TurnAggregate('weighted', 'sum(weighted)', weighted=True), ReportFormat.SHARE)
-output = StringIO()
-with redirect_stdout(output):
-    assert main(['--db', str(paths.db), '--production-docs', str(paths.production_docs),
-                 'wait_share', '--by', 'role,activity']) == 0
-print(output.getvalue(), end='')
-"""
-        general = self.report_script(script)
+        metric = usage_report.Metric('wait_share', usage_report.METRICS['wait_share'].description,
+            usage_report.TurnAggregate('wait', "sum(CASE WHEN activity = 'wait' THEN weighted ELSE 0 END)", weighted=True),
+            usage_report.TurnAggregate('weighted', 'sum(weighted)', weighted=True), usage_report.ReportFormat.SHARE)
+        with mock.patch.dict(usage_report.METRICS, {'wait_share': metric}):
+            general = self.report("wait_share", "--by", "role,activity")
         self.assertEqual((general.returncode, general.stderr), (0, ""))
         additive = self.report("wait_share", "--by", "role,activity")
         self.assertEqual(general.stdout, additive.stdout)
@@ -400,6 +389,7 @@ raise SystemExit(result)
         self.assertEqual(self.rows("SELECT state FROM turn_sources WHERE machine = 'natedev' AND family = 'codex'")[0]["state"],
                          "unreachable")
 
+    @process_boundary
     def test_list_names_each_metric_with_its_description(self) -> None:
         self.assert_report("list", "list")
 
@@ -567,44 +557,29 @@ raise SystemExit(result)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
 
     def test_one_registry_entry_adds_a_named_metric_without_other_changes(self) -> None:
-        script = """
-import sys
-from scripts.usage.usage_report import METRICS, Metric, TurnAggregate, ReportFormat, main
-METRICS['turn_count'] = Metric('turn_count', 'Stored turn count',
-                             TurnAggregate('turns', 'count(*)'), format=ReportFormat.COUNT)
-raise SystemExit(main(sys.argv[1:]))
-"""
-        result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", script, "--db", str(self.db_path),
-                                 "--production-docs", str(self.production_docs), "turn_count"],
-                                env=self.report_environment(), cwd=REPOSITORY, capture_output=True,
-                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        metric = usage_report.Metric('turn_count', 'Stored turn count',
+                                    usage_report.TurnAggregate('turns', 'count(*)'), format=usage_report.ReportFormat.COUNT)
+        with mock.patch.dict(usage_report.METRICS, {'turn_count': metric}):
+            result = self.report("turn_count")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, self.expected_report("turn-count"))
 
     def test_rate_format_prints_two_decimals_without_a_denominator(self) -> None:
-        script = """
-import sys
-from scripts.usage.usage_report import METRICS, Metric, TurnAggregate, ReportFormat, main
-METRICS['input_rate'] = Metric('input_rate', 'Average input divided by three',
-                             TurnAggregate('average_input', 'avg(input) / 3.0'), format=ReportFormat.RATE)
-raise SystemExit(main(sys.argv[1:]))
-"""
-        result = self.report_script(script, "input_rate")
+        metric = usage_report.Metric('input_rate', 'Average input divided by three',
+            usage_report.TurnAggregate('average_input', 'avg(input) / 3.0'), format=usage_report.ReportFormat.RATE)
+        with mock.patch.dict(usage_report.METRICS, {'input_rate': metric}):
+            result = self.report("input_rate")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, self.expected_report("rate-without-denominator"))
 
     def test_number_format_rounds_a_ratio_without_decimals(self) -> None:
-        script = """
-import sys
-from scripts.usage.usage_report import METRICS, OUTCOMES, Metric, TurnSum, TurnValue, OutcomeCount, ReportFormat, main
-METRICS['checkpoint_number'] = Metric('checkpoint_number', 'Weighted checkpoint ratio as a number',
-                                    TurnSum('weighted', (TurnValue.WEIGHTED,)),
-                                    OutcomeCount(OUTCOMES['checkpoints']), ReportFormat.NUMBER)
-raise SystemExit(main(sys.argv[1:]))
-"""
-        result = self.report_script(script, "checkpoint_number")
+        metric = usage_report.Metric('checkpoint_number', 'Weighted checkpoint ratio as a number',
+            usage_report.TurnSum('weighted', (usage_report.TurnValue.WEIGHTED,)),
+            usage_report.OutcomeCount(usage_report.OUTCOMES['checkpoints']), usage_report.ReportFormat.NUMBER)
+        with mock.patch.dict(usage_report.METRICS, {'checkpoint_number': metric}):
+            result = self.report("checkpoint_number")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(result.stdout, self.expected_report("number-with-denominator"))
@@ -889,7 +864,6 @@ print(json.dumps(results))
 
 
 from scripts.production.staff_test_support import StaffTestCase
-from scripts.usage import usage_report
 
 
 class BranchUsageLocationTests(StaffTestCase):

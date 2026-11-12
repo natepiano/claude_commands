@@ -196,7 +196,7 @@ print('SENT: fixture')
 
 
 class OpenPass(TypedDict):
-    worker_name: str
+    worker_id: str
     kind: str
     status: str
 

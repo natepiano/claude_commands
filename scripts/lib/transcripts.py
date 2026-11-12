@@ -1,7 +1,7 @@
 """Open plain and zstd transcripts through one seekable binary stream."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 import subprocess
@@ -18,8 +18,13 @@ def transcript_paths(root: Path, pattern: str = "**/*.jsonl") -> list[Path]:
     found: dict[Path, Path] = {}
     for suffix in (".zst", ""):
         for path in root.glob(pattern + suffix):
-            found[uncompressed_path(path.resolve())] = path
+            found[uncompressed_path(path)] = path
     return sorted(found.values(), key=str)
+
+
+def distinct_files(paths: Iterable[Path]) -> list[Path]:
+    """Merge aliases in a small list of transcript matches."""
+    return sorted({path.resolve() for path in paths})
 
 
 @contextmanager
