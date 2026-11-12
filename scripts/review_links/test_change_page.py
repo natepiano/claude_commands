@@ -1173,6 +1173,11 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(forms.tabs[question], "page-owner")
         self.assertEqual(forms.outcomes[question], ["answer"])
         self.assertEqual(forms.question_counts["page-owner"], 1)
+        for review_type in ("questions", "changes", "rebuilds"):
+            with self.subTest(review_type=review_type, total="absent"):
+                self.assertNotIn('data-total', body)
+                self.assertNotIn("total.textContent", body)
+                self.assertNotIn("+' waiting'", body)
 
         with self.subTest(rebuilds="missing folder"):
             browser = change_page.ReviewBrowser("private-rebuilds")
@@ -1181,7 +1186,8 @@ class ChangePageTests(unittest.TestCase):
                 body = change_browser.render(browser, status).decode()
             reads.assert_called_once_with()
             self.assertIn('data-type-count="rebuilds">0</span>', body)
-            self.assertIn('<p>No rebuild is needed.</p>', body)
+            empty = body.split('<div hidden data-rebuilds data-count="0">', 1)[1].split('</div>', 1)[0]
+            self.assertEqual(empty, '<p>No rebuilds needed.</p>')
             self.assertFalse(Path(os.environ["REBUILD_NEEDS_DIR"]).exists())
 
         with self.subTest(rebuilds="machine reasons and current names"):
@@ -1205,27 +1211,55 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('data-type-count="rebuilds">2</span>', body)
             self.assertLess(body.index('data-review-type="changes"'), body.index('data-review-type="rebuilds"'))
             block = body.split('<div hidden data-rebuilds data-count="2">', 1)[1].split('</div>', 1)[0]
-            self.assertLess(block.index('data-machine="mac"'), block.index('data-machine="natedev"'))
-            self.assertIn('<h2>natedev · <code>bbbbbbb</code></h2>', block)
-            self.assertIn('<h2>mac · <code>ccccccc</code></h2>', block)
-            self.assertLess(block.index("Apply the first &lt;settings&gt;."), block.index("Apply the second settings."))
-            self.assertIn("For renamed &lt;unit&gt; · requested by page-owner", block)
-            self.assertIn("For second-session</p>", block)
-            self.assertNotIn("requested by second-session", block)
-            self.assertIn("For unknown-staff · requested by unknown-requester", block)
+            self.assertLess(block.index('data-machine="natedev"'), block.index('data-machine="mac"'))
+            self.assertIn('<h2>Rebuild natedev</h2>', block)
+            self.assertIn('<h2>Rebuild the Mac</h2>', block)
+            self.assertIn('<p>Run <code>rebuild</code> in a terminal on natedev.</p>', block)
+            self.assertIn('<p>Run <code>rebuild</code> in Terminal on the Mac.</p>', block)
+            self.assertIn('<p>Mac updates can take five minutes while the Mac is reachable.</p>', block)
+            self.assertLess(block.index("Apply the second settings."), block.index("Apply the first &lt;settings&gt;."))
+            self.assertEqual(block.count('<p>After the rebuild</p>'), 2)
+            self.assertEqual(block.count('<details><summary>Details</summary>'), 2)
+            self.assertNotIn('<details open', block)
+            natedev, mac = block.split('</article>', 1)
+            self.assertEqual(natedev.count('One rebuild applies all listed changes.'), 1)
+            self.assertNotIn('One rebuild applies all listed changes.', mac)
+            main, details = natedev.split('<details>', 1)
+            self.assertNotIn('For ', main)
+            self.assertNotIn('renamed', main)
+            self.assertNotIn('Configuration commit:', main)
+            self.assertIn('Configuration commit: <code>' + 'b' * 40 + '</code>', details)
+            self.assertIn('Configuration commit: <code>' + 'a' * 40 + '</code>', details)
+            self.assertLess(details.index('b' * 40), details.index('a' * 40))
+            self.assertIn('Affected session: renamed &lt;unit&gt; (unit)', details)
+            self.assertIn('Affected session: second-session (unit)', details)
+            self.assertEqual(details.count('Requested by:'), 1)
+            self.assertIn('Requested by: page-owner (showrunner)', details)
+            self.assertNotIn('Requested by: second-session', details)
+            self.assertIn('Unknown session: unknown-staff', mac)
+            self.assertIn('Unknown session: unknown-requester', mac)
+            self.assertIn('Configuration commit: <code>' + 'c' * 40 + '</code>', mac)
+            self.assertTrue(block.endswith('<p>Completed requests clear automatically. Refresh this page after the rebuild.</p>'))
             for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
                 self.assertNotIn(control, block)
             self.assertIn("showrunners.hidden=rebuildMode", body)
             self.assertIn("next.hidden=rebuildMode || waiting().length===0", body)
-            self.assertIn(".length+rebuildCount)+' waiting'", body)
+            self.assertNotIn('data-total', body)
 
             with self.subTest(rebuilds="need spacing"):
-                self.assertIn('[data-rebuilds] li p{margin:0}', body)
-                gaps = re.search(r'\[data-rebuilds\] li p\+p\{margin-top:(\d+)px\}'
-                                 + r'\[data-rebuilds\] li\+li\{margin-top:(\d+)px\}', body)
-                self.assertIsNotNone(gaps)
-                assert gaps is not None
-                self.assertLess(int(gaps[1]), int(gaps[2]))
+                self.assertIn('[data-rebuilds] li+li{margin-top:16px}', body)
+                self.assertIn('[data-rebuilds] details p{margin:0}', body)
+                self.assertIn('[data-rebuilds] details p+p{margin-top:8px}', body)
+                self.assertIn('margin-top:16px;padding-top:16px', body)
+                self.assertIn('flex-wrap:wrap;gap:8px', body)
+                self.assertIn('section h1,h2{font-size:20px', body)
+
+            with self.subTest(rebuilds="requester absent"):
+                single: need.NeedRecord = {**need.read_needs()[0].newest, "requested_by": ""}
+                summary = need.MachineNeeds(single, (single["reason"],), (single,))
+                content = change_browser.rebuild_list([summary], staff.snapshot())
+                self.assertNotIn('Requested by:', content)
+                self.assertNotIn('One rebuild applies all listed changes.', content)
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:
         destination = fixture_member("showrunner", name="destination")

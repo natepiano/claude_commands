@@ -86,7 +86,7 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 ### Questions, Changes, and Rebuilds
 
 The review page has Questions, Changes, and Rebuilds type tabs with waiting counts.
-The global waiting count includes all three types.
+Each type tab shows its own count. The page has no combined total.
 The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
 The document title remains Changes to review.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
@@ -123,17 +123,25 @@ Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 The Changes tab retains its existing cards, controls, and count rules.
 
-Rebuilds shows one list, with one block per machine in machine order.
+Rebuilds shows one block per machine, with natedev first, then the Mac, then other machines in name order.
 It has no showrunner tabs, card navigation, Next, or answer form.
 Its count is the number of machines with open rebuild needs.
-Each block shows the machine and the first seven characters of its newest need's NixOS commit.
-The block lists each open need from oldest to newest.
-Each need shows its reason and the current name of the staff member it concerns.
-It also shows `requested by <name>` when the requesting staff ID differs from the affected staff ID.
-Unknown staff IDs remain visible as IDs.
+Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
+The Mac instruction states that updates can take five minutes while the Mac is reachable.
+A machine with multiple needs shows `One rebuild applies all listed changes.`
+Under `After the rebuild`, bullets show the stored reasons unchanged, newest first by creation time.
+A closed `Details` disclosure shows each full configuration commit in the same order.
+It shows `Affected session: <name> (<kind>)` from the current staff record.
+It shows `Requested by: <name> (<kind>)` only for a different, recorded requester.
+Unknown staff IDs appear as `Unknown session: <id>`.
 The reader uses the same staff record as the page routing.
 Each render calls `rebuild.need.read_needs()` once.
-An empty or missing needs folder shows `No rebuild is needed.` and a count of 0.
+The final line states `Completed requests clear automatically. Refresh this page after the rebuild.`
+An empty or missing needs folder shows only `No rebuilds needed.` beneath the tabs, with a count of 0.
+
+The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
+The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
+Controls wrap on narrow screens, keep a minimum height of 44px, and show keyboard focus in both color themes.
 
 ### Answering a change review
 

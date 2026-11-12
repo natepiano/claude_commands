@@ -134,7 +134,7 @@ When the user asks to review changes, follow [Bare command](#bare-command).
 
 The page has Questions, Changes, and Rebuilds tabs with waiting counts.
 Questions and Changes keep their own staff-based showrunner tabs and one card at a time.
-The global waiting count includes all three types.
+Each type tab shows its own count. The page has no combined total.
 The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
 An empty showrunner tab shows `No questions are waiting.` or `No changes are waiting.`
 The selected showrunner tab supplies the count; the card has no separate remaining count.
@@ -153,12 +153,15 @@ Recovery sends only `saved: true` answers for closed questions.
 Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
 The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
 
-Rebuilds shows one block per machine, in machine order, without showrunner tabs, card navigation, Next, or an answer form.
-Its count is the number of machines with open needs.
-Each block shows the newest need's short NixOS commit and every open reason, from oldest to newest.
-Each reason names its affected staff member and a different requesting staff member when recorded.
-Unknown staff IDs appear as IDs.
-An empty view shows `No rebuild is needed.`
+Rebuilds counts machines with open needs and shows natedev before the Mac.
+Each block tells the user where to run `rebuild`.
+Multiple needs share one rebuild; their unchanged reasons appear under `After the rebuild`, newest first.
+A closed Details disclosure shows full commits, affected staff names and kinds, and different requesters.
+Unknown staff IDs appear as `Unknown session: <id>`.
+The Mac block states that updates can take five minutes while the Mac is reachable.
+The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
+An empty view shows `No rebuilds needed.`
+Rebuilds has no showrunner tabs, card navigation, Next, or answer form.
 
 The Changes tab contains every waiting change.
 The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.

@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -205,23 +206,35 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 
 
 def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
-    """Show each machine's reasons with the current staff names."""
-    def name(identity: str) -> str:
+    """Show the rebuild action before its reasons and session details."""
+    def session(label: str, identity: str) -> str:
         member = record.by_id(staff.StaffId(identity))
-        return html.escape(member.name if member is not None else identity)
+        text = f"{label}: {member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
+        return '<p>' + html.escape(text) + '</p>'
 
     blocks: list[str] = []
-    for machine in machines:
+    for machine in sorted(machines, key=lambda item: (
+            item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"])):
+        machine_name = machine.newest["machine"]
+        name = "the Mac" if machine_name == "mac" else machine_name
+        terminal = "Terminal" if machine_name == "mac" else "a terminal"
         items: list[str] = []
-        for item in machine.records:
-            requester = (" · requested by " + name(item["requested_by"])
+        details: list[str] = []
+        for item in sorted(machine.records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
+            requester = (session("Requested by", item["requested_by"])
                          if item["requested_by"] and item["requested_by"] != item["concerns"] else "")
-            items.append(f'<li><p>{html.escape(item["reason"])}</p><p>For {name(item["concerns"])}{requester}</p></li>')
-        blocks.append(f'<article data-machine="{html.escape(machine.newest["machine"])}">'
-            + f'<h2>{html.escape(machine.newest["machine"])} · <code>{html.escape(machine.newest["nixos_commit"][:7])}</code></h2>'
-            + '<ul>' + ''.join(items) + '</ul></article>')
+            items.append(f'<li>{html.escape(item["reason"])}</li>')
+            details.append('<li><p>Configuration commit: <code>' + html.escape(item["nixos_commit"]) + '</code></p>'
+                           + session("Affected session", item["concerns"]) + requester + '</li>')
+        blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
+            + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
+            + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
+            + ('<p>One rebuild applies all listed changes.</p>' if len(machine.records) >= 2 else '')
+            + '<p>After the rebuild</p><ul>' + ''.join(items) + '</ul>'
+            + '<details><summary>Details</summary><ol>' + ''.join(details) + '</ol></details></article>')
     return (f'<div hidden data-rebuilds data-count="{len(machines)}">'
-            + (''.join(blocks) if blocks else '<p>No rebuild is needed.</p>') + '</div>')
+            + (''.join(blocks) + '<p>Completed requests clear automatically. Refresh this page after the rebuild.</p>'
+               if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -238,17 +251,18 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
         + f'<button type="button" role="tab" data-review-type="questions">Questions (<span data-type-count="questions">{len(prepared.questions)}</span>)</button>'
         + f'<button type="button" role="tab" data-review-type="changes">Changes (<span data-type-count="changes">{sum(item.waiting for item in prepared.changes)}</span>)</button>'
         + f'<button type="button" role="tab" data-review-type="rebuilds">Rebuilds (<span data-type-count="rebuilds">{len(rebuilds)}</span>)</button></nav>')
-    content = ('''<style>[hidden]{display:none!important}nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:8px}
-nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
+    content = ('''<style>[hidden]{display:none!important}nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+nav button{margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
 section+section{border:0;margin:0;padding:0}
-[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:24px;padding-top:12px}
-[data-rebuilds] li p{margin:0}[data-rebuilds] li p+p{margin-top:4px}[data-rebuilds] li+li{margin-top:16px}
+[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:16px;padding-top:16px}
+[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}
+[data-rebuilds] details p{margin:0}[data-rebuilds] details p+p{margin-top:8px}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
 </style><h1 data-review-heading>Changes to review</h1>''' + type_tabs + '<nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav>'
                + ''.join(section(item, feedback_rows) for item in prepared.changes)
                + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
                + rebuild_list(rebuilds, prepared.record)
-               + '<p hidden data-empty></p><p data-total></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
+               + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Next</button></div>'
                + '<noscript>Enable JavaScript to review changes and use Next.</noscript>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
     return change_page.document(content)
@@ -350,7 +364,6 @@ const allTabs=[...document.querySelectorAll('[data-showrunner]')];
 const types=[...document.querySelectorAll('[data-review-type]')];
 const rebuilds=document.querySelector('[data-rebuilds]'), rebuildCount=Number(rebuilds.dataset.count);
 const showrunners=document.querySelector('nav[aria-label="Showrunner"]');
-const total=document.querySelector('[data-total]');
 const next=document.querySelector('[data-next]'), empty=document.querySelector('[data-empty]');
 const heading=document.querySelector('[data-review-heading]');
 const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
@@ -375,7 +388,7 @@ function show(){
  rows.forEach(r=>r.hidden=r!==current);
  tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab && t.dataset.type===kind));
   t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.type && r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
- total.textContent=(rows.filter(r=>r.dataset.pending==='true').length+rebuildCount)+' waiting'; next.hidden=rebuildMode || waiting().length===0;
+ next.hidden=rebuildMode || waiting().length===0;
  if(current) remembered.set(kind+'/'+tab,current.dataset.key);
  const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
  places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
