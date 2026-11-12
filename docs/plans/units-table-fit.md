@@ -38,40 +38,26 @@ The showrunner's design: leave out a column that is `—` in every row; fit each
 
 ### Phase 1 — Tables fit the terminal width  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:units` prints tables whose rows are at most `units_table_columns - 4` columns wide, so Claude Code draws them as tables.
-
-**Spec:**
-
-1. Add `units_table_columns=170` to `config/production.conf`, with the comment "Terminal width in columns that the /showrunner:units tables fit." and the range line `# whole: 40..`. Read it at use, as the other keys in that file are read.
-2. Add one shared function in `display_cells.py`: `fitted(headers, rows, *, cuttable, columns) -> tuple[headers, rows]`.
-   - Leave out each column whose cells are all `NONE`. Keep a column that has no rows.
-   - The row width is `1 + Σ(width + 3)`, where a column's width is the widest of its header and its cells, and at least 3. The limit is `columns - 4`.
-   - `cuttable` is an ordered tuple of header names. While the width is over the limit, take the first cuttable column whose width is above its header's width, and make it one column narrower: each of its cells wider than the new width keeps its text to `new width - 1` columns, strips trailing spaces, then adds `…`. Recompute and repeat.
-   - A column is cut only when every column before it in `cuttable` is at its header's width. A cuttable column never goes below its header's width. When no cuttable column can shrink, return the table as it is.
-   - Cut on display columns: a wide character is never split.
-3. `unit_phases.table` calls `fitted` with `cuttable` in this order: Queued, Non-Phase Work, Workers (the `worker_heading()` text), then Notes last, so Notes keeps its text while another text cell can still shrink. Then it escapes and joins the rows. The optional ETA Plan column keeps its current rule.
-4. `style_units.table` calls `fitted` with `cuttable` = Step, then Ticket. Keep its right-aligned number columns aligned after a column is left out.
-5. Update `commands/showrunner/units.md`: a column that is `—` in every row is left out; the tables fit `units_table_columns`; long text cells end with `…`.
-6. Update the "Unit phases" item in `docs/as-built/showrunner-automation.md` in the same commit.
-7. Progress legend (the user via sdlc, 2026-11-12: "i need a legend for the progress table to show up underneath"). When the fitted phase table keeps its Progress column, `unit_phases.table` adds one blank line and then `Progress: 🟩 done · 🟨 open · ⬜ not started` under the table. The squares and words come from the same constants `progress_cell` uses. No legend when Progress is left out or the table has no rows. The style table has no legend. Update `commands/showrunner/units.md` and the as-built item.
+- `config/production.conf` holds `units_table_columns=170` (`# whole: 40..`). Both tables read it with `conf.read_or_repository("production")`.
+- `display_cells.fitted(headers, rows, *, cuttable, columns)` leaves out each column whose cells are all `—` and keeps a column with no rows. It measures a row as `1 + Σ(width + 3)` against the limit `columns - 4`.
+- While a row is over the limit, `fitted` makes the first `cuttable` column above its header width one column narrower. A cut cell ends with `…` and never splits a wide character. When no cuttable column can shrink, the table stays as it is.
+- `unit_phases.table` cuts Queued, Non-Phase Work, Workers, then Notes. The Progress bar, the ETAs, Unit, Status, Machine and Phase are never cut.
+- When a row has a Progress bar, `unit_phases.table` adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`. `progress_cell` and `progress_legend()` share the `ProgressState` constants. A table with no rows, and the style table, have no legend.
+- `style_units.table` cuts Step, then Ticket, and keeps its number columns right-aligned after a column is left out.
 
 **Files:**
-- `config/production.conf` — the new key.
+- `config/production.conf` — `units_table_columns`.
 - `scripts/production/display_cells.py` — `fitted`.
-- `scripts/production/unit_phases.py` — call `fitted`.
-- `scripts/production/style_units.py` — call `fitted`.
-- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the text.
-- `scripts/production/test_unit_phases.py`, `scripts/production/test_style_units.py` — rows.
+- `scripts/production/unit_phases.py` — `ProgressState`, `progress_legend`, the fitted phase table.
+- `scripts/production/style_units.py` — the fitted style table.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the command text and the as-built item.
+- `scripts/production/test_unit_phases.py`, `scripts/production/test_style_units.py` — the rows.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the config key, `display_cells.py`, `unit_phases.py`, `style_units.py`, the command text and the as-built doc.
-- `test` — rows in the existing test classes: an all-`—` column is left out; a wide table at 170 columns fits `166`, cut in the order Queued, Non-Phase Work, Workers, then Notes, with Notes whole while another text column is above its header width; Progress and ETA cells stay whole; a wide character is not split; a cuttable column stops at its header width; a table that already fits does not change; the style table keeps its number alignment. Update existing expectations that change.
+**Gotchas:**
+- `cuttable` holds original column indexes, not header names, because two columns can share a header name.
+- A CONF_DIR test fixture can omit `production.conf`; `read_or_repository` then reads the repository file.
+- Other suites call `unit_phases.table`: `test_shutdown_cli`, `test_accounts` and `test_style_plan_split`.
 
-**State:** none
-
-**Acceptance gate:**
-1. `basedpyright scripts/production scripts/lib`: 0 errors, 0 warnings, 0 notes.
-2. The Test command passes.
-3. Live: `scripts/lib/py scripts/production/unit_phases.py --production sdlc` prints a table whose every row is at most 166 display columns, with Progress and ETAs whole.
+**Ruled out:** cut selection by header name.
