@@ -62,24 +62,15 @@
 
 ### Phase 3 — Amend /remove_command  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/remove_command` gives the steps phase 2 needed, so a second use finds the whole footprint the first time.
-
-**Spec:**
-
-Fold phase 2's lessons into `commands/remove_command.md`: missed spellings, missed places, classes that did not fit, the order that worked, and what the verification needed. Keep it a prompt; add a script only if phase 2 shows a step that a prompt cannot do well.
-
-Add the showrunner's rule (sdlc, 2026-11-12): a dead reference in another unit's file needs no go. Delete it, then send the showrunner one line that names the file. Ask the owner first only for a change to live behavior in that file.
+- `commands/remove_command.md` stays a prompt, with no script and no test.
+- Step 1 traces other callers of each policy, helper, CLI subcommand and config mode. It also searches config values and environment setup and cleanup lists for fixtures under other names.
+- Step 3 keeps a requested board post within 900 characters and puts the full table in the reply.
+- Step 4 resolves shared dependencies and moves shared fixtures before it deletes config. It moves a removed CLI path's tests to the live function they also cover, and renames test labels that name the command.
+- Step 4 holds the showrunner's rule: a dead reference in another unit's file needs no go. The command deletes it, then sends the showrunner one line that names the file. It asks the owner first only for a change to live behavior.
+- Step 5 runs the tests of shared callers and importers too.
+- Step 6 shows the `send.py` result. A non-zero exit is an anomaly to report, and the notice is not sent again.
 
 **Files:**
-- `commands/remove_command.md` — amended steps.
-
-**Workers:** 1 writer; one file.
-- `impl` — `commands/remove_command.md`.
-
-**State:** none.
-
-**Constraints from prior phases:** phase 2's inventory table and reply list what the first use found.
-
-**Acceptance gate:** each phase 2 lesson is a step or a line in `commands/remove_command.md`. `git diff --check` is clean.
+- `commands/remove_command.md` — the amended command.
