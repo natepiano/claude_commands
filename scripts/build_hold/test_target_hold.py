@@ -12,6 +12,7 @@ import unittest
 
 from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold, mac_test, targets
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production import staff
 
 ORIGINAL_RUN = subprocess.run
 ORIGINAL_POPEN = subprocess.Popen
@@ -63,6 +64,20 @@ class TargetHoldTests(IsolatedTargetState):
                 result = self.invoke_hold(["release", "--holder", "alice", *selection])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse((self.mac_state / "block.json").exists())
+        member = fixture_member("producer", name="before-rename")
+        result = self.invoke_hold(["hold", "--target", "mac", "--holder", member.name, "--for", "rename hold"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        block = mac_test.read_claim_block(mac_test.state_paths("mac"))
+        assert not isinstance(block, mac_test.NoMacBlock)
+        self.assertEqual(block.holder, member.id)
+        member = staff.rename(member.id, "after-rename")
+        status = self.invoke_mac(["status", "--target", "mac"])
+        self.assertIn("blocked by after-rename since ", status.stdout)
+        refused = self.invoke_hold(["release", "--target", "mac", "--holder", "before-rename"])
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        released = self.invoke_hold(["release", "--target", "mac", "--holder", member.name])
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        self.assertFalse((self.mac_state / "block.json").exists())
 
     def test_unconfigured_mac_hold_refuses_before_state_writes(self) -> None:
         _ = self.config.write_text(self.config.read_text().replace("targets=mac,", "targets="), encoding="utf-8")
@@ -92,7 +107,7 @@ class TargetHoldTests(IsolatedTargetState):
         result = build_hold.run_mac_hold(["block", "--holder", "alice", "--for", "inspect mac"])
         self.assertEqual(result.status, 2, result.stdout + result.stderr)
         self.assertEqual(self.snapshot(), before)
-        result = build_hold.release_mac_hold(build_hold.HolderIdentity("alice", "alice"), "alice")
+        result = build_hold.release_mac_hold(build_hold.HolderIdentity("alice", "alice"))
         self.assertEqual(result.status, 2, result.stdout + result.stderr)
         self.assertEqual(self.snapshot(), before)
 
@@ -126,7 +141,7 @@ class TargetHoldTests(IsolatedTargetState):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([(event["target"], event["event"], event["holder"], event["reason"])
                           for event in self.events()],
-                         [(name, event, "alice", f"inspect {name}")
+                         [(name, event, build_hold.holder_of("alice").key, f"inspect {name}")
                           for name in TARGET_NAMES for event in ("began", "ended")])
 
     def test_wrong_holder_cannot_release_another_targets_hold(self) -> None:
@@ -155,7 +170,7 @@ class TargetHoldTests(IsolatedTargetState):
                 mock.patch.object(subprocess, "run", side_effect=AssertionError("Local hold must not dispatch")):
             result = self.invoke_hold(["hold", "--target", "natedev", "--holder", "alice", "--for", "inspect local"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue((self.root / "holders/alice").is_file())
+        self.assertTrue((self.root / "holders" / build_hold.holder_of("alice").key).is_file())
         for name in TARGET_NAMES:
             self.assertFalse(self.directory(name).exists())
             self.assertIsInstance(targets.target_state(self.selected_target(name)),

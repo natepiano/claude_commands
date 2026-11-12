@@ -493,7 +493,60 @@ The same administrator session reads failure details without another passphrase 
 ## Paired speed trials
 
 Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
-Both refs must exist in pushed public history for `~/.claude`.
+Both refs can name local commits in `~/.claude`.
+The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
+The expires field records the trial's fixed expiry epoch in seconds.
+The trial folder's UUID supplies the id; `trial_branch_prefix` configures the prefix.
+At trial end, cleanup lists the trial's remote branch namespace and deletes each branch, including after errors and Ctrl-C.
+The trial installs no signal handler.
+Ctrl-C and terminal command exceptions stop the paired service.
+SIGTERM or SIGHUP to the terminal can skip branch cleanup.
+The separate trial service then runs to its normal end and cleans its boxes.
+The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+After a service stop, systemd runs this cleanup after killing the coordinator and its children.
+Cleanup requests termination for all recorded boxes before searching uncertain launches.
+Cleanup requests termination for each discovered box before the next search.
+Cleanup checks final states after these requests.
+Cleanup uses one deadline from `termination_timeout_s` for all boxes.
+Each API call uses the time that remains before this deadline.
+The service stop timeout adds twice `api_timeout_s` to this deadline duration.
+Cleanup records confirmed termination in the cost ledger.
+Confirmed termination is final for every later ledger outcome.
+Later running, absent, or terminated updates cannot change its end time or cost.
+A worker rejects an ended booking before checking for a launch file.
+The ledger rejects reservations for closed attempt IDs.
+A retry uses a new attempt ID.
+Cleanup resolves reservations without saved launch arguments as `GateAbsent`.
+The module and coordinator also call this cleanup from `finally` blocks.
+Repeated cleanup does not change resolved reservations.
+AWS failures leave reservations unresolved for later recovery.
+Before reservation, the coordinator cleans expired earlier trials with unresolved reservations.
+The sweep checks each attempt's owner and passes only due attempts to cleanup.
+The sweep preserves boxes with live owners, even when another owner in the same expired trial has ended.
+The sweep preserves trial folders.
+Guest expiry and the AWS expiry function remain independent termination controls.
+AWS failures can delay termination beyond the configured expiry and confirmation timeout.
+Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+The worker installs no signal handler.
+The ledger records each worker's PID, process start identity, and attempt folder.
+Reconciliation preserves live workers and workers whose identity cannot be read.
+Reconciliation terminates expired attempts and attempts whose recorded worker has ended.
+Each worker reconciles before reusing a saved launch.
+A hard kill without a later start can leave the booking open.
+The ledger continues to estimate its cost for the spending cap.
+The AWS expiry function ends the box.
+The next gate or trial start closes the booking after confirmation.
+Before new pushes, a start sweep deletes parsed trial branches whose expiry is earlier than the current time.
+The sweep reads no current lifetime setting.
+A lower lifetime setting leaves existing trials' fixed expiries unchanged.
+The sweep preserves unexpired branches, malformed names, and unrelated branches.
+A sweep failure prints one stderr line and the trial continues.
+This cleanup covers a push accepted remotely before the client reports an error.
+Each network Git call uses `git_network_timeout_s`, which defaults to 60 seconds.
+A timeout or cancellation kills the Git process group, including SSH children.
+A cleanup failure prints one stderr line for the trial or branch and preserves the trial's exit code.
+The pushes use the invoking terminal's Git credentials.
 Each module uses one disposable gate box.
 All boxes launch after the full trial obtains its cloud slots and cost reservations.
 The trial refuses costs above the daily or monthly room.
@@ -594,23 +647,35 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 The prices command prints regional Spot prices without resource identities.
+It reads gate regions, then `spot_candidate_regions`, without duplicates.
+It preserves the configured order within each list.
+`spot_candidate_regions=us-east-2 us-west-2` also supplies the regions for Spot work and later price steering.
+`gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
-`deploy.py prices` and the price stage of `up` show the Standard Spot vCPU quota (`L-34B43A08`) for each configured region.
+`deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
+The price stage of `up` shows this quota for each gate region.
+Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
 A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
-`deploy.py quota-request` requests `spot_quota_request_vcpus` from `cloud_gate.conf` in each configured region.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 128 vCPUs.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+It uses `gpu_spot_quota_request_vcpus=4` for one xlarge GPU box.
+All three new keys are in `cloud_gate.conf`.
+Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
 It prints the region, desired value, and request status without request, case, or account identifiers.
 A failed call prints only the AWS error code or Python error class and does not stop other regions.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.

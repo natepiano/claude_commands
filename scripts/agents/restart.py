@@ -17,8 +17,9 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from threading import Event
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from importlib import import_module
@@ -26,11 +27,11 @@ from importlib import import_module
 from scripts.herdr import herdr
 from scripts.herdr import herdr_types
 from scripts.message import sessions, codex_daemon
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.transcripts import transcript_paths
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.agents import member_account, shutdown_record, pane_record
 from scripts.agents.stop_results import StopResult, Stopped, NotRunning, StopFailed
 from scripts.agents.codex_trust import trust_arguments
@@ -84,6 +85,122 @@ class WorkerRestartScope(Enum):
 class RestartDisposition(Enum):
     RESTORED = "the row started or already runs"
     HELD = "the row keeps its pause or exit record"
+
+
+class ResumeCheckState(Enum):
+    NO_MESSAGE = "no continuation message"
+    NO_WORK = "no work after the continuation message"
+    UNREADABLE = "transcript unreadable"
+    RESUMED = "resumed"
+
+
+@dataclass
+class CodexResumeTranscript:
+    """Read new turns in the account and thread used at launch."""
+
+    transcript: herdr.SessionTranscript
+    since: datetime
+    offsets: dict[Path, int] = field(default_factory=dict)
+
+    def skip_existing_turns(self) -> None:
+        try:
+            source = worker_admission.codex_transcript_source(self.transcript.session_id, self.transcript.config_dir)
+            with open_transcript(source) as stream:
+                self.offsets[source] = herdr.complete_transcript_offset(stream)
+        except (OSError, ValueError):
+            pass
+
+    def progress(self, text: str) -> ResumeCheckState:
+        state = ResumeCheckState.NO_MESSAGE
+        try:
+            source = worker_admission.codex_transcript_source(self.transcript.session_id, self.transcript.config_dir)
+            offset = self.offsets.get(source, 0)
+            if source.stat().st_size < offset:
+                offset = 0
+            for row in worker_admission.transcript_records(
+                    source, offset=offset, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES):
+                if isinstance(row, worker_admission.TornTranscriptRecord):
+                    return ResumeCheckState.UNREADABLE
+                stamp = row.get("timestamp")
+                if not isinstance(stamp, str):
+                    continue
+                at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if at.tzinfo is None or at <= self.since:
+                    continue
+                entry = worker_admission.transcript_entry(row, set())
+                if entry.startswith("user:\n") and text in entry:
+                    state = ResumeCheckState.NO_WORK
+                elif state is ResumeCheckState.NO_WORK:
+                    raw = row.get("payload")
+                    if isinstance(raw, dict):
+                        payload = cast(dict[str, object], raw)
+                        if (payload.get("role") == "assistant"
+                                or payload.get("type") in ("agent_message", "function_call", "custom_tool_call")):
+                            return ResumeCheckState.RESUMED
+            return state
+        except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+            return ResumeCheckState.UNREADABLE
+
+
+@dataclass
+class DirectorResumeCheck:
+    name: str
+    text: str
+    reader: herdr.TranscriptCursor | CodexResumeTranscript
+
+    def progress(self) -> ResumeCheckState:
+        if isinstance(self.reader, CodexResumeTranscript):
+            return self.reader.progress(self.text)
+        turns = self.reader.read_turns()
+        if isinstance(self.reader.readability, herdr.TranscriptUnreadable) or not self.reader.current_paths:
+            return ResumeCheckState.UNREADABLE
+        state = ResumeCheckState.NO_MESSAGE
+        for turn in sorted(turns, key=lambda turn: turn[0]):
+            row = turn[1]
+            if state is ResumeCheckState.NO_WORK and row.get("type") == "assistant":
+                return ResumeCheckState.RESUMED
+            if (row.get("type") == "user" and not row.get("isMeta", False)
+                    and self.text in worker_admission.transcript_entry(row, set())):
+                state = ResumeCheckState.NO_WORK
+        return state
+
+
+class NoDirectorResumeChecks(Enum):
+    CURRENT = "this caller does not check director progress"
+
+
+@dataclass
+class DirectorResumeChecks:
+    checks: list[DirectorResumeCheck] = field(default_factory=list)
+
+    def report(self) -> None:
+        if not self.checks:
+            return
+        try:
+            settings = conf.read("shutdown")
+            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
+            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+        except (OSError, ValueError):
+            for check in self.checks:
+                print(f"{check.name}: restart check: {ResumeCheckState.UNREADABLE.value}")
+            print(f"restart check: 0 of {len(self.checks)} directors resumed")
+            return
+        states = [ResumeCheckState.NO_MESSAGE] * len(self.checks)
+        while True:
+            for index, check in enumerate(self.checks):
+                if states[index] is not ResumeCheckState.RESUMED:
+                    states[index] = check.progress()
+            if all(state is ResumeCheckState.RESUMED for state in states):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+        for check, state in zip(self.checks, states):
+            if state is not ResumeCheckState.RESUMED:
+                print(f"{check.name}: restart check: {state.value}")
+        passed = sum(state is ResumeCheckState.RESUMED for state in states)
+        print(f"restart check: {passed} of {len(self.checks)} directors resumed")
 
 
 class ClaudeTrustWriteFailed(OSError):
@@ -155,17 +272,24 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
              codex: herdr.CodexConversations | None = None) -> bool:
     with operation_deadline.within(deadline):
         try:
-            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session]
+            record = staff.initial_snapshot()
+            if record.by_id(row.id) is None:
+                record = staff.StaffSnapshot((*record.rows, row))
+            panes = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, client,
+                pane_record.read(client.session))
+            if not panes and any(pane["session_id"] == row.current_session for pane in client.panes()):
+                raise herdr_types.HerdrFailure(f"would signal a process that does not run session {row.current_session}",
+                                               "wrong_target")
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained; no signal sent")
                 return False
             if panes and not herdr.check_target(str(row.current_session), action="signal",
-                    place=herdr.HerdrPlace(client.session, panes[0]["pane_id"]),
-                    terminal=panes[0].get("terminal_id", ""), client=client):
+                    place=herdr.HerdrPlace(client.session, str(panes[0]["pane_id"])),
+                    terminal=str(panes[0].get("terminal_id", "")), client=client):
                 return False
             if panes:
                 # End the restore entry before the signal, so no restore revives the stopped session.
-                pane_record.end(client.session, panes[0]["pane_id"], str(row.current_session),
+                pane_record.end(client.session, str(panes[0]["pane_id"]), str(row.current_session),
                                 record=staff.StaffSnapshot((row,)))
         except (herdr_types.HerdrFailure, OSError, ValueError) as error:
             _anomaly(row, error)
@@ -178,13 +302,16 @@ def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math
         return False
 
 
-def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-    projected = entry.copy()
-    projected["session_id"] = identity
-    projected["name"] = name
+def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
+                  record: staff.StaffSnapshot | pane_launch.StaffSnapshotRead = pane_launch.StaffSnapshotRead.CURRENT) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+    record = staff.initial_snapshot() if isinstance(record, pane_launch.StaffSnapshotRead) else record
+    projected = pane_launch.current_launch(entry, record)
+    if "staff_id" not in projected:
+        projected["session_id"] = identity
+        projected["name"] = name
     arguments = pane_record.resume_arguments(projected)
-    kind = pane_launch.agent_kind(entry)
-    home = pane_launch.config_home(entry)
+    kind = pane_launch.saved_kind(projected)
+    home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         return kind, {}, arguments
@@ -304,7 +431,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               resolver: session_staff.RowResolver | None = None,
               worker_scope: WorkerRestartScope = WorkerRestartScope.FOLLOW_OWNER,
               observed: RestartObservations | None = None,
-              opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE) -> str:
+              opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
+              resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
@@ -333,7 +461,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if row.kind == "producer":
             kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
         else:
-            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name)
+            kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):
@@ -345,24 +473,36 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
                        client.saved_row_tab(str(row.id), row.name, workspace))
+        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+        expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
+        if row.kind == "producer":
+            environment = expectation.environment(environment)
         prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
         target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
+        source_client = client
         try:
-            panes = [pane for pane in client.panes() if pane["session_id"] == row.current_session] if row.kind != "producer" else []
+            if publication is not None and publication.path != pane_record.record_path(client.session):
+                source_client = herdr.Herdr(publication.path.stem)
+            entries = ({original["pane_id"]: original} if original is not None else {})
+            locations = [dict(pane) for pane in source_client.panes()]
+            evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(record, locations))
+            panes = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, source_client,
+                                                entries, evidence=evidence)
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained")
-            elif panes and (original is None or original["cwd"] == str(folder)):
-                target = herdr.ExistingPane(panes[0]["pane_id"], panes[0].get("terminal_id", ""))
-            elif (row.kind != "producer" and not panes and publication is not None
-                    and publication.path == pane_record.record_path(client.session)
-                    and publication.entry["cwd"] == str(folder)):
-                retained = next((pane for pane in client.panes() if pane["pane_id"] == publication.entry["pane_id"]), None)
-                if (retained is not None and (terminal := retained.get("terminal_id", ""))
-                        and isinstance(client.pane_activity(retained["pane_id"]), herdr.PaneAtShell)):
-                    target = herdr.ExistingPane(retained["pane_id"], terminal)
+            elif panes:
+                pane = panes[0]
+                source_pane = pane_launch.ResumeSourcePane(str(pane["pane_id"]))
+                if (row.kind != "producer" and source_client.session == client.session
+                        and (original is None or original["cwd"] == str(folder))
+                        and pane.get("terminal_id")
+                        and (pane in evidence.scan.found.get(row.id, ())
+                             or isinstance(client.pane_activity(str(pane["pane_id"])), herdr.PaneAtShell))):
+                    target = herdr.ExistingPane(str(pane["pane_id"]), str(pane["terminal_id"]))
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
@@ -381,11 +521,31 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         settings = conf.read("shutdown")
         start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
-        selected_home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
+        check: DirectorResumeCheck | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT
         if isinstance(opening, herdr.OpeningPrompt):
-            opening = replace(opening, transcript=herdr.SessionTranscript(selected_home, str(row.current_session)))
-        expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(folder), selected_home)
-        scope = (pane_launch.producer_start(pane_record.record_directory(), expectation)
+            transcript = herdr.SessionTranscript(selected_home, str(row.current_session))
+            opening = replace(opening, transcript=transcript)
+            if row.kind in ("unit", "showrunner") and isinstance(resume_checks, DirectorResumeChecks):
+                since = datetime.now(timezone.utc)
+                reader = (herdr.TranscriptCursor(transcript, since) if kind == "claude" else
+                          CodexResumeTranscript(transcript, since))
+                reader.skip_existing_turns()
+                check = DirectorResumeCheck(row.name, opening.text, reader)
+                if isinstance(reader, herdr.TranscriptCursor):
+                    cursor = reader
+                    before_prompt = opening.before_prompt
+
+                    def native_transcript(actual: herdr.SessionTranscript) -> object:
+                        if actual != cursor.transcript:
+                            cursor.transcript = actual
+                            cursor.offsets.clear()
+                            cursor.sizes.clear()
+                            cursor.turns.clear()
+                            cursor.skip_existing_turns()
+                        return before_prompt(actual)
+
+                    opening = replace(opening, before_prompt=native_transcript)
+        scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
@@ -416,13 +576,14 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if (publication is not None and original is not None and projected is not None
                 and (publication.path != path or result.pane != original["pane_id"])):
             try:
-                source_client = client if publication.path == path else herdr.Herdr(publication.path.stem)
-                if not pane_holds_other_work(source_client, original["pane_id"], str(row.current_session)):
+                if (isinstance(source_pane, pane_launch.ResumeSourceAbsent)
+                        or not pane_holds_other_work(source_client, source_pane.pane, str(row.current_session))):
                     completed = expectation.expected_launch(projected) if row.kind == "producer" else projected
                     pane_launch.finish_restore(publication.path, original,
                                                pane_launch.resume_attempt(path, result.pane),
                                                names.resume_proof(original, completed), close=client.close_tab_confirmed,
-                                               destination=path, close_source=source_client.close_tab_confirmed)
+                                               destination=path, close_source=source_client.close_tab_confirmed,
+                                               source_pane=source_pane)
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 _anomaly(row, error)
         try:
@@ -435,29 +596,28 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
             _ = (_restore_workers(row, record) if observed is None else
                  _restore_workers(row, record, observed=observed))
+        if isinstance(resume_checks, DirectorResumeChecks) and isinstance(check, DirectorResumeCheck):
+            resume_checks.checks.append(check)
         print(f"{row.name}: restarted")
         return result.pane
 
 
 def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
     try:
-        panes = client.panes()
-        launches = {entry["session_id"]: entry for entry in sorted(pane_record.launches(), key=lambda entry: entry["written_at"])}
-        pane_ids = {pane["pane_id"] for pane in panes}
-        found: list[tuple[staff.StaffRow, str]] = []
-        for row in rows:
-            matches = [pane["pane_id"] for pane in panes if pane["session_id"] == row.current_session]
-            if matches:
-                found.extend((row, pane) for pane in matches)
-                continue
-            entry = max((launches[reference] for reference in (str(row.id), str(row.current_session)) if reference in launches),
-                        key=lambda entry: entry["written_at"], default=None)
-            if entry is not None and entry["pane_id"] in pane_ids:
-                found.append((row, entry["pane_id"]))
-        missing = [row for row in rows if row.kind == "producer" and not any(item.id == row.id for item, _pane in found)]
-        if missing:
-            scan = client.scan_row_panes(staff.StaffSnapshot(tuple(missing)), [dict(pane) for pane in panes])
-            found.extend((row, str(pane["pane_id"])) for row in missing for pane in scan.found.get(row.id, []))
+        entries = pane_record.read(client.session)
+        record = staff.initial_snapshot()
+        record = staff.StaffSnapshot((*record.rows, *(row for row in rows if record.by_id(row.id) is None)))
+        with herdr.pane_evidence_run():
+            panes = [dict(pane) for pane in client.panes()]
+            evidence = pane_launch.NativePaneEvidence(panes, client.scan_row_panes(record, panes))
+            found: list[tuple[staff.StaffRow, str]] = []
+            for row in rows:
+                reference = pane_launch.StaffLaunchReference(row.id)
+                newest = max((entry for entry in entries.values() if pane_launch.launch_reference(entry, record) == reference),
+                             key=lambda entry: entry["written_at"], default=None)
+                retained = {newest["pane_id"]: newest} if newest is not None else {}
+                found.extend((row, str(pane["pane_id"])) for pane in pane_launch.reference_panes(
+                    reference, record, client, retained, evidence=evidence))
         return found
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
@@ -824,6 +984,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    resume_checks = DirectorResumeChecks()
+
     def start_holder(holder: staff.StaffRow, focus: bool) -> RestartDisposition:
         with staff.row_operation(str(holder.id)):
             current_record = staff.initial_snapshot()
@@ -849,11 +1011,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 _ = start_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
-                              opening=opening)
+                              opening=opening, resume_checks=resume_checks)
             else:
                 _ = start_row(current, current_record, client, present=focus, resolver=facts,
                               target_account="" if isinstance(account, AllRestartAccounts) else account,
-                              worker_scope=worker_scope, observed=observed, opening=opening)
+                              worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
             return RestartDisposition.RESTORED
 
     if holders:
@@ -883,6 +1045,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             _ = client.sort_tabs()
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    resume_checks.report()
     return exit_code
 
 

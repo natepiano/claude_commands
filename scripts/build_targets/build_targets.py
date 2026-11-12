@@ -943,7 +943,7 @@ def hold_waited_on(holds: build_hold.NatedevHolds,
     own_key = ""
     if isinstance(owner, OwningSession):
         try:
-            own_key = build_hold.holder_path(directory, owner.session_id).name
+            own_key = build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
         except ValueError:
             pass
     lineage = (build_hold.caller_processes(build_hold.PROC_ROOT, os.getpid())
@@ -971,6 +971,7 @@ def tell_wait_holder(holder: build_hold.Holder, line: str, caller: str) -> None:
     """Tell the holder about unresolved ownership without ending the wait."""
     import subprocess
 
+    from scripts.build_hold import build_hold
     from scripts.lib import conf
     from scripts.lib.process_failure import failure_detail
     from scripts.message import session_send
@@ -978,7 +979,7 @@ def tell_wait_holder(holder: build_hold.Holder, line: str, caller: str) -> None:
     try:
         with conf.diagnostics(report=False):
             timeout = conf.read("build_targets").number("hold_sender_timeout_seconds")
-        result = subprocess.run(session_send.send_argv("--to", f"session:{holder.key}", "--text", line),
+        result = subprocess.run(session_send.send_argv("--to", build_hold.holder_address(holder.key), "--text", line),
                                 capture_output=True, text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as error:
         reason = f"send timed out after {error.timeout:g} seconds"

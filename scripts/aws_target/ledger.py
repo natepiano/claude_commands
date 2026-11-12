@@ -102,6 +102,18 @@ class GateAllowanceUnpriced:
 
 
 @dataclass(frozen=True)
+class GateOwnerUnknown:
+    """No worker identity establishes whether the attempt is active."""
+
+
+@dataclass(frozen=True)
+class GateWorkerOwner:
+    pid: int
+    start: str
+    folder: str
+
+
+@dataclass(frozen=True)
 class GateReservation:
     attempt: str
     at: int
@@ -114,11 +126,17 @@ class GateReservation:
     region: str = ''
     day_rates: tuple[tuple[str, BoxRate], ...] = ()
     booked_allowance: GateAllowance | GateAllowanceUnpriced = GateAllowanceUnpriced()
+    owner: GateWorkerOwner | GateOwnerUnknown = GateOwnerUnknown()
 
 
 @dataclass(frozen=True)
 class GateReserved:
     reservation: GateReservation
+
+
+@dataclass(frozen=True)
+class GateAttemptEnded:
+    reason: str = 'The attempt booking has ended; use a new attempt id'
 
 
 @dataclass(frozen=True)
@@ -421,7 +439,9 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                   for rate in rows(item, 'day_rates')) if 'day_rates' in item else (),
             GateAllowance(money(text(mapping(item['booked_allowance']), 'usd')),
                           text(mapping(item['booked_allowance']), 'source'))
-            if item.get('booked_allowance') is not None else GateAllowanceUnpriced()))
+            if item.get('booked_allowance') is not None else GateAllowanceUnpriced(),
+            GateWorkerOwner(instant(mapping(item['owner']), 'pid'), text(mapping(item['owner']), 'start'),
+                            text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown()))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     for inventory in evidence.inventories:
@@ -468,6 +488,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
+             'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
+                      if isinstance(r.owner, GateWorkerOwner) else None,
              'booked_allowance': {'usd': str(r.booked_allowance.usd), 'source': r.booked_allowance.source}
                                  if isinstance(r.booked_allowance, GateAllowance) else None,
              'day_rates': [{'day': day, 'usd_per_hour': str(rate.usd_per_hour), 'source': rate.source}
@@ -1240,11 +1262,13 @@ class CostLedger:
                 and datetime.fromtimestamp(r.at, ZoneInfo('UTC')).date().isoformat() == day.day
                 for r in state.gate_reservations)) for day in days)
 
-    def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached:
+    def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached | GateAttemptEnded:
         """Reserve gate costs under the shared Rust accounting lock."""
         with self._locked() as state:
             for previous in state.gate_reservations:
                 if previous.attempt == request.attempt:
+                    if isinstance(previous.state, (GateAbsent, GateTerminated)):
+                        return GateAttemptEnded()
                     return GateReserved(previous)
             settings = read_settings(settings_path)
             costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
@@ -1278,11 +1302,20 @@ class CostLedger:
                                        for row in state.gate_reservations]
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
-        """Release a reservation only after AWS confirms its final state."""
+    def gate_owner(self, attempt: str, owner: GateWorkerOwner) -> None:
+        """Save the worker identity before an attempt can launch a box."""
         with self._locked() as state:
-            state.gate_reservations = [replace(r, state=outcome, instance_type=instance_type or r.instance_type) if r.attempt == attempt else r
-                                       for r in state.gate_reservations]
+            state.gate_reservations = [replace(row, owner=owner) if row.attempt == attempt else row
+                                       for row in state.gate_reservations]
+            self._save(state)
+
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+        """Preserve confirmed termination against every later outcome."""
+        with self._locked() as state:
+            if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
+                return
+            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
+                                       if row.attempt == attempt else row for row in state.gate_reservations]
             self._price_gates(state, self.read_bills(), int(time.time()) if isinstance(outcome, GateRunning) else outcome.at)
             self._save(state)
 

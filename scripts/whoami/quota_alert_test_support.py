@@ -37,7 +37,7 @@ from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 
 from scripts.message import send
 from scripts.notify.user_action import ActionRequired, UserAction, parse_user_action
@@ -391,6 +391,8 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
+        _ = fixture_member("producer", name="director")
+        _ = fixture_member("showrunner", name="runner")
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",

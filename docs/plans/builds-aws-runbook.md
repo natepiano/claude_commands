@@ -38,7 +38,7 @@ There is no separate charge timer.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
-7. Run `python3 scripts/aws_target/deploy.py quota-request` to request the configured Spot vCPU quota in each gate region.
+7. Run `python3 scripts/aws_target/deploy.py quota-request` to request Standard and G and VT Spot quotas in the configured regions.
 8. Run `python3 scripts/aws_target/deploy.py up --approve-resources` for deployment.
    Deployment refuses a price older than `price_max_age_seconds`.
    Confirm that `notification_email_file` names an existing private file before deployment.
@@ -49,13 +49,23 @@ A placement score for one instance type is always low. AWS needs at least three 
 
 On 2026-11-11, the Standard Spot vCPU quota (`L-34B43A08`) in `us-west-2` is 5.
 The largest configured gate needs 32 vCPUs.
-`deploy.py quota-request` requests `spot_quota_request_vcpus=128` from `cloud_gate.conf` in each configured region.
+`deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+The command uses `spot_quota_request_vcpus=128` from `cloud_gate.conf`.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions=us-east-2 us-west-2`.
+It uses `gpu_spot_quota_request_vcpus=4` for one xlarge GPU box.
+Spot work and later price steering use the same candidate region list.
 The command decrypts the administrator key at the terminal.
 It skips sufficient quotas and existing open requests.
 It prints request status and desired values without request, case, or account identifiers.
 A failed region prints only the AWS error code or Python error class while other regions continue.
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy needs `servicequotas:GetServiceQuota`, `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`, and `servicequotas:RequestServiceQuotaIncrease`.
+Both quota codes use these same three IAM actions.
+
+`deploy.py prices` reads gate regions, then candidate regions, without duplicates.
+It preserves the configured order within each list.
+It adds `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` to the existing price rows.
+All three new keys are in `cloud_gate.conf`.
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 

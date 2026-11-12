@@ -168,8 +168,8 @@ def _launch(verb: str, arguments: list[str]) -> int:
     return 0
 
 
-def claude_names() -> dict[str, str]:
-    """The newest live Claude name in each pane of the shared herdr session."""
+def claude_sessions() -> dict[str, SessionRecord]:
+    """Return the newest live Claude record for each pane in the shared session."""
     shared = herdr.shared_session()
     newest: dict[str, SessionRecord] = {}
     directory = sessions_dir()
@@ -187,7 +187,7 @@ def claude_names() -> dict[str, str]:
             continue
         if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
             newest[place.pane] = record
-    return {pane: record["name"] for pane, record in newest.items()}
+    return newest
 
 
 def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
@@ -261,15 +261,18 @@ def _main(argv: list[str]) -> int:
             _attach(pane)
         with herdr.pane_snapshot() as read_panes:
             panes = read_panes(shared)
-            names = claude_names()
+            sessions = claude_sessions()
             membership = staff.initial_snapshot()
             roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
-            showrunner_names = {runner["session"] for runner in require_complete(
-                registered_showrunners(membership=membership)) if runner["session"]}
+            documents = {runner["doc"] for runner in require_complete(registered_showrunners(membership=membership))}
+            showrunner_ids = {row.id for row in membership.find(kind="showrunner")
+                              if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and str(row.doc.path) in documents}
             for row in panes:
                 pane = row["pane_id"]
-                claude = names.get(pane, "")
-                role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
+                current = sessions.get(pane)
+                claude = current["name"] if current is not None else ""
+                owner = membership.by_current_session(current["sessionId"]) if current is not None else None
+                role = roles.get(pane, "showrunner" if owner is not None and owner.id in showrunner_ids else "standalone")
                 print(f"{row.get("label") or pane}\t{role}\t{claude}")
             return 0
     except (herdr_types.HerdrFailure, OSError) as error:
