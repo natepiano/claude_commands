@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
+import shutil
 import subprocess
+import sys
 import unittest
 from typing import ClassVar, cast
 
@@ -52,6 +54,26 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(len(records), 1)
         self.assertEqual((records[0]["id"], records[0]["role"]), ("current-session-id", "showrunner"))
         self.assertNotIn("lens", records[0])
+
+    def test_missing_prompt_markers_fail_at_delivery_without_registration_changes(self) -> None:
+        for marker in ("The prompt:", "**A tick**"):
+            with self.subTest(marker=marker):
+                script = self.copied_command()
+                template = script.parents[2] / "commands/showrunner/produce.md"
+                _ = template.write_text(template.read_text(encoding="utf-8").replace(marker, "", 1), encoding="utf-8")
+                registered = self.run_copy(script, "register", "--session", "resumed-showrunner")
+                self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+                before = self.doc.read_bytes()
+                calls = self.notifier_calls()
+                result = subprocess.run([sys.executable, str(script), "prompt", "--owner", self.owner_id],
+                                        cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(marker, result.stdout + result.stderr)
+                self.assertEqual(self.doc.read_bytes(), before)
+                self.assertFalse(self.config.exists())
+                self.assertEqual(self.notifier_calls(), calls)
+                self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+                shutil.rmtree(script.parents[2])
 
 
 if __name__ == "__main__":

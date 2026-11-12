@@ -49,7 +49,7 @@ def read_launch_receipt(path: Path, record: staff.StaffSnapshot) -> OwnedReceipt
     row = record.by_id(staff.StaffId(owner)) if isinstance(owner, str) else None
     if row is not None:
         return OwnedReceipt(row, fields)
-    if isinstance(owner, str) and owner == fields.get("session_id"):
+    if isinstance(owner, str):
         try:
             return UnpublishedReceipt(staff.native_id(owner), fields)
         except staff.StaffRefused:

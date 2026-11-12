@@ -192,14 +192,14 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     def cleanup_files(self) -> tuple[Path, ...]:
         state = self.root / "state"
-        files = (state / self.child.id / "prompt.txt", state / "counts" / self.child.id,
+        files = (state / "counts" / self.child.id,
                  state / "outstanding" / f"{self.child.id}.json",
                  state / "outstanding" / f"{self.child.id}.history.jsonl",
-                 state / self.child.id / "history.txt", state / self.parent.id / "prompt.txt",
+                 state / self.child.id / "history.txt",
                  state / "counts" / self.parent.id)
         for path in files:
             write_text_atomic(path, "retained fixture content\n")
-        write_text_atomic(files[2], "[]\n")
+        write_text_atomic(files[1], "[]\n")
         update_registration.write_open_entries(read_production(self.child), [
             {"since": "2026-11-09T10:01", "text": "Keep this reminder"}], self.question_staff())
         return files
@@ -218,12 +218,12 @@ class DemoteShowrunnerTests(StaffTestCase):
         other_doc = self.checkout / "other-production.md"
         write_text_atomic(other_doc, self.document(self.checkout))
         other = self.root / "notifier" / f"showrunner-{self.parent.id}"
-        unchanged = {path: path.read_bytes() for path in (*files[2:], other_doc, *other.iterdir())}
+        unchanged = {path: path.read_bytes() for path in (*files[1:], other_doc, *other.iterdir())}
         before = int(self.git("-C", str(self.child_tree), "rev-list", "--count", "HEAD"))
         code, _, errors = self.run_command()
         self.assertEqual(code, 0, errors)
         self.assertFalse((self.root / "notifier" / f"showrunner-{self.child.id}").exists())
-        for path in files[:2]:
+        for path in files[:1]:
             self.assertFalse(path.exists(), str(path))
         for path, content in unchanged.items():
             self.assertEqual(path.read_bytes(), content)
@@ -329,7 +329,7 @@ class DemoteShowrunnerTests(StaffTestCase):
             self.assertEqual(self.child_doc.read_bytes(), document)
         self.start.assert_called_once()
         self.place.assert_called_once()
-        self.assertTrue(all(path.exists() for path in files[2:]))
+        self.assertTrue(all(path.exists() for path in files[1:]))
 
     def test_name_only_uses_the_child_plan_and_keeps_explicit_values(self) -> None:
         original_doc = self.child_doc

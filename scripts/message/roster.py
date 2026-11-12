@@ -861,9 +861,11 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
             showrunner, director = _held_location(parent, membership, {})
         except (OSError, ValueError):
             return ShownName(NoProduction(), NoUnit(), JobUnassigned("design worker parent unavailable"), name)
+        instance = next(instance for instance in design.roles if instance.role == held_role)
+        name = design_roles.instance_name(instance, membership)
         return shown_name(RosterEntry(
             machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
-            name=name, status="", reach=Messageable(name), cwd=design.repository,
+            name=name, status="", reach=Messageable(name), cwd=design_roles.design_repository(design, membership),
             showrunner=showrunner, director=director, assignment=HeldDesignRole(held_role, session_dir)))
     showrunner: ShowrunnerRelationship = NoShowrunner()
     director: DirectorRelationship = NoDirector()
@@ -1259,7 +1261,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 thread = (member.current_session if member is not None and isinstance(evidence, session_staff.RecordedWorker)
                           and isinstance(evidence.backend, staff.CodexBackend) else "")
                 if not thread:
-                    print(f"anomaly: {instance.name}: held role has no Codex backend", file=sys.stderr)
+                    print(f"anomaly: {design_roles.instance_name(instance, membership)}: held role has no Codex backend", file=sys.stderr)
                     continue
                 if thread in threads:
                     continue
@@ -1267,9 +1269,9 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
                 status = type(instance.lifecycle).__name__
                 entries.append(RosterEntry(machine=machine, kind='codex',
                     role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
-                    name=instance.name, status=status, reach=CannotReceiveMessages(
+                    name=design_roles.instance_name(instance, membership), status=status, reach=CannotReceiveMessages(
                         'held role; add pending messages through design_roles.py'),
-                    cwd=design.repository, showrunner=showrunner, director=director,
+                    cwd=design_roles.design_repository(design, membership), showrunner=showrunner, director=director,
                     assignment=HeldDesignRole(instance.role, str(path.parent)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:

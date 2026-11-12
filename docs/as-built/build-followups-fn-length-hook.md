@@ -172,7 +172,44 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
   - Idle for `stall_minutes` with no work and a `holding:` status naming an outside party: only a per-unit log line, with no bump or showrunner tell. The hold leaves `tell_sent` false. A later idle unit can receive its bump and tell in the same stretch. Other idle units, including holds naming only their own work and units with no turn-end status, keep one bump to the unit's own socket (`stall-watch: you have been idle since HH:MM <zone> with nothing running. Continue your run; …`, key `stall-watch:<unit>:<since>:bump`) and one report to its showrunner (`<unit> idle since …, nothing running; bumped. Last status: <line>`, key `…:tell`) per idle stretch.
   - `send_all` starts every `send.py --to uds:<socket> --from stall-watch --key <key> --text …` together and waits at most 90 s for the batch; a failed recipient is retried next tick with the same key; the stretch flag is set only after a successful send. A successful prompt alert immediately saves `alerted` and its report as `case_pending`. `retry_cases` opens pending cases after the batch and on later ticks, clearing each report only when its case opens or joins; case retries send no second alert. A cleared prompt retires its alert even while the case is pending. Successful retirement moves a pending case to its own `.case.json` snapshot, freeing the active prompt state for new alerts. `retry_cases` reads both prompt and case files and removes each case file only after its case opens or joins.
 
-- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` makes a run-only instance (`RUN=` in `conf`; not combinable with `--to`, `--from`, `--check`, `--command`, `--prompt-file`, `--hold` or `--aligned`; timeout defaults to 120 s). `cmd_tick` starts each due `RUN=` job outside the tick through `launch_run`: a transient `systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on macOS a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label; with neither launcher it logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job after the tick lock is released. The job claims its slot, runs the command with output to `<instance>/run.log` (replaced each run), has a `zselect` watchdog that sends TERM at the timeout, and appends `run timeout` or `run exit <rc>` to `fire.log`. Non-run jobs still run inside the tick.
+- `notifier.sh new <instance> --every <min> --run <cmd> [--timeout <s>]` creates a run-only instance with `RUN=` in `conf`.
+  It cannot combine `--run` with `--to`, `--from`, `--check`, `--command`, `--prompt`, `--hold` or `--aligned`.
+  The timeout defaults to 120 seconds.
+  `cmd_tick` starts each due job through `launch_run` outside the tick.
+  Linux uses a transient `systemd-run --user --collect --quiet --no-block` service named `session-notifier-<name>-<pid>-<random>`.
+  macOS uses a `launchctl submit` job that runs `run-due-and-remove <name> <label>` and removes its own label.
+  Without either launcher, the notifier logs `run launcher unavailable: <name>; waiting after tick` and runs the job after it releases the tick lock.
+  The job claims its slot and replaces `<instance>/run.log` with its command output.
+  A `zselect` watchdog sends TERM at the timeout.
+  The job appends `run timeout` or `run exit <rc>` to `fire.log`.
+  Other jobs run inside the tick.
+
+### Production launch and wrap records
+
+`scripts/production/add_showrunner.py` writes `~/.local/state/showrunner/<owner staff id>/add_showrunner.json`.
+The receipt stores `owner`, `caller`, `resume` and `started_at`.
+It stores no `session_id`.
+A pending receipt also stores `doc` and `config_dir` as creation claims.
+
+`finish_publication` saves `config_dir` as the owner's home through `staff.set_home`.
+It then rewrites the receipt without `doc` and `config_dir`.
+The first launch and a repeated owned launch with creation claims both call `finish_publication`.
+This order lets a repeated launch complete an interrupted home write.
+
+`completion_receipt.read_launch_receipt` resolves `owner` through staff and returns `OwnedReceipt`, `UnpublishedReceipt` or `NoReceipt`.
+An owned receipt uses the owner's current session, document and home from staff.
+An unpublished receipt has no staff row and uses `owner` as its native session identity.
+Its creation claims supply the document and account directory until publication completes.
+`ShowrunnerLaunch.from_receipt` accepts the receipt variant and reads `started_at` from its fields.
+
+`scripts/production/production_lifecycle.py` saves `wrap_release.json` under the same owner directory.
+`former_parent` stores a recipient staff id or `null`.
+`former_children` and `told` store lists of recipient staff ids.
+`showrunner_tree.edges_to_release` captures these ids from staff relationships.
+`release_edges` reads each recipient's current staff name immediately before its delivery.
+After a successful delivery, it saves that recipient's id in `told`.
+It reads current names again for the final parent and children report.
+This per-delivery lookup preserves correct routing when a recipient changes name during an earlier delivery.
 
 ### Adhoc review
 
