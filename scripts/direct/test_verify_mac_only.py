@@ -111,6 +111,22 @@ try_reserved_target
             text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
+    def routing_result(self) -> subprocess.CompletedProcess[str]:
+        """Use the real eligibility and routing functions with private records."""
+        functions = shell_functions(
+            VERIFY, "initialize_step_record", "remove_step_record", "phase_wait_start",
+            "phase_wait_holder_flags", "phase_wait_target_busy",
+        )
+        return self.call_mac_functions(functions + r'''
+MAC_ONLY=1 MAC_REASON="needs macOS"
+STEP_RECORD_SCRIPT=$TEST_REAL_DIRECT/step_record.py
+STEP_RECORD_PATH="" STEP_STATE_PATH=""
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy)$'
+trap 'remove_step_record; finish_tree_watch; finish_hold_wait; release_token' EXIT
+initialize_step_record
+route_test
+''')
+
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
         for name, value in (
@@ -212,7 +228,7 @@ try_reserved_target
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
 
     def test_policy_refusals_start_nothing(self) -> None:
-        result = self.verify("test", "sample", "--env", "SHOTS")
+        result, = self.parser_results([("test", "sample", "--env", "SHOTS")])
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stderr, 'verify.sh: --env and --fetch need --mac "<why>".\n')
         self.assertEqual(self.runner_events(), [])
@@ -295,7 +311,7 @@ try_reserved_target
 
     def test_eligibility_refuses_before_runner_and_records_decline(self) -> None:
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
-        result = self.verify("test", "sample", "--mac", "needs macOS")
+        result = self.routing_result()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
         self.assertEqual(self.runner_events(), [])
@@ -346,8 +362,8 @@ try_reserved_target
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        result = self.verify("test", "sample", "--mac", "why", extra={
-            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        result = self.routing_result()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(self.local_runs(), [])

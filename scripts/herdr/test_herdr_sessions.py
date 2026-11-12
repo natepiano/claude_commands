@@ -229,8 +229,8 @@ class HerdrSessionsTests(unittest.TestCase):
         _ = doc.write_text("fake production")
         record = read_session(self.records / f"{pid}.json")
         assert not isinstance(record, UnreadableSessionRecord)
-        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", doc))
-        _ = self.enterContext(patch.object(showrunners, "_session_name", return_value=record["name"]))
+        identity = record["sessionId"] if staff.snapshot().by_current_session(record["sessionId"]) is None else ""
+        owner = fixture_member("showrunner", name="fixture", doc=staff.LiveDoc("natedev", doc), runtime_id=identity)
         instance = self.state / f"showrunner-{owner.id}"
         instance.mkdir()
         _ = (instance / "conf").write_text(
@@ -251,8 +251,8 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("fix-rounds",))
         self.server(100, "agents")
         self.process(11, 100, ["zsh"], {"HERDR_PANE_ID": "wM:pM"})
-        self.claude(12, 11, "fix-rounds", pane="wM:pM")
-        _ = unit_membership("sdlc", "fix-rounds")
+        member = unit_membership("sdlc", "fix-rounds")
+        self.claude(12, 11, "fix-rounds", pane="wM:pM", marks={"CLAUDE_CODE_SESSION_ID": member.current_session})
         replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
         replies["--session agents pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
             {"pane_id": "wM:pR", "workspace_id": "wM", "label": "fix-rounds"}]}})}
@@ -299,6 +299,11 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
                                            ["--session", "agents", "pane", "list"],
                                            ["--session", "other", "pane", "list"]])
+
+        owner = staff.snapshot().by_current_session(fixture_runtime_id("pane-session-201"))
+        assert owner is not None
+        _ = staff.rename(owner.id, "renamed-showrunner")
+        self.assertIn("showrunner\tshowrunner\tdirector\n", self.call("list")[1])
 
     def test_partial_discovery_does_not_mislabel_an_unknown_showrunner_standalone(self) -> None:
         self.respond(["agents"], tabs=("unknown",))
@@ -358,6 +363,7 @@ class HerdrSessionsTests(unittest.TestCase):
         panes = [{"pane_id": f"w1:p{index}", "label": name, "workspace_id": "w1"}
                  for index, name in enumerate(("herdr", "shutdown", "style", "former-name", "terminal"), 1)]
         panes.append({"pane_id": "w2:p1", "label": "style", "workspace_id": "w2"})
+        panes.append({"pane_id": "w1:unowned", "label": "style", "workspace_id": "w1"})
         replies["--session agents pane list"] = {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0}
         replies["--session agents workspace list"] = {"stdout": json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "sdlc"}, {"workspace_id": "w2", "label": "natedev"}]}}), "code": 0}
@@ -367,7 +373,7 @@ class HerdrSessionsTests(unittest.TestCase):
             self.assertEqual(self.call("list"), (0,
                 "herdr\tunit sdlc/herdr\therdr\nshutdown\tunit sdlc/shutdown\tshutdown\n"
                 + "style\tunit sdlc/style\tstyle\nformer-name\tunit sdlc/models\tmodels\n"
-                + "terminal\tstandalone\t\nstyle\tstandalone\t\n", ""))
+                + "terminal\tstandalone\t\nstyle\tstandalone\t\nstyle\tstandalone\t\n", ""))
         read.assert_called_once_with()
 
     def test_partial_staff_marks_do_not_make_a_unit_role(self) -> None:
@@ -578,7 +584,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("target",))
         for owner, operation, arguments in (
                 (herdr, "live_sessions", ("list",)),
-                (herdr_sessions, "claude_names", ("list",)),
+                (herdr_sessions, "claude_sessions", ("list",)),
                 (herdr_sessions, "unit_roles", ("list",)),
                 (herdr_sessions, "registered_showrunners", ("list",)),
                 (os, "execvp", ("attach", "target"))):

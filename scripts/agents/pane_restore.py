@@ -35,8 +35,8 @@ def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
                   original: pane_record.PaneLaunch, entry: pane_record.PaneLaunch, *, reported_unknown: str) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr_types.HerdrFailure("the pane runs a program")
-    kind = pane_launch.agent_kind(entry)
-    home = pane_launch.config_home(entry)
+    kind = pane_launch.saved_kind(entry)
+    home = pane_launch.config_home(entry, record=staff.StaffSnapshot(()))
     if isinstance(home, staff.HomeUnknown):
         from scripts.agents import member_account
 
@@ -76,7 +76,7 @@ def restore(session: str, *, dry_run: bool) -> int:
     live: set[str] = set()
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
-        reference = saved["session_id"] if saved is not None else pane.session_id or ""
+        reference = saved.get("staff_id", saved["session_id"]) if saved is not None else pane.session_id or ""
         row = record.by_member_reference(reference)
         if row is None:
             if saved is None:
@@ -91,7 +91,7 @@ def restore(session: str, *, dry_run: bool) -> int:
             home = pane_launch.config_home(saved, record=record)
             if isinstance(home, staff.SessionHome):
                 target_accounts[holder.id] = (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(home.path), home.path)
-                    if pane_launch.agent_kind(saved) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home.path), home.path))
+                    if pane_launch.agent_kind(saved, record=record) == "codex" else accounts.NamedAccount(accounts.claude_config_label(home.path), home.path))
             else:
                 print(f"anomaly: {row.name}: session home is unknown; select the normal account", file=sys.stderr)
         if dry_run:
@@ -118,7 +118,7 @@ def restore(session: str, *, dry_run: bool) -> int:
             entry = names.resume(saved)
             entry["environment"] = names.environment(entry)
             label = entry["name"] or pane.label
-            observed = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+            observed = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry, record=record))
             if isinstance(observed, herdr.UnknownConversation):
                 herdr.conversation_note(observed)
             if isinstance(observed, herdr.LiveConversation) or entry["session_id"] in live:
@@ -132,7 +132,7 @@ def restore(session: str, *, dry_run: bool) -> int:
                 print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {account}")
                 continue
             with staff.row_operation(entry["session_id"]):
-                current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry))
+                current = herdr.read_conversation(entry["session_id"], pane_launch.agent_kind(entry, record=record))
                 if isinstance(current, herdr.LiveConversation):
                     print(f"{pane.pane_id} {label}: left as it is: it already runs")
                     continue

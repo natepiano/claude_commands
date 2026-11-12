@@ -6,18 +6,21 @@ from scripts.style.ledger_test_support import ticket_owner_id
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.style import coverage_report, style_config
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.style.ledger_test_support import write_style_units
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -69,17 +72,31 @@ class CoverageReportTests(unittest.TestCase):
     repo: Path = Path()
     rule_dir: Path = Path()
     tip: str = ""
+    repository_seed: ClassVar[Path]
+    repository_tip: ClassVar[str]
     sources: tuple[str, ...] = tuple(
         f"crates/{crate}/src/{name}.rs"
         for crate in ("alpha", "beta") for name in ("lib", "other")
     )
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.repository_seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        builder = cls(methodName="runTest")
+        builder.repo = cls.repository_seed
+        builder.build_repository()
+        cls.repository_tip = builder.tip
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style/rust"
-        self.repo.mkdir()
+        _ = shutil.copytree(self.repository_seed, self.repo, symlinks=True)
+        self.tip = self.repository_tip
+        _ = self.git("update-index", "--refresh")
         self.rule_dir.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
@@ -87,6 +104,11 @@ class CoverageReportTests(unittest.TestCase):
             "USER_ZONE": "America/New_York",
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("showrunner", name="report")
+
+    def build_repository(self) -> None:
+        self.repo.mkdir()
         _ = self.git("init", "-q", "--initial-branch=main")
         _ = self.git("config", "user.name", "Coverage report tests")
         _ = self.git("config", "user.email", "coverage@example.invalid")
@@ -97,8 +119,6 @@ class CoverageReportTests(unittest.TestCase):
         for source in self.sources:
             self.write(source, "pub fn value() -> u32 { 1 }\n")
         self.tip = self.commit("Create report workspace")
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = fixture_member("showrunner", name="report")
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(
@@ -132,11 +152,16 @@ class CoverageReportTests(unittest.TestCase):
                           input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).with_name("coverage_report.py")),
-             "--repo", str(self.repo), *arguments],
-            check=False, capture_output=True, text=True,
-        )
+        command = ["--repo", str(self.repo), *arguments]
+        if process_boundary_for_case(self):
+            result = subprocess.run(
+                [str(Path(__file__).resolve().parents[1] / "lib/py"),
+                 str(Path(__file__).with_name("coverage_report.py")), *command],
+                check=False, capture_output=True, text=True,
+            )
+        else:
+            result = invoke_cli(coverage_report, lambda: coverage_report.main(sys.argv[1:]),
+                                command, dict(os.environ), Path.cwd())
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -240,6 +265,7 @@ class CoverageReportTests(unittest.TestCase):
         self.assertEqual(rows["manifests"].current, "1 of 2 crates")
         self.assertEqual(rows["structure"].current, "1 of 4 files")
 
+    @process_boundary
     def test_rows_cover_each_counted_tier_and_held_and_waived_judgments_still_finish_a_rule(self) -> None:
         _ = self.rule("lint", "tier: A\nmechanism: clippy\n")
         listed = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")

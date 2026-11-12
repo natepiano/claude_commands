@@ -526,22 +526,24 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             "tmux": "",
         }
         _ = (directory / "renamed-session.json").write_text(json.dumps(record))
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId("renamed-session"))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def test_mac_release_after_session_rename_releases_own_block_and_keeps_others(self) -> None:
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "renamed-session"}):
-            for given in ([], ["--holder", "first-name"], ["--holder", "current-name"]):
+            for given in ([], ["--holder", "session:renamed-session"], ["--holder", "current-name"]):
                 with self.subTest(given=given):
                     self.session("first-name")
                     status, _, errors, calls = self.run_with_mac_stand_in(
                         ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks", "--target", "mac"]])
+                    self.assertEqual(calls, [["block", "--holder", "fixed", "--for", "renderer checks", "--target", "mac"]])
                     self.session("current-name", "first-name", "middle-name")
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"],
-                                             ["unblock", "--holder", "first-name", "--target", "mac"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
                     self.assertEqual(output, "Mac stand-in result\n")
                     self.assertEqual(errors, "Mac stand-in detail\n")
                     self.assertFalse((self.scratch / "stand-in-block-holder").exists())
@@ -553,7 +555,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
                     self.assertEqual(output, "blocked by someone-else\n")
                     self.assertEqual(errors, "")
                     self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
@@ -649,9 +651,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
             with self.subTest(by_id=by_id):
                 result = self.run_cli(folder, "release", "--holder", session_id if by_id else name)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse((folder / session_id).exists())
+                self.assertFalse((folder / ("fixed-" + session_id)).exists())
             # A failing subcase must not leave a hold in the next subcase's fixture.
-            (folder / session_id).unlink(missing_ok=True)
+            (folder / ("fixed-" + session_id)).unlink(missing_ok=True)
 
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"hold", "status", "audit"} else []
@@ -690,6 +692,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
         _ = (self.scratch / "sessions" / f"{session_id}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
+        member = staff.StaffRow(staff.StaffId("fixed-" + session_id), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId(session_id))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def hold(self, folder: Path, given: str | None) -> str:
         identity = build_hold.holder_of(given)
@@ -706,40 +711,45 @@ class CommandTests(PrivateReleaseBroadcastTest):
         _ = build_hold.release_cycle(folder, build_hold.held_key(folder, "new-name"))
         rows = recorded_hold_events(self.scratch / "buildlog", 2)
         self.assertEqual([(row["event"], row["hold_key"], row["holder"]) for row in rows],
-                         [("began", "id-1", "old-name"), ("ended", "id-1", "new-name")])
+                         [("began", "fixed-id-1", "old-name"), ("ended", "fixed-id-1", "new-name")])
 
     def test_a_hold_is_kept_by_session_id_so_a_rename_between_hold_and_release_loses_nothing(self) -> None:
         folder = self.scratch / "holders"
         self.session("id-1", "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
             self.assertIn("natedev is held for one test.", self.hold(folder, None))
-        self.assertEqual([path.name for path in folder.iterdir()], ["id-1"])
+        self.assertEqual([path.name for path in folder.iterdir()], ["fixed-id-1"])
         self.session("id-1", "new-name", "old-name")
         holders = build_hold.read_holders(folder)
         assert isinstance(holders, build_hold.ActiveHolders)
-        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "id-1")])
-        # The name it had when it took the hold still finds it, and so does no name at all.
+        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "fixed-id-1")])
+        # The native ID resolves the fixed member after the staff rename.
         with self.assertRaisesRegex(ValueError, "someone-else held nothing"):
             _ = build_hold.held_key(folder, "someone-else")
-        self.assertEqual(build_hold.held_key(folder, "old-name"), "id-1")
-        self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
+        self.assertEqual(build_hold.held_key(folder, "session:id-1"), "fixed-id-1")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "fixed-id-1")
+        with self.assertRaisesRegex(ValueError, "old-name held nothing"):
+            _ = build_hold.held_key(folder, "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
-            self.assertEqual(build_hold.held_key(folder, None), "id-1")
-        self.assertEqual(build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "id-1"))), "released, builds may resume.")
+            self.assertEqual(build_hold.held_key(folder, None), "fixed-id-1")
+        self.assertEqual(build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "fixed-id-1"))), "released, builds may resume.")
 
     def test_a_hold_taken_under_a_name_before_is_released_by_the_session_that_had_the_name(self) -> None:
         folder = self.scratch / "holders"
-        # No live session is called this yet, so the hold is kept under the name, as every hold once was.
+        # A holder outside staff keeps its explicit key.
         _ = self.hold(folder, "old-name")
         self.assertEqual([path.name for path in folder.iterdir()], ["old-name"])
         self.session("id-1", "new-name", "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
-            self.assertEqual(build_hold.held_key(folder, None), "old-name")
-        self.assertEqual(build_hold.held_key(folder, "new-name"), "old-name")
+            with self.assertRaisesRegex(ValueError, "new-name held nothing"):
+                _ = build_hold.held_key(folder, None)
+        with self.assertRaisesRegex(ValueError, "new-name held nothing"):
+            _ = build_hold.held_key(folder, "new-name")
+        self.assertEqual(build_hold.held_key(folder, "old-name"), "old-name")
         # With no name and no session, there is no holder to look up.
         refused = self.run_cli(folder, "hold", "--for", "one test")
         self.assertEqual(refused.returncode, 1)
-        self.assertIn("give --holder: this is not a live Claude session", refused.stderr)
+        self.assertIn("give --holder: this caller has no staff row", refused.stderr)
 
     def test_last_release_sets_aside_each_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
@@ -934,6 +944,21 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
 
     def test_idle_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
+        for variables, expected in (
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds")}, self.scratch / "custom-holds-release"),
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds"),
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": ".",
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": "."}, Path.cwd().with_name(Path.cwd().name + "-release")),
+            ({}, self.scratch / ".local/state/build-hold-release"),
+        ):
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in {"BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR"}}
+            environment.update(variables)
+            with self.subTest(variables=variables), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(build_hold.release_directory(), expected)
+                self.assertFalse(expected.exists())
         release = self.scratch / "release"
         self.assertFalse(release.exists())
         for arguments in (
@@ -1960,6 +1985,26 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
                     self.assertEqual(repeated.returncode, 0, repeated.stderr)
                     self.assertEqual(repeated.stdout.splitlines(), ["hold is already released."])
                     send.assert_not_called()
+
+        member = staff.StaffRow(staff.StaffId("fixed-release-holder"), "producer", "before-rename", staff.StaffRoot(),
+                                current_session=staff.StaffId("release-conversation"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            folder = self.scratch / "holders"
+            _ = build_hold.start_hold(folder, build_hold.holder_of(member.name), "rename recovery",
+                                      build_hold.NoReleaseEta(), self.now)
+            build_hold.record_recipients([("waiting", "rename-recipient")])
+            self.assertEqual(self.stop_release_after_unlink(member.name).returncode, 1)
+            intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
+            assert not isinstance(intent, build_hold.NoReleaseIntent)
+            self.assertEqual(intent["holder_key"], member.id)
+        member = staff.StaffRow(member.id, "producer", "after-rename", member.parent, current_session=member.current_session)
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
+            resumed = invoke_hold(["release", "--holder", member.name], dict(os.environ))
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual([call.args[0]["session_id"] for call in send.call_args_list], ["rename-recipient"])
+            self.assertTrue((build_hold.release_directory() / "receipts" / member.id / "completed-release.json").is_file())
 
     def test_finished_release_reruns_leave_files_and_notices_unchanged(self) -> None:
         self.begin()

@@ -219,6 +219,19 @@ class LedgerTests(CostFixture):
                                          instance_type='m7a.8xlarge', region='us-east-2')
         self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('daily_limit'))
 
+    def test_stale_absence_preserves_confirmed_termination_and_cost(self) -> None:
+        request = self.allowance_gate()
+        ended = ledger.GateTerminated(request.expires, 'i-allowance')
+        self.book.resolve_gate(request.attempt, ended)
+        before = self.book.read_snapshot().gate_reservations[0]
+        cost = gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60)
+        self.assertGreater(cost[0], Decimal(0))
+        self.book.resolve_gate(request.attempt, ledger.GateAbsent(request.expires + 60))
+        after = self.book.read_snapshot().gate_reservations[0]
+        self.assertEqual(after, before)
+        self.assertEqual(after.state, ended)
+        self.assertEqual(gate_trial.trial_cost(self.book, {request.attempt}, self.settings, request.expires + 60), cost)
+
     def test_bill_allowance_corrects_the_saved_estimate_once(self) -> None:
         request = self.allowance_gate()
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(

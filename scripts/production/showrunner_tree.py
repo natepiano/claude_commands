@@ -131,7 +131,7 @@ def check_attach(child: str, parent: str, *, record: staff.StaffSnapshot | None 
 
 @dataclass(frozen=True)
 class ReportedTo:
-    parent: str
+    parent: staff.StaffId
 
 
 @dataclass(frozen=True)
@@ -142,8 +142,8 @@ class Root:
 @dataclass(frozen=True)
 class WrapRelease:
     former_parent: ReportedTo | Root
-    former_children: tuple[str, ...]
-    told: tuple[str, ...]
+    former_children: tuple[staff.StaffId, ...]
+    told: tuple[staff.StaffId, ...]
 
 
 def stored_children(production_name: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
@@ -153,10 +153,12 @@ def stored_children(production_name: str, *, record: staff.StaffSnapshot | None 
 
 def edges_to_release(production_name: str, *, record: staff.StaffSnapshot | None = None) -> WrapRelease:
     """Capture recorded edges before wrap retires any row."""
+    record = staff.snapshot() if record is None else record
     tree = edges(record=record)
     parent = tree.get(production_name, "")
-    children = tuple(sorted(child for child, above in tree.items() if above == production_name))
-    return WrapRelease(ReportedTo(parent) if parent else Root(), children, ())
+    children = tuple(showrunners.owner_for(child, record).id
+                     for child in sorted(child for child, above in tree.items() if above == production_name))
+    return WrapRelease(ReportedTo(showrunners.owner_for(parent, record).id) if parent else Root(), children, ())
 
 
 def main(action: str, production_name: str) -> int:

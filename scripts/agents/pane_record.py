@@ -102,15 +102,7 @@ def resume_launch(entry: PaneLaunch) -> PaneLaunch:
     """Resolve a retained member reference to its current conversation for resume."""
     from scripts.production import staff
 
-    record = staff.initial_snapshot()
-    owner = record.by_member_reference(entry["session_id"])
-    current = entry.copy()
-    if owner is not None:
-        current["session_id"] = owner.current_session
-        unit = record.parent_of(owner) if owner.kind == "worker" else owner
-        if unit is not None and unit.kind == "unit" and not isinstance(unit.worktree, staff.WorktreeUnfilled):
-            current["cwd"] = str(unit.worktree.path)
-    return current
+    return pane_launch.current_launch(entry, staff.initial_snapshot())
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
@@ -126,7 +118,11 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
 
 def resume_arguments(entry: PaneLaunch) -> list[str]:
     """Build backend arguments from a launch with its current conversation id."""
-    if pane_launch.agent_kind(entry) == "codex":
+    return _resume_arguments(entry)
+
+
+def _resume_arguments(entry: PaneLaunch) -> list[str]:
+    if pane_launch.saved_kind(entry) == "codex":
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
             arguments.extend(("--model", entry["model"]))
@@ -161,7 +157,7 @@ def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
                 continue
             policy.extend((option, value))
         current["codex_policy"] = policy
-    arguments = resume_arguments(current)
+    arguments = _resume_arguments(current)
     if settings.kind == "claude":
         arguments.extend(("--effort", settings.effort))
     return arguments
@@ -178,8 +174,9 @@ def without_legacy_identity(entry: PaneLaunch) -> PaneLaunch:
     return current
 
 
-def save(session: str, entries: dict[str, PaneLaunch]) -> None:
-    pane_launch.save(record_path(session), {pane: without_legacy_identity(entry) for pane, entry in entries.items()})
+def save(session: str, entries: dict[str, PaneLaunch], *,
+         record: staff.StaffSnapshot | pane_launch.StaffSnapshotRead = pane_launch.StaffSnapshotRead.CURRENT) -> None:
+    pane_launch.save(record_path(session), {pane: without_legacy_identity(entry) for pane, entry in entries.items()}, record=record)
 
 
 def write(session: str, launch: PaneLaunch) -> None:

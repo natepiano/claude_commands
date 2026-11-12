@@ -14,7 +14,7 @@ from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, fixture_session, unit_membership
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.pane_launch import PaneLaunch
 
@@ -83,6 +83,7 @@ class StatusDiscoveryTests(StaffTestCase):
                                    {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
         launch["environment"] = {"CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(launch)).path),
                                  "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
+        fixture_session(fixture.unit.current_session, staff.CodexBackend(self.root / ".codex2"))
         names = LaunchNames(staff.snapshot())
         before = self.staff_state()
         self.assertEqual(names.environment(launch), {
@@ -111,6 +112,7 @@ class StatusDiscoveryTests(StaffTestCase):
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
             {}, ["claude", "--model", "sonnet"])
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
         with mock.patch.object(pane_record, "launches", return_value=[]):
             saved = labels.record_membership(entry)
             self.assertEqual(saved, entry)
@@ -288,7 +290,7 @@ class StatusDiscoveryTests(StaffTestCase):
         morty = fixture_runtime_id("retained-pane-morty")
         from scripts.message import codex_daemon
 
-        sessions = [codex_daemon.DaemonSession(morty, "morty", str(self.root), "idle")]
+        sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
 
         def configured_morty(identity: str) -> bool:
             return identity == morty

@@ -115,7 +115,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                   mock.patch.object(herdr.Herdr, "close_tab_confirmed", side_effect=close) as closed,
                   redirect_stderr(io.StringIO()) as errors):
                 state = worker_panes.observe(unit.id, before)[0]
-                self.assertIsInstance(state, worker_panes.ClosedWorker if stopped_director else worker_panes.StoppedWorker)
+                self.assertIsInstance(state, worker_panes.StoppedWorker)
                 self.assertTrue(promote_showrunner.stop(promotion))
                 if unresolved:
                     closed.assert_not_called()

@@ -355,10 +355,20 @@ def delivered_worker_results(runs: Path, worker: str, *, since: float) -> set[st
 
 def live_runs(runs: Path, worker: str) -> list[RunRecord]:
     """Return running records whose supervisor still owns the record."""
+    return _live_runs(runs, lambda raw: raw.get("worker") == worker)
+
+
+def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
+    """Read live records for fixed staff identities, including renamed members."""
+    return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
+
+
+def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> list[RunRecord]:
+    """Read each record once and check its owner and supervisor."""
     found: list[RunRecord] = []
     for path in sorted(runs.glob("*.json")):
         raw = worker_lifecycle.read_json_object(path)
-        if (raw.get("status") == "running" and raw.get("worker") == worker
+        if (raw.get("status") == "running" and owns(raw)
                 and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
     return found

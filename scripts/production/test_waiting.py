@@ -8,27 +8,32 @@ from scripts.direct import progress_history
 import fcntl
 import io
 import json
+import multiprocessing
 import os
 import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import TextIO, cast, final, override
+from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_group import send_process_group
 from scripts.production import add_unit
 from scripts.production import merge_checkpoint
 from scripts.production import production_doc, staff
@@ -94,6 +99,8 @@ def setUpModule() -> None:
 
 @final
 class WaitingTests(unittest.TestCase):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
     root: Path = Path()
     checkout: Path = Path()
     alpha: Path = Path()
@@ -108,21 +115,59 @@ class WaitingTests(unittest.TestCase):
     env: dict[str, str] = {}
     host_pids: dict[str, int] = {}
 
+    @classmethod
     @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        staff_environment: dict[str, str] = {}
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.fixture_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="waiting-"))) / "case"
+        cls.fixture_seed = cls.fixture_root.with_name("seed")
+        builder = cls()
+        builder.bind_fixture(cls.fixture_root)
+        builder.root.mkdir()
+        builder.env = {**os.environ, "HOME": str(builder.root / "home"),
+                       "XDG_CONFIG_HOME": str(builder.root / "config")}
+        builder.build_git_trees()
+        _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(cls.fixture_root)
+
+    def bind_fixture(self, root: Path) -> None:
+        self.root = root
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
         self.beta = self.root / "beta"
+        self.origin = self.root / "origin.git"
         self.doc = self.checkout / "docs/plans/example-production.md"
         self.log = self.checkout / "production.log"
         self.state = self.root / "state"
         self.board = self.root / "board.json"
         self.sends = self.root / "sends.jsonl"
-        self.state.mkdir()
         self.bin_path = self.root / "bin"
+
+    def build_git_trees(self) -> None:
+        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
+        _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
+        _ = self.git("config", "user.name", "Waiting Test")
+        _ = self.git("config", "user.email", "waiting@example.invalid")
+        _ = self.git("remote", "add", "origin", str(self.origin))
+        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
+        self.write(self.checkout / "README.md", "base\n")
+        self.write(self.checkout / "shared.txt", "base\n")
+        self.write_production_doc()
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-m", "initial production")
+        _ = self.git("push", "-u", "origin", "production")
+        _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
+        _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
+
+    @override
+    def setUp(self) -> None:
+        self.addCleanup(shutil.rmtree, self.fixture_root)
+        # Git's linked worktree paths must match the seed's original paths.
+        _ = shutil.copytree(self.fixture_seed, self.fixture_root, symlinks=True)
+        self.bind_fixture(self.fixture_root)
+        staff_environment: dict[str, str] = {}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
+        self.state.mkdir()
         self.bin_path.mkdir()
         berth = self.bin_path / "cargo-berth"
         _ = berth.write_text(BERTH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
@@ -167,25 +212,12 @@ class WaitingTests(unittest.TestCase):
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
         _ = self.enterContext(production_paths(self.env))
         self.board_ready()
-        self.origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
-        _ = self.git("config", "user.name", "Waiting Test")
-        _ = self.git("config", "user.email", "waiting@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
-        self.write(self.checkout / "Cargo.toml", "[workspace]\n")
-        self.write(self.checkout / "README.md", "base\n")
-        self.write(self.checkout / "shared.txt", "base\n")
         self.production_doc()
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "initial production")
-        _ = self.git("push", "-u", "origin", "production")
-        _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
-        _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         ensure_excluded(self.checkout, "/.unit.toml")
-        for folder, plan in ((self.alpha, "alpha"), (self.beta, "beta")):
-            write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
         self.write(self.log, "# Production log — example\n\n### STATE\n")
+        # Copied indexes must record the new file metadata.
+        for checkout in (self.checkout, self.alpha, self.beta):
+            _ = self.git("update-index", "--refresh", cwd=checkout)
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +285,7 @@ class WaitingTests(unittest.TestCase):
             "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
 
-    def production_doc(self) -> None:
+    def write_production_doc(self) -> None:
         self.write(self.doc, "\n".join((
             "# Production — example", "", "> **Status: PRODUCTION — running.** Example.",
             "", "## Production Context", "", "- **Merge branch:** `production`",
@@ -263,6 +295,8 @@ class WaitingTests(unittest.TestCase):
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
+    def production_doc(self) -> None:
+        self.write_production_doc()
         owner = showrunner_relationship("showrunner-example")
         _ = staff.set_doc(owner.id, staff.LiveDoc(local_machine(), self.doc))
         _ = write_timer(self.root / "notifier", owner.name, owner.id, "", self.doc)
@@ -603,17 +637,63 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(next_phase.returncode, 0, next_phase.stdout + next_phase.stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", next_phase.stdout)
 
-    def eta_request_process(self, phase: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [sys.executable, str(SCRIPT), "eta-request", ALPHA, "--phase", phase,
-             "--production", "showrunner-example", "--state-dir", str(self.state)],
-            cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+    def eta_request_processes(self, phases: list[str]) -> list[subprocess.CompletedProcess[str]]:
+        context = multiprocessing.get_context("fork")
+        ready = context.Barrier(len(phases) + 1)
+        processes: list[BaseProcess] = []
+        outputs: list[tuple[TextIO, TextIO]] = []
+
+        def request(phase: str, stdout: TextIO, stderr: TextIO) -> None:
+            os.setpgid(0, 0)
+            try:
+                _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                result = self.run_waiting("eta-request", ALPHA, "--phase", phase,
+                                          "--state-dir", str(self.state))
+            except BaseException:
+                traceback.print_exc(file=stderr)
+                stderr.flush()
+                raise
+            _ = stdout.write(result.stdout)
+            _ = stderr.write(result.stderr)
+            stdout.flush()
+            stderr.flush()
+            raise SystemExit(result.returncode)
+
+        with ExitStack() as files:
+            try:
+                for phase in phases:
+                    stdout = files.enter_context(tempfile.TemporaryFile(mode="w+"))
+                    stderr = files.enter_context(tempfile.TemporaryFile(mode="w+"))
+                    process = context.Process(target=request, args=(phase, stdout, stderr))
+                    process.start()
+                    processes.append(process)
+                    outputs.append((stdout, stderr))
+                _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+                results: list[subprocess.CompletedProcess[str]] = []
+                for phase, process, (stdout, stderr) in zip(phases, processes, outputs):
+                    process.join(timeout=TEST_HANG_GUARD_SECS)
+                    status = process.exitcode
+                    if status is None:
+                        raise TimeoutError("The ETA request process did not finish.")
+                    _ = stdout.seek(0)
+                    _ = stderr.seek(0)
+                    results.append(subprocess.CompletedProcess(
+                        [str(SCRIPT), "eta-request", ALPHA, "--phase", phase],
+                        status, stdout.read(), stderr.read()))
+                return results
+            finally:
+                for process in processes:
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.join(timeout=TEST_HANG_GUARD_SECS)
+                    process.close()
 
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
-        processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
+        processes = self.eta_request_processes(phases)
+        outputs = [(process.stdout, process.stderr) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -621,8 +701,8 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertFalse([path for path in self.state.iterdir() if path.suffix == ".tmp"])
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
-        processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
+        processes = self.eta_request_processes([PHASE for _ in range(12)])
+        outputs = [(process.stdout, process.stderr) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")

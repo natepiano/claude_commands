@@ -21,7 +21,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from threading import Event, Lock
@@ -120,39 +120,31 @@ def _producer_folder(name: str) -> Path:
 
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
-                           client: herdr.Herdr, *, lost_pane: str = "") -> PendingProducerAdmission:
+                           client: herdr.Herdr) -> PendingProducerAdmission:
     from scripts.lib import nix_env
     from scripts.whoami.account import named_account_environment
 
     workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
-    entries = pane_record.read_strict(client.session)
-    source = entries.get(lost_pane)
-    pending_identities = ({source["session_id"], pane_record.resume_launch(source)["session_id"]}
-                          if source is not None else set[str]())
-    shells = [row for row in client.panes() if row["pane_id"] != lost_pane
-              and (row["pane_id"] not in entries or entries[row["pane_id"]]["session_id"] in pending_identities)
-              and (not row["session_id"] or row["session_id"] in pending_identities)
-              and client.producer_pane(row["pane_id"], request.name, workspace)]
-    if len(shells) > 1:
-        raise ValueError("producer has several matching shells; retain them for inspection")
-    if shells:
-        row = shells[0]
-    else:
-        environment = named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
-        prepared = herdr.prepare_agent_environment(str(request.folder), environment)
-        if isinstance(prepared, nix_env.Refused):
-            raise OSError(str(prepared))
-        pane = client.open_tab(workspace, request.name, str(request.folder), prepared.env)
-        row = client.pane_row(pane)
-        if isinstance(row, herdr.NoPane):
-            raise ValueError("reserved producer pane is unavailable")
+    environment = named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
+    prepared = herdr.prepare_agent_environment(str(request.folder), environment)
+    if isinstance(prepared, nix_env.Refused):
+        raise OSError(str(prepared))
+    pane = client.open_tab(workspace, request.name, str(request.folder), prepared.env)
+    row = client.pane_row(pane)
+    if isinstance(row, herdr.NoPane):
+        raise ValueError("reserved producer pane is unavailable")
     return PendingProducerAdmission(row["pane_id"], herdr.json_text(row.get("terminal_id"), "producer terminal"), kind, home)
 
 
-def _save_producer_reservation(request: ProducerFirstStart, pending: PendingProducerAdmission) -> None:
-    write_text_atomic(_producer_admission_path(request.name), json.dumps({
-        "pane": pending.pane, "terminal": pending.terminal, "kind": pending.kind,
-        "home": str(pending.home), "folder": str(request.folder)}))
+def _save_producer_reservation(request: ProducerFirstStart, pending: PendingProducerAdmission,
+                               client: herdr.Herdr) -> None:
+    try:
+        write_text_atomic(_producer_admission_path(request.name), json.dumps({
+            "pane": pending.pane, "terminal": pending.terminal, "kind": pending.kind,
+            "home": str(pending.home), "folder": str(request.folder)}))
+    except OSError:
+        _ = client.close_tab_confirmed(pending.pane, terminal=pending.terminal)
+        raise
 
 
 def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
@@ -179,28 +171,21 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
         except (OSError, ValueError, herdr_types.HerdrFailure):
             pass
         conflicts.append((identity, pane["pane_id"]))
+    membership = staff.initial_snapshot()
+    member = next((row for row in membership.find(kind="producer") if row.name == name), None)
     named: list[tuple[str, tuple[int, ...]]] = [
-        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions() if row["name"] == name]
-    homes = {agent_accounts.codex_home(), *(owner.home for owner in codex_daemon.daemons(os.environ))}
-    threads: set[str] = set()
-    for home in sorted(homes):
-        try:
-            lines = (home / "session_index.jsonl").read_text().splitlines()
-        except FileNotFoundError:
-            continue
-        for line in lines:
-            if not line.strip():
-                continue
-            entry = herdr.json_object(cast(object, json.loads(line)), "producer thread index")
-            if entry.get("thread_name") == name:
-                threads.add(herdr.json_text(entry.get("id"), "producer thread id"))
-    if threads:
+        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions()
+        if member is not None and row["sessionId"] == member.current_session]
+    if member is not None:
         codex = herdr.codex_conversations()
-        named.extend((identity, codex.live[identity]) for identity in threads if identity in codex.live)
+        if member.current_session in codex.live:
+            named.append((member.current_session, codex.live[member.current_session]))
     for daemon in codex_daemon.read_daemons(os.environ):
         if isinstance(daemon.sessions, codex_daemon.DaemonUnreadable):
             raise ValueError(f"producer thread registry is unreadable: {daemon.sessions.reason}")
-        named.extend((row.thread_id, ()) for row in daemon.sessions if row.name == name)
+        named.extend((row.thread_id, ()) for row in daemon.sessions
+                     if (member := membership.by_current_session(row.thread_id)) is not None
+                     and member.kind == "producer" and member.name == name)
     for identity, pids in named:
         places = [pane["pane_id"] for pane in panes if pane["session_id"] == identity]
         if not places:
@@ -275,6 +260,9 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
         key = "CLAUDE_CONFIG_DIR" if observed.kind == "claude" else "CODEX_HOME"
         entry["config_dir"] = native.environment.get(key) or str(Path.home() / (".claude" if observed.kind == "claude" else ".codex"))
         entry.update(pid=pid, proc_start=native.started)
+        place = herdr.herdr_place_of(pid)
+        if isinstance(place, herdr.HerdrPlace):
+            herdr.forget_pane_evidence(place.session, place.pane)
         if herdr.native_process(pid, observed.kind) != native:
             raise ValueError("producer process changed before adoption")
         return entry
@@ -308,9 +296,10 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
             worktree=staff.PresentWorktree(remote.local_machine(), folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
         if entry["pane_id"]:
-            expectation = pane_launch.ProducerStartExpectation(row.id, native, kind, folder, home.path)
-            with pane_launch.producer_start(pane_record.record_directory(), expectation):
+            expectation = pane_launch.ProducerLaunchRequest(row.id, native, kind, folder, home.path)
+            with pane_launch.producer_launch_request(expectation):
                 row = pane_launch.staff_admitted(row)
+            client.remember_row_tab(str(row.id), entry["pane_id"])
         else:
             row = staff.set_home(row.id, home)
         _producer_admission_path(request.name).unlink(missing_ok=True)
@@ -370,14 +359,14 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
             selected = member_account.producer_account(kind, to=to)
             home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
             pending = _reserve_producer_pane(request, kind, home, client)
-            _save_producer_reservation(request, pending)
+            _save_producer_reservation(request, pending, client)
         pane_row = client.pane_row(pending.pane)
         if isinstance(pane_row, herdr.NoPane) or pane_row.get("terminal_id") != pending.terminal:
             lost = pending
             retained = pane_record.read_strict(client.session).get(lost.pane)
             if retained is not None and not isinstance(herdr.read_conversation(retained["session_id"], kind), herdr.StoppedConversation):
                 raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
-            pending = _reserve_producer_pane(request, kind, lost.home, client, lost_pane=lost.pane)
+            pending = _reserve_producer_pane(request, kind, lost.home, client)
             if retained is not None:
                 replacement = retained.copy()
                 replacement["pane_id"] = pending.pane
@@ -391,7 +380,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
                         raise ValueError("replacement producer pane holds another conversation; retain its launch record")
                     entries[pending.pane] = replacement
                     pane_launch.save(pane_record.record_path(client.session), entries)
-            _save_producer_reservation(request, pending)
+            _save_producer_reservation(request, pending, client)
             if retained is not None:
                 pane_launch.retire_launch(pane_record.record_path(client.session), lost.pane, retained)
         if isinstance(client.pane_activity(pending.pane), herdr.PaneAtShell):
@@ -425,12 +414,13 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "") -> Resu
         row = staff.ensure("producer", name=request.name, runtime_id=identity,
             worktree=staff.PresentWorktree(remote.local_machine(), request.folder),
             doc=staff.LiveDoc(remote.local_machine(), request.folder))
-        expectation = pane_launch.ProducerStartExpectation(row.id, identity, kind, request.folder, pending.home)
-        with pane_launch.producer_start(pane_record.record_directory(), expectation):
+        expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
+        with pane_launch.producer_launch_request(expectation):
             row = pane_launch.staff_admitted(row)
         publication = pane_record.read_strict(client.session).get(pending.pane)
         if publication is None or not publication.get("producer_binding", False):
             raise ValueError("producer admission needs pane publication; retain its native conversation")
+        client.remember_row_tab(str(row.id), pending.pane)
         path.unlink(missing_ok=True)
         label = (accounts.claude_config_label(pending.home) if kind == "claude"
                  else agent_accounts.codex_home_role_label(pending.home))
@@ -471,7 +461,8 @@ def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_N
     for pane in client.panes():
         identity = pane["session_id"]
         entry = entries.get(pane["pane_id"])
-        owner = membership.by_member_reference(entry["session_id"]) if entry is not None else None
+        reference = pane_launch.launch_reference(entry, membership) if entry is not None else pane_launch.NativeLaunchReference("")
+        owner = membership.rows_by_id[reference.id] if isinstance(reference, pane_launch.StaffLaunchReference) else None
         saved_identity = owner.current_session if owner is not None else entry["session_id"] if entry is not None else ""
         label = pane.get("label") or ""
         producer = owner or membership.by_current_session(identity or "")
@@ -797,7 +788,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         client = herdr.Herdr(herdr.shared_session())
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
         with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-            futures = [(item, pool.submit(restart.stop_row, item.row, client,
+            futures = [(item, pool.submit(copy_context().run, restart.stop_row, item.row, client,
                 deadline=deadline, **shared)) for item in live]
             for item, future in futures:
                 if not future.result():
@@ -835,7 +826,7 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_record.PaneLaunch) -> t
 
 def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
     """Use the selected launch environment, retained home, or normal account."""
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     directory = entry["environment"].get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR", "")
     home = staff.SessionHome(Path(directory)) if directory else pane_launch.config_home(entry)
     if isinstance(home, staff.HomeUnknown):
@@ -848,7 +839,7 @@ def _launch_home(entry: pane_record.PaneLaunch) -> staff.SessionHome:
 def _pane_command(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str) -> list[str]:
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     if kind == "claude":
         home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
         herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
@@ -869,7 +860,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_record.PaneLaunch,
 
     from scripts.lib.agent_program import resolve_program
 
-    kind = pane_launch.agent_kind(entry)
+    kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
     unset, pane_environment = _pane_environment(tab, entry)
     environment.update(pane_environment)
@@ -1186,7 +1177,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = recovered
         if entry is not None:
             entry = names.resume(entry)
-        kind = pane_launch.agent_kind(entry) if entry is not None else "claude"
+        kind = pane_launch.saved_kind(entry) if entry is not None else (
+            pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
             kind = restart.producer_launch(row)[0]
@@ -1229,6 +1221,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             target_dir, label = selected.dir, selected.label
             account_environment = named_account_environment(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
+        if row is not None and row.kind == "producer":
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            entry["environment"] = expectation.environment(entry["environment"])
         if row is None:
             entry["config_dir"] = str(target_dir)
             previous_home = pane_launch.config_home(original.entry, record=names.tab_record) if original is not None else staff.HomeUnknown()
@@ -1243,8 +1238,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 isinstance(tab, herdr.TabSession) and os.environ.get("HERDR_SESSION") == client.session
                 and os.environ.get("HERDR_PANE_ID") == tab.pane_id):
             space = herdr.row_workspace(row, names.tab_record, row.name)
-            if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, row.name, space):
-                destination = client.producer_row_tab(str(row.id), row.name, space)
+            if isinstance(tab, SessionNotFound) or not client.producer_pane(tab.pane_id, str(row.id), space, record=names.tab_record):
+                destination = client.producer_row_tab(str(row.id), row.name, space, record=names.tab_record)
                 tab = (herdr.TabSession(destination.pane, row.name, "", identity)
                        if isinstance(destination, herdr.ExistingPane) else SessionNotFound(identity))
         if isinstance(tab, SessionNotFound):
@@ -1291,8 +1286,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                                          row is None or row.kind != "worker" or isinstance(own, BusyPass) or detached) else ""
         completed = entry
         if row is not None and row.kind == "producer":
-            expectation = pane_launch.ProducerStartExpectation(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
-            start_scope.enter_context(pane_launch.producer_start(pane_record.record_directory(), expectation))
+            expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
+            start_scope.enter_context(pane_launch.producer_launch_request(expectation))
             completed = expectation.expected_launch(entry)
         if os.environ.get("HERDR_PANE_ID") == tab.pane_id:
             if row is None:
@@ -1644,7 +1639,8 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
             row = membership.by_member_reference(session) or next((row for row in membership.rows if row.name == session), None)
             identity = row.current_session if row is not None else session
             publication = pane_record.publication_for_session(identity, record=membership)
-            kind = pane_launch.agent_kind(publication.entry) if publication is not None else "claude"
+            kind = pane_launch.agent_kind(publication.entry, record=membership) if publication is not None else (
+                pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
             if row is not None and row.kind == "producer":
                 restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
                 kind = restart.producer_launch(row)[0]

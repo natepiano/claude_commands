@@ -150,7 +150,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
-| `scripts/build_hold/build_hold.py` | read | local_snapshot, OpenRun; finds the run owner's current_session |
+| `scripts/build_hold/build_hold.py` | read | local_snapshot, snapshot, initial_snapshot, by_id, by_member_reference, OpenRun; holder keys are fixed staff ids, and the current name, session and message address come from the row |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
@@ -197,9 +197,11 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
+| `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
 | `scripts/message/morty_identity.py` | read | native_id |
+| `scripts/message/postmaster.py` | read | snapshot, StaffSnapshot, by_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
 | `scripts/message/roster.py` | read | initial_snapshot, runtime_id |
@@ -248,7 +250,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |
 | `scripts/production/showrunner_tree.py` | read | active, snapshot |
-| `scripts/production/showrunners.py` | read | initial_snapshot, runtime_id |
+| `scripts/production/showrunners.py` | read | initial_snapshot, runtime_id, snapshot |
 | `scripts/production/staff.py` | owner | staff.json (owner) |
 | `scripts/production/staff_move.py` | write | cli_result, main, move, operation, snapshot |
 | `scripts/production/staff_sources.py` | write | active, apply_seed, cli_result, ensure, initial_snapshot, native_id, operation, set_doc, snapshot |
@@ -262,7 +264,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/unit_config.py` | read | snapshot |
 | `scripts/production/unit_config_test_support.py` | read | staff.json path |
 | `scripts/production/unit_lookup.py` | read | snapshot |
-| `scripts/production/unit_move.py` | write | folder_move_path, native_id, set_worktree, snapshot |
+| `scripts/production/unit_move.py` | write | native_id, row_operation, set_worktree, snapshot |
 | `scripts/production/unit_phases.py` | read | snapshot |
 | `scripts/production/unit_queue.py` | read | local_snapshot, by_current_session, caller_identity, StaffId |
 | `scripts/production/unit_run.py` | read | snapshot |
@@ -307,10 +309,12 @@ The shared pane launch builder uses `set_home`.
 | `scripts/usage/transcript_retention.py` | read | local_snapshot |
 | `scripts/usage/usage_report.py` | read | snapshot |
 | `scripts/usage/waste_watch.py` | read | snapshot |
+| `scripts/whoami/five_hour.py` | read | snapshot |
+| `scripts/whoami/quota_alert.py` | read | snapshot; send.staff_named |
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-183 accessor rows: 40 write, 142 read, 1 owner.
+186 accessor rows: 39 write, 146 read, 1 owner.
 
 ## Approved copies
 
@@ -323,3 +327,20 @@ No other copy of the staff facts is allowed without the user's approval. Remake 
 `Herdr.codex_client_session` reads the current thread for a bare Codex pane from its tab's staff row.
 Both `Herdr._codex_launch` and `pane_record.seed` use this method.
 `pane_record.py` still reads staff for saved launch references and resume operations.
+
+A removed worktree retains its branch in `rows[].worktree.branch`.
+`staff.RemovedWorktree.branch` uses `ParkedBranch` or `BranchUnrecorded`.
+The lifecycle writers retain the branch before they remove its last Git evidence.
+Parked configuration files retain only the retirement date and session.
+Folder moves use the staff row lock.
+Git stores the move lock at `<git-common-dir>/worktrees/<worktree-id>/locked`.
+`unit_move._lock_move` writes `staff:<unit-id>` through `git worktree lock`.
+`unit_move.move_locked` and `_recoverable_folder` read this fixed identity.
+The file contains no folder, branch, destination, or requested name.
+`_unlock_move` removes the lock after staff records the destination.
+Recovery also checks the owner's Git repository before it adopts a destination.
+After an interruption, staff can still name the absent source.
+Several worktrees can share one Git repository.
+Staff, disk, and the ordinary Git registration cannot then prove which unit owns the destination.
+The native lock supplies this identity without a move journal.
+`staff.folder_move_path` and the folder move journal are removed.

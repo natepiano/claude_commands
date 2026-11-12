@@ -29,7 +29,7 @@ from scripts.hooks import showrunner_footer
 
 
 class RegistrationTests(RegistrationFixture):
-    def test_unreadable_timer_reports_and_keeps_generated_prompts_unchanged(self) -> None:
+    def test_unreadable_timer_reports_without_rewriting_a_legacy_prompt(self) -> None:
         timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
@@ -57,6 +57,9 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
+        self.assertEqual(updates[updates.index("--prompt") + 1], "scheduled")
+        self.assertNotIn("--prompt-file", updates)
+        self.assertFalse((self.state / "showrunner" / self.owner_id / "prompt.txt").exists())
         self.assertIn("automatic reports are off", first.stdout)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
@@ -152,9 +155,16 @@ class RegistrationTests(RegistrationFixture):
                               encoding="utf-8")
         result = self.run_command("register")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("register: warn", result.stdout)
-        self.assertIn("production example has showrunner other", result.stdout)
-        self.assertIn("/agents rename example other", result.stdout)
+        self.assertNotIn("register: warn", result.stdout)
+        self.assertNotIn("production example has showrunner other", result.stdout)
+        self.assertNotIn("/agents rename example other", result.stdout)
+        with mock.patch.dict(os.environ, self.env):
+            _ = staff.rename(staff.StaffId(self.owner_id), "renamed-example")
+        renamed = self.run_command("register")
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertNotIn("register: warn", renamed.stdout)
+        updates = [call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.owner_id}"]]
+        self.assertEqual([call[call.index("--to") + 1] for call in updates], [f"session:{self.owner_id}"] * 2)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
 

@@ -58,6 +58,8 @@ State:
   Unit records identify each phase checkpoint. Commit subjects supply no state.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<staff id>`, where `<staff id>` is the showrunner row id.
+- The stopped timer conf carries `PROMPT=scheduled`.
+  Prompt delivery reads the owner's current staff row.
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit staff id>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
@@ -436,12 +438,30 @@ At the start and on every resume, register this session:
 --production <showrunner name>`
 
 Registration retains a stopped `showrunner-<staff id>` timer for discovery and session ownership.
+The timer targets `session:<staff id>` and stores `PROMPT=scheduled`.
+Registration creates no prompt file.
 It sends no automatic report and ignores the production document's old Updates interval.
 Registration creates stall-watch only when absent.
 `CLAUDE_CODE_SESSION_ID` must be set.
 The staff name must match the session name.
 Registration warns about a mismatch and continues after an account move.
 Use `/showrunner:units` when the user requests status.
+
+`update_registration.py prompt --owner <staff id>` builds the prompt at delivery.
+It reads the owner's current name and production document through staff.
+It changes no registration or scratchpad state.
+The stopped timer sends no automatic report.
+
+The prompt:
+
+> Scheduled update (every <N> minutes; the user is in <zone>).
+> Use your scratchpad path for `<SCRATCH>` in this command.
+> Run `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <zone> --production <showrunner name> > <SCRATCH>/unit_status.txt`.
+> Run `/showrunner:units` for <showrunner name>.
+
+**A tick** starts with `Scheduled update`.
+Treat the text as the update prompt.
+Do not reply to the timer.
 
 **Compact after a checkpoint.** At most once per phase: on the first status check after a unit director checkpoints a phase, read its context size from its pane
 footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
@@ -469,6 +489,7 @@ Turns come from unit directors' messages and the user. Handle each message:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
+| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |

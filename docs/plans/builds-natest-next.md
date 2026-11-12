@@ -4,6 +4,10 @@ The phase backlog of natest-unit. Phases 117–119 are complete. Apply item 6a t
 
 ## Order
 
+0. Top priority (user via builds, 2026-11-11, item 80): make the slow `verify.sh` tests quicker, inside natest only. Keep every check and the keep-coverage rule. No test removal is approved. verify owns the files: get verify's go for each edit. Work the slowest verify module first: `direct/test_verify_wait_holder.py` (67.9 CPU s, 26 slow tests start the full script), then `test_verify_mac_only.py` (41.7), `test_verify_ssh_targets_routing.py` (39.9), `test_verify_token_renew.py` (31.2), `test_verify_result_environment.py` (30.1) and `test_verify_routing_rule.py` (29.4). Phase 179 measured 496 full-script launches in 338 of the 414 slow verify tests; at least 32 tests need the real process path. For each module: profile with `module_cost.py --tests 10 --commands 10`, map each assertion to the code it proves, call the real functions through `shell_test_support.shell_functions` where the decision lives in a function, and keep full-entry tests for dispatch and argument wiring. Keep a full-entry test when its decision exists only in the dispatch branch. Route a missing callable boundary to verify-unit; do not copy that decision into the fixture. Shared harness pilot (architect after Phase 179): `test_verify_doc.py`, `test_verify_doc_records.py` and `test_verify_doc_checkout.py` (8 tests, 11 full-script launches, 18.879 CPU s in the reference gate) share `verify_doc_test_support.py:203`; use the real functions at `verify.sh:1947,1958,1967` and `lint/invoke.sh:781`. The estimated saving range is 0-18.879 CPU s; it is a gross ceiling. Compare unchanged test counts in aws pairs. Keep the Phase 179 fast-only estimate as a workload model; do not select tests for removal by duration. A smaller merge gate is not approved; it waits for the item 82 selector replay. Shared fixed-reply installer (architect after Phase 183): Phases 181 and 183 saved only 1.37 s and 0.71 s in aws pairs, because the full entries verify named hold most of the cost. Routing-script consolidation (`start_pinned_route()`, `routing_result()`) gets no speed credit without paired measurements. Trial one shared installer for cheap fixed Cargo replies in the full-entry fixtures. Start at `verify_mac_offload_test_support.py:306`, which starts Python for fixed replies and observed commands. Share it with `verify_token_wait_test_support.py`, `verify_hold_wait_test_support.py` and `verify_ssh_targets_test_support.py`. Use shell replies only where a fixture needs fixed output. Keep the Python path for signals, PID publication, edits, custom observers and dynamic event records. Keep argument checks, output, status, event contents, token observations and every full entry. Keep the shell `RUSTC_STUB` and token metadata path. Get verify's go and run every affected importer. Phase 177 measures 1,141 Python Cargo tasks at 25.261 local CPU s across 47 modules; 0–25.261 CPU s is a gross ceiling, not an aws forecast.
+0a. Approved (user, 2026-11-11): one read-only `coverage_overlap.py` collection across `scripts/direct` (estimate 52 serial minutes, 2,545 CPU s). Report candidates and unknown coverage apart. Candidates are not removal approvals. No test removal or coverage reduction is approved.
+Phase 180 found 0 known of 1,558 tests because of a collector lifetime defect; Phase 184 repairs only that cause (architect after Phase 183). An earlier launch marks a later test unknown only with evidence that the child was alive; a launch with no exit evidence stays unknown. The repeat report keeps launch ids, owners, programs and lifetime evidence, compares matching test ids for unknown-to-known changes, and recounts every remaining cause. A separate research phase takes the Bash, Cargo, wrapper, ps, fork, thread and missing-report causes. Tell real leaf binaries from wrappers before a change to `COVERAGE_LEAF_PROGRAMS`. Unsupported tests stay unknown and are never removal candidates.
+
 Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed phases confirm their targets at dispatch.
 
 1. Phases 65, 64, 66, 55, 63, 70 and 71 are complete, and they form one tip.
@@ -12,7 +16,124 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 4. Phase 63 is complete. Phase 70 reports the token order hang; its cause stays open. Read the call output and queue files at its next recurrence.
 5. Phase 72 complete; the lifecycle writer and the first admission stack stay unproved. Phase 73 makes no code change: verify-unit owns the surviving token-renewal delay, and the Mac case needs no edit because queue lacked Phase 63's marker wait.
 6. Further `test_verify*` batches follow CPU rank. Measure with `module_cost.py --tests 10 --commands 10` before direct moves. Queue Phases 30-31 and verify Phase 41w are merged. The 2026-11-09 remeasure shows that the real `build_targets.py` commands in the SSH and wait-holder modules run through `verify.sh`, so their import hold stays. Hold routing decisions without a narrow function for verify's function change. These include Mac retry, fallback, queue-age and handoff cases. Profile doc, lint-scope and existing token-renewal function cases now. Their fixtures and function boundaries differ from the SSH fixtures. Include admission, setup and cleanup CPU. Give each shared fixture one owner. Each batch has one phase and one bumped checkpoint. Use `docs/plans/natedev-verify-test-cost.md` for the file list.
-6a. Pick each speed phase by the CPU a test change can remove (showrunner, 2026-11-09). Refresh the CPU rank. Compare the highest eligible module with shared test command chains before selecting a phase. Attribute the measured 268 CPU s of fixture and stub `python -c` calls to their callers. Profile the leading candidates with `module_cost.py --tests 10 --commands 10`, and identify removable CPU while retaining required process boundaries. Select the largest measured removable cost. Open a phase only for a measured removable cost. Link modules with the same production limit to one owner proposal, and send each production-limit proposal to the showrunner for routing. Keep each module's behavior map and verification separate. Revisit a floor after its owner change lands. No CPU limit holds the plan. The mission is to take the next longest test each time. A module at its floor gets a Floors row or an owner proposal, and the next module follows. The item 11 Rule 2 sweep runs beside speed work; it does not wait for speed work to end.
+6a. Pick each speed phase by the CPU a test change can remove (showrunner, 2026-11-09). Refresh the CPU rank. Compare the highest eligible module with shared test command chains before selecting a phase. Attribute the measured 268 CPU s of fixture and stub `python -c` calls to their callers. Profile the leading candidates with `module_cost.py --tests 10 --commands 10`, and identify removable CPU while retaining required process boundaries. Rank work by estimated gate seconds saved per total work hour, including implementation, review and acceptance measurement; keep confidence and ownership beside each estimate (user item 80, 2026-11-11). Item 0 comes first. Open a phase only for a measured removable cost. Link modules with the same production limit to one owner proposal, and send each production-limit proposal to the showrunner for routing. Keep each module's behavior map and verification separate. Revisit a floor after its owner change lands. No CPU limit holds the plan. The mission is to take the next longest test each time. A module at its floor gets a Floors row or an owner proposal, and the next module follows. The item 11 Rule 2 sweep runs beside speed work; it does not wait for speed work to end.
+
+Remaining Phase 177 shared-cost proposals (architect after Phase 178). The order ranks gross budgets, not proven removable work: Phase 177 expanded every command by 1.645391 from an expensive-module sample. Screen in this order, behind item 0:
+
+| Candidate | Gross ceiling, CPU s per work hour | Owner |
+| --- | ---: | --- |
+| Target metadata reads | 18.69 | verify-unit; coordinate builds target owners |
+| Git metadata queries | 15.58 | copies-unit and style-unit |
+| Model resolution | 13.86 | models owner; coordinate sdlc and devtools callers |
+| Admission client reuse | 10.95 | queue-unit and verify-unit |
+
+1. Measure repeated operations within one caller before you select implementation work.
+2. Estimate unsampled work from caller counts or a weighted sample within each caller family.
+3. Divide confirmed removable CPU by all implementation, review and acceptance hours. CPU divided by 32 is a capacity estimate, not a measured gate-time reduction.
+4. Subtract overlap with Phases 181–183 before you rank another proposal.
+5. Model resolution: `models_config.sh:64,105` already shares an operation table; keep `assign.py:418` launch configuration and registry publication.
+6. Admission reuse: `memory_gate.sh:156` already uses one client per wait; keep owner PID, signals, launch and release.
+
+Phase 185 (lighter recorder import) replaces the dropped Phase 182 (architect after Phase 183). Measure real command handlers as well as `--help`, because handlers can load deferred imports. Report review-launcher gains apart from verify gains. Measure `start-wait`, `wait-holder` and `finish-wait`, and add `test_verify_wait_holder.py` and `test_verify_mac_only.py` to the paired caller runs before a wait-holder claim. Get owner approval before the change goes past its approved scope. Target and Git metadata stay owner-led research until measured removable work displaces this trial.
+
+Measurement tool repair (natest, before another broad command census): `task_cpu.py:61` decodes the whole status file, and a task name with byte `0xff` broke it in Phase 177. Read only the numeric `Tgid` and `PPid` fields. Test that byte sequence and ordinary status input. Keep Phase 177's in-memory replacement in its measurement record. Keep this repair apart from test-speed savings.
+
+6b. Class seeds are done for the Git fixtures (architect review after Phases 160–162). Phases 160 and 161 saved 1.15, 0.18, 0.14 and 0.08 CPU s. The next speed work targets test bodies. Remaining costs:
+
+| Module | Remaining cost and source |
+| --- | --- |
+| `production/test_waiting.py` | Phase 163 is complete. Both parallel tests use 12 forked children through `eta_request_processes`, line 653. Real lookups, locks and atomic publication remain. aws module CPU falls from 27.59 to 14.61 s. |
+| `style/test_coverage_report.py` | Phase 178 completes this change at `35eaebdf1`: all 20 tests and assertions remain, one real CLI test remains, aws CPU falls from 13.56 to 3.10 s. Four measured ledger importers saved 0.23–0.35 s each; that does not establish the saving across all 41 importers. |
+| `style/test_mechanical_classes.py` | `commit` (line 166) and `judged` (line 171) build and compare revisions. `style_footprint.py:343` reads Git for each changed file. |
+| `style/test_order_waste.py` | `build_history`, line 120, builds histories for each test. The CLI test at line 370 runs table, JSON and missing-ledger commands. `order_waste.py:515,548` read blame and history. |
+
+Phases 181 (`68da1fa10`) and 183 (`8fe4448ec`) are complete; Phase 180 is inconclusive and Phase 182 is dropped (architect after Phase 183). Dispatch order:
+1. The shared fixed-reply installer in item 0, with one writer across the shared support files, on verify's go.
+2. Finish Phase 185 with its writer and the caller measurements in item 6a.
+3. Finish Phase 184 with its writer and one collection from an immutable checkpoint.
+4. Keep Phase 176 apart from these files.
+5. `test_verify_ssh_targets_routing.py` (14 tests), one writer, after the shared trial and verify's go.
+6. `test_verify_token_renew.py` (14 tests). Its function tests already cover renewal and admission.
+7. `test_verify_result_environment.py` (7 tests). Keep real startup, saved-pass reuse and environment forwarding where those boundaries supply the proof.
+8. `test_verify_routing_rule.py` (13 tests). Keep its parser and policy function tests.
+9. Use matching production code on both sides of each timing pair; count Phase 185 apart.
+10. The admission_records import (queue-owned conditions) and the fork follow-up below come after item 0.
+
+Phase 177 measurement conditions (architect after Phase 179): report sampled command costs directly. Estimate unsampled costs only from known caller counts or a weighted sample within each caller family. Separate test bodies, class fixtures, per-test fixtures, imports and supervisor work, and parent CPU from child command CPU. Record each estimate's population, sample and expansion method. Do not count shared imports twice.
+
+Phase 138 takes priority when builds contains its three required owner changes. Keep its dependency checks and aws acceptance gate.
+
+Keep both `test_change_review.py` fork candidates under the sdlc hold. When that hold ends, add a deterministic contention event to `test_two_readiness_calls_share_the_list_lock_without_duplicate_rows`: today the parent releases its directory lock at `scripts/production/test_change_review.py:1359` before the children import.
+
+Fork candidates (separate processes for contention; no fresh interpreter needed):
+
+| Location | Children in one test | Boundary to keep |
+| --- | ---: | --- |
+| `scripts/usage/test_agents_log.py:343` | 6 | `register_default`; one successful registration and one saved assignment |
+| `scripts/usage/test_agents_log.py:530` | 4 | `append`; 80 complete records from concurrent writers |
+| `scripts/agents/test_detached_runs.py:381` | 4 | Real admission lock; outcomes `[0, 4, 4, 4]`; one saved run |
+| `scripts/production/test_ci_points.py:1009` | 2 | Both children reach the held review lock; one alert |
+| `scripts/production/test_change_review.py:1356` | 2 | List lock and duplicate prevention; sdlc hold stays |
+| `scripts/production/test_change_review.py:1636` | 8, across two lists | Separate adds keep numbering and saved rows; sdlc hold stays |
+
+In each child, close inherited parent lock descriptors before the contention starts. Keep separate output capture, child environments, intended patches and process-group cleanup. Keep cold-import tests such as `scripts/buildlog/test_repo_root_imports.py:40,84` on fresh interpreters.
+
+Phase 168 measured the six fork candidates at `8d1005406` (estimate = children × (child start + entry import); fork, barrier and cleanup costs not subtracted). All six are test-only changes:
+
+| Candidate | Removable CPU s | Owner |
+| --- | ---: | --- |
+| `test_change_review.py:1636`, eight adds | 1.994 | natest; sdlc hold |
+| `test_ci_points.py:1009`, CI watch | 1.025 | natest |
+| `test_detached_runs.py:381`, admission | 0.770 | natest |
+| `test_change_review.py:1356`, readiness | 0.501 | natest; sdlc hold |
+| `test_agents_log.py:343`, registration | 0.241 | natest |
+| `test_agents_log.py:530`, append | 0.147 | natest |
+
+After Phase 170 lands, measure these candidates (architect review after Phase 173):
+
+| Location | Function work | Boundary to keep |
+| --- | --- | --- |
+| `scripts/agents/test_detached_runs.py:434` | `detached_runs.main()` for start and reap | The parent holds admission during unpublished-record inspection. |
+| `scripts/production/test_worker_admission.py:290,688` | `switch_worker()` | Separate contenders, equal-slot refusal and prevention of a second destination. |
+| `scripts/lib/test_main_publish.py:119,130` | `main_publish.push()` and `child_lock_handoff()` | Real publication locks and shell handoff behavior. |
+| `scripts/production/test_waiting.py:769` | `waiting.main()` | Observed contention on the state lock and the unrelated-lock event. |
+
+Use the Phase 170 fork helper only after you rebuild the intended environment and clear inherited process-local operation state. Close parent lock descriptors unless inheritance is the tested behavior. Keep every assertion and each real shell boundary. Keep cold-import and restart tests on fresh interpreters, for example `test_unit_runs.py:91`, `test_conf.py:74` and `test_main_publish.py:576`. Keep production and lifecycle owner holds. Assign no saving before measurement. The `test_waiting.py:653` helper also duplicates fork ownership and cleanup; it can move to the shared helper, but that removes no interpreter starts.
+
+More lock-only candidates for `ForkChildren` (`scripts/lib/fork_test_support.py`, architect after Phase 178). Measure after item 0 and the owner's go. Use pipes for readiness and release, never multiprocessing events.
+
+| Location | Candidate | Boundary to keep |
+| --- | --- | --- |
+| `scripts/build_targets/test_ssh_eligibility.py:236` | Six lock-holder children | Real state lock, readiness and reservation refusal |
+| `scripts/lib/test_scratch.py:501` | One shared-lock holder | Removal refused while live; removal succeeds after the holder dies |
+| `scripts/message/test_repeat_guard.py:511` | Eight concurrent and three later attempts | Fail-open contention, durable counts and threshold enforcement |
+
+Entry imports: ci_points 0.50 s, change_review 0.22 s, detached_runs 0.14 s, agents_log 0.02 s. Lock waits cost almost no CPU. A fork child must close the parent's lock descriptors, keep its own patches (admission: `supervises`, `tree_key`, `Popen`; CI: `observed_lock` and its readiness descriptor) and not inherit unrelated parent patches. The readiness test shows no held-lock wait today; a fork version needs a deterministic readiness event to prove contention.
+
+Phase 164 measured the shared style Git work at `fe38cb50e` (style_sync 70 tests 21.9 CPU s, bulk_run 108 tests 38.7, crate_run 96 tests 40.8). Shared ledger reads are not a large lever. Phase 166 completed the workspace seed and admission setup changes: aws CPU fell from 45.12 to 43.85 s (1.27 s). The two remaining style-unit proposals have a combined local gross ceiling of 2.29 child CPU s; their implementation cost and aws gain are not measured. The style_sync share of about 0.41 s has the same limit. Treat the Phase 168 and 169 numbers as unverified ceilings; do not apply a conversion factor from Phase 166.
+- Proposals to style-unit (production): reuse immutable ledger reads within one operation (1.50 s), and combine the two `ledger_location` queries at `style_ledger.py:7782,7783` into one (0.79 s).
+- Larger costs: in crate_run, `copies.py` fetch and clone (`copies.py:763,803,936`, 7.80 child CPU s), and commit resolution, remote discovery and remote HEAD deletion (`copies.py:450,469,760`, 3.19 s; line 760 is a write). In bulk_run, `test_admission_window_preserves_only_admission_interrupts` (6.6 CPU s). Keep measured costs separate from estimated savings.
+
+| Work | Possible removal | Owner and limit |
+| --- | --- | --- |
+| `test_crate_run.py:205`, repeated `freeze()` setup | A private frozen-state seed for continuation tests. Creation and selection tests keep the real creation path. | natest; keep every assertion; rebuild live ownership and locks per test |
+| `test_crate_run.py:135,161,242`, default frozen state | Phase 171 shares one frozen seed across 27 prerequisite cases. aws CPU falls from 59.32 to 58.44 s. `test_moved_destination_clean_overlap_is_merged_and_reproved` stays unseeded: it changes the base before it freezes. | natest; done; all 96 tests and assertions, fresh ownership, fresh locks and later checkout operations kept |
+| `test_crate_run.py:970`, judgment continuation setup | A separate three-case seed; estimated ceiling 0.67 CPU s before ownership reconstruction. | natest; the saving needs measurement |
+| `copies.py:476,478`, repository metadata | One query for Git directories and bare state; keep `:479`. Ceiling 0.82 child CPU s. | copies-unit; keep linked-worktree handling and current errors |
+| `copies.py:763,936`, preparation fetches | One request for remote refs and the exact base. Ceiling 2.20 child CPU s. No blanket omission: fresh candidates and changed sources need synchronization. | copies-unit; confirm the overlapping calls first; keep pruning, HEAD deletion and errors |
+| `copies.py:450,469,760` | Narrower production operations after attribution. Keep named refs and config fresh; keep remote HEAD deletion. | copies-unit |
+| `crate_run.py:1123,1392` | Keep validation checkouts and stale-candidate proofs, including `test_crate_run.py:1017,2288`. | style-unit |
+
+Phase 169: a larger project seed removes no checkout work; `copies.fresh_tree()` makes each private checkout at `copies.py:673`. Keep manifest-creation tests unseeded and rebuild ownership and locks per test. Do not add overlapping ceilings, and do not treat the report as an aws result.
+
+Top five at the 2026-11-11 ranking (latest run 16:07 UTC), current test counts 27, 50, 70, 96 and 18:
+1. `direct/test_verify_wait_holder.py`, 67.9 CPU s: recorder imports at `progress_history.py:33-44` stay Phase 138's target; real target calls at line 561 stay with verify-unit.
+2. `production/test_fast_track.py`, 48.2: repeated immutable Git reads through `fast_track.py:129`; devtools-unit owns production changes.
+3. `style/test_style_sync.py`, 47.7: Phase 164 budgets about 0.41 child CPU s for the two style-unit proposals.
+4. `style/test_crate_run.py`, 47.6: prerequisite copy work above; copy synchronization needs copies-unit.
+5. `direct/test_verify_mac_only.py`, 41.7: remaining helper and target starts need verify-unit; keep the leak check at `verify_mac_offload_test_support.py:1159`.
+
+Record the measured revision and test counts with each ranking. The 2026-11-11 ranking showed 52 fast-track, 97 crate-run and 17 Mac-only tests; the files then held 50, 96 and 18.
    - Phase 95 complete: `direct/test_verify_wait_holder.py`, 94.1 to 81.5 CPU s in pairs, at its floor. Real target, reservation and recorder commands limit it. Remeasured 2026-11-09 at 74.0 CPU s; the import hold stays (Floors). verify-unit still owns the routing boundary proposal. Phase 102 already includes 41w. Keep the other verify modules as candidates under `docs/plans/natedev-verify-test-cost.md`, subject to refreshed CPU rank and their existing holds.
 7. Phases 67, 68, 84, 85, 86, 88, 90, 91 and 92 are complete. Phase 86 reports no measured CPU gain from the table proposals in the two streamline reports. The codex_mesh deletion is merged; item 10 owns the remaining measurements. Phase 90: the six `LedgerTestCase` modules, 109.0 to 78.3 CPU s in pairs. Phase 91: the SSH result module, 59.9 to 49.9 CPU s. Phase 88: the staff modules 49.2 to 26.2 CPU s, add-unit 23.7 to 14.6, fast-track 66.6 to 58.4. Phase 92 reports a 27 GiB gate tmpfs reading from a suspected runaway verify module. Verify Phase 41r owns the fix. Phase 89 is complete at `d23c0bf81`: `direct/test_assign_launcher.py`, 47.2 to 26.0 CPU s in pairs, an accepted floor (Floors). Models-launch-settings phase 1 is merged at `6cde34726` and `b381eb355`. Keep 26.0 CPU s as the historical floor. Measure all four launcher modules across that change with fixed fixtures, `/tmp` roots and matching bytecode conditions.
 8. Phase 59 complete: `style/test_style_proposals.py`, 53.75 to 28.51 CPU s in pairs; the rule-loading proposal is with the style owner.
@@ -20,7 +141,7 @@ Median CPU per gate, from `show.py top --limit 400` on 2026-11-06. The speed pha
 
 10. Locate the builds merge for hierarchies-unit Phase 30 deletion commit `ce529466f`. Builds revision `a87536252` and worktree merge `d7234eaac` contain the deletion. Compare the gate CPU and test count before and after that builds merge. Historical baseline: `agents/test_codex_mesh.py`, 736 tests and 194.3 CPU s median per gate (`show.py top`, 2026-11-07 14:50 EST). Also compare the `config/postmaster.conf` selection count and the cold-cache and warm-cache selection times. Phase 96 baseline: 574 of 738 modules selected; 572 reach `send_budget.py` and 570 reach `codex_mesh.py`. Keep the Phase 96 counts as history. Phase 127 applies the user's answer B (2026-11-10): select recorded readers, unrecorded modules, and modules whose own text names the config. Use the newest full, non-aborted gate with at least one config record.
 
-11. Rule 2 sweep (the user, 2026-11-07: "do rules 1 and 2"; 2026-11-11: no CPU or money bar, fewer tests is the goal). Phases 145–152, 155, 156 and 159 are complete. Phase 159 removed three of 127 tests across eight modules. Use one review phase for each shared fixture or behavior family, with one writer for each shared fixture. Keep removal phases separate from speed comparisons that require unchanged test counts. Each removed test keeps its own consequence and reason. Check the fixture outputs that each removed test used. Search code, docs and inventories before a path is deleted. Run the required checks on the final merged tree before review, and record the tested revision. A completed module stays complete unless new evidence calls for another review. Keep owner holds and active phase reservations. Phase 159 reviewed eight checkpoint modules. sdlc still holds `scripts/production/test_merge_checkpoint.py`, `test_merge_checkpoint_batch.py` and `test_merge_checkpoint_history.py`. Start no phase on those three files before sdlc releases them. Speed work runs beside the sweep.
+11. Rule 2 sweep (the user, 2026-11-07: "do rules 1 and 2"; 2026-11-11: no CPU or money bar, fewer tests is the goal). The broad sweep is done (architect review after Phase 173): Phases 165, 167 and 172 removed one test of 201 reviewed. Phases 145–152, 155, 156, 159, 162, 165, 167 and 172 are complete. Keep the completed families closed unless new evidence names removable tests. Phase 172 keeps all 86 Pushover tests. Reduce the test count through proven coverage overlap, merged duplicates and table rows that share one fixture. Keep every distinct behavior and assertion. Three isolated wording candidates remain: `message/test_send.py:4086,4637` and `feature_log/test_feature_log.py:3634`. Review these tests when their owners free the files; do not reopen their families. Do not schedule the 482 account tests or the remaining style-plan families without identified removals. Check complete returned values and their consumers before an assertion is removed: Phase 165 showed that a narrow-looking assertion guarded the full ticket file list. Each removed test keeps its own consequence and reason. Keep owner holds and active phase reservations. Keep removal work separate from speed comparisons that require unchanged test counts.
 
 Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.60 CPU s and style sync at 26.40 CPU s. Refresh their gate ranks after builds includes that revision. Never select `types/basedpyright` for a speed phase.
 
@@ -61,6 +182,7 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
     Generic file hashing in `direct/tree_watch.py` and `direct/progress_history.py` still records nothing.
     Fixture readers in five `*_test_support.py` files also record nothing.
   - Classify the three failures that Phase 127's targeted run missed and its full gate found: `aws_target/test_admin_secrets.py`, `whoami/test_profile_notes_pass.py`, `usage/test_context_economy_read.py`. Record why each was not selected.
+  - Phase 175 completes the historical failure inventory. Phase 176 repairs supported dependency links before the prospective audit: track repository roots within each function's scope; follow the called helper's scan behavior, not every scan in its module; keep the scanned folder and pattern; exclude temporary-folder scans from audit evidence; keep direct-import, fixture-config and recorded-read selection; replay all 55 cases and keep every old selection; report added modules and estimated executed CPU per rule. Add negative cases for unused scanners, temporary scans and the same parameter name in unrelated functions. Keep unexplained historical failures apart from proven dependency misses.
   - Completion condition: after a day on builds, report missed failures, confirmed unnecessary selections and their measured CPU.
   - Submit any selector change with its coverage cases for separate approval.
   - Keep the Phase 37 estimates and Phase 112 replay counts as history. Phase 127's replay (17,861 to 10,042 CPU s over 19 merges) is an estimate from one current graph, one set of config records and saved module CPU. Compare it with measured selection time and executed test CPU. The merge gate continues to run all modules.
@@ -161,7 +283,7 @@ Each floor row states its measurement conditions: revision, filesystem roots and
 | --- | --- | --- | --- |
 | `production/test_fast_track.py` | Historical wall median: 97.9 s in Phase 33; Phase 88 reports 58.4 CPU s. Phase 139 profile: 45.7 CPU s, 52 tests. | Git and required children dominate. Both isolated trials regress; combined gains remain uncertain. No absolute CPU floor is established. devtools-unit owns further Git work. | 33, 87, 88, 139 |
 | `direct/test_verify_ssh_targets_routing.py` | 81.6 | `eligible` and `reserve` process startup after queue Phases 30–31 removed the admission imports. Remeasured 2026-11-09 with `module_cost.py`, sequential, revision `5ff151123`: 47.9 CPU s; `build_targets.py` makes 49 starts for 15.9 s through `verify.sh` | 24 |
-| `style/test_crate_run.py` | Phase 77 measure: 53.25 CPU s; Phase 143 measure: 43.985 CPU s | No absolute CPU floor is established. Manifest batching landed at `ca17f3dca`. Phase 153 measured crate run unchanged at 59.45 CPU s in aws pairs. Crate run already copies a complete class seed. Profile the remaining Git work before proposing another setup change. Style owns production Git changes. | 77, 141, 143 |
+| `style/test_crate_run.py` | Phase 77 measure: 53.25 CPU s; Phase 143 measure: 43.985 CPU s | No absolute CPU floor is established. Manifest batching landed at `ca17f3dca`. Phase 153 measured crate run unchanged at 59.45 CPU s in aws pairs. Crate run already copies a complete class seed. Profile the remaining Git work before proposing another setup change. style-unit owns crate_run production Git changes; copies-unit owns `copies.py` fetch, clone and remote operations. | 77, 141, 143 |
 | `direct/test_verify_mac_only.py` | 185.8 (load 52-70); Phase 157 aws pairs: 38.31 to 36.18 CPU s | Real `build_targets.py` processes through `verify.sh`. Queue Phases 30–31 removed the old admission imports. Phase 157 removed two full verify starts and one redundant cleanup scan. Profile current startup and fixture CPU before confirming this floor. | 39, 41, 42, 157 |
 | `direct/test_verify_ssh_targets_retained.py` | 35.5 (load 52-65) | child process starts and the coordination imports through `build_hold.py`; no fixed waits remain. Remeasured 2026-11-09: 14.1 CPU s | 56 |
 | `direct/test_verify_ssh_targets_retry.py` | 42.1 (load 52-65) | the same starts and imports; `recovery_start_seconds` stays 5 s. Remeasured 2026-11-09: 17.9 CPU s | 56 |

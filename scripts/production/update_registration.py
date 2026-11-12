@@ -508,7 +508,6 @@ def remove_updates(owner: staff.StaffRow) -> None:
     """Remove the generated schedule files and retain reminders and history."""
     _ = notifier(["remove", f"showrunner-{owner.id}"])
     root = _showrunner_state_root()
-    (root / owner.id / "prompt.txt").unlink(missing_ok=True)
     (root / "counts" / owner.id).unlink(missing_ok=True)
 
 
@@ -522,11 +521,47 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
     raise RegistrationFailure("notifier", f"status: {failure_detail(result)}")
 
 
+class ScheduledUpdates(NamedTuple):
+    minutes: int
+    aligned: bool
+
+
 DEFAULT_MINUTES = 15
 
 
+class UpdatesOnDemand(NamedTuple):
+    """The document has no scheduled update interval."""
+
+
+def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
+    line = next((line for line in lines if line.startswith("- **Updates:**")), "")
+    match = re.search(r"every (\d+) minutes", line)
+    # Quiet by default (user, 2026-10-13): only a line asking for a schedule makes one.
+    if match is None or re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
+    minutes = int(match.group(1))
+    if minutes <= 0:
+        raise RegistrationFailure("prompt", "Updates interval must be positive")
+    return ScheduledUpdates(minutes, "on the hour" in line)
+
+
+def scheduled_prompt(minutes: int, production: Production) -> str:
+    source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
+    document = source.read_text(encoding="utf-8")
+    if "The prompt:\n" not in document:
+        raise RegistrationFailure("register", "The prompt: marker is missing")
+    tail = document.split("The prompt:\n", 1)[1]
+    if "\n**A tick**" not in tail:
+        raise RegistrationFailure("register", "**A tick** marker is missing")
+    template = tail.split("\n**A tick**", 1)[0]
+    prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
+    prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", str(production.zone)).replace("<showrunner name>", production.name)
+    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(production.owner.id)))
+    return prompt
+
+
 def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | None = None) -> list[str]:
-    """Copy missing scratchpad state to the registered owner."""
+    """Copy missing scratchpad state."""
     done: list[str] = []
     try:
         record = staff.snapshot() if record is None else record
@@ -534,7 +569,6 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
         copied = showrunners.adopt_session_state(identity, record=record)
         if copied:
             done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(identity)}")
-
     except (OSError, UnicodeError, RegistrationFailure, staff.StaffRefused, staff.StaffUnreadable) as error:
         done.append(f"state move skipped: {error}")
     return done
@@ -544,10 +578,6 @@ def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
-    # An account move restarts a showrunner on its own, so a name that differs only warns; attach refuses it
-    # for a new production.
-    if why := showrunners.name_refusal(production.name, showrunners.session_name(session_id)):
-        report("register", "warn", why)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
@@ -561,7 +591,7 @@ def register(production: Production) -> None:
     owner = production.owner
     updates = f"showrunner-{owner.id}"
     _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(DEFAULT_MINUTES),
-                  "--command", "/showrunner:units", "--from", f"showrunner-timer-{production.name}"])
+                  "--prompt", "scheduled", "--from", f"showrunner-timer-{production.name}"])
     _ = notifier(["stop", updates])
     if isinstance(instance("stall-watch"), InstanceAbsent):
         run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
@@ -1468,6 +1498,8 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
+    prompt = commands.add_parser("prompt")
+    _ = prompt.add_argument("--owner", required=True)
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action)
@@ -1495,6 +1527,12 @@ def main() -> int:
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
+        if action == "prompt":
+            production = read_production(cast(str, args.owner))
+            schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
+            minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
+            print(scheduled_prompt(minutes, production))
+            return 0
         identities = QuestionStaff.read() if action in ("ask", "questions-table") else None
         name = cast(str | None, args.production)
         if name is None:

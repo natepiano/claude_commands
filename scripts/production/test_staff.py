@@ -27,7 +27,7 @@ from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
 from scripts.lib import unit_runs
-from scripts.message import sessions
+from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
@@ -392,7 +392,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         _, _, worker = self.tree()
         _ = self.session_record(worker.id, worker.name)
         before = self.staff_file.read_bytes()
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
             with self.assertRaisesRegex(staff.StaffRefused, worker.id):
                 _ = staff.retire(worker.id)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -910,7 +910,7 @@ class StaffTests(StaffCommandTestCase):
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
             doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
             self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(staff.snapshot().by_id(row.id))
             before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -998,7 +998,7 @@ class StaffTests(StaffCommandTestCase):
                 _ = staff.set_doc(fixture.id, staff.LiveDoc("natedev", Path("/srv/staff-guard/production.md")))
             self.assertEqual(primary_file.read_bytes(), before)
 
-            with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
                 self.assertEqual(staff._remove_test_fixture(fixture.id), staff.FixtureRemoved(fixture))  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(staff.snapshot().rows, (changed,))
 
@@ -1278,7 +1278,8 @@ class StaffTests(StaffCommandTestCase):
 
     def test_staff_writes_keep_unknown_row_location_and_pause_fields(self) -> None:
         runner, unit, worker = self.tree()
-        for row, other, key, state in ((unit, runner, "worktree", "present"),
+        for row, other, key, state in ((unit, runner, "worktree", "parked"),
+                                       (unit, runner, "worktree", "present"),
                                        (unit, runner, "worktree", "removed"),
                                        (runner, unit, "doc", "live"),
                                        (runner, unit, "doc", "wrapped")):
@@ -1288,6 +1289,8 @@ class StaffTests(StaffCommandTestCase):
                                "future_location": ["retained", {"revision": 2}]},
                          "paused": {"since": "2026-11-06T16:54:00-05:00", "by": "owner", "why": "review",
                                     "future_pause": {"enabled": True}}}
+                if state == "parked":
+                    value[key] = {**cast(dict[str, object], value[key]), "state": "removed", "branch": "feature/parked"}
                 _ = self.write_document({"schema": 2, "rows": [value, other.to_json(), worker.to_json()]})
                 current = staff.snapshot().by_id(row.id)
                 assert current is not None
@@ -1295,6 +1298,9 @@ class StaffTests(StaffCommandTestCase):
                 location = current.worktree if key == "worktree" else current.doc
                 assert isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc))
                 self.assertEqual(location.unknown_fields, {"future_location": ["retained", {"revision": 2}]})
+                if state == "parked":
+                    assert isinstance(location, staff.RemovedWorktree)
+                    self.assertEqual(location.branch, staff.ParkedBranch("feature/parked"))
                 assert isinstance(current.paused, staff.Paused)
                 self.assertEqual(current.paused.unknown_fields, {"future_pause": {"enabled": True}})
                 _ = staff.rename(other.id, "other-" + state)
