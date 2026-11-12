@@ -554,6 +554,8 @@ fi
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
         [[ "${VERIFY_HELPER_STARTED:-0}" == 0 ]] || return 0
+        # shellcheck source=/dev/null
+        source "$VERIFY_START_DIR/file_lock.sh" || return 2
         VERIFY_HELPER_STARTED=1
         local script="$VERIFY_START_DIR/verify_helper.py" input output
         [[ -f "$script" ]] || return 0
@@ -584,7 +586,7 @@ verify_helper() {
             while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do forwarded+=("$entry"); done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if flock -x 72 2>/dev/null && (
+        if lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             env -0
             printf '\0%s\0' "$input"
@@ -2790,7 +2792,7 @@ check_mac_only_result() {
 
 route_test() {
     local name eligibility reason settings platform admission remote_candidates=0 reservation_status
-    local announced_reason="" retry=0 retry_ready
+    local announced_reason="" retry=0 retry_ready reserve_hook
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -2846,7 +2848,8 @@ route_test() {
             step_can_retry || continue
             if [[ "$eligibility" == excluded && ! "$reason" =~ $SSH_RETRYABLE_REASON ]]; then continue; fi
             [[ -f "$MAC_RUNNER" ]] || continue
-            if [[ "$(ssh_reserve_hook "$name" "$settings" "$retry")" == false ]]; then continue; fi
+            reserve_hook=$(ssh_reserve_hook "$name" "$settings" "$retry")
+            if [[ "$reserve_hook" == false ]]; then continue; fi
             remote_candidates=1
             if [[ "$MAC_ONLY" == 0 && "$retry" == 1 && -z "$PINNED_TARGET" && "$platform" == macos ]]; then
                 retry_ready=0
@@ -2863,7 +2866,7 @@ route_test() {
             fi
             if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
             reservation_status=0
-            eval "$(ssh_reserve_hook "$name" "$settings" "$retry")" || reservation_status=$?
+            eval "$reserve_hook" || reservation_status=$?
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 ]] \
                 && phase_wait_target_busy "$PINNED_TARGET"; then continue; fi
             if [[ -n "$PINNED_TARGET" && "$reservation_status" != 0 && "$eligibility" == eligible ]]; then

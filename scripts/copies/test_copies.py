@@ -977,7 +977,16 @@ class StandingTests(unittest.TestCase):
         _ = self.git(self.source, "remote", "remove", "origin")
         linked = self.base / "worktree"
         _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
-        self.assertEqual(copies.repository_name(linked), self.source.name)
+        bare = self.base / "bare.git"
+        _ = self.git(self.base, "clone", "-q", "--bare", str(self.source), str(bare))
+        _ = self.git(bare, "remote", "remove", "origin")
+        bare_linked = self.base / "bare-worktree"
+        _ = self.git(bare, "worktree", "add", "--detach", str(bare_linked), self.head)
+        for source, main in ((self.source, self.source), (linked, self.source),
+                             (bare, bare), (bare_linked, bare)):
+            with self.subTest(source=source):
+                self.assertEqual(copies.main_checkout(source), main)
+                self.assertEqual(copies.repository_name(source), main.name)
 
     def test_relative_origin_uses_the_main_checkout_from_each_worktree(self) -> None:
         _ = self.git(self.source, "remote", "set-url", "origin", "../origin.git")
@@ -1003,6 +1012,7 @@ class StandingTests(unittest.TestCase):
         _ = self.git(main, "worktree", "add", "--detach", str(linked), "HEAD")
         for source in (main, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
+                self.assertEqual(copies.main_checkout(source), main)
                 self.assertEqual(self.cache(tree).parent.name, "widget")
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 

@@ -108,7 +108,19 @@ An interruption marker reports the instance generation.
 - Unpinned test, check, doc, example, and lint judgments try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
 - `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
 - `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
-- `hold_enforcer.protected_reason` protects every step state except `ON_NATEDEV`, so a natedev hold stops only local work.
+- A natedev hold permits a process that holds a live Mac or AWS claim, plus its ancestors and descendants.
+  The reason is `holds a live Mac or AWS claim`, even when the step record is stale or unreadable.
+  The enforcer reads the process table before it reads claims once per pass during a hold.
+  It uses the same claims for decisions and signals.
+  A claim or target config read error prevents TERM and KILL for that pass.
+  The enforcer reports the error once and reports recovery once.
+  Audits and reports show the error and list builds without claim protection.
+  The drain reports the error once and stops no waiting run until claims are readable.
+  If the initial claim read fails, the drain hold keeps every outermost gate.
+  After claims become readable, the drain stops waiting gates and keeps working gates alive.
+  A new claim cancels a pending kill. An ended claim permits the next pass to stop the family.
+  `hold_enforcer.protected_reason` keeps live step controllers and route children alive in `waiting_hold` and `waiting_mac`.
+  `--drain` also waits for cargo children and admission reservations. It still stops waiting runs.
 
 ### Cost ledger and spending guard: `scripts/aws_target/`
 
@@ -276,6 +288,13 @@ It can import the administrator profile and the old OAuth file.
 It removes those plain credentials only after the encrypted write succeeds.
 It preserves the scaler profile and all unrelated sections.
 Enter retains a stored value during replacement.
+
+One resolver selects the scaler credential file for deployment, key creation, and teardown.
+It uses a nonempty `AWS_SHARED_CREDENTIALS_FILE` override before `credential_file` from `cloud_gate.conf`.
+It expands `~` in either path.
+Every `deploy.py` command sets the resolved path in its environment before dispatch.
+AWS CLI subprocesses inherit the same path.
+User deployment commands need no credential environment prefix.
 
 `price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
 `prepare` decrypts only when it must reconcile existing AWS resources.
@@ -566,6 +585,27 @@ The installed guest supplies the environment and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
+Each paired run writes a UTC `stage=` line through the shared stage writer.
+Warm-up stages are `warm-up base` and `warm-up changed`.
+Measured stages are `round <r> of <N> <variant>`.
+The guest writes `finish` after the last run.
+It publishes the current stage before each run through the existing per-run log transfer.
+The final transfer includes `finish` and the last result rows.
+These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The upload count and measured result fields remain unchanged.
+
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+The progress record adds `stage`, `region`, and `zone` beside the existing fields.
+Before the first box log line, the state is `requesting` and the stage is `launch`.
+The last UTC `stage=` line supplies the stage text.
+A `round` stage sets the state to `running`.
+Once the merge runner writes `Runner:`, the stage text becomes empty and the existing module counter applies.
+`Cloud gate: uploading` sets the stage text to `uploading`.
+Each log download publishes the progress beside the reservation sidecar in `.cloud.json`.
+After launch, every progress publication includes the launched region and availability zone from the saved variant.
+Before launch, the region and zone are empty.
+Older records default all three new fields to empty strings.
+Older readers ignore these extra fields.
 
 Stdout contains run JSON lines, module JSON lines, and one final cost JSON line.
 The module summary gives the median CPU saving across complete pairs.
@@ -582,11 +622,13 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
 
-The controller uses the region order in `cloud_gate.conf`.
+The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The default order is us-east-2, then us-west-2.
+The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+`us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-Within each region, it tries each configured type and each public zone.
+The gate ranks deployed types and public zones by size and expected cost before launch.
+Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after every regional variant refuses.
 Paired trials use the same regional launch and cleanup path.
@@ -646,6 +688,13 @@ Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
 
+European deployment needs account and policy changes before the regional stacks can start.
+Enable `eu-south-2` on the AWS Account page and wait until its status is `ENABLED`.
+See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
+Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before deployment.
+Keep the existing home and US region permissions.
+The runbook gives the preparation steps.
+
 The controller reads gate Spot prices every `price_refresh_seconds=3600`.
 It reads prices after the tick releases `controller.lock`, in the same process.
 It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
@@ -662,10 +711,24 @@ Failed attempts use the same refresh interval.
 The price read remains active when the former builder route is disabled or removed.
 
 A new gate ranks only variants from its deployment.
+Before its first ranking, it reads live Spot prices in parallel from each deployed region.
+Each region receives one Linux/UNIX request for all configured `instance_types`.
+`spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.
+The reader selects the latest price for each deployed zone and type.
+Live rows replace matching hourly rows for this ranking only.
+Failed or slow regions retain their hourly rows.
+The live read never writes `spot-prices.json`.
+`launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
+Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Resumed launches keep the saved ranking and evidence without another live read.
 Available variants precede variants under a capacity cooldown.
 Within each group, larger vCPU sizes precede smaller sizes.
 Types with equal vCPU counts compete on expected gate cost.
-That cost equals the hourly Spot price times expected gate hours, plus the remote region transfer charge.
+That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
+It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
+`region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
+Missing regions contribute zero extra seconds.
+`gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
 Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
 Without recent durations, it uses `lifetime_minutes`.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
@@ -691,7 +754,7 @@ Refusal handling, regional cost bookings, and the $35 daily and $400 monthly lim
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
-`spot_candidate_regions=us-east-2 us-west-2` also supplies the regions for Spot work and later price steering.
+`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2` supplies the candidate regions for Spot work and price reads.
 `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
@@ -705,8 +768,10 @@ A type with another size has no known count, and the check skips it.
 A failed read prints the quota as unknown with the redacted reason, and the command continues.
 The administrator IAM policy is outside the repository and needs `servicequotas:GetServiceQuota`.
 `deploy.py quota-request` requests Standard Spot quota (`L-34B43A08`) in each gate region from `regions`.
+Credential refusals print their message once and stop the command with a nonzero exit status.
+AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-The default request is 128 vCPUs.
+The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
 It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 All three new keys are in `cloud_gate.conf`.

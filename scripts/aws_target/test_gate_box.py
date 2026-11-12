@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import gate_box, gate_trial, ledger
+from scripts.aws_target import test_gate_trial as trial_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
@@ -25,6 +26,53 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class GateBoxTests(unittest.TestCase):
+    def test_paired_guest_uploads_warm_up_round_and_finish_stages_in_run_order(self) -> None:
+        fixture = trial_tests.PairedTrialTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reply, _ = fixture.guest()
+        log = (fixture.root / 'box/uploaded-log').read_text()
+        lines = [line for line in log.splitlines() if ' stage=' in line]
+        self.assertEqual([line.split(' stage=', 1)[1] for line in lines], [
+            'warm-up base', 'warm-up changed', 'round 1 of 3 base', 'round 1 of 3 changed',
+            'round 2 of 3 changed', 'round 2 of 3 base', 'round 3 of 3 base', 'round 3 of 3 changed', 'finish'])
+        for line in lines:
+            self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
+        runs = ledger.rows(reply, 'runs')
+        self.assertEqual(len(runs), 6)
+        self.assertTrue(all(set(row) == gate_box.RUN_FIELDS for row in runs))
+        self.assertEqual(sum(line.startswith('{"module":') for line in log.splitlines()), 6)
+
+    def test_paired_guest_stage_write_errors_keep_all_runs_and_pass_verdict(self) -> None:
+        failure = '''class FailedStageWrite:
+    def __enter__(self):
+        return self
+    def __exit__(self, *error):
+        pass
+    def write(self, text):
+        (root / 'failed-stage-write').write_text(text)
+        raise OSError('The stage write failed')
+
+'''
+        for name in ('warm-up base', 'finish'):
+            with self.subTest(stage=name):
+                fixture = trial_tests.PairedTrialTests()
+                self.addCleanup(fixture.doCleanups)
+                fixture.setUp()
+                guest = gate_box.GUEST.replace('def stage(name):', failure + 'def stage(name):')
+                guest = guest.replace("(root / 'boot.log').open('a')",
+                    f"(FailedStageWrite() if name == {name!r} else (root / 'boot.log').open('a'))")
+                with mock.patch.object(gate_box, 'GUEST', guest):
+                    reply, traces = fixture.guest()
+                self.assertIn(' stage=' + name + '\n', (fixture.root / 'box/failed-stage-write').read_text())
+                self.assertEqual(len(traces), 8)
+                runs = ledger.rows(reply, 'runs')
+                self.assertEqual([(row['round'], row['variant']) for row in runs],
+                                 [(1, 'base'), (1, 'changed'), (2, 'changed'), (2, 'base'), (3, 'base'), (3, 'changed')])
+                self.assertTrue(all(row['status'] == 0 for row in runs))
+                self.assertEqual(reply['verdict'], 'pass')
+                self.assertNotIn('error', reply)
+
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
