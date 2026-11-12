@@ -3269,7 +3269,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - basedpyright on each changed Python file reports 0 errors and 0 warnings.
 - Three aws pairs show a CPU gain with unchanged test counts; with no gain, the phase lands nothing.
 
-### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: todo
+### Phase 184 — The coverage collector stops one child with no seen exit from marking every later test unknown  · status: done
 **Depends on:** Phase 180
 
 #### Work Order
