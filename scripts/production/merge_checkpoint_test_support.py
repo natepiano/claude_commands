@@ -764,19 +764,18 @@ class MergeCheckpointFixture(unittest.TestCase):
         return self.invoke(["--from-child", "example-style", "--checkpoint", checkpoint,
                             "--production", "example", "--started", STARTED, *extra])
 
-    def prepare_handoff_ledger(self, checkpoint: str, *, add_handoff: bool = True) -> None:
+    def prepare_handoff_ledger(self, checkpoint: str) -> None:
         ledger = Path(__file__).resolve().parents[1] / "style/style_ledger.py"
         self.env["MERGE_CHECKPOINT_STYLE_LEDGER"] = str(ledger)
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "style-state")
         catalog = self.root / "rule-catalog"
         catalog.mkdir()
         self.env["STYLE_HISTORY_NATE_STYLE_DIR"] = str(catalog)
-        commands = [["reconcile", "--branch-point", "production", "--style-branch", "alpha-branch"]]
-        if add_handoff:
-            commands.extend([
-                ["handoff", "add", "--checkpoint", checkpoint],
-                ["handoff", "send", "--checkpoint", checkpoint, "--to", "example"],
-            ])
+        commands = [
+            ["reconcile", "--branch-point", "production", "--style-branch", "alpha-branch"],
+            ["handoff", "add", "--checkpoint", checkpoint],
+            ["handoff", "send", "--checkpoint", checkpoint, "--to", "example"],
+        ]
         for arguments in commands:
             result = subprocess.run(
                 [sys.executable, str(ledger), *arguments, "--repo", str(self.unit)],

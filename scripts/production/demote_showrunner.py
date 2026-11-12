@@ -245,7 +245,7 @@ def restore(path: Path) -> int:
         _ = staff.change_director(source.id, staff.ShowrunnerRole(source.name, source.parent.id, source.doc))
         for identity in cast(list[str], fields["directors"]):
             _ = staff.move(staff.StaffId(identity), staff.ReportsTo(source.id))
-        entry = cast(pane_launch.PaneLaunch, fields["launch"])
+        entry = pane_record.resume_launch(cast(pane_launch.PaneLaunch, fields["launch"]))
         environment = entry["environment"].copy()
         if isinstance(source.home, staff.SessionHome):
             environment.update(named_account_environment(source.home.path))
@@ -256,9 +256,6 @@ def restore(path: Path) -> int:
         if isinstance(started, (herdr.nix_env.Refused, herdr.PromptNotSubmitted)):
             print(started.reason, file=sys.stderr)
             return 1
-        production = read_production(source)
-        if isinstance(update_registration.update_schedule(production.doc.read_text().splitlines()), update_registration.ScheduledUpdates):
-            _ = update_registration.notifier(["start", f"showrunner-{source.id}"])
         path.unlink()
     return 0
 

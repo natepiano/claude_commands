@@ -118,6 +118,14 @@ class RunStaffAtUse(Enum):
     LOCAL = "read the local staff record"
 
 
+@dataclass(frozen=True)
+class LauncherRunDirectories:
+    """Share worker resolution and parent scans within one display."""
+
+    by_worker: dict[staff.StaffId, tuple[Path, ...]]
+    by_session: dict[str, list[str]]
+
+
 
 
 def open_run(session_id: str, *,
@@ -252,10 +260,15 @@ def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffA
 
 
 def held_by_session(root_override: str | Path | None = None, *,
-                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL,
+                    additional_roots: Sequence[Path] = ()) -> dict[str, list[str]]:
     """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
-    for folder in run_folders(root_override):
+    folders: dict[Path, Path] = {}
+    for root in (root_override, *additional_roots):
+        for folder in run_folders(root):
+            _ = folders.setdefault(folder.resolve(), folder)
+    for folder in folders.values():
         if (folder / STATE_FILE).is_file():
             found.setdefault(director(folder, record=record), []).append(str(folder))
     return found

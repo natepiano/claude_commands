@@ -8,6 +8,8 @@ description: Control Hana views and screenshots.
    ~/.claude/scripts/lib/py ~/.claude/scripts/hana_shot/hana_shot.py shot --port 15791 --launch --purpose "home and log panel views" --view home --view log-panel-front --out <scratchpad>/shots --shutdown
    ```
 
+   For gate builds, pass the `published:` path as `--binary` and a matching worktree as `--worktree` for assets. Never copy from a gate checkout's `target`.
+
    Take every view you need in one call: repeat `--view`, or `--view all`. Stdout prints one PNG path per shot. Stderr prints the time per phase. Exit 0 means every shot was saved; 1 means a shot failed; 2 means refused; 3 means a screenshot timed out.
 2. Pick your own port; port 15702 is the user's Hana and is always refused. `--launch` uses a scratch `XDG_CONFIG_HOME`, waits for "scene revealed" and a frame time under 50 ms, and records the instance. `--shutdown` stops it, prints any panic lines from its log, and deletes the scratch. Use `launch --port N --purpose "<feature under test>"` and `shutdown --port N` alone to keep one Hana open across several calls. Never Save Scene in it.
 

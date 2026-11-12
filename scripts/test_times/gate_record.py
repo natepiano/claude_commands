@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -43,6 +43,9 @@ TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
+    # Older records can omit the module times.
+    started_at: NotRequired[str]
+    ended_at: NotRequired[str]
     config_reads: NotRequired[list[str]]
     folder_scans: NotRequired[list[str]]
     content_reads: NotRequired[list[str]]
@@ -106,6 +109,19 @@ class GateRunRecord(GateRun):
 
 @dataclass(frozen=True)
 class NoModuleTimes:
+    reason: str
+
+
+@dataclass(frozen=True)
+class WallClockSpan:
+    """The wall-clock epoch seconds for one module attempt."""
+    started_at: float
+    ended_at: float
+
+
+@dataclass(frozen=True)
+class WallClockNotRecorded:
+    """The attempt has no recorded wall-clock span."""
     reason: str
 
 
@@ -223,6 +239,7 @@ class Execution:
     restart: Literal["", "hold"]
     times: ModuleTimes | NoModuleTimes | TimingNotApplicable
     output: str
+    wall_clock: WallClockSpan | WallClockNotRecorded = field(default=WallClockNotRecorded("not recorded"), kw_only=True)
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -302,6 +319,8 @@ def slow_test_s() -> float:
 
 def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
     """Keep each attempt and select its test times with one threshold."""
+    from scripts.buildlog import store
+
     attempts: dict[tuple[str, str], int] = {}
     modules: list[ModuleRun] = []
     for job in executions:
@@ -315,6 +334,9 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
             "log": "",
         }
+        if isinstance(job.wall_clock, WallClockSpan):
+            module["started_at"] = store.utc_iso(job.wall_clock.started_at)
+            module["ended_at"] = store.utc_iso(job.wall_clock.ended_at)
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
             reads = module_read_record(times.get("config_reads"), times.get("folder_scans"), times.get("content_reads"))

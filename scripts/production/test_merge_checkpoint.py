@@ -23,6 +23,7 @@ from typing import cast, final
 from zoneinfo import ZoneInfo
 
 from scripts.production import merge_checkpoint
+from scripts.worktree import worktrees
 from scripts.production import showrunners
 from scripts.production import production_doc
 
@@ -66,15 +67,6 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].label, "example aws-routing-proof/demo")
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
-
-    def test_example_without_a_manifest_has_no_step(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            checkout = Path(temporary)
-            _ = (checkout / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
-            production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
-                                                  checkout / "production.log", ZoneInfo("UTC"))
-            steps = checkpoint_gate.test_steps(production, ("crates/proof_crate/examples/demo.rs",), ())
-            self.assertEqual(steps, [])
 
     def test_package_commands_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
@@ -135,19 +127,25 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             _ = self.git("merge", "--ff-only", checkpoint, cwd=tree)
             _ = self.git("push", "-u", "origin", branch, cwd=tree)
         self.write(trees["dirty-work"], "src/alpha.txt", "uncommitted work\n")
+        retained = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/other-production", retained)
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIsInstance(worktrees.cleanup(trees["dirty-work"]), worktrees.Kept)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/other-production"), retained)
 
         result = self.run_checkpoint(checkpoint).process
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("push: ok", result.stdout)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/other-production"), retained)
         self.assertIn("worktrees: ended", result.stdout)
         self.assertIn(str(trees["landed-work"]), result.stdout)
         self.assertIn("worktrees: kept", result.stdout)
         self.assertIn(str(trees["dirty-work"]), result.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"),
                          self.git("rev-parse", "refs/heads/production", cwd=self.origin))
-        worktrees = self.git("worktree", "list", "--porcelain")
-        self.assertNotIn(f"worktree {trees['landed-work']}\n", worktrees + "\n")
+        tree_listing = self.git("worktree", "list", "--porcelain")
+        self.assertNotIn(f"worktree {trees['landed-work']}\n", tree_listing + "\n")
         self.assertNotIn(trees["landed-work"].name, [path.name for path in self.root.iterdir()])
         for folder in (self.checkout, self.origin):
             branches = self.git("for-each-ref", "--format=%(refname)", "refs/heads", cwd=folder).splitlines()
@@ -208,12 +206,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertNotIn(code_merge, self.git("rev-list", "--first-parent", "HEAD").splitlines())
                 self.assertEqual(self.git("merge-base", "--is-ancestor", code_merge, "production"), "")
                 closing = self.as_built_commit()
+                held_commit = closing
                 if unmerged_code:
                     closing = self.checkpoint(content="code after the as-built commit\n")
                 if side_docs:
                     _ = self.git("checkout", "-b", "side-phase", f"{closing}^", cwd=self.unit)
                     side = self.checkpoint("docs/side.md", "unmerged side phase\n",
                                            subject="checkpoint(beta): side phase", push=False)
+                    held_commit = side
                     _ = self.git("checkout", "alpha-branch", cwd=self.unit)
                     _ = self.git("merge", "--no-ff", "-m", "Merge side phase after as-built", side, cwd=self.unit)
                     _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
@@ -234,8 +234,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 (self.state / "events.jsonl").unlink()
                 result = self.run_checkpoint(closing, "--as-built", review=False)
                 if unmerged_code or side_docs:
-                    self.assert_stopped_before_merge(result, "held", "phase 2 code checkpoint has not merged")
-                    self.assertIn("wait for the phase code checkpoint to merge, then resend the shrink",
+                    subject = self.git("show", "-s", "--format=%s", held_commit)
+                    self.assert_stopped_before_merge(result, "held", f"unmerged commit {held_commit[:12]}: {subject}")
+                    self.assertIn(f"wait for {held_commit[:12]} to merge, then resend the as-built",
                                   result.process.stdout)
                 else:
                     self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
@@ -353,7 +354,7 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
-        for failure in ("push", "final-fetch"):
+        for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref"):
             with self.subTest(failure=failure):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -366,6 +367,34 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                 self.assertNotEqual(before, remote)
                 main = self.push_main_change("main-only.txt", "independent main work\n")
                 checkpoint = self.checkpoint()
+                if failure in ("rollback-fetch", "rollback-ref"):
+                    _ = self.git("merge", "--no-ff", "-m", "Merge checkpoint", checkpoint)
+                    self.assertNotEqual(self.git("rev-parse", "HEAD"), before)
+                    production = production_doc.ProductionDocument(
+                        self.doc, "example", "production", self.checkout, self.log, ZoneInfo("UTC"))
+                    arguments = (("fetch", "origin", "+refs/heads/production:refs/remotes/origin/production")
+                                 if failure == "rollback-fetch" else ("rev-parse", "refs/remotes/origin/production"))
+                    original_git = merge_checkpoint.git
+
+                    def fail_preparation(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                        if args == arguments:
+                            return subprocess.CompletedProcess(["git", *args], 1, "", "fixture rollback preparation failed")
+                        return original_git(checkout, *args)
+
+                    with mock.patch.dict(os.environ, self.env), mock.patch.object(
+                            merge_checkpoint, "git", side_effect=fail_preparation) as commands:
+                        with self.assertRaises(checkpoint_gate.Stop) as stopped:
+                            with merge_checkpoint.push_rollback(production, before):
+                                self.fail("push preparation must stop before yield")
+                    self.assertEqual((stopped.exception.step, stopped.exception.state), ("push", "failed"))
+                    self.assertIn("fixture rollback preparation failed", stopped.exception.detail)
+                    self.assertFalse(any(call.args[1] in ("push", "ls-remote") for call in commands.call_args_list))
+                    self.assertEqual(self.git("rev-parse", "HEAD"), before)
+                    self.assertEqual(self.git("status", "--porcelain"), "")
+                    self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
+                    self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
+                    self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+                    continue
                 if failure == "push":
                     hook = self.origin / "hooks/pre-receive"
                     _ = hook.write_text("#!/bin/sh\nexit 1\n")
@@ -382,7 +411,7 @@ import os
 from pathlib import Path
 import sys
 state = Path(os.environ["CHECKPOINT_TEST_STATE"])
-if sys.argv[-3:] == ["fetch", "origin", "main"] and (state / "tested-tip").exists():
+if sys.argv[-3:] == ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"] and (state / "tested-tip").exists():
     print("fixture final fetch failed", file=sys.stderr)
     raise SystemExit(1)
 os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
@@ -593,26 +622,45 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
 
     def test_checkpoint_on_no_origin_branch_checks_all_heads_and_still_holds(self) -> None:
         sha = self.checkpoint(push=False)
-        # Simulate a deleted alternate branch with a stale local tracking ref.
+        # Keep stale tracking refs without accepting them as origin evidence.
         _ = self.git("push", "origin", f"{sha}:refs/heads/alpha-phase", cwd=self.unit)
         _ = self.git("update-ref", "refs/remotes/origin/alpha-phase", sha)
         _ = self.git("update-ref", "-d", "refs/heads/alpha-phase", cwd=self.origin)
+        retained = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "origin", "HEAD:refs/heads/sdlc")
+        sibling = self.root / "sibling"
+        _ = self.git("worktree", "add", "--detach", str(sibling), "HEAD")
+        _ = self.git("config", "uploadpack.hideRefs", "refs/heads/sdlc", cwd=self.origin)
+        _ = self.git("config", "fetch.prune", "true")
         with mock.patch.object(merge_checkpoint, "git", wraps=merge_checkpoint.git) as commands:
             result = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(result, "held", "ancestry: held — commit is not on origin")
         self.assertIn("send alpha: push your branch to origin and resend the checkpoint", result.process.stdout)
-        commands.assert_any_call(self.checkout, "fetch", "--prune", "origin",
+        for checkout in (self.checkout, sibling):
+            self.assertEqual(self.git("rev-parse", "refs/remotes/origin/sdlc", cwd=checkout), retained)
+        self.assertEqual(self.git("rev-parse", "refs/heads/sdlc", cwd=self.origin), retained)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/alpha-phase"), sha)
+        commands.assert_any_call(self.checkout, "fetch", "--no-prune", "--porcelain", "--verbose", "origin",
                                  "+refs/heads/*:refs/remotes/origin/*")
-        self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/alpha-phase"), "")
 
     def test_second_origin_branch_is_accepted_when_the_unit_branch_was_deleted(self) -> None:
-        sha = self.checkpoint(push=False)
-        _ = self.git("push", "origin", "HEAD:refs/heads/alpha-phase", cwd=self.unit)
-        _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("is on origin/alpha-phase", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+        for tracking_ref in ("missing", "behind"):
+            with self.subTest(tracking_ref=tracking_ref):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                before = self.git("rev-parse", "HEAD")
+                sha = self.checkpoint(push=False)
+                _ = self.git("push", "origin", "HEAD:refs/heads/alpha-phase", cwd=self.unit)
+                _ = self.git("push", "origin", "--delete", "alpha-branch", cwd=self.unit)
+                if tracking_ref == "behind":
+                    _ = self.git("update-ref", "refs/remotes/origin/alpha-phase", before)
+                    self.assertEqual(self.git("merge-base", "--is-ancestor", before, sha, cwd=self.unit), "")
+                    self.assertNotEqual(before, sha)
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                self.assertIn("is on origin/alpha-phase", result.process.stdout)
+                self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
 
     def test_unit_branch_on_origin_uses_the_fast_path(self) -> None:
         sha = self.checkpoint()

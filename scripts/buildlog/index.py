@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 
 
 # These indexes support repeated queries over the current schema.
@@ -217,6 +217,8 @@ GATE_MODULE_COLUMNS: list[Column] = [
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "host"),
     ("started_at", "TEXT", "the run's start"),
+    ("module_started_at", "TEXT", "the module attempt's start, UTC ISO; NULL when not recorded"),
+    ("module_ended_at", "TEXT", "the module attempt's end, UTC ISO; NULL when not recorded"),
     ("suite", "TEXT", "suite name"),
     ("module", "TEXT", "test module; basedpyright for the types suite"),
     ("attempt", "INTEGER", "execution number from 1; includes hold restarts and reruns"),
@@ -961,7 +963,10 @@ def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src:
         config_reads = json.dumps(sorted(reads.config_reads.stems)) if isinstance(reads.config_reads, RecordedConfigReads) else None
         folder_scans = json.dumps(folder_scan_strings(reads.folder_scans)) if isinstance(reads.folder_scans, RecordedFolderScans) else None
         content_reads = json.dumps(sorted(reads.content_reads.paths)) if isinstance(reads.content_reads, RecordedContentReads) else None
-        insert(connection, "gate_modules", pick({**module, **parent, "config_reads": config_reads,
+        insert(connection, "gate_modules", pick({**module, **parent,
+                                                "module_started_at": module.get("started_at"),
+                                                "module_ended_at": module.get("ended_at"),
+                                                "config_reads": config_reads,
                                                 "folder_scans": folder_scans, "content_reads": content_reads}, GATE_MODULE_COLUMNS))
         owner: GateTestOwner = {
             **parent,

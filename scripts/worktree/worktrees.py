@@ -269,7 +269,7 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
 
 
 def cleanup(path: Path) -> CleanupReady | Kept:
-    _ = git(path, "fetch", "--prune", "origin")
+    _ = git(path, "fetch", "--no-prune", "origin")
     dirty = git(path, "status", "--porcelain").stdout
     if dirty:
         return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))

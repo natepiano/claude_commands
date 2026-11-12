@@ -140,22 +140,20 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     for launch in sources.launches:
         if launch.get("pane_id") != pane or launch.get("ended"):
             continue
-        if record.by_member_reference(launch["session_id"]) is not None:
+        if record.by_member_reference(pane_launch.reference_id(launch)) is not None:
             return True
     return False
 
 
 class CodexProcessThreads:
-    """Read a thread from its process or terminal metadata."""
+    """Read a thread from its process or native pane record."""
 
     def __init__(self) -> None:
         self.panes: dict[tuple[str, str], dict[str, object]] = {}
         self.foreground_pids: dict[tuple[str, str], int] = {}
-        self.threads: dict[Path, dict[str, str]] = {}
 
     def thread(self, pid: int, environment: Mapping[str, str]) -> str:
         from scripts.herdr import herdr
-        from scripts.message import codex_daemon
 
         try:
             try:
@@ -179,22 +177,7 @@ class CodexProcessThreads:
                 return identity
             if identity := environment.get("CODEX_THREAD_ID", ""):
                 return identity
-            title = pane.get("terminal_title_stripped")
-            if not isinstance(title, str):
-                return ""
-            name = title.partition(" | ")[0]
-            home = Path(environment.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-            if home not in self.threads:
-                observed = codex_daemon.loaded_sessions(home / "app-server-control/app-server-control.sock")
-                self.threads[home] = {}
-                if not isinstance(observed, codex_daemon.DaemonUnreadable):
-                    for entry in observed:
-                        # A repeated name cannot identify one terminal's thread.
-                        if entry.name in self.threads[home]:
-                            self.threads[home][entry.name] = ""
-                        else:
-                            self.threads[home][entry.name] = entry.thread_id
-            return self.threads[home].get(name, "")
+            return ""
         except (OSError, ValueError, herdr_types.HerdrFailure):
             return environment.get("CODEX_THREAD_ID", "")
 

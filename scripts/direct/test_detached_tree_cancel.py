@@ -39,7 +39,11 @@ def deliver(member, membership, text, **options):
     write_text_atomic(path, json.dumps({"messages": messages}))
     return send.Result("queued", "private fixture")
 
-with patch.object(send, "deliver_worker_text", side_effect=deliver):
+def deliver_result(path: Path) -> int:
+    return detached_runs.main(["deliver", str(path)])
+
+with (patch.object(send, "deliver_worker_text", side_effect=deliver),
+      patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver_result)):
     raise SystemExit(detached_runs.main(sys.argv[1:]))
 """
 

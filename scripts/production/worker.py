@@ -25,11 +25,12 @@ from typing import Literal, cast, final
 
 from scripts.agents import detached_runs, worker_lifecycle
 from scripts.herdr import herdr_types
-from scripts.accounts import accounts
+from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
@@ -256,7 +257,7 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
     except ValueError:
         return
     tokens = 0
-    with source.open(encoding="utf-8") as transcript:
+    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
             record = rollouts.decode_rollout(line)
             if record is None:
@@ -351,6 +352,14 @@ def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownersh
     print(f"anomaly: {pane}: cleanup failed: {' '.join(reason.splitlines())}", file=sys.stderr)
 
 
+@dataclass(frozen=True)
+class SendNoticesAfterDispatch:
+    """This dispatch owns the lock and sends notices after its return."""
+
+
+SEND_NOTICES_AFTER_DISPATCH = SendNoticesAfterDispatch()
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -360,10 +369,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
              on_submission: Callable[[], object] = lambda: None,
              lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+             notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
-    with ExitStack() as operations, ExitStack() as cleanup:
+    with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
+        notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
@@ -377,17 +388,17 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
             if isinstance(receipt, DispatchComplete):
                 save_reply(Path(delivery.reply_file), receipt.reply)
-            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
                           import_module("scripts.herdr.turn_end").repeat_completion_notice)
-            repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
-                   worker_panes.worker_pass(row, session_dir))
+            _ = notice_delivery.callback(repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
+                                           worker_panes.worker_pass(row, session_dir)))
             return DispatchSubmission.SUBMITTED
         if row is not None:
             owner = staff.snapshot().parent_of(row)
             if owner is not None:
-                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], None],
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], Callable[[], None]],
                                    import_module("scripts.herdr.turn_end").finish_late_completion)
-                finish_late(row, owner, hold, completion_actions.held_role)
+                _ = notice_delivery.callback(finish_late(row, owner, hold, completion_actions.held_role))
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
@@ -605,6 +616,7 @@ def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.Wo
         return worker_panes.start_or_resume(parent, WorkerName.parse(name) if name else _free_name(parent, role, staff.snapshot()), role)
 
 
+@herdr.pane_evidence_run()
 def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path, slot: str,
            phase: str, kind: str, launcher_command: list[str], lens: str = "", name: str = "",
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
@@ -629,7 +641,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if needs_team:
             names = {row.name for row in rows}
             for default_role in ("impl", "fix", "review", "test"):
-                if default_role in names:
+                if default_role in names or default_role == role:
                     continue
                 before = rows_before_launch()
                 with redirect_stderr(io.StringIO()) as diagnostics:
@@ -849,6 +861,7 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",
@@ -988,7 +1001,13 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generato
         print(f"anomaly: {path}: {error}", file=sys.stderr)
 
 
-def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, WorkerDispatchRecord]:
+@dataclass(frozen=True)
+class RecordedWorkerDispatches:
+    by_worker: dict[StaffId, WorkerDispatchRecord]
+    runs: tuple[Path, ...]
+
+
+def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
     names = {(row.parent.id, row.name): row for row in workers if isinstance(row.parent, staff.ReportsTo)}
@@ -1063,7 +1082,7 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
                 del pending[str(target.id).encode()]
             if not pending:
                 break
-    return found
+    return RecordedWorkerDispatches(found, tuple(runs))
 
 
 class WorkerFilter(Enum):
@@ -1081,22 +1100,22 @@ def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter) -> b
             or selection is WorkerFilter.CLOSED and isinstance(state, worker_panes.ClosedWorker))
 
 
-def _waiting_on(row: staff.StaffRow, record: staff.StaffSnapshot) -> str:
-    run = worker_panes.worker_run(row, record=record)
-    return ", ".join(item["label"] for item in detached_runs.live_runs(
-        run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)) or "-"
+def _waiting_on(row: staff.StaffRow, detached: session_state.RunningDetachedWork) -> str:
+    return ", ".join(detached.labels.get(row.id, ())) or "-"
 
 
 def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = WorkerFilter.ALL,
                      as_json: bool = True) -> list[dict[str, object]]:
     dispatches = _recorded_worker_dispatches(record)
+    detached = (session_state.running_detached_work(record, additional_runs=dispatches.runs)
+                if not as_json else session_state.NO_DETACHED_WORK)
     states = {state.row.id: state for parent_id in dict.fromkeys(
         row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo))
         for state in worker_panes.observe(parent_id, record)} if selection is not WorkerFilter.ALL or not as_json else {}
     listing: list[dict[str, object]] = []
     for row in record.find(kind="worker"):
         parent = record.parent_of(row)
-        saved = dispatches.get(row.id, WorkerDispatchRecord({}, 0))
+        saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
         if parent is None:
             continue
         if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
@@ -1112,7 +1131,9 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
         work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
         if status == "active":
             try:
-                dispatch = worker_panes.worker_dispatch_state(row, worker_panes.worker_run(row, record=record))
+                run = worker_panes.worker_run(row, record=record)
+                dispatch = (worker_panes.worker_dispatch_state(row, run) if as_json else
+                            worker_panes.worker_dispatch_state(row, run, detached=detached))
                 if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
                     status, work = dispatch.value, "idle"
                 elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
@@ -1123,7 +1144,10 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
             "activity": fields.get("activity") or status})
         if not as_json:
             item["list_activity"] = activity or item["role"]
-            item["waiting_on"] = _waiting_on(row, record)
+            observed = states.get(row.id)
+            if observed is not None and isinstance(observed, worker_panes.OpenWorker):
+                item["pane"], item["state"] = _worker_pane_state(observed, detached)
+            item["waiting_on"] = _waiting_on(row, detached)
         listing.append(item)
     if not as_json:
         listing.sort(key=lambda fields: not (StaffId(str(fields["id"])) in states
@@ -1131,13 +1155,12 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
     return listing
 
 
-def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+def _worker_pane_state(state: worker_panes.WorkerPane,
+                       detached: session_state.RunningDetachedWork) -> tuple[str, str]:
     if isinstance(state, worker_panes.OpenWorker):
-        if isinstance(state.row.paused, staff.Paused):
-            return "open", "paused"
-        if isinstance(state.row.exited, staff.Exited):
-            return "open", "exited"
-        return "open", worker_panes.worker_state(state)
+        activity = worker_panes.worker_state(state)
+        classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
+        return "open", activity if activity == "unknown" and classified == "idle" else classified
     if isinstance(state, worker_panes.StoppedWorker):
         return "open", "exited"
     if isinstance(state, worker_panes.ClosedWorker):
@@ -1148,24 +1171,28 @@ def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
 def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True,
                  selection: WorkerFilter = WorkerFilter.ALL) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
-    observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
+    detached = session_state.running_detached_work(record)
+    observed = _read_workers(next(row for row in record.rows if row.id == parent), record,
+                             scanned=detached.launcher_runs.by_session)
     with progress_history.dispatch_reads(record, observed.runs):
         states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
         for state in states:
             if not _listed_worker(state, selection):
                 continue
-            facts: dict[str, object] = {"state": type(state).__name__, "work": worker_panes.worker_state(state)}
+            pane, displayed_state = _worker_pane_state(state, detached)
+            work = displayed_state if isinstance(state, worker_panes.OpenWorker) else worker_panes.worker_state(state)
+            facts: dict[str, object] = {"state": type(state).__name__, "work": work}
             fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
             if not as_json:
-                fields["pane"], fields["state"] = _worker_pane_state(state)
+                fields["pane"], fields["state"] = pane, displayed_state
                 dispatch = progress_history.last_dispatch(state.row.id)
                 fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
                                            and dispatch.status in ("active", "refused") else fields["role"])
-                fields["waiting_on"] = _waiting_on(state.row, record)
+                fields["waiting_on"] = _waiting_on(state.row, detached)
             listing.append(fields)
     return listing
 

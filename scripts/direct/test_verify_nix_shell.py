@@ -67,6 +67,7 @@ class VerifyNixShellTests(NixFixture):
         direct.mkdir(parents=True)
         self.verify_script = direct / "verify.sh"
         _ = shutil.copy2(VERIFY, self.verify_script)
+        _ = shutil.copy2(VERIFY.with_name("file_lock.sh"), direct / "file_lock.sh")
         self.verify_script.chmod(0o755)
         self.script(scripts / "lib/py", PYTHON_SHIM)
         (scripts / "lib/nix_env.py").symlink_to(SCRIPTS / "lib/nix_env.py")

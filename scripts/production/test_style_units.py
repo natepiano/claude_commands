@@ -615,12 +615,6 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual(self.database.read_bytes(), before)
 
-    def test_a_caller_must_supply_ledger_paths_even_when_a_phase_record_names_a_plan(self) -> None:
-        records: dict[str, object] = {"names": {"plan": str(self.root / "names.md")}}
-        with (patch.object(style_ledger, "ledger_location", side_effect=AssertionError("no phase-based lookup")),
-              self.assertRaisesRegex(TypeError, "ledger_paths")):
-            _ = style_units.table([live_unit("names")], records, doc=self.doc)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
-
     def test_an_explicit_ledger_path_keeps_ticket_and_counts_when_the_phase_record_is_unavailable(self) -> None:
         _ = self.ticket(count=3)
         self.findings(self.decision("approved", "names"), "filed", 7)

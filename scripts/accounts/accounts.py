@@ -144,6 +144,9 @@ ALWAYS_LINKED = frozenset({
     "paste-cache", "uploads",
 })
 CODEX_ALWAYS_LINKED = frozenset({"skills", "rules", "plugins", "sessions", "archived_sessions"})
+# Keep these links before the first append creates their shared targets.
+CODEX_WRITE_THROUGH = frozenset({"session_index.jsonl", "history.jsonl"})
+NO_WRITE_THROUGH_FILES = frozenset[str]()
 AT_FDCWD = -100  # Linux: resolve relative paths from the current directory.
 RENAME_NOREPLACE = 1  # Linux renameat2: refuse an existing destination.
 RENAME_EXCL = 4  # macOS renamex_np: refuse an existing destination.
@@ -776,12 +779,13 @@ def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> li
 
 def _shared_repair_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Judge shared entries without performing any of their possible repairs."""
     if destination == source_dir:
         return []
     if not source_dir.is_dir():
-        return _shared_link_problems(destination, source_dir, shared, folders)
+        return _shared_link_problems(destination, source_dir, shared, folders, write_through=write_through)
     problems: list[str] = []
     for name in shared:
         path, target = destination / name, source_dir / name
@@ -809,6 +813,7 @@ def _shared_repair_problems(
 
 def _repair_shared_links(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Repair entries inside an existing shared home; never create an empty shared file."""
     if (destination == source_dir or destination.is_symlink() or not destination.is_dir()
@@ -826,7 +831,7 @@ def _repair_shared_links(
                 if name in folders:
                     target.mkdir(mode=0o700, exist_ok=True)
                     target.chmod(0o700)
-                else:
+                elif name not in write_through:
                     if _is_expected_link(path, target):
                         try:
                             path.unlink()
@@ -1106,6 +1111,7 @@ def _link_problems(destination: Path) -> list[str]:
 
 def _shared_link_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], required: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     problems: list[str] = []
     for name in shared:
@@ -1125,7 +1131,7 @@ def _shared_link_problems(
                 problems.append(
                     f"accounts: {path} points to {actual}, not {target}"
                 )
-            elif not path.exists():
+            elif not path.exists() and not (name in write_through and not os.path.lexists(target)):
                 problems.append(f"accounts: {path} is broken")
         elif path.exists():
             problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
@@ -1335,6 +1341,7 @@ def _link_codex_home(label: str) -> list[str]:
         return [f"accounts: could not create {destination}: {error}"]
     problems = _repair_shared_links(
         destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     return problems
 
@@ -1396,10 +1403,11 @@ def _inspect_codex_home(label: str, destination: Path, workers_home: Path, *, al
         return CodexHomeInspection((diagnostic,), ObservedStateCause(diagnostic,
             ProblemCauseKey("access", CauseAccount(label), CauseFile(str(destination)))))
     problems = (_check_default_codex_home(workers_home) if destination == accounts_home() / ".codex"
-                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED)
+                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+                                            write_through=CODEX_WRITE_THROUGH)
                 if allow_shared_repair
                 else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
-                                           CODEX_SHARED, CODEX_ALWAYS_LINKED))
+                                           CODEX_SHARED, CODEX_ALWAYS_LINKED, write_through=CODEX_WRITE_THROUGH))
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
@@ -3361,6 +3369,7 @@ def check_codex_target(label: str, workers_home: Path, *, repair: bool = True) -
     target = _codex_move_target(label)
     problems = (_repair_shared_links if repair else _shared_repair_problems)(
         target.home, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     for problem in problems:
         account_anomaly(problem)
@@ -5165,14 +5174,20 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
         notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+            ProblemCause("warning", warning), NoUserStep())))
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
@@ -5280,6 +5295,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(error.__cause__, FileNotFoundError):
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
+    detached = session_state.running_detached_work(membership)
+    inputs.update(detached.inputs)
     for path in pane_launch.record_directory().glob("*.json"):
         inputs.add(path)
         try:
@@ -5287,9 +5304,9 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         except (OSError, ValueError):
             continue
         for launch in entries.values():
-            previous = launches.get(launch["session_id"])
+            previous = launches.get(pane_launch.reference_id(launch))
             if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
+                launches[pane_launch.reference_id(launch)] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 
@@ -5316,7 +5333,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                                              session_staff.LiveSession(identity))
             if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.StoredReference(launch["session_id"]))
+                                                 session_staff.StoredReference(pane_launch.reference_id(launch)))
         except (staff.StaffUnreadable, ValueError) as error:
             print(f"accounts: unit {identity}: {error}", file=sys.stderr)
             continue
@@ -5338,13 +5355,13 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
-                state = session_state.classify(session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                state = session_state.classify(owner if owner is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             else:
                 member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
                     member_row if member_row is not None else session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             counts.setdefault((directory, role), {})[identity] = state
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
@@ -5358,7 +5375,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        state = session_state.classify(member, session_state.NoLiveSession())
+        state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
         counts.setdefault((directory, role), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
@@ -5379,7 +5396,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
-                        session_state.UnrecordedStaff(), session_state.LiveActivity(status))
+                        state.row, session_state.LiveActivity(status), detached=detached)
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
@@ -5393,7 +5410,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
-                    session_state.UnrecordedStaff(), session_state.LiveActivity(process.activity))
+                    member, session_state.LiveActivity(process.activity), detached=detached)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 

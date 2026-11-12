@@ -6,7 +6,6 @@ except FileNotFoundError:
     pass
 
 import sys
-import fcntl
 import json
 import shlex
 import subprocess
@@ -27,6 +26,7 @@ from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch, agent_kind, without_staff_labels
+from scripts.herdr import pane_launch
 from scripts.lib import legacy_identity
 from scripts.production import unit_names
 
@@ -236,10 +236,14 @@ def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
             for name, raw in entries.items() if isinstance(raw, dict)}
 
 
-def read_worker_roster(path: Path) -> dict[str, object]:
-    from scripts.agents import worker_lifecycle
-    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
-        return handle.read_object()
+def run_workers(state: Mapping[str, object], record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Read the selected run's workers from the same staff snapshot as its owner."""
+    from scripts.lib import unit_runs
+
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+        return ()
+    return tuple(record.find(kind="worker", parent=owner.id))
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:
@@ -419,7 +423,7 @@ class RowResolver:
             return LocationUnfilled("the worktree is not recorded")
         retired = isinstance(tree, RemovedWorktree)
         if retired:
-            home = Path.home() if tree.machine == remote.local_machine() else Path("~")
+            home = None if tree.machine == remote.local_machine() else Path("~")
             path = configuration.parked_path(holder.id, home=home)
         else:
             path = tree.path / ".unit.toml"
@@ -453,11 +457,9 @@ class RowResolver:
         if isinstance(tree, WorktreeUnfilled):
             return LocationUnfilled("the worktree is not recorded")
         if isinstance(tree, RemovedWorktree):
-            config = self.unit_config(holder)
-            if isinstance(config, UnitConfig) and isinstance(config.retired, configuration.RetiredSession):
-                return Branch(config.retired.branch.value)
-            return RetiredFactsUnavailable(config.reason if isinstance(config, (ConfigMissing, RetiredFactsUnavailable))
-                                          else "parked retirement facts are missing")
+            if isinstance(tree.branch, staff.ParkedBranch):
+                return Branch(tree.branch.value)
+            return RetiredFactsUnavailable("the parked branch is not recorded in staff")
         state, text = self._fact(tree.machine, "git", tree.path)
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
@@ -776,7 +778,7 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
             candidates = set(pane_rows.get(unit.place, ()))
             for launch in launches:
                 if unit.place.session == shared_session and launch["pane_id"] == unit.place.pane:
-                    owner = record.by_current_session(launch["session_id"])
+                    owner = record.by_member_reference(pane_launch.reference_id(launch))
                     if owner is not None:
                         candidates.add(owner.id)
             if candidates:
@@ -863,11 +865,11 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        if agent_kind(launch) == "codex":
+        if agent_kind(launch, record=self.record) == "codex":
             return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)
-        owner = self.record.by_member_reference(launch["session_id"])
-        session_id = owner.current_session if owner is not None else launch["session_id"]
+        owner = self.record.by_member_reference(pane_launch.reference_id(launch))
+        session_id = owner.current_session if owner is not None else pane_launch.reference_id(launch)
         return labels.environment(launch["environment"], session_id)
 
 
@@ -894,7 +896,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
 
     record = staff.snapshot()
     history = pane_record.launches()
-    newest = {entry["session_id"]: entry["written_at"]
+    newest = {pane_launch.reference_id(entry): entry["written_at"]
               for entry in sorted(history, key=lambda item: item["written_at"])}
     live = sessions.running_sessions()
     repaired: list[RepairedSessionLabels] = []
@@ -908,7 +910,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
             if session is None or session["sessionId"] in seen:
                 continue
             seen.add(session["sessionId"])
-            if pane_record.matching_launch(process.place, session["sessionId"]) is not None:
+            if pane_launch.matching_launch(pane_record.read(process.place.session), process.place, session["sessionId"]) is not None:
                 continue
             try:
                 entry = pane_record.running_launch(session, process.place, process.cwd)
@@ -917,16 +919,16 @@ def repair_marks() -> list[RepairedSessionLabels]:
             if record.by_current_session(entry["session_id"]) is None:
                 continue
             pane_record.write(process.place.session, entry)
-            newest[entry["session_id"]] = entry["written_at"]
+            newest[pane_launch.reference_id(entry)] = entry["written_at"]
             repaired.append(RepairedSessionLabels(
-                f"{process.place.session}:{process.place.pane}:{entry['session_id']}",
+                f"{process.place.session}:{process.place.pane}:{pane_launch.reference_id(entry)}",
                 (), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)
             changed = False
             for pane, entry in entries.items():
-                if entry["written_at"] != newest.get(entry["session_id"]):
+                if entry["written_at"] != newest.get(pane_launch.reference_id(entry)):
                     continue
                 restored = entry.copy()
                 restored["environment"] = pane_record.retained_environment(entry, history)
@@ -935,7 +937,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
                     entries[pane] = restored
                     before, after = entry["environment"], restored["environment"]
                     repaired.append(RepairedSessionLabels(
-                        f"{path.stem}:{pane}:{entry['session_id']}",
+                        f"{path.stem}:{pane}:{pane_launch.reference_id(entry)}",
                         tuple((key, value) for key, value in sorted(after.items()) if before.get(key) != value),
                         tuple(sorted(key for key in before if key not in after))))
                     changed = True

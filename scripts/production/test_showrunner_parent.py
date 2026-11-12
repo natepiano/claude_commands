@@ -138,7 +138,7 @@ class ShowrunnerParentTests(StaffTestCase):
         _ = staff.move(leaf.id, staff.ReportsTo(child_row.id))
         _ = staff.move(child_row.id, staff.ReportsTo(parent_row.id))
         capture = showrunner_tree.edges_to_release("tools")
-        self.assertEqual(capture, showrunner_tree.WrapRelease(showrunner_tree.ReportedTo("umbrella"), ("leaf",), ()))
+        self.assertEqual(capture, showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent_row.id), (leaf.id,), ()))
         self.assertEqual(showrunner_tree.edges_to_release("tools"), capture)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
         self.assertEqual(list(state.glob("*/parent")), [])
