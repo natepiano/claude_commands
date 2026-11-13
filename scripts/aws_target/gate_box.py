@@ -6,19 +6,17 @@ from datetime import datetime
 import hashlib
 import hmac
 import json
-import inspect
 import shlex
+from pathlib import Path
 from urllib.parse import quote
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from enum import StrEnum
 import math
-from scripts.aws_target import ledger
 
 if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
+    from scripts.test_times import gate_record
 
-from scripts.lib import conf
-from scripts.test_times import gate_record
 
 
 @dataclass(frozen=True, repr=False)
@@ -60,6 +58,7 @@ RUN_FIELDS = {'module', 'variant', 'round', 'cpu_s', 'peak_mib', 'wall_s', 'stat
 
 def validate_paired_result(row: dict[str, object], request: dict[str, object], instance: str) -> None:
     """Validate the task identity and each measured sample."""
+    from scripts.aws_target import ledger
     for key in ('attempt', 'commit', 'tree', 'base', 'changed', 'module', 'rounds'):
         if row.get(key) != request[key]:
             raise ValueError('The paired result differs from ' + key)
@@ -89,7 +88,7 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
         raise ValueError('The paired result has no verdict')
 
 
-# The installed controller supplies the supervisor for both tested trees.
+# The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
 
@@ -107,17 +106,7 @@ def paired_trial():
     def upload():
         put(links['log'], b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists()))
     try:
-        repo = root / 'repo'
-        subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
-        trees = {}
-        for variant in ('base', 'changed'):
-            revision = gate_request[variant]
-            path = root / variant
-            subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(path), revision['commit']], check=True)
-            tree = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-            if tree != revision['tree']:
-                raise ValueError('The source tree differs from the request')
-            trees[variant] = path
+        trees = {variant: root / variant for variant in ('base', 'changed')}
         (root / 'measure').touch()
         with (root / 'upload.lock').open('a') as lock:
             import fcntl
@@ -217,29 +206,148 @@ def paired_trial():
             upload()
         except Exception as error:
             reply['log_error'] = str(error)
-        put(links['result'], json.dumps(reply).encode())
+    return reply
 
-paired_trial()
+result.clear()
+result.update(paired_trial())
 '''
 
 
-def paired_supervisor() -> str:
-    """Embed the installed gate environment and memory sampler."""
+GUEST_TRANSFERS = r'''import json, subprocess, time
+def stage(name):
+    try:
+        with (root / 'boot.log').open('a') as output:
+            output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
+    except OSError:
+        pass
+def get(url, destination):
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
+def put(url, content):
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', url],
+                   input=content, check=True)
+def publish(name):
+    put(links[name], json.dumps(result).encode())
+'''
+
+
+CANDIDATE_GUEST = r'''import contextlib, json, os, pathlib, subprocess, threading, time, traceback
+def busy_cpu_seconds():
+    ticks = list(map(int, pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
+    return (sum(ticks) - ticks[3] - ticks[4] - ticks[7]) / os.sysconf('SC_CLK_TCK')
+def sample_memory():
+    try:
+        fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
+        used = (int(fields['MemTotal'].split()[0]) - int(fields['MemAvailable'].split()[0])) * 1024
+        result['memory_peak_bytes'] = max(result['memory_peak_bytes'] or 0, used)
+    except (OSError, ValueError, KeyError):
+        pass
+def monitor_memory(stop):
+    while True:
+        sample_memory()
+        if stop.wait(2):
+            return
+memory_stop = threading.Event()
+memory_thread = None
+cpu_started = None
+try:
+    repo = root / 'repo'
     from scripts.production import merge_gate
-    from scripts.lib.descendants import adopt_descendants
-    from scripts.lib.process_group import check_process_group, send_process_group
-    environment = inspect.getsource(merge_gate.test_module_environment).replace(
-        'Path(__file__).resolve().parents[1] / "lib/py"', 'sys.executable')
-    return ('from pathlib import Path\nimport ctypes\nfrom typing import cast\n'
-            + inspect.getsource(adopt_descendants) + '\n' + environment + '\n'
-            + inspect.getsource(merge_gate.swapped_kib) + '\n'
-            + inspect.getsource(merge_gate.process_memory_mib) + '\n'
-            + inspect.getsource(check_process_group) + '\n'
-            + inspect.getsource(send_process_group) + '\n' + PAIRED_GUEST)
+    os.environ['HERDR_BIN'] = '/nonexistent/herdr'
+    timings = {}
+    if 'module_seconds' in links:
+        get(links['module_seconds'], root / 'module_seconds.json')
+        timings = json.loads((root / 'module_seconds.json').read_text())
+    result['tools_ready_at'] = time.time()
+    result['module_time_limit_s'] = links['module_time_limit_s']
+    result['max_running_jobs'] = os.cpu_count() or 1
+    result['vcpus'] = result['max_running_jobs']
+    sample_memory()
+    memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
+    memory_thread.start()
+    stage('tests start')
+    with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        with merge_gate.rollback_signals():
+            cpu_started = busy_cpu_seconds()
+            result['gate_started_at'] = time.time()
+            if links.get('production'):
+                gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+                                            module_time_limit_s=links['module_time_limit_s'],
+                                            selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
+                                            mode=merge_gate.SuiteMode(links['mode']))
+            else:
+                gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+                                            module_time_limit_s=links['module_time_limit_s'])
+            if links.get('production'):
+                result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
+                                                     result['gate_started_at'], time.time(), links['mode'])
+                dirty = gate_request['dirty_paths']
+                result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
+                                        dirty_path_count=len(dirty))
+                result.update(attempt=links['attempt'], commit=links['commit'], tree=links['tree'],
+                              host=os.uname().nodename, gate=encode_run(gate))
+            result['gate_finished_at'] = time.time()
+            cpu_finished = busy_cpu_seconds()
+    result['verdict'] = 'pass' if gate.passed else 'fail'
+    result['modules'] = []
+    for job in gate.jobs:
+        measured = job.times if isinstance(job.times, dict) else {}
+        result['tests'] += measured.get('tests_run', 0)
+        result['skips'] += measured.get('skipped', 0)
+        name = job.suite + '/' + job.module
+        result['modules'].append({'module': name, 'status': job.returncode, 'tests': measured.get('tests_run', 0),
+                                  'skips': measured.get('skipped', 0), 'seconds': job.seconds, 'stopped': bool(job.killed_for)})
+        if job.returncode:
+            result['failed_modules'].append(name)
+except BaseException:
+    if 'gate_started_at' in result:
+        result['gate_finished_at'] = time.time()
+        cpu_finished = busy_cpu_seconds()
+    result['verdict'] = 'error'
+    result['error'] = traceback.format_exc()
+    with log.open('a') as output:
+        output.write(result['error'])
+finally:
+    if cpu_started is not None:
+        if 'gate_finished_at' not in result:
+            result['gate_finished_at'] = time.time()
+            cpu_finished = busy_cpu_seconds()
+        result['gate_s'] = result['gate_finished_at'] - result['gate_started_at']
+        result['busy_cpu_s'] = cpu_finished - cpu_started
+        result['cpu_use_percent'] = 100 * result['busy_cpu_s'] / max(0.001, result['vcpus'] * result['gate_s'])
+    if memory_thread is not None:
+        memory_stop.set()
+        memory_thread.join()
+        sample_memory()
+'''
 
 
-# This program runs inside the instance's tool shell, not on natedev.
-LEGACY_GUEST = r'''import concurrent.futures, contextlib, datetime, json, os, pathlib, sqlite3, subprocess, sys, threading, time, traceback
+def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -> None:
+    """Run the verified candidate with its own suite and record code."""
+    namespace: dict[str, object] = {
+        'root': root, 'links': links, 'result': result, 'log': root / 'gate.log',
+        'encode_run': encode_run, 'completion_record': completion_record,
+    }
+    exec(GUEST_TRANSFERS, namespace)
+    if links.get('production'):
+        request = cast(dict[str, object], json.loads((root / 'request.json').read_text()))
+        namespace['gate_request'] = request
+        if request.get('task') == 'paired':
+            from scripts.production import merge_gate
+            from scripts.lib.descendants import adopt_descendants
+            from scripts.lib.process_group import send_process_group
+            namespace.update(
+                timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
+                           'kernel_boot_at', 'instance_running_at') if key in result},
+                adopt_descendants=adopt_descendants, send_process_group=send_process_group,
+                test_module_environment=merge_gate.test_module_environment,
+                process_memory_mib=merge_gate.process_memory_mib)
+            exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
+            return
+    exec(CANDIDATE_GUEST, namespace)
+
+
+# The live bootstrap verifies the tree before it calls the candidate entry point.
+GUEST = r'''import concurrent.futures, datetime, importlib, json, os, pathlib, sqlite3, subprocess, sys, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
@@ -264,170 +372,97 @@ for metadata_path in ('/etc/ec2-metadata/instance-identity-document', '/run/clou
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         continue
     break
-def stage(name):
-    try:
-        with (root / 'boot.log').open('a') as output:
-            output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
-    except OSError:
-        pass
-links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
+''' + GUEST_TRANSFERS + r'''links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
 result = {**timestamps, 'verdict': 'ready', 'tests': 0, 'skips': 0, 'failed_modules': [], 'memory_peak_bytes': None}
 log = root / 'gate.log'
-def get(url, destination):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
-def put(url, content):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', url],
-                   input=content, check=True)
-def publish(name):
-    put(links[name], json.dumps(result).encode())
-def busy_cpu_seconds():
-    ticks = list(map(int, pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
-    return (sum(ticks) - ticks[3] - ticks[4] - ticks[7]) / os.sysconf('SC_CLK_TCK')
-def sample_memory():
-    try:
-        fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
-        used = (int(fields['MemTotal'].split()[0]) - int(fields['MemAvailable'].split()[0])) * 1024
-        result['memory_peak_bytes'] = max(result['memory_peak_bytes'] or 0, used)
-    except (OSError, ValueError, KeyError):
-        pass
-def monitor_memory(stop):
-    while True:
-        sample_memory()
-        if stop.wait(2):
-            return
-memory_stop = threading.Event()
-memory_thread = None
-cpu_started = None
 try:
-    result['tools'] = {}
-    def tool_version(name):
-        version = subprocess.run([name, '--version'], capture_output=True, text=True)
-        return (version.stdout or version.stderr).strip()
-    names = ('git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as tools:
-        for name, version in zip(names, tools.map(tool_version, names)):
-            result['tools'][name] = version
-    stage('tools checked')
-    result['tools']['python_sqlite'] = sqlite3.sqlite_version
+    if not (links.get('production') and gate_request.get('task') == 'paired'):
+        result['tools'] = {}
+        def tool_version(name):
+            version = subprocess.run([name, '--version'], capture_output=True, text=True)
+            return (version.stdout or version.stderr).strip()
+        names = ('git', 'python3', 'cargo', 'rustc', 'rustdoc', 'rustup', 'cargo-nextest', 'uv', 'sqlite3')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as tools:
+            for name, version in zip(names, tools.map(tool_version, names)):
+                result['tools'][name] = version
+        stage('tools checked')
+        result['tools']['python_sqlite'] = sqlite3.sqlite_version
     if links['step'] == 'start':
         result['tools_ready_at'] = time.time()
         links['boot'] = 'warm' if (root / 'prepared').exists() else 'cold'
     else:
         repo = root / 'repo'
-        if links.get('production'):
+        if links.get('production') and gate_request.get('task') == 'paired':
             subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
-            if links.get('source'):
-                get(links['source'], root / 'source.bundle')
-                subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), links['commit']], check=True)
-            subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
+            for variant in ('base', 'changed'):
+                revision = gate_request[variant]
+                path = root / variant
+                subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(path), revision['commit']], check=True)
+                tree = subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+                if tree != revision['tree']:
+                    raise ValueError('The source tree differs from the request')
+            repo = root / 'changed'
         else:
-            get(links['source'], root / 'source.bundle')
-            subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(repo)], check=True)
-        subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
-        if links.get('production'):
-            from subprocess import check_output
-            tree = check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-            if tree != links['tree']:
-                raise ValueError('The source tree differs from the request')
-            subprocess.run(['git', '-C', str(repo), 'remote', 'set-url', 'origin', links['origin']], check=True)
+            if links.get('production'):
+                subprocess.run(['git', 'clone', gate_request['clone_url'], str(repo)], check=True)
+                if links.get('source'):
+                    get(links['source'], root / 'source.bundle')
+                    subprocess.run(['git', '-C', str(repo), 'fetch', str(root / 'source.bundle'), links['commit']], check=True)
+                subprocess.run(['git', '-C', str(repo), 'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']], check=True)
+            else:
+                get(links['source'], root / 'source.bundle')
+                subprocess.run(['git', 'clone', str(root / 'source.bundle'), str(repo)], check=True)
+            subprocess.run(['git', '-C', str(repo), 'checkout', '--detach', links['commit']], check=True)
+            if links.get('production'):
+                from subprocess import check_output
+                tree = check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+                if tree != links['tree']:
+                    raise ValueError('The source tree differs from the request')
+                subprocess.run(['git', '-C', str(repo), 'remote', 'set-url', 'origin', links['origin']], check=True)
         stage('source ready')
         home = pathlib.Path.home() / '.claude'
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
         sys.path.insert(0, str(repo))
-        from scripts.production import merge_gate
-        os.environ['HERDR_BIN'] = '/nonexistent/herdr'
-        timings = {}
-        if 'module_seconds' in links:
-            get(links['module_seconds'], root / 'module_seconds.json')
-            timings = json.loads((root / 'module_seconds.json').read_text())
-        result['tools_ready_at'] = time.time()
-        result['module_time_limit_s'] = links['module_time_limit_s']
-        result['max_running_jobs'] = os.cpu_count() or 1
-        result['vcpus'] = result['max_running_jobs']
-        sample_memory()
-        memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-        memory_thread.start()
-        stage('tests start')
-        with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            with merge_gate.rollback_signals():
-                cpu_started = busy_cpu_seconds()
-                result['gate_started_at'] = time.time()
-                if links.get('production'):
-                    gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
-                                                module_time_limit_s=links['module_time_limit_s'],
-                                                selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
-                                                mode=merge_gate.SuiteMode(links['mode']))
-                else:
-                    gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
-                                                module_time_limit_s=links['module_time_limit_s'])
-                if links.get('production'):
-                    from scripts.aws_target.gate_box import encode_run, completion_record
-                    result['record'] = completion_record(gate, links['attempt'], links['commit'], tree, os.uname().nodename,
-                                                         result['gate_started_at'], time.time(), links['mode'])
-                    dirty = gate_request['dirty_paths']
-                    result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
-                                            dirty_path_count=len(dirty))
-                    result.update(attempt=links['attempt'], commit=links['commit'], tree=tree,
-                                  host=os.uname().nodename, gate=encode_run(gate))
-                result['gate_finished_at'] = time.time()
-                cpu_finished = busy_cpu_seconds()
-        result['verdict'] = 'pass' if gate.passed else 'fail'
-        result['modules'] = []
-        for job in gate.jobs:
-            measured = job.times if isinstance(job.times, dict) else {}
-            result['tests'] += measured.get('tests_run', 0)
-            result['skips'] += measured.get('skipped', 0)
-            name = job.suite + '/' + job.module
-            result['modules'].append({'module': name, 'status': job.returncode, 'tests': measured.get('tests_run', 0),
-                                      'skips': measured.get('skipped', 0), 'seconds': job.seconds, 'stopped': bool(job.killed_for)})
-            if job.returncode:
-                result['failed_modules'].append(name)
-except BaseException:
-    if 'gate_started_at' in result:
-        result['gate_finished_at'] = time.time()
-        cpu_finished = busy_cpu_seconds()
+        candidate_path = repo / 'scripts/aws_target/gate_box.py'
+        if not candidate_path.is_file():
+            raise RuntimeError('candidate predates guest entry point')
+        candidate = importlib.import_module('scripts.aws_target.gate_box')
+        if pathlib.Path(candidate.__file__).resolve() != candidate_path.resolve():
+            raise RuntimeError('The guest entry point is outside the candidate tree')
+        entry = getattr(candidate, 'run_guest', None)
+        if not callable(entry):
+            raise RuntimeError('candidate predates guest entry point')
+        entry(root, links, result)
+except Exception as error:
     result['verdict'] = 'error'
-    result['error'] = traceback.format_exc()
+    result['error'] = str(error) if str(error) == 'candidate predates guest entry point' else traceback.format_exc()
+    if result['error'] == 'candidate predates guest entry point' and 'boot_error' in links:
+        put(links['boot_error'], json.dumps(result).encode())
     with log.open('a') as output:
         output.write(result['error'])
 finally:
-    if cpu_started is not None:
-        if 'gate_finished_at' not in result:
-            result['gate_finished_at'] = time.time()
-            cpu_finished = busy_cpu_seconds()
-        result['gate_s'] = result['gate_finished_at'] - result['gate_started_at']
-        result['busy_cpu_s'] = cpu_finished - cpu_started
-        result['cpu_use_percent'] = 100 * result['busy_cpu_s'] / max(0.001, result['vcpus'] * result['gate_s'])
-    if memory_thread is not None:
-        memory_stop.set()
-        memory_thread.join()
-        sample_memory()
-    try:
-        if links.get('production'):
-            with log.open('a') as output:
-                output.write('Cloud gate: uploading\n')
-        content = b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists())
+    if not (links.get('production') and gate_request.get('task') == 'paired'):
         try:
-            snapshot = subprocess.run(['ps', '-eo', 'etimes,pcpu,rss,args', '--sort=-etimes'], capture_output=True, text=True)
-            lines = [line[:200] for line in snapshot.stdout.splitlines() if 'curl' not in line][:60]
-            content += ('\n' + '\n'.join(lines) + '\n').encode()
-        except (OSError, subprocess.SubprocessError):
-            pass
-        content += time.strftime('\nUTC: %Y-%m-%dT%H:%M:%SZ\n', time.gmtime()).encode()
-        put(links['log'], content)
-    except Exception as error:
-        result['log_error'] = str(error)
+            if links.get('production'):
+                with log.open('a') as output:
+                    output.write('Cloud gate: uploading\n')
+            content = b''.join(path.read_bytes() for path in (root / 'boot.log', log, root / 'timeline.log') if path.exists())
+            try:
+                snapshot = subprocess.run(['ps', '-eo', 'etimes,pcpu,rss,args', '--sort=-etimes'], capture_output=True, text=True)
+                lines = [line[:200] for line in snapshot.stdout.splitlines() if 'curl' not in line][:60]
+                content += ('\n' + '\n'.join(lines) + '\n').encode()
+            except (OSError, subprocess.SubprocessError):
+                pass
+            content += time.strftime('\nUTC: %Y-%m-%dT%H:%M:%SZ\n', time.gmtime()).encode()
+            put(links['log'], content)
+        except Exception as error:
+            result['log_error'] = str(error)
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
 '''
-
-
-GUEST = LEGACY_GUEST.replace("links['boot'] =",
-    "if links.get('production') and gate_request.get('task') == 'paired':\n    exec(" + repr(paired_supervisor())
-    + ")\n    raise SystemExit(0)\nlinks['boot'] =", 1)
 
 
 def log_upload(links: dict[str, str]) -> str:
@@ -489,6 +524,7 @@ GATE_IMAGE_OWNER_TAG = 'cloud-claude-gate-image'
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
+    from scripts.lib import conf
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     def download(key: str, name: str) -> str:
@@ -546,6 +582,7 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
+    from scripts.test_times import gate_record
     from scripts.production.merge_gate import GateRun, GateJobResult
     from dataclasses import asdict
     if not isinstance(run, GateRun):
@@ -568,6 +605,7 @@ def encode_run(run: object) -> dict[str, object]:
 
 def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
+    from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
     from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
     import math
@@ -613,6 +651,7 @@ def decode_run(value: object) -> GateRun:
 
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
     """Keep every attempt's output for the gate record writer."""
+    from scripts.test_times import gate_record
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
                                   job.returncode, job.restart, job.times, job.output,
                                   wall_clock=job.wall_clock)
@@ -622,6 +661,7 @@ def execution_records(value: GateRun) -> list[gate_record.Execution]:
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
                       started: float, ended: float, mode: str) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
+    from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record
     from scripts.production.merge_gate import GateRun

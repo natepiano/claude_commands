@@ -116,7 +116,7 @@ The default remains three measured rounds.
 The reserved box lifetime includes both warm-up runs and all measured rounds.
 The guest divides the available time across warm-up runs and measured rounds.
 Odd rounds run base first; even rounds run changed first.
-The installed guest supplies the environment and memory sampler.
+The changed candidate supplies the supervisor, environment, and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
@@ -202,6 +202,17 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The live `gate_box.GUEST` program contains the bootstrap code.
+The bootstrap downloads or clones the candidate and verifies its requested tree.
+It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.
+The entry point accepts the box directory, links, and mutable result dictionary.
+The candidate supplies its own suite, rollback, timing, and record code.
+The bootstrap names no `merge_gate` attribute and copies no host function source.
+A paired trial uses the changed candidate's entry point to supervise both verified trees.
+A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
+The controller then uses the normal natedev fallback.
+The result fields and transfer links keep their existing format.
+
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.
 The current source checkout occurs after `nix_ready_at`, so results omit `source_ready_at`.
