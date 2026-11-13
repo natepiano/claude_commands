@@ -9,7 +9,12 @@ Run this in the showrunner session. Run
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
 Print the tables as Markdown in the reply, without code fences.
-Keep each phase on one Markdown row so Claude Code wraps its cells within the terminal width.
+Preserve continuation rows exactly as the script prints them.
+Each continuation row repeats Unit and fills one work cell.
+The script reads this pane's width once from herdr and shapes the phase tables for that width.
+When it cannot read the width within `units_table_width_read_milliseconds`, it uses `units_table_floor_columns`.
+This fallback is normal and prints no anomaly.
+`units_table_cell_lines` sets the cell line cap for Claude Code 2.1.319.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
 For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule.
@@ -27,6 +32,11 @@ Each table omits a column when every row has `—` in that column.
 A table without rows keeps its columns.
 The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
 Claude Code sets their column widths from the terminal width.
+When the column minimums exceed that width, the script adds a space inside the longest ID.
+The space follows a `-`, `/` or `_` between two letters or digits.
+A word without such a mark breaks only at `units_table_break_columns` or more columns; shorter words stay whole.
+When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks.
+One break costs less than Claude Code's hard wrap of every column.
 The style table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
 It allows four columns for the terminal margin and measures text before Markdown escaping.
 Long style text cells end with `…`; a cut never splits a wide character.
@@ -113,10 +123,10 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
 Workers first limits each cell to 80 characters.
 Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
 Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
-The helper preserves full cells for native Markdown wrapping.
-Workers uses the same wrapping form when the status table exceeds the terminal width.
-Do not insert `<br>` or continuation rows.
-Claude Code displays `<br>` as text and adds row borders around continuation rows.
+At the pane width, or the floor without one, a cell that needs more lines than the cap continues on extra rows.
+A split uses ` · ` first, then `; `, then a word boundary.
+Unit, Status, Machine, and Progress never split.
+Do not insert `<br>`; Claude Code displays it as text.
 Empty cells show `—`.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
