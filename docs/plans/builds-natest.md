@@ -3832,35 +3832,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 255 — The send tests do less repeated work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `message/test_send.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** next untouched module in the descending CPU list (show.py top 15:18: rank 12, 38.0 median CPU s, 316 tests). Slowest kept test `AccountDaemonRoutingTests.test_names_that_differ_only_in_case_are_ambiguous_even_with_an_exact_match` 5.5 s.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD message/test_send.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Remove repeated work a test does not check: per-test setup that can be built once per class and copied, process starts that a content-only test does not check (use the `invoke_cli` pattern), and repeated parsing. Keep real process starts where a test checks process integration, exit status, signals or waits. Also look for test-isolation defects: inherited `UNIT_*` variables, real run roots, real staff or home paths. Report each one.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/message/test_send.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235-238 and 251: class seed copies; register cleanup before a copy. Phase 252: bind private run roots with `bind_private_run_roots`. Phase 242: in-process calls bind per call the module state that the real process reads at start. Phases 240-247: natedev gains can come from host state; only aws pairs decide a land.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `message/repeat_guard_test_support.py`: `run_guard_in_process()` patches `repeat_guard.isolated` with `guard_worker_in_process` for the module; the real worker decode and storage run in process, and a fault warns once and admits delivery. Child interpreters keep the process boundary.
+- `message/test_send.py`: `setUpModule` calls it; `repeat_guard.py` starts 262 -> 5.
+- aws pairs: 31.409 -> 13.550 CPU s (paired median saving 17.865 s); peak 180.2 -> 180.4 MiB. 317 tests and their assertions unchanged; director reviews approve. Checkpoint 8fc1fdc55.
 
 ### Phase 256 — The stall watch tests do less repeated work  · status: todo
 **Depends on:** none
