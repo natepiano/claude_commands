@@ -35,14 +35,17 @@ class RebuildSettings:
     ssh: str
     interval: int
     eval_timeout: int
+    eval_retry_seconds: int
 
     @classmethod
     def read(cls, path: Path) -> RebuildSettings:
         values = config_values(path)
         settings = cls(Path(values["rebuild.repo"]), values["rebuild.ref"],
                        values["rebuild.natedev"], values["rebuild.mac"],
-                       values["rebuild.ssh"], int(values["rebuild.interval"]), int(values["rebuild.eval_timeout"]))
-        if not settings.repo.is_absolute() or settings.interval <= 0:
+                       values["rebuild.ssh"], int(values["rebuild.interval"]), int(values["rebuild.eval_timeout"]),
+                       int(values["rebuild.eval_retry_seconds"]))
+        if (not settings.repo.is_absolute() or settings.interval <= 0
+                or settings.eval_timeout <= 0 or settings.eval_retry_seconds <= 0):
             raise ValueError("Invalid rebuild settings")
         if not all((settings.ref, settings.natedev, settings.mac, settings.ssh)):
             raise ValueError("Empty rebuild settings")
@@ -88,12 +91,26 @@ class ExpectedSystems:
                            "natedev": self.natedev, "mac": self.mac})
 
 
+@dataclass(frozen=True)
+class NoEvaluationFailure:
+    """No failed evaluation requires a retry delay."""
+
+
+@dataclass(frozen=True)
+class EvaluationFailure:
+    """The commit, source, and completion time of a failed evaluation."""
+
+    commit: str
+    source: tuple[str, ...]
+    failed_at: float
+
+    def details(self) -> str:
+        return json.dumps({"commit": self.commit, "source": self.source, "failed_at": self.failed_at})
+
+
 def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoExpectedSystems,
-                     run: CommandRunner) -> ExpectedSystems | NoExpectedSystems:
-    """Reuse complete evaluations and retry missing results."""
-    commit = run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{settings.ref}^{{commit}}"])
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
-        return NoExpectedSystems()
+                     run: CommandRunner, commit: str) -> ExpectedSystems | NoExpectedSystems:
+    """Reuse a complete evaluation for the resolved commit or evaluate it."""
     source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
     if (isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source
             and system_path(previous.natedev) and system_path(previous.mac)):
@@ -141,6 +158,7 @@ class RebuildAnswer:
     machines: tuple[str, ...]
     refresh_due: bool
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
+    failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -162,9 +180,9 @@ def cache_path(config: Path) -> Path:
     return path
 
 
-def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
+def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time) -> RebuildAnswer:
     """Combine the cached comparison with open rebuild needs."""
-    answer = _read_cache(config)
+    answer = _read_cache(config, clock)
     try:
         machines = set(answer.machines) | {summary.newest["machine"] for summary in need.read_needs()}
     except (OSError, ValueError, KeyError, TypeError):
@@ -172,7 +190,7 @@ def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
     return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines))
 
 
-def _read_cache(config: Path) -> RebuildAnswer:
+def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
     """Read the configured comparison cache without evaluating systems."""
     try:
         cache = cache_path(config)
@@ -182,28 +200,33 @@ def _read_cache(config: Path) -> RebuildAnswer:
         lines = cache.read_text(encoding="utf-8").splitlines()
         if len(lines) < 2 or not lines[1].isdigit():
             return RebuildAnswer((), True)
-        refresh_due = int(lines[1]) <= time.time() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
+        refresh_due = int(lines[1]) <= clock() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
         expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
+        failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
         if len(lines) >= 4:
             try:
                 details = cast(dict[str, object], json.loads(lines[3]))
                 commit, source = details["commit"], details["source"]
-                local, mac = details["natedev"], details["mac"]
                 if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
-                        and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))
-                        and isinstance(local, str) and system_path(local) and isinstance(mac, str) and system_path(mac)):
-                    expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
+                        and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))):
+                    failed_at = details.get("failed_at")
+                    if isinstance(failed_at, (float, int)) and 0 <= failed_at < float("inf"):
+                        failure = EvaluationFailure(commit, tuple(cast(list[str], source)), failed_at)
+                    else:
+                        local, mac = details["natedev"], details["mac"]
+                        if isinstance(local, str) and system_path(local) and isinstance(mac, str) and system_path(mac):
+                            expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
             except (ValueError, KeyError, TypeError):
                 pass
-        return RebuildAnswer(tuple(item.removeprefix("rebuild ") for item in items), refresh_due, expected)
+        return RebuildAnswer(tuple(item.removeprefix("rebuild ") for item in items), refresh_due, expected, failure)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
 
-def write(config: Path, run: CommandRunner = command_output) -> None:
+def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
     from scripts.statusline import counts_row
 
@@ -217,18 +240,30 @@ def write(config: Path, run: CommandRunner = command_output) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
-        answer = read(config)
+        answer = _read_cache(config, clock)
         if not answer.refresh_due:
             return
         began = time.time_ns()
         line, due, details = "", "", ""
+        if isinstance(answer.failure, EvaluationFailure):
+            line, details = answer.row(), answer.failure.details()
         try:
             settings = RebuildSettings.read(config)
-            expected = expected_systems(settings, answer.expected, run)
-            line = row(settings, expected, run)
-            if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
-                details = expected.details()
-            due = str(int(time.time()) + settings.interval)
+            commit = run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{settings.ref}^{{commit}}"])
+            source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
+            failure = answer.failure
+            if (isinstance(failure, EvaluationFailure) and failure.commit == commit and failure.source == source
+                    and clock() < failure.failed_at + settings.eval_retry_seconds):
+                line, details = answer.row(), failure.details()
+            elif re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+                expected = expected_systems(settings, answer.expected, run, commit)
+                evaluated_at = clock()
+                line = row(settings, expected, run)
+                if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
+                    details = expected.details()
+                else:
+                    details = EvaluationFailure(commit, source, evaluated_at).details()
+            due = str(int(clock()) + settings.interval)
         except (OSError, ValueError, KeyError):
             pass
         counts_row.write_cache(cache, line, due, [config], began, details)

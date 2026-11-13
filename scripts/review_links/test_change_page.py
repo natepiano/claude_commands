@@ -1605,12 +1605,26 @@ class ChangePageTests(unittest.TestCase):
         for refusal in ("bad proposal /private/file.json", "feature_log: bad proposal /private/file.json"):
             with (self.subTest(refusal=refusal),
                   patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError(refusal))):
-                failed = self.http_request(path, fields)
-                self.assertEqual(failed.status, 503)
-                self.assertEqual(json.loads(failed.body), {"reason": "The feature log could not be updated."})
-                self.assertNotIn("/private/", failed.body)
-                self.assertEqual(len(change_review.pending(self.review_list)), 3)
-                self.assertEqual(self.messages[-1][2].splitlines()[1], "feature_log: bad proposal /private/file.json")
+                for _attempt in range(3):
+                    failed = self.http_request(path, fields)
+                    self.assertEqual(failed.status, 503)
+                    self.assertEqual(json.loads(failed.body), {"reason": "The feature log could not be updated."})
+                    self.assertNotIn("/private/", failed.body)
+                    self.assertEqual(len(change_review.pending(self.review_list)), 3)
+                    self.assertEqual(self.messages[-1][2].splitlines()[1], "feature_log: bad proposal /private/file.json")
+                    self.assertEqual(len(self.messages), 1)
+        with patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError("another failure")):
+            self.assertEqual(self.http_request(path, fields).status, 503)
+        self.assertEqual(len(self.messages), 2)
+        with patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError("bad proposal /private/file.json")):
+            other = self.browser_fields(forms, "page-owner/C3", "not works", "Another row")
+            self.assertEqual(self.http_request(path, other).status, 503)
+        self.assertEqual(len(self.messages), 3)
+        status = change_page.DeliveryStatus(self.root)
+        with patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError("bad proposal /private/file.json")):
+            with self.assertRaises(change_page.FeatureLogFailed):
+                change_page.closeout_before_save(self.page, self.production, "C1", "not works", status)
+        self.assertEqual(len(self.messages), 3)
         self.delivery_done.clear()
         saved = self.http_request(path, fields)
         self.assertEqual(saved.status, 200)

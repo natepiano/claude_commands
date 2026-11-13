@@ -115,6 +115,112 @@ raise SystemExit(1)
                     self.assertIn("alpha phase 2", self.log.read_text())
                     self.assertIn("beta phase 2", self.log.read_text())
 
+    def test_main_conflict_drops_only_the_conflicting_unit_before_clean_items_land(self) -> None:
+        for main_moves_after_tests in (False, True):
+            with self.subTest(main_moves_after_tests=main_moves_after_tests):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.promotions = str(self.promote)
+                self.production_doc()
+                start = self.git("rev-parse", "HEAD")
+                first = self.checkpoint(content="clean alpha change\n")
+                second = self.beta_checkpoint("src/beta.txt", "beta conflict\n")
+                third = self.checkpoint("src/third.txt", "another clean alpha change\n")
+                main_commit = self.push_main_change("src/beta.txt", "main conflict\n")
+                if main_moves_after_tests:
+                    _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
+                    self.executable(self.bin / "checkpoint-test", STUB + f'''
+import subprocess
+subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+''')
+                result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second),
+                                          self.batch_line("alpha", "3", third)])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+                repair = [line for line in notices if "merge origin/main" in line]
+                self.assertEqual(repair, ["send beta: merge origin/main into your own unit branch, "
+                                          + "resolve src/beta.txt, and send a new checkpoint"])
+                self.assertIn(f"beta phase 2 ({second[:12]}): origin/main conflicts: src/beta.txt", result.stdout)
+                self.assertNotIn("merge origin/main into the merge branch", result.stdout)
+                self.assertIn("send alpha: phase 2 merged", result.stdout)
+                self.assertIn("send alpha: phase 3 merged", result.stdout)
+                self.assertNotIn("send beta: phase 2 merged", result.stdout)
+                self.assertEqual(result.stdout.count("batch: retry"), 1)
+                tip = self.git("rev-parse", "HEAD")
+                for branch in ("production", "main"):
+                    self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), tip)
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+                merges = self.git("rev-list", "--reverse", "--first-parent", "--merges", start + ".." + tip).splitlines()
+                self.assertEqual([self.git("rev-parse", merge + "^2") for merge in merges], [first, third, main_commit])
+                self.assertEqual([row["source_checkpoint"] for row in self.receipts()], [first, third, main_commit])
+                self.assertEqual(self.git("show", "HEAD:src/beta.txt"), "main conflict")
+                self.assertEqual(self.git("show", "HEAD:src/alpha.txt"), "clean alpha change")
+                self.assertEqual(self.git("show", "HEAD:src/third.txt"), "another clean alpha change")
+                self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_bisection_main_conflict_keeps_the_clean_unit_out_of_repair_notices(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        start = self.git("rev-parse", "HEAD")
+        self.write(self.unit, "src/broken.txt", "shared test failure\n")
+        _ = self.git("add", "src/broken.txt", cwd=self.unit)
+        first = self.checkpoint(content="alpha conflicts with main\n")
+        second = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+        third = self.checkpoint(content="main resolution\n")
+        main_commit = self.push_main_change("src/alpha.txt", "main resolution\n")
+        self.executable(self.bin / "checkpoint-test", STUB + '''
+raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
+''')
+        result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second),
+                                  self.batch_line("alpha", "3", third)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual([line for line in notices if line.startswith("send beta:")],
+                         [line for line in notices if line.startswith("send beta: phase 2 merged and pushed")])
+        self.assertEqual(sum(line.startswith("send beta:") for line in notices), 1)
+        self.assertIn("send alpha: merge origin/main into your own unit branch, resolve src/alpha.txt, "
+                      + "and send a new checkpoint", result.stdout)
+        self.assertIn(f"send alpha: resolve alpha phase 2 ({first[:12]}), then resend this checkpoint", result.stdout)
+        self.assertNotIn("into the merge branch", result.stdout)
+        self.assertEqual(result.stdout.count("batch: retry"), 1)
+        self.assertEqual(self.events("checkpoint-test"), [[], [], []])
+        tip = self.git("rev-parse", "HEAD")
+        for branch in ("production", "main"):
+            self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), tip)
+        merges = self.git("rev-list", "--reverse", "--first-parent", "--merges", start + ".." + tip).splitlines()
+        self.assertEqual([self.git("rev-parse", merge + "^2") for merge in merges], [second, main_commit])
+        self.assertEqual(self.git("show", "HEAD:src/beta.txt"), "clean beta change")
+        self.assertEqual(self.git("show", "HEAD:src/alpha.txt"), "main resolution")
+        self.assertEqual(self.git("ls-tree", "HEAD", "--", "src/broken.txt"), "")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_main_conflict_in_existing_work_names_clean_items_as_able_to_land_alone(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        first = self.checkpoint(content="clean alpha change\n")
+        second = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+        self.write(self.checkout, "existing.txt", "existing unpublished work\n")
+        _ = self.git("add", "existing.txt")
+        _ = self.git("commit", "-m", "existing unpublished work")
+        start = self.git("rev-parse", "HEAD")
+        published = self.git("rev-parse", "production", cwd=self.origin)
+        main_commit = self.push_main_change("existing.txt", "main change\n")
+        result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual(notices, [f"send {unit}: your checkpoint is clean against origin/main and can land alone; "
+                                  + "the showrunner will inspect the combined merge conflict" for unit in ("alpha", "beta")])
+        self.assertNotIn("merge origin/main into", result.stdout)
+        self.assertNotIn("batch: retry", result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main_commit)
+        self.assertEqual(self.receipts(), [])
+        self.assertEqual(self.events("checkpoint-test"), [])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
     def test_conflicting_second_item_drops_before_the_remaining_items_retry(self) -> None:
         for preexisting_merge, held_case in ((False, ""), (True, ""), (False, "two holds"), (False, "later item")):
             with self.subTest(preexisting_merge=preexisting_merge, held_case=held_case):

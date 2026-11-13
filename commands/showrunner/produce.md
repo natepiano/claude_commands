@@ -666,6 +666,7 @@ returns it to its unit.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
+     Landing treats each review row as a separate result on its link, including old proposals without `--separate-result`.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
    A script failure leaves the row open. Report no separate feature-log
