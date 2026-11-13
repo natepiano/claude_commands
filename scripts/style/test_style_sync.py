@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
@@ -1146,11 +1148,15 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         self.assertEqual(stopped.exception.signum, signal.SIGTERM)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
+
     def test_a_stop_signal_right_after_the_dir_is_made_still_removes_it(self) -> None:
         make_dir = build_folders.create_build_folder
 
         def make_dir_then_signal(request: build_folders.BuildFolderRequest) -> Path:
             made = make_dir(request)
+            self.assertTrue(made.with_name(made.name + ".lock").is_file())
+            record = cast(dict[str, object], json.loads(made.with_name(made.name + ".lease.json").read_text()))
+            self.assertEqual(record["pid"], os.getpid())
             os.kill(os.getpid(), signal.SIGTERM)
             return made
 
@@ -1161,6 +1167,7 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
         self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
+
 
     def test_standing_checkout_has_no_registration_in_the_source(self) -> None:
         original_worktrees = self.git("worktree", "list", "--porcelain")
@@ -1198,6 +1205,69 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         ])
         self.assertEqual(sorted(self.lint_temp.iterdir()), [live, unowned, unreadable, verifier_running])
         self.assertEqual(self.git("worktree", "list", "--porcelain"), kept_worktrees)
+
+    def test_sweep_retries_a_query_that_still_holds_its_lock(self) -> None:
+        directory = self.stale_dir("query", ended_pid(), registered=True)
+        lock = directory.with_name(directory.name + ".lock")
+        lock.touch()
+        lease = directory.with_name(directory.name + ".lease.json")
+        _ = lease.write_text("record")
+        reached, release = threading.Event(), threading.Event()
+        flock = fcntl.flock
+
+        def pause_query(descriptor: int, mode: int) -> None:
+            try:
+                flock(descriptor, mode)
+            except BlockingIOError:
+                release.set()
+                raise
+            if threading.current_thread().name.startswith("probe") and mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                reached.set()
+                if not release.wait(3):
+                    raise AssertionError("the sweep did not meet the query")
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe") as workers:
+            with mock.patch("fcntl.flock", side_effect=pause_query):
+                query = workers.submit(build_folders.build_folder_state, directory)
+                try:
+                    self.assertTrue(reached.wait(3))
+                    with redirect_stdout(io.StringIO()):
+                        style_sync.sweep_stale_lint_dirs()
+                finally:
+                    release.set()
+                self.assertEqual(query.result(timeout=3), "free")
+        self.assertFalse(directory.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(lease.exists())
+        self.assertNotIn(str(directory / "checkout"), self.git("worktree", "list", "--porcelain"))
+
+    def test_sweep_removes_free_folder_metadata_and_keeps_held_folder_metadata(self) -> None:
+        for held in (False, True):
+            with self.subTest(held=held):
+                directory = self.stale_dir(f"lock-{held}", ended_pid(), registered=True)
+                lock = directory.with_name(directory.name + ".lock")
+                lease = directory.with_name(directory.name + ".lease.json")
+                _ = lease.write_text(json.dumps({"pid": ended_pid(), "purpose": "sweep-test"}))
+                with lock.open("w") as descriptor:
+                    if held:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    entries = set(self.lint_temp.iterdir())
+                    files = {entry: entry.read_bytes() for entry in (lock, lease, directory / style_sync.OWNER_FILE)}
+                    original_worktrees = self.git("worktree", "list", "--porcelain")
+                    with redirect_stdout(io.StringIO()):
+                        style_sync.sweep_stale_lint_dirs()
+                    if held:
+                        self.assertEqual(set(self.lint_temp.iterdir()), entries)
+                        self.assertTrue((directory / "checkout").is_dir())
+                        self.assertEqual({entry: entry.read_bytes() for entry in files}, files)
+                        self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
+                        self.assertEqual(build_folders.build_folder_state(directory), "held")
+                    else:
+                        self.assertFalse(directory.exists())
+                        self.assertFalse(lock.exists())
+                        self.assertFalse(lease.exists())
+                        self.assertNotIn(str(directory / "checkout"), self.git("worktree", "list", "--porcelain"))
+                        self.assertEqual(build_folders.build_folder_state(directory), "free")
 
     def test_a_sweep_failure_prints_one_line_and_the_lint_run_continues(self) -> None:
         stuck = self.stale_dir("stuck", ended_pid(), registered=False)
@@ -1296,7 +1366,15 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
             _ = process.wait()
         group = int(verifier.read_text())
         self.addCleanup(kill_group, group)
-        [directory] = list(self.lint_temp.iterdir())
+        [directory] = [path for path in self.lint_temp.iterdir() if path.is_dir()]
+        lock = directory.with_name(directory.name + ".lock")
+        lease_path = directory.with_name(directory.name + ".lease.json")
+        self.assertTrue(lock.is_file())
+        lease = cast(dict[str, object], json.loads(lease_path.read_text()))
+        self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+        self.assertEqual(lease["pid"], process.pid)
+        self.assertIsInstance(lease["start_time"], str)
+        self.assertEqual(build_folders.build_folder_state(directory), "free")
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertTrue((directory / "checkout").exists())

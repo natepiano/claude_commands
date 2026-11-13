@@ -39,7 +39,7 @@ from scripts.herdr import turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import send
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
@@ -673,6 +673,42 @@ sys.exit(1)
         self.assertEqual(record.get("exit_code"), 0)
         self.assertEqual(Path(record["log"]).read_text().strip(), str(self.worker_id))
 
+    def test_plain_python_command_uses_its_copy_and_keeps_startup_hooks(self) -> None:
+        selected, other, startup = (self.root / name for name in ("copy", "other", "startup"))
+        for root in (selected, other):
+            (root / "scripts/lib").mkdir(parents=True)
+            _ = (root / "scripts/lib/py").write_text("# Checkout marker.\n")
+            _ = (root / "scripts/value.py").write_text("VALUE = 1\n")
+        _ = (other / "scripts/__init__.py").write_text("")
+        startup.mkdir()
+        _ = (startup / "sitecustomize.py").write_text("import os; os.environ['COPY_STARTUP'] = 'loaded'\n")
+        command = [sys.executable, "-c",
+                   "import json, os; from scripts import value; "
+                   + "print(json.dumps([value.__file__, os.environ['PYTHONPATH'], os.environ['COPY_STARTUP']]))"]
+        path = self.record(command)
+        with (contextlib.chdir(selected), patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(other), str(selected), str(startup))),
+              })):
+            record = self.supervise(path)
+        self.assertEqual(record.get("exit_code"), 0, Path(record["log"]).read_text())
+        self.assertEqual(json.loads(Path(record["log"]).read_text()),
+                         [str(selected / "scripts/value.py"), str(startup), "loaded"])
+
+    def test_repeat_budget_hook_selects_the_test_copy_without_exporting_it(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", "import json, os; from scripts.message import repeat_guard; "
+             + "print(json.dumps([repeat_guard.__file__, repeat_guard.GUARD_IO_CEILING_SECONDS, "
+             + "os.environ['PYTHONPATH']]))"],
+            cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        filename, budget, inherited = cast(tuple[str, int, str], json.loads(result.stdout))
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(Path(filename).resolve(), root / "scripts/message/repeat_guard.py")
+        self.assertEqual(budget, TEST_HANG_GUARD_SECS)
+        self.assertFalse(any((Path(entry or os.curdir) / "scripts/lib/py").is_file()
+                             for entry in inherited.split(os.pathsep)))
+
     def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
         count = self.root / "count"
         command = ["/bin/sh", "-c", f'echo run >> "{count}"']
@@ -723,7 +759,10 @@ sys.exit(1)
             sender_pid = self.root / "sender-pid"
             _ = (startup / "sitecustomize.py").write_text('''
 import os
+import sys
 from pathlib import Path
+import runpy
+runpy.run_path(CHECKOUT_STARTUP, run_name='_delivery_python_startup')["select_checkout"](sys.argv)
 from scripts.message import send
 from scripts.production import staff
 
@@ -733,7 +772,7 @@ def fake_sender(*arguments, **options):
 
 staff.local_snapshot = staff.initial_snapshot
 send.deliver_worker_text = fake_sender
-''')
+'''.replace("CHECKOUT_STARTUP", repr(str(Path(__file__).resolve().parents[1] / 'lib/python_startup/sitecustomize.py'))))
             path = self.record([sys.executable, "-c", "pass"])
             with (patch.dict(os.environ, {
                     "PYTHONPATH": str(startup) + os.pathsep + os.environ.get("PYTHONPATH", ""),

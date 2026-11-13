@@ -207,23 +207,13 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
     os.execvp(argv[0], list(argv))
 
 
-def remove_queue_place_folder(path: Path, allocated: os.stat_result) -> None:
-    with cancellation.defer_cleanup_signals():
-        try:
-            current = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if os.path.samestat(current, allocated):
-            shutil.rmtree(path)
-
-
 @contextmanager
 def queue_place_folder(prefix: str) -> Generator[Path]:
     """Allocate and remove the folder without installing a signal handler."""
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            path = build_folders.create_build_folder(build_folders.UniqueBuildFolder(prefix=prefix))
-            _ = cleanup.callback(remove_queue_place_folder, path, path.stat(follow_symlinks=False))
+            path = cleanup.enter_context(build_folders.temporary_build_folder(
+                build_folders.UniqueBuildFolder(prefix=prefix)))
         yield path
 
 
@@ -237,8 +227,8 @@ def cleanup_queue_place_folders() -> None:
         if admission_records.process_start_time(int(fields[0])) == fields[1]:
             continue
         try:
-            if not path.is_symlink() and path.stat().st_uid == os.getuid():
-                shutil.rmtree(path)
+            if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
+                _ = build_folders.remove_build_folder(path, lambda: shutil.rmtree(path))
         except FileNotFoundError:
             pass
 

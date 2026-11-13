@@ -429,7 +429,7 @@ def remove_if_stale(directory: Path) -> None:
             return
     except (OSError, ValueError):
         return
-    if remove_lint_dir(owner_record.repo, directory):
+    if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
         print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
 
 

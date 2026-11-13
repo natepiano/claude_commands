@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_startup
+
 from dataclasses import dataclass
 import json
 import math
@@ -349,7 +351,7 @@ class Reads(unittest.TestCase):
     def test_reads(self):
         conf.read('alpha').text('value')
         subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
-                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+                       env={{**os.environ, 'PYTHONPATH': {str(repository / 'scripts/lib/python_startup')!r}}}, check=True)
         subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
                        {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
 """
@@ -418,7 +420,8 @@ finally:
             runner = root / "scripts/test_times/module_run.py"
             runner.parent.mkdir()
             _ = runner.write_text(RUNNER.read_text())
-            for name in ("conf_reads.py", "package_root.py"):
+            for name in ("conf_reads.py", "package_root.py", "python_startup/sitecustomize.py"):
+                (library / name).parent.mkdir(parents=True, exist_ok=True)
                 _ = (library / name).write_text((RUNNER.parents[1] / "lib" / name).read_text())
             for package in (root / "scripts", library, root / "tests", root / "import_only"):
                 package.mkdir(exist_ok=True)
@@ -432,7 +435,7 @@ finally:
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
-            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(root),
+            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
                            "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
             for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
                 _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
@@ -635,6 +638,11 @@ class FixtureCPU(unittest.TestCase):
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            copy_startup(root)
+            runner = root / "scripts/test_times/module_run.py"
+            runner.parent.mkdir(parents=True, exist_ok=True)
+            _ = runner.write_text(RUNNER.read_text())
+            _ = (root / "scripts/lib/descendants.py").write_text((RUNNER.parents[1] / "lib/descendants.py").read_text())
             folder = root / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
@@ -652,7 +660,7 @@ class FixtureCPU(unittest.TestCase):
             for working_directory in (root, folder, Path("/home")):
                 with self.subTest(case="package name", cwd=working_directory):
                     result = subprocess.run(
-                        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_package_name.py"],
+                        [str(root / "scripts/lib/py"), str(runner), str(folder), "test_package_name.py"],
                         cwd=working_directory, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)

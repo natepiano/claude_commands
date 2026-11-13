@@ -875,7 +875,7 @@ class MemoryFeedTests(unittest.TestCase):
                     sys.exit(status)
                 """)
                 result = subprocess.run([sys.executable, "-c", probe, str(installed), package, module, alias], cwd=installed,
-                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    env={**os.environ, "PYTHONPATH": str(installed / "scripts/lib/python_startup")}, capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
@@ -894,7 +894,7 @@ class MemoryFeedTests(unittest.TestCase):
                         sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
                 """)
                 result = subprocess.run([sys.executable, "-c", restarted, str(installed), alias], cwd=installed,
-                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    env={**os.environ, "PYTHONPATH": str(installed / "scripts/lib/python_startup")}, capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
