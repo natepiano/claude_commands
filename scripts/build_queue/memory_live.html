@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Build Memory</title>
+<title>Builds</title>
 <style>
 :root {
   color-scheme: light;
@@ -11,6 +11,8 @@
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f;
   --used: #2a78d6; --res-a: #427caf; --res-b: #6b91b7; --room: #1baf7a;
   --building: #007e78; --testing: #b00079;
+  --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
+  --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
 }
 @media (prefers-color-scheme: dark) {
@@ -20,6 +22,8 @@
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
     --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
     --building: #27c6b8; --testing: #ca458f;
+    --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+    --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
   }
 }
@@ -29,6 +33,8 @@
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
   --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
   --building: #27c6b8; --testing: #ca458f;
+  --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+  --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
 }
 * { box-sizing: border-box; }
@@ -78,6 +84,15 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
+#tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
+#tip .mac-tip-fields dt { text-align: left; }
+#tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
+#tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
+.seg-remote { background: var(--remote-memory); }
+.machine[data-machine="natedev"] { color: var(--machine-natedev); }
+.machine[data-machine="mac"] { color: var(--machine-mac); }
+.machine[data-machine="aws"] { color: var(--machine-aws); }
 #tip b { display: block; margin-bottom: 2px; }
 .mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); transition: left 0.6s ease; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
@@ -153,7 +168,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 0.75rem; }
+.row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -164,24 +180,32 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.room > *, .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
+.wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
+.walk-table tr.room > * { border-bottom: 1px solid var(--line); }
+.walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
+.queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
-.walk-table thead tr { height: 30px; }
+.walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
 .walk-table tbody tr { height: 44px; }
 .walk-table .step { display: none; }
 .walk-table th, .walk-table td { padding: 3px 16px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
+.walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
+.walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
+.walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
-.walk.beside .walk-table tr.room > *, .walk.beside .walk-table tr.wait-first > * { border-top: 0; }
+.walk.beside .walk-table tr.room > *, .walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
+.walk.beside .wrow.room::after { width: calc(100% + var(--details)); }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before {
   content: ""; position: absolute; top: 0; left: 0; width: calc(100% + var(--details));
   border-top: 1px solid var(--line); pointer-events: none;
@@ -236,9 +260,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 #s-ci_ram[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.wait-reason { color: var(--ink-2); font-size: 0.8rem; overflow-wrap: anywhere; }
-.wait-reasons { margin-top: 10px; }
-.wait-reasons p { margin: 4px 0; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
@@ -260,7 +281,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <body>
 <main>
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
-  <h1>Build memory on natedev</h1>
+  <h1>Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
 
@@ -312,10 +333,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
-    <p class="report-window" id="priority-line"></p>
-    <p class="report-window" id="head-line"></p>
     <p class="pressure-reason" id="cap-reason"></p>
-    <div class="wait-reasons" id="wait-reasons"></div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -364,6 +382,10 @@ const TIPS = {
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
+function formatPercent(value, complete = true) {
+  const tenths = Math.floor(value * 10);
+  return `${((complete ? tenths : Math.min(tenths, 999)) / 10).toFixed(1)}%`;
+}
 function level(d) {
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
@@ -377,10 +399,42 @@ Object.assign(TIPS, {
   walkhead: () => ["Running, in start order", "Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
   ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The cap is unavailable." : "The red tick is the cap line."}`],
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
-  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : d.psi.some.toFixed(1))}%`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${d.limits.some}% (the red line).`],
-  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : d.psi.full.toFixed(1))}%`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${d.limits.full}%.`],
-  "g-swap": (d) => [`Swap used · ${pctOf(d.swap_used, d.swap_total).toFixed(0)}%`, `The queue holds above ${d.limits.swap}% swap used.`],
+  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${formatPercent(d.limits.some)} (the red line).`],
+  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
+  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
 });
+function macRow(row) {
+  return row.kind === "mac-build" || row.kind === "mac-unavailable";
+}
+function stageText(row) {
+  if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
+  return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
+}
+function doneText(row) {
+  const progress = row.progress;
+  if (!progress || progress.kind !== "RowProgress") return "—";
+  const percent = recorded(progress.percent) ? progress.percent
+    : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
+  return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
+}
+function macTipFields(row, data) {
+  const fields = [["Machine", "mac"],
+    ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
+    ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
+    ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
+  if (row.progress?.kind === "RowProgress") fields.push(["Progress",
+    `${row.progress.done} of ${row.progress.total} ${row.progress.unit} · ${formatPercent(row.progress.percent, row.progress.done === row.progress.total)}`]);
+  return fields;
+}
+function tooltipHtml(key, data) {
+  const [head, body] = tipText(key, data);
+  const [kind, index] = key.split(":");
+  const row = kind === "row" ? data.walk[+index] : null;
+  if (!row || !macRow(row)) return `<b>${esc(head)}</b>${esc(body)}`;
+  return `<b>${esc(head)}</b><dl class="mac-tip-fields">` +
+    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
+    `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
+}
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
@@ -397,9 +451,10 @@ function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
 function rowUnit(row) {
-  return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
+  return row.ci ? "hana CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
 function rowOwner(row, waiting = false) {
+  if (macRow(row)) return row.repository || "";
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
   }
@@ -421,7 +476,7 @@ function cloudStatus(row, tip) {
 function progressTip(row) {
   const progress = row.progress;
   if (!progress || progress.kind !== "RowProgress") return "";
-  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${Math.round(progress.percent)}% done`;
+  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${formatPercent(progress.percent, progress.done === progress.total)} done`;
   return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
 }
 function rawTipText(key, d) {
@@ -433,7 +488,9 @@ function rawTipText(key, d) {
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
-    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: aws. No local memory reservation.${progressTip(r)}`];
+    if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
+      macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
+    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: ${r.machine}. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
@@ -449,7 +506,8 @@ function rawTipText(key, d) {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
     if (w.kind === "cloud") return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${w.reason}. No local memory reservation.`];
-    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `Needs ${f1(w.need)} GiB. Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    const need = w.head_text?.includes("; need ") ? "" : `Needs ${f1(w.need)} GiB. `;
+    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
   }
   return TIPS[key](d);
 }
@@ -459,7 +517,13 @@ function memoryText(text) {
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
 function tipText(key, d) {
-  return rawTipText(key, d).map(memoryText);
+  const text = rawTipText(key, d);
+  const [kind, index] = key.split(":");
+  const row = kind === "row" ? d.walk[+index] : kind === "wait" ? d.waiters[+index] : null;
+  const notes = row ? [row.head_text, row.priority_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
+  if (key === "walkhead") notes.push(d.unmatched_priority_text);
+  text[1] = [text[1], ...notes].filter(Boolean).join("\n");
+  return text.map(memoryText);
 }
 function roomEquation(d) {
   const terms = d.room_source === "cap"
@@ -471,7 +535,7 @@ function roomEquation(d) {
 }
 function ago(then, now) {
   const m = Math.max(0, Math.round((now - then) / 60));
-  if (m < 1) return "under 1 min";
+  if (m < 1) return "<1 min";
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
   return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} days`;
@@ -481,8 +545,7 @@ let tipKey = null;
 function showTip(key, x, y) {
   if (!latest) return;
   tipKey = key;
-  const [head, body] = tipText(key, latest);
-  tip.innerHTML = `<b>${esc(head)}</b>${esc(body)}`;
+  tip.innerHTML = tooltipHtml(key, latest);
   tip.classList.add("on");
   placeTip(x, y);
 }
@@ -524,6 +587,12 @@ function render(d) {
     recordReadFailure("The queue did not answer.");
     return;
   }
+  for (const [theme, colors] of Object.entries(d.colors)) {
+    document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
+    for (const [machine, color] of Object.entries(colors.machines)) {
+      document.documentElement.style.setProperty(`--machine-${machine}-${theme}`, color);
+    }
+  }
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
   $("room-equation").textContent = roomEquation(d);
@@ -547,8 +616,6 @@ function render(d) {
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit;
-  const wait = d.waiting > 0 ? `${d.waiting} ${d.waiting === 1 ? "step waits" : "steps wait"}.` : "No step waits.";
-  $("answer").textContent = `Next step room · ${wait}`;
   for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
@@ -557,7 +624,7 @@ function render(d) {
   for (const [k, v] of Object.entries(segVals)) $(`l-${k}`).textContent = f1(v);
   latest = d;
   setTimeout(fitLabels, 650);
-  if (tipKey) { const [h, b] = tipText(tipKey, d); tip.innerHTML = `<b>${esc(h)}</b>${esc(b)}`; }
+  if (tipKey) tip.innerHTML = tooltipHtml(tipKey, d);
 
 
   renderWalk(d);
@@ -590,8 +657,8 @@ function renderSwap(d) {
     $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
     $(`gl-${k}`).style.left = `${(lim).toFixed(2)}%`;
-    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : `${v.toFixed(1)}%`;
-    $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
+    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : formatPercent(v);
+    $(`limit-${k}`).textContent = `Queue holds at ${formatPercent(lim)}`;
   }
   placeLimitLabels();
   $("swaprows").innerHTML = d.swap_by.map((row, index) =>
@@ -739,25 +806,36 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const cells = (place, name, duration, machine, vcpus, unit, pid, tip, className = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
-      `<td class="pid">${typeof pid === "number" ? pid : "—"}</td></tr>`);
+  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
+    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th>`;
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, r.vcpus, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
+    cells(stageText(r),
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
   cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
+  if (d.waiters.length) {
+    const units = d.queued_priority_units || [];
+    const title = !units.length ? "Queued, in order of submission"
+      : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
+      : `Queued, ${units.join(" followed by ")} and then in submission order`;
+    tableRows.push(`<tr class="queue-head">${columns("#", "Waiting")}</tr>`);
+    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${esc(title)}</span></div>`);
+  }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.machine || "", null, w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -767,8 +845,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `<th scope="col" class="place">#</th><th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th><th scope="col" class="unit">Unit</th>` +
-    `<th scope="col" class="pid">Pid</th></tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `${columns("Stage", "Duration")}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
@@ -779,10 +856,6 @@ function renderWalk(d) {
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
   $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
-  $("priority-line").textContent = d.priority_text || "";
-  $("head-line").textContent = d.head_text || "";
-  $("wait-reasons").innerHTML = d.waiters.map(waiter =>
-    `<p class="wait-reason"><strong>${esc(waiter.name)}</strong> · ${esc(waiter.reason)}</p>`).join("");
   fitLabels();
 }
 
@@ -834,13 +907,13 @@ function fitWalkDetails() {
       context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
       return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
     });
-    if (name === "duration") widths.push(context.measureText("waits 99 h 59 min").width + 16);
+    if (name === "duration") widths.push(context.measureText("99 h 59 min").width + 16);
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
-  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
+  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
@@ -872,7 +945,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   if (!beside) {
-    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
+    const fixedWidth = ["place", "done", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
       width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
     const padding = ["step", "unit"].reduce((width, name) =>
       width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
@@ -887,6 +960,9 @@ function fitWalkDetails() {
   }
   for (const row of walk.querySelectorAll(".wrow.cloud-work")) {
     const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
+    const detail = row.querySelector(".amounts");
+    detail.style.maxWidth = beside
+      ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
     row.style.minHeight = "";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
@@ -920,7 +996,7 @@ function placeMemoryBars(d) {
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
-    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${memoryAmount(amount.value)}</span>`).join("");
+    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
     const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
@@ -930,7 +1006,15 @@ function placeMemoryBars(d) {
     const index = Number(row.dataset.run), run = d.walk[index];
     let bars = "";
     const amounts = [];
-    if (run.ci) {
+    if (macRow(run)) {
+      if (run.kind === "mac-build" && recorded(run.used)) {
+        const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
+        bars = box(0, useWidth, "seg-remote");
+        amounts.push({kind: "used-amount", left: 0, value: run.used});
+      }
+    } else if (run.kind === "cloud" && recorded(run.used)) {
+      bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
+    } else if (run.ci) {
       bars = box(used, ciWidth, "seg-ci", "ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
@@ -953,7 +1037,8 @@ function placeMemoryBars(d) {
     row.querySelector(".track").innerHTML = bars;
     if (run.kind !== "cloud") {
       placeAmounts(row, amounts);
-      if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
+      if (run.kind === "mac-unavailable") row.querySelector(".amounts").textContent = run.status;
+      else if (!recorded(run.used)) row.querySelector(".amounts").textContent = macRow(run) ? "Used unavailable" : `Use unavailable: ${run.used.reason}`;
     }
   }
   const roomTrack = document.querySelector(".wrow.room .track");

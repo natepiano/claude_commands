@@ -56,6 +56,28 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(recent.reports[1].problem, "identity unavailable")
         self.assertEqual(usage_store.timer_file().stat().st_mode & 0o777, 0o600)
 
+    def test_login_end_round_trips_through_the_store_and_timer_and_clears_when_unknown(self) -> None:
+        end = agent_accounts.LoginEndKnown(RESETS.astimezone(timezone(timedelta(hours=2))))
+        for tool in ("Claude", "Codex"):
+            for known in (True, False):
+                with self.subTest(tool=tool, known=known):
+                    report = Report(tool, email="timer@example.invalid", quotas=[Quota("Weekly", 20, RESETS)],
+                                    login_ends_at=end if known else agent_accounts.LoginEndUnknown())
+                    usage_store.save([report], READ)
+                    usage_store.save_timer_usage("selection", [report], READ)
+                    usage = usage_store.load()[usage_store.key(tool, report.email or "")]
+                    self.assertEqual(usage.get("login_ends_at"), RESETS.isoformat() if known and tool == "Claude" else None)
+                    recent = usage_store.recent_timer_usage("selection", READ + timedelta(minutes=1))
+                    assert isinstance(recent, usage_store.RecentTimerUsage)
+                    self.assertEqual(recent.reports[0].login_ends_at, agent_accounts.LoginEndKnown(RESETS)
+                                     if known and tool == "Claude" else agent_accounts.LoginEndUnknown())
+
+    def test_login_end_survives_a_stale_access_token_read(self) -> None:
+        report = Report("Claude", email="timer@example.invalid", login_ends_at=agent_accounts.LoginEndKnown(RESETS),
+                        weekly_read_skip=StaleTokenSkip(), usage_read_outcome=UsageReadOutcome.STALE_TOKEN)
+        usage_store.save([report], READ)
+        self.assertEqual(usage_store.load()["timer@example.invalid"].get("login_ends_at"), RESETS.isoformat())
+
     def test_timer_cache_rejects_expiry_clock_reversal_selection_change_and_damage(self) -> None:
         usage_store.save_timer_usage("selection", [], READ)
         for signature, at in (("other", READ), ("selection", READ - timedelta(seconds=1)),

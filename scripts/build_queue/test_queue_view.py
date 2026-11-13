@@ -10,6 +10,10 @@ from dataclasses import replace
 from pathlib import Path
 import json
 import os
+import shlex
+import struct
+import subprocess
+import time
 import unittest
 from typing import Self, cast, override
 from unittest import mock
@@ -24,7 +28,7 @@ from scripts.build_queue.queue_fixture import (
     ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import QueueLines, json_form, plain, wrap
+from scripts.build_queue.queue_lines import QueueLines, cut_tail, json_form, plain, wrap
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
@@ -32,6 +36,79 @@ from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+
+
+class RecordedOwnerQueueTests(unittest.TestCase):
+    def test_parentless_owner_keeps_its_name_without_changing_the_step_name(self) -> None:
+        with QueueFixture() as fixture:
+            model = fixture.model()
+            waiter = replace(model.reading.view.waiting[0], session_id="solo", session_name="solo",
+                             unit="", project="repository", step="check")
+            model = with_waiting(model, [waiter])
+            model = replace(model, labels={"solo": UnitLabels("solo")})
+            lines = queue_view.render_view(model, 120)
+            self.assertIn("solo", plain(lines))
+            self.assertIn("repository check", plain(lines))
+            self.assertNotIn("solo check", plain(lines))
+            self.assertEqual(queue_view.name_text(waiter, model), "solo")
+
+    def test_detached_and_systemd_rows_resolve_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="demo", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            current = fixture_runtime_id("owner-after-session-restart")
+            worker = staff.update_current_session(worker.current_session, staff.native_id(current))
+            model = fixture.model()
+            for source, owner in (("detached", worker), ("systemd", unit)):
+                with self.subTest(source=source), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
+                }), mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
+                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    self.assertEqual(identity.session_id, owner.current_session)
+                    labels = unit_labels.unit_labels_for([identity.session_id], os.environ)
+                    waiter = replace(model.reading.view.waiting[0], session_id=identity.session_id,
+                                     session_name=identity.name, unit=identity.unit)
+                    running = replace(model.reading.view.running[0], session_id=identity.session_id,
+                                      session_name=identity.name, unit=identity.unit)
+                    for step in (waiter, running):
+                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT)
+                        self.assertEqual(queue_evidence.step_labels(step, labels), expected)
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
+                                     expected)
+
+    def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "live-session", "CLAUDE_CODE_SESSION_ID": "",
+                                         "BUILDLOG_OWNER_STAFF_ID": "other-owner"}):
+            self.assertEqual(admission_client.step_identity("nextest", "").session_id, "live-session")
+
+    def test_missing_owner_records_have_explicit_labels_on_every_destination(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production.staff_test_support import isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            model = fixture.model()
+            for reference in ("", "missing-staff-row"):
+                with self.subTest(reference=reference), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": reference,
+                }):
+                    identity = admission_client.step_identity("targeted-test", "")
+                    self.assertEqual(identity.session_id, "")
+                    for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
+                        label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
+                        self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    label = queue_view.cloud_step_labels(cloud, replace(model, labels={}))
+                    self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
 
 
 def queue_json_text(data: QueueLines) -> str:
@@ -72,9 +149,402 @@ def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
         reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)
 
 
+
+
+
+
+def empty_mac_reading(fixture: QueueFixture) -> None:
+    """Keep existing renderer tests on a fresh private Mac reading."""
+    path = fixture.root / "mac-builds.json"
+    _ = path.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+    _ = (fixture.root / "memory_feed.conf").write_text("# whole: 1..\nmac_activity_refresh_seconds=30\n")
+    _ = fixture.enter_context(mock.patch.object(queue_view, "mac_reading_path", return_value=path))
+    _ = fixture.enter_context(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
+
+
+class MacQueueViewTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
+    def test_project_record_returns_empty_for_an_unreadable_folder(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folder = fixture.root / "unreadable"
+            folder.mkdir()
+            folder.chmod(0)
+            try:
+                script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                    f"print(json.dumps(project_record({str(folder)!r})))")
+                result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+            finally:
+                folder.chmod(0o700)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(json.loads(result.stdout.removesuffix("rc=0\n")),
+                             {"recorded_unit": "", "session": "", "repository": ""})
+
+    def test_project_record_catches_each_filesystem_error(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            for operation in ("resolve", "is_symlink", "stat", "exists", "read_text"):
+                with self.subTest(operation=operation):
+                    record = fixture.root / ".copy-record.json"
+                    if operation == "read_text":
+                        _ = record.write_text('{}')
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        "from unittest.mock import patch\n"
+                        + f"with patch.object(Path, {operation!r}, side_effect=PermissionError('unreadable')):\n"
+                        + f"    print(json.dumps(project_record({str(fixture.root)!r})))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(json.loads(result.stdout.removesuffix("rc=0\n")),
+                                     {"recorded_unit": "", "session": "", "repository": ""})
+
+    def test_mac_reader_keeps_rows_when_one_row_field_fails(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folders = {pid: str(fixture.root / str(pid)) for pid in (100, 200, 300)}
+            processes = {pid: {"parent": 1, "command": "cargo build", "executable": "/bin/cargo",
+                              "resident_bytes": pid, "started_at": NOW + pid} for pid in folders}
+            captures = {pid: {"folder": folder, "command": "cargo build", "progress_tail": ""}
+                        for pid, folder in folders.items()}
+            for failed in ("project_record", "repository_name", "running_test_pid", "build_origin"):
+                with self.subTest(failed=failed):
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        f"read_processes = lambda: {processes!r}\n"
+                        + f"read_captures = lambda processes: {captures!r}\n"
+                        + "output = lambda arguments: ''\n"
+                        + "def project_record(folder):\n"
+                        + "    return dict(recorded_unit='unit', session='session', repository='')\n"
+                        + "repository_name = lambda folder: 'repo'\n"
+                        + "running_test_pid = lambda pid, *args: pid + 1\n"
+                        + "build_origin = lambda pid, processes: 'ci'\n"
+                        + f"original = {failed}\n"
+                        + "def fail_one(value, *args):\n"
+                        + f"    if value in (200, {folders[200]!r}):\n"
+                        + "        raise PermissionError('unreadable row')\n"
+                        + "    return original(value, *args)\n"
+                        + f"{failed} = fail_one\nprint(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    self.assertEqual([row["pid"] for row in rows], [100, 200, 300])
+                    for row in rows:
+                        bad = row["pid"] == 200
+                        self.assertEqual(row["recorded_unit"], "" if bad and failed == "project_record" else "unit")
+                        self.assertEqual(row["session"], "" if bad and failed == "project_record" else "session")
+                        self.assertEqual(row["repository"], "" if bad and failed == "repository_name" else "repo")
+                        self.assertEqual(row["test_pid"], -1 if bad and failed == "running_test_pid" else int(cast(int, row["pid"])) + 1)
+                        self.assertEqual(row["origin"], "unknown" if bad and failed == "build_origin" else "ci")
+
+    def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
+        for origin in queue_view.MacBuildOrigin:
+            with self.subTest(origin=origin):
+                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin)
+                row = queue_view.mac_build_record(build)
+                self.assertEqual(queue_view.mac_build_from_record(row), build)
+                del row["origin"]
+                self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
+
+    def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            processes: dict[int, dict[str, object]] = {
+                100: {"parent": 90, "command": "/bin/cargo build", "executable": "/bin/cargo",
+                      "resident_bytes": 1234, "started_at": NOW},
+                90: {"parent": 80, "command": "/bin/sh build.sh", "executable": "/bin/sh",
+                     "resident_bytes": 0, "started_at": NOW},
+                80: {"parent": 1, "command": "", "executable": "/runner", "resident_bytes": 0, "started_at": NOW},
+            }
+            for command, parent, expected in (
+                ("/actions/Runner.Worker spawn", 1, "ci"),
+                ('"/actions runner/Runner.Listener" run', 1, "ci"),
+                ("/bin/echo Runner.Worker", 1, "non-ci"),
+                ("/actions/Runner.Worker-helper", 1, "non-ci"),
+                ("/bin/sh build.sh", 90, "non-ci"),
+            ):
+                with self.subTest(command=command, parent=parent):
+                    processes[80]["command"] = command
+                    processes[80]["parent"] = parent
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        f"read_processes = lambda: {processes!r}\n" +
+                        "read_captures = lambda processes: {}\n" +
+                        f"output = lambda arguments: 'p100\\nn{folder}\\n'\n" +
+                        "repository_name = lambda folder: 'hana'\n" +
+                        "print(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["pid"], 100)
+                    self.assertEqual(rows[0]["origin"], expected)
+
+    def test_mac_names_use_the_package_then_the_repository(self) -> None:
+        for command, repository, expected in (
+            ("cargo build --release -p hana", "", "hana build"),
+            ("cargo build -phana", "other", "hana build"),
+            ("cargo build --package=hana", "other", "hana build"),
+            ("cargo check --package hana", "other", "hana check"),
+            ("cargo nextest run", "cargo-liner", "cargo-liner nextest"),
+            ("cargo build", "", "build"),
+            ("", "", "cargo"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(queue_view.mac_step_name(queue_view.MacBuild(1, "/project", 0,
+                    command, repository)), expected)
+
+    def test_mac_command_jobs_reads_all_supported_positive_values(self) -> None:
+        for argument in ("--test-threads 12", "--test-threads=12", "-j12", "-j 12", "--jobs 12", "--jobs=12"):
+            with self.subTest(argument=argument):
+                self.assertEqual(queue_view.mac_command_jobs("cargo nextest run " + argument), 12)
+        for command in ("cargo build", "cargo build -j0", "cargo nextest run --test-threads 0"):
+            self.assertIsInstance(queue_view.mac_command_jobs(command), queue_view.MacJobsUnavailable)
+
+    def test_periodic_reader_preserves_folders_and_elapsed_days(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            _ = (fixture.root / "mac_test.conf").write_text(
+                "host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\nmirror_root=~/.local/state/mac-test/mirror\n")
+            path = fixture.root / "mac-builds.json"
+            now = NOW
+            for elapsed, seconds in (("03:04", 184), ("02:03:04", 7384), ("1-02:03:04", 93784)):
+                with self.subTest(elapsed=elapsed):
+                    result = subprocess.CompletedProcess(["ssh"], 0,
+                        stdout=json.dumps([{"pid": 710001, "folder": "/Users/nate/mac clone", "started_at": now - seconds,
+                            "resident_bytes": 1048576, "test_pid": 710002, "command": "cargo nextest run --jobs=4",
+                            "repository": "hana", "progress_tail": "", "recorded_unit": "", "session": ""}]) + "\nrc=0\n", stderr="")
+                    with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
+                          mock.patch.object(subprocess, "run", return_value=result),
+                          mock.patch.object(time, "time", return_value=now)):
+                        queue_view.refresh_mac_builds()
+                        reading = queue_view.read_mac_builds()
+                    self.assertEqual(reading.error, "")
+                    self.assertEqual(reading.read_at, now)
+                    build, = reading.builds
+                    self.assertEqual(build.pid, 710001)
+                    self.assertEqual(build.folder, "/Users/nate/mac clone")
+                    self.assertEqual(build.started_at, now - seconds)
+                    self.assertEqual(build.stage, queue_view.MacTesting(710002))
+                    self.assertEqual(build.resident_bytes, 1048576)
+                    self.assertEqual(build.jobs, 4)
+                    self.assertEqual(queue_view.mac_step_name(build), "hana nextest")
+
+
+
+
+    def test_mac_reader_finds_all_three_tile_runs_and_their_counters(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            binary = fixture.root / "bin"
+            binary.mkdir()
+            born = int(time.mktime(time.strptime("Thu Nov 12 18:00:00 2026", "%a %b %d %H:%M:%S %Y")))
+            stamp = "Thu Nov 12 18:00:00 2026"
+            records = fixture.root / "captures" / "501"
+            (records / "state/pids").mkdir(parents=True)
+            folders = [fixture.root / "native" / "trunk-p172", fixture.root / "mirror" / "hana",
+                       fixture.root / "mirror" / "cargo-liner"]
+            for index, (pid, folder, done, total) in enumerate(zip((100, 200, 300), folders, (604, 647, 983), (1000,) * 3, strict=True)):
+                folder.mkdir(parents=True)
+                _ = (folder / ".copy-record.json").write_text(json.dumps({
+                    "owner": "trunk" if index == 0 else "mirror-unit",
+                    "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
+                if index == 0:
+                    _ = (folder / "Cargo.toml").write_text(
+                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                generation = f"fixture-{pid}"
+                log = f"run-{generation}-{pid}.log"
+                arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]
+                fields = ["cargo-tile-v3", generation, "fixture-boot", str(born), log, str(folder),
+                          str(fixture.root), str(len(arguments)), *arguments]
+                _ = (records / "state/pids" / f"{pid}.{generation}").write_bytes("\0".join([*fields, ""]).encode())
+                _ = (records / log).write_text(f"\rBuilding [==> ] {done}/{total}: fixture\r")
+            # The nested cargo and the compiler stay in their parent's row.
+            process_rows = [f"{pid} 1 501 100 01:00 {stamp} /bin/cargo" for pid in (100, 200, 300)]
+            process_rows += [f"201 200 501 200 00:59 {stamp} /bin/cargo",
+                             f"202 201 501 300 00:58 {stamp} /bin/rustc"]
+            scripts = {
+                "sysctl": "printf 'fixture-boot\\n'",
+                "git": "exit 1",
+                "lsof": "exit 1",
+                "ps": "case \"$*\" in *comm=*) cat <<'ROWS'\n" + "\n".join(process_rows) + "\nROWS\n;;\n*) cat <<'ROWS'\n" +
+                      "\n".join(f"{pid} /bin/cargo nextest run" for pid in (100, 200, 201, 300)) + "\n202 /bin/rustc\nROWS\n;;\nesac",
+            }
+            for name, body in scripts.items():
+                path = binary / name
+                _ = path.write_text("#!/bin/sh\n" + body + "\n")
+                path.chmod(0o755)
+            script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
+                f"CAPTURE_ROOT = Path({str(records.parent)!r})")
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            self.assertEqual([row["pid"] for row in rows], [100, 200, 300])
+            self.assertEqual([row["resident_bytes"] for row in rows], [100 * 1024, 600 * 1024, 100 * 1024])
+            self.assertEqual([row["recorded_unit"] for row in rows], ["trunk", "mirror-unit", "mirror-unit"])
+            self.assertEqual([row["repository"] for row in rows], ["hana", "hana", "cargo-liner"])
+            self.assertEqual(queue_view.mac_command_jobs(str(rows[1]["command"])), 12)
+            percentages: list[float] = []
+            for row in rows:
+                counter = progress_profile.parse_progress(str(row["progress_tail"]))
+                assert isinstance(counter, progress_profile.ProgressCounter)
+                percentages.append(counter.percent)
+            self.assertEqual(percentages, [60.4, 64.7, 98.3])
+            # A reused PID cannot supply the old capture's folder or counter.
+            stale = records / "state/pids/100.fixture-100"
+            _ = stale.write_bytes(stale.read_bytes().replace(str(born).encode(), str(born - 1).encode()))
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            self.assertEqual([row["pid"] for row in rows], [200, 300])
+
+    def test_mac_reader_finds_tests_in_the_selected_target_directory(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            binary = fixture.root / "bin"
+            binary.mkdir()
+            folder = fixture.root / "project"
+            (folder / ".cargo").mkdir(parents=True)
+            _ = (folder / "Cargo.toml").write_text('[workspace]\n')
+            config = folder / ".cargo/config.toml"
+            (folder / "linked-output").symlink_to(folder / "out space", target_is_directory=True)
+            cases: list[tuple[str, list[str], dict[str, str], str, str, bool, bool]] = [
+                ("default", [], {}, "", "target/debug/deps/test_binary", False, True),
+                ("argument", ["--target-dir", "out space"], {"CARGO_TARGET_DIR": "wrong"}, "", "out space/debug/deps/test_binary", False, True),
+                ("equals", ["--target-dir=out space"], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("symlink", ["--target-dir", "linked-output"], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("environment", [], {"CARGO_TARGET_DIR": "out space"}, "", "out space/debug/deps/test_binary", False, True),
+                ("build environment", [], {"CARGO_BUILD_TARGET_DIR": "out space"}, "", "out space/debug/deps/test_binary", False, True),
+                ("configuration", [], {}, "out space", "out space/debug/deps/test_binary", False, True),
+                ("CLI configuration", ["--config", 'build.target-dir="out space"'], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("compiler observation", [], {}, "", "out space/debug/deps/test_binary", True, True),
+                ("unrelated directory", ["--target-dir", "out space"], {}, "", "other/debug/deps/test_binary", False, False),
+                ("directory prefix", ["--target-dir", "out space"], {}, "", "out space-other/debug/deps/test_binary", False, False),
+                ("build script", ["--target-dir", "out space"], {}, "", "out space/debug/deps/build-script-build", False, False),
+            ]
+            for name, arguments, environment, configured, executable, compiler, testing in cases:
+                with self.subTest(source=name):
+                    config.unlink(missing_ok=True)
+                    if configured:
+                        _ = config.write_text('[build]\ntarget-dir = ' + json.dumps(configured) + '\n')
+                    stamp = "Thu Nov 12 18:00:00 2026"
+                    process_rows = [f"100 1 501 100 01:00 {stamp} /bin/cargo",
+                                    f"101 100 501 100 01:00 {stamp} {folder / executable}"]
+                    commands = ["100 " + shlex.join(["cargo", "test", *arguments]), f"101 {folder / executable}"]
+                    if compiler:
+                        process_rows.append(f"102 100 501 100 01:00 {stamp} /bin/rustc")
+                        commands.append("102 " + shlex.join(["rustc", "--crate-name", "hana_tests", "--out-dir",
+                                                            str(folder / executable).rsplit("/", 1)[0]]))
+                    scripts = {
+                        "sysctl": "exit 1",
+                        "git": "exit 1",
+                        "lsof": "cat <<'ROWS'\np100\nn" + str(folder) + "\nROWS",
+                        "ps": "case \"$*\" in *comm=*) cat <<'ROWS'\n" + "\n".join(process_rows) + "\nROWS\n;;\n*) cat <<'ROWS'\n" + "\n".join(commands) + "\nROWS\n;;\nesac",
+                    }
+                    for program, body in scripts.items():
+                        path = binary / program
+                        _ = path.write_text("#!/bin/sh\n" + body + "\n")
+                        path.chmod(0o755)
+                    environment = {"HOME": str(fixture.root), **environment}
+                    # The kernel buffer contains argv, then environment fields.
+                    data = struct.pack("i", 3) + b"/bin/cargo\0\0cargo\0test\0CARGO_TARGET_DIR=not-an-environment-field\0"
+                    data += b"\0".join(os.fsencode(key + "=" + value) for key, value in environment.items())
+                    data += b"\0TOKEN=not-public\0\0"
+                    script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
+                        f"CAPTURE_ROOT = Path({str(fixture.root / 'captures')!r})")
+                    script = script.replace("print(json.dumps(read_builds()))",
+                        f"assert cargo_environment({data!r}) == {environment!r}\n"
+                        + f"process_environment = lambda pid: cargo_environment({data!r})\nprint(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                        env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertNotIn("not-public", result.stdout)
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    row, = rows
+                    self.assertEqual(row["test_pid"], 101 if testing else 0)
+                    row["counter"] = {}
+                    build = queue_view.mac_build_from_record(row)
+                    self.assertIsInstance(build.stage, queue_view.MacTesting if testing else queue_view.MacBuilding)
+
+    def test_mac_command_jobs_requires_a_recorded_positive_value(self) -> None:
+        for command in ("cargo nextest run -j8", "cargo build -j 8", "cargo test --jobs=8", "cargo check --jobs 8"):
+            self.assertEqual(queue_view.mac_command_jobs(command), 8)
+        for command in ("cargo test", "cargo build --jobs=0", "cargo test --jobs=-1"):
+            self.assertIsInstance(queue_view.mac_command_jobs(command), queue_view.MacJobsUnavailable)
+
+    def test_mac_reader_logs_raw_errors_without_publishing_them(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            _ = (fixture.root / "mac_test.conf").write_text("host=fixture\n# range: 5e-324..\nconnect_timeout_s=2\nmirror_root=~/.local/state/mac-test/mirror\n")
+            path = fixture.root / "mac-builds.json"
+            _ = path.write_text('{"read_at":0,"builds":[],"error":""}')
+            result = subprocess.CompletedProcess(["ssh"], 0, stdout="rc=0\n", stderr="awk: private raw error")
+            with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
+                  mock.patch.object(subprocess, "run", return_value=result) as run,
+                  self.assertLogs(queue_view.__name__, level="WARNING") as logs):
+                queue_view.refresh_mac_builds()
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("private raw error", str(logs.output))
+            self.assertNotIn("private raw error", path.read_text())
+
+    def test_native_mac_rows_show_the_folder_without_local_memory(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            reading = queue_view.MacBuildReading(now, (queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 45),))
+            with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                text = plain(queue_view.render_view(model, 240))
+            for expected in ("started on the Mac", "mac-clone", "Progress unavailable", "owner not recorded"):
+                self.assertIn(expected, text)
+            row, = [line for line in text.splitlines() if "pid 710001" in line]
+            self.assertIn("mac", row)
+
+    def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
+            for read_at, error in ((now - 90, ""), (now - 30, "Mac unreachable"), (0, "Mac reading missing")):
+                with self.subTest(read_at=read_at, error=error):
+                    reading = queue_view.MacBuildReading(read_at, (build,), error)
+                    with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                        text = plain(queue_view.render_view(model, 240))
+                    self.assertIn("Mac reading is old", text)
+                    self.assertNotIn("pid 710001", text)
+
+
 class CloudQueueViewTests(unittest.TestCase):
+    def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
+        model = self.cloud_model()[0]
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        for step, owner, expected in (
+            ("targeted-test", director, "panes targeted"),
+            ("merge-gate", director, "panes merge"),
+            ("merge-gate", runner, "showrunner merge"),
+            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
+            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
+            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("build", director, "build"),
+            ("literal{step}", director, "literal{step}"),
+        ):
+            with self.subTest(step=step, owner=owner):
+                current = replace(row, identity=replace(row.identity, step=step))
+                labeled = replace(model, labels={row.identity.session_id: owner})
+                self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
+        current = replace(row, identity=replace(row.identity, step="targeted-test"))
+        settings = dict(model.names.settings)
+        settings["owned.targeted-test"] = "targeted for {unit}"
+        configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
+        self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
+        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
+        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
+        empty_mac_reading(fixture)
         write_memory_config(fixture.root / "build_admission.conf",
             cloud_gate_slots="1", cloud_gate_stale_pushes="3")
         _ = (fixture.root / "cloud_gate.conf").write_text(
@@ -140,6 +610,28 @@ class CloudQueueViewTests(unittest.TestCase):
                     self.assertIn(failure_text, text)
                 else:
                     self.assertNotIn("failed module", text)
+
+    def test_cloud_rows_show_stage_and_location(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        for stage, region, zone, detail in (
+            ("tools ready", "", "", "tools ready"),
+            ("tests start", "eu-south-2", "eu-south-2a", "tests start · eu-south-2, zone a"),
+            ("", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
+            ("", "", "eu-south-2a", "zone eu-south-2a"),
+            ("", "eu-south-2", "", "eu-south-2"),
+            ("", "", "", ""),
+        ):
+            with self.subTest(stage=stage, region=region, zone=zone):
+                current = replace(row, progress=replace(row.progress, stage=stage, region=region, zone=zone))
+                self.assertEqual(queue_view.cloud_detail(current), detail)
+                current_model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
+                text = plain(queue_view.render_view(current_model, 240))
+                expected = " · ".join(filter(None, ("running", detail, "7 of 12 modules", "1 failed module")))
+                self.assertIn(expected, text)
 
     def test_cloud_rows_sort_with_local_steps_and_keep_the_local_memory_bars(self) -> None:
         model, fixture = self.cloud_model()
@@ -242,6 +734,7 @@ class QueueViewFixtureTests(QueueFixtureTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        empty_mac_reading(self.fixture)
         _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
 
@@ -310,7 +803,7 @@ class QueueViewTests(QueueViewFixtureTests):
             with self.subTest(columns=columns):
                 lines = queue_view.render_view(model, columns)
                 rows = waiting_rows(lines)
-                self.assertIn("nateroids nextest", rows[0])
+                self.assertIn("cables nextest" if columns >= 100 else "cables nexte…", rows[0])
                 for marker in ("pid ",):
                     self.assertEqual(terminal_width(rows[0][:rows[0].index(marker)]),
                                      terminal_width(rows[1][:rows[1].index(marker)]))
@@ -820,8 +1313,10 @@ class QueueViewTests(QueueViewFixtureTests):
                 self.assertEqual(len(running), 3)
                 for index, row in enumerate(running):
                     unit = "queue-…" if columns == 60 else "queue-unit"
-                    self.assertEqual(row[:header.index("step")].split(), ["run", "builds", unit])
-                    self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+                    self.assertEqual(row[:header.index("step")].split(),
+                                     ["run", "buil…" if columns == 60 else "builds", unit])
+                    self.assertEqual(row[header.index("step"):header.index("min")].strip(),
+                        cut_tail("queue-unit merge gate", header.index("min") - header.index("step") - 1))
                     self.assertEqual(row[header.index("min"):].split()[0], str(index + 1))
                     self.assertIn("5.0", row)
                     if columns >= 100:
@@ -1464,11 +1959,12 @@ class CapViewTests(QueueViewFixtureTests):
 
     def test_size_bars_show_uncut_needs_with_nearest_eighth_and_zero(self) -> None:
         model = self.fixture.cap_model()
-        for need, expected in ((6.8, "██████▊"), (0, ""), (25, "█" * 25)):
-            with self.subTest(need=need):
+        for columns, need, expected in ((100, 6.8, "██████▊"), (100, 0, ""), (100, 25, "█" * 23),
+                                        (120, 6.8, "██████▊"), (120, 0, ""), (120, 25, "█" * 25)):
+            with self.subTest(columns=columns, need=need):
                 step = replace(model.reading.view.waiting[1], need=int(need * admission_records.GIB))
                 changed = with_waiting(model, [model.reading.view.waiting[0], step])
-                lines = queue_view.render_view(changed, 100, colour=True)
+                lines = queue_view.render_view(changed, columns, colour=True)
                 row = next(line for line in lines if plain([line]).lstrip().startswith("2 "))
                 self.assertEqual("".join(span.text for span in row if span.tone == "warning"), "●" + expected)
                 self.assertTrue(any(f"{need:.1f}" in span.text and span.tone == "inactive" for span in row))
@@ -1485,13 +1981,17 @@ class CapViewTests(QueueViewFixtureTests):
         model = replace(with_waiting(model, [first, second]), labels=labels)
         for columns in (80, 100, 140):
             with self.subTest(columns=columns):
-                rows = waiting_rows(queue_view.render_view(model, columns))
+                lines = queue_view.render_view(model, columns)
+                rows = waiting_rows(lines)
                 self.assertIn("metrics-viewer", rows[0])
                 self.assertNotIn("performance-metrics-viewer", rows[0])
                 self.assertIn("tool-based-ui", rows[1])
                 self.assertEqual(rows[1].split()[2], "—")
                 self.assertNotIn("other-session", rows[1])
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual(rows[0][start:end].strip(), cut_tail("metrics-viewer nextest", end - start - 1))
+                self.assertEqual(rows[1][start:end].strip(), "nextest")
 
     def test_showrunner_prefix_is_removed_from_running_and_queued_units(self) -> None:
         model = self.fixture.cap_model()
@@ -1526,7 +2026,7 @@ class CapViewTests(QueueViewFixtureTests):
         header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
         row, = waiting_rows(lines)
         self.assertEqual(row[:header.index("step")].split()[1:], ["sdlc", "devtools"])
-        self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+        self.assertEqual(row[header.index("step"):header.index("min")].strip(), "devtools merge gate")
 
 
 
@@ -1553,7 +2053,9 @@ class CapViewTests(QueueViewFixtureTests):
                 rows = waiting_rows(narrow)
                 self.assertEqual(len(rows), 2)
                 self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in narrow))
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(narrow).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual([row[start:end].strip() for row in rows], ["cables nexte…", "cables nexte…"])
 
 
 if __name__ == "__main__":

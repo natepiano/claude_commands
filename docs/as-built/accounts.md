@@ -322,8 +322,19 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
+Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
+`Report` distinguishes `LoginEndKnown` from `LoginEndUnknown`.
+The usage reader takes the date from `claudeAiOauth.refreshTokenExpiresAt` in the metadata it already loads.
+Both live paths use this source, so the disk identity shortcut still avoids a Claude process start.
+The usage store and the timer cache preserve the date without storing other credential fields.
+An accepted reading without a date removes the stored date.
+Status classifies shared-home repairs before rendering.
+The text board keeps these repair lines.
+JSON omits these lines from `problems`, so cargo-handler and unit-board panes do not show them.
+All other problem lines remain in JSON.
 Each account row exports `sessions` beside `role_counts`.
-Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
 Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
@@ -333,8 +344,17 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
-A missing live session gives `exited`; live activity gives `busy` or `idle`.
-The workers role retains only `busy` and `idle`.
+A busy pane gives `busy`. A starting pane gives `starting`, including with a live detached run.
+The starting state shows that the pane has not reached an idle prompt.
+Other live detached work gives `waiting`.
+Exit and pause records take priority over all activity states.
+Without a live detached run, a missing live session gives `exited`.
+Other live activity gives `idle`.
+Role counts include `starting` and `waiting` separately from `busy` and `idle`.
+Peer counts use zero for each missing `starting` or `waiting` field.
+Published counts include waiting within busy and starting within idle, so older peers retain valid totals.
+The new fields identify those subsets. The decoder separates them for display.
+The cache retains the published document to prevent repeated subtraction.
 Claude producers count under `showrunners` with the same hold and activity rules.
 Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.

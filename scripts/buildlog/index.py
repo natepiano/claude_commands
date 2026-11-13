@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 
 # These indexes support repeated queries over the current schema.
@@ -176,6 +176,7 @@ TEST_COLUMNS: list[Column] = [
 ]
 
 GATE_RUN_COLUMNS: list[Column] = [
+    ("vcpus", "INTEGER", "vCPU count; absent for old records"),
     ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),
@@ -1165,7 +1166,7 @@ def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead)
         except FileNotFoundError:
             remove_index(path)
         else:
-            if path.name == LEGACY_INDEX_NAME or max(changed.st_atime, changed.st_mtime) < cutoff:
+            if path.name == LEGACY_INDEX_NAME or changed.st_mtime < cutoff:
                 remove_index(path)
 
 

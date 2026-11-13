@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, final, override
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.checkout_test_support import copy_runtime
 
 KEYS = Path(__file__).with_name("settings_local_keys.sh")
 BASH = shutil.which("bash") or "/bin/bash"
@@ -119,6 +120,7 @@ else:
         raise SystemExit(1)
     print("SENT: fixture")
 '''.replace("REAL_SENDER", repr(str(KEYS.parents[1] / "message/send.py"))))
+        copy_runtime(self.root, configuration=False)
         self.write_settings({"shared": 1})
         _ = (self.root / ".gitattributes").write_text("settings.json filter=claude-settings\n")
         _ = self.git("init", "-qb", "baseline")
@@ -148,6 +150,66 @@ else:
 
     def refresh(self) -> subprocess.CompletedProcess[str]:
         return self.run_command(BASH, "scripts/settings/refresh_filtered_index.sh")
+
+    def test_refresh_from_another_repository_uses_the_settings_head(self) -> None:
+        committed = {"first": 1, "second": 2, "shared": 3}
+        blob = self.git("hash-object", "-w", "--stdin", contents=json.dumps(committed, indent=2) + "\n").strip()
+        _ = self.git("update-index", "--cacheinfo", f"100644,{blob},settings.json")
+        _ = self.git("commit", "-qm", "Set the settings key order")
+        other = self.home / "other repository"
+        other.mkdir()
+        other_settings = other / "settings.json"
+        foreign = json.dumps({"second": 2, "first": 1, "localOnly": "foreign"}, indent=2) + "\n"
+        _ = other_settings.write_text(foreign)
+        _ = self.git("-C", str(other), "init", "-qb", "foreign")
+        _ = self.git("-C", str(other), "add", "settings.json")
+        _ = self.git("-C", str(other), "commit", "-qm", "Set conflicting settings")
+        self.write_settings({"second": 2, "first": 1, "shared": 3, "localOnly": "saved", "theme": "dark"})
+        before = self.settings.read_bytes()
+        captured = self.root / "cleaned.json"
+        cleaner = self.root / "scripts/settings/clean_settings_json.sh"
+        wrapper = self.root / "scripts/settings/capture-clean.sh"
+        _ = wrapper.write_text(f"#!{BASH}\nset -euo pipefail\n" +
+                               f"{shlex.quote(str(cleaner))} | tee {shlex.quote(str(captured))}\n")
+        wrapper.chmod(0o755)
+        table = self.root / "scripts/settings/git_filters_table.sh"
+        command = (f"source {shlex.quote(str(table))}\n" +
+                   f"git_filters_refresh_path {shlex.quote(str(self.root))} " +
+                   "scripts/settings/capture-clean.sh settings.json claude-settings")
+        result = subprocess.run([BASH, "-c", command], cwd=other, env=self.env, capture_output=True,
+                                text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(captured.read_text(), json.dumps(committed, indent=2) + "\n")
+        self.assertEqual(self.read_json(self.sidecar), {"localOnly": "saved", "theme": "dark"})
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(other_settings.read_text(), foreign)
+        self.assertFalse((other / "settings.local-keys.json").exists())
+
+    def test_clean_keeps_head_object_order_and_appends_new_keys(self) -> None:
+        committed = {"precomputeCompactionEnabled": True,
+                     "permissions": {"allow": ["Read", "Bash"], "deny": ["Write"], "removed": True},
+                     "shared": {"first": 1, "second": 2, "items": [{"left": 1, "right": 2}, {"left": 3, "right": 4}]},
+                     "removed": True}
+        blob = self.git("hash-object", "-w", "--stdin", contents=json.dumps(committed, indent=2) + "\n").strip()
+        _ = self.git("update-index", "--cacheinfo", f"100644,{blob},settings.json")
+        _ = self.git("commit", "-qm", "Set the shared key order")
+        live = {"enabledPlugins": {"new-plugin@official": True},
+                "shared": {"second": 22, "newSecond": 4, "first": 11, "newFirst": 3,
+                           "items": [{"right": 4, "left": 3}, {"right": 2, "left": 1}]},
+                "permissions": {"deny": ["Write"], "newSecond": True, "allow": ["Bash", "Read"], "newFirst": False},
+                "precomputeCompactionEnabled": False,
+                "hooks": {"SessionStart": [{"hooks": [{"command": "shared.py", "type": "command"}]}]}}
+        self.write_settings(live)
+        before = self.settings.read_bytes()
+        cleaned = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text())
+        expected = {"precomputeCompactionEnabled": False,
+                    "permissions": {"allow": ["Bash", "Read"], "deny": ["Write"], "newSecond": True, "newFirst": False},
+                    "shared": {"first": 11, "second": 22, "items": [{"left": 3, "right": 4}, {"left": 1, "right": 2}],
+                               "newSecond": 4, "newFirst": 3},
+                    "enabledPlugins": live["enabledPlugins"], "hooks": live["hooks"]}
+        self.assertEqual(json.loads(cleaned.stdout), expected)
+        self.assertEqual(cleaned.stdout, json.dumps(expected, indent=2) + "\n")
+        self.assertEqual(self.settings.read_bytes(), before)
 
     def test_unknown_key_is_saved_before_checkout_and_does_not_change_diff_or_status(self) -> None:
         local = {"shared": 1, "newSetting": {"enabled": True}, "voice": {"enabled": True}}
@@ -204,20 +266,59 @@ else:
         self.assertIn("settings.json", self.git("status", "--porcelain", "--untracked-files=no"))
         self.assertEqual(self.sends(), [])
 
-    def test_unreadable_baseline_reports_an_error_and_preserves_live_and_saved_values(self) -> None:
+    def test_missing_head_keeps_live_order_and_preserves_live_and_saved_values(self) -> None:
         self.write_settings({"shared": 1, "newSetting": "local"})
         _ = self.refresh()
         before = self.settings.read_bytes(), self.sidecar.read_bytes(), self.history.read_bytes()
         _ = self.git("update-ref", "-d", "HEAD")
         clean = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text(), check=False)
-        self.assertNotEqual(clean.returncode, 0)
-        self.assertEqual(clean.stdout, "")
-        self.assertIn("cannot read committed HEAD:settings.json",
-                      (self.root / "settings.local-keys.errors.log").read_text())
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertEqual(json.loads(clean.stdout), {"shared": 1})
+        self.assertEqual(clean.stderr, "")
+        self.assertFalse((self.root / "settings.local-keys.errors.log").exists())
         smudge = self.run_command(BASH, "scripts/settings/smudge_settings_json.sh", contents='{"shared": 1}\n')
         self.assertEqual(json.loads(smudge.stdout), {"shared": 1, "newSetting": "local"})
         self.assertEqual(smudge.stderr, "")
         self.assertEqual((self.settings.read_bytes(), self.sidecar.read_bytes(), self.history.read_bytes()), before)
+
+    def test_clean_without_committed_settings_keeps_live_order(self) -> None:
+        revision = self.git("rev-parse", "HEAD").strip()
+        live = {"second": {"b": 2, "a": 1}, "first": [2, 1], "voice": {"enabled": True}}
+        for missing in ("HEAD", "settings.json"):
+            with self.subTest(missing=missing):
+                self.write_settings({"shared": 1})
+                _ = self.git("update-ref", "HEAD", revision)
+                _ = self.git("read-tree", revision)
+                if missing == "HEAD":
+                    _ = self.git("update-ref", "-d", "HEAD")
+                else:
+                    _ = self.git("rm", "--cached", "-f", "settings.json")
+                    _ = self.git("commit", "-qm", "Remove the settings blob")
+                self.write_settings(live)
+                before = self.settings.read_bytes()
+                cleaned = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text())
+                self.assertEqual(cleaned.stdout, json.dumps({"second": live["second"], "first": live["first"]}, indent=2) + "\n")
+                self.assertEqual(cleaned.stderr, "")
+                self.assertEqual(self.settings.read_bytes(), before)
+                self.assertEqual(self.read_json(self.sidecar), {"voice": {"enabled": True}})
+
+    def test_clean_uses_live_order_when_the_head_read_fails(self) -> None:
+        shims = self.root / "shims"
+        shims.mkdir()
+        shim = shims / "git"
+        marker = self.root / "head-reads"
+        _ = shim.write_text(f"#!{BASH}\necho read >> {shlex.quote(str(marker))}\nexit 128\n")
+        shim.chmod(0o755)
+        self.env["PATH"] = str(shims) + os.pathsep + self.env.get("PATH", os.defpath)
+        live = {"second": {"b": 2, "a": 1}, "first": [2, 1], "theme": "dark"}
+        self.write_settings(live)
+        before = self.settings.read_bytes()
+        cleaned = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text())
+        self.assertEqual(cleaned.stdout, json.dumps({"second": live["second"], "first": live["first"]}, indent=2) + "\n")
+        self.assertEqual(cleaned.stderr, "")
+        self.assertEqual(marker.read_text(), "read\n")
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertEqual(self.read_json(self.sidecar), {"theme": "dark"})
 
     def test_notices_survive_deletion_restart_and_use_live_configuration(self) -> None:
         self.write_settings({"shared": 1, "firstKey": True, "theme": "dark"})

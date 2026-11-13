@@ -55,6 +55,19 @@ class RunningServiceJob:
 
 
 @dataclass(frozen=True)
+class WaitingServiceJob:
+    started_at: float
+
+
+@dataclass(frozen=True)
+class UnmatchedServiceJob:
+    started_at: float
+
+
+ServiceJobState = RunningServiceJob | WaitingServiceJob | UnmatchedServiceJob | IdleService | NotServiceSlice
+
+
+@dataclass(frozen=True)
 class ScopeProcess:
     pid: int
     program: str
@@ -83,6 +96,7 @@ class ScopeActivityReader:
         self.environments: dict[int, dict[str, str]] = {}
         self.commands: dict[int, tuple[str, ...]] = {}
         self.runs: dict[int, LiveBuildRun] = {run.pid: run for run in runs}
+        self.resolved_runs: dict[int, LiveBuildRun | NoLiveBuildRun] = {}
         self.boot: float = 0.0
         try:
             self.boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
@@ -128,11 +142,28 @@ class ScopeActivityReader:
         return result
 
     def run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
-        for ancestor in self.ancestors(pid):
-            run = self._run_at(ancestor, NoLiveBuildRun())
-            if isinstance(run, LiveBuildRun) or self.environment(ancestor).get("BUILDLOG_RUN"):
-                return run
-        return NoLiveBuildRun()
+        chain: list[int] = []
+        seen: set[int] = set()
+        ancestor = pid
+        while ancestor in self.processes and ancestor not in self.resolved_runs and ancestor not in seen:
+            seen.add(ancestor)
+            chain.append(ancestor)
+            ancestor = self.processes[ancestor].parent
+        if ancestor in seen:
+            # A cycle has no common root. Resolve each member from its own ancestry.
+            for member in chain:
+                run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
+                for ancestor in self.ancestors(member):
+                    run = self._run_at(ancestor, NoLiveBuildRun())
+                    if isinstance(run, LiveBuildRun) or self.environment(ancestor).get("BUILDLOG_RUN"):
+                        break
+                self.resolved_runs[member] = run
+            return self.resolved_runs[pid]
+        inherited = self.resolved_runs.get(ancestor, NoLiveBuildRun())
+        for ancestor in reversed(chain):
+            inherited = self._run_at(ancestor, inherited)
+            self.resolved_runs[ancestor] = inherited
+        return self.resolved_runs.get(pid, NoLiveBuildRun())
 
     def _run_at(self, pid: int, inherited: LiveBuildRun | NoLiveBuildRun) -> LiveBuildRun | NoLiveBuildRun:
         known = self.runs.get(pid)

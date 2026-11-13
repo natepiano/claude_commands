@@ -41,7 +41,8 @@ class AutoSilenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": folder})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "NOTIFY_STATE_DIR": folder, "STAFF_FILE": str(Path(folder) / "staff.json")})))
         self.commands, self.pushes, self.posted, self.now = [], [], [], START
         registry = Path(folder) / "sessions"
         registry.mkdir()
@@ -62,15 +63,17 @@ class AutoSilenceTests(unittest.TestCase):
                               move: resume_message.NoAccountMove | resume_message.AccountMove = resume_message.NO_ACCOUNT_MOVE,
                               workers: resume_message.ResumeWorkers = resume_message.NO_WORKERS,
                               context: str = "",
-                              own_pass: resume_message.BusyPass | resume_message.NoOwnPass = resume_message.NO_OWN_PASS) -> str:
+                              own_pass: resume_message.BusyPass | resume_message.NoOwnPass = resume_message.NO_OWN_PASS,
+                              unit: staff.StaffRow | None = None) -> str:
             self.assertEqual(cause, "you were stopped and resumed")
             return resume_message.resume_message("the herdr server restarted", move=move,
-                                                  workers=workers, context=context, own_pass=own_pass)
+                                                  workers=workers, context=context, own_pass=own_pass, unit=unit)
 
         for name, identity in (("devtools", "33c5eac0-86d3-4b40-907c-8b24fc8831bd"),
                                ("models", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
             with self.subTest(session=name):
                 entry = pane_record.launch("w1:p1", identity, "/fixture", {}, ["claude"])
+                self.assertNotIn("staff_id", entry)
                 environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}
                 with (mock.patch.object(pane_record, "matching_launch", return_value=entry),
                       mock.patch.object(session_staff, "record_membership", return_value=entry),

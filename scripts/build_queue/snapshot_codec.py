@@ -1,13 +1,46 @@
 """Encode and validate tagged domain records."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import MISSING, fields, is_dataclass
+from enum import Enum, auto
 from functools import lru_cache
 import math
 from pathlib import Path
 from types import UnionType
 from typing import Callable, Literal, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+
+# Literal unions use typing.Union on Python 3.13.
+LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+
+
+class SnapshotReadPolicy(Enum):
+    ALL_FIELDS = auto()
+    ACQUISITION_FIELDS = auto()
+
+
+_READ_POLICY = ContextVar("snapshot_read_policy", default=SnapshotReadPolicy.ALL_FIELDS)
+
+
+@contextmanager
+def snapshot_read_policy(policy: SnapshotReadPolicy) -> Generator[None]:
+    """Limit omitted fields to the current reader and restore the previous policy."""
+    token = _READ_POLICY.set(policy)
+    try:
+        yield
+    finally:
+        _READ_POLICY.reset(token)
+
+
+@lru_cache(maxsize=None)
+def acquisition_unused_fields(schema: type) -> frozenset[str]:
+    """Each omitted field must have a default for the acquisition reader."""
+    return frozenset(member.name for member in fields(schema)
+                     if member.metadata.get("acquisition_unused") is True
+                     and (member.default is not MISSING or member.default_factory is not MISSING))
+
 
 @lru_cache(maxsize=None)
 def snapshot_fields(schema: type) -> dict[str, object]:
@@ -55,8 +88,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
-    # A union of Literal aliases still has typing.Union as its origin on 3.13.
-    if origin is UnionType or origin is get_origin(Literal[0] | Literal[1]):
+    if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -108,5 +140,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")
+    unused = (acquisition_unused_fields(schema)
+              if _READ_POLICY.get() is SnapshotReadPolicy.ACQUISITION_FIELDS else frozenset[str]())
     return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
-                                                for name, kind in annotations.items() if name in record})
+                                                for name, kind in annotations.items() if name in record and name not in unused})

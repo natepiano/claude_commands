@@ -24,6 +24,7 @@ from typing import cast, override
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import broadcast
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production import codex_winddown
 from scripts.production import fake_unit_host
 from scripts.production import fake_showrunner
@@ -127,10 +128,10 @@ class NoticeRetryTests(unittest.TestCase):
         self.assertEqual((self.state / codex_winddown.QUIET).read_text(encoding="utf-8"), "sent\n")
 
     def test_a_running_count_before_the_quiet_claim_cancels_the_pass(self) -> None:
-        def prepare(_push: object) -> list[str]:
+        def prepare(_push: object, *, send_script: Path) -> list[str]:
             self.assertFalse((self.state / codex_winddown.QUIET).exists())
             codex_winddown.announce_quiet(1)
-            return [sys.executable, str(self.state / "fake-send.py")]
+            return [sys.executable, str(send_script)]
 
         with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
@@ -635,8 +636,17 @@ class MessageTests(unittest.TestCase):
         _ = (self.root / "ps").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments], env=self.environment, capture_output=True,
-                              text=True, check=False)
+        # Broadcasts resolve the sender from the current process registry.
+        if process_boundary_for_case(self) or arguments[0] in ("start", "triage", "clear"):
+            return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *arguments],
+                                  env=self.environment, capture_output=True, text=True, check=False)
+        command_arguments = list(arguments)
+        with (mock.patch.object(codex_winddown, "STATE", Path(self.environment["CODEX_WINDDOWN_STATE"])),
+              mock.patch.object(codex_winddown, "NOTIFIER", Path(self.environment["CODEX_WINDDOWN_NOTIFIER"])),
+              mock.patch.object(broadcast, "SEND", Path(self.environment["BROADCAST_SEND"])),
+              mock.patch.object(process_table, "PS", shlex.split(self.environment["PROCESS_TABLE_PS"]))):
+            return invoke_cli(codex_winddown, lambda: codex_winddown.main(command_arguments), command_arguments,
+                              self.environment, Path.cwd(), production_state=True)
 
     def test_start_tells_each_role_its_version_and_starts_each_showrunners_count(self) -> None:
         done = self.run_script("start", "--from", "natedev")
@@ -750,6 +760,7 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("count", fixture_runtime_id("showrunner::show"))
         self.assertEqual((self.root / "log").read_text(encoding="utf-8").count("--to user"), 2)
 
+    @process_boundary
     def test_status_says_whether_a_wind_down_is_on(self) -> None:
         self.assertIn("Wind-down: off", self.run_script("status").stdout)
         _ = self.run_script("start", "--from", "natedev")

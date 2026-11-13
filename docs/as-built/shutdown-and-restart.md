@@ -75,9 +75,8 @@ A family switch preserves its source when release remains unproved.
 The short form is `resume NAME`, through `scripts/agents/resume`.
 The wrapper uses the shared Python launcher and locates `shutdown.py` beside the wrapper.
 
-The lookup accepts a short name, a staff id, or a current session id.
-An exact Codex thread name resolves through the shared `session_index.jsonl`.
-A canonical UUID takes priority over a thread name and reads no index.
+The lookup accepts a staff name, a staff id, a launch reference, or a native session id.
+A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
@@ -353,10 +352,11 @@ Each child has one result:
 |---|---|---|
 | `Resumable` | The child's turn was live | The unchanged command from `resume_worker_command` |
 | `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
-| `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
+| `Unavailable` | The run, worker record, or known staff role is unavailable | One `anomaly:` line with the child and reason |
 
 The reader selects staff members under the moved parent.
 It reads each member's backend and current native session.
+The member's `KnownWorkerRole` supplies the child's role without a history fallback.
 A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
 A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.
@@ -447,7 +447,17 @@ If a stop includes the caller, restart continues in a detached process before th
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
 A stop checks the current conversation before it sends a signal.
-A failed row prints one anomaly line. Other rows continue.
+A failed row does not stop other rows.
+After the start pool finishes, restart reads each failed unit director or showrunner conversation again.
+If the read proves that the conversation stopped, restart retries that start once with the same arguments.
+A successful retry prints only `<name>: down; started`.
+If the row becomes live before the retry launches it, the retry prints only `<name>: unchanged`.
+A second failure prints `<name>: down: <reason>` on stdout and keeps the row pending.
+An error without text uses its type name as the reason.
+A live or unknown conversation keeps the existing anomaly line and gets no retry.
+Trust-write failures and row-lock refusals keep their existing behavior without a retry.
+An unreadable native identity in a retained pane excludes that pane from placement candidates.
+It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
@@ -461,6 +471,11 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
+The opening prompt and the Claude resume check share a cursor positioned before launch.
+The cursor skips complete historical records without parsing their JSON.
+Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
+If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.
+The cursor retains observed turns, so prompt submission does not remove evidence from the resume check.
 The reader leaves a final record without a newline unread until the writer completes it.
 The launch boundary follows the last complete newline.
 A malformed Codex record with a newline makes the transcript unreadable.
@@ -526,6 +541,28 @@ An unconfirmed worker stop needs targeted proof of process absence before restar
 Live or unknown evidence leaves the worker pending.
 The worker check uses the same function as the Codex row check.
 
+### Legacy Claude launchers
+
+`assign_claude.run` installs no signal handler.
+Its child commands inherit the launcher's process group.
+Stop that group to stop the launcher and its child commands.
+`assign.sh` uses `exec` for `assign.py` and creates no separate process group.
+The current native worker path does not call the legacy Claude launcher.
+
+The launcher checks the claim owner under the claim lock before each publication.
+The launcher records its PID and process start in `impl_claim_<slot>.json` before work starts.
+The claim also records the host, boot, and PID namespace.
+`read_worker_claim` rejects dead processes, zombie processes, and reused PIDs.
+It compares local processes only when the saved scope matches the current scope.
+It retains claims with missing start evidence, missing scope, different scope, or unreadable identity.
+Status readers recover an `implementing` status whose launcher has ended.
+They write `error` and add a blocked board entry under the claim lock.
+The next assignment can replace the ended claim.
+Normal completion still releases the claim.
+An interrupted exit retains the claim, including a Python `KeyboardInterrupt` from SIGINT.
+A killed launcher cannot record pass completion.
+Its ledger entry keeps the last saved state.
+
 ### Gates during a session restart
 
 A session stop sends TERM, then KILL after the grace period, to the one proved agent PID (`stop_resume.py`).
@@ -535,6 +572,12 @@ A normal stop keeps the pane and its shell.
 A detached run continues across a session stop or restart.
 `detached_runs.py start` starts its supervisor in a new process session.
 The command runs in a `builds-detached.slice` scope when systemd is available.
+The command shares the supervisor's process group, including through the scope prefix.
+The supervisor uses default TERM, INT, and HUP dispositions.
+It installs no signal handler.
+An explicit stop signals the supervisor's process group after the caller proves its identity.
+The next start, worker restore, or explicit `detached_runs.py reap` finishes the dead supervisor's record and delivers its result.
+The result reports no exit status unless the supervisor saved the command's status before it died.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
 The supervisor waits for delivery before it marks the run finished.

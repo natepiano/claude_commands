@@ -47,7 +47,8 @@ from scripts.buildlog import store
 from scripts.lib import test_phase
 
 from scripts.build_queue.scope_activity import (
-    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, ScopeActivityReader, ScopeProcesses,
+    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
+    ScopeActivityReader, ScopeProcesses,
 )
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
@@ -122,8 +123,6 @@ def _live_run(run: wire.RunIdentity) -> LiveBuildRun:
 class Clock(Protocol):
     def now(self) -> float: ...
     def monotonic(self) -> float: ...
-
-
 
 
 class Readings(Protocol):
@@ -527,7 +526,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
         except (OSError, ValueError):
             members[reading.cgroup] = frozenset()
-        if not isinstance(reading.job_state, NotServiceSlice):
+        if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
@@ -1203,10 +1202,12 @@ class AdmissionServer:
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+        rows = self._ordered_waiters()
+        sessions = [row.get("session_id", "") for _, row in rows if not row.get("unit")]
         labels: Mapping[str, gate.UnitMembership] = (
-            gate.priority_labels([waiting.row.get("session_id", "") for waiting in self.waiters.values()])
-            if not isinstance(self.priority, records.NoQueuePriority) else {})
-        return gate.apply_queue_priority(self._ordered_waiters(), gate.QueueOrderContext(self.priority, labels))
+            gate.priority_labels(sessions)
+            if sessions and not isinstance(self.priority, records.NoQueuePriority) else {})
+        return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
 
     def _override_pending_reconnect(self) -> bool:
         if isinstance(self.override_reconnect_until, NoReconnectGrace):
@@ -1454,7 +1455,8 @@ class AdmissionServer:
         tree_pids = gate.process_tree(roots, dict(evidence.processes))
         result: list[records.UnownedSliceMemory] = []
         for memory in evidence.unowned:
-            required = not isinstance(memory.job_state, NotServiceSlice)
+            state = records.recorded_service_state(memory)
+            required = not isinstance(state, NotServiceSlice)
             if not required and memory.cgroup in owned:
                 continue
             scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))] if required else []
@@ -1466,12 +1468,17 @@ class AdmissionServer:
             use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
                       else item.bytes for item in duplicate)
             use += sum(item.anonymous.bytes for item in scoped if isinstance(item.anonymous, records.AnonymousRunUse))
-            job = memory.job_state
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
+            job = (gate.service_job_state(workers, dict(evidence.processes), tree_pids | scoped_pids,
+                    [waiting.row for waiting in self.waiters.values()],
+                    state.started_at if isinstance(state,
+                        (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0)
+                   if required else state)
+            legacy_job = memory.job_state
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
                                dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
-                job = IdleService()
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
+                legacy_job = IdleService()
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
@@ -2050,8 +2057,7 @@ class AdmissionServer:
         adopted: list[placement.AdoptedProviderClaim] = []
         with claim_state.locked(paths.lock):
             held = claim_state.read_claims(paths)
-        generation = (offload.expected_instance_generation(target.name)
-                      if isinstance(target, target_config.SshTarget) and target_config.is_aws_target(target) else "")
+        generation = ""
         for claim in held:
             record = claim.record
             if "remote_host" not in record:
@@ -2243,7 +2249,7 @@ class AdmissionServer:
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
-        started, cpu_started = self.clock.monotonic(), time.process_time()
+        started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
             return self._handle_request(request, connection)
         finally:
@@ -2257,7 +2263,7 @@ class AdmissionServer:
             records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
         else:
             records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
-            wall, cpu = self.clock.monotonic() - started, time.process_time() - cpu_started
+            wall, cpu = self.clock.monotonic() - started, time.thread_time() - cpu_started
             if wall > limit:
                 print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
                       file=sys.stderr, flush=True)

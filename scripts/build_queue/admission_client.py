@@ -22,7 +22,7 @@ import sys
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
-from scripts.build_queue import admission_code
+from scripts.build_queue import admission_code, snapshot_codec
 if TYPE_CHECKING:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
 else:
@@ -93,9 +93,20 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
     return line
 
 
+def _is_placement_control(request: wire.Request) -> bool:
+    return isinstance(request, (wire.PlacementRequest, wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport))
+
+
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
+    if _is_placement_control(request):
+        reply = _call(request, lambda _wait: None)
+        if isinstance(reply, LeftQueue):
+            raise _QueueLeft()
+        if isinstance(reply, wire.Refused):
+            raise wire.AdmissionUnavailable(reply.reason)
+        return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
@@ -293,8 +304,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
-          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
-    acquisition = isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
+          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization:
+    acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
@@ -332,8 +343,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
              *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
-             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
+             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization:
     first = request
+    placement_control = _is_placement_control(first)
     leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
@@ -348,7 +360,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     restarted = False
     last_valid = CLOCK.monotonic()
     last_silence_notice = last_valid
-    if isinstance(configuration, wire.AcquisitionTiming) and retry.unreachable_deadline == float("inf"):
+    if (not isinstance(configuration, wire.CleanupTiming)
+            and (isinstance(configuration, wire.AcquisitionTiming) or placement_control)
+            and retry.unreachable_deadline == float("inf")):
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
 
     def check_unreachable() -> None:
@@ -401,7 +415,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         last_silence_notice = CLOCK.monotonic()
                         continue
                     try:
-                        reply = wire.parse_reply(line, request)
+                        with snapshot_codec.snapshot_read_policy(snapshot_codec.SnapshotReadPolicy.ACQUISITION_FIELDS):
+                            reply = wire.parse_reply(line, request)
                     except ValueError as error:
                         raise CheckerFailure(str(error)) from error
                     if CLOCK.monotonic() > retry.deadline:
@@ -409,9 +424,13 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
-                        if generation_query:
+                        if generation_query or placement_control:
                             return reply
                         return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)))
+                    if placement_control:
+                        if isinstance(reply, (wire.Assignment, wire.PlacementWait, wire.DispatchStatus, wire.FirstAuthorization)):
+                            return reply
+                        raise CheckerFailure("invalid placement control answer")
                     if generation_query:
                         if retry.left_queue():
                             return LeftQueue()
@@ -505,6 +524,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 except Exception as refresh_error:
                     reason = str(refresh_error) or "checker returned an error"
         except (OSError, TransportUnavailable) as error:
+            if placement_control and isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
+                reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused"
+                raise wire.AdmissionUnavailable(reason) from error
             if retry.launch_without_wait or CLOCK.monotonic() >= retry.deadline:
                 return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
             restart_error = isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE)
@@ -687,8 +709,12 @@ class WaitOutput:
         self.last_position = reply.position
         if snapshot.head_need:
             text += f"; head {snapshot.head_label} needs {snapshot.head_need / records.GIB:.1f} GiB"
-        summary = ", ".join(("" if item.project else Path(item.folder).name + " ")
-            + f"{queue_lines.step_text(item, build_steps.RECORDED_STEP_NAMES)} in {item.folder}" for item in snapshot.running)
+        from scripts.message import unit_labels
+
+        labels = unit_labels.unit_labels_for([item.session_id for item in snapshot.running], os.environ)
+        summary = ", ".join(("" if queue_lines.step_owner_name(item, labels) else Path(item.folder).name + " ")
+            + f"{queue_lines.step_text(item, build_steps.RECORDED_STEP_NAMES, labels=labels)} in {item.folder}"
+            for item in snapshot.running)
         reason_text = (records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(decision.pressure) if isinstance(decision.pressure, records.MemoryPressure) else "")
@@ -733,6 +759,24 @@ class InferProfileAtUse:
 INFER_PROFILE_AT_USE = InferProfileAtUse()
 
 
+def step_identity(step: str, worktree: str) -> wire.Identity:
+    from scripts.build_queue import admission_records as records
+    from scripts.production import staff
+
+    identity = records.waiter_identity(step, worktree)
+    if not identity["session_id"] and (reference := os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")):
+        # Resolve the recorded staff owner only when the caller has no session identity.
+        try:
+            member = staff.snapshot().by_id(staff.StaffId(reference))
+        except staff.StaffUnreadable:
+            member = None
+        if member is not None:
+            identity["session_id"] = member.current_session
+            identity["session_name"] = member.name
+    return wire.Identity(identity["session_id"], identity["session_name"], identity["step"],
+                         identity["folder"], identity.get("unit", ""))
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -751,11 +795,11 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = records.waiter_identity(estimate.profile.step, estimate.profile.worktree)
+    identity = step_identity(estimate.profile.step, estimate.profile.worktree)
     if isinstance(estimate.profile, records.ProgramProfile):
-        identity["folder"] = estimate.profile.worktree
+        identity = replace(identity, folder=estimate.profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
-        wire.Identity(identity["session_id"], identity["session_name"], identity["step"], identity["folder"], identity.get("unit", "")),
+        identity,
         records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run)
 

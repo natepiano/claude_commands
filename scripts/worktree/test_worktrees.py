@@ -101,7 +101,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT),
+            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",

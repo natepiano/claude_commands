@@ -1,6 +1,8 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import json
 import io
 import os
@@ -42,14 +44,14 @@ class NativeHookEntryTests(unittest.TestCase):
                 payload = json.dumps(value)
                 receiver = Path(folder) / "receive.py"
                 receipt = Path(folder) / "receipt.json"
-                atomic_file.write_text_atomic(receiver, "\n".join((
+                atomic_file.write_text_atomic(receiver, python_tool_source("\n".join((
                     "from dataclasses import asdict",
                     "import json, sys",
                     "from pathlib import Path",
                     "from scripts.herdr import turn_end",
                     "from scripts.lib.atomic_file import write_text_atomic",
                     "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
-                    "raise SystemExit(turn_end.main(sys.argv[2:]))", "")))
+                    "raise SystemExit(turn_end.main(sys.argv[2:]))", ""))))
                 children: list[subprocess.Popen[bytes]] = []
 
                 def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
@@ -257,12 +259,13 @@ class TurnEndTests(unittest.TestCase):
                     stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
-        opened = self.case.opened()
         original_run = self.case.run_dir
         original_state = (original_run / "progress_history_state.json").read_bytes()
         outside = Path(self.enterContext(TemporaryDirectory(prefix="outside-worker-run-")))
         atomic_file.write_text_atomic(outside / "progress_history_state.json", original_state.decode())
         self.case.run_dir = outside
+        _ = staff.set_run(self.case.fixture.parent.id, staff.OpenRun(outside))
+        opened = self.case.opened()
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         self.assertEqual(worker_panes.worker_run(opened.row), outside)
         self.assertEqual(len(self.case.fixture.world.launches), 1)
@@ -877,6 +880,23 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(status.read_text(), "error\n")
         self.assertIn("ledger write failed", self.case.agent.notices[-1])
         self.assertEqual(len(self.case.agent.notices), 1)
+
+        with self.subTest(completion="error reply is missing"):
+            current = self.case.opened("missing-error-reply")
+            instance = progress_history.begin_dispatch(self.case.run_dir, slot=current.row.name, phase="8", role="impl",
+                worker_name=current.row.name, worker_id=current.row.id, launcher_command=["assign.sh"],
+                prompt=self.case.prompt, kind="impl", lens="")
+            missing = self.case.run_dir / "missing-error-reply.md"
+            progress_history.save_dispatch_delivery(self.case.run_dir, instance,
+                progress_history.DispatchDelivery("saved prompt", instance, str(missing)))
+            progress_history.complete_dispatch(self.case.run_dir, current.row.name, instance, status="error")
+            progress_history.save_hook_completion(self.case.run_dir, instance,
+                progress_history.HookCompletion("error", str(missing), ("error reply write failed",)))
+            turn_end.run_finished(str(current.row.current_session))
+            self.assertEqual(worker_panes.worker_pass(current.row, self.case.run_dir)["status"], "error")
+            self.assertEqual(len(self.case.agent.notices), 2)
+            self.assertIn("error reply write failed", self.case.agent.notices[-1])
+            self.assertFalse(missing.exists())
 
     def test_submission_keeps_the_held_role_until_the_hook_completes(self) -> None:
         self.case.agent.finish_after = 1

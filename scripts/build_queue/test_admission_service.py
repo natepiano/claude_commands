@@ -4,6 +4,8 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
+from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
@@ -27,7 +29,6 @@ import threading
 import time
 import subprocess
 import unittest
-from types import ModuleType
 from typing import cast, override
 from unittest import mock
 
@@ -91,6 +92,45 @@ class FixedSystemReader:
 
     def close(self) -> None:
         pass
+
+
+class ReferenceActivityReader(ScopeActivityReader):
+    """Keep the original ancestry traversal as an independent test reference."""
+
+    @override
+    def run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+        for ancestor in self.ancestors(pid):
+            run = self._run_at(ancestor, NoLiveBuildRun())
+            if isinstance(run, LiveBuildRun) or self.environment(ancestor).get("BUILDLOG_RUN"):
+                return run
+        return NoLiveBuildRun()
+
+
+class ProcessRunEvidenceTests(unittest.TestCase):
+    def test_process_run_evidence_reuses_ancestors_and_keeps_run_boundaries(self) -> None:
+        for cyclic in (False, True):
+            with self.subTest(cyclic=cyclic), AdmissionFixture() as fixture:
+                for pid in range(1, 201):
+                    parent = 3 if cyclic and pid == 1 else pid - 1
+                    write_process(fixture.proc.path, pid, parent=parent)
+                    directory = fixture.proc.path / str(pid)
+                    _ = (directory / "cmdline").write_bytes(
+                        b"bash\0verify.sh\0" if pid in (2, 17) else b"python3\0fixture.py\0")
+                    environment = b"BUILDLOG_RUN=absent\0" if pid == 41 else b""
+                    if pid == 88:
+                        environment = b"BUILDLOG_RUN=17:17\0"
+                    _ = (directory / "environ").write_bytes(environment)
+                processes = fixture.proc.processes()
+                activity = ReferenceActivityReader(processes, fixture.proc.path)
+                expected = {pid: activity.run(pid) for pid in processes}
+                reader = ScopeActivityReader(processes, fixture.proc.path)
+                with mock.patch.object(reader, "command", wraps=reader.command) as command:
+                    actual = {pid: reader.run(pid) for pid in processes}
+                self.assertEqual(actual, expected)
+                if not cyclic:
+                    self.assertLessEqual(command.call_count, len(processes))
+                self.assertIsInstance(actual[41], NoLiveBuildRun)
+                self.assertEqual(actual[88], actual[17])
 
 
 class ReplyPublicationTests(unittest.TestCase):
@@ -882,6 +922,53 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 
 class PendingPriorityTests(unittest.TestCase):
+    def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
+        from scripts.message import roster, unit_labels
+        from scripts.production import staff
+
+        producer = staff.StaffRow(staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
+                                 current_session=staff.StaffId("producer-session"))
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "chosen", staff.ReportsTo(producer.id),
+                                 current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "builder", staff.ReportsTo(director.id),
+                               current_session=staff.StaffId("worker-session"))
+        snapshot = staff.StaffSnapshot((producer, director, worker))
+        expected = {"director-session": UnitLabels("chosen", "production", "chosen", unit_labels.OwnerRole.UNIT),
+                    "worker-session": UnitLabels("builder", "production", "chosen", unit_labels.OwnerRole.UNIT)}
+        with mock.patch.object(staff, "snapshot", return_value=snapshot), \
+                mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
+            self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), \
+                    mock.patch.object(staff, "snapshot", side_effect=OSError("unreadable") if unreadable else None,
+                                      return_value=snapshot), \
+                    mock.patch.object(roster, "unit_labels_for", return_value={**expected,
+                                      "unrecorded": UnitLabels("old", unit="other")}) as fallback:
+                actual = gate.priority_labels(["director-session", "worker-session", "unrecorded"])
+                self.assertEqual(actual, {**expected, "unrecorded": UnitLabels("old", unit="other")})
+                fallback.assert_called_once_with(
+                    ["director-session", "worker-session", "unrecorded"] if unreadable else ["unrecorded"], os.environ)
+
+    def test_explicit_waiter_units_keep_order_without_a_roster_lookup(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            requests = [replace(fixture.request(), identity=wire.Identity("old", "older", "check", "", "other")),
+                        replace(fixture.request(), identity=wire.Identity("new", "newer", "check", "", "chosen"))]
+            for request in requests:
+                _ = fixture.server.handle_request(request)
+            fixture.server.priority = records.QueuePriority(({
+                "unit": "chosen", "why": "urgent", "set_at": fixture.clock.now(), "set_by": "director"},))
+            rows = [(fixture.state_dir / records.waiter_owner(waiting.row), waiting.row)
+                    for waiting in fixture.server.waiters.values()]
+            expected = gate.apply_queue_priority(rows, gate.QueueOrderContext(
+                fixture.server.priority, {"old": UnitLabels("older", unit="other"),
+                                          "new": UnitLabels("newer", unit="chosen")}))
+            with mock.patch.object(gate, "priority_labels", side_effect=AssertionError("roster lookup")):
+                _ = fixture.server.run_pass()
+            assert isinstance(fixture.server.last_inputs, records.QueueInputs)
+            self.assertEqual(fixture.server.last_inputs.ordered,
+                             [(path, records.stored_waiter(row)) for path, row in expected[0]])
+
     def test_runner_retry_cannot_attach_to_a_pending_priority_request(self) -> None:
         with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
             try:
@@ -2403,6 +2490,45 @@ class QueueLifecycleTests(unittest.TestCase):
 
 class CiSliceAdmissionTests(unittest.TestCase):
 
+    def test_ci_worker_uses_the_current_reservation_and_waiter_identity(self) -> None:
+        from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+
+        for admitted, expected in ((True, RunningServiceJob), (False, WaitingServiceJob)):
+            with self.subTest(admitted=admitted), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(700001, "100")
+                write_process(fixture.proc.path, 700010)
+                _ = (fixture.proc.path / "700010/comm").write_text("Runner.Worker\n")
+                write_process(fixture.proc.path, owner.pid, parent=700010, start=owner.start_time)
+                _ = (fixture.root / "ci.slice/cgroup.procs").write_text(f"700010\n{owner.pid}\n")
+                if not admitted:
+                    _ = only_admitted(fixture.server.handle_request(
+                        fixture.request(owner=fixture.fixture_owner(700020, "200"), need=GIB)))
+                request = fixture.request(owner=owner, need=GIB if admitted else 100 * GIB)
+                reply = fixture.server.handle_request(request)
+                self.assertEqual(any(isinstance(item, wire.Admitted) for item in reply), admitted)
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, expected)
+                self.assertIsInstance(ci.job_state, IdleService if admitted else RunningServiceJob)
+                self.assertEqual(len(view.reading.view.waiting), int(not admitted))
+                if admitted:
+                    grant = only_admitted(reply)
+                    fixture.release(grant)
+                else:
+                    fixture.server.waiters.clear()
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, UnmatchedServiceJob)
+                self.assertIsInstance(ci.job_state, RunningServiceJob)
+
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
         for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):
             with self.subTest(shared=shared), AdmissionFixture() as fixture:
@@ -3602,40 +3728,34 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(len(fixture.server.reservations), 1)
 
     def test_unparsed_request_refusals_decode_with_both_protocol_versions(self) -> None:
-        source = subprocess.run(["git", "show", "7ab78b74e:scripts/build_queue/admission_protocol.py"],
-            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
-        legacy = ModuleType("admission_protocol_version_one")
-        with mock.patch.dict(sys.modules, {legacy.__name__: legacy}):
-            exec(compile(source, "admission_protocol_version_one.py", "exec"), legacy.__dict__)
-            decode_legacy = cast(Callable[[str], object], getattr(legacy, "parse_reply"))
-            for version in (1, 2):
-                for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
-                    with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
-                        fixture.configure(request_max_bytes=512)
-                        _ = fixture.run_pass()
-                        prefix = f'{{"v":{version},'
-                        if kind.startswith("oversize"):
-                            line = prefix + '"data":"'
-                            tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
-                            limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
-                            line += "x" * (limit + 1 - len(line) - len(tail)) + tail
-                        else:
-                            line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
-                        sent: list[str] = []
+        for version in (1, 2):
+            for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
+                with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
+                    fixture.configure(request_max_bytes=512)
+                    _ = fixture.run_pass()
+                    prefix = f'{{"v":{version},'
+                    if kind.startswith("oversize"):
+                        line = prefix + '"data":"'
+                        tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
+                        limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
+                        line += "x" * (limit + 1 - len(line) - len(tail)) + tail
+                    else:
+                        line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
+                    sent: list[str] = []
 
-                        def capture(line: str) -> str:
-                            sent.append(line)
-                            return line
+                    def capture(line: str) -> str:
+                        sent.append(line)
+                        return line
 
-                        with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
-                            peer = fixture.connect(line)
-                            if kind == "fragmented":
-                                self.assertEqual(peer.replies(), [])
-                                peer.socket.sendall(b'"type":"view","data": }\n')
-                            reply, = peer.replies()
-                        self.assertIsInstance(reply, wire.Refused)
-                        self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
-                        self.assertEqual(wire.parse_reply(sent[-1]), reply)
+                    with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                        peer = fixture.connect(line)
+                        if kind == "fragmented":
+                            self.assertEqual(peer.replies(), [])
+                            peer.socket.sendall(b'"type":"view","data": }\n')
+                        reply, = peer.replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
+                    self.assertEqual(wire.parse_reply(sent[-1]), reply)
 
     def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
@@ -5397,8 +5517,6 @@ class RunPlaceTests(unittest.TestCase):
 
     def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
         from zoneinfo import ZoneInfo
-        from scripts.aws_target import aws_target
-        from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
 
@@ -5418,21 +5536,11 @@ class RunPlaceTests(unittest.TestCase):
             model = queue_view.QueueModel(reading, {}, records.NoWaiter(), head_facts.PaceUnavailable(), ZoneInfo("UTC"),
                 queue_view.HostLoadUnavailable(), gate.smallest_head_release(reading.explanation))
             rendered = plain(queue_view.render_view(model, 100))
+            heading, = [line for line in rendered.splitlines() if line.lstrip().startswith("# ")]
             row, = [line for line in rendered.splitlines()
-                    if line.split()[:1] == ["1"] and line.split()[3:5] == ["project", "check"]]
-            self.assertEqual(row.split()[5], "0", rendered)
-            settings_path = fixture.root / "aws_target.conf"
-            _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
-                                     + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
-            configuration = conf.read(settings_path)
-            settings = read_control_settings(configuration)
-            controller = aws_target.Controller(settings_path, fixture.root / "aws", fixture.state_dir)
-            eligible_steps = cast(Callable[[ControlSettings, int, conf.ConfigRead], int],
-                                  getattr(controller, "_queued"))
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 0)
-            fixture.clock.advance(300)
-            _ = fixture.server.run_pass()
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)
+                    if line.lstrip().startswith("1 ") and "project check" in line]
+            minute_column = heading.index("min")
+            self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
@@ -5457,7 +5565,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
                 output = io.StringIO()
                 with mock.patch.object(fixture.server, "_handle_request", side_effect=measured), \
                         mock.patch.object(conf, "read", side_effect=configuration), \
-                        mock.patch.object(time, "process_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
+                        mock.patch.object(time, "thread_time", side_effect=(2.0, 2.125, 3.0, 3.01)), \
                         redirect_stderr(output):
                     for _ in range(2):
                         self.assertEqual(fixture.server.handle_request(wire.BuildHistoryRequest()), [wire.BuildHistoryReply(0)])

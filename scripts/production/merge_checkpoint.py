@@ -97,7 +97,7 @@ class ShrinkCommit(NamedTuple):
 
 
 class AsBuiltCommit(NamedTuple):
-    """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
+    """A unit's closing documentation commit after its last phase merged."""
 
 
 class ReviewTrial(NamedTuple):
@@ -114,7 +114,7 @@ class NoReviewTrial(NamedTuple):
 
 class Unit(NamedTuple):
     name: str
-    plan: Path
+    plan: Path | unit_config.StandbyPlan | unit_config.PermanentPlan
     worktree: Path
     branch: str
     staff_id: staff.StaffId
@@ -213,8 +213,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, "no unit configuration")
     if not isinstance(config, unit_config.UnitConfig):
         return UnitUnavailable(name, config.reason)
-    plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
-            else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
+    plan = config.plan.path if isinstance(config.plan, unit_config.PlanFile) else config.plan
     return Unit(name, plan, location.path, branch.name, row.id)
 
 
@@ -467,7 +466,7 @@ def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
-    """Check required review lines and count checkpoints and commits without a descendant checkpoint."""
+    """Check review lines and count selected commits with valid lines."""
     previous = request.production.merge_branch
     try:
         commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
@@ -476,7 +475,9 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise checkpoint_gate.Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise checkpoint_gate.Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
-    selected = change_review.review_commits(commits)
+    selected = [commit for commit in change_review.review_commits(commits)
+                if (lines := change_review.entries(commit.message))
+                and not any(isinstance(line, change_review.Malformed) for line in lines)]
     checkpoint_gate.report("change review", "ok", f"{len(selected)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 
@@ -554,13 +555,18 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
 
 def checkpoint_plan(request: MergeRequest) -> Path:
     """Use a closing item's subject slug or retain the configured plan."""
+    plan = request.unit.plan
+    configured_path = (plan if isinstance(plan, Path) else
+                       Path("standby" if isinstance(plan, unit_config.StandbyPlan) else "permanent"))
     if isinstance(request.kind, CodeCheckpoint):
-        return request.unit.plan
+        return configured_path
     subject = good(git(request.production.checkout, "show", "-s", "--format=%s", request.commit), "scope")
     pattern = (r"shrink\(([^()/\\]+)\): phase \S+ — .+" if isinstance(request.kind, ShrinkCommit)
                else r"docs\(([^()/\\]+)\): as-built")
     match = re.fullmatch(pattern, subject)
-    return request.unit.plan.with_name(match[1] + ".md") if match else request.unit.plan
+    if match and (isinstance(request.kind, AsBuiltCommit) or not isinstance(plan, Path)):
+        return Path("docs/plans") / (match[1] + ".md")
+    return configured_path.with_name(match[1] + ".md") if match else configured_path
 
 
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
@@ -582,9 +588,16 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         plan = checkpoint_plan(request).as_posix()
         unexpected = [path for path in paths if not path.endswith(".md")]
         if unexpected or plan not in paths:
-            raise checkpoint_gate.Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
-                       + f"got {', '.join(paths)}",
-                       "commit only the as-built docs and the plan's deletion, then resend the as-built")
+            plan_exists = bool(good(git(request.production.checkout, "ls-tree", "--name-only",
+                                        request.production.merge_branch, "--", plan), "scope"))
+            if plan_exists or unexpected or any(PurePosixPath(path).parent != PurePosixPath("docs/as-built")
+                                                for path in paths):
+                rule = (f"an as-built commit carries only docs and must change or delete {plan}; " if plan_exists
+                        else f"an as-built commit without {plan} on the merge branch allows only docs/as-built/*.md; ")
+                raise checkpoint_gate.Stop("scope", "held", rule
+                           + f"got {', '.join(paths)}",
+                           "commit only the as-built docs" + (" and the plan's deletion" if plan_exists else "")
+                           + ", then resend the as-built")
     checkpoint_gate.report("scope", "ok", f"{len(paths)} changed paths"
            + (f"; {imported} came from origin merge branches" if imported else ""))
 
@@ -726,6 +739,15 @@ def merge_main(production: ProductionDocument) -> None:
         merge_main_commit(production, main.stdout.strip())
 
 
+class MainConflict(checkpoint_gate.Stop):
+    """The main commit that conflicts with the unpublished merge tip."""
+
+    def __init__(self, main_commit: str, paths: tuple[str, ...]) -> None:
+        super().__init__("push", "held", "origin/main conflicts: " + ", ".join(paths),
+                         "merge origin/main into the merge branch, resolve the conflict, and run the push again")
+        self.main_commit: str = main_commit
+
+
 def merge_main_commit(production: ProductionDocument, main_commit: str) -> None:
     """Integrate the given main commit without fetching another tip."""
     checkout = production.checkout
@@ -736,8 +758,7 @@ def merge_main_commit(production: ProductionDocument, main_commit: str) -> None:
             conflicts = good(git(checkout, "diff", "--name-only", "--diff-filter=U"), "push")
             _ = good(git(checkout, "merge", "--abort"), "push")
             if conflicts:
-                raise checkpoint_gate.Stop("push", "held", "origin/main conflicts: " + ", ".join(conflicts.splitlines()),
-                           "merge origin/main into the merge branch, resolve the conflict, and run the push again")
+                raise MainConflict(main_commit, tuple(conflicts.splitlines()))
             _ = good(merged, "push")
 
 
@@ -994,7 +1015,7 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         script = checkpoint_gate.tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
         review_command = [PYTHON, script]
-        command = [*review_command, "add", "--unit", request.unit.name, "--plan", request.unit.plan.as_posix(),
+        command = [*review_command, "add", "--unit", request.unit.name, "--plan", checkpoint_plan(request).as_posix(),
                    "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
@@ -1371,10 +1392,38 @@ class MergedBatchItem(NamedTuple):
 class BatchItemStop(Exception):
     """The items that prevent the current unpublished batch from landing."""
 
-    def __init__(self, indices: tuple[int, ...], stop: checkpoint_gate.Stop) -> None:
+    def __init__(self, indices: tuple[int, ...], stop: checkpoint_gate.Stop,
+                 item_stops: tuple[tuple[int, checkpoint_gate.Stop], ...] = ()) -> None:
         super().__init__(stop.detail)
         self.indices: tuple[int, ...] = indices
         self.stop: checkpoint_gate.Stop = stop
+        self.item_stops: tuple[tuple[int, checkpoint_gate.Stop], ...] = item_stops
+
+
+def batch_main_conflicts(items: list[MergedBatchItem], conflict: MainConflict) -> BatchItemStop:
+    """Check each submitted checkpoint against the main commit that held publication."""
+    stops: list[tuple[int, checkpoint_gate.Stop]] = []
+    for item in items:
+        request = item.request
+        result = git(request.production.checkout, "merge-tree", "--write-tree", "--name-only",
+                     conflict.main_commit, request.commit)
+        if result.returncode == 1:
+            paths = tuple(result.stdout.split("\n\n", 1)[0].splitlines()[1:])
+            files = ", ".join(paths)
+            label = f"{request.unit.name} phase {request.phase} ({request.commit[:12]})"
+            stops.append((item.position, checkpoint_gate.Stop("push", "held",
+                f"{label}: origin/main conflicts: {files}",
+                f"merge origin/main into your own unit branch, resolve {files}, and send a new checkpoint")))
+        elif result.returncode:
+            stop = checkpoint_gate.Stop("push", "failed", result.stderr.strip() or f"merge-tree exit {result.returncode}",
+                                        "the showrunner will inspect the merge-tree failure")
+            return BatchItemStop(tuple(item.position for item in items), stop)
+    if not stops:
+        # No individual checkpoint explains the conflict in the combined merge tip.
+        stops = [(item.position, checkpoint_gate.Stop("push", "held", conflict.detail,
+                  "your checkpoint is clean against origin/main and can land alone; "
+                  + "the showrunner will inspect the combined merge conflict")) for item in items]
+    return BatchItemStop(tuple(index for index, _ in stops), conflict, tuple(stops))
 
 
 def reset_batch(production: ProductionDocument, start_tip: str, *, merge_in_progress_at_start: bool) -> None:
@@ -1415,6 +1464,8 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
             return candidates[low]
         finally:
             _ = good(git(reference.production.checkout, "reset", "--keep", start_tip), "bisect")
+    except MainConflict:
+        raise
     except checkpoint_gate.Stop as error:
         raise BatchItemStop(tuple(item.position for item in candidates), error) from error
     except (OSError, ValueError) as error:
@@ -1513,6 +1564,8 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
         stop = error if isinstance(error, checkpoint_gate.Stop) else checkpoint_gate.Stop(
             "run", "failed", str(error), "the showrunner will inspect the failed command")
         if not publication_started:
+            if isinstance(error, MainConflict):
+                raise batch_main_conflicts(items, error) from error
             raise BatchItemStop(tuple(range(len(requests))), stop) from error
         for item in items:
             _ = report_checkpoint_stop(item.request, stop)
@@ -1534,6 +1587,7 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
             return run_batch_attempt(requests, start_tip, log)
         except BatchItemStop as error:
             dropped = dict.fromkeys(error.indices, error.stop)
+            dropped.update(error.item_stops)
             if error.stop.state in ("held", "failed"):
                 for index, request in enumerate(requests):
                     for cause_index in sorted(error.indices):
@@ -1675,11 +1729,10 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         address = child_runner("address", request.child.name)
         if not address:
             raise Refusal(f"no address for {request.child.name}")
-        result = subprocess.run([
-            PYTHON, script, "--to", address, "--from", request.production.name,
+        result = subprocess.run(session_send.send_argv("--to", address, "--from", request.production.name,
             "--text", f"From the showrunner of {request.production.name}: hand-off {request.checkpoint[:7]} merged as {merge_head[:7]}.",
-            "--timeout", "10",
-        ], capture_output=True, text=True, check=False, timeout=15)
+            "--timeout", "10", send_script=Path(script), python_interpreter=PYTHON,
+        ), capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
             raise Refusal(f"send.py: {failure_detail(result)}")
     except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:

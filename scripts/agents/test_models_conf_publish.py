@@ -90,7 +90,7 @@ class RegistryFixture(unittest.TestCase):
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
                             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
                             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "catalog-state"),
-                            "PYTHONPATH": str(REPO), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                            "PYTHONPATH": str(REPO / "scripts/lib/python_startup"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Registry Test",
                             "GIT_AUTHOR_EMAIL": "registry@example.invalid", "GIT_COMMITTER_NAME": "Registry Test",
                             "GIT_COMMITTER_EMAIL": "registry@example.invalid"}
@@ -172,7 +172,7 @@ def read_then_edit(path, *arguments, **keywords):
     return text
 conf_reads.read_text = read_then_edit
 ''')
-        self.environment["PYTHONPATH"] = str(hook) + os.pathsep + self.environment["PYTHONPATH"]
+        self.environment["PYTHONPATH"] = self.environment["PYTHONPATH"] + os.pathsep + str(hook)
         operations = ("agents_set_row direct.impl gpt-b:max",
                       "agents_set_assignment direct claude", "agents_set_all_assignments claude",
                       "agents_set_model gpt-b direct", "agents_set_service_tier fast direct")

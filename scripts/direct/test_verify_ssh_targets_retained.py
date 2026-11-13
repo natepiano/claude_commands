@@ -62,21 +62,21 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def retain_slots(self, capacity: int = 2) -> list[Path]:
-        _ = write_config_fixture(self.root / "aws_target.conf",
-                                 (self.root / "aws_target.conf").read_text()
+        _ = write_config_fixture(self.root / "linux_target.conf",
+                                 (self.root / "linux_target.conf").read_text()
                                  + f"slots={capacity}\nslots.hana={capacity}\n",
-                                 template="aws_target")
+                                 template="mac_test")
         paths: list[Path] = []
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(Path, "home", return_value=self.home), \
              mock.patch.object(process_identity, "process_start", side_effect=process_reader(eligibility_support.SshEligibilityTests().process_start)), \
              mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope(
                  "hana", "https://example.com/team/hana")):
-            state = mac_test.state_paths("aws")
+            state = mac_test.state_paths("linux")
             for pid in range(2147483000, 2147483000 + capacity):
                 args = mac_test.CliArguments()
-                args.target, args.worktree, args.pid = "aws", str(self.root), pid
-                args.what, args.remote = "test hana", "fake-aws"
+                args.target, args.worktree, args.pid = "linux", str(self.root), pid
+                args.what, args.remote = "test hana", "fake-linux"
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(mac_test.command_claim(args, state, watch_claim=False), 0)
             paths = [claim.path for claim in mac_test.read_claims(state)]
@@ -84,7 +84,7 @@ exit 0
         return paths
 
     def test_queue_retry_cleans_retained_slots_after_their_owners_exit(self) -> None:
-        self.configure("natedev,aws")
+        self.configure("natedev,linux")
         claims = self.retain_slots()
         self.release_memory_after_hook()
         result = self.verify("test", "sample", "--no-cache")
@@ -98,7 +98,7 @@ exit 0
         self.assertLess(sum(path.exists() for path in claims), len(claims))
 
     def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
-        self.configure("natedev,aws,spare")
+        self.configure("natedev,linux,spare")
         claims = self.retain_slots()
         _ = self.hold_memory()
         pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
@@ -107,24 +107,24 @@ exit 0
         before_attempt = r'''
 steps_path = root / "memory-steps.json"
 steps = json.loads(steps_path.read_text()) if steps_path.exists() else []
-if request.target == "aws":
+if request.target == "linux":
     assert steps == [], steps
-    steps.append("aws_attempt")
+    steps.append("linux_attempt")
 else:
     assert request.target == "spare", request.target
-    assert steps == ["aws_attempt", "aws_cleanup_failed"], steps
+    assert steps == ["linux_attempt", "linux_cleanup_failed"], steps
     prior = json.loads((root / "ssh-events.jsonl").read_text().splitlines()[-1])
-    assert prior["target"] == "aws" and "cleanup" in prior["actions"], prior
+    assert prior["target"] == "linux" and "cleanup" in prior["actions"], prior
     assert prior["holder"] == "LostRunLeftovers", prior
     steps.append("spare_retry")
 steps_path.write_text(json.dumps(steps))
 '''
         after_attempt = r'''
-if request.target == "aws":
+if request.target == "linux":
     assert isinstance(result, offload.BusyMacDecline), result
     assert isinstance(result.holder, offload.LostRunLeftovers), result
     assert "cleanup" in actions and "run" not in actions, actions
-    steps.append("aws_cleanup_failed")
+    steps.append("linux_cleanup_failed")
 else:
     assert isinstance(result, offload.PassedOnTarget), result
     steps.append("spare_completed")
@@ -137,10 +137,10 @@ steps_path.write_text(json.dumps(steps))
             "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
             "offload.persist_attempt(request, result,", after_attempt + "\noffload.persist_attempt(request, result,"))
         result = self.verify("test", "sample", "--no-cache", extra={
-            "TEST_SSH_MODES": '{"aws":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+            "TEST_SSH_MODES": '{"linux":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()
-        self.assertEqual((first["target"], second["target"]), ("aws", "spare"))
+        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
         self.assertEqual(first["result_type"], "BusyMacDecline")
         self.assertEqual(first["holder"], "LostRunLeftovers")
         self.assertIn("cleanup", first["actions"])
@@ -148,15 +148,15 @@ steps_path.write_text(json.dumps(steps))
         self.assertNotIn("release", first["actions"])
         self.assertTrue(all(path.exists() for path in claims))
         self.assertEqual(first["queued_at"], second["queued_at"])
-        self.assertFalse((self.target_state("aws") / "unreachable_until").exists())
+        self.assertFalse((self.target_state("linux") / "unreachable_until").exists())
         self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
-                         ["aws_attempt", "aws_cleanup_failed", "spare_retry", "spare_completed"])
+                         ["linux_attempt", "linux_cleanup_failed", "spare_retry", "spare_completed"])
 
     def test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits(self) -> None:
         self.configure("natedev,mac")
         self.enable_mac()
         # Keep os.environ stable while the admission reader uses the private memory paths.
-        claim = subprocess.run([sys.executable, "-c", """
+        claim = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", """
 import os
 from unittest import mock
 from scripts.lib import process_start as process_identity

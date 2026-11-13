@@ -210,7 +210,7 @@ class CoverageOverlapTests(unittest.TestCase):
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "lib/py", "lib/python_startup/sitecustomize.py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
                     "production/gate_modules.py", "test_times/module_run.py",
                 )),
             ):
@@ -361,6 +361,52 @@ class Child(unittest.TestCase):
         self.assertEqual(child["child"], "none")
         self.assertFalse(child["candidate"])
         self.assertEqual((child["line_count"], parent["line_count"]), (3, 1))
+        self.assertTrue(parent["candidate"])
+        self.assertEqual(parent["covered_by"], [child["id"]])
+
+    def test_child_uses_and_traces_its_copy_without_exporting_checkout_roots(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_copy.py": PRELUDE + '''
+import json
+import tempfile
+from scripts.test_times.coverage_overlap import ChildEnvironment
+
+class Copy(unittest.TestCase):
+    def test_a_child(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            other = Path(directory) / "other"
+            (other / "scripts/lib").mkdir(parents=True)
+            (other / "scripts/lib/py").write_text("# Checkout marker.\\n")
+            (other / "scripts/__init__.py").write_text("")
+            extra = Path(directory) / "extra"
+            extra.mkdir()
+            (extra / "helper.py").write_text("VALUE = 1\\n")
+            original = os.environ["PYTHONPATH"]
+            os.environ["PYTHONPATH"] = os.pathsep.join((str(other), str(extra), original))
+            environment = ChildEnvironment(Path(os.environ["NATEST_COVERAGE_DIR"]))
+            try:
+                environment.start_test(self.id())
+                child = subprocess.run(
+                    [sys.executable, "-c", "import json, os, helper; "
+                     "from scripts.fixture import product; product.right(); "
+                     "print(json.dumps([product.__file__, os.environ['PYTHONPATH']]))"],
+                    cwd=Path(__file__).parent, capture_output=True, text=True, check=True)
+                filename, inherited = json.loads(child.stdout)
+                self.assertEqual(filename, str(root / "scripts/fixture/product.py"))
+                self.assertIn(str(extra), inherited.split(os.pathsep))
+                self.assertNotIn(str(other), inherited.split(os.pathsep))
+                self.assertNotIn(str(root), inherited.split(os.pathsep))
+            finally:
+                environment.restore()
+                os.environ["PYTHONPATH"] = original
+
+    def test_z_parent(self) -> None:
+        self.assertEqual(right(), "right")
+'''})
+        child = fixture.row("test_a_child")
+        parent = fixture.row("test_z_parent")
+        self.assertEqual(child["child"], "none")
+        self.assertEqual(parent["line_count"], 1)
         self.assertTrue(parent["candidate"])
         self.assertEqual(parent["covered_by"], [child["id"]])
 

@@ -20,8 +20,10 @@ from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import IO, cast, final
 from unittest import mock
-from scripts.style import rules
+from scripts.style import rules, candidate_generators
 from scripts.style import style_ledger
+from scripts.style.refill_facts import RefillFacts
+from scripts.style.refill_inputs import RefillInputs
 from scripts.style.approved_renames import AppliedInCode
 
 
@@ -95,6 +97,65 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertEqual(inventory, cache.tip(commit).entries)
         contents = dict(style_ledger.blob_contents(self.repo, {path: inventory[path].object}))
         self.assertEqual(contents[path], (self.repo / path).read_bytes())
+        # These blob contents share a four-digit object prefix.
+        first, second = ("126", "337") if len(tree) == 64 else ("142", "784")
+        self.write("ambiguous-first", first)
+        self.write("ambiguous-second", second)
+        ambiguous = self.git("hash-object", "-w", "ambiguous-first")[:4]
+        _ = self.git("hash-object", "-w", "ambiguous-second")
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        for name, revision in (("missing", "missing-revision"), ("non-commit", tree),
+                               ("ambiguous", ambiguous), ("range", "HEAD..HEAD")):
+            with self.subTest(revision=name):
+                with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                    _ = read_tip(self.repo, revision)
+                if name != "range":
+                    self.assertEqual(refused.exception.status, 128)
+                if name == "ambiguous":
+                    self.assertIn("is ambiguous", refused.exception.stderr)
+
+        samples = ("", "one", "one\n", "one\r\ntwo\rthree\n", "first\u2028second\n", "one")
+        paths = tuple(f"line-count-{index}.txt" for index in range(len(samples)))
+        for path, text in zip(paths, samples):
+            self.write(path, text)
+        counted_tip = self.commit("Line counts")
+        with self.ledger() as ledger:
+            _ = ledger._tip(counted_tip)  # pyright: ignore[reportPrivateUsage]
+            with mock.patch.object(style_ledger, "blob_contents", wraps=style_ledger.blob_contents) as batch:
+                counts = ledger.line_counts(counted_tip, paths)
+                self.assertEqual(counts, {path: len(text.splitlines()) for path, text in zip(paths, samples)})
+                batch.assert_called_once()
+            with mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected Git process")):
+                self.assertEqual(ledger.line_counts(counted_tip, paths), counts)
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                stored = cast(tuple[int], connection.execute("SELECT COUNT(*) FROM refill_objects").fetchone())[0]
+                self.assertEqual(stored, len(set(samples)))
+        # Stored lengths survive a new ledger handle.
+        with self.ledger() as ledger:
+            self.assertEqual(ledger.line_counts(counted_tip, paths), counts)
+        self.write("invalid-lines.txt", "")
+        _ = (self.repo / "invalid-lines.txt").write_bytes(b"\xff")
+        invalid_tip = self.commit("Invalid source encoding")
+        with self.ledger() as ledger, self.assertRaises(UnicodeDecodeError):
+            _ = ledger.line_counts(invalid_tip, ("invalid-lines.txt",))
+
+        with self.ledger() as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            facts = RefillFacts(connection, str(self.repo / ".git"), "inventory")
+            inputs = RefillInputs(self.repo, tree, facts)
+            self.assertEqual(inputs.entries, inventory)
+            connection.commit()
+            with mock.patch.object(RefillInputs, "read_trees", side_effect=AssertionError("unchanged subtree")):
+                self.assertEqual(RefillInputs(self.repo, tree, facts).entries, inventory)
+            object_path = self.git("rev-parse", "--git-path", f"objects/{tree[:2]}/{tree[2:]}")
+            tree_file = self.repo / object_path
+            content = tree_file.read_bytes()
+            tree_file.unlink()
+            try:
+                with self.assertRaises(style_ledger.GitReadFailed):
+                    _ = RefillInputs(self.repo, tree, facts)
+            finally:
+                _ = tree_file.write_bytes(content)
+            self.assertEqual(RefillInputs(self.repo, tree, facts).entries, inventory)
 
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")
@@ -314,6 +375,36 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertEqual(upgraded.ticket_base("10"), self.initial_tip)
                     self.assertEqual(len(upgraded.ticket_open(ticket_owner_id("names"))), 2)
         self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
+
+        for source_version, route in ((40, "sql"), (40, "ledger"), (41, "sql"), (41, "ledger")):
+            with self.subTest(candidate_migration=route, source_version=source_version):
+                database = self.root / f"phase-one-{source_version}-{route}.sqlite"
+                with closing(sqlite3.connect(database)) as connection:
+                    for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                        if number <= source_version:
+                            _ = connection.executescript(migration)
+                    _ = connection.execute(
+                        "INSERT INTO refill_objects(object_store,object_id,reader_version,fact_kind,fact_key,line_count) "
+                        + "VALUES ('store','blob',1,'line_count','',7)")
+                    _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+                    _ = connection.execute("INSERT INTO schema_version VALUES (?)", (source_version,))
+                    connection.commit()
+                    if route == "sql":
+                        for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                            if number > source_version:
+                                _ = connection.executescript(migration)
+                if route == "ledger":
+                    with style_ledger.Ledger(self.repo, database):
+                        pass
+                with closing(sqlite3.connect(database)) as connection, closing(sqlite3.connect(":memory:")) as fresh:
+                    for _, migration in sorted(style_ledger.MIGRATIONS.items()):
+                        _ = fresh.executescript(migration)
+                    query = "SELECT name,sql FROM sqlite_master WHERE name LIKE 'refill_%' ORDER BY name"
+                    schema_rows = cast(list[tuple[str, str]], connection.execute(query).fetchall())
+                    self.assertEqual(schema_rows, cast(list[tuple[str, str]], fresh.execute(query).fetchall()))
+                    counts = cast(list[tuple[int]], connection.execute(
+                        "SELECT line_count FROM refill_objects WHERE fact_kind='line_count'").fetchall())
+                    self.assertEqual(counts, [(7,)])
 
     def pipeline_tickets(self) -> tuple[style_ledger.Ledger, str, str]:
         rule = self.rule("pipeline")
@@ -618,6 +709,26 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                          [(style_ledger.Filed(proposal), style_ledger.ReadByPerson("nate")),
                           (style_ledger.Filed(proposal), style_ledger.NotReadByPerson()),
                           (style_ledger.Built(proposal), style_ledger.ReadByPerson("ana"))])
+        expected = ledger.held_findings(style_ledger.AllHeldFindings())
+        with mock.patch.object(ledger, "_held", side_effect=AssertionError("bulk read used a point lookup")):
+            for selection in (style_ledger.AllHeldFindings(), style_ledger.HeldFindingsInState("filed"),
+                              style_ledger.HeldFindingsInState("built"), style_ledger.UnfiledFindingsFromOpenTickets()):
+                with self.subTest(selection=selection):
+                    queries: list[str] = []
+                    ledger_connection = ledger._connection  # pyright: ignore[reportPrivateUsage]
+                    ledger_connection.set_trace_callback(queries.append)
+                    try:
+                        observed = ledger.held_findings(selection)
+                    finally:
+                        ledger_connection.set_trace_callback(None)
+                    self.assertEqual(sum("FROM held_findings h LEFT JOIN" in query for query in queries), 1)
+                    if isinstance(selection, style_ledger.AllHeldFindings):
+                        self.assertEqual(observed, expected)
+                    elif isinstance(selection, style_ledger.HeldFindingsInState):
+                        expected_state = style_ledger.Filed if selection.state == "filed" else style_ledger.Built
+                        self.assertEqual(observed, tuple(finding for finding in expected if isinstance(finding.state, expected_state)))
+                    else:
+                        self.assertEqual(observed, ())
         shown = {not_applied: "filed again by nate: a person read the code", checked: "",
                  applied: "applied, read by ana: a person read the code"}
         listed = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--json").stdout))
@@ -1194,13 +1305,39 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertEqual(scopes, [("module",)])
 
     def test_a_modules_cell_stays_current_after_a_comment_only_change_at_each_scope(self) -> None:
+        from scripts.style.style_ledger import _only_comments_changed, _rust_code  # pyright: ignore[reportPrivateUsage]
+        source = "mod first {\n//! Inner doc.\nfn value() { work(); }\n}\nmod second {}\n"
+        changes = (
+            ("equal code", source, True),
+            ("comment", "// A note.\n" + source, True),
+            ("moved inner doc", source.replace("//! Inner doc.\n", "").replace("mod second {}", "mod second {\n//! Inner doc.\n}"), False),
+            ("code", source.replace("work()", "other()"), False),
+        )
+        for label, changed, expected in changes:
+            with self.subTest(comparison=label):
+                old_code, new_code = _rust_code(source.encode()), _rust_code(changed.encode())
+                self.assertIsInstance(old_code, style_ledger.RustCode)
+                assert isinstance(old_code, style_ledger.RustCode)
+                self.assertEqual(len(old_code.digest), 32)
+                code = {"old": old_code, "new": new_code}
+                before = {"file.rs": style_ledger.TreeEntry("100644", "blob", "old")}
+                after = {"file.rs": style_ledger.TreeEntry("100644", "blob", "new")}
+                self.assertEqual(_only_comments_changed(before, after, code.__getitem__), expected)
         file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
         for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
             self.comment_only_change(relative)
         self.set_tip(self.commit("Change comments only"))
-        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
-            with self.subTest(rule=rule):
-                self.assertEqual(self.states(rule)[judged], "current")
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with self.ledger() as ledger, mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+            for _ in range(2):
+                for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
+                    with self.subTest(rule=rule):
+                        states = {cell.path: cell.state for cell in ledger.cells(rule=rule)}
+                        self.assertEqual(states[judged], "current")
+            _ = ledger.declaration_reading((), lambda _: False)
+        commits = [cast(tuple[Path, str], call.args)[1] for call in builds.call_args_list]
+        self.assertGreaterEqual(len(commits), 2)
+        self.assertEqual(len(commits), len(set(commits)))
 
     def test_a_names_cell_goes_stale_after_a_comment_only_change(self) -> None:
         _, _, _, names_rule, _ = self.comment_scope_rules()
@@ -1949,6 +2086,16 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
         self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
+
+        self.write("README.md", "Advance the migrated listed view\n")
+        changed_tip = self.commit("Advance listed inputs")
+        with self.ledger() as refreshed:
+            refreshed.set_tip(changed_tip)
+            self.assertEqual({site.path for site in refreshed.listed_sites(listed)}, set(self.sources))
+        with self.ledger() as refreshed, mock.patch.object(
+            candidate_generators, "enumerate_candidates", side_effect=AssertionError("unchanged generator")
+        ):
+            self.assertEqual({site.path for site in refreshed.listed_sites(listed)}, set(self.sources))
 
     def test_rust_files_exposes_the_synced_universe_even_with_only_crate_rules(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")

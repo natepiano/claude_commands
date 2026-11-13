@@ -7,6 +7,7 @@ appear as one scratch caller in each kind's table.
 
 from __future__ import annotations
 
+import calendar
 import json
 import re
 import sqlite3
@@ -2315,13 +2316,30 @@ def peer_sync_lines() -> list[str]:
     return lines
 
 
+def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, today: date, pace_days: int) -> list[str]:
+    """Month to date, the month forecast from recent billed days, and the gate compute share."""
+    month = [spend for spend in spends if spend.day.startswith(f'{today:%Y-%m}')]
+    billed = sorted((spend for spend in spends if spend.source == 'AWS bill'), key=lambda spend: spend.day)[-pace_days:]
+    billed_usd = sum((spend.usd for spend in billed), Decimal(0))
+    if not month or not billed or billed_usd <= 0:
+        return []
+    to_date = sum((spend.usd for spend in month), Decimal(0))
+    pace = billed_usd / len(billed)
+    days_left = calendar.monthrange(today.year, today.month)[1] - today.day + 1
+    forecast = sum((spend.usd for spend in month if spend.day < today.isoformat()), Decimal(0)) + pace * days_left
+    gates = sum((group.usd for spend in billed for group in spend.groups if group.group == ledger.SPEND_GROUPS[0]), Decimal(0))
+    return [f'**Month to date (UTC {today:%Y-%m}): ${to_date:.2f} of the ${monthly_limit:.2f} monthly limit. '
+            + f'Month forecast: ${forecast:.2f} at ${pace:.2f} a day, the average of the last {len(billed)} billed days.**',
+            '', f'32-CPU gate compute is {gates / billed_usd:.0%} of the spend on those days.', '']
+
+
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
     settings = conf.path('aws_target')
     directory = ssh_target_state_directory('aws')
     instant = int(time.time())
     spends: tuple[ledger.DailySpend, ...] = ()
-    daily_limit = Decimal(0)
+    daily_limit = monthly_limit = Decimal(0)
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
         snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
@@ -2329,6 +2347,7 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
         if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
             spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
             daily_limit = inputs.settings.daily_limit_usd
+            monthly_limit = inputs.settings.monthly_limit_usd
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
@@ -2341,6 +2360,11 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
                     or newest_bill_day < spend.day <= last_estimate_day),
                    key=lambda spend: spend.day, reverse=True)
     lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, daily_limit, today)]
+    try:
+        pace_days = conf.read(settings).whole('spend_pace_days')
+        lines.extend(spend_analysis(shown, monthly_limit, date.fromisoformat(today), pace_days))
+    except (OSError, ValueError, KeyError) as error:
+        lines.extend((f'Month forecast unavailable: {error}.', ''))
     notes: list[str] = []
     if saving.steps > 0:
         dollars = uptime = 'unavailable'

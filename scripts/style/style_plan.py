@@ -27,6 +27,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cached_property
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 
@@ -976,20 +977,104 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     return RenamedText(style_footprint.canonical_code(tuple(renamed), comments), module_sites)
 
 
-def declares_module(repo: Path, path: str, text: str, file: str) -> bool:
-    """Whether the Rust file at path, read as text, declares the module file, or has a token the scan cannot read, or
-    the module file is not in a crate whose modules it can name."""
+@dataclass(frozen=True)
+class DefaultModulePath:
+    """The file module has no path attribute."""
+
+
+@dataclass(frozen=True)
+class LiteralModulePath:
+    """One plain path string belongs to a file module item."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class UncertainDeclarationPath:
+    """The module's path attribute can name any module file."""
+
+
+@dataclass(frozen=True)
+class ModuleDeclaration:
+    """A module item has a name, an inline scope, and a path form."""
+
+    name: str
+    scope: tuple[InlineModule, ...]
+    path: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
+
+
+@dataclass(frozen=True)
+class ModuleDeclarationText:
+    """A readable file's declaration syntax is independent of the requested module file."""
+
+    words: tuple[str, ...]
+    starts: frozenset[int]
+    modules: tuple[InlineModule, ...]
+    declarations: tuple[ModuleDeclaration, ...]
+
+    def declares(self, path: str, module: style_footprint.CrateModule, parent: tuple[str, ...], file: str) -> bool:
+        """Read the kept items for one module file without scanning its owner's text again."""
+        name, filename = module_name(file), PurePosixPath(file).name
+        for declaration in self.declarations:
+            if isinstance(declaration.path, UncertainDeclarationPath):
+                return True
+            if isinstance(declaration.path, LiteralModulePath):
+                named = declaration.path.value
+                if named.rsplit("/", 1)[-1] != filename:
+                    continue
+                if declaration.scope or posixpath.normpath(str(PurePosixPath(path).parent / named)) == file:
+                    return True
+            elif (declaration.name == name and not isinstance(module, style_footprint.OutsideCrate)
+                  and module + tuple(scope.name for scope in declaration.scope) == parent):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class UnreadableDeclarationText:
+    """The token scan cannot read this file's declarations."""
+
+
+def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+    """Scan one file text and keep its words, item starts, inline modules, and declaration paths."""
     try:
         spans = style_footprint.token_spans(text)
     except style_footprint.UnreadableTokenSpans:
-        return True
+        return UnreadableDeclarationText()
+    if len(spans) != len(style_footprint.tokens(text)):
+        return UnreadableDeclarationText()
+    words = plain_words(spans)
+    starts = style_footprint.code_item_starts(words)
+    modules = inline_modules(words, starts)
+    attributes = style_footprint.decorated_items(words)
+    paths: dict[int, LiteralModulePath | UncertainDeclarationPath] = {
+        owner: UncertainDeclarationPath() for owner, decorated in attributes.items()
+        if words[owner] == "mod" and "path" in decorated}
+    attribute_spans = dict(style_footprint.attribute_spans(words))
+    for start, owner in style_footprint.attribute_owners(words).items():
+        named = words[start + 4][1:-1] if attribute_spans[start] == start + 6 else ""
+        if (owner in paths and owner in starts and attributes[owner].count("path") == 1
+                and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
+                and words[owner + 2:owner + 3] == (";",)):
+            paths[owner] = LiteralModulePath(named)
+    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""), enclosing(modules, owner),
+                                           paths.get(owner, DefaultModulePath()))
+                         for owner in sorted(paths.keys() | {index for index, word in enumerate(words)
+                                                              if word == "mod" and index in starts
+                                                              and words[index + 2:index + 3] == (";",)}))
+    return ModuleDeclarationText(words, starts, modules, declarations)
+
+
+def declares_module(repo: Path, path: str, text: str | ModuleDeclarationText | UnreadableDeclarationText, file: str) -> bool:
+    """Read kept declaration syntax, or scan text supplied directly by a caller."""
+    reading = module_declaration_text(text) if isinstance(text, str) else text
     root = crate_root(repo, file)
-    if len(spans) != len(style_footprint.tokens(text)) or isinstance(root, NoCrateRoot):
+    if isinstance(reading, UnreadableDeclarationText) or isinstance(root, NoCrateRoot):
         return True
     module = style_footprint.crate_module(file, root)
     if isinstance(module, style_footprint.OutsideCrate):
         return True
-    return DeclarationScan(path, plain_words(spans), style_footprint.crate_module(path, root), module[:-1], file).declares()
+    return reading.declares(path, style_footprint.crate_module(path, root), module[:-1], file)
 
 
 def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
@@ -1676,11 +1761,35 @@ _READ_LIMITS = BatchLimits(25, 5000, 10)
 _STRUCTURE_LIMITS = BatchLimits(6, 3000, 5)
 
 
-def read_slices(repo: Path, tip: str, files: tuple[str, ...], limits: BatchLimits = _READ_LIMITS) -> tuple[tuple[str, ...], ...]:
+@dataclass(frozen=True)
+class UnstoredLineCounts:
+    """A standalone slice read has no ledger for stored counts."""
+
+
+_UNSTORED_LINE_COUNTS = UnstoredLineCounts()
+
+
+def source_line_counts(repo: Path, tip: str, files: tuple[str, ...],
+                       ledger: style_ledger.Ledger | UnstoredLineCounts = _UNSTORED_LINE_COUNTS) -> dict[str, int]:
+    """Read source lengths through one batch, with ledger storage when available."""
+    if not files:
+        return {}
+    if isinstance(ledger, style_ledger.Ledger):
+        return ledger.line_counts(tip, files)
+    cache = style_ledger.GitReadCache(repo)
+    cache.read(tip, files)
+    blobs = cache.tip(tip).blobs
+    return {path: len(cache.contents[blobs[path]].decode().replace("\r\n", "\n").replace("\r", "\n").splitlines())
+            if path in blobs else len(git(repo, "show", f"{tip}:{path}").splitlines())
+            for path in files}
+
+
+def read_slices(repo: Path, tip: str, files: tuple[str, ...], limits: BatchLimits = _READ_LIMITS,
+                *, ledger: style_ledger.Ledger | UnstoredLineCounts = _UNSTORED_LINE_COUNTS) -> tuple[tuple[str, ...], ...]:
     """Keep directories together, splitting only an oversized directory."""
     directories: dict[str, list[str]] = defaultdict(list)
     present = style_proposals.files_at(repo, tip, files)
-    lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in present}
+    lengths = source_line_counts(repo, tip, tuple(present), ledger)
     for path in sorted(present):
         directories[str(PurePosixPath(path).parent)].append(path)
     groups: list[tuple[str, ...]] = []
@@ -1746,37 +1855,173 @@ class RefillCells:
     waits: Mapping[str, style_proposals.RankWait]
 
 
-def _unit_tickets(family: rules.Family, cell: style_ledger.Cell) -> bool:
-    return cell.family == family or (family == "modules" and cell.tier == "D")
+@dataclass(frozen=True)
+class NewRefillObservation:
+    """A direct caller starts a separate selection observation."""
 
 
-def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, ...], base: UnitBase, family: rules.Family,
-                  scope: PilotScope, waits: Mapping[str, style_proposals.RankWait],
-                  definitions: Mapping[str, rules.Rule]) -> RefillCells:
-    """Leave out unchanged held sites with open proposals, and find the unit's cells a ticket at its tip cannot change."""
-    held = ledger.latest_held_judgments()
-    findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
-    for finding in ledger.held_findings(style_ledger.AllHeldFindings()):
-        # A waived, built or withdrawn finding needs no more work at its site.
-        if not isinstance(finding.state, style_ledger.Waived | style_ledger.Built | style_ledger.Withdrawn):
-            findings[(finding.rule, finding.path)].append(finding)
+_NEW_REFILL_OBSERVATION = NewRefillObservation()
+
+
+
+@dataclass(frozen=True)
+class ProposalFileIdentity:
+    """The file identity used for one parsed proposal status."""
+
+    modified_ns: int
+    size: int
+
+
+@dataclass(frozen=True)
+class ProposalStatus:
+    """The parsed open status of one proposal file identity."""
+
+    identity: ProposalFileIdentity
+    is_open: bool
+
+
+@dataclass(frozen=True)
+class HeldSiteCells:
+    """The held-site filter result for observed cells, definitions, and proposal statuses."""
+
+    source: tuple[style_ledger.Cell, ...]
+    definitions: tuple[tuple[str, rules.Rule], ...]
+    eligible: tuple[style_ledger.Cell, ...]
+    proposals: tuple[tuple[Path, bool], ...]
+
+
+@dataclass(frozen=True)
+class UnreadHeldSiteCells:
+    """This observation has no held-site filter result."""
+
+
+
+class RefillContext:
+    """Share finding rows and eligible groups between selection observations."""
+
+    def __init__(self, ledger: style_ledger.Ledger) -> None:
+        self.ledger: style_ledger.Ledger = ledger
+        self.version: tuple[int, int, bool] = (-1, -1, False)
+        self.tickets: list[tuple[rules.Family, PilotScope, Mapping[rules.Family, PilotScope], RefillCells,
+                                 frozenset[str], BusyFiles, tuple[TicketSelection, ...]]] = []
+        self.held: dict[tuple[str, str], list[style_ledger.HeldFinding]] = {}
+        self.judgments: dict[tuple[str, str], str] = {}
+        self.filtered: HeldSiteCells | UnreadHeldSiteCells = UnreadHeldSiteCells()
+        self.proposal_statuses: dict[Path, ProposalStatus] = {}
+        self.rule_changes: dict[tuple[str, str], bool] = {}
+        self.rule_texts: dict[tuple[str, str], bool] = {}
+        self.current_held_texts: dict[tuple[str, str], bool] = {}
+        self.blobs: dict[tuple[str, str], str] = {}
+        self.reader: style_proposals.GitProposalReader = style_proposals.GitProposalReader(ledger)
+
+    def observe(self) -> None:
+        """Discard mutable facts after a write, while callers retain earlier stage values."""
+        version = self.ledger.selection_version()
+        if self.version != version:
+            self.version = version
+            self.tickets.clear()
+            self.filtered = UnreadHeldSiteCells()
+            self.rule_changes.clear()
+            self.rule_texts.clear()
+            self.current_held_texts.clear()
+            self.blobs.clear()
+            self.held.clear()
+            for finding in self.ledger.held_findings(style_ledger.AllHeldFindings()):
+                if not isinstance(finding.state, style_ledger.Waived | style_ledger.Built | style_ledger.Withdrawn):
+                    self.held.setdefault((finding.rule, finding.path), []).append(finding)
+            self.judgments = self.ledger.latest_held_judgments()
+
+
+    def proposal_is_open(self, path: Path) -> bool:
+        """Parse a proposal again only after its file identity changes."""
+        try:
+            status = path.stat()
+        except OSError:
+            _ = self.proposal_statuses.pop(path, None)
+            return frontmatter(path).get("status") == ["open"]
+        identity = ProposalFileIdentity(status.st_mtime_ns, status.st_size)
+        previous = self.proposal_statuses.get(path)
+        if previous is None or previous.identity != identity:
+            previous = ProposalStatus(identity, frontmatter(path).get("status") == ["open"])
+            self.proposal_statuses[path] = previous
+        return previous.is_open
+
+    def rule_changed(self, finding: style_ledger.HeldFinding, definitions: Mapping[str, rules.Rule]) -> bool:
+        """Compare each held rule pin once per observation."""
+        key = (finding.rule, finding.rule_blob)
+        if key not in self.rule_changes:
+            self.rule_changes[key] = style_ledger.rule_changed_since_judged(finding, definitions)
+            definition = definitions.get(style_ledger.base_rule(finding.rule))
+            if definition is not None:
+                self.rule_texts[(definition.rule_id, finding.rule_blob)] = not self.rule_changes[key]
+        return self.rule_changes[key]
+
+    def rule_text_unchanged(self, blob: str, definition: rules.Rule) -> bool:
+        """Share pin comparisons between held findings and their judgments."""
+        key = (definition.rule_id, blob)
+        if key not in self.rule_texts:
+            self.rule_texts[key] = rules.judged_text_unchanged(blob, definition)
+        return self.rule_texts[key]
+
+    def judgment_text_current(self, key: tuple[str, str], definitions: Mapping[str, rules.Rule]) -> bool:
+        """Keep only the current-text result of each held judgment read."""
+        if key not in self.current_held_texts:
+            judgment = self.ledger.newest_held_judgment(*key)
+            definition = definitions.get(style_ledger.base_rule(key[0]))
+            self.current_held_texts[key] = (
+                isinstance(judgment, style_ledger.NewestHeldJudgment) and definition is not None
+                and self.rule_text_unchanged(judgment.inputs.rule_blob, definition))
+        return self.current_held_texts[key]
+
+    def blob(self, commit: str, path: str) -> str:
+        """Read each source blob identity once per observation."""
+        key = (commit, path)
+        if key not in self.blobs:
+            self.blobs[key] = self.reader.blob(commit, path)
+        return self.blobs[key]
+
+    def eligible_cells(self, cells: tuple[style_ledger.Cell, ...],
+                       definitions: Mapping[str, rules.Rule]) -> tuple[style_ledger.Cell, ...]:
+        """Share the held-site filter across families while observing changed proposal statuses."""
+        self.observe()
+        observed = self.filtered
+        catalog = tuple(definitions.items())
+        if isinstance(observed, HeldSiteCells):
+            if (observed.source == cells and observed.definitions == catalog
+                    and all(self.proposal_is_open(path) == is_open for path, is_open in observed.proposals)):
+                return observed.eligible
+            self.tickets.clear()
+            if observed.definitions != catalog:
+                self.rule_changes.clear()
+                self.rule_texts.clear()
+                self.current_held_texts.clear()
+        proposals: dict[Path, bool] = {}
+        eligible = held_site_cells(self.ledger, cells, definitions, self, proposals)
+        self.filtered = HeldSiteCells(cells, catalog, eligible, tuple(proposals.items()))
+        return eligible
+
+
+def held_site_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, ...],
+                    definitions: Mapping[str, rules.Rule], context: RefillContext,
+                    proposals: dict[Path, bool]) -> tuple[style_ledger.Cell, ...]:
+    """Exclude unchanged held sites with open proposals, independently of the unit family."""
+    def proposal_is_open(path: Path) -> bool:
+        if path not in proposals:
+            proposals[path] = context.proposal_is_open(path)
+        return proposals[path]
+
     tip = synced_tip(ledger)
     result: list[style_ledger.Cell] = []
     for cell in cells:
         key = (cell.rule, cell.path)
-        if (cell.state in ("open", "stale") and key in held and findings[key]
-                and not any(style_ledger.rule_changed_since_judged(finding, definitions) for finding in findings[key])):
-            judgment = ledger.newest_held_judgment(*key)
-            definition = definitions.get(cell.rule.removesuffix("#uncovered"))
-            current_text = (isinstance(judgment, style_ledger.NewestHeldJudgment) and definition is not None
-                            and rules.judged_text_unchanged(judgment.inputs.rule_blob, definition))
-            if current_text and all(isinstance(finding.state, style_ledger.Filed)
-                   and frontmatter(finding.state.proposal).get("status") == ["open"]
-                   for finding in findings[key]):
+        findings = context.held.get(key, ())
+        if (cell.state in ("open", "stale") and key in context.judgments and findings
+                and not any(context.rule_changed(finding, definitions) for finding in findings)):
+            if context.judgment_text_current(key, definitions) and all(isinstance(finding.state, style_ledger.Filed)
+                                    and proposal_is_open(finding.state.proposal) for finding in findings):
                 try:
-                    reader = style_proposals.GitProposalReader(ledger)
-                    previous = reader.blob(held[key], cell.path)
-                    current = reader.blob(tip, cell.path)
+                    previous = context.blob(context.judgments[key], cell.path)
+                    current = context.blob(tip, cell.path)
                 except style_ledger.GitReadFailed:
                     raise
                 except style_ledger.LedgerError:
@@ -1785,25 +2030,48 @@ def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, .
                     if previous and previous == current:
                         continue
         result.append(cell)
+    return tuple(result)
+
+
+def _unit_tickets(family: rules.Family, cell: style_ledger.Cell) -> bool:
+    return cell.family == family or (family == "modules" and cell.tier == "D")
+
+
+def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, ...], base: UnitBase, family: rules.Family,
+                  scope: PilotScope, waits: Mapping[str, style_proposals.RankWait],
+                  definitions: Mapping[str, rules.Rule],
+                  context: RefillContext | NewRefillObservation = _NEW_REFILL_OBSERVATION) -> RefillCells:
+    """Leave out unchanged held sites with open proposals, and find the unit's cells a ticket at its tip cannot change."""
+    if isinstance(context, NewRefillObservation):
+        context = RefillContext(ledger)
+    result = context.eligible_cells(cells, definitions)
     own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))
     judged = ledger.judged_at_base(own, base.commit) if isinstance(base, UnitBranchTip) else ()
-    return RefillCells(tuple(result), frozenset(judged), waits)
+    return RefillCells(result, frozenset(judged), waits)
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
                       *, base: UnitBase, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
-    definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
-    cells = tuple(ledger.cells())
-    waits = style_proposals.ranked_work(ledger, cells, family_scopes).waits(family)
-    return _tickets_from(repo, ledger, busy, family, scope, family_scopes,
-                         _refill_cells(ledger, cells, base, family, scope, waits, definitions), first_files)
+    with ledger.finding_reads():
+        context = RefillContext(ledger)
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+        cells = tuple(ledger.cells())
+        waits = style_proposals.ranked_work(ledger, cells, family_scopes).waits(family)
+        return _tickets_from(repo, ledger, busy, family, scope, family_scopes,
+                             _refill_cells(ledger, cells, base, family, scope, waits, definitions, context), first_files,
+                             context)
 
 
 def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, family: rules.Family, scope: PilotScope,
                   family_scopes: Mapping[rules.Family, PilotScope], refill: RefillCells,
-                  first_files: frozenset[str]) -> tuple[TicketSelection, ...]:
+                  first_files: frozenset[str], context: RefillContext) -> tuple[TicketSelection, ...]:
+    context.observe()
+    for old_family, old_scope, old_scopes, old_refill, old_first, old_busy, tickets in context.tickets:
+        if (family, scope, family_scopes, refill, first_files, busy) == (
+                old_family, old_scope, old_scopes, old_refill, old_first, old_busy):
+            return tickets
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
@@ -1840,7 +2108,7 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
                 available = {path for path in available if not busy.contains(path)}
                 sites_by_rule = {rule_id: ledger.listed_sites(rule_id, crate)
                                  for rule_id in sorted({cell.rule for cell in structure})}
-                for files in sorted(read_slices(repo, tip, tuple(sorted(available)), _STRUCTURE_LIMITS)):
+                for files in sorted(read_slices(repo, tip, tuple(sorted(available)), _STRUCTURE_LIMITS, ledger=ledger)):
                     batch_cells = tuple(cell for cell in file_cells if cell.path in files)
                     if manifest in files:
                         batch_cells += manifest_cells
@@ -1886,9 +2154,11 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
             remaining = tuple(path for path in paths if path not in first_files)
             for group in (priority, remaining):
                 if group:
-                    for files in read_slices(repo, tip, group):
+                    for files in read_slices(repo, tip, group, ledger=ledger):
                         result.append(TicketSelection("read", family, crate, files, rule_ids))
-    return tuple(sorted(result, key=lambda ticket: not first_files.intersection(ticket.files)))
+    tickets = tuple(sorted(result, key=lambda ticket: not first_files.intersection(ticket.files)))
+    context.tickets.append((family, scope, family_scopes, refill, first_files, busy, tickets))
+    return tickets
 
 
 def family_rank(family: rules.Family) -> int:
@@ -1912,13 +2182,18 @@ def ranked_candidates(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       families: tuple[rules.Family, ...], scope: PilotScope,
                       scopes: Mapping[rules.Family, PilotScope], base: UnitBase,
                       first_files: frozenset[str], definitions: Mapping[str, rules.Rule],
-                      cells: tuple[style_ledger.Cell, ...]) -> tuple[TicketSelection, ...]:
+                      cells: tuple[style_ledger.Cell, ...], *,
+                      context: RefillContext | NewRefillObservation = _NEW_REFILL_OBSERVATION) -> tuple[TicketSelection, ...]:
     """Rank owned work by tier D, blocked cells, and family rank."""
+    if isinstance(context, NewRefillObservation):
+        with ledger.finding_reads():
+            return ranked_candidates(repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells,
+                                     context=RefillContext(ledger))
     ranked = style_proposals.ranked_work(ledger, cells, scopes)
     blocked = blocked_cell_counts(cells, scopes)
     candidates = tuple(ticket for family in families for ticket in _tickets_from(
         repo, ledger, busy, family, scope, scopes,
-        _refill_cells(ledger, cells, base, family, scope, ranked.waits(family), definitions), first_files))
+        _refill_cells(ledger, cells, base, family, scope, ranked.waits(family), definitions, context), first_files, context))
     return tuple(sorted(candidates, key=lambda ticket: work_order(ticket.kind, ticket.family, ticket.crate, blocked)))
 
 
@@ -2381,6 +2656,9 @@ class EditedFiles:
     A qualified rename includes its own file and Rust or Markdown files that hold the old name as a word.
     A restructure includes its own Rust file and files whose `mod` lines or `#[path]` strings declare it.
     Unreadable declarations count as edited.
+    Each distinct declaration blob is scanned once per refill.
+    A plain file-module path string that ends in another file's name does not declare the requested module file.
+    This exclusion also applies inside inline modules.
     Other findings include their own file.
     Append recorded need paths for every finding.
     Recorded needs also extend the gate's edit approval.
@@ -2396,9 +2674,14 @@ class EditedFiles:
         self.texts: dict[str, str] = {}
         # The renamed_text of each file rename in each file that names its old module.
         self.readings: dict[FileRename, tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]] = {}
+        self.declarations: dict[str, ModuleDeclarationText | UnreadableDeclarationText] = {}
+        self.edited: dict[str, tuple[str, ...]] = {}
+        self.named: dict[str, tuple[tuple[str, str], ...]] = {}
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """Return computed files first, then recorded need paths, without duplicates."""
+        if finding.finding_id in self.edited:
+            return self.edited[finding.finding_id]
         moved = file_rename(finding.kind, finding.path, finding.after)
         pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(moved, FileRename):
@@ -2410,12 +2693,19 @@ class EditedFiles:
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             computed = (finding.path, *named_files)
         elif finding.kind == "restructure" and finding.path.endswith(".rs"):
-            owners = (path for path, text in self.declaring(module_name(finding.path))
-                      if path != finding.path and declares_module(self.repo, path, text, finding.path))
+            owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
+                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
             computed = (finding.path, *owners)
         else:
             computed = (finding.path,)
-        return tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
+        self.edited[finding.finding_id] = tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
+        return self.edited[finding.finding_id]
+
+    def declaration_text(self, blob: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+        """Keep one declaration scan for each blob read during this refill."""
+        if blob not in self.declarations:
+            self.declarations[blob] = module_declaration_text(self.texts[blob])
+        return self.declarations[blob]
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """For a file rename, each file at either commit that names the old module and has a `path` word the rename gate
@@ -2455,17 +2745,31 @@ class EditedFiles:
     def naming(self, name: str) -> tuple[tuple[str, str], ...]:
         """Each Rust file that holds name as a word at either commit, with its text there, read by one batch. A path
         with the same blob at both commits is listed once."""
-        named = {commit: self.ledger.files_naming(commit, name) for commit in self.commits()}
-        self.read(named)
-        versions = dict.fromkeys((path, self.blobs[commit, path]) for commit, paths in named.items() for path in paths)
-        return tuple((path, self.texts[blob]) for path, blob in versions)
+        return tuple((path, self.texts[blob]) for path, blob in self.named_versions(name))
+
+    def named_versions(self, name: str) -> tuple[tuple[str, str], ...]:
+        """Read candidate blobs and keep each distinct path and blob pair."""
+        if name not in self.named:
+            named = {commit: self.ledger.files_naming(commit, name) for commit in self.commits()}
+            self.read(named)
+            self.named[name] = tuple(dict.fromkeys((path, self.blobs[commit, path])
+                                                  for commit, paths in named.items() for path in paths))
+        return self.named[name]
 
     def declaring(self, name: str) -> tuple[tuple[str, str], ...]:
         """Each Rust file at either commit that may declare a module named name, with its text there: one that holds
         name as a word, or a `path` string the scan cannot read with certainty (`UNREAD_PATH_STRING`), which no grep
         for the name finds."""
-        unread = (entry for entry in self.naming("path") if UNREAD_PATH_STRING.search(entry[1]))
-        return tuple(dict.fromkeys((*self.naming(name), *unread)))
+        return tuple(dict.fromkeys((path, self.texts[blob]) for path, blob in self.declaring_versions(name)))
+
+    def declaring_versions(self, name: str) -> tuple[tuple[str, str], ...]:
+        """The path and blob of each candidate module-declaring file at either commit."""
+        return tuple(dict.fromkeys((*self.named_versions(name), *self.unread_path_versions)))
+
+    @cached_property
+    def unread_path_versions(self) -> tuple[tuple[str, str], ...]:
+        """Find unreadable path strings once for the refill."""
+        return tuple(entry for entry in self.named_versions("path") if UNREAD_PATH_STRING.search(self.texts[entry[1]]))
 
     def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
         """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read
@@ -2635,7 +2939,6 @@ def projected_follow_findings(reading: style_ledger.DeclarationReading) -> dict[
     return findings
 
 
-
 @dataclass(frozen=True)
 class BuildableDecision:
     """Approved findings that passed refill's shared source, rank, ownership and sync gates in one crate."""
@@ -2666,13 +2969,14 @@ class DecisionBatch:
 
 
 def fill_decision_batch(repo: Path, tip: str, candidates: tuple[BuildableDecision, ...],
-                        family: rules.Family) -> DecisionBatch:
+                        family: rules.Family, *,
+                        ledger: style_ledger.Ledger | UnstoredLineCounts = _UNSTORED_LINE_COUNTS) -> DecisionBatch:
     """Fill one rule and crate, then add same-family findings on its selected files."""
     first = candidates[0]
     primary = tuple(candidate for candidate in candidates
                     if candidate.crate == first.crate and candidate.definition.rule_id == first.definition.rule_id)
     primary_files = tuple(sorted({finding.path for candidate in primary for finding in candidate.findings}))
-    lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in primary_files}
+    lengths = source_line_counts(repo, tip, primary_files, ledger)
     selected: list[BuildableDecision] = []
 
     def admit(candidate: BuildableDecision, finding: style_ledger.HeldFinding) -> None:
@@ -2715,6 +3019,21 @@ def _select_phase(
     changes: MainChanges | UnknownMainChanges,
     predecessor: WaitingCheckpoint | NoCheckpointBlock = _NO_CHECKPOINT_BLOCK,
     *, family: rules.Family,
+    selection: FamilySelection = FamilySelection.OWN, families: tuple[rules.Family, ...] = (),
+) -> BuildableFindings | PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge:
+    with ledger.finding_reads():
+        return _select_observed_phase(
+            ledger, unit, branch, plan, repo, doc, text, scope, busy, first_files, definitions, changes, predecessor,
+            family=family, selection=selection, families=families, context=RefillContext(ledger))
+
+
+def _select_observed_phase(
+    ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
+    doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
+    definitions: Mapping[str, rules.Rule],
+    changes: MainChanges | UnknownMainChanges,
+    predecessor: WaitingCheckpoint | NoCheckpointBlock = _NO_CHECKPOINT_BLOCK,
+    *, family: rules.Family, context: RefillContext,
     selection: FamilySelection = FamilySelection.OWN, families: tuple[rules.Family, ...] = (),
 ) -> BuildableFindings | PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge:
     families = families or (family,)
@@ -2824,7 +3143,7 @@ def _select_phase(
         owned for owned in families if owned == "modules"
         or (queued and queued[0]["kind"] != "structure"
             and family_rank(owned) < family_rank(cast(rules.Family, queued[0]["family"]))))
-    coverage = (ranked_candidates(repo, ledger, busy, coverage_families, scope, scopes, base, first_files, definitions, cells)
+    coverage = (ranked_candidates(repo, ledger, busy, coverage_families, scope, scopes, base, first_files, definitions, cells, context=context)
                 if selection == FamilySelection.OWN and queued and coverage_families else ())
     def take_queued(tickets: tuple[style_ledger.TicketRecord, ...]) -> (
             PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork):
@@ -2934,7 +3253,7 @@ def _select_phase(
 
     if selection == FamilySelection.OWN and "modules" in families:
         priority = tuple(ticket for ticket in ranked_candidates(
-            repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells)
+            repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
             if ticket.kind == "structure" and not pending_decision_files.intersection(ticket.files))
         if priority:
             result = take_reads(priority)
@@ -3125,14 +3444,14 @@ def _select_phase(
             owned for owned in families if family_rank(owned) < family_rank(family))
             if primary.definition.tier != "D" else ())
         higher = (tuple(ticket for ticket in ranked_candidates(
-            repo, ledger, busy, higher_families, scope, scopes, base, first_files, definitions, cells)
+            repo, ledger, busy, higher_families, scope, scopes, base, first_files, definitions, cells, context=context)
             if ticket.kind != "structure") if higher_families else ())
         if higher:
             result = take_reads(higher)
             if isinstance(result, PhaseWritten):
                 return result
         batch = fill_decision_batch(repo, tip, tuple(candidate for candidate in ordered_decisions
-                                                    if candidate.definition.family == family), family)
+                                                    if candidate.definition.family == family), family, ledger=ledger)
         ticket_id = ledger.next_ticket_id()
         ledger.ticket_add(ticket_id, unit, "proposal", family, batch.crate,
                           list(batch.files), sorted({finding.rule for finding in batch.findings}),
@@ -3157,12 +3476,12 @@ def _select_phase(
     if selection == FamilySelection.COUNT:
         reason = ", ".join(f"{reason} ({count})" for reason, count in sorted(refusals.items()) if count) or "none approved"
         return BuildableFindings(buildable, reason)
-    candidates = ranked_candidates(repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells)
+    candidates = ranked_candidates(repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
     if candidates:
         return take_reads(candidates)
     blocked_crates: set[str] = set()
     for family in families:
-        refill = _refill_cells(ledger, cells, base, family, scope, ranked_work.waits(family), definitions)
+        refill = _refill_cells(ledger, cells, base, family, scope, ranked_work.waits(family), definitions, context)
         if isinstance(base, UnitBranchTip) and refill.judged_at_base:
             merge = ledger.style_merge_changes(refill.judged_at_base, base.commit)
             if isinstance(merge, style_ledger.StyleMergeChanges):

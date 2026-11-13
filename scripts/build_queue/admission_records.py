@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -422,13 +422,30 @@ class CompilerServiceMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class ServiceJobStateNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
     diagnostic: str = ""
     cgroup: str = ""
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
     pid: int | PidNotRecorded = field(kw_only=True)
-    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+    # Keep this wire union stable for pinned clients.
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = field(
+        default=NotServiceSlice(), metadata={"acquisition_unused": True})
+    # New service states belong in this optional field.
+    service_job_state: ServiceJobState | ServiceJobStateNotRecorded = field(
+        default_factory=ServiceJobStateNotRecorded, kw_only=True, metadata={"acquisition_unused": True})
+
+
+def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -> ServiceJobState:
+    """Read the current state, with the legacy state for older snapshots."""
+    if isinstance(memory, UnownedSliceMemory) and not isinstance(memory.service_job_state, ServiceJobStateNotRecorded):
+        return memory.service_job_state
+    return memory.job_state
 
 
 @dataclass(frozen=True)
@@ -1246,12 +1263,18 @@ def process_start_time(pid: int) -> str | None:
         return None
 
 
+def format_percent(value: float, *, complete: bool = True) -> str:
+    """Round down to one decimal place without showing an early completion."""
+    tenths = math.floor(value * 10)
+    return f"{(tenths if complete else min(tenths, 999)) / 10:.1f}%"
+
+
 def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
-                f"some avg10 {pressure.some_avg10:.1f}; swap {pressure.swap_used_percent:.1f}% used")
+                f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
     if pressure.condition == "swap":
-        return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
+        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 

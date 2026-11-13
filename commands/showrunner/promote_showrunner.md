@@ -21,6 +21,8 @@ Pass your own model id and effort level.
 Both options are required.
 Use `--check` to inspect the request without changes.
 The command preserves the conversation and retained workers.
+Promotion removes the unit type from the showrunner row.
+The recovery command includes the saved unit type.
 It stops the unit before it starts the child on the showrunner account.
 The child's document supplies its merge branch.
 A failed restart prints a recovery command.

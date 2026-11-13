@@ -33,6 +33,11 @@ A move can write the target home before start confirmation.
 The home alone does not prove a successful start.
 `member_account.repair_home` repairs it from a proved live process.
 
+`StaffRow.role` is `KnownWorkerRole(value)` or `WorkerRoleUnknown()`.
+`WorkerRole` accepts `impl`, `test`, `fix`, `review`, `astra-designer`, and `astra-reviewer`.
+Live worker readers use this staff field without a role-history fallback.
+Stored references keep the staff id and resolve current staff facts when used.
+
 ## Producer rows and commands
 
 Each producer runs its own named job.
@@ -121,6 +126,9 @@ The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, a
 They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
 `set_worker_role` writes the last dispatch role.
 `set_home` writes the selected or proved account home.
+`set_home(..., only_unknown=True)` completes only an unknown home.
+Its CLI form uses `--only-unknown`.
+The setter checks the current row inside the staff transaction, so a stale receipt cannot overwrite a recorded home.
 `progress_history.begin_dispatch` writes every dispatch role, including Astra policies.
 The shared pane launch builder uses `set_home`.
 `add_unit.ensure_staff_unit`, worker pane admission, and `staff_sources.ensure_staff_showrunner` complete earlier pane publications.
@@ -143,9 +151,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
-| `scripts/astra/astra_roles.py` | read | local_snapshot |
+| `scripts/astra/astra_roles.py` | write | local_snapshot, set_worker_role |
 | `scripts/astra/design_role_test_support.py` | read | CodexBackend |
-| `scripts/astra/design_roles.py` | read | runtime_id |
+| `scripts/astra/design_roles.py` | read | runtime_id, snapshot, by_id; resolves saved checkout owners through staff |
 | `scripts/bevy_upgrade/bevy_upgrade.py` | read | snapshot |
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
@@ -155,6 +163,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
+| `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
@@ -188,13 +197,17 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
 | `scripts/hooks/session-start-pane-record.py` | read | runtime_id |
+| `scripts/hooks/session-start-direct-resume.py` | read | local_by_current_session, unit_command |
 | `scripts/hooks/showrunner_footer.py` | read | snapshot |
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
+| `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
+| `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |
+| `scripts/lint/sweep.py` | read | local_snapshot, StaffSnapshot (type), StaffId; holder_sessions names the parent director of a detached worker run |
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
@@ -208,9 +221,10 @@ The shared pane launch builder uses `set_home`.
 | `scripts/message/send.py` | read | snapshot |
 | `scripts/message/sessions.py` | read | current_session_target |
 | `scripts/message/unit_labels.py` | read | active, snapshot, local_snapshot, OpenRun |
+| `scripts/nightly_review/candidates.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
 | `scripts/nix_env/heal.py` | read | initial_snapshot |
-| `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session |
+| `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session, set_home |
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
@@ -276,8 +290,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
-| `scripts/review_links/change_browser.py` | read | none (ReportsTo type) |
-| `scripts/review_links/change_page.py` | read | snapshot |
+| `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
+| `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -292,7 +306,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/stop_resume.py` | write | initial_snapshot, row_operation, slot_operation, ensure, native_id, set_home, resume, set_hold, child_environment |
 | `scripts/agents/unit_staff_test_support.py` | read | staff.json path |
 | `scripts/statusline/assignment.py` | read | StaffRow.from_json, StaffSnapshot |
-| `scripts/statusline/counts_row.py` | read | none (StaffRefused exception) |
+| `scripts/statusline/counts_row.py` | read | record_path, by_id, parent_of, StaffId (StaffRefused exception) |
 | `scripts/statusline/statusline.sh` | read | staff.json (shell) |
 | `scripts/style/add_style.py` | read | snapshot, LiveDoc, WrappedDoc |
 | `scripts/style/coverage_report.py` | read | snapshot |
@@ -301,7 +315,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/style/style_ledger.py` | read | snapshot |
 | `scripts/style/style_plan.py` | read | snapshot |
 | `scripts/style/style_plan_test_support.py` | read | staff.json path |
-| `scripts/style/style_proposals.py` | read | snapshot |
+| `scripts/style/style_proposals.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/style/style_sync.py` | read | local_snapshot, caller_identity, doc_owner |
 | `scripts/style/unit_files.py` | read | snapshot |
 | `scripts/usage/agents_log.py` | read | local_snapshot, OpenRun |
@@ -314,7 +328,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-186 accessor rows: 39 write, 146 read, 1 owner.
+191 accessor rows: 40 write, 150 read, 1 owner.
 
 ## Approved copies
 

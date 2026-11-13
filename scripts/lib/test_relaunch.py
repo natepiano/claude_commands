@@ -22,6 +22,9 @@ from scripts.lib.process_group import send_process_group
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 
@@ -37,6 +40,37 @@ class RelaunchObservation(TypedDict):
 class FinishedChild:
     def wait(self) -> int:
         return 23
+
+
+class UnitResumeCommandTests(StaffTestCase):
+    def test_resume_and_account_move_name_the_recorded_command(self) -> None:
+        runner = fixture_member("showrunner", name="demo")
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                row = staff.ensure("unit", name=unit_type, parent=staff.ReportsTo(runner.id),
+                    runtime_id=fixture_runtime_id(unit_type), unit_type=unit_type)
+                text = resume_message("maintenance", unit=row, move=AccountMove("claude1", "claude2"))
+                self.assertIn(f"/unit:{unit_type}", text)
+                self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", text)
+                self.assertIn("moved from claude1 to claude2", text)
+                self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.", text)
+
+    def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("merges"), unit_type="merge")
+        fixture_session(row.current_session, staff.ClaudeBackend())
+        row = staff.rename(row.id, "renamed")
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers())):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        self.assertIn("/unit:merge", arguments[-1])
+        self.assertNotIn("/unit:direct", arguments[-1])
 
 
 class RelaunchTests(ShutdownTestCase):
@@ -123,7 +157,7 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
         self.assertIn("for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.", text)
         self.assertIn("moved from source to destination", text)
-        self.assertIn("Background commands that you started before the restart ended with no result. Run them again.",
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
                       text.splitlines()[1])
         self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
         self.assertEqual(text.count("Worker idle-id: idle"), 1)
@@ -136,7 +170,7 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", workers=ResumeWorkers(panes=[
             PaneWorkerResume(staff.StaffId(name), IdleWorker()) for name in ("impl-id", "review-id")]))
         self.assertIn("You were stopped and resumed because a shutdown.", text)
-        self.assertIn("Background commands that you started before the restart ended with no result. Run them again.",
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
                       text.splitlines()[1])
         self.assertIn("for messages kept while you were down", text)
         for name in ("impl-id", "review-id"):
@@ -159,6 +193,7 @@ class RelaunchTests(ShutdownTestCase):
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         passes = cast(dict[str, dict[str, object]], state["pass"])
         command = ("bash", "assign.sh", "--role", "impl", "--prompt", str(fixture.root / "saved prompt.md"))
+        passes[row.name]["worker_id"] = row.id
         passes[row.name]["launcher_command"] = list(command)
         for status in ("unsubmitted", "submitted", "done", "completed"):
             with self.subTest(status=status):

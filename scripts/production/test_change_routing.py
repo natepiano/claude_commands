@@ -437,6 +437,76 @@ class StaffRoutingTests(unittest.TestCase):
                     _ = record.write_text(json.dumps(fields))
                     self.assertEqual(change_routing.waits_for_user(listing, row, root), expected)
 
+    def test_delivery_readers_keep_default_fallbacks_and_require_complete_collected_reads(self) -> None:
+        listing = self.root / "change-review - top.md"
+        row = {"#": "C1"}
+        path = change_routing.delivery_path(self.root, listing, "C1")
+        read_text = Path.read_text
+        with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}):
+            for failure in ("unreadable", "invalid JSON", "invalid encoding"):
+                with self.subTest(failure=failure):
+                    _ = path.write_bytes(b"\xff" if failure == "invalid encoding" else b"{")
+
+                    def read(source: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                        if source == path and failure == "unreadable":
+                            raise PermissionError(str(path))
+                        return read_text(source, encoding=encoding, errors=errors)
+
+                    with mock.patch.object(Path, "read_text", read):
+                        if failure != "invalid encoding":
+                            self.assertTrue(change_routing.waits_for_user(listing, row, self.root))
+                            self.assertEqual(change_routing.waiting_rows(listing, [row]), [row])
+                        for single in (False, True):
+                            sources: list[Path] = []
+                            with self.assertRaises((OSError, ValueError)):
+                                if single:
+                                    _ = change_routing.waits_for_user(listing, row, self.root, sources=sources)
+                                else:
+                                    _ = change_routing.waiting_rows(listing, [row], sources=sources)
+                            self.assertIn(path, sources)
+            path.unlink()
+            sources = []
+            self.assertTrue(change_routing.waits_for_user(listing, row, self.root, sources=sources))
+            self.assertIn(path, sources)
+
+    def test_collected_legacy_document_reads_fail_while_default_readers_skip_them(self) -> None:
+        doc = self.root / "child-production.md"
+        listing = self.root / "legacy.md"
+        _ = doc.write_text(f"- **Change review:** {listing}\n")
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == doc:
+                raise PermissionError(str(doc))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with mock.patch.object(Path, "read_text", read):
+            record = staff.snapshot()
+            self.assertEqual(change_routing.StaffRouting(record, {"child": doc}).list_owner(listing), "legacy")
+            sources: list[Path] = []
+            with self.assertRaises(PermissionError):
+                _ = change_routing.StaffRouting(record, {"child": doc}, sources=sources).list_owner(listing)
+            self.assertIn(doc, sources)
+
+    def test_missing_optional_source_folders_are_empty_and_unreadable_folders_raise(self) -> None:
+        from scripts.production.issues import source_paths
+
+        folder = self.root / "missing"
+        sources: list[Path] = []
+        self.assertEqual(source_paths(folder, "*.md", sources=sources), [])
+        self.assertEqual(sources, [folder])
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(str(folder))):
+            with self.assertRaises(PermissionError):
+                _ = source_paths(folder, "*.md", sources=sources)
+
+    def test_collected_routing_does_not_read_or_send_alerts(self) -> None:
+        self.enterContext(production_staff_record())
+        sources: list[Path] = []
+        router = change_routing.StaffRouting(staff.snapshot(), {}, sources=sources)
+        owner = router.owner({"#": "C1", "Producer": "missing"}, self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        cast(mock.Mock, self.alert).assert_not_called()
+
 
     def test_only_named_fixture_rows_receive_producer_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -69,15 +69,25 @@ In a terminal:
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
+| Login ends | The Claude login's server time limit in the user's zone. A dash means unknown or Codex. |
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses the launch. It does not select `~/.codex` as a fallback. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live usage request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says "the attempt time is not recorded". It does not promise when another read will run. A good read clears the star and footnote. The default table shows accounts and upcoming moves; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
-`status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the problem lines below the normal table.
+`status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order.
+`problems` contains the table's problem lines except shared-home repair lines.
+These repairs cover real entries where shared links belong, clashing entries, folders to merge, and failed shared moves.
+The text board keeps these lines, including with `--detail`.
+All other problem lines remain in JSON.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `login_ends_at`, `credits`, `use_credits` and `read_at`.
+`login_ends_at` is an ISO 8601 UTC string, or null for an unknown date or a Codex row.
+`Login ends` uses the same date format as `Weekly resets`.
+The usage reader takes this date from `claudeAiOauth.refreshTokenExpiresAt` in the metadata it already loads.
+Claude Code reports the same value as `loginExpiresAt`.
+A token refresh does not extend this server time limit.
 `tool` is `claude` or `codex`.
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.
@@ -162,7 +172,7 @@ A failed refresh retains its watches and retries on the next tick.
 An unavailable local staff record supplies no group membership.
 
 
-Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
+Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. JSON `problems` omits shared-home repair lines and the `* ` footnote prefix. All other problem lines match the text board. A direct folder or sign-in check replaces the empty-row summary for that cause.
 
 A login with no account note has one line that names the missing note. The line asks for the account's login. Problem lines use account labels and never print a login.
 

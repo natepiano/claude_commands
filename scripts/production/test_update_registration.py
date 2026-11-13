@@ -15,6 +15,7 @@ from typing import IO, cast, final, override
 from unittest import mock
 
 from scripts.production import session_staff, staff, showrunners
+from scripts.production.production_doc import read_production
 from scripts.agents import shutdown
 from scripts.agents import remote
 from scripts.production.rename_test_support import RenameDisplays
@@ -59,6 +60,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
         self.assertEqual(updates[updates.index("--prompt") + 1], "scheduled")
         self.assertNotIn("--prompt-file", updates)
+        self.assertNotIn("--from", updates)
         self.assertFalse((self.state / "showrunner" / self.owner_id / "prompt.txt").exists())
         self.assertIn("automatic reports are off", first.stdout)
         for instance in ("stall-watch",):
@@ -486,6 +488,16 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn(str(self.asker_id), references)
         self.assertIn("renamed", result.stdout)
         self.assertNotIn("relay: to alpha", result.stdout)
+
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            production = read_production("example")
+            identities = registration.QuestionStaff.read()
+            asker = registration.StaffAsker(self.asker_id)
+            relay = registration.answer_relay(production, production.name, asker, identities)
+            self.assertEqual(relay.recipient, self.asker_id)
+            self.assertEqual(relay.line, registration.relay_line(production, production.name, asker, identities))
+            with self.assertRaises(registration.RegistrationFailure):
+                _ = registration.answer(production, "Choose the layout", identities=identities, only_open=True)
 
     def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
         self.file_question()

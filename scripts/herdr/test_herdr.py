@@ -221,18 +221,19 @@ class NativePaneSessionTests(StaffTestCase):
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
-        for arguments, refusal in ((["codex"], herdr.CodexPaneStarting),
-                          (["codex", "app-server", "--managed-daemon"], ValueError),
-                          (["codex", "exec", "resume", identity], ValueError),
-                          (["codex", "-c", "resume", identity], ValueError)):
+        for arguments, refusal, cause in ((["codex"], herdr.CodexPaneStarting, "pane is starting"),
+                          (["codex", "app-server", "--managed-daemon"], ValueError, "subcommand app-server"),
+                          (["codex", "exec", "resume", identity], ValueError, "subcommand exec"),
+                          (["codex", "-c", "resume", identity], ValueError, "option -c has no =")):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             with (self.subTest(arguments=arguments),
                   patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
                   patch.object(herdr, "_PLATFORM", "linux"),
                   patch.object(sessions, "process_start", return_value="same-process"),
                   patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": identity})):
-                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable"):
+                with self.assertRaisesRegex(refusal, "Codex launch identity is unavailable") as failure:
                     _ = herdr.native_process(998079, "codex")
+                self.assertIn(cause, str(failure.exception))
 
     def test_codex_native_process_accepts_only_the_thread_in_its_resume_arguments(self) -> None:
         identity = fixture_runtime_id("argv-thread")
@@ -289,6 +290,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(entry.get("pid"), 998070)
 
         for source, report, failure in (("fresh", True, ""), ("fresh", False, ""),
+                                        ("fresh-worker", False, ""),
                                         ("wrapper", False, ""), ("wrapper-without-identity", False, ""),
                                         ("two-fresh", False, "Codex launch has no unique foreground process"),
                                         ("invalid-resume", False, "Codex launch identity is unavailable"),
@@ -296,6 +298,10 @@ class NativePaneSessionTests(StaffTestCase):
                                         ("write-failure", True, "Is a directory")):
             with self.subTest(source=source, report=report), tempfile.TemporaryDirectory(dir=self.root) as folder:
                 arguments = ["resume", "invalid"] if source == "invalid-resume" else []
+                if source == "fresh-worker":
+                    arguments = ["--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+                                 "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+                                 "-c", "notice.hide_rate_limit_model_nudge=true"]
                 with (codex_launch_evidence(Path(folder), ["codex", *arguments]) as process_info,
                       patch.object(client, "start_command", return_value=subprocess.CompletedProcess[str]([], 0, "", "")),
                       redirect_stderr(io.StringIO()) as errors):
@@ -332,7 +338,7 @@ class NativePaneSessionTests(StaffTestCase):
                     self.assertIn("legacy launch publication is unavailable:", errors.getvalue())
                     self.assertIn(failure, errors.getvalue())
                     self.assertIn("; launch continues\n", errors.getvalue())
-                elif source == "fresh" and not report:
+                elif source in {"fresh", "fresh-worker"} and not report:
                     self.assertEqual(errors.getvalue(), "herdr codex-worker:w1:p1: pane is starting; pane retained\n")
                     self.assertNotIn("anomaly", errors.getvalue())
                 else:
@@ -473,33 +479,40 @@ class NativePaneSessionTests(StaffTestCase):
                 self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
 
         pending_launches = (
-            (["codex"], True),
-            (["codex", "Explain this repository"], True),
-            (["codex", "--", "Explain this repository"], True),
-            (["codex", "--model", "test-model", "--no-alt-screen"], True),
-            (["codex", "--config=resume"], False),
-            (["codex", "-cresume"], False),
-            (["codex", '-cmodel="test-model"'], True),
-            (["node", "/opt/@openai/codex/bin/codex.js"], True),
-            (["codex", "resume", "--last"], False),
-            (["codex", "exec"], False),
-            (["codex", "--future-option"], False),
-            (["codex", "--model"], False),
-            (["codex", "--model", "--no-alt-screen"], False),
+            (["codex"], True, ""),
+            (["codex", "--no-daemon", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access",
+              "--ask-for-approval", "never", "-c", 'model_reasoning_effort="high"',
+              "-c", "notice.hide_rate_limit_model_nudge=true"], True, ""),
+            (["codex", "Explain this repository"], True, ""),
+            (["codex", "--", "Explain this repository"], True, ""),
+            (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
+            (["codex", "--config=resume"], False, "option --config has no ="),
+            (["codex", "-cresume"], False, "option -c has no ="),
+            (["codex", '-cmodel="test-model"'], True, ""),
+            (["node", "/opt/@openai/codex/bin/codex.js"], True, ""),
+            (["codex", "resume", "--last"], False, "bad resume id"),
+            (["codex", "exec"], False, "subcommand exec"),
+            (["codex", "--future-option"], False, "unknown option --future-option"),
+            (["codex", "--future-option=private-value"], False, "unknown option --future-option"),
+            (["codex", "--model"], False, "option --model has a missing or dash value"),
+            (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
-        for arguments, starting in pending_launches:
+        for arguments, starting, cause in pending_launches:
             with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
                 pane = herdr.json_object(evidence["pane"], "fixture pane")
                 pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
                 info = herdr.json_object(evidence["process_info"], "fixture process info")
                 info.update(shell_pid=998069, foreground_process_group_id=998070)
-                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError):
+                with self.assertRaises(herdr.CodexSessionPending if starting else ValueError) as failure:
                     _ = herdr.codex_resume_thread(998070)
                 identity = herdr.codex_launch_identity(998070, "")
                 if starting:
                     self.assertIsInstance(identity, herdr.StartingCodexPane)
                 else:
                     self.assertIsInstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    assert isinstance(identity, herdr.CodexLaunchIdentityUnknown)
+                    self.assertEqual(identity.reason, f"pid 998070: Codex launch identity is unavailable: {cause}")
+                    self.assertEqual(str(failure.exception), identity.reason)
                 client = herdr.Herdr("agents")
                 with redirect_stderr(io.StringIO()) as notes:
                     scan = client.scan_row_panes(staff.initial_snapshot(), [pane])
@@ -1322,6 +1335,78 @@ class PromptSubmissionTests(unittest.TestCase):
         )
         self.assertIsInstance(result, herdr.PromptSubmitted)
         self.assertGreater(cursor.offsets[self.path], before)
+
+    def check_start_cursor(self, *, supplied: bool, native_identity_changes: bool) -> None:
+        self.write_turn("prelaunch-only-history", kind="assistant", seconds_after_launch=-1)
+        historical_size = self.path.stat().st_size
+        requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                     if native_identity_changes else self.transcript)
+        source = self.path.with_name(requested.session_id + ".jsonl")
+        if source != self.path:
+            _ = source.write_bytes(self.path.read_bytes())
+        cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+        if supplied:
+            cursor = herdr.TranscriptCursor(requested, self.launched_at)
+            cursor.skip_existing_turns()
+        publications: list[herdr.SessionTranscript] = []
+        seen: list[herdr.TranscriptCursor] = []
+        positions: list[dict[Path, int]] = []
+        original_read = herdr.TranscriptCursor.read_turns
+
+        def read_turns(reader: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+            seen.append(reader)
+            positions.append(dict(reader.offsets))
+            return original_read(reader)
+
+        def start(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.write_turn("resume the saved work")
+            self.write_turn("Resumed work", kind="assistant", seconds_after_launch=2)
+            return subprocess.CompletedProcess(["fixture agent start"], 0, "", "")
+
+        def publish(actual: herdr.SessionTranscript) -> None:
+            publications.append(actual)
+
+        def native_session(*_args: object, **_kwargs: object) -> str:
+            native.return_value = herdr.NativeAgentProcess(
+                herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})
+            return self.transcript.session_id
+
+        cast(Mock, self.start).side_effect = start
+        with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(requested.session_id), "fixture-prompt-recipient", {})) as native,
+              patch.object(self.client, "native_session", side_effect=native_session),
+              patch.object(herdr.TranscriptCursor, "read_turns", read_turns),
+              patch.object(json, "loads", wraps=json.loads) as parsed):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id],
+                herdr.OpeningPrompt("resume the saved work", requested, publish, cursor), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        cast(Mock, self.start).assert_called_once()
+        self.assertEqual(self.typed, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(publications, [self.transcript])
+        self.assertTrue(seen)
+        self.assertTrue(all(reader is seen[0] for reader in seen))
+        if supplied:
+            self.assertIs(seen[0], cursor)
+        self.assertEqual(seen[0].transcript, self.transcript)
+        self.assertEqual(positions[0], {} if native_identity_changes else {self.path: historical_size})
+        self.assertEqual(len(seen[0].read_turns()), 2)
+        self.assertEqual(any("prelaunch-only-history" in str(value)
+                            for parsed_call in parsed.call_args_list
+                            for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
+
+    def test_start_positions_an_automatic_cursor_before_the_agent_command(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=False)
+
+    def test_start_keeps_a_supplied_cursor_and_its_publication_callback(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=False)
+
+    def test_start_moves_a_supplied_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=True)
+
+    def test_start_moves_an_automatic_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=True)
 
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
@@ -3844,11 +3929,13 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"],
                                            ["--session", "fixture", "workspace", "list"]])
 
-    def test_tab_sessions_omits_panes_without_a_label(self) -> None:
+    def test_tab_sessions_keeps_panes_without_a_label(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1"}, {"pane_id": "w1:p2", "label": None},
             {"pane_id": "w1:p3", "label": "named"}]}}))
-        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p3", "named", "", None)])
+        self.assertEqual(self.herdr.tab_sessions(), [herdr.TabSession("w1:p1", "", "", None),
+                                                    herdr.TabSession("w1:p2", "", "", None),
+                                                    herdr.TabSession("w1:p3", "named", "", None)])
 
     def test_tab_sessions_keeps_panes_with_missing_or_unlabelled_workspaces(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
@@ -5259,7 +5346,7 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(scans.call_count, 2)
-        with patch.object(herdr, "_proc_root", return_value=self.root / "missing") as roots:
+        with patch.object(herdr, "proc_root", return_value=self.root / "missing") as roots:
             with herdr.process_snapshot():
                 self.assertEqual(herdr.herdr_processes(), [])
                 self.assertEqual(herdr.herdr_processes(), [])
@@ -6835,6 +6922,34 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_launch_ignores_an_unreadable_identity_in_another_rows_retained_pane(self) -> None:
+        owner = unit_membership("natedev", "report")
+        _ = unit_membership("natedev", "accounts")
+        client = LayoutHerdr()
+        pane = client.open_tab("natedev", owner.name, str(self.root), {})
+        tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+        _ = tab.pop("session_id")
+        entry = pane_launch.launch(pane, owner.current_session, str(self.root), {}, ["claude"])
+        pane_launch.save(pane_launch.record_directory() / "fixture.json", {pane: entry})
+        record = staff.initial_snapshot()
+        with herdr.pane_evidence_run():
+            panes = client.listed("pane")
+            cached = client.scan_row_panes(record, panes)
+            self.assertEqual(cached, herdr.RowPaneScan({}, []))
+            tab["session_id"] = owner.current_session
+            with (patch.object(herdr, "pane_native_process",
+                               side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
+                  patch.object(client, "run_in_pane"),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
+                result = herdr.launch_prepared_agent("fixture", herdr.NewTab("natedev", "accounts"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(),
+                    5000, agent="accounts", client=client)
+                self.assertGreater(decoded.call_count, 0)
+                started.assert_called_once()
+        self.assertNotEqual(result.pane, pane)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        self.assertIn(tab, client.tabs)
+
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()
         cases: tuple[tuple[staff.Kind, str, str], ...] = (
@@ -6861,6 +6976,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 
+        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
         owner = fixture_member("producer", name="owner")
         other = fixture_member("producer", name="other-owner")
         for case, binding, native, launch_owner in (
@@ -6869,12 +6985,17 @@ class SavedLayoutTests(unittest.TestCase):
                 ("matching native", False, owner.current_session, owner),
                 ("foreign native", True, other.current_session, owner),
                 ("foreign launch", True, owner.current_session, other),
+                ("old workspace title", True, owner.current_session, owner),
+                ("missing pane title", True, owner.current_session, owner),
                 ("reused pane", False, "", owner)):
             with self.subTest(case=case):
                 client = LayoutHerdr("producer-reuse")
                 client.spaces = [("w1", "producers")]
                 _ = client.add_tab("w1", owner.name)
                 shell = client.tabs[0]
+                if case in {"old workspace title", "missing pane title"}:
+                    client.spaces = [("w1", "old-workspace-title"), ("w2", "producers")]
+                    shell["label"] = "old-producer-title" if case == "old workspace title" else ""
                 _ = shell.pop("session_id", None)
                 if native:
                     shell["session_id"] = native

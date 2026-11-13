@@ -413,22 +413,6 @@ def _state(session_dir: Path) -> dict[str, object]:
     return state
 
 
-def _events(path: Path) -> list[dict[str, object]]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            lines = handle.read().splitlines()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        return []
-    events: list[dict[str, object]] = []
-    for line in lines:
-        event = _json_object(line)
-        if event is not None:
-            events.append(event)
-    return events
-
-
 def _epoch(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -496,11 +480,12 @@ def _phase_instances(
     return list(instances.values())
 
 
-def _newest_open_instance(
+def _open_instances(
     runs: list[list[dict[str, object]]],
-) -> OpenPhaseInstance | NoOpenPhase:
+) -> list[OpenPhaseInstance]:
+    """Read every unfinished phase instance in the newest run."""
     if not runs:
-        return NoOpenPhase()
+        return []
     events = runs[-1]
     started: list[PhaseInstance] = []
     closed: set[str] = set()
@@ -528,10 +513,7 @@ def _newest_open_instance(
                 finish=PhaseInstanceWithoutFinish(),
             )
         )
-    for instance in reversed(started):
-        if instance.instance_id not in closed:
-            return _open_instance(runs, instance)
-    return NoOpenPhase()
+    return [_open_instance(runs, instance) for instance in started if instance.instance_id not in closed]
 
 
 def _open_instance(
@@ -947,6 +929,29 @@ def _with_history(
     )
 
 
+def with_run_promises(record: PhaseRecord, events: list[dict[str, object]]) -> PhaseRecord:
+    """Use one run's promise trails and preserve the plan's duration predictions."""
+    runs = [events]
+    instances = _phase_instances(runs)
+    phases: list[plan_history.PlanPhase] = [
+        {"id": row.phase, "title": row.title, "done": isinstance(row, DonePhase)}
+        for row in record.phases
+    ]
+    assigned = _instances_by_phase(phases, instances)
+    rows: list[DonePhase | OpenPhase | TodoPhase] = []
+    current = record.current
+    for row, related in zip(record.phases, assigned, strict=True):
+        history = _phase_history(runs, related, row)
+        enriched = replace(row, eta_trail=history.eta_trail)
+        rows.append(enriched)
+        if isinstance(current, OpenPhase) and current.phase == row.phase:
+            current = replace(current, eta_trail=history.eta_trail)
+    if isinstance(current, OpenPhase) and current.phase not in {row.phase for row in rows}:
+        related = [instance for instance in instances if instance.instance_id == current.instance_id]
+        current = replace(current, eta_trail=_phase_history(runs, related, current).eta_trail)
+    return record._replace(current=current, phases=rows, plan_finish=_plan_finish(rows))
+
+
 def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
     """Select the run that its owner's staff pointer names."""
     opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
@@ -975,13 +980,13 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
+    run_events = [plan_history.read_run_events(path)
+                  for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     current_run = _current_run_events(run_events, resolver.record)
-    open_instance = _newest_open_instance(current_run)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
-        [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+        _open_instances(current_run),
     )
 
 
@@ -1015,13 +1020,13 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
             phase=_text(event.get("phase_id")) or (instance.phase if instance else ""),
             title=_text(event.get("phase_title")) or (instance.title if instance else ""),
             start=instance.start if instance else at - timedelta(seconds=seconds),
-            finish=InstanceFinished(at=at, status="completed", seconds=seconds, written_at=index),
+            finish=InstanceFinished(at=at, status=_text(event.get("status")), seconds=seconds, written_at=index),
         ))
     opened = [instance for instance in instances if instance.instance_id not in finished_ids]
     ordered = finished + opened
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,
-         "done": isinstance(instance.finish, InstanceFinished)}
+         "done": isinstance(instance.finish, InstanceFinished) and instance.finish.status == "completed"}
         for instance in ordered
     ]
     return _build_phase_record(
@@ -1075,7 +1080,7 @@ def _build_phase_record(
         ]
         row_instances.append(related)
         row_open = next(
-            (candidate for candidate in open_instances if any(
+            (candidate for candidate in reversed(open_instances) if any(
                 instance.instance_id == candidate.phase.instance_id for instance in assigned[index]
             )),
             NoOpenPhase(),
@@ -1085,7 +1090,7 @@ def _build_phase_record(
                 (instance.start for instance in related),
                 default=row_open.phase.start,
             )
-            current = OpenPhase(
+            opened = OpenPhase(
                 phase=phase["id"],
                 title=phase["title"],
                 started=earliest,
@@ -1094,7 +1099,9 @@ def _build_phase_record(
                 first_stated=row_open.first_stated,
                 instance_id=row_open.phase.instance_id,
             )
-            rows.append(current)
+            rows.append(opened)
+            if row_open is open_instance:
+                current = opened
         elif phase["done"]:
             rows.append(_done_phase(phase, related))
         else:
@@ -1488,7 +1495,7 @@ def _production_unit_plans(production: Production, *, resolver: session_staff.Ro
 
 def show_production(production_doc: Path) -> str:
     """Return every live unit's phase record as one JSON object."""
-    resolver = session_staff.RowResolver(staff.snapshot())
+    resolver = session_staff.RowResolver(plan_history.staff_record())
     production = read_production(production_doc, resolver=resolver)
     records: dict[str, object] = {}
     for unit_plan in _production_unit_plans(production, resolver=resolver):
@@ -1552,10 +1559,7 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
         row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)
                     if unit_names.name(item.name) == unit_names.name(unit)), None)
         if row is not None:
-            from scripts.message import sessions
-            live = next((item for item in sessions.live_sessions() if item["sessionId"] == row.current_session), None)
-            if live is not None:
-                name = live["name"]
+            name = row.name
         break
     cleaned = name.replace("/", "-").replace("\0", "-").lstrip(".")
     return cleaned or unit
@@ -1849,8 +1853,9 @@ def refresh(session_dir: Path) -> None:
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions
     try:
-        showrunner = next((item["name"] for item in sessions.live_sessions()
-                           if owner is not None and item["sessionId"] == owner.current_session), "")
+        live = sessions.live_sessions()
+        showrunner = owner.name if owner is not None and any(
+            item["sessionId"] == owner.current_session for item in live) else ""
     except OSError as error:
         raise Refusal(f"cannot look up the showrunner of {production.name}: {error}") from error
     if showrunner:
@@ -1869,12 +1874,15 @@ def refresh(session_dir: Path) -> None:
             "phase note target is not owned by "
             + f"{production.name}/{reference.unit}: {target}"
         )
+    unit = next(row for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
+                if row.name == unit_names.name(reference.unit))
+    display_name = next((item["name"] for item in live if item["sessionId"] == unit.current_session), name)
+    display_name = display_name.replace("/", "-").replace("\0", "-").lstrip(".") or reference.unit
     _write_note(
         target,
         _note_text(
-            name,
-            next(row.id for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
-                 if row.name == unit_names.name(reference.unit)),
+            display_name,
+            unit.id,
             record,
         ),
         production.name,

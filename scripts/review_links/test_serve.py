@@ -1,6 +1,8 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import importlib.util
 import os
 import select
@@ -23,7 +25,7 @@ from unittest.mock import patch
 from typing import cast, override
 
 
-from scripts.review_links import change_page, serve
+from scripts.review_links import change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -94,6 +96,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(reply.content_type.startswith("text/"), reply.content_type)
         self.assertIn("charset=utf-8", reply.content_type)
         self.assertEqual(reply.body.decode("utf-8"), text)
+
+    def test_console_route_serves_same_origin_navigation_under_the_existing_access_rules(self) -> None:
+        folder = self.root / "abc123"
+        folder.mkdir()
+        pages = (console.ConsolePage("changes", "Changes", "list-checks", "Changes",
+                                     console.AvailablePage("/abc123/changes.html")),)
+        _ = (folder / "console.html").write_bytes(console.render(pages))
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("GET", "/abc123/console.html?page=changes")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "text/html; charset=utf-8")
+            self.assertIn("frame-src 'self'", response.getheader("Content-Security-Policy") or "")
+            self.assertNotEqual(response.getheader("X-Frame-Options"), "DENY")
+            self.assertIn(b"<h1>Hana console</h1>", response.read())
+        finally:
+            connection.close()
+        for path in ("/../abc123/console.html", "/%2e%2e/abc123/console.html", "/.review-link-console.html"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path).status, 404)
 
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"
@@ -245,6 +268,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ".index.json", ".INDEX.JSON", ".Index.Json",
                 ".index.lock", ".INDEX.LOCK", ".Index.Lock",
                 ".review-link-x", ".REVIEW-LINK-X", ".Review-Link-x",
+                ".review-link-delivery-user-answer.json",
             ):
                 with self.subTest(folder=folder.name, filename=filename):
                     _ = (folder / filename).write_text(private, encoding="utf-8")
@@ -597,7 +621,7 @@ class ServerCodeRestartTests(unittest.TestCase):
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
         driver = checkout / "driver.py"
-        _ = driver.write_text('''import importlib.util
+        _ = driver.write_text(python_tool_source('''import importlib.util
 import os
 import sys
 from contextlib import redirect_stdout
@@ -624,7 +648,7 @@ class ObservedServer(serve.ReviewLinksServer):
 serve.ReviewLinksServer = ObservedServer
 with redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
-''')
+'''))
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
@@ -745,7 +769,7 @@ class ReviewLinksConfigTests(unittest.TestCase):
         for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
             with self.subTest(key=key):
                 self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
+        for key, expected in {'page_refresh_seconds': 15.0, 'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
             with self.subTest(key=key):
                 self.assertEqual(settings.number(key), expected)
 

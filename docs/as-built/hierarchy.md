@@ -44,6 +44,8 @@ The Mac sends staff operations to the owner on natedev.
 | `StaffRow.id` | Fixed member identity. |
 | `StaffRow.parent` | `ReportsTo(StaffId)` or `StaffRoot`. |
 | `StaffRow.current_session` | Current native Claude session or Codex thread. |
+| `KnownWorkerRole`, `WorkerRoleUnknown` | The worker's current role or an explicit unknown role. |
+| `SessionHome`, `HomeUnknown` | The account configuration folder or an explicit unknown home. |
 | `PresentWorktree`, `RemovedWorktree`, `WorktreeUnfilled` | Current worktree location or its explicit missing state. |
 | `LiveDoc`, `WrappedDoc`, `DocUnfilled` | Production document location or its explicit missing state. |
 | `Paused`, `Exited`, `Active` | Staff hold state. |
@@ -53,6 +55,9 @@ Rows, locations, and hold records preserve unknown JSON fields through `unknown_
 A location change preserves those fields. A new hold starts a new hold record.
 An incompatible change requires a new schema number.
 The [staff accessor list](staff-accessors.md) identifies readers and writers.
+Stored references keep the fixed staff id and read other current staff facts when used.
+Dated history retains event-time facts for attribution.
+Display names do not select stored relationships or replace native identity evidence.
 
 `scripts/herdr/worker_panes.py` owns worker execution and observation.
 `observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` shares one pane read across parents.
@@ -88,7 +93,8 @@ A shared read through `worker_lifecycle.locked_state` creates no missing state f
 `HookCompletion` records completed actions so an interrupted handler can continue.
 An already finished hook event changes no dispatch.
 A missing final transcript record does not erase a matching DONE reply supported by the dispatch prompt.
-A live detached command prevents completion. A pending command result or friend reply keeps the assignment active.
+A live detached command prevents completion.
+A pending command result keeps the assignment active.
 
 Normal DONE closure retains the staff row and native conversation.
 The next assignment resumes that conversation in a new pane.
@@ -108,6 +114,9 @@ A replacement process in that terminal stays open.
 `scripts/agents/detached_runs.py` starts and supervises long commands.
 Records and logs live under `<run>/detached_runs/`.
 `detached_run_process.py` proves supervisor identity before a caller signals its process group.
+The command shares that group through the systemd scope prefix.
+The supervisor installs no signal handler.
+The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
 
 ### Channels and user decisions
@@ -134,8 +143,11 @@ The [messaging contract](session-roster.md) defines peer lookup and delivery out
 `change_review.change_queue(path, scope, below=False) -> ChangeQueue` supplies both `/next change` and `change_review.py show`.
 `ChangeQueue` carries the pin name and ordered entries.
 Scoped lookup includes earlier production lists and routes their rows through current staff ownership.
-Current-list rows retain plain ids. Other lists qualify their ids, such as `sdlc/C9`.
-Their prerequisites receive the same qualification.
+Displayed IDs use the responsible showrunner, such as `sdlc/C9`, through the page's shared staff resolver.
+The queue retains plain keys for current-list rows and list-qualified keys for other rows.
+Prerequisites retain that list qualification.
+Row commands accept both displayed IDs and existing list-based IDs.
+An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.

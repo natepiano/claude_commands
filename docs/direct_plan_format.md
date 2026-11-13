@@ -28,15 +28,14 @@ to rediscover after a context compaction lives in the doc.
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** <one line: what this builds>
 
-<!-- Optional; set by the originating review (e.g. /api_review). Preserved verbatim
+<!-- Optional; set by the originating design doc. Preserved verbatim
      by /plan:to_phased_plan and /plan:phase_review; consumed by /plan:to_as_built.
      amend = on completion, fold the shipped changes into the named existing
      as-built docs — no new doc; create (or line absent) = distill a new as-built doc. -->
 > **As-built disposition: <amend | create>** — <amend: name the target as-built docs>
 
-<!-- Optional; a standing plan never closes its run. <NextPhase/> refills it
-     through style_plan.py. Git-exclude the plan:
-     the ledger is its record; checkpoint and shrink never commit or shrink it. -->
+<!-- Style units use /unit:style and <StandingPlanRefill/> in docs/direct/style_unit.md.
+     Git-exclude the standing plan; the ledger is its record. -->
 > **Standing:** style_plan.py
 
 <!-- Optional; the hanadocs issues whose work this plan builds (/showrunner:proposal).

@@ -164,6 +164,7 @@ class InventoryTests(ShutdownTestCase):
                 "staff_id": child.id, "slot": name, "launcher_pid": launcher}))
             write_text_atomic(run / f"impl_status_{name}", status)
             agents_log.append(identity, "review" if name == "busy" else "impl", None, datetime.now(timezone.utc))
+            _ = staff.set_worker_role(child.id, staff.KnownWorkerRole("review" if name == "busy" else "impl"))
 
         def launcher_alive(pid: int) -> bool:
             return pid in {810, 811, 812}
@@ -830,7 +831,7 @@ elif "comm=" in joined:
             event = {
                 "event_type": "run_started",
                 "run_started_at": started_at,
-                "main_agent": {"session_id": UNIT_ID},
+                "owner_staff_id": member.id,
                 "working_dir": str(self.checkout),
                 "plan_doc": plan,
                 "branch": "shutdown",
@@ -1449,6 +1450,7 @@ class WorkerResumeTests(StaffTestCase):
 
     def assigned(self, *rows: staff.StaffRow) -> None:
         for row in rows:
+            _ = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
             agents_log.append(row.current_session, "impl", None, datetime.now(timezone.utc))
 
     def test_resume_results_select_children_across_families_and_deduplicate_run_references(self) -> None:
@@ -1471,13 +1473,23 @@ class WorkerResumeTests(StaffTestCase):
         os.utime(second, (2, 2))
         with patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read_tasks:
             results = inventory.worker_resumes(owner, staff.local_snapshot())
-        self.assertEqual(read_tasks.call_count, 1)
+        self.assertEqual(read_tasks.call_count, 0)
         live = [result.seat for result in results if isinstance(result, Resumable)]
         waiting = [result.seat for result in results if isinstance(result, Idle)]
         self.assertEqual({seat["staff_id"] for seat in live}, {claude.id})
         self.assertEqual([seat["staff_id"] for seat in waiting], [idle.id])
         self.assertEqual(len(results), 2)
         self.assertEqual({seat["run_dir"] for seat in live}, {str(second)})
+        for role in ("review", "fix"):
+            with self.subTest(staff_role=role):
+                _ = staff.set_worker_role(claude.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
+                results = inventory.worker_resumes(owner, staff.local_snapshot())
+                self.assertEqual([result.seat["role"] for result in results if isinstance(result, Resumable)], [role])
+        for contents in (b"", b"\xff"):
+            with self.subTest(history=contents):
+                _ = (agents_log.state_dir() / "agents.jsonl").write_bytes(contents)
+                results = inventory.worker_resumes(owner, staff.local_snapshot())
+                self.assertEqual([result.seat["role"] for result in results if isinstance(result, Resumable)], ["fix"])
 
 
 
@@ -1509,7 +1521,7 @@ class WorkerResumeTests(StaffTestCase):
         results = inventory.worker_resumes(owner, staff.local_snapshot())
         errors = {result.staff_id: result.reason for result in results if isinstance(result, Unavailable)}
         self.assertIn("Claude child record is unavailable", errors[missing.id])
-        self.assertIn("last assignment is unavailable", errors[unassigned.id])
+        self.assertIn("staff worker role is unavailable", errors[unassigned.id])
         self.assertEqual([result.seat["staff_id"] for result in results if isinstance(result, Idle)], [idle.id])
         from scripts.lib.resume_message import ResumeWorkers, resume_message
         message = resume_message("account move", workers=ResumeWorkers(results, str(self.root)))

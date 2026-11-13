@@ -83,6 +83,138 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Hana console
+
+`change_page.py` without rows prints `/<snapshot>/console.html?page=changes`.
+Selected-row links with `--production NAME C27` still open `changes.html` directly.
+`scripts/review_links/console.py` publishes the console beside its Changes snapshot.
+The server applies the same root, traversal, private-file, and symlink rules to both pages.
+The console adds a same-origin content policy and permits same-origin framing.
+Its title is **Hana console**, followed by the selected page title.
+
+The left navigation has icons and labels for Changes and Builds.
+The desktop top bar shows only the selected page title.
+Its toggle collapses the labels into an icon rail.
+Hover and keyboard focus show each collapsed label.
+The browser stores the collapse state in `localStorage`.
+Each storage operation catches failures, so blocked storage does not stop navigation.
+The selected page fills a same-origin frame beside the navigation.
+The shell follows the system light or dark theme.
+At phone width, a slim top bar shows **Hana console** and a menu button.
+The frame uses the full page width below the top bar.
+The menu button opens the navigation above the frame.
+A page choice, the Escape key, or a click outside closes the navigation.
+The phone navigation starts closed and does not change the stored desktop state.
+
+`?page=<id>` selects a page.
+Missing and unknown ids select the first configured entry.
+Navigation clicks update this query with `history.replaceState`.
+
+`config/console.conf` defines entries in file order.
+The publisher reads it through `conf.read("console")` when it creates the link.
+Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
+The URL value has the form `python:<module>:<function>`.
+The function takes no arguments and returns a URL path under the review root.
+The console also accepts a full URL from the configured review origin and converts it to a path.
+The URL function raises one of `review_link.SNAPSHOT_ERRORS` when the page is unavailable.
+An absent function also makes the entry unavailable.
+That entry remains visible and shows **Not available** when selected.
+Publishing the console again resolves the current configuration and page availability.
+
+A page joins with one configuration block and its URL function.
+The page serves itself at that path and permits same-origin framing.
+A link that leaves the page uses `target="_top"`.
+The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
+`change_page.page_url` reuses the existing Changes publisher.
+The Builds entry calls `memory_feed.page_url`.
+That function returns the configured Builds page URL without publishing a reading.
+
+The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+That folder includes the version, source, and ISC license.
+The console inlines the icons and makes no CDN, font, script, or stylesheet request.
+
+### Questions, Changes, and Rebuilds
+
+The review page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
+The selected tab joins the content panel and has an accent line on its top edge.
+Arrow keys, Home, and End select tabs. Tab moves to the selected tab and then the page controls.
+Each type tab shows its own count. The page has no combined total.
+The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
+The document title remains Changes to review.
+The page updates itself through its existing GET URL without a full reload.
+`page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
+The page loads updates only while its browser tab is visible.
+It loads an update at once when the tab becomes visible again.
+Updates retain the selected type, showrunner, waiting card, open Details sections, and scroll position.
+If the card no longer waits, the page selects the next waiting item in the same filter.
+Typed text or an active save holds replacement; the page keeps only the newest loaded update.
+The page applies that update when all unsaved fields are empty or the save ends.
+A successful save requests a fresh update so an older response cannot restore the saved item.
+Updates preserve a retained field's focus and cursor.
+A failed load changes nothing; the next interval tries again.
+Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
+Questions and Changes show one card at a time.
+The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
+All is the default and includes every showrunner in the existing item order.
+The menu keeps the existing showrunner order.
+The tab bar and menu stay on one line at phone and desktop widths.
+Switching types retains each type's selected showrunner and card.
+The URL fragment records the type, showrunner, and card.
+Skip for now skips a card without saving an answer.
+The control hides when no other item waits in the selected filter.
+An empty type shows **No questions to answer.** or **No changes to review.**
+
+Questions read the canonical records through `update_registration.question_records_for_document`.
+A question belongs to the showrunner whose record owns it.
+A question without a staff owner appears under **Owner unavailable**.
+The reader also scans question folders under the showrunner state root when their owners leave staff.
+Owned cards show the title before the filed text, choices, and **Asked by <session>**.
+They have no separate Question label.
+The field label stays **Answer**, and its action stays **Save answer**.
+An **Owner unavailable** card shows the question and `No showrunner owns this question.`
+It has no answer form, and the server refuses an answer.
+It has no Ask showrunner to check or Ask a question controls.
+`update_registration.answer` records the answer for its owning production.
+The typed `AnswerRelay` gives the same recipient decision as the CLI relay line.
+A unit relay receives the answer directly.
+A transferred unit's showrunner receives the answer with the unit's name.
+An answer without a relay goes to the question's showrunner.
+Each message starts with `From the user (via the review page): ` and names the question.
+
+A saved answer opens the next waiting question and shows **Answer saved.** above the card.
+A failed save retains the typed answer and shows **Not saved: <reason>**.
+An answer to a question already answered elsewhere fails without sending another message.
+Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.
+Private delivery records retain the answer text, message, source record, owning document, and fixed recipient ids for recovery.
+The first delivery record stores `saved: false` before the answer saves.
+The second delivery record stores `saved: true` after the answer saves.
+A save error clears that attempt's delivery intent and releases its claim.
+Recovery sends only answers with `saved: true` whose canonical question record is closed.
+Recovery clears an intent for an open question.
+For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
+The Changes tab retains its existing cards, controls, and count rules.
+
+Rebuilds shows one block per machine, with natedev first, then the Mac, then other machines in name order.
+It has no showrunner menu, card navigation, Skip for now, or answer form.
+Its count is the number of machines with open rebuild needs.
+Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
+The Mac instruction states that updates can take five minutes while the Mac is reachable.
+A machine with multiple needs shows `One rebuild applies all listed changes.`
+Under `After the rebuild`, bullets show the stored reasons unchanged, newest first by creation time.
+A closed `Details` disclosure shows each full configuration commit in the same order.
+It shows `Affected session: <name> (<kind>)` from the current staff record.
+It shows `Requested by: <name> (<kind>)` only for a different, recorded requester.
+Unknown staff IDs appear as `Unknown session: <id>`.
+The reader uses the same staff record as the page routing.
+Each render calls `rebuild.need.read_needs()` once.
+The final line states `Completed requests clear automatically. Refresh this page after the rebuild.`
+An empty or missing needs folder shows only `No rebuilds needed.` beneath the tabs, with a count of 0.
+
+The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
+The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
+Controls wrap on narrow screens, keep a minimum height of 44px, and show keyboard focus in both color themes.
+
 ### Answering a change review
 
 `change_page.py` publishes one page with every waiting change from every configured showrunner list.
@@ -171,28 +303,36 @@ A verdict retains the Producer cell in Reviewed.
 Delivery records store fixed staff ids.
 Each send reads `staff.snapshot()` and sends to `session:<current_session>` from the saved staff row.
 An account move changes the next recipient address without changing the stored staff id.
-The status line counts the same staff tabs and shows a separate `unrouted` item.
+The status line counts the same staff groups and shows a separate `unrouted` item.
 The `unrouted` count covers all page lists across independent production roots.
 The page and status line use the same waiting rule.
-Saved verdicts, validation requests, and open questions leave the waiting count and Next order as soon as they save.
+Saved verdicts, validation requests, and open questions leave the waiting count and Skip for now order as soon as they save.
 The page, footer, and `/next` use this rule regardless of delivery results.
-Empty lists and showrunners retain their zero-count tabs.
-Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
-The selected tab uses `outline-offset:-2px` to keep its full outline visible inside the scroll container.
-Builds rows can remain in the natedev list while the builds tab shows them.
+Empty lists and showrunners retain their zero-count menu options.
+Menu options with waiting changes precede empty options in alphabetical order.
+The selected type tab joins the content panel.
+Its keyboard focus outline stays inside the tab edges.
+Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each tab orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
+Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
 The page keeps row entries during ordering and does not format the text that `/next` prints.
 The existing urgency order, pin, dependencies, and moved rows determine its order.
-Rows from another list use qualified row IDs and qualified prerequisite IDs.
-Next selects the next prepared row in the browser without a server request.
+Queue keys and prerequisites retain their list-based IDs.
+The Details line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
+The shared staff resolver supplies the prefix used by the showrunner filter.
+Rows without a staff producer use the list's showrunner through the same resolver.
+`verdict` and `answer-question` print the same responsible-showrunner ID.
+Row commands and selected-row links accept that ID and the existing list-based ID.
+An ambiguous displayed ID requires an explicit `--list <path>`.
+Skip for now selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
 A reload restores that place when the row waits, awaits validation, or has an open question.
 An answered row stays absent from the browser list during delivery and after a reload.
-An empty tab shows **0 changes left** and hides Next.
-Each successful save opens the next waiting change in the same tab.
-Next skips a change without saving an answer.
-The page keeps the current row if the user selects Next or another tab during the save.
+An empty showrunner filter shows **No changes for this showrunner.** or **No questions for this showrunner.** and hides Skip for now.
+The showrunner filter supplies the count; the card has no separate remaining count.
+Each successful save opens the next waiting change in the same filter.
+Skip for now skips a change without saving an answer.
+The page keeps the current row if the user selects Skip for now or another tab during the save.
 
 The record's `Kind` column remains the only source for the kind.
 Set it with `change_review.py set-kind --production <showrunner name> --row C27 --kind 'See in action'`.
@@ -204,7 +344,11 @@ The page shows every row with its recorded kind or the missing-kind notice.
 
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
-Each row shows its kind, description once, proof, and answer controls.
+Each card starts with its title.
+One closed **Details** disclosure holds the ID, date, commit, and kind.
+How to check or Proof stays in the main view.
+The title uses 20px text; section labels use 17px text.
+A 16px gap separates the title and metadata.
 How to check and Proof show text lines in preformatted blocks.
 Consecutive lines that start with `- ` form a bulleted list.
 Consecutive lines that start with a number, a dot, and a space form a numbered list.
@@ -214,20 +358,21 @@ The list file stores cell line breaks as `<br>` and reads them as line breaks.
 A typed `<br>` takes one more backslash in storage and reads back unchanged.
 Every line separator that Python's `splitlines` recognizes is a line break.
 Each row stays on one table line.
-The user can select Works, Not works, Validate yourself, Send feedback, or Ask a question.
-The feedback box is a textarea with `feedback_rows` rows.
+Works and Does not work are the main actions.
+Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+The **Comment, question or feedback** field is a textarea with `feedback_rows` rows.
 The setting starts at 5.
 The box accepts line breaks for every outcome.
 The server converts CRLF, CR, and Unicode line separators to newline characters.
 The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
-Not works with text saves `not works: <text>`.
-Send feedback saves the user's text without a prefix.
-Its saved verdict removes the row from the page count, including feedback that returns the change to its unit.
+Does not work with text saves `not works: <text>`.
+Send feedback asks the showrunner to act before the change returns to the user.
+Each verdict saves the text from **Comment, question or feedback** as its comment.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
-**Validate yourself** sends the showrunner the row ID and **the user asks you to validate this**.
+**Ask showrunner to check** sends the showrunner the row ID and **the user asks you to validate this**.
 The message includes any feedback from the form.
 This answer writes no verdict and runs no feature-log command.
 The current page advances when the request saves.
@@ -239,10 +384,10 @@ The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
 
-**Ask a question** uses the feedback box.
+**Ask a question** uses the **Comment, question or feedback** field.
 The server refuses empty questions and questions that contain only whitespace.
 It saves no verdict and runs no feature-log command.
-The server stores the question before it sends one message to the tab's showrunner.
+The server stores the question before it sends one message to the row's showrunner.
 The message names the row, list, production, change, and question.
 It includes a separate `Question id: <id>` line.
 The page advances after the save.
@@ -255,16 +400,30 @@ The command refuses a row without an open question.
 The command refuses an old or unknown question ID.
 The same ID and answer text change nothing and exit 0 on a rerun.
 The same ID with different answer text is refused.
-The row returns to its tab's count and Next order after the answer saves.
+The row returns to its showrunner's count and Skip for now order after the answer saves.
 The page shows the question and answer below the change, with the usual answer buttons.
 Question and Answer show text lines in paragraphs and use the same list forms as How to check.
 The answer keeps its internal line breaks and strips only whitespace at its two ends.
 All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
+Send feedback asks the showrunner to act on the text.
+Feedback uses the existing question delivery record with `kind: feedback`.
+The message contains `the user sends feedback to act on`, `Feedback id: <id>`, and `Feedback: <text>`.
+Open feedback removes the row from every waiting count and navigation order.
+A direct link shows **The showrunner will act on this** without answer buttons.
+The showrunner uses `change_page.py answer-question` with the feedback id to record its action.
+The page shows **Showrunner: <note>** and returns the row to the waiting count.
+A saved verdict closes the row as before.
+Feedback text that starts with `works` or `fine` saves a verdict under the existing rules.
+Feedback uses the existing delivery attempts, retry budget, and startup recovery.
+Owner unavailable changes retain their verdict controls and hide every showrunner action, including Send feedback.
+
+
 Each answer uses a background `fetch` POST.
-The row shows **Saving**, **Saved: <answer>**, or a short failure reason.
-Next stays available during a save.
+The row shows **Saving** during a save.
+An automatic move shows **Answer saved.** or **Review saved.** above the next card.
+Skip for now stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 A failed save keeps the row in that count and does not change the current row.
 
@@ -305,10 +464,16 @@ An absent proposal returns `skipped: no proposal for <row>` and is not an error.
 Malformed proposals, incompatible states, and SSH failures raise `FeatureLogError`.
 The server makes no separate proposal lookup.
 A Hana list uses a bare review ID, such as `C27`.
-Other lists use their filename's showrunner name, such as `natedev/C27`.
+Other feature-log review IDs retain their filename's showrunner name, such as `natedev/C27`.
+These stored IDs stay valid when the displayed ID names another responsible showrunner.
 A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
 A returning answer calls `drop_review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.
+The server sends one alert per list, row, and error text.
+It saves sent alerts under `.review-link-closeout-alert-*.json` in the snapshot root.
+The delivery lock serializes the alert check, send, and record write.
+Repeated saves and server restarts retain this record.
+A different error or row can send another alert.
 The server does not repeat the feature-log operation for a saved answer.
 
 The server then calls `change_review.save_verdict` with paths from the configured list and production records.
@@ -333,7 +498,7 @@ The server starts no detached shell for message delivery.
 The all-list page sends to the row's current staff showrunner.
 Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
-An exact `works` verdict goes only to the showrunner, including text from Send feedback.
+An exact `works` verdict goes only to the showrunner, including requests from the older feedback endpoint.
 When one staff unit owns the change, every other verdict also goes to that unit.
 The Producer cell identifies that unit through its fixed staff id.
 An empty Producer cell belongs to the list's staff showrunner.
@@ -373,7 +538,7 @@ The server pauses once between rounds and retries only failed recipients.
 The showrunner receives its first attempt before any recipient receives a second attempt.
 A `QUEUED:` result with exit 1 counts as kept; a `KEPT:` result with exit 0 also counts as kept.
 Other nonzero exits fail.
-After all tries fail for a recipient, the server sends one alert to the tab's showrunner, with no alert retries.
+After all tries fail for a recipient, the server sends one alert to the row's showrunner, with no alert retries.
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
 If the alert fails, the server prints one line to stderr and stops.
@@ -408,12 +573,12 @@ Older selected-row forms retain their styled failure page and typed answer.
 A fallback form needs only the page manifest and notice when row or queue reads fail.
 An unknown page, invalid content type, or refused bind shows one short sentence in the same style.
 
-The browser uses its prepared queue for Next and stores no second queue on the server.
-Validate yourself calls the existing queue writer before the response.
+The browser uses its prepared queue for Skip for now and stores no second queue on the server.
+Ask showrunner to check calls the existing queue writer before the response.
 One stable lock in `urgency.py` protects pin, selection, and move operations across all queues.
 Each operation opens the lock separately and retains atomic file replacement.
 A GET never publishes or advances a page.
-Older selected-row pages retain their server Next form for compatibility.
+Older selected-row pages retain their server Skip for now form for compatibility.
 The sender's repeat rules also apply when the server recovers a pending message.
 The review record remains the only verdict store.
 

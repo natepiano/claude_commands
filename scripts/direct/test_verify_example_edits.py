@@ -26,7 +26,7 @@ wait_for_file(Path(sys.argv[1]))
         _ = cargo.write_text(cargo.read_text().replace(edit, before + edit + after))
         self.environment.update({
             "TEST_EDIT_CONTROL": str(control), "TEST_EDIT_ORDER": str(order),
-            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
         })
 
     def prepare_edit_order(self) -> None:
@@ -47,7 +47,7 @@ if Path(sys.argv[0]).name == "tree_watch.py" and not sys.argv[1].startswith("--"
 ''')
         self.environment.update({
             "VERIFY_TREE_WATCH_S": "3600",
-            "PYTHONPATH": str(control) + os.pathsep + self.environment["PYTHONPATH"],
+            "PYTHONPATH": self.environment["PYTHONPATH"] + os.pathsep + str(control),
         })
 
     def test_a_write_to_the_session_folder_in_the_worktree_keeps_the_pass(self) -> None:

@@ -14,14 +14,6 @@
   - Completion condition: on or after 2026-12-05 the reader and the file are deleted, `sweep.py rebuilds` reads only the journal and the build-log rows, and `test_sweep.py` passes.
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
-- [ ] **Measure EASY backfill against the deployed captured-room rule**
-  - Start after deployment of the current rule and seven days within one unchanged policy and configuration span.
-  - Calibrate the deployed model first. Stop comparison if calibration fails.
-  - Bound the cohort at changes to priority, head policy, estimation, memory charges, slots, spacing, safety settings or headroom.
-  - Use the shipped `head_policy` and `admission_walk` for the baseline.
-  - Include head protection, continuation slots, the starts-alone exception and start spacing.
-  - Report additional wait savings and head delay.
-  - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
 - [ ] **Match trims against each step's recorded Cargo output roots**
   - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
@@ -57,7 +49,7 @@
   - Revealed by: Phase 26; narrowed after the existing pane route and writer tests satisfied the access requirement.
 
 - [ ] **One owner for Cargo target detection in scripts/lib/cargo_output.py** (after the held 63-64 hash lands)
-  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`) and their tests.
+  - Target: move `RUSTC_INFO`, `FINGERPRINT_DIR`, `has_cargo_tag`, `build_trees`, `is_cargo_target`, `enclosing_cargo_target` and its two result types from `scripts/lint/sweep.py` to `scripts/lib/cargo_output.py`; switch every caller (`sweep.py`, `scripts/buildlog/disk.py`, `scripts/buildlog/memory.py`, `scripts/lint/folder_audit.py`) and their tests, `scripts/lib/test_scratch.py` included.
   - Why needed: `memory.py` loads the whole sweeper to ask whether a folder is Cargo output, and the sweeper imports buildlog modules back. One owner in `scripts/lib` removes that cycle.
   - Completion condition: no copy of the detection is left in `sweep.py`; `memory.py` imports it at the top and drops its run-time `import sweep`. This replaces the Phase 67 import rule for `memory.py`. The change reports `memory.py` import time before and after, and the sweep, memory, disk and offload tests pass.
   - Revealed by: Phase 70 simplify review F008 (builds showrunner 2026-11-05: next; run after the held 63-64 hash lands, so `sweep.py` changes in one place at a time)
@@ -80,5 +72,6 @@
   - Revealed by: Phase 79; the builds showrunner placed it in next items on 2026-11-07.
 
 ## Dropped
+- **Measure EASY backfill against the deployed captured-room rule** — dropped by the user 2026-11-13 (via the builds showrunner): "we cannot let small builds start while a large head is blocking because that large build will never run - we already know this from experience." Do not propose backfill again.
 
 - **The floor pass keeps an existing hana `target/external-client`** — dropped by the builds showrunner 2026-11-05: the measured cause (fresh-clone CI points) is already gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout (Phase 73).

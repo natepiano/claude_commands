@@ -6,12 +6,15 @@ import os
 import subprocess
 import sys
 
-from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
+from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
+from scripts.production.cli_fixture import process_boundary
 from scripts.lib import process_start
+from scripts.direct import worker_state
+from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture):
     def test_phase_launch_records_its_baseline_before_the_worker_opens(self) -> None:
         session = self.start_phase("first-baseline")
         head = subprocess.run(["git", "-C", str(self.working_dir), "rev-parse", "HEAD"], check=True,
@@ -26,13 +29,16 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         self.assertEqual((session / "baseline-at-worker-open").read_text(), head)
 
 
+    @process_boundary
     def test_live_claim_refuses_a_second_claude_launcher_without_a_pass(self) -> None:
         session = self.start_phase("live-claim")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)
-        saved = json.dumps({"pid": os.getpid(), "started": started.start, "worker": "fixture-impl"})
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
+        saved = json.dumps({"pid": os.getpid(), "started": started.start, "worker": "fixture-impl", "scope": scope})
         _ = claim.write_text(saved)
         before = self.open_passes(session)
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
@@ -44,14 +50,17 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         self.assertEqual(claim.read_text(), saved)
         self.assertFalse((self.root / "delivered_message.txt").exists())
 
+    @process_boundary
     def test_a_reused_live_pid_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("reused-pid-claim")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
         _ = claim.write_text(json.dumps({
-            "pid": os.getpid(), "started": started.start + "-previous", "worker": "fixture-impl",
+            "scope": scope, "pid": os.getpid(), "started": started.start + "-previous", "worker": "fixture-impl",
         }))
         _ = (session / "impl_status_fixture-impl").write_text("implementing\n")
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
@@ -64,13 +73,16 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         finished_pass, = self.launch_records(session, "pass_finished")
         self.assertEqual(finished_pass["status"], "completed")
 
+    @process_boundary
     def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("stale-claim")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
         with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
             _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
-        _ = claim.write_text(json.dumps({"pid": child.pid, "started": "ended-launcher-start", "worker": "fixture-impl"}))
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
+        _ = claim.write_text(json.dumps({"scope": scope, "pid": child.pid, "started": "ended-launcher-start", "worker": "fixture-impl"}))
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "impl_status_fixture-impl").read_text(), "implemented\n")

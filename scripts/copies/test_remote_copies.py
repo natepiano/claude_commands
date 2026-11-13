@@ -533,10 +533,10 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertIn('"owner": "alpha"', metadata.read_text())
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
 
-    def test_remote_kind_covers_mac_linux_and_aws(self) -> None:
+    def test_remote_kind_covers_mac_linux_and_named_peer(self) -> None:
         from scripts.mac_test import offload
         from scripts.build_targets import target_config
-        targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("aws", "linux"))
+        targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("peer", "linux"))
         for name, platform in targets:
             with self.subTest(target=name), mock.patch.object(offload, "configured_ssh_target",
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
@@ -706,7 +706,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         seed_interpreter_cache(self.root / "probe-cache", python)
         return subprocess.run(["/bin/sh", "-c", copies.mirror_probe_setup(str(self.mirror))],
                               env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                   "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                                   "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                                    "XDG_CACHE_HOME": str(self.root / "probe-cache"), "CLAUDE_PYTHON": ""},
                               capture_output=True, text=True, timeout=10)
 

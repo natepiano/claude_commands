@@ -46,15 +46,13 @@ Notes = list[quota_alert.AgentNote]
 
 REGISTRY = registry_text({
     'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
-                              'design_roles': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+                              'design_roles': 'codex   # a trailing comment'}),
     'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
     'direct.claude': ExactRows({'impl': 'opus:high'}),
     'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
     'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
     'design_roles.codex': ExactRows({'reviewer': 'gpt-6-sol:xhigh'}),
     'design_roles.claude': ExactRows({'reviewer': 'opus:max'}),
-    'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
-    'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
     'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
     'claude.agents': ExactRows({'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}),
 })
@@ -110,6 +108,13 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
+def select_fixture_registry(test: unittest.TestCase, root: Path) -> Path:
+    """Select the fixture registry for both Python and shell readers."""
+    registry = root / "models.conf"
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+    return registry
+
+
 class QuotaReminderFixture(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -132,6 +137,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
+        registry = select_fixture_registry(self, self.root)
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -142,7 +148,6 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.conf"
-        registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -394,6 +399,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = fixture_member("producer", name="director")
         _ = fixture_member("showrunner", name="runner")
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = select_fixture_registry(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root), "USER_ZONE": "UTC",
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -414,7 +420,6 @@ stall_minutes=5
 faults_to=director
 always=director
 """))
-        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
@@ -536,7 +541,7 @@ class CodexRerunFixture(CodexZeroEpisodeFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
-            "direct": "codex", "design_roles": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+            "direct": "codex", "design_roles": "codex", "cli": "claude"}))
         _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
         _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
         _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=

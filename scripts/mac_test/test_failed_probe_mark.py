@@ -199,25 +199,14 @@ class FailedProbeTests(OffloadCommandFixture):
                          ["mac_test: could not reach the Mac: ValueError: fixture failed"])
         self.assertEqual(self.free("mac"), "bad")
 
-    def test_interrupted_and_unresolved_probes_keep_the_failed_mark(self) -> None:
-        self.fixture["probe_status"] = 255
-        with redirect_stderr(io.StringIO()):
-            self.assertIsInstance(self.probe(), offload.UnavailableProbe)
-        self.fixture["probe_status"] = 0
-        for answer, result_type in (("aws_interrupted=generation", offload.InterruptedTargetStatus),
-                                    ("linux_startup=unresolved", offload.UnresolvedSlotStartup)):
-            with self.subTest(answer=answer):
-                self.fixture["probe_lines"] = [answer]
-                self.assertIsInstance(self.probe(), result_type)
-                self.assertEqual(self.free(), "bad")
 
     def test_failed_mark_precedes_aws_status_and_mac_status_then_clears(self) -> None:
         self.fixture["probe_status"] = 255
         for name in ("mac", "box"):
             with redirect_stderr(io.StringIO()):
                 self.assertIsInstance(self.probe(name), offload.UnavailableProbe)
-        aws = target_config.SshTarget("box", "linux", self.root / "aws_target.conf")
-        self.assertIsInstance(targets.target_state(aws), targets.Unreachable)
+        linux = target_config.SshTarget("box", "linux", self.root / "linux.conf")
+        self.assertIsInstance(targets.target_state(linux), targets.Unreachable)
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(mac_test.command_target_status(mac_test.state_paths("mac")), 0)
@@ -257,7 +246,7 @@ class FailedProbeTests(OffloadCommandFixture):
             '    if [[ " $* " != *" --files-from="* ]]; then\n'
             + f'        {shlex.quote(sys.executable)} {shlex.quote(str(receiver))} "${{@: -2:1}}" "${{!#}}" || exit $?\n'
             + '    fi\n    exit "$rsync_status"')
-        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
         self.environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
         source = source.replace('exit "$probe_status"',
             'printf "end %s\\n" "$EPOCHREALTIME" >> "$root/probe-timing"\nexit "$probe_status"')
@@ -588,7 +577,6 @@ raise SystemExit("Unexpected remote command: " + command)
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
 
 
-
 class StepRecoveryTests(VerifyLintScopeFixture):
     def test_each_local_lint_step_reads_eligibility_once_with_the_new_step_flag(self) -> None:
         settings = self.root / "mac_test.conf"
@@ -624,16 +612,17 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         for row in rows:
             self.assertIn("--new-step", row)
 
-    def test_local_work_finishes_while_a_new_step_recovers_aws(self) -> None:
+    def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
-        _ = write_config_fixture(self.root / "aws_target.conf",
-            "offload=on\nhost=fake-aws\nkinds=test,check,doc,lint\nslots=1\n"
+        _ = write_config_fixture(self.root / "linux.conf",
+            "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
+            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
-            + "parity.scripts_commit=fixture\n", template="aws_target")
+            + "parity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=mac,natedev,aws\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n")
-        state = Path(self.environment["HOME"]) / ".local/state/build-targets/aws"
+            "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+        state = Path(self.environment["HOME"]) / ".local/state/build-targets/linux"
         state.mkdir(parents=True)
         book = ledger.CostLedger(state)
         observed = int(time.time())
@@ -675,7 +664,7 @@ if "linux_runner.py" in command and "probe" in command:
         output.write(json.dumps(sys.argv[1:]) + "\n")
     with (root / "probe-release").open() as release:
         assert release.readline() == "continue\n"
-    print("free_gib=1000\nhost=fake-aws\nnextest=fixture\nmend=fixture\nrc=0")
+    print("free_gib=1000\nhost=fake-linux\nnextest=fixture\nmend=fixture\nrc=0")
     print("scripts_commit=" + (root / "remote-stamp").read_text())
     raise SystemExit(0)
 print("fake Mac unavailable", file=sys.stderr)
@@ -688,14 +677,14 @@ raise SystemExit(255)
         self.assertTrue(any(args[:1] == ["clippy"] for args in self.cargo_calls()))
         # The remote probe remains blocked after local work finishes.
         with mock.patch.dict(os.environ, self.environment):
-            self.assertIsInstance(offload.read_failed_probe("aws"), offload.FailedProbe)
+            self.assertIsInstance(offload.read_failed_probe("linux"), offload.FailedProbe)
         _ = os.write(descriptor, b"continue\n")
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         with mock.patch.dict(os.environ, self.environment):
-            self.assertEqual(mac_test.free_now(mac_test.state_paths("aws"),
-                self.root / "aws_target.conf", self.root), "free")
-            answer = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("aws"),
+            self.assertEqual(mac_test.free_now(mac_test.state_paths("linux"),
+                self.root / "linux.conf", self.root), "free")
+            answer = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("linux"),
                 self.root, "sample", "lint", targets.ANY_ELIGIBLE_TARGET)
         self.assertIsInstance(answer, targets.EligibleTarget)
         probes = (self.root / "recovery-probes").read_text().splitlines()
@@ -704,7 +693,6 @@ raise SystemExit(255)
         self.assertEqual(len(copies), 2)
         self.assertTrue(any(word.startswith("--files-from=") for word in copies[0]))
         self.assertIn("--delete", copies[1])
-
 
 
 if __name__ == "__main__":

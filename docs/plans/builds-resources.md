@@ -230,8 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
-   `read_cycle()` (`build_hold.py:994`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:983`) returns `Path | None`, for the same no-current-cycle state.
-   Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
+   `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
+   Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
    Update `read_cycle_for_change()` and its test callers.
    Dailies callers were retired on 2026-11-11.
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
@@ -240,7 +240,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1171) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1438) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
@@ -2285,3 +2285,141 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `commands/build/hold.md`, `docs/as-built/builds-aws-target.md` — the rule text
 
 **Gotchas:** read the process table before the claim records. The reverse order lets a claim taken between the two reads receive TERM.
+
+### Phase 108 — The floor keeps the build output of a copy with a live or waiting verify.sh build  · status: done
+
+#### As-built
+
+- `process_uses()` counts a `verify.sh` process as a user of its workspace target, the same as a cargo-nextest run. A process is a `verify.sh` process when the basename of argv[0] is `verify.sh`, or argv[0] is `bash`, `sh`, `zsh` or `dash` and the first argument without a leading `-` has the basename `verify.sh`.
+- A `verify.sh` that waits in the build queue is a live process, so its target is in use for its whole wait.
+- `workspace_targets(argv, cwd, environ, targets)` (formerly `nextest_targets`) resolves the target for both runners: `--target-dir`, `CARGO_TARGET_DIR`, cargo config, then the target beside a folder that holds the cwd.
+- The use text is `runs verify.sh in <cwd>`. The rule applies to every `process_uses()` caller: the floor, the floor alert choices and the hand cleanup. No flag or config key controls it.
+
+**Files:**
+- `scripts/lint/sweep.py` — `process_uses()`, `workspace_targets()`
+- `scripts/lint/test_sweep.py` — the verify recheck row and a 9-row invocation table (bash, direct call, `bash -e`, sh, `zsh -f`, dash, other.sh, `CARGO_TARGET_DIR`, another workspace)
+- `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
+
+**Gotchas:** `bash -o pipefail verify.sh` is not matched, because the first argument without a leading `-` is `pipefail`.
+
+### Phase 109 — Every hana Linux CI job finds its devShell tools again, and a cargo version call skips the queue  · status: done
+
+#### As-built
+
+- `cargo_path(explicit, front)` returns every `os.get_exec_path()` entry in its order. It drops only the folder that holds the front and each folder whose `cargo` is an executable that resolves to the front. The devShell folders (`cc`, `cargo-deny`, `cargo-nextest`, `cargo-sweep`, `mold`) before the real cargo stay on the child PATH.
+- Without `--cargo`, the command is the first `cargo` on that PATH that does not resolve to the front. With `--cargo <path>`, the command is that path; its folder goes first and its later duplicate is dropped.
+- `building_call(arguments)` returns no build when a flag that only prints text comes after the subcommand and before `--`: `-V` or `--version` (not for `install`, where `--version <VERSION>` takes a value), and `-h` or `--help`. Such a call runs at once with no admission request. An argument after `--` does not change the result.
+- Measured before the fix: every hana Linux CI job failed from the 2026-11-11 14:30 switch with `linker cc not found` and `no such command`. On 2026-11-12, `cargo clippy --version` held the queue head for 85 minutes with a 6,740,828,160-byte estimate.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — `cargo_path()`, `building_call()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the wrapper test with a devShell folder and a recursing shim before the real cargo, with and without `--cargo`; a `building_call()` table; a `clippy --version` row in the outage pass-through test
+
+**Gotchas:** the CI runners run the front from a nix store copy. A fix reaches CI only after the nixos input bump and a switch.
+
+### Phase 110 — A cancelled CI job leaves no admission folder behind  · status: done
+
+#### As-built
+
+- The CI front names its shared admission folder `build-admission-ci-<uid>-<pid>-<start>-<random>`, with the front pid and its `/proc` start time.
+- `remove_abandoned_folders(shared_folder)` runs in `run_cargo()` before the front makes its folder, only when `--shared-folder` is given. It removes each `build-admission-ci-<uid>-*` folder that the same uid owns when the named owner is not live (`records.process_start_time(pid)` differs) or the name has no owner (the old name form). A live owner's folder stays. A folder that another front removes first is not an error.
+- A front that ends by SIGKILL still leaves its folder; the next building call on that runner removes it. No signal handler, flag or config key.
+- Measured before the fix: each hana runner held two left folders (05:30 and 16:43 on 2026-11-12).
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — `remove_abandoned_folders()`, the folder prefix in `run_cargo()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the shared-folder row of the wrapper test makes a dead-owner, an old-form and a live-owner folder; only the live-owner folder stays
+
+**Gotchas:** at the first building call after the deploy, an old-form folder of a front that still runs is removed too.
+
+### Phase 112 — A queued hana CI run with no jobs stops holding a Mac block  · status: done
+
+#### As-built
+
+- `ci_activity()` asks `gh run list` for `databaseId,createdAt` for the `queued` and `in_progress` lists, and keeps each run's status in a `CiRun`.
+- A run from the `queued` list with an empty job list and a `createdAt` more than `ci_jobless_queued_minutes` before now does not count as CI busy. Every other run counts as before: an `in_progress` run with no jobs stays busy, and a queued run with jobs is busy until its `ci_job` is completed.
+- A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
+- `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
+- No new `gh` call, flag, cancel call or state file.
+- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
+- `scripts/mac_test/test_mac_test.py` — rows in `test_queued_or_in_progress_run_without_mac_job_is_busy` for the age limit, a configured limit, a running run with no jobs and a malformed timestamp
+- `config/mac_test.conf` — `ci_jobless_queued_minutes`
+
+**Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.
+
+### Phase 113 — A cargo version or help call runs during a build hold  · status: done
+
+#### As-built
+
+- After the subcommand is found, `scripts/build_hold/cargo` scans the later arguments up to `--`. A `-h` or `--help`, or a `-V` or `--version` with a subcommand other than `install`, runs the real cargo at once, with no Python and no scope.
+- During a hold, `cargo nextest --version` in `have_nextest()` (`scripts/lint/invoke.sh`) now succeeds, so `require_nextest()` no longer prints `cargo nextest is required`.
+- `install --version <v>` and a `--help` after `--` still go through the hold check, as in `ci_cargo_front.building_call()`.
+- No change to `invoke.sh` or to the rest of the wrapper.
+
+**Files:**
+- `scripts/build_hold/cargo` — the help and version scan after the subcommand
+- `scripts/build_hold/test_cargo_wrapper.py` — rows in `test_non_building_commands_skip_scope_and_python` for `nextest --version`, `clippy -V`, `build --help` and `test -h`; rows in the building test for `install --version 1.0 x` and `nextest run -- --help`
+
+### Phase 114 — A memory wait line names the build it waits behind  · status: todo
+
+**Depends on:** none. Merge queue's phase 44 re-land into this branch when it is on main, before the checkpoint; it edits `scripts/build_queue/admission_service.py` too.
+
+**Source (2026-11-13, builds showrunner):** "start A now". A is the first item of the plan for hana CI job 131906898560: 173 of its 183 minutes were memory-queue wait, and every wait line said `head  needs N GiB` with a blank name.
+
+#### Work Order
+
+**Goal:** each memory wait line says which build it waits behind. A hana CI front shows as `hana CI · <runner> · <step>`.
+
+**Measured:**
+1. `AdmissionService._wait_snapshot()` (`scripts/build_queue/admission_service.py`) sets `head_label` from the head waiter's `session_name` only. A CI front has no session name, so the label is empty.
+2. `admission_client.py` prints `; head {snapshot.head_label} needs …`. An empty label gives `head  needs 16.0 GiB`.
+3. `wire.Wait` gets a second head name from `inputs.ordered[0][1].get("session_name", "")` (`admission_service.py`, the wait reply loop). It has the same gap.
+4. `gate.waiter_unit_name()` (`scripts/lint/memory_admit.py`) already names a waiter: `unit`, then `session_name`, then the folder name, then the pid. `memory_feed.feed_step_labels()` already shows a CI runner's step as `hana CI` with the runner unit.
+
+**Spec:**
+1. Add one function that names a waiter for a wait line. It returns `hana CI · <runner> · <step>` for a CI front, and otherwise the same name as `gate.waiter_unit_name()`, with the step when the waiter has one.
+2. Find how a CI front is told apart from other waiters in the waiter record. Reuse that rule; add no second rule.
+3. Use the function for `head_label` in `_wait_snapshot()` and for the head name in `wire.Wait`.
+4. When the head is the waiter itself, the line says `this build is the queue head` in place of `head <name> needs`.
+5. Change no admission decision, wire field type or record format.
+
+**Tests:** add rows to the existing wait-snapshot and wait-line tests in `scripts/build_queue/test_admission_service.py` and `scripts/build_queue/test_admission_client.py`, as they fit:
+1. A CI-front head gives `head hana CI · hana-linux-2 · test needs 12.3 GiB`.
+2. A unit head with a session name keeps today's text.
+3. A head with no session name and no unit gives the folder name or the pid, never an empty name.
+4. The waiter that is the head gets the head text of Spec item 4.
+
+**Files:**
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/admission_client.py`
+- `scripts/build_queue/test_admission_service.py`
+- `scripts/build_queue/test_admission_client.py`
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.build_queue.test_admission_service` and `scripts.build_queue.test_admission_client`.
+2. Lint: `basedpyright` on the changed files, once after the edits.
+
+**Speed:** one name lookup for each wait reply; no new read of a file or of `/proc`.
+
+### Phase 116 — The Mac idle alert counts a running hana CI Mac job as Mac work  · status: done
+
+#### As-built
+
+- `mac_test.ci_activity()` returns `CiMacJobRunning` for an `in_progress` hana CI Mac job and `CiJobNotStarted` for a run whose Mac job has not started. `CiUnknown` keeps the free reading.
+- A pending block that waits on a running CI Mac job saves `waiting_on` `{"kind": "ci_mac_job"}` (`WaitingOnCiMacJob` in `claim_state.py`). A job that has not started keeps `ci_job`, and old `ci_job` records still read.
+- The block text is "Block pending for <holder>: hana CI is running on the Mac. Nothing new starts there, and you get a message when it finishes." `pending_wait_text` gives "hana CI is running on the Mac".
+- `mac_idle.mac_work()` returns `NatedevJobOnMac` for a block that waits on a running CI Mac job. With no block and no claim, it asks `ci_activity()` only while steps wait (`waiting_for_mac`) and `ci_repo` is set, and a running CI Mac job gives busy. Thus the idle alert does not send "No block and no claim" while hana CI runs on the Mac.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — the CI activity types and the block pending text
+- `scripts/mac_test/claim_state.py` — `WaitingOnCiMacJob` and its record form
+- `scripts/buildlog/mac_idle.py` — `mac_work` reads a running CI Mac job as Mac work
+- `scripts/mac_test/test_mac_test.py` — `test_busy_ci_keeps_block_pending_until_watch_sends_once` is a queued/running table
+- `scripts/buildlog/test_mac_idle.py` — rows for a running CI Mac job with a block and with no block

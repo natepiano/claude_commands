@@ -396,11 +396,13 @@ class DecisionWriter:
         approval = self.rule_approval(key, inherited)
         project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
+        caller = staff.snapshot().by_current_session(staff.caller_identity())
+        proposed_by = caller.id if caller is not None and caller.kind == "unit" else self.standing.name
         with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
             body = Path(scratch) / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", self.standing.name, "--extra-tags", "style",
+                             "--proposed-by", proposed_by, "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
                              "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),

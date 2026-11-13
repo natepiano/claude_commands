@@ -15,7 +15,6 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from typing import Literal, TypedDict, cast
@@ -24,12 +23,12 @@ from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.herdr import herdr_types
 from scripts.whoami import account
 from scripts.agents import remote
+from scripts.lib import unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.message.sessions import process_start as _process_start
 from scripts.production import showrunners, staff, session_staff
-from scripts.usage import agents_log
 from scripts.direct.worker_state import worker_status_path
 from scripts.lib.resume_message import ClaudeChildResume, Resumable, Idle, Unavailable, WorkerResume
 from scripts.production import unit_lookup
@@ -412,6 +411,7 @@ def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]
 
 def _newest_unit_plans() -> dict[str, str]:
     newest: dict[str, tuple[float, str]] = {}
+    record = staff.local_snapshot()
     directory = unit_lookup.runs_dir()
     try:
         paths = list(directory.glob("*.jsonl"))
@@ -427,10 +427,11 @@ def _newest_unit_plans() -> dict[str, str]:
         if not isinstance(value, dict):
             continue
         event = cast(dict[str, object], value)
-        main_agent = event.get("main_agent")
-        if not isinstance(main_agent, dict):
+        reference = event.get(unit_runs.OWNER_FIELD)
+        owner = record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else None
+        if owner is None or owner.kind != "unit":
             continue
-        session_id = _string(cast(dict[str, object], main_agent).get("session_id"))
+        session_id = owner.current_session
         plan = _string(event.get("plan_doc")) or _string(event.get("plan"))
         started = event.get("run_started_at")
         rank = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else modified
@@ -756,8 +757,6 @@ def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> l
     if not children:
         return []
     try:
-        tasks = agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
-        moment = datetime.now(timezone.utc)
         runs = session_staff.worker_run_entries(membership, children)
     except (OSError, ValueError) as error:
         return [Unavailable(child.id, child.name, str(error).replace("\n", " ")) for child in children]
@@ -768,13 +767,12 @@ def worker_resumes(parent: staff.StaffRow, membership: staff.StaffSnapshot) -> l
             if found is None:
                 raise ValueError("Claude child record is unavailable in its recorded runs")
             directory, entry = found
-            task = agents_log.role_at(tasks, child.current_session, moment)
-            if not isinstance(task, agents_log.Assignment):
-                raise ValueError("last assignment is unavailable" + (f": {'; '.join(tasks.problems)}" if tasks.problems else ""))
+            if not isinstance(child.role, staff.KnownWorkerRole):
+                raise ValueError("staff worker role is unavailable")
             status = worker_status_path(directory, str(entry["slot"])).read_text().strip()
             live = status == "implementing"
             launcher = entry.get("launcher_pid", 0)
-            seat = ClaudeChildResume(run_dir=str(directory), seat=child.name, role=task.role, staff_id=child.id, turn_live=live,
+            seat = ClaudeChildResume(run_dir=str(directory), seat=child.name, role=child.role.value, staff_id=child.id, turn_live=live,
                               launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
             results.append(Resumable(seat) if live else Idle(seat))
         except (OSError, ValueError) as error:

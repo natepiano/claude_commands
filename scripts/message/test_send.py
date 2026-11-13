@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import io
 import builtins
 import fcntl
@@ -43,7 +45,7 @@ from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
 from scripts.message.relay_test_support import write_relay_record
-from scripts.lib import conf, names, process_start
+from scripts.lib import conf, names, process_start, models_registry
 from scripts.production import staff
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
@@ -119,6 +121,44 @@ def write_send_config(path: Path, values: str) -> int:
     return path.write_text(timings + "\n" + values)
 
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_imports_only_its_temporary_checkout(self) -> None:
+        repository = Path(send.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            selected, other, home = (base / name for name in ("selected", "other", "home"))
+            home.mkdir()
+            record = base / "relay-import.json"
+            observer = ("\nimport scripts\n"
+                        + "with open(os.environ['RELAY_IMPORT_RECORD'], 'w') as output:\n"
+                        + "    json.dump([__file__, list(scripts.__path__), os.environ.get('PYTHONPATH', '')], output)\n")
+            for checkout in (selected, other):
+                _ = shutil.copytree(repository / "scripts", checkout / "scripts",
+                                    ignore=shutil.ignore_patterns("__pycache__"))
+                identity = checkout / "scripts/message/relay_identity.py"
+                _ = identity.write_text(identity.read_text() + observer)
+            _ = (other / "scripts/__init__.py").write_text("")
+            fake = base / "fake-claude"
+            message = send.Message("uds:/fixture", "copy-sender", "Copy", "body", None)
+            payload = stream(INIT, call(send.agent_text(message, via_relay=True)), answer(OK))
+            _ = fake.write_text(f"#!{sys.executable}\nprint({payload!r}, end='')\n")
+            fake.chmod(0o755)
+            with (mock.patch.dict(os.environ, {
+                    "HOME": str(home), "PYTHONPATH": str(other), "RELAY_IMPORT_RECORD": str(record),
+                    "XDG_CACHE_HOME": str(base / "cache"),
+                  }),
+                  mock.patch.object(send, "__file__", str(selected / "scripts/message/send.py")),
+                  mock.patch.object(send, "STATE", base / "state"),
+                  mock.patch.object(send, "claude_binary", return_value=str(fake)),
+                  mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+                  mock.patch.object(models_registry, "claude_model", return_value="fixture")):
+                result = send.relay(message, TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.outcome, "sent", result.detail)
+            filename, paths, inherited = cast(tuple[str, list[str], str], json.loads(record.read_text()))
+            self.assertEqual(Path(filename), selected / "scripts/message/relay_identity.py")
+            self.assertEqual(paths, [str(selected / "scripts")])
+            self.assertNotIn(str(other), inherited.split(os.pathsep))
+            self.assertNotIn(str(selected), inherited.split(os.pathsep))
+
     def test_relay_reads_its_cleanup_budget_before_starting_the_process(self) -> None:
         class TimedOutRelay:
             returncode: int = 0
@@ -370,7 +410,7 @@ class RecipientStaffFixture:
 
     def staff_member(self, identity: str, name: str) -> None:
         self.staff_rows[identity] = staff.StaffRow(
-            staff.StaffId(identity), "unit", name, staff.StaffRoot(), current_session=staff.StaffId(identity))
+            staff.StaffId(identity), "unit", name, staff.StaffRoot(), current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct"))
 
     def recipient_roster(self, entries: list[roster.RosterEntry], problems: list[str],
                          warnings: list[str] | None = None) -> roster.Roster:
@@ -932,7 +972,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("new-session", "new label")
         self.staff_rows.clear()
         self.staff_rows["fixed"] = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                                                current_session=staff.StaffId("new-session"))
+                                                current_session=staff.StaffId("new-session"), unit_type=staff.UnitDetails("direct"))
         result = send.send(local_options(["--to", "session:fixed", "--from", "test", "--text", "hello", "--key", "fixed-id"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'new-session.sock'}")
@@ -942,7 +982,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("runner"))
         rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", staff.ReportsTo(parent.id),
-                                        current_session=staff.StaffId(identity)) for identity in ("one", "two"))]
+                                        current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct")) for identity in ("one", "two"))]
         self.staff_rows = {row.id: row for row in rows}
         for target in ("resources", "builds/resources"):
             errors = io.StringIO()
@@ -1007,7 +1047,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("new-session", "new label")
         self.staff_rows = {"old-session": staff.StaffRow(
             staff.StaffId("old-session"), "unit", "resources", staff.StaffRoot(),
-            current_session=staff.StaffId("new-session"))}
+            current_session=staff.StaffId("new-session"), unit_type=staff.UnitDetails("direct"))}
         result = send.send(local_options(["--to", f"uds:{self.root / 'old-session.sock'}", "--text", "hello", "--key", "old-socket"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'new-session.sock'}"])
@@ -1024,7 +1064,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         runner = staff.StaffRow(staff.StaffId("runner-fixed"), "showrunner", "builds", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-current"))
         unit = staff.StaffRow(staff.StaffId("unit"), "unit", "resources", staff.ReportsTo(runner.id),
-                             current_session=staff.StaffId("director"))
+                             current_session=staff.StaffId("director"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {row.id: row for row in (runner, unit)}
         record = staff.StaffSnapshot(tuple(self.staff_rows.values()))
         self.assertEqual(send.resolve_staff_recipient("builds/resources", record), unit)
@@ -1037,23 +1077,23 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         direct = staff.StaffRow(staff.StaffId("direct-worker"), "worker", "test2", staff.ReportsTo(report.id),
                                current_session=staff.StaffId("direct-current"))
         report_unit = staff.StaffRow(staff.StaffId("report-unit"), "unit", "report", staff.ReportsTo(runner.id),
-                                    current_session=staff.StaffId("report-director"))
+                                    current_session=staff.StaffId("report-director"), unit_type=staff.UnitDetails("direct"))
         nested = staff.StaffRow(staff.StaffId("nested-worker"), "worker", "test2", staff.ReportsTo(report_unit.id),
                                current_session=staff.StaffId("nested-current"))
         other = staff.StaffRow(staff.StaffId("other-runner"), "showrunner", "other", staff.StaffRoot(),
                               current_session=staff.StaffId("other-current"))
         other_unit = staff.StaffRow(staff.StaffId("other-unit"), "unit", "builds", staff.ReportsTo(other.id),
-                                   current_session=staff.StaffId("other-director"))
+                                   current_session=staff.StaffId("other-director"), unit_type=staff.UnitDetails("direct"))
         resources = staff.StaffRow(staff.StaffId("resources-worker"), "worker", "resources", staff.ReportsTo(other_unit.id),
                                   current_session=staff.StaffId("resources-current"))
         queue = staff.StaffRow(staff.StaffId("queue-director"), "unit", "queue", staff.ReportsTo(runner.id),
-                              current_session=staff.StaffId("queue-current"))
+                              current_session=staff.StaffId("queue-current"), unit_type=staff.UnitDetails("direct"))
         queue_worker = staff.StaffRow(staff.StaffId("queue-worker"), "worker", "queue", staff.ReportsTo(other_unit.id),
                                      current_session=staff.StaffId("queue-worker-current"))
         alpha = staff.StaffRow(staff.StaffId("alpha-director"), "unit", "alpha", staff.ReportsTo(runner.id),
-                              current_session=staff.StaffId("alpha-current"))
+                              current_session=staff.StaffId("alpha-current"), unit_type=staff.UnitDetails("direct"))
         alpha_unit = staff.StaffRow(staff.StaffId("alpha-unit-director"), "unit", "alpha-unit", staff.ReportsTo(runner.id),
-                                   current_session=staff.StaffId("alpha-unit-current"))
+                                   current_session=staff.StaffId("alpha-unit-current"), unit_type=staff.UnitDetails("direct"))
         record = staff.StaffSnapshot((*record.rows, report, direct, report_unit, nested, other, other_unit, resources,
                                       queue, queue_worker, alpha, alpha_unit))
         worker_record = staff.StaffSnapshot((other, other_unit, queue_worker))
@@ -1125,7 +1165,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as transport:
             self.assertEqual(send.send(local_options(["--to", "resources", "--text", "hello"])).outcome, "sent")
         snapshots.assert_called_once_with()
-        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, registry=registry)
+        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, registry=registry,
+                                          participants=roster.MessageParticipants(frozenset(("resources-current",))))
 
     def daemon_owner(self) -> codex_daemon.CodexDaemon:
         home = self.root / ".codex2"
@@ -2059,7 +2100,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_keyed_staff_recipient_restart_preserves_repeat_window(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                                current_session=staff.StaffId("before"))
+                                current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         options = local_options(["--to", "fixed", "--key", "settings-result", "--repeat-minutes", "120",
                                  "--text", "The local key needs attention."])
@@ -2105,7 +2146,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                current_session=staff.StaffId("runner"))
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.ReportsTo(runner.id),
-                               current_session=staff.StaffId("current"))
+                               current_session=staff.StaffId("current"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {row.id: row for row in (runner, member)}
         started = send.now()
         targets = ("resources", "fixed", "resources", "builds/resources", "session:fixed",
@@ -2148,7 +2189,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_legacy_transport_claim_preserves_its_timestamp_after_migration(self) -> None:
         self.session("current", "resources")
         self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                                                  current_session=staff.StaffId("current"))}
+                                                  current_session=staff.StaffId("current"), unit_type=staff.UnitDetails("direct"))}
         started = send.now()
         socket_address = f"uds:{self.root / 'current.sock'}"
         unrelated = "session:unrelated"
@@ -2301,7 +2342,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_failed_stable_claim_does_not_clear_a_later_attempt(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                               current_session=staff.StaffId("before"))
+                               current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         started = send.now()
         options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
@@ -2401,7 +2442,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_queued_staff_message_reaches_its_new_session_once(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                               current_session=staff.StaffId("before"))
+                               current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         started = send.now()
         options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "120", "--text", "Queued notice"])
@@ -2435,7 +2476,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_expired_staff_retry_replaces_the_previous_sessions_queued_body(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                               current_session=staff.StaffId("before"))
+                               current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         started = send.now()
         options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Older body"])
@@ -2611,7 +2652,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_pending_returns_the_newest_copy_after_interrupted_queue_replacement(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                               current_session=staff.StaffId("before"))
+                               current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         started = send.now()
         stable = send.StableRecipient("staff:fixed")
@@ -2670,7 +2711,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_delivered_staff_retry_removes_its_queued_copy_from_the_previous_session(self) -> None:
         self.session("before", "resources")
         member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                               current_session=staff.StaffId("before"))
+                               current_session=staff.StaffId("before"), unit_type=staff.UnitDetails("direct"))
         self.staff_rows = {"fixed": member}
         started = send.now()
         options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Queued notice"])
@@ -2694,7 +2735,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         for identity in ("first", "second", "third"):
             self.session(identity, "resources")
             self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", staff.StaffRoot(),
-                                                      current_session=staff.StaffId(identity))}
+                                                      current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct"))}
             outcomes.append(send.send(local_options(["--to", "fixed", "--from", "sender", "--text", "Notice"])).outcome)
         self.assertEqual(outcomes, ["sent", "sent", "held"])
         self.assertEqual(len(self.relayed), 2)
@@ -2958,9 +2999,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_a_note_to_the_user_with_one_key_has_no_window_without_repeat_minutes(self) -> None:
         note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
                 "--text", "The build passed."]
-        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-            self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
-        self.assertEqual(channel.call_count, 2)
+        for extra in ([], ["--through-silence"]):
+            note.extend(extra)
+            with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+                self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
+            self.assertEqual(channel.call_count, 2)
+            command = cast(list[str], channel.call_args.args[0])
+            self.assertEqual("--through-silence" in command, bool(extra))
+            self.assertEqual(command[command.index("--priority") + 1], "0")
+            self.assertNotIn("--repeat-minutes", command)
 
     def test_a_remote_emergency_push_holds_its_window_on_this_host_only(self) -> None:
         with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
@@ -3989,7 +4036,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_typed_anomaly_owner_overrides_a_name_in_its_reason(self) -> None:
         other = staff.StaffRow(staff.StaffId("other-id"), "unit", "other", staff.StaffRoot(),
-                               current_session=staff.StaffId("other-session"))
+                               current_session=staff.StaffId("other-session"), unit_type=staff.UnitDetails("direct"))
         anomaly = StaffRowAnomaly(other, "missing-person has no recorded document")
         observed = roster.Roster([], [], [anomaly.diagnostic], (anomaly,))
         errors = io.StringIO()
@@ -5061,12 +5108,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ("FAILED: post failed fallback text:", "Build stopped — Action: Choose in natedev terminal.", 3),
         ):
             with self.subTest(header=header), mock.patch.object(send, "run", return_value=(code, "remote banner\n" + header + "\n" + payload + "\n", "")) as run:
-                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
+                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev", "--through-silence"))))
             if code == 3:
                 self.assertEqual(result.detail, "on natedev: post failed " + send.UNREVIEWED_FALLBACK)
             else:
                 self.assertEqual(result.detail, "on natedev: " + header.partition(": ")[2] + "\n" + payload)
             self.assertIn("--answerable", cast(list[str], run.call_args.args[0])[-1])
+            self.assertIn("--through-silence", cast(list[str], run.call_args.args[0])[-1])
             self.assertTrue(cast(list[str], run.call_args.args[0])[-1].startswith("CLAUDE_PID= "))
             if code == 3:
                 marker = send.as_dict(send.loads(self.failure_marker().read_text()))
@@ -5233,7 +5281,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.action, send.NoUserRecipient())
 
     def test_action_flags_are_only_for_user_messages(self) -> None:
-        for action in (["--no-action"], ["--action", "reply"]):
+        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"]):
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
                 _ = local_options(["--to", "natedev", *action, "--text", "hello"])
@@ -5302,8 +5350,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
 
     def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
-                   registry: sessions.RegistryRead) -> roster.Roster:
-        del registry
+                   registry: sessions.RegistryRead,
+                   participants: roster.AllRosterSessions | roster.MessageParticipants) -> roster.Roster:
+        del registry, participants
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
         return self.local
@@ -5646,7 +5695,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
         notes = self.root / "agents"
         self.queue_contents, self.queued = {}, []
         self.members = [staff.StaffRow(staff.StaffId("account-thread"), "unit", "Account window", staff.StaffRoot(),
-                                      current_session=staff.StaffId("account-thread"))]
+                                      current_session=staff.StaffId("account-thread"), unit_type=staff.UnitDetails("direct"))]
         for home, label in zip(self.homes, ("codex1", "codex2")):
             write_codex_account(home, notes, label)
             (home / "app-server-control").mkdir()
@@ -5799,9 +5848,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "oauthAccount": {"emailAddress": "sender@example.invalid"}}))
         executable = self.root / ".local/bin/claude"
         executable.parent.mkdir(parents=True)
-        _ = executable.write_text(
-            f"#!{sys.executable}\n"
-            + "import json, socket, sys\n"
+        _ = executable.write_text(python_tool_source(
+            "import json, socket, sys\n"
             + "from scripts.message.test_send import INIT, OK, answer, call, stream\n"
             + "prompt = sys.stdin.read()\n"
             + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
@@ -5809,14 +5857,14 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             + "with socket.socket(socket.AF_UNIX) as connection:\n"
             + "    connection.connect(target.removeprefix('uds:'))\n"
             + "    connection.sendall(text.encode())\n"
-            + "print(stream(INIT, call(text), answer(OK)), end='')\n")
+            + "print(stream(INIT, call(text), answer(OK)), end='')\n"))
         executable.chmod(0o755)
         question, response = "Can you confirm the survey?", "The survey is confirmed."
         with ShortUnixSocket() as sender, self.daemon(self.homes[1]):
             address = f"uds:{sender.bind_socket()}"
             sender.listen(1)
             self.members.append(staff.StaffRow(staff.StaffId("sender"), "unit", "sdlc", staff.StaffRoot(),
-                                               current_session=staff.StaffId("sender")))
+                                               current_session=staff.StaffId("sender"), unit_type=staff.UnitDetails("direct")))
             sender.settimeout(5)
             with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": address}):
                 delivered = self.command("send.py", "--to", "codex:account-thread", "--from", "sdlc", "--text", question)

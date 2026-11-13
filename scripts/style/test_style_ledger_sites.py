@@ -13,6 +13,7 @@ from pathlib import Path
 from contextlib import closing
 from typing import cast, final
 from unittest import mock
+from weakref import ref
 from scripts.style import style_ledger
 from scripts.style import rules
 from scripts.style.approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
@@ -30,7 +31,38 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class StyleLedgerSitesTests(LedgerTestCase):
     def test_judging_checkpoint_keeps_the_base_coordinate_and_bulk_rename(self) -> None:
         ledger, finding, base, checkpoint = self.site_with_comment_checkpoint()
-        evidence = ledger.finding_site(finding, checkpoint)
+        parsed_files: list[ref[declarations.DeclaredFile]] = []
+        parse = declarations.read_declarations
+
+        def remember(source: str) -> declarations.DeclaredFile:
+            file = parse(source)
+            parsed_files.append(ref(file))
+            return file
+
+        cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips")).clear()
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with (mock.patch.object(style_ledger, "_tip", wraps=builder) as inventories,
+              mock.patch.object(style_ledger, "read_declarations", wraps=remember) as reads,
+              mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate):
+            for _ in range(3):
+                _ = tuple(ledger.cells(rule=finding.rule))
+            evidence = ledger.finding_site(finding, checkpoint)
+        commits = [cast(tuple[Path, str], call.args)[1] for call in inventories.call_args_list]
+        self.assertEqual(set(commits), {base, checkpoint})
+        self.assertEqual(len(commits), len(set(commits)))
+        self.assertEqual(style_footprint.tokenized_text.cache_info().currsize, 0)
+        parsed = [cast(tuple[str], call.args)[0] for call in reads.call_args_list]
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(len(set(parsed)), len(parsed))
+        separate.assert_not_called()
+        self.assertTrue(all(file() is None for file in parsed_files))
+        for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
+                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+            with self.subTest(completed_cache=cache):
+                self.assertFalse(getattr(ledger, cache))
+        items = cast(dict[tuple[str, str], tuple[declarations.DeclaredItem, ...]], getattr(ledger, "_declared_files"))
+        self.assertTrue(items)
+        self.assertTrue(all(commit == checkpoint for commit, _ in items))
         self.assertIsInstance(evidence, style_ledger.UnchangedSite)
         assert isinstance(evidence, style_ledger.UnchangedSite)
         self.assertEqual((evidence.path, evidence.line), (PARENT_FILE, 2))
@@ -908,6 +940,12 @@ class StyleLedgerSitesTests(LedgerTestCase):
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
         _, (field, header) = self.judge_parent(ledger, ((2, "old: u32,"), (1, "pub struct Parent {")))
         tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: PARENT})
+        with mock.patch.object(style_ledger, "read_declarations", wraps=declarations.read_declarations) as first_reads:
+            reading = ledger.declaration_reading((field, header), lambda _: True)
+        sources = [cast(tuple[str], call.args)[0] for call in first_reads.call_args_list]
+        self.assertEqual(len(sources), len(set(sources)))
+        self.assertEqual([type(outcome) for outcome in reading.outcomes], [style_ledger.DeclarationMoved] * 2)
+        self.assertEqual(style_footprint.tokenized_text.cache_info().currsize, 0)
         judged = style_ledger.Ledger.finding_anchor
         written = False
 
@@ -926,12 +964,16 @@ class StyleLedgerSitesTests(LedgerTestCase):
             outcomes = self.follow_approved(ledger, [field, header])
         resolves = [call for call in runs.call_args_list if "--quiet" in cast(tuple[list[str]], call.args)[0]]
         self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
-        # Git resolves one judged commit. Each reading parses its two historical files again after the group releases them.
-        # The two readings share the tip's two parsed files.
-        self.assertEqual((len(resolves), reads.call_count), (1, 6))
+        # Each reading shares compact parsing until its final outcome.
+        # The first reading also supplies the immutable ancestry result.
+        self.assertEqual((len(resolves), reads.call_count), (0, 4))
         rows = {finding.finding_id: (finding.path, finding.line, finding.follow) for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
         self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
+        for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
+                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+            with self.subTest(completed_cache=cache):
+                self.assertFalse(getattr(ledger, cache))
 
 
     def test_a_filed_rename_whose_after_name_its_file_now_declares_is_built_not_withdrawn(self) -> None:
@@ -1658,10 +1700,38 @@ class StyleLedgerSitesTests(LedgerTestCase):
                     target = source.replace("fn original", "fn renamed")
                     if changed:
                         target = target.replace("use crate::a::one::Arg", "use crate::a::two::Arg")
+                    if not unrelated:
+                        target += ("impl crate::a::Holder<A> {\n"
+                                   "    fn rejected(&self) -> u32 {\n        2\n    }\n"
+                                   "    fn ignored(&self) -> u32 {\n        3\n    }\n}\n")
                     other_items = ("pub struct Other;\nimpl Other {\n    fn unrelated(&self) -> u32 {\n        1\n    }\n}\n"
                                    if unrelated else "")
                     _ = self.commit_tip(ledger, {PARENT_FILE: target, MOVED_FILE: other_items})
                     before = self.held_rows(ledger.database)
+                    tokenizer = style_footprint.tokenized_text
+                    lexical_reads: list[str] = []
+
+                    def read_tokens(text: str) -> style_footprint.TokenizedText:
+                        misses = tokenizer.cache_info().misses
+                        result = tokenizer(text)
+                        if tokenizer.cache_info().misses != misses:
+                            lexical_reads.append(text)
+                        return result
+
+                    with (mock.patch.object(style_footprint, "tokenized_text", wraps=read_tokens) as tokens,
+                          mock.patch.object(ledger, "_file_at", wraps=getattr(ledger, "_file_at")) as file_reads,
+                          mock.patch.object(ledger, "_outside_search", wraps=getattr(ledger, "_outside_search")) as searches):
+                        setattr(tokens, "__wrapped__", tokenizer.__wrapped__)
+                        tokens.attach_mock(mock.Mock(side_effect=tokenizer.cache_clear), "cache_clear")
+                        _ = ledger.declaration_reading((finding_id,), lambda _: True)
+                    self.assertEqual(lexical_reads.count(source), 1)
+                    self.assertEqual(lexical_reads.count(target), 1)
+                    coordinates = [cast(tuple[str, str], call.args) for call in file_reads.call_args_list]
+                    self.assertEqual(len(coordinates), len(set(coordinates)))
+                    searches.assert_called()
+                    for cache in ("_trait_imports", "_trait_positions", "_module_links", "_extern_file_names",
+                                  "_type_header_conditions", "_commit_files", "_parsed_files", "_declared_blobs"):
+                        self.assertFalse(getattr(ledger, cache))
                     with mock.patch.object(ledger, "_outside_body_check", wraps=getattr(ledger, "_outside_body_check")) as body_checks:
                         outcome, = self.follow_approved(ledger, [finding_id])
                     if unrelated:

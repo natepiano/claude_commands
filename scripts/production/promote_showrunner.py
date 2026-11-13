@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.production import add_unit, completion_receipt, staff, staff_sources, unit_config, worker
 from scripts.herdr import herdr_types
 from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
@@ -37,7 +37,7 @@ from scripts.production import unit_effort
 from scripts.production import unit_lookup
 from scripts.message import sessions
 from scripts.lib import unit_runs
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.production.session_pane import HerdrFailure, read_place
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, read_new_production, read_production
 
@@ -61,6 +61,7 @@ class Promotion(NamedTuple):
     marked: unit_lookup.LabeledSession
     claude: unit_lookup.LiveClaude
     worktree: Path
+    unit_type: staff.UnitType = "direct"
 
 
 def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -142,7 +143,7 @@ def checked(name: str, child_name: str, doc: Path, *,
             worktree = location.path
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
         marked = unit_lookup.LabeledSession(name, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
-        return Promotion(name, parent, child, marked, claude, worktree)
+        return Promotion(name, parent, child, marked, claude, worktree, add_unit.saved_unit_type(fields))
     try:
         selected = staff_sources.member(staff_sources.UnitMember(parent.name, name), record)
         if isinstance(selected, staff_sources.NoSuchMember):
@@ -163,7 +164,8 @@ def checked(name: str, child_name: str, doc: Path, *,
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
     _ = add_showrunner.checked(child, parent.name, ending=ending, start_in=worktree, config_dir=directory)
-    return Promotion(name, parent, child, marked, claude, worktree)
+    assert isinstance(selected.row.unit_type, staff.UnitDetails)
+    return Promotion(name, parent, child, marked, claude, worktree, selected.row.unit_type.value)
 
 
 def promotion_record(parent: Production, unit: str) -> Path:
@@ -188,6 +190,7 @@ def save_promotion(promotion: Promotion, target: Path) -> None:
         "session_id": promotion.claude.session_id, "session": promotion.marked.place.session,
         "pane": promotion.marked.place.pane, "socket": promotion.claude.socket, "pid": str(promotion.claude.pid),
         "worktree": str(promotion.worktree),
+        "unit_type": promotion.unit_type,
         "launched_at": datetime.now(UTC).isoformat(),
     }) + "\n")
 
@@ -195,10 +198,9 @@ def save_promotion(promotion: Promotion, target: Path) -> None:
 def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) -> int:
     """Finish our saved conversation in its child tab, without launching it again."""
     place = herdr.herdr_place_of(pid)
-    if isinstance(place, herdr.NotInHerdr) or not any(
-        pane["pane_id"] == place.pane and pane.get("label") == promotion.child.name
-        for pane in herdr.Herdr(place.session).panes()
-    ):
+    if (isinstance(place, herdr.NotInHerdr)
+            or herdr.Herdr(place.session).native_session(place.pane, "claude", herdr.PROGRAM_TIMEOUT_SECONDS)
+            != promotion.claude.session_id):
         raise Refusal(f"session {promotion.claude.session_id} runs outside {promotion.child.name}'s tab")
     fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
     at = datetime.fromisoformat(fields["launched_at"])
@@ -233,18 +235,28 @@ def stop_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lo
         try:
             panes = client.panes()
             tabs = {pane.get("tab_id", "") for pane in panes if pane["pane_id"] == place.pane}
-            workers: set[str] = {worker.name for worker in record.find(kind="worker", parent=row.id)} if row is not None else set()
-            shells = [pane for pane in panes if pane.get("tab_id", "") in tabs and pane.get("label") in workers]
+            workers = record.find(kind="worker", parent=row.id) if row is not None else []
+            entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+            evidence = pane_launch.NativePaneEvidence(panes, client.scan_row_panes(record, [dict(pane) for pane in panes]))
+            shells: list[tuple[str, dict[str, object]]] = []
+            for worker in workers:
+                try:
+                    matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(worker.id), record, client,
+                                                         entries, evidence=evidence)
+                except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+                    print(f"anomaly: {worker.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+                    continue
+                shells.extend((worker.name, pane) for pane in matches if pane.get("tab_id", "") in tabs)
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             print(f"anomaly: {name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
             shells = []
-        for pane in shells:
+        for worker_name, pane in shells:
             try:
-                if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell) and not client.close_tab_confirmed(
-                        pane["pane_id"], terminal=pane.get("terminal_id", "")):
-                    print(f"anomaly: {pane.get('label')}: old worker shell close failed", file=sys.stderr)
+                if isinstance(client.pane_activity(str(pane["pane_id"])), herdr.PaneAtShell) and not client.close_tab_confirmed(
+                        str(pane["pane_id"]), terminal=str(pane.get("terminal_id", ""))):
+                    print(f"anomaly: {worker_name}: old worker shell close failed", file=sys.stderr)
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-                print(f"anomaly: {pane.get('label')}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+                print(f"anomaly: {worker_name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         try:
             if not client.close_tab_confirmed(place.pane, target=claude.session_id):
                 print(f"anomaly: {name}: old director tab close failed", file=sys.stderr)
@@ -267,12 +279,13 @@ def account_line() -> str:
 
 
 def restore_line(promotion: Promotion) -> str:
-    """The command that resumes the stopped session as the unit it was, with the plan its .unit.toml names."""
+    """Resume the stopped unit with its saved plan and type."""
     config = unit_config.read(promotion.worktree, cleanup=False)
     if isinstance(config, unit_config.ConfigMissing):
-        return f"add_unit.py with --resume {promotion.claude.session_id}; {config.reason}"
+        return f"add_unit.py with --unit-type {promotion.unit_type} --resume {promotion.claude.session_id}; {config.reason}"
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
         "--production", promotion.parent.name, promotion.unit,
+        "--unit-type", promotion.unit_type,
         *unit_config.plan_arguments(config.plan),
         "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 

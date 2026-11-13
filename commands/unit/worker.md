@@ -48,13 +48,20 @@ When the stop budget is unusable, `worker.py end` prints the configuration refus
 The worker row stays.
 Correct the named configuration and run `end <name>` again.
 
-For assignment, exit 0 means submitted. The pass and any held role stay active.
+For assignment, exit 0 means submitted or accepted for detached compaction.
+The pass and any held role stay active.
 The launcher returns at once. End the director turn after any assigned synchronous review.
+When compaction is due, the launcher prints `<worker>: compaction runs detached; the prompt follows`.
+The child survives a signal to the caller's process group.
+It requires a compaction record within `WORKER_COMPACT_SECONDS`, then sends the prompt and confirms its transcript receipt.
+A detached failure ends the pass with `error` and sends the director a completion notice.
+Assignments with no compaction due keep their attached delivery path.
 The turn hook saves the result, completes the pass, and sends the director its reply path.
 The hook closes the completed pane and keeps its native conversation.
-A live run or pending friend reply retains the same pass without another prompt.
+A live run retains the same pass without another prompt.
 Other codes: `1` check failure, `2` refusal, `4` Codex question, `6` busy, `7` retained, `8` uncertain.
-A Codex delivery returns only after its transcript records the prompt, within `WORKER_SETTLE_SECONDS`; otherwise it returns `8`. A Claude delivery returns before its transcript must contain the prompt.
+An attached Codex delivery requires its transcript prompt within `WORKER_SETTLE_SECONDS`; otherwise it returns `8`.
+A Claude delivery returns before its transcript must contain the prompt.
 A failed delivery command returns an error.
 The transcript prevents replay and proves completion.
 
@@ -64,5 +71,11 @@ An unexpected screen prompt ends no turn, and the director finds it only when it
 1. Read the question in the worker reply.
 2. Answer with `worker.py answer <name> --text "<answer>"`.
 3. End the director turn until the next hook message.
+
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+Use `answer <name> --text "Read the assigned prompt and do the work."` to resubmit the work.
+For an active pass, `answer` adds the saved DONE instruction and keeps the pass and delivery.
+The normal turn hook sends the completion notice after the matching DONE reply.
+A blocked Codex question receives only the supplied answer text.
 
 A repeated saved launcher reads the receipt and returns without another submission.

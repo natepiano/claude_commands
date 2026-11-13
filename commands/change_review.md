@@ -8,6 +8,9 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 For `/change_review` with no action:
 
+The command prints the Hana console link with Changes selected.
+The console navigation switches between Changes and Builds.
+
 1. Run the page script:
 
    ```sh
@@ -35,7 +38,7 @@ On exit 1 report its one line.
 
 ## Find the list
 
-Every action finds the list from its production, written `<production>` below:
+Every action finds the list from its production, written `[--production <name>]` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
@@ -70,7 +73,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -122,39 +125,109 @@ To rewrite a row still to review, such as one that lacks where to try it or
 what the person sees:
 
 ```sh
-… edit <production> --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`.
+The prefix names the responsible showrunner, even when another showrunner's list stores the row.
+Commands also accept the list-based ID and a bare row number with the selected list.
+Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
 When the user asks to review changes, follow [Bare command](#bare-command).
 
-The page contains every waiting change, with staff-based showrunner tabs.
+The page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
+The selected tab joins the content panel and has an accent line on its top edge.
+Use the arrow keys, Home, and End to select a tab.
+Questions and Changes show one card at a time.
+The compact **Showrunner:** menu starts with **All (n)**, then lists each showrunner with its waiting count.
+All is the default and includes every showrunner in the existing item order.
+The URL retains the selected type, filter, and card across page loads and automatic updates.
+Each type tab shows its own count. The page has no combined total.
+The page updates itself without a full reload through its existing GET URL.
+`page_refresh_seconds` starts at 15 seconds and permits 5 to 300 seconds.
+The page loads updates only while visible and loads at once when its browser tab becomes visible again.
+An update retains the type, showrunner, waiting card, open Details sections, scroll position, and retained field focus and cursor.
+Typed text or an active save holds replacement; only the newest loaded update waits.
+Replacement continues when all unsaved fields are empty or the save ends.
+After a successful save, the page requests a fresh update to exclude older responses.
+A failed load changes nothing; the next interval tries again.
+The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
+An empty showrunner filter shows `No questions for this showrunner.` or `No changes for this showrunner.`
+An empty type shows `No questions to answer.` or `No changes to review.`
+The selected showrunner filter supplies the count; the card has no separate remaining count.
+A question stays with the showrunner whose question list holds it.
+An unknown question owner appears under **Owner unavailable**.
+Owned question cards show the title before the filed text, choices, and `Asked by <session>`.
+They omit the separate Question label and keep `Answer` and `Save answer`.
+An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
+Save answer records the answer and opens the next waiting question.
+Skip for now skips a question without saving.
+It hides when no other item waits in the selected showrunner filter.
+Questions have no Ask showrunner to check or Ask a question controls.
+A stale question refuses an answer if another session already answered it.
+Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
+The delivery record stores `saved: false` before the answer saves and `saved: true` after it saves.
+A save error clears the delivery intent and releases its claim.
+Recovery sends only `saved: true` answers for closed questions.
+Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
+The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
+
+Rebuilds counts machines with open needs and shows natedev before the Mac.
+Each block tells the user where to run `rebuild`.
+Multiple needs share one rebuild; their unchanged reasons appear under `After the rebuild`, newest first.
+A closed Details disclosure shows full commits, affected staff names and kinds, and different requesters.
+Unknown staff IDs appear as `Unknown session: <id>`.
+The Mac block states that updates can take five minutes while the Mac is reachable.
+The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
+An empty view shows `No rebuilds needed.`
+Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
+The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
+It combines these needs with cached system comparisons without duplicate machines.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds.
+`rebuild.eval_retry_seconds` sets a 600-second wait after failed or partial evaluations; a new commit bypasses this wait.
+
+The Changes tab contains every waiting change.
+Each card starts with its 20px title; section labels use 17px text.
+One closed Details disclosure holds the ID, date, commit, and kind, with 16px space after the title.
+How to check or Proof stays in the main view.
+Works and Does not work are the main actions.
+Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
 Reviewed rows keep the production name recorded at the verdict.
 Renames and transfers do not rewrite these cells.
-The `unrouted` tab shows an unknown id or a broken staff parent chain.
+The **Owner unavailable** option shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
-This tab offers no question control, and the server refuses question submissions without saving.
+These rows hide all showrunner actions, including Send feedback.
+The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
-Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
-The selected tab draws its full outline inside its edges, including the first and last tabs.
+Menu options with waiting changes precede empty options in alphabetical order.
+Keyboard focus keeps its visible outline.
 Answers save in the background.
-Each successful save opens the next waiting change in the same tab.
+Each successful save opens the next waiting change in the same filter.
 Navigation during a save prevents this automatic change.
-Next skips a change without saving an answer.
-A failed HTTP save keeps the typed answer, error text, answer form, and waiting count.
-A saved verdict shows **Saved: <answer>**.
-Validate yourself removes the row from every waiting count and Next order when the request saves.
+Skip for now skips a change without saving an answer.
+A failed HTTP save keeps the typed text, answer form, and waiting count, and shows `Not saved: <reason>`.
+An automatic move after a change save shows **Review saved.** above the next card.
+An automatic move after a question save shows **Answer saved.** above the next card.
+Manual navigation clears this notice.
+A direct link to a saved verdict shows **Saved: <answer>**.
+Ask showrunner to check removes the row from every waiting count and Skip for now order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-Ask a question uses the feedback box.
+Ask a question uses the **Comment, question or feedback** field.
 It removes the row from every waiting count until the showrunner answers.
 A direct link shows **The showrunner will answer this** without answer buttons.
-Send feedback saves the text unchanged; text that starts with `works` or `fine` can land the change.
+Send feedback asks the showrunner to act on the text.
+Open feedback removes the row from every waiting count until the showrunner records its action.
+A direct link shows **The showrunner will act on this** without answer buttons.
+The recorded note shows **Showrunner: <note>**, and the row returns to the count.
+Feedback uses the existing question delivery record, retry budget, and startup recovery.
+Works and Does not work save the text from **Comment, question or feedback** as their comment.
+The server retains its verdict rules for text that starts with `works` or `fine`.
 The server manages delivery; the page shows no delivery notes, links, or resend controls.
 The server reads `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf` when delivery starts.
 The initial values are 3 tries and a 5 second pause.
@@ -177,12 +250,12 @@ A nonblocking lock prevents two renders from sending one alert at once.
 The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
-The diagnostic command `show <production>` still prints the current row and count.
+The diagnostic command `show [--production <name>]` still prints the current row and count.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
-run `mark-important <production> --row <id>`, with the ID as `/next` shows it,
-such as `C434` or `sdlc/C9`.
+run `mark-important [--production <name>] --row <id>`, with the ID as `/next` shows it,
+such as `sdlc/C434` or `sdlc/C9`.
 
 ## A folder for the user to try
 
@@ -206,15 +279,18 @@ A verdict beginning `works` or `fine`, after optional `okay`/`ok` and a row id
 (`c17`), lands the row. Case and later words do not affect the result; any
 other start returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
 feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
-there leaves the row open. Then:
+there leaves the row open.
+Different review rows can land feature-log notes on one merge link without `--separate-result`.
+The review page sends one failure alert per list, row, and error text.
+Then:
 
 ```sh
-… verdict <production> --row <id> --verdict "<the user's words>"
+… verdict [--production <name>] --row <id> --verdict "<the user's words>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`, or its existing list-based ID.
 It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
-`C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
+`<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`. Either way it removes
 the row's scratch folders and prints `removed <path>` for each.
 The Producer cell stays with the row in Reviewed.
 Send a returning row and the user's words to its Producer staff id.
@@ -246,7 +322,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.
@@ -254,6 +330,19 @@ The answer and cells can hold several lines; lines that start with `- ` or `1. `
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.
+
+## Feedback
+
+1. Read the feedback and its `Feedback id` in the change review message.
+2. Complete the directed action.
+3. Record what you did with the feedback id:
+
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<what you did>"
+```
+
+The note returns the row to the user's waiting count.
+A verdict closes the row under the existing verdict rules.
 
 ## Never a question
 

@@ -10,4 +10,4 @@ Code also checks `push-one-action`, not you: the body must not tell the user to 
 
 Before returning `send`, identify whom each person, session, account or unit name refers to using the text alone. Fail `reader-starts-cold` with the unexplained name quoted when the reader cannot place it.
 
-Return `withhold` when the push asks nothing of the user and tells nothing they must know now; quote the unnecessary text under `push-only-what-the-user-must-do`. Keep its action form. A whole plan finished and merged, and before/after shots ready for review, are allowed notes: never withhold those. Reply and question reviews do not use `withhold`.
+Return `withhold` when the push asks nothing of the user and tells nothing they must know now; quote the unnecessary text under `push-only-what-the-user-must-do`. Keep its action form. A whole plan finished and merged, and before/after shots ready for review, are allowed notes: never withhold those. A note whose text states the user's request ("You asked ...") is also allowed: never withhold it. Reply and question reviews do not use `withhold`.

@@ -19,7 +19,7 @@
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
-  buildlog hourly                   sync, vault pull, ci, screenshot scan, then Rust release check
+  buildlog hourly                   sync, vault pull, ci, screenshot scan, Rust release check, then AWS snapshot
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -210,6 +210,14 @@ def screenshot_hourly() -> int:
     ).returncode
 
 
+def aws_snapshot() -> int:
+    from scripts.aws_target.aws_target import snapshot
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.lib import conf
+
+    return snapshot(conf.path('aws_target'), ssh_target_state_directory('aws'))
+
+
 def hourly() -> int:
     from scripts.buildlog import ci
     from scripts.buildlog import index
@@ -220,7 +228,8 @@ def hourly() -> int:
 
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
-                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
+                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
+                      ("AWS snapshot", aws_snapshot)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run

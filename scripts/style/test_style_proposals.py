@@ -41,7 +41,7 @@ from scripts.production import proposals_table
 from scripts.production.issues import Issue, frontmatter, open_issues
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id
 from scripts.style.style_proposals import FilingResult
-from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member
+from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member, fixture_runtime_id
 from scripts.production import staff, unit_names
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
@@ -2341,6 +2341,15 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
             self.assertEqual(sum(call[0] == "create" for call in self.calls), 4)
 
+    def test_a_unit_caller_records_its_fixed_id_on_a_style_proposal(self) -> None:
+        unit = proposal_issue.staff_reference("names", "unit")
+        unit = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("style-restarted")))
+        with self.ledger() as ledger, mock.patch.object(staff, "caller_identity", return_value=unit.current_session):
+            finding = self.hold(ledger)
+            issue, = self.file(ledger)
+            self.assertEqual(frontmatter(issue)["proposed_by"], [unit.id])
+            self.assertEqual([item.finding_id for item in ledger.proposal_findings(issue)], [finding.finding_id])
+
     def test_file_reads_workspace_once_for_many_findings_in_multiple_crates(self) -> None:
         with self.ledger() as ledger:
             findings = tuple(self.hold(ledger, crate=crate, line=line)
@@ -3619,8 +3628,23 @@ class StyleProposalsTests(unittest.TestCase):
             issue = self.approved_decision(ledger, renamed, left)
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed"), "alpha/src/b.rs": "pub fn other() {}\n"})
             before = self.written(ledger)
-            dry = self.follow("--dry-run")
-            self.assertEqual(self.written(ledger), before)
+            read = style_ledger.Ledger.declaration_reading
+            observed_reads = 0
+
+            def read_and_check(active: style_ledger.Ledger, ids: Iterable[str],
+                               approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
+                nonlocal observed_reads
+                result = read(active, ids, approved)
+                observed_reads += 1
+                for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_tips"):
+                    self.assertFalse(getattr(active, cache))
+                return result
+
+            with mock.patch.object(style_ledger.Ledger, "declaration_reading", read_and_check):
+                dry = self.follow("--dry-run")
+                self.assertEqual(self.written(ledger), before)
+                self.assertEqual(self.follow("--dry-run"), dry)
+            self.assertEqual(observed_reads, 2)
             self.assertEqual(dry[0], 1)
             lines = dry[1].splitlines()
             self.assertIn(f"built {renamed.finding_id} {self.rename} alpha/src/a.rs:1: struct Parent renamed to Renamed in alpha/src/a.rs:1", lines)

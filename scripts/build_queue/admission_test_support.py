@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import test_phase
+from scripts.lib import cancellation, test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
 
@@ -348,6 +348,8 @@ class AdmissionFixture(ExitStack):
         self.root: Path = root if root is not None else self.enter_context(
             build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
                 prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
+        self.temporary: Path = self.root / "tmp"
+        self.temporary.mkdir(parents=True, exist_ok=True)
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
             short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
@@ -376,7 +378,8 @@ class AdmissionFixture(ExitStack):
             "BUILDLOG_RUN": "",
             "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root), **interpreter_cache_environment(self.root / "cache")}
+            "HOME": str(self.root), "TMPDIR": str(self.temporary),
+            **interpreter_cache_environment(self.root / "cache")}
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
@@ -428,16 +431,19 @@ class AdmissionFixture(ExitStack):
 
         worker = threading.Thread(target=serve, name="private-admission-loop")
         self.serving_active.set()
-        worker.start()
         try:
+            cancellation.start_masked_thread(worker)
             yield self
         finally:
             stopped.set()
-            self.server.wake_loop()
-            worker.join(timeout=TEST_HANG_GUARD_SECS)
-            if worker.is_alive():
-                raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
-            self.serving_active.clear()
+            try:
+                if worker.ident is not None:
+                    self.server.wake_loop()
+                    worker.join(timeout=TEST_HANG_GUARD_SECS)
+                    if worker.is_alive():
+                        raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
+            finally:
+                self.serving_active.clear()
             if failures:
                 raise failures[0]
 

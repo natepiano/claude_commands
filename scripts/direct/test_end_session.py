@@ -18,6 +18,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib import unit_runs
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -85,6 +86,7 @@ class EndSessionTests(unittest.TestCase):
             encoding="utf-8",
         )
         python_shim.chmod(0o755)
+        copy_runtime(self.root)
         self.session_id = session_id
 
     def run_pointer(self) -> Path | None:
@@ -100,7 +102,7 @@ class EndSessionTests(unittest.TestCase):
                        if name != "CODEX_THREAD_ID" and not name.startswith("PLAN_DELEGATE_")}
         environment.update({
             "HOME": str(self.root),
-            "PYTHONPATH": os.pathsep.join((str(END_SESSION.resolve().parents[2]), os.environ.get("PYTHONPATH", ""))),
+            "PYTHONPATH": os.pathsep.join((str(END_SESSION.resolve().parents[1] / "lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "CODEX_THREAD_ID": "",
             "COPIES_CONFIG": str(END_SESSION.resolve().parents[2] / "config/copies.conf"),

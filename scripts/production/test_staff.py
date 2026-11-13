@@ -92,8 +92,104 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffCommandTestCase):
+    def test_older_writer_unit_type_on_other_kinds_is_removed(self) -> None:
+        runner, _, worker = self.tree()
+        producer = fixture_member("producer", name="producer")
+        for row in (runner, worker, producer):
+            for value in ("merge", None, {"future": "type"}):
+                with self.subTest(kind=row.kind, value=value):
+                    decoded = staff.StaffRow.from_json({**row.to_json(), "unit_type": value})
+                    self.assertEqual(decoded, row)
+                    self.assertNotIn("unit_type", decoded.to_json())
+                    self.assertNotIn("unit_type", decoded.unknown_fields)
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        rows = cast(list[dict[str, object]], document["rows"])
+        next(item for item in rows if item["id"] == runner.id)["unit_type"] = "merge"
+        self.write_json(self.staff_file, document)
+        self.assertEqual(staff.by_id(runner.id), runner)
+        renamed = staff.rename(runner.id, "renamed")
+        self.assertNotIn("unit_type", renamed.to_json())
+        saved = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertNotIn("unit_type", next(item for item in cast(list[dict[str, object]], saved["rows"])
+                                         if item["id"] == runner.id))
+
+    def test_unit_details_have_distinct_variants(self) -> None:
+        runner, unit, _ = self.tree()
+        self.assertIsInstance(runner.unit_type, staff.NotUnit)
+        self.assertEqual(unit.unit_type, staff.UnitDetails("direct"))
+        self.assertNotIn("__post_init__", staff.StaffRow.__dict__)
+
+    def test_demotion_selects_unit_type_locally_and_remotely(self) -> None:
+        parent, unit, _ = self.tree()
+        location = staff.PresentWorktree("natedev", self.root / "typed-unit")
+        doc = staff.LiveDoc("natedev", self.root / "typed-production.md")
+        for machine in ("natedev", "mac"):
+            for unit_type in staff.UNIT_TYPES:
+                with self.subTest(machine=machine, unit_type=unit_type), self.machine(machine):
+                    promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=doc)
+                    self.assertNotIn("unit_type", promoted.to_json())
+                    demoted = staff.change_director(unit.id,
+                        staff.UnitRole(unit.name, parent.id, location, unit_type=unit_type))
+                    self.assertEqual(demoted.to_json()["unit_type"], unit_type)
+                    self.assertEqual(staff.unit_command(demoted), f"/unit:{unit_type}")
+
+    def test_unit_types_round_trip_and_select_commands(self) -> None:
+        _, unit, _ = self.tree()
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                typed = replace(unit, unit_type=staff.UnitDetails(unit_type))
+                decoded = staff.StaffRow.from_json(typed.to_json())
+                self.assertEqual(decoded, typed)
+                self.assertEqual(decoded.to_json()["unit_type"], unit_type)
+                self.assertNotIn("unit_type", decoded.unknown_fields)
+                self.assertEqual(staff.unit_command(decoded), f"/unit:{unit_type}")
+
+    def test_old_unit_defaults_to_direct_and_writes_the_type_on_change(self) -> None:
+        _, unit, _ = self.tree()
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        fields = next(row for row in cast(list[dict[str, object]], document["rows"]) if row["id"] == unit.id)
+        _ = fields.pop("unit_type", None)
+        self.write_json(self.staff_file, document)
+        decoded = staff.by_id(unit.id)
+        assert decoded is not None
+        self.assertEqual(decoded.unit_type, staff.UnitDetails("direct"))
+        changed = staff.rename(unit.id, "renamed")
+        self.assertEqual(changed.to_json()["unit_type"], "direct")
+        self.assertIn('"unit_type": "direct"', self.staff_file.read_text())
+
+    def test_invalid_unit_type_is_unreadable(self) -> None:
+        _, unit, _ = self.tree()
+        for value in ("unknown", "", None, 1, list[object](), dict[str, object]()):
+            with self.subTest(value=value), self.assertRaisesRegex(staff.StaffUnreadable, "unit_type"):
+                _ = staff.StaffRow.from_json({**unit.to_json(), "unit_type": value})
+
+    def test_other_kinds_drop_stored_unit_type_and_refuse_admission_type(self) -> None:
+        runner, _, worker = self.tree()
+        producer = fixture_member("producer", name="producer")
+        for row in (runner, worker, producer):
+            with self.subTest(kind=row.kind):
+                self.assertNotIn("unit_type", row.to_json())
+                decoded = staff.StaffRow.from_json({**row.to_json(), "unit_type": "direct"})
+                self.assertNotIn("unit_type", decoded.to_json())
+                with self.assertRaisesRegex(staff.StaffRefused, "unit_type"):
+                    _ = staff.ensure(row.kind, name=row.name, parent=row.parent, unit_type="merge")
+                with self.assertRaises(staff.StaffRefused):
+                    _ = staff.unit_command(row)
+
+    def test_mac_admission_preserves_unit_type_and_refuses_conflicts(self) -> None:
+        runner, _, _ = self.tree()
+        with self.machine("mac"):
+            typed = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+                runtime_id=fixture_runtime_id("merge-director"), unit_type="merge")
+            self.assertEqual(typed.unit_type, staff.UnitDetails("merge"))
+            self.assertEqual(staff.ensure("unit", name=typed.name, parent=typed.parent), typed)
+            with self.assertRaisesRegex(staff.StaffRefused, "unit_type"):
+                _ = staff.ensure("unit", name=typed.name, parent=typed.parent, unit_type="style")
+        self.assertEqual(staff.by_id(typed.id), typed)
+
+
     def test_old_row_keeps_unknown_role_and_home_absent(self) -> None:
-        _, _, member = self.tree()
+        _, unit, member = self.tree()
         value = member.to_json()
         self.assertNotIn("role", value)
         self.assertNotIn("home", value)
@@ -104,6 +200,23 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         with redirect_stderr(io.StringIO()):
             staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(self.staff_file.read_bytes(), before)
+        for machine in ("natedev", "mac"):
+            row = fixture_worker(f"home-{machine}", unit.id)
+            initial = self.root / f"{machine}-initial-home"
+            newer = self.root / f"{machine}-newer-home"
+            with self.subTest(machine=machine), self.machine(machine):
+                for requested, flags, expected in ((initial, ("--only-unknown",), initial),
+                                                   (newer, ("--only-unknown",), initial),
+                                                   (newer, (), newer)):
+                    with self.subTest(requested=requested, flags=flags):
+                        before_home = self.staff_state()
+                        result = self.cli("set-home", row.id, str(requested), *flags, "--json")
+                        changed = replace(row, home=staff.SessionHome(expected))
+                        self.assertEqual(json.loads(result.stdout), changed.to_json())
+                        self.assertEqual(staff.by_id(row.id), changed)
+                        if requested == newer and flags:
+                            self.assertEqual(self.staff_state(), before_home)
+        self.assertTrue(any("--only-unknown" in command for command in self.ssh_commands()))
 
     def test_run_pointer_edits_preserve_other_fields_and_a_newer_run(self) -> None:
         _, unit, _ = self.tree()
@@ -371,7 +484,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         before = self.write_document({"schema": 2, "rows": rows, "pending_retire": [unit]})
         record = staff.snapshot()
         self.assertEqual(record.schema, 2)
-        self.assertEqual([row.to_json() for row in record.rows], rows)
+        self.assertEqual([row.to_json() for row in record.rows], [rows[0], {**rows[1], "unit_type": "direct"}])
         self.assertEqual(record.pending_retire, (unit,))
         self.assertIsNone(record.by_current_session(unit))
         self.assertEqual(record.by_current_session(current), record.by_id(staff.StaffId(unit)))
@@ -1099,7 +1212,8 @@ class StaffTests(StaffCommandTestCase):
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
                 promoted = staff.promote_unit(unit.id, name=unit.name, parent=parent.id, doc=document)
-                self.assertEqual(promoted, replace(unit, kind="showrunner", worktree=staff.WORKTREE_UNFILLED, doc=document))
+                self.assertEqual(promoted, replace(unit, kind="showrunner", unit_type=staff.NotUnit(),
+                                                   worktree=staff.WORKTREE_UNFILLED, doc=document))
                 child = fixture_member("unit", name="child-" + machine, parent=promoted.id)
                 retained = fixture_member("worker", name="worker-" + machine, parent=promoted.id)
                 destination = staff.UnitRole(unit.name, parent.id, location)

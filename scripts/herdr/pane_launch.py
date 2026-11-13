@@ -170,6 +170,18 @@ def launch_reference(entry: Mapping[str, object], record: staff.StaffSnapshot) -
     return StaffLaunchReference(owner.id) if owner is not None else NativeLaunchReference(str(entry.get("session_id", "")))
 
 
+def named_references(name: str, record: staff.StaffSnapshot,
+                     entries: Mapping[str, PaneLaunch]) -> set[StaffLaunchReference | NativeLaunchReference]:
+    """Resolve a staff name or a retained native name without reading display labels."""
+    references: set[StaffLaunchReference | NativeLaunchReference] = {
+        StaffLaunchReference(row.id) for row in record.rows
+        if name in (row.name, row.id, row.current_session)}
+    references.update(reference for entry in entries.values()
+        if isinstance(reference := launch_reference(entry, record), NativeLaunchReference)
+        and name in (reference.session, entry.get("name")))
+    return references
+
+
 class UnknownNativePane(Protocol):
     @property
     def pane(self) -> str: ...
@@ -206,32 +218,45 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
                     record: staff.StaffSnapshot, client: NativePaneServer,
                     entries: Mapping[str, PaneLaunch], *,
                     evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT) -> list[dict[str, object]]:
-    """Select the current native pane, or its retained shell after the process stops."""
+    """Select the current native pane, or its newest retained shell after the process stops."""
     owner = record.by_id(reference.id) if isinstance(reference, StaffLaunchReference) else None
     if isinstance(reference, StaffLaunchReference) and owner is None:
         return []
+    panes: Sequence[Mapping[str, object]]
+    found: Mapping[staff.StaffId, Sequence[Mapping[str, object]]]
     if isinstance(evidence, ReadNativePanes):
         panes = [dict(pane) for pane in client.panes()]
-        evidence = NativePaneEvidence(panes, client.scan_row_panes(record, panes))
-    unknown = {item.pane for item in evidence.scan.unknown}
-    if isinstance(reference, StaffLaunchReference):
-        matches = evidence.scan.found.get(reference.id, ())
+        scan = client.scan_row_panes(record, [dict(pane) for pane in panes])
+        found = scan.found
+        unknown = {item.pane for item in scan.unknown}
     else:
-        matches = [pane for pane in evidence.panes if str(pane["pane_id"]) not in unknown
-                   and reference.session in _pane_native_sessions(client, pane)]
+        panes = evidence.panes
+        found = evidence.scan.found
+        unknown = {item.pane for item in evidence.scan.unknown}
+    decoded: dict[str, set[str]] = {}
+    if isinstance(reference, StaffLaunchReference):
+        matches = found.get(reference.id, ())
+    else:
+        decoded = {str(pane["pane_id"]): native_sessions(client, pane) for pane in panes
+                   if str(pane["pane_id"]) not in unknown}
+        matches = [pane for pane in panes if reference.session in decoded.get(str(pane["pane_id"]), set())]
     if matches:
         return [dict(pane) for pane in matches]
     retained = {pane for pane, entry in entries.items() if launch_reference(entry, record) == reference
                 or isinstance(reference, NativeLaunchReference) and entry.get("session_id") == reference.session}
-    occupied = {str(pane["pane_id"]) for matches in evidence.scan.found.values() for pane in matches}
-    candidates = [pane for pane in evidence.panes
+    occupied = {str(pane["pane_id"]) for matches in found.values() for pane in matches}
+    candidates = [pane for pane in panes
                   if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
-                  and str(pane["pane_id"]) not in unknown]
+                  and (owner is None or owner.kind != "worker" or str(pane["pane_id"]) not in unknown)]
     if owner is not None:
-        return [dict(pane) for pane in candidates
-                if _retained_native_owner(client, pane, owner, record)]
-    return [dict(pane) for pane in candidates if not any(record.by_member_reference(identity) is not None
-            for identity in _pane_native_sessions(client, pane))]
+        retained_matches = [dict(pane) for pane in candidates
+                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
+                                _retained_native_owner(client, pane, owner, record))]
+    else:
+        retained_matches = [dict(pane) for pane in candidates
+                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
+                                not decoded[str(pane["pane_id"])])]
+    return sorted(retained_matches, key=lambda pane: entries[str(pane["pane_id"])]["written_at"], reverse=True)[:1]
 
 
 class NativePaneDecoder(Protocol):
@@ -241,8 +266,12 @@ class NativePaneDecoder(Protocol):
                             pane: Mapping[str, object]) -> CurrentProcessEvidence: ...
 
 
-def _pane_native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
+def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
     info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
+    return _native_sessions(info, pane)
+
+
+def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
     identities: set[str] = set()
     for process in cast(list[dict[str, object]], info.get("foreground_processes", [])):
@@ -253,11 +282,26 @@ def _pane_native_sessions(client: NativePaneServer, pane: Mapping[str, object]) 
     return identities
 
 
+def _retained_shell(client: NativePaneServer, pane: Mapping[str, object]) -> bool:
+    """Refresh a retained unknown pane once after its agent can exit."""
+    try:
+        info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
+        shell = info.get("shell_pid")
+        return (isinstance(shell, int) and shell > 0 and info.get("foreground_process_group_id") == shell
+                and not _native_sessions(info, pane))
+    except (OSError, ValueError, herdr_types.HerdrFailure):
+        return False
+
+
 def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
                            owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
-    """Keep the retained pane unless another staffed owner runs there."""
+    """Keep readable retained panes unless another staffed owner runs there."""
+    try:
+        identities = native_sessions(client, pane)
+    except (herdr_types.HerdrFailure, OSError, ValueError):
+        return False
     return all(current is None or current.id == owner.id
-               for identity in _pane_native_sessions(client, pane)
+               for identity in identities
                for current in (record.by_member_reference(identity),))
 
 
@@ -307,11 +351,11 @@ def native_kind(row: staff.StaffRow) -> str:
     """Read the current backend from its native pane or Claude registry."""
     module = import_module("scripts.herdr.herdr")
     session = cast(Callable[[], str], module.shared_session)()
-    client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-    native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-    codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-    claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
     try:
+        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
+        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
+        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
+        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")
@@ -352,14 +396,11 @@ def current_kind(row: staff.StaffRow) -> Literal["claude", "codex"]:
     family = native_kind(row)
     if family in ("claude", "codex"):
         return family
-    from scripts.lib.transcripts import transcript_paths
+    from scripts.lib.transcripts import codex_transcript_homes, transcript_paths
 
-    homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
-    homes.extend(Path.home().glob(".codex*"))
-    if home := os.environ.get("CODEX_HOME"):
-        homes.append(Path(home))
+    extra_homes = (row.home.path,) if isinstance(row.home, staff.SessionHome) else ()
     if any(transcript_paths(home / folder, f"**/*{row.current_session}.jsonl")
-           for home in dict.fromkeys(homes) for folder in ("sessions", "archived_sessions")):
+           for home in codex_transcript_homes(extra_homes) for folder in ("sessions", "archived_sessions")):
         return "codex"
     if (isinstance(row.home, staff.SessionHome) and
             transcript_paths(row.home.path / "projects", f"*/{row.current_session}.jsonl")) or sessions.transcript_locations(row.current_session):
@@ -673,7 +714,7 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
 def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
                       membership: staff.StaffSnapshot, sources: Sequence[Path],
                       request: ProducerLaunchRequest | ProducerLaunchFromStaff) -> None:
-    """Commit one proved producer binding and remove its other bindings without closing panes."""
+    """Commit the producer binding. Keep open prior bindings unless another native owner holds the pane."""
     paths = sorted({path.absolute(), *(source.absolute() for source in sources)})
     if any(source.parent != path.absolute().parent for source in paths):
         raise ValueError("producer publication paths must share the record directory")
@@ -734,9 +775,31 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         raise ValueError("producer process changed before publication")
     committed = retained_launch(launch, membership)
     committed["producer_binding"] = True
-    updates = {source: {pane: entry for pane, entry in entries.items()
-                         if launch_reference(entry, membership) != StaffLaunchReference(owner.id)}
-               for source, entries in records.items()}
+    updates = {source: entries.copy() for source, entries in records.items()}
+    for source, entries in records.items():
+        prior = {pane for pane, entry in entries.items()
+                 if launch_reference(entry, membership) == StaffLaunchReference(owner.id)
+                 and (source != path.absolute() or pane != launch["pane_id"])}
+        if not prior:
+            continue
+        try:
+            client = cast(Callable[[str], NativePaneServer],
+                          import_module("scripts.herdr.herdr").Herdr)(source.stem)
+            present = {str(pane["pane_id"]): pane for pane in client.panes()}
+        except (OSError, ValueError, herdr_types.HerdrFailure):
+            continue
+        dropped = prior - present.keys()
+        for pane in prior & present.keys():
+            try:
+                identities = native_sessions(client, present[pane])
+                if identities and all(current is not None and current.id != owner.id
+                                      for identity in identities
+                                      for current in (membership.by_member_reference(identity),)):
+                    dropped.add(pane)
+            except (OSError, ValueError, herdr_types.HerdrFailure):
+                continue
+        for pane in dropped:
+            del updates[source][pane]
     updates[path.absolute()][launch["pane_id"]] = committed
     changed = {source: entries for source, entries in updates.items() if entries != records[source]}
     if len(changed) > 1:
@@ -818,6 +881,7 @@ class ResumeSourcePane:
 
 class ResumeSourceAbsent(Enum):
     CURRENT = "the operation found no source pane"
+    OTHER_OWNER = "another native owner holds the recorded pane"
 
 
 def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
@@ -954,7 +1018,7 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                            source_pane=source_pane)
         raise
     source_close = close if isinstance(close_source, ResumeRecord) else close_source
-    if source and source_close(source) is not True:
+    if source_pane is not ResumeSourceAbsent.OTHER_OWNER and (not source or source_close(source) is not True):
         return
     if destination_path == path:
         retire_launch(path, original["pane_id"], original, replacement=retained)

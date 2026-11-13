@@ -3,6 +3,8 @@
 
 A visible trailer has three fields and an optional fourth field: after <step>.
 An invisible change uses Change-Review: none — <reason>.
+Every supplied review line must parse, whatever the commit subject.
+Only checkpoints that change more than Markdown require a review line.
 See commands/change_review.md for actions, list selection, urgency, verdicts, and scratch folders.
 
 An open Production cell holds its unit's fixed staff id or its showrunner's fixed staff id.
@@ -187,10 +189,8 @@ def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
 
 def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
     """Why a commit's message fails the rule, or the empty string."""
-    if not needs_trailer(subject, files):
-        return ""
     found = entries(message)
-    if not found:
+    if not found and needs_trailer(subject, files):
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
@@ -291,7 +291,7 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
 
 
 def missing(commits: list[Commit]) -> list[str]:
-    """Each checkpoint without a good line that no passing commit names in a Change-Review-Covers line.
+    """Each invalid commit that no passing commit names in a Change-Review-Covers line.
 
     A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
     """
@@ -331,9 +331,11 @@ def visible(commits: list[Commit]) -> list[Visible]:
     return [item for _, item in _checkpoint_entries(commits)]
 
 
-def _line_value(doc: Path) -> str | None:
+def _line_value(doc: Path, *, sources: list[Path] | None = None) -> str | None:
     """The path the doc's Change review line names: its first `quoted` part, else the words before
     any ` — ` note. None when the doc has no line."""
+    if sources is not None:
+        sources.append(doc)
     for line in doc.read_text(encoding="utf-8").splitlines():
         if line.startswith(LIST_HEADER):
             value = line.removeprefix(LIST_HEADER).strip()
@@ -343,19 +345,23 @@ def _line_value(doc: Path) -> str | None:
 
 
 def list_path(doc: Path, *,
-              record: staff.StaffSnapshot | None = None) -> Path | None:
+              record: staff.StaffSnapshot | None = None, sources: list[Path] | None = None) -> Path | None:
     """Return the root showrunner's list, or the document's path when its owner cannot be resolved.
 
     Return None when the document has no Change review line.
     Report a different path in that line.
     """
-    value = _line_value(doc)
+    value = _line_value(doc, sources=sources)
     if value is None:
         return None
     named = Path(value).expanduser() if value else None
     try:
-        derived = list_file(showrunner_of(doc, record=record))
-    except (ChangeReviewError, OSError):
+        derived = list_file(showrunner_of(doc, record=record), sources=sources)
+    except OSError:
+        if sources is not None:
+            raise
+        return named
+    except ChangeReviewError:
         return named
     if named is not None and named.absolute() != derived.absolute():
         print(f"change review: {doc} names {named} in its Change review line; the list is {derived}",
@@ -402,14 +408,44 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else BODY
 
 
-def list_file(showrunner: str) -> Path:
+def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
-    return lists_directory() / f"{PREFIX}{showrunner}.md"
+    folder = lists_directory() if sources is None else lists_directory(sources=sources)
+    return folder / f"{PREFIX}{showrunner}.md"
 
 
 def _owner(path: Path) -> str:
     """The showrunner a list is named for."""
     return path.stem.removeprefix(PREFIX)
+
+
+def display_id(row: dict[str, str], showrunner: str) -> str:
+    """Show the current responsible showrunner beside the local row number."""
+    return f"{showrunner}/{row['#'].rpartition('/')[2]}"
+
+
+def review_routing(paths: Iterable[Path]) -> change_routing.StaffRouting:
+    """Prepare the shared staff resolver for the requested lists."""
+    return _routing_from_snapshots(_review_snapshots(paths))
+
+
+def _routing_from_snapshots(snapshots: Mapping[Path, ReviewListSnapshot]) -> change_routing.StaffRouting:
+    """Resolve ownership from the same list reads used for row lookup."""
+    record = staff.snapshot()
+    documents = {member.name: member.doc.path for member in record.find(kind="showrunner")
+                 if isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))}
+    documents = change_routing.production_documents(documents,
+        ((_owner(path), snapshot.text) for path, snapshot in snapshots.items()))
+    return change_routing.StaffRouting(record, documents)
+
+
+def row_display_id(path: Path, row: str) -> str:
+    """Resolve the displayed identity without changing the stored list identity."""
+    local = row.rpartition("/")[2]
+    found = next((item for item in review_rows(path) if item["#"] == local), None)
+    if found is None:
+        raise ChangeReviewError(f"{row} is not on the list to review")
+    return display_id(found, review_routing((path,)).owner(found, path).tab)
 
 
 def _shown(doc: Path) -> str:
@@ -594,27 +630,40 @@ def _number(row_text: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def _merged_day(row: dict[str, str]) -> datetime | None:
+def _merged_day(row: dict[str, str], *, sources: list[Path] | None = None) -> datetime | None:
     """The day the row's Merged cell starts with: the row's age."""
+    merged = row.get("Merged", "")
+    if merged in ("", NOT_YET, "—"):
+        return None
     try:
-        return datetime.fromisoformat(row.get("Merged", "").split(" ", 1)[0])
+        return datetime.fromisoformat(merged.split(" ", 1)[0])
     except ValueError:
+        if sources is not None:
+            raise
         return None
 
 
-def row_entries(rows: list[dict[str, str]]) -> list[urgency.Entry[dict[str, str]]]:
+def row_entries(rows: list[dict[str, str]], *, sources: list[Path] | None = None) -> list[urgency.Entry[dict[str, str]]]:
     """The rows as urgency.py entries, by C number: each with its level, merge day and prerequisite."""
     entries: list[urgency.Entry[dict[str, str]]] = []
     for row in sorted(rows, key=lambda row: _number(row.get("#", ""))):
         level, after = _rank(row)
-        entries.append(urgency.Entry(row.get("#", ""), row, level, _merged_day(row), after=after))
+        entries.append(urgency.Entry(row.get("#", ""), row, level, _merged_day(row, sources=sources), after=after))
     return entries
+
+
+def prerequisite_key(after: str, source: Path, current: Path) -> str:
+    """Map a stored prerequisite to its key in the current list's queue."""
+    if after and "/" not in after and source.absolute() != current.absolute():
+        after = f"{_owner(source)}/{after}"
+    return after.removeprefix(f"{_owner(current)}/")
 
 
 def ordered(rows: list[dict[str, str]], path: Path) -> list[dict[str, str]]:
     """The rows in urgency.py's order: the pinned row first while it waits, then by urgency, then by C
     number; a row the user moved to the end last."""
-    return [entry.item for entry in urgency.queue_order(row_entries(rows), queue(path))]
+    entries = [replace(entry, after=prerequisite_key(entry.after, path, path)) for entry in row_entries(rows)]
+    return [entry.item for entry in urgency.queue_order(entries, queue(path))]
 
 
 def _sort(path: Path, lines: list[str]) -> None:
@@ -766,22 +815,25 @@ def pending(path: Path) -> list[dict[str, str]]:
     return _review_table(path, lines, SECTION)
 
 
-def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None) -> Path:
+def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None,
+               sources: list[Path] | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
 
-    if doc.is_file() and (value := _line_value(doc)):
+    if doc.is_file() and (value := _line_value(doc, sources=sources)):
         return Path(value).expanduser()
     record = staff.snapshot() if record is None else record
     name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
-        return list_file(name)
+        return list_file(name, sources=sources)
     root = showrunner_tree.root_of(name, record=record)
     try:
-        return production_list(name, record=record)
+        return (production_list(name, record=record) if sources is None
+                else production_list(name, record=record, sources=sources))
     except ChangeReviewError:
         if name == root:
             raise
-        return production_list(root, record=record)
+        return (production_list(root, record=record) if sources is None
+                else production_list(root, record=record, sources=sources))
 
 
 @dataclass(frozen=True)
@@ -794,53 +846,56 @@ class ProductionReviewList:
 class ScopedReviewEntry:
     review_list: ProductionReviewList
     entry: urgency.Entry[dict[str, str]]
+    owner: change_routing.ChangeOwner
 
 
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
-                record: staff.StaffSnapshot | None = None) -> tuple[ProductionReviewList, ...]:
+                record: staff.StaffSnapshot | None = None,
+                sources: list[Path] | None = None) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
     record = staff.snapshot() if record is None else record
     owner = _owner(path) if path.name.startswith(PREFIX) else showrunner_of(doc, record=record)
     lists = {path.absolute(): ProductionReviewList(path, owner)}
     for production in scope_docs(doc, below, record=record):
         name = unit_lookup.doc_owner(production, record).name
-        earlier = list_file(name)
+        earlier = list_file(name, sources=sources)
         if earlier.absolute() in lists or earlier.exists():
             lists[earlier.absolute()] = ProductionReviewList(earlier, name)
     return tuple(lists.values())
 
 
 def routed_review_entries(path: Path, doc: Path, below: bool = False,
-                          record: staff.StaffSnapshot | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
-    """Read all source lists before the shared staff rule assigns their rows."""
-    return _routed_review_entries(path, doc, below, record if record is not None else staff.snapshot())
+                          record: staff.StaffSnapshot | None = None, *,
+                          sources: list[Path] | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Read and route lists. A source collector requires complete reads."""
+    return _routed_review_entries(path, doc, below, record if record is not None else staff.snapshot(), sources=sources)
 
 
-def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.StaffSnapshot, *,
+                           sources: list[Path] | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
     """Route all rows with one consistent staff snapshot."""
-    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below, record=record)}
-    for source in lists_directory().glob(PREFIX + "*.md"):
+    if sources is not None:
+        sources.append(doc)
+    listed = {item.path.absolute(): item for item in scope_lists(path, doc, below, record=record, sources=sources)}
+    folder = lists_directory() if sources is None else lists_directory(sources=sources)
+    for source in issues.source_paths(folder, PREFIX + "*.md", sources=sources):
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
     documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
                  if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
-    snapshots: dict[Path, ReviewListSnapshot] = {}
-    for source in listed:
-        try:
-            snapshot = review_snapshot(source)
-        except (ChangeReviewError, OSError, UnicodeError) as error:
-            print(f"change review: {source}: {error}", file=sys.stderr)
-            continue
-        snapshots[source] = snapshot
+    snapshots = _review_snapshots(listed, sources=sources)
     documents = change_routing.production_documents(documents,
         ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
-    routing = change_routing.StaffRouting(record, documents)
-    names = {path.name for path in change_routing.review_root().glob(".review-link-delivery-*")}
+    routing = change_routing.StaffRouting(record, documents, sources=sources)
+    names = {path.name for path in issues.source_paths(
+        change_routing.review_root(sources=sources), ".review-link-delivery-*", sources=sources)}
     routed: list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]] = []
     for source, snapshot in snapshots.items():
-        rows = change_routing.waiting_rows(source, snapshot.pending, names)
+        rows = change_routing.waiting_rows(source, snapshot.pending, names, sources=sources)
         try:
-            entries = row_entries(rows)
+            entries = row_entries(rows, sources=sources)
         except ChangeReviewError as error:
+            if sources is not None:
+                raise ValueError(str(error)) from error
             print(f"change review: {source}: {error}", file=sys.stderr)
             continue
         routed.extend((listed[source], routing.owner(entry.item, source), entry.item) for entry in entries)
@@ -861,15 +916,18 @@ def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[Sc
     record = staff.snapshot()
     scope = review_scope(doc, below, record)
     grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
+    owners: dict[tuple[Path, str], change_routing.ChangeOwner] = {}
     for review_list, owner, row in _routed_review_entries(path, doc, below, record):
         if owner.tab in scope:
             if review_list.path not in grouped:
                 grouped[review_list.path] = (review_list, [])
             grouped[review_list.path][1].append(row)
+            owners[review_list.path, row["#"]] = owner
     found: list[ScopedReviewEntry] = []
     for review_list, rows in grouped.values():
         try:
-            found.extend(ScopedReviewEntry(review_list, entry) for entry in row_entries(rows))
+            found.extend(ScopedReviewEntry(review_list, entry, owners[review_list.path, entry.key])
+                         for entry in row_entries(rows))
         except ChangeReviewError as error:
             print(f"change review: {review_list.path}: {error}", file=sys.stderr)
     return found
@@ -884,15 +942,16 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
 
 
 def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
-    """Keep current-list IDs and pins; name other rows and their prerequisites with their list."""
+    """Show the responsible showrunner while retaining list-based queue keys and prerequisites."""
     entries: list[urgency.Entry[dict[str, str]]] = []
     for scoped in scoped_review_entries(path, doc, below):
         entry = scoped.entry
         prefix = (f"{_owner(scoped.review_list.path)}/"
                   if scoped.review_list.path.absolute() != path.absolute() else "")
         key = prefix + entry.key
-        after = prefix + entry.after if entry.after and "/" not in entry.after else entry.after
-        entries.append(replace(entry, key=key, item=entry.item | {"#": key}, after=after))
+        after = prerequisite_key(entry.after, scoped.review_list.path, path)
+        entries.append(replace(entry, key=key,
+                               item=entry.item | {"#": display_id(entry.item, scoped.owner.tab)}, after=after))
     return entries
 
 
@@ -913,7 +972,11 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
+        routing = review_routing((path,))
+        entries = row_entries(change_routing.waiting_rows(path, pending(path)))
+        return ChangeQueue(queue(path), [replace(entry, item=entry.item | {
+            "#": display_id(entry.item, routing.owner(entry.item, path).tab)},
+            after=prerequisite_key(entry.after, path, path)) for entry in entries])
 
     record = staff.snapshot()
     name = unit_lookup.doc_owner(scope, record).name
@@ -1470,6 +1533,21 @@ def review_snapshot(path: Path) -> ReviewListSnapshot:
     return ReviewListSnapshot(text, pending, reviewed)
 
 
+def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None) -> dict[Path, ReviewListSnapshot]:
+    """Report unreadable lists once. A source collector requires complete reads."""
+    snapshots: dict[Path, ReviewListSnapshot] = {}
+    for path in paths:
+        if sources is not None:
+            sources.append(path)
+        try:
+            snapshots[path] = review_snapshot(path)
+        except (ChangeReviewError, OSError, UnicodeError) as error:
+            if sources is not None:
+                raise ValueError(str(error)) from error
+            print(f"change review: {path}: {error}", file=sys.stderr)
+    return snapshots
+
+
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
     """Classify by whether the change alters something the user runs or sees."""
     if kind not in REVIEW_KINDS:
@@ -1518,17 +1596,18 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     """Save a verdict and remove its scratch folders without printing output."""
     verdict = _words("verdict", verdict)
     local_row = _row_id("row", row.rpartition("/")[2])
+    shown = row_display_id(path, local_row)
     warnings: list[str] = []
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     lines: list[str] = []
     if isinstance(result, VerdictConflict):
-        reason = (f'change review: {row} has the verdict "{result.recorded}" from {result.day}; '
+        reason = (f'change review: {shown} has the verdict "{result.recorded}" from {result.day}; '
                   + 'this verdict is not recorded')
         return VerdictRefused(end_row_scratch(path, local_row), reason, warnings)
     if isinstance(result, VerdictAlreadyRecorded):
-        lines.append(f"{row} already has this verdict ({result.day}); the list is unchanged")
+        lines.append(f"{shown} already has this verdict ({result.day}); the list is unchanged")
     merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
-    lines.append(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+    lines.append(f"{shown} landed" if lands(verdict) else f"{shown} returns to its unit (merged {merged})")
     lines.extend(end_row_scratch(path, local_row))
     return VerdictSaved(lines, warnings)
 
@@ -1570,10 +1649,11 @@ def showrunner_of(doc: Path, *,
     return showrunner_tree.root_of(row.name, record=record)
 
 
-def production_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
+def production_list(production: str, *, record: staff.StaffSnapshot | None = None,
+                    sources: list[Path] | None = None) -> Path:
     """Return the review list for the staff name, or for the calling showrunner when the name is empty."""
     doc = production_doc(production, record=record)
-    path = list_path(doc, record=record)
+    path = list_path(doc, record=record) if sources is None else list_path(doc, record=record, sources=sources)
     if path is None:
         raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     return path
@@ -1814,16 +1894,48 @@ class ReviewRowTarget:
 
 def _row_option(options: CommandLine) -> ReviewRowTarget:
     """The list and local row ID selected by --row, as /next printed it."""
-    name, separator, row = options.row.strip().rpartition("/")
+    return resolve_row(options.row, production=options.production,
+                       review_list=Path(options.list) if options.list else None)
+
+
+def resolve_row(value: str, *, production: str = "", review_list: Path | None = None,
+                selected_list_only: bool = False) -> ReviewRowTarget:
+    """Resolve CLI row inputs with the explicit list or the production's selected list."""
+    name, separator, row = value.strip().rpartition("/")
     row = _row_id("row", row)
+    if separator and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+        raise ChangeReviewError(f"--row {value!r} is not a row id such as C3 or production/C3")
+    if review_list is not None:
+        path = review_list.expanduser()
+    else:
+        try:
+            doc = production_doc(production)
+        except ChangeReviewError:
+            if production or not separator:
+                raise
+            path = list_file(name)
+        else:
+            path = scope_list(doc)
     if not separator:
-        return ReviewRowTarget(_list(options), row)
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
-        raise ChangeReviewError(f"--row {options.row!r} is not a row id such as C3 or production/C3")
-    path = list_file(name)
-    if options.list and Path(options.list).expanduser().resolve() != path.resolve():
-        raise ChangeReviewError(f"--row {options.row} names {path}, which differs from --list {options.list}")
-    return ReviewRowTarget(path, row)
+        return ReviewRowTarget(path, row)
+    paths = ((path,) if review_list is not None or selected_list_only else tuple(dict.fromkeys((path, list_file(name),
+        *sorted(lists_directory().glob(PREFIX + "*.md"))))))
+    snapshots = _review_snapshots(paths)
+    routing = _routing_from_snapshots(snapshots)
+    matches: dict[Path, ReviewRowTarget] = {}
+    for candidate, snapshot in snapshots.items():
+        for item in (*snapshot.pending, *snapshot.reviewed):
+            if item["#"] == row and (name == routing.list_owner(candidate)
+                                      or name == routing.owner(item, candidate).tab):
+                matches[candidate.resolve()] = ReviewRowTarget(candidate, row)
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if matches:
+        choices = ", ".join(str(candidate) for candidate in matches)
+        raise ChangeReviewError(f"{value} matches several lists; pass --list: {choices}")
+    if review_list is not None or selected_list_only:
+        raise ChangeReviewError(f"--row {value} differs from --list {path}; no matching row belongs to that showrunner")
+    raise ChangeReviewError(f"{value} is not on a review list")
 
 
 def _row_id(name: str, value: str) -> str:
@@ -1833,7 +1945,7 @@ def _row_id(name: str, value: str) -> str:
     return row
 
 
-def _rank_option(options: CommandLine) -> str:
+def _rank_option(options: CommandLine, destination: Path) -> str:
     """The Urgency cell --urgency, --due and --after give; empty for a normal row."""
     try:
         level = urgency.read(options.urgency, options.due)
@@ -1841,7 +1953,12 @@ def _rank_option(options: CommandLine) -> str:
         raise ChangeReviewError(str(error)) from None
     if level.level == urgency.USER:
         level = urgency.mark(datetime.now(user_zone()).replace(tzinfo=None))
-    return urgency.cell(level, _row_id("after", options.after) if options.after.strip() else "")
+    after = ""
+    if options.after.strip():
+        target = resolve_row(options.after, production=options.production,
+                             review_list=Path(options.list) if options.list else None, selected_list_only=True)
+        after = target.row if target.path.resolve() == destination.resolve() else f"{_owner(target.path)}/{target.row}"
+    return urgency.cell(level, after)
 
 
 def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
@@ -1859,8 +1976,8 @@ def _run(options: CommandLine) -> int:
             merged = options.merged.strip()
             if merged:
                 _require_main(repo, merged)
-            item, rank = _visible(options), _rank_option(options)
             path = _list(options)
+            item, rank = _visible(options), _rank_option(options, path)
             record = staff.snapshot()
             rows = append_rows(path, [item], today(), merged, production_doc(options.production), rank,
                                producers=[producer_at(repo, record)], record=record)
@@ -1891,7 +2008,7 @@ def _run(options: CommandLine) -> int:
             print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
-            result = save_verdict(target.path, options.row.strip(), options.verdict, production_doc(options.production))
+            result = save_verdict(target.path, target.row, options.verdict, production_doc(options.production))
             for warning in result.warnings:
                 print(warning, file=sys.stderr)
             if isinstance(result, VerdictRefused):

@@ -301,6 +301,24 @@ class IndexTests(unittest.TestCase):
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
 
+    def test_vcpu_schema_rebuild_keeps_old_records_and_reads_new_counts(self) -> None:
+        old: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "old", "host": "natedev"}
+        new: Record = {**old, "id": "new", "vcpus": 16}
+        self.write(self.host_file, old, new)
+        columns, key, description = index.TABLES["gate_runs"]
+        old_columns = [column for column in columns if column[0] != "vcpus"]
+        with mock.patch.dict(index.TABLES, {"gate_runs": (old_columns, key, description)}), \
+                mock.patch.object(index, "SCHEMA_VERSION", index.SCHEMA_VERSION - 1), \
+                mock.patch.object(index, "GATE_RUN_COLUMNS", old_columns):
+            self.assertEqual(index.update(), 2)
+            old_path = index.index_path()
+            self.assertEqual(self.rows("SELECT id FROM gate_runs ORDER BY id"), [("new",), ("old",)])
+        self.assertEqual(index.update(), 2)
+        self.assertNotEqual(index.index_path(), old_path)
+        self.assertEqual(self.rows("SELECT id, vcpus FROM gate_runs ORDER BY id"), [("new", 16), ("old", None)])
+        with closing(sqlite3.connect(old_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM gate_runs").fetchone(), (2,))
+
     def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
         template = gate_run()["modules"][0]
         run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
@@ -464,8 +482,8 @@ class IndexTests(unittest.TestCase):
         sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
         for path in sidecars:
             _ = path.write_bytes(b"old schema sidecar")
-        os.utime(old_path, (old, old))
-        os.utime(recent_path, (old, recent))
+        for path, accessed, modified in ((old_path, recent, old), (recent_path, old, recent)):
+            os.utime(path, (accessed, modified))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
@@ -477,7 +495,7 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(recent_path.is_file())
         os.utime(recent_path, (recent, old))
         self.assertEqual(index.update(), 0)
-        self.assertTrue(recent_path.is_file())
+        self.assertFalse(recent_path.exists())
         self.assertEqual(self.ids(), ["retained"])
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
         self.assertEqual(index.update(), 0)

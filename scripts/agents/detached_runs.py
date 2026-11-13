@@ -3,7 +3,8 @@
 
 Start writes a run record and returns after it starts the supervisor.
 The supervisor runs the command and delivers its result to the current worker.
-Reap delivers results for records whose supervisor disappeared.
+Reap finishes records whose supervisor disappeared and delivers their results.
+Stop a run through its supervisor's process group, including scoped commands.
 Exit 3 means that no registered worker owns the caller.
 """
 
@@ -31,13 +32,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
@@ -61,7 +62,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
-FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in builds-detached.slice, a child of builds.slice.
 # The parent slice's memory limit and CPU weight also apply to the detached command.
 # The scope writes the marker before the command starts.
@@ -81,6 +81,9 @@ class RunRecord(TypedDict):
     log: str
     started_at: float
     pid: int
+    supervisor_started: NotRequired[str]
+    command_pid: NotRequired[int]
+    command_started: NotRequired[str]
     director_dir: str
     done_message_file: str
     # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
@@ -226,25 +229,62 @@ def _number(value: object, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+def _group_is_live(group: int) -> bool:
+    """Keep the run pending while its group has live processes or cannot be read."""
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
+                                capture_output=True, text=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return True
+        if int(fields[0]) == group and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def _saved_process(pid: object, started: object) -> process_start.ProcessStart:
+    """Read the saved process identity and reject a reused PID."""
+    if not isinstance(started, str) or not started or _integer(pid) <= 0:
+        return process_start.Gone()
+    observed = process_start.process_start(_integer(pid))
+    if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
+        return process_start.Gone()
+    return observed
+
+
 def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
-    """A running record that no supervisor runs. A record with no pid yet is still starting for its
-    first minute: `start` writes the record before it spawns the supervisor."""
+    """Recover a running record after its command and owned group processes end."""
     if raw.get("status") != "running":
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        return not detached_run_process.supervises(pid, path)
+        if detached_run_process.supervises(pid, path):
+            return False
+        command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
+        if isinstance(command, (process_start.Started, process_start.Unreadable)):
+            return False
+        supervisor = _saved_process(pid, raw.get("supervisor_started"))
+        owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
+        if not owns_group and isinstance(command, process_start.Zombie):
+            try:
+                owns_group = os.getpgid(_integer(raw.get("command_pid"))) == pid
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        return not owns_group or not _group_is_live(pid)
     started = _number(raw.get("started_at"), now)
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
-    """End each running record whose supervisor is gone, of one worker or of all, and return their run ids.
+    """Recover results after the command and owned group processes end.
 
-    Its worker gets a FAIL result with no exit status, unless a newer run of the same command in
-    the same folder answers for it. On 2026-10-22 a unit stopped 23 queued runs by their process
-    group; a supervisor that dies that way delivers nothing, and its worker waited for a result
-    that never came. A claim file keeps two callers from delivering one result twice.
+    Deliver the saved command status when available.
+    A claim file prevents duplicate delivery.
     """
     runs = _runs_dir(session_dir)
     if not runs.is_dir():
@@ -643,22 +683,35 @@ def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
-    """Run the command with its output appended to the log, forward signals to it, and return its status."""
+    """Publish the child identity before the command runs in the supervisor's group."""
+    # The shell keeps its PID across exec and waits for identity publication.
+    gate = 'read -r ready || exit 125; exec 0</dev/null; exec "$@"'
     try:
         with log.open("ab") as output:
-            child = subprocess.Popen(command, env=environment,
-                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+            child = subprocess.Popen(["/bin/sh", "-c", gate, "detached-command", *command],
+                                     env=environment, process_group=os.getpgrp(),
+                                     stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
             _ = output.write(f"detached_runs: command did not start: {exc}\n")
         return 127
 
-    def forward(signum: int, _frame: FrameType | None) -> None:
-        with contextlib.suppress(OSError):
-            child.send_signal(signum)
-
-    for forwarded in FORWARDED_SIGNALS:
-        _ = signal.signal(forwarded, forward)
+    assert child.stdin is not None
+    with child.stdin:
+        started = process_start.process_start(child.pid)
+        if not isinstance(started, process_start.Started):
+            with log.open("a", encoding="utf-8") as output:
+                _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
+        else:
+            path = Path(environment["UNIT_DETACHED_RECORD"])
+            with record_lock(path):
+                record = _read_record(path)
+                record.update(command_pid=child.pid, command_started=started.start)
+                supervisor = process_start.process_start(os.getpid())
+                if isinstance(supervisor, process_start.Started):
+                    record["supervisor_started"] = supervisor.start
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            _ = child.stdin.write(b"start\n")
     return _exit_status(child.wait())
 
 
@@ -671,11 +724,19 @@ def command_supervise(args: argparse.Namespace) -> int:
             record["pid"] = os.getpid()
             record = _write_record(record_path, record)
     environment = dict(os.environ)
+    from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+    paths = inherited_paths(environment.get("PYTHONPATH", ""))
+    if paths:
+        environment["PYTHONPATH"] = os.pathsep.join(paths)
+    else:
+        _ = environment.pop("PYTHONPATH", None)
     environment.update({
         "UNIT_DETACHED_RUN": "1",
         "UNIT_RUN_DIR": record["session_dir"],
         "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
         "UNIT_DETACHED_RECORD": str(record_path.resolve()),
+        "BUILDLOG_OWNER_STAFF_ID": record["staff_id"],
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
@@ -701,6 +762,22 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_record_exit(args: argparse.Namespace) -> int:
+    """Save the command status before its orphan record is completed."""
+    path = Path(str(getattr(args, "record", "")))
+    caller = os.getppid()
+    with record_lock(path):
+        record = _read_record(path)
+        if record["status"] != "running" or record.get("command_pid") != caller:
+            return 0
+        started = _saved_process(caller, record.get("command_started"))
+        if not isinstance(started, process_start.Started):
+            return 0
+        record["exit_code"] = int(getattr(args, "exit_code", 0))
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    return 0
+
+
 def command_reap(args: argparse.Namespace) -> int:
     for run_id in reap_orphans(str(getattr(args, "session_dir", "")), str(getattr(args, "worker", "") or "")):
         print(f"run {run_id} ended: its supervisor is gone")
@@ -721,6 +798,10 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    record_exit = verbs.add_parser("record-exit", help="save a command status without completing its run")
+    _ = record_exit.add_argument("record")
+    _ = record_exit.add_argument("exit_code", type=int, choices=range(256))
+    record_exit.set_defaults(handler=command_record_exit)
     delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)
@@ -734,4 +815,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["supervise"]:
+        for number in CANCELLATION_SIGNALS:
+            _ = signal.signal(number, signal.SIG_DFL)
     sys.exit(main())

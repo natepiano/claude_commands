@@ -125,9 +125,9 @@ class AdminSecretTests(unittest.TestCase):
         output, errors = StringIO(), StringIO()
         with mock.patch.object(admin_secrets, 'read_hidden', return_value='test-passphrase') as prompt, \
              redirect_stdout(output), redirect_stderr(errors):
-            _ = subject.price()
+            _ = subject.admin.executor(execute)(['aws', 'ec2', 'describe-spot-price-history'], capture_output=True, text=True, timeout=1, check=False)
             _ = box.Tailnet(self.settings, subject.admin, transport).call('GET', 'acl')
-            _ = subject.price()
+            _ = subject.admin.executor(execute)(['aws', 'ec2', 'describe-spot-price-history'], capture_output=True, text=True, timeout=1, check=False)
             prompt.assert_called_once()
         self.assertEqual(len(calls), 2)
         self.assertEqual(requests, ['oauth/token', 'tailnet/-/acl'])
@@ -148,7 +148,7 @@ class AdminSecretTests(unittest.TestCase):
                     _ = (self.path.parent / 'tailscale-oauth').write_text('{}')
                 with mock.patch.object(admin_secrets, 'read_hidden') as prompt:
                     with self.assertRaisesRegex(admin_secrets.SecretsRefused, 'deploy.py secrets'):
-                        _ = deploy.Deployment(self.settings, self.root / 'state', self.root / 'bundle').up(approve_resources=True)
+                        _ = deploy.Deployment(self.settings, self.root / 'state', self.root / 'bundle').gate_up(approve_resources=True)
                     prompt.assert_not_called()
 
     def test_secrets_import_removes_only_admin_and_keeps_scaler_after_encryption(self) -> None:
@@ -200,6 +200,42 @@ class AdminSecretTests(unittest.TestCase):
         self.assertIsNone(cast(object, failure.exception.output))
         self.assertIsNone(failure.exception.stderr)
         self.assertEqual(cast(object, failure.exception.cmd), 'administrator AWS command')
+
+    def test_redaction_removes_credential_fields_without_loaded_credentials(self) -> None:
+        session = admin_secrets.AdminSecretSession(self.settings)
+        for field in ('AWS_SECRET_ACCESS_KEY=', 'SecretAccessKey: ', 'secret access key: ',
+                      'AWS_SESSION_TOKEN=', 'SessionToken: ', 'security_token=',
+                      'X-Amz-Security-Token: ', 'Authorization: ', 'Signature=', 'Credential=',
+                      'X-Amz-Credential=', 'X-Amz-Signature=', '"SecretAccessKey": '):
+            with self.subTest(field=field):
+                message = 'AccessDenied: ' + field + 'fixture-secret\nfixture-secret-tail'
+                redacted = session.redact(message)
+                self.assertEqual(redacted, 'AccessDenied: ' + field + '[redacted]')
+                self.assertEqual(session.redact(redacted), redacted)
+
+    def test_repeated_redaction_preserves_reports_after_credential_markers(self) -> None:
+        session = admin_secrets.AdminSecretSession(self.settings)
+        for field in ('AWS_SESSION_TOKEN=', 'AWS_SESSION_TOKEN= ', 'X-Amz-Security-Token: '):
+            with self.subTest(field=field):
+                redacted = session.redact('AccessDenied: ' + field + 'fixture-token')
+                report = redacted + '\nFoundation: CREATE_FAILED\nstack status: CREATE_FAILED'
+                self.assertEqual(session.redact(report), report)
+                self.assertEqual(session.redact(session.redact(report)), report)
+
+    def test_redaction_is_idempotent_for_identifiers_and_known_credentials(self) -> None:
+        session = admin_secrets.AdminSecretSession(self.settings)
+        session.credentials = VALUES
+        for message in ('test-admin-secret', '123456\n789012', 'AKIAIOSFODNN\n7EXAMPLE',
+                        'arn:aws:iam::123456\n789012:user/fixture', 'i-0123456789abcdef0'):
+            with self.subTest(message=message):
+                redacted = session.redact(message)
+                self.assertEqual(session.redact(redacted), redacted)
+
+    def test_redaction_keeps_known_credentials_hidden_beside_credential_fields(self) -> None:
+        session = admin_secrets.AdminSecretSession(self.settings)
+        session.credentials = VALUES
+        self.assertEqual(session.redact('AccessDenied: test-admin-secret AWS_SESSION_TOKEN=fixture-token'),
+                         'AccessDenied: [redacted] AWS_SESSION_TOKEN=[redacted]')
 
     def test_admin_errors_redact_values_and_reject_inherited_session_tokens(self) -> None:
         self.save()

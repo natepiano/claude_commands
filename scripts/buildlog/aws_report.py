@@ -104,10 +104,13 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     launched = {ledger.text(row, 'attempt'): number(row['time']) for row in rows
                 if row['result'] == 'launched' and 'mode' in row}
     runs: list[FinishedGateRun] = []
+    fallbacks: list[tuple[datetime, dict[str, object]]] = []
     omitted = 0
     for row in rows:
         at = datetime.fromtimestamp(float(str(row['time'])), UTC)
         if start <= at < end:
+            if row['result'] == 'fallback':
+                fallbacks.append((at, row))
             if 'mode' not in row:
                 omitted += 1
             elif row['result'] == 'finished':
@@ -163,6 +166,14 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
         totals.extend((str(len(matching)), median_run_time([run.test_s for run in matching]),
                        median_run_time([run.box_s for run in matching])))
     lines.append('| All shown days | ' + ' | '.join([*totals, trend_cost_cell(runs, allocations)]) + ' |')
+    for at, row in sorted(fallbacks, key=lambda entry: entry[0], reverse=True):
+        reason = next((line.strip() for line in str(row.get('reason', '')).splitlines() if line.strip()),
+                      'Reason unavailable')
+        reason = ' '.join(reason.split())
+        if len(reason) > 200:
+            reason = reason[:197] + '...'
+        mode = str(row.get('mode', 'unknown mode'))
+        lines.extend(('', f'- Cloud gate uses natedev: {reason} ({at:%Y-%m-%d %H:%M:%S UTC}, {mode}).'))
     return GateCostReport([*lines, ''], source)
 
 
