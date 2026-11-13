@@ -3656,7 +3656,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - natedev module CPU 81.5 -> 37.8 s: the rename fixtures read 422,583 live run JSON files on the host. aws pairs 34.319 -> 34.423 CPU s, peak 224.5 -> 227.1 MiB: the aws host has no live run folders, so no gain.
 - The finding is a test-isolation defect; Phase 252 owns the fix for every module.
 
-### Phase 244 — The verify wait holder tests start fewer recorder and target helpers  · status: todo
+### Phase 244 — The verify wait holder tests start fewer recorder and target helpers  · status: done
 **Depends on:** none
 
 #### Work Order
