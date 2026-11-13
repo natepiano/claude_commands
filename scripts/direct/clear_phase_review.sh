@@ -41,8 +41,11 @@ FILES=(
 
 
 # Select reviewers from staff before removing their phase files.
+# A file program keeps the working directory off the import path; a failed read stops the script.
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+REVIEWERS="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/phase_reviewers.py" "${SESSION_DIR}")"
 while IFS= read -r worker; do
+  [[ -n "${worker}" ]] || continue
   FILES+=(
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_status"*
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_pid"*
@@ -50,23 +53,7 @@ while IFS= read -r worker; do
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_reply"*
     "${SESSION_DIR}/phases/${PHASE_ID}/${worker}_agent"*.log
   )
-done < <("${SCRIPT_DIR}/../lib/py" - "${SESSION_DIR}" <<'PYTHON'
-import os
-import sys
-from pathlib import Path
-
-from scripts.direct import progress_history
-from scripts.production import staff, worker_admission
-
-os.environ["UNIT_RUN_DIR"] = sys.argv[1]
-record = staff.local_snapshot()
-parent = worker_admission.parent(record, run=Path(sys.argv[1]))
-for row in record.find(kind="worker", parent=parent.id):
-    dispatch = progress_history.last_dispatch(row.id)
-    if isinstance(dispatch, progress_history.RecordedDispatch) and dispatch.role == "review":
-        print(row.name)
-PYTHON
-)
+done <<< "${REVIEWERS}"
 
 if ((${#FILES[@]})); then
   rm -f -- "${FILES[@]}"
