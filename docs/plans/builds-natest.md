@@ -3518,34 +3518,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `test_merge_gate_suites_signals.py:81` gains two rows (other-checkout token return; deferred rollback under a live holder); both fail on the old code. 230 merge gate tests pass. Checkpoint `2c59524fa`.
 - Open (routed by builds to sdlc devtools): `scripts/lib/build_folders.py:47,262,286` still installs signal handlers on the gate path through `temporary_build_folder()`.
 
-### Phase 228 — The whole-machine cloud guest keeps no shared gate state  · status: todo
+### Phase 228 — The whole-machine cloud guest keeps no shared gate state  · status: done
 **Depends on:** Phase 227
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts.aws_target.test_gate_trial` passes again. A whole-machine gate run keeps its recovery records private and never reads the shared gate state directory.
-
-**Decision:** director, 2026-11-12. Phase 222 (`b17e9b84e`) broke `GuestTests.test_guest_uses_whole_machine_without_types_with_timeout_and_counts`; the test passes at `bd55aa60b` and on origin/builds. The land chain 219–227 waits on this fix. The test stays unchanged: it proves that a tests-only guest touches no shared ledger, CPU pool, hold, governor or state directory.
-
-**Spec:**
-1. Cause: `run_suites()` (`merge_gate.py:1385`) calls `recover_gate_runs(repo)`, and `:1524` enters `gate_recovery(repo)` for every machine kind. Both reach `gate_state_dir()` through `gate_run_directory()` (`:796`) and `:803`. The test patches `gate_state_dir` to raise, so the guest stops before `discover_test_modules`.
-2. Fix: for a `WholeMachine` run, skip shared recovery and keep the run record, its operation lock and its recovery state in a private directory that the run owns (the pattern of `state_directory = gate_state_dir() if shared else tmpfs` at `:1462`). Remove that directory at the run end.
-3. A `SharedMachine` run keeps the Phase 222 and 227 behavior byte for byte: cross-checkout recovery, the shared operation lock, deferred rollback.
-4. Keep the existing whole-machine process-group, folder and token cleanup in the private recovery object. Do not add signal handlers.
-5. Do not edit `scripts/aws_target/test_gate_trial.py`. Add a row to an existing recovery test only when the whole-machine path needs a proof that the guest test does not give.
-6. Run from the worktree root: `scripts/lib/py -m unittest scripts.aws_target.test_gate_trial scripts.aws_target.test_gate_box scripts.aws_target.test_cloud_gate`, and every `scripts/production/test_merge_gate*.py` module. Run basedpyright on each changed file.
-
-**Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/production/test_merge_gate_suites_signals.py` (only for a needed row)
-
-**Workers:** 1 writer; one function path in one file.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 222: no signal handlers; one run record per gate by atomic rename; the next gate start recovers a dead gate's record.
-- Phase 227: shared recovery reads every checkout directory; a live gate holds `operation.lock` shared; rollback takes it `LOCK_EX | LOCK_NB` and defers when busy.
-
-**Acceptance gate:**
-- The guest test passes with no edit to it; all 179 aws target tests pass; all merge gate tests pass; basedpyright clean.
-- sdlc sees the diff before land.
+- Phase 222 made every gate run shared recovery, so the whole-machine guest reached `gate_state_dir()` and `test_gate_trial.py` `GuestTests.test_guest_uses_whole_machine_without_types_with_timeout_and_counts` failed. Now a `WholeMachine` run skips shared recovery (`merge_gate.py:1408`) and keeps its `run.json` and `operation.lock` in a private `merge-gate-recovery-*` directory under tmpfs (`:879`), removed at normal or failed exit. Nested runs keep their existing recovery owner. Shared recovery is unchanged; the guest test is unchanged. 179 aws target tests and 230 merge gate tests pass. Checkpoint `ef465ee86`.
