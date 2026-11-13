@@ -3754,3 +3754,157 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Profile only; no source change. `MergeCheckpointFixture.setUpClass` already builds the repositories once and saves a class snapshot; per-test setup starts no Git command (`FastTrackTests.setUp` 2.6 CPU s over 50 tests).
 - Module 49.1 natedev CPU s: Git 7,446 starts (17.5 s) and `fast_track.py` 22 starts (11.9 s) run inside tested `fast_track.py` behavior (restores, patches, retries, publication, recovery). A test-only change has no budget left.
 - Architecture proposal to sdlc: profile `fast_track.py` itself (0.54 CPU s and about 340 Git starts per run).
+
+### Phase 247 — The offload cleanup tests do less repeated work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `mac_test/test_offload_cleanup.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** Gate median CPU 48.4 s; one test is 77.8 s wall. sdlc owner go 2026-11-13 15:35, profile first.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD mac_test/test_offload_cleanup.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/mac_test/test_offload_cleanup.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 248 — The verify SSH routing tests do less repeated work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_ssh_targets_routing.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** Gate median CPU 48.4 s. sdlc owner go 2026-11-13 15:35, profile first.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_ssh_targets_routing.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_verify_ssh_targets_routing.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 249 — The bulk run tests do less repeated work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_bulk_run.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** Gate median CPU 47.2 s. sdlc owner go 2026-11-13 15:35, profile first.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD style/test_bulk_run.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/style/test_bulk_run.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 250 — The verify Mac-only tests do less repeated work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_mac_only.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** Gate median CPU 46.1 s. sdlc owner go 2026-11-13 15:35, profile first.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_mac_only.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_verify_mac_only.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 251 — The crate run setup removes a partial seed copy  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a failed seed copy in `style/test_crate_run.py` leaves no partial root for the next test.
+
+**Decision:** sdlc go 2026-11-13 15:35: correctness fix; no speed gain needed.
+
+**Spec:**
+1. In `setUp` (`test_crate_run.py:200-201`), register `shutil.rmtree(self.root, ignore_errors=True)` before `shutil.copytree`.
+2. Keep every test and assertion. Run the module once and basedpyright on the file.
+
+**Files:**
+- `scripts/style/test_crate_run.py`
+
+**Workers:** 1 writer.
+- impl: all files.
+
+**Acceptance gate:**
+- The module passes; a probe with a failed copy shows no partial root before the next test.
