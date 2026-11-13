@@ -3747,3 +3747,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The same test count and assertions; the module passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 243 — The rename tests reuse their restored fixture state  · status: todo
+**Depends on:** Phase 236
+
+#### Work Order
+
+**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** Phase 236 profile; sdlc owner go 2026-11-13 14:45 and 15:05 (start on the Phase 236 checkpoint). `FolderRenameTests.test_rename_finishes_a_pending_folder_move_before_renaming_its_folder_and_branch` (`test_shutdown_cli.py:3437`) costs 16.6 natedev CPU s: it restores the fixture and runs real Git moves for 7 interruption points. `UnitRenameTests` identity tests (`:3121`, `:3174`) cost 9.9 s.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Find what each restore and each interruption point repeats that the subtest does not check. Build that state once and copy it per subtest, as Phase 236 did for the retired and resume states. Keep each of the 7 interruption points and its real Git move, branch rename and staff publication. A copy must hold no path into the seed.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/agents/test_shutdown_cli.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 236: class snapshots at fixed roots; `restore_repository` registers the destination removal before the copy (finding F001).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
