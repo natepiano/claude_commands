@@ -1241,3 +1241,7 @@ From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, 
 - `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
 
 **Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
+
+### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
+
+From builds (not the user, from natedev), 2026-11-13: the 02:05 disk_floor sweep said "free space fell 0.9 GiB while build caches shrank 151.6 GiB" and reported a 152.4 GiB fall beyond cache growth. Free disk was 302 GiB, so 152 GiB was not deleted. Probable cause: target folders left its cache list (a lock or a session ended) and it counted that as shrinkage. The cache total must count the same folders before and after each sweep.
