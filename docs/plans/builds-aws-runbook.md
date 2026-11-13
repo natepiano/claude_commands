@@ -108,8 +108,9 @@ After this change reaches the installed scripts:
 2. Run `python3 scripts/aws_target/deploy.py spot-table`, or `/aws_prices` in a session, to inspect the snapshot.
 
 Later reads run through the existing timer.
-`GateGpuTrialScalerPolicy` already allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.
-No `deploy.py up` command is required for this change.
+`GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.
+The deployed stack gets this policy only from `python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources`.
+Until the user runs that command, each hourly read logs `UnauthorizedOperation` for `ec2:DescribeSpotPriceHistory`.
 The snapshot makes only these two read calls.
 It does not use Cost Explorer or create resources.
 
