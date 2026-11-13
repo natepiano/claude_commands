@@ -83,8 +83,13 @@ FAILED_NATEDEV_ALERT = sweep.FloorChannelOutcome.FAILED
 
 def write(path: Path, size: int = SIZE) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Random bytes, so no filesystem stores the file sparse or deduplicated.
-    _ = path.write_bytes(os.urandom(size))
+    with path.open("wb") as handle:
+        if size and sys.platform == "linux":
+            # Allocated blocks count in st_blocks without a write of each byte.
+            os.posix_fallocate(handle.fileno(), 0, size)
+        elif size:
+            # Random bytes, so no filesystem stores the file sparse or deduplicated.
+            _ = handle.write(os.urandom(size))
     return path
 
 
@@ -247,6 +252,11 @@ def reported_floor_targets(text: str) -> set[str]:
             for line in text.splitlines() if "the floor would take" in line}
 
 
+def skip_host_ci_targets(state: Path) -> None:
+    """Point the committed CI targets, real folders on natedev, at a missing folder."""
+    _ = write_config_fixture(conf.path("lint"), f"sweep_ci_targets={state / 'no-ci-target'}\n")
+
+
 class SweepCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -256,6 +266,7 @@ class SweepCase(unittest.TestCase):
             tmp_sweep.STATE_ENV: str(state / "sweep"),
             "BUILDLOG_DIR": str(state / "buildlog"),
         })))
+        skip_host_ci_targets(state)
 
     def target(self) -> Target:
         return Target(Path(self.enterContext(tempfile.TemporaryDirectory())).resolve())
@@ -7086,6 +7097,7 @@ class MacFloorTests(SweepCase):
             with self.subTest(claim_after_scan=after_scan):
                 isolated = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
                 with local_remote_transport(isolated), warm_claim_servers():
+                    skip_host_ci_targets(isolated)
                     late_tree, late_payload = cargo_target(isolated, "unleased", APP, time.time() - DAY)
                     _ = (late_tree.parent / sweep.USE_STAMP).write_text("")
                     paths = mac_test.state_paths()
