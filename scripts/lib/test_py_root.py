@@ -296,6 +296,23 @@ class PythonRootTests(unittest.TestCase):
                     self.assertEqual(result.stderr, "")
                     self.assertEqual(json.loads(result.stdout), [str(child / "scripts")])
 
+    def test_failed_startup_hook_is_not_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            shim = self.checkout(base / "selected", "selected")
+            hook = base / "hook"
+            hook.mkdir()
+            _ = (hook / "sitecustomize.py").write_text("raise RuntimeError('failed startup hook')\n")
+            environment = {**os.environ, "PYTHONPATH": str(hook), "XDG_CACHE_HOME": str(base / "cache")}
+            result = subprocess.run(
+                [str(shim), "-c", "import sys; print(len(sys.modules['_devtools_checkout'].__dict__.get('startup_hooks', [])))"],
+                cwd=base, env=environment, capture_output=True, text=True,
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("RuntimeError: failed startup hook", result.stderr)
+            self.assertEqual(result.stdout.strip(), "0")
+
     def test_copy_imports_stay_in_the_copy(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

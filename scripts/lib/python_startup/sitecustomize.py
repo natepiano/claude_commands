@@ -123,8 +123,8 @@ def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
         module = module_from_spec(spec)
         # Keep hook contexts active for the process lifetime.
         hooks = cast(list[ModuleType], sys.modules["_devtools_checkout"].__dict__.setdefault("startup_hooks", []))
-        hooks.append(module)
         spec.loader.exec_module(module)
+        hooks.append(module)
 
 
 # Reuse this module when an entry loads package_root.py.
