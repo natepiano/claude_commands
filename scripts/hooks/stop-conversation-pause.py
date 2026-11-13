@@ -78,7 +78,9 @@ def main() -> None:
         if records_scheduled_prompts:
             conversation_pause.record_scheduled_prompts(
                 session_id,
-                tuple(wakeup["prompt"] for wakeup in wakeups),
+                tuple(conversation_pause.ScheduledTaskPrompt(
+                    wakeup["id"], wakeup["prompt"], wakeup["recurring"]
+                ) for wakeup in wakeups),
             )
         if marks_reply_ended:
             conversation_pause.mark_reply_ended(
