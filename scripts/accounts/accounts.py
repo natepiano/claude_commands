@@ -4264,6 +4264,18 @@ class StatusRow:
 
 
 @dataclass(frozen=True)
+class UseTableProblemLines:
+    """All supplied table notes also belong in panes."""
+
+
+@dataclass(frozen=True)
+class PaneProblemLines:
+    """Classified status lines that belong in account panes."""
+
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class StatusReading:
     rows: tuple[StatusRow, ...]
     notes: tuple[str, ...]
@@ -4273,6 +4285,10 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
+    pane_problems: PaneProblemLines | UseTableProblemLines = field(default_factory=UseTableProblemLines)
+
+    def pane_problem_lines(self) -> tuple[str, ...]:
+        return self.pane_problems.lines if isinstance(self.pane_problems, PaneProblemLines) else self.notes
 
 
 class StatusAccountDocument(TypedDict):
@@ -4421,7 +4437,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.pane_problem_lines()]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4430,6 +4446,11 @@ ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage"
 @dataclass(frozen=True)
 class NoSeparateCause:
     """The fault itself states all that is known about its cause."""
+
+
+@dataclass(frozen=True)
+class SharedHomeRepair:
+    """Shared home entries need repair outside account panes."""
 
 
 @dataclass(frozen=True)
@@ -4518,7 +4539,7 @@ class StatusProblem:
 
     subject: str
     wrong: str
-    cause: ProblemCause | NoSeparateCause
+    cause: ProblemCause | NoSeparateCause | SharedHomeRepair
     step: ProblemStep | NoUserStep
     footnote: bool = False
     origin: Literal["diagnostic", "account state", "role"] = "diagnostic"
@@ -4705,9 +4726,12 @@ def status_check_problem(text: str, subject: str, *, setup: str, login: str,
     if primary.endswith(" is a link"):
         return StatusProblem(subject, "private file is linked", ProblemCause("check", text, CauseFile(primary.removesuffix(" is a link"))),
             ProblemStep("use a private file in this home; " + setup))
+    shared_repair = primary.endswith(" is a real file") or (primary.startswith("repair ") and any(
+        marker in primary for marker in (": resolve clashing entries ", ": move its contents into a shared folder at ",
+                                        ": atomic no-replace moves to ", ": could not move into ")))
     if primary.startswith(subject + " "):
         primary = primary[len(subject) + 1:]
-    return StatusProblem(subject, primary, NoSeparateCause(), step)
+    return StatusProblem(subject, primary, SharedHomeRepair() if shared_repair else NoSeparateCause(), step)
 
 
 def _account_state_problems(status: AccountStatus | CodexStatus) -> list[StatusProblem]:
@@ -5038,8 +5062,11 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     problems.extend(diagnostics)
     for problem in problems:
         _observe_status_problem(problem)
-    notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
+    merged = merge_status_problems(problems)
+    notes = [render_status_problem(problem) for problem in merged]
     notes.extend(count_problems)
+    pane_problems = PaneProblemLines((*(render_status_problem(problem) for problem in merged
+                                       if not isinstance(problem.cause, SharedHomeRepair)), *count_problems))
     detail_lines: tuple[str, ...] = ()
     if detail:
         journal = moves.read_journal()
@@ -5047,7 +5074,8 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
             *_move_status_lines(moves.account_moves(journal), zone, account_config=account_config), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs)
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs,
+                         pane_problems=pane_problems)
 
 
 @dataclass
@@ -5183,6 +5211,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    pane_notes = list(reading.pane_problem_lines())
     warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
@@ -5195,9 +5224,12 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         warning_groups.setdefault(key, []).append(line)
     for (kind, cause), lines in warning_groups.items():
         warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
-        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", warning), NoUserStep())))
-    return replace(reading, notes=tuple(dict.fromkeys(notes)))
+        rendered = render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", warning), NoUserStep()))
+        notes.append(rendered)
+        pane_notes.append(rendered)
+    return replace(reading, notes=tuple(dict.fromkeys(notes)),
+                   pane_problems=PaneProblemLines(tuple(dict.fromkeys(pane_notes))))
 
 
 def _upcoming_move_lines() -> tuple[str, ...]:

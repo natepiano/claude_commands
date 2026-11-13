@@ -322,6 +322,10 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+Status classifies shared-home repairs before rendering.
+The text board keeps these repair lines.
+JSON omits these lines from `problems`, so cargo-handler and unit-board panes do not show them.
+All other problem lines remain in JSON.
 Each account row exports `sessions` beside `role_counts`.
 Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
