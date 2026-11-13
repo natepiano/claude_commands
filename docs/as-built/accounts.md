@@ -307,6 +307,7 @@ It ends each open pass of a stopped worker as `canceled`, also for a Codex worke
 It closes the pane of a stopped worker when the close checks permit. Claude workers are not touched.
 Each affected director gets one stop report. A worker that is not proved stopped, or a pass that is not canceled, also goes to `faults_to`.
 A live detached run of a stopped worker continues; the report names its result file and its log.
+Its result goes to the director: `send.deliver_worker_text` sends the text for a stopped or closed worker to the holder and starts no worker.
 No command starts workers when the flag goes off; the next assign of a director starts its worker.
 
 The credits setting of the hold owner releases a credits-off hold: when `codex_credit_accounts` names the owner again, routing can return before the hold time.

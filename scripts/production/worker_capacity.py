@@ -7,6 +7,9 @@ affected unit director gets one report. Claude workers are not touched.
 
 No command starts workers again. When capacity returns, quota_alert.py sends
 the notice, and the next assign of a unit director starts its worker.
+
+A live detached run of a stopped worker continues. Its result goes to the
+director, because delivery to a stopped or closed worker goes to the holder.
 """
 from __future__ import annotations
 try:

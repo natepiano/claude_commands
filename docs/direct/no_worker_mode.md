@@ -12,7 +12,7 @@ The no-capacity broadcast stops every Codex worker on the machine; you stop none
 - `Stopped` names each worker whose process it stopped.
 - `Passes ended as canceled` names each worker whose open pass it ended. Continue that work from the worktree as a director activity; do not redispatch the pass.
 - `Pass stays open` names a pass that it could not end, with the cause. Tell your showrunner.
-- `Detached run continues` names a run that is not stopped, with its result file and its log. Read the result when the run ends.
+- `Detached run continues` names a run that is not stopped, with its result file and its log. Its result comes to you when the run ends; it starts no worker.
 - `Not proved stopped` names a worker that can still run. Send it no work; your showrunner gets the same fault.
 Claude workers are not stopped. The workers-back notice starts no worker; your next assign starts it.
 
