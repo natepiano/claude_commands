@@ -2410,45 +2410,16 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 116 — The Mac idle alert counts a running hana CI Mac job as Mac work  · status: done
 
-**Depends on:** Phase 114 (it runs first; no shared file).
+#### As-built
 
-**Source (2026-11-13, builds showrunner):** "The real defect is the alert: buildlog/mac_idle_alert.py and the page banner said 'MAC IDLE 11 min ... Blocked by research' while hana CI compiled and tested on the Mac. The alert has no CI input. Fix: a running CI Mac job counts as Mac work, so no idle alert fires; a pending block reads that it waits for hana CI to finish on the Mac."
-
-#### Work Order
-
-**Goal:** while hana CI's Mac job runs on the Mac, the Mac idle watch gives no idle alert, and a pending block says that it waits for hana CI to finish on the Mac.
-
-**Measured:**
-1. Run 43433403496: `macOS: Compile and Test` ran on `hana-macos` from 10:44:51 to 11:25:43 EST (a 23 min test build, then 17 min of tests). Research's block was pending from 11:00 to 11:26. The banner said `MAC IDLE 11 min ... Blocked by research`.
-2. `ci_activity()` (`scripts/mac_test/mac_test.py`) gives `CI_BUSY` when the `ci_job` of a queued or running CI run is not completed. It does not tell a running Mac job from one that has not started.
-3. A pending block saves `waiting_on` as `{"kind": "ci_job"}` (`WaitingOnCiJob` in `scripts/mac_test/claim_state.py`).
-4. `mac_work()` (`scripts/buildlog/mac_idle.py`) returns `IdleReservation("blocked", …)` for every block that is not `NoMacBlock`, also for a pending block that waits on CI. `alert_line()` (`scripts/buildlog/mac_idle_alert.py`) then prints `Blocked by <holder>`.
-
-**Spec:**
-1. `ci_activity()` tells apart two busy cases: the `ci_job` has status `in_progress` (it runs on the Mac), and the `ci_job` is not started or the run has no such job yet. Use two types, not a flag.
-2. Add a block wait type for the running case, saved as `{"kind": "ci_mac_job"}`. Keep `{"kind": "ci_job"}` for a CI run whose Mac job has not started, so old block records still read.
-3. The pending text for the running case: `Block pending for <holder>: hana CI is running on the Mac. Nothing new starts there, and you get a message when it finishes.` `pending_wait_text()` gives `hana CI is running on the Mac`. The not-started case keeps today's text.
-4. `mac_work()` returns a busy result for a pending block whose wait is the running case, so `watch_once()` writes `state: busy` and no idle alert or message fires. Reuse the busy path that `NatedevJobOnMac` takes; add no second busy path.
-5. With no block and no live claim, `mac_work()` asks `ci_activity()` only when steps wait for the Mac. A running CI Mac job gives the same busy result, so `No block and no claim` does not fire while hana CI runs on the Mac. A `CiUnknown` answer keeps today's free reading.
-6. Change nothing else in block activation, claims or `alert_line()`.
-
-**Tests:** add rows to the existing tests as they fit:
-1. `scripts/mac_test/test_mac_test.py`: an `in_progress` Mac job gives the running case; a `queued` Mac job and a run with no Mac job yet give the not-started case; the block record round-trips both kinds; the pending text of the running case.
-2. `scripts/buildlog/test_mac_idle.py`: a pending block that waits on a running CI Mac job gives `state: busy` and no alert; a pending block that waits on a not-started CI job keeps today's `blocked` reading; no block and no claim with a running CI Mac job gives `state: busy`; no block, no claim and no CI Mac job keeps today's free reading.
+- `mac_test.ci_activity()` returns `CiMacJobRunning` for an `in_progress` hana CI Mac job and `CiJobNotStarted` for a run whose Mac job has not started. `CiUnknown` keeps the free reading.
+- A pending block that waits on a running CI Mac job saves `waiting_on` `{"kind": "ci_mac_job"}` (`WaitingOnCiMacJob` in `claim_state.py`). A job that has not started keeps `ci_job`, and old `ci_job` records still read.
+- The block text is "Block pending for <holder>: hana CI is running on the Mac. Nothing new starts there, and you get a message when it finishes." `pending_wait_text` gives "hana CI is running on the Mac".
+- `mac_idle.mac_work()` returns `NatedevJobOnMac` for a block that waits on a running CI Mac job. With no block and no claim, it asks `ci_activity()` only while steps wait (`waiting_for_mac`) and `ci_repo` is set, and a running CI Mac job gives busy. Thus the idle alert does not send "No block and no claim" while hana CI runs on the Mac.
 
 **Files:**
-- `scripts/mac_test/mac_test.py`
-- `scripts/mac_test/claim_state.py`
-- `scripts/buildlog/mac_idle.py`
-- `scripts/mac_test/test_mac_test.py`
-- `scripts/buildlog/test_mac_idle.py`
-
-**Workers:** one implement worker.
-
-**State:** `block.json` gets the new `waiting_on` kind `ci_mac_job`. An old record keeps `ci_job` and reads as before.
-
-**Verification:**
-1. Test: `scripts.mac_test.test_mac_test` and `scripts.buildlog.test_mac_idle`.
-2. Lint: `basedpyright` on the changed files, once after the edits.
-
-**Speed:** no new `gh` call for a block; the job status is already in the `gh run view` answer. With no block and no claim, the watch makes the `ci_activity()` calls only while steps wait for the Mac.
+- `scripts/mac_test/mac_test.py` — the CI activity types and the block pending text
+- `scripts/mac_test/claim_state.py` — `WaitingOnCiMacJob` and its record form
+- `scripts/buildlog/mac_idle.py` — `mac_work` reads a running CI Mac job as Mac work
+- `scripts/mac_test/test_mac_test.py` — `test_busy_ci_keeps_block_pending_until_watch_sends_once` is a queued/running table
+- `scripts/buildlog/test_mac_idle.py` — rows for a running CI Mac job with a block and with no block
