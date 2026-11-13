@@ -214,7 +214,8 @@ class DispatchAgent:
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
         action, pane = args[4:6]
-        self.fixture.assertNotIn("--timeout", args)
+        if not (action == "prompt" and args[6] == "/compact"):
+            self.fixture.assertNotIn("--timeout", args)
         if "--until" in args:
             self.fixture.assertEqual(args[-2:], ["--until", "working"])
         if action == "prompt":
@@ -1054,9 +1055,16 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(identities[0], identities[1])
 
     def test_compaction_proof_precedes_the_dispatch_prompt(self) -> None:
-        for proof in ("absent", "compacted", "task_started"):
+        class CompactionClock:
+            seconds: float = 100.0
+
+            def monotonic(self) -> float:
+                return self.seconds
+
+        for proof in ("absent", "compacted", "task_started", "delayed", "bounded"):
             with self.subTest(proof=proof):
-                self.agent.compact_proof = proof
+                self.agent.compact_proof = ("absent" if proof == "delayed" else
+                                            "compacted" if proof == "bounded" else proof)
                 current = self.opened("compact-proof-" + proof)
                 backend = staff.backend(current.row)
                 assert isinstance(backend, staff.CodexBackend)
@@ -1067,6 +1075,31 @@ class WorkerCommandTests(unittest.TestCase):
                         "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
                 before = len(self.agent.submitted)
                 send_keys = self.fixture.world.send_keys
+                wait_turn_end = self.fixture.world.wait_turn_end
+                order: list[str] = []
+                compact_commands: list[list[str]] = []
+                clock = CompactionClock()
+
+                def run_compaction(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    result = self.agent.run(arguments, **options)
+                    if len(arguments) > 6 and arguments[6] == "/compact":
+                        compact_commands.append(arguments)
+                        if proof == "bounded":
+                            clock.seconds = 195.0
+                    return result
+
+                def finish_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+                    if proof == "bounded":
+                        self.assertEqual(timeout_ms, 205000)
+                    if proof == "delayed" and pane in self.agent.compacting:
+                        # Model a 95-second compaction without a real delay.
+                        if timeout_ms < 95000:
+                            return herdr.WaitTimedOut()
+                        with source.open("a") as stream:
+                            _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
+                        self.agent.compact_inputs[pane] = ""
+                        order.append("compacted")
+                    return wait_turn_end(pane, timeout_ms)
 
                 def clear(pane: str, *keys: str, target: str, expected_text: str = "") -> None:
                     send_keys(pane, *keys, target=target, expected_text=expected_text)
@@ -1076,22 +1109,36 @@ class WorkerCommandTests(unittest.TestCase):
                     return herdr.ComposerInput(self.agent.compact_inputs.get(pane, ""))
 
                 with (patch.object(self.fixture.world, "composer", side_effect=compact_composer),
+                      patch.object(worker, "time", new=clock),
+                      patch.object(subprocess, "run", side_effect=run_compaction),
                       patch.object(self.fixture.world, "send_keys", side_effect=clear) as keys,
+                      patch.object(self.fixture.world, "wait_turn_end", side_effect=finish_compaction),
+                      patch.object(self.agent, "during_prompt", new=lambda: order.append("prompt")),
                       redirect_stderr(io.StringIO()) as errors):
                     result = worker.dispatch_turn(self.fixture.parent.id, current, self.fixture.world,
                         "End your final reply with DONE compact-proof", "compact-proof", run=self.run_dir)
-                if proof == "absent":
+                if proof == "bounded":
+                    self.assertEqual(len(compact_commands), 1)
+                    command = compact_commands[0]
+                    self.assertIn("--timeout", command)
+                    self.assertEqual(command[command.index("--timeout") + 1], "300000")
+                if proof in {"absent", "task_started"}:
                     self.assertEqual(result, worker.ExitCode.REFUSED)
                     self.assertEqual(len(self.agent.submitted), before)
                     self.assertIn("compaction has no transcript proof", errors.getvalue())
                     self.assertIn("no prompt sent", errors.getvalue())
-                    keys.assert_called_once_with(current.pane, "ctrl-u", target=str(current.row.current_session),
-                                                 expected_text="/compact")
+                    if proof == "absent":
+                        keys.assert_called_once_with(current.pane, "ctrl-u", target=str(current.row.current_session),
+                                                     expected_text="/compact")
+                    else:
+                        keys.assert_not_called()
                 else:
                     self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                     self.assertEqual(self.agent.submitted[before:], [(current.pane,
                         script_prompt("End your final reply with DONE compact-proof"))])
                     keys.assert_not_called()
+                    if proof == "delayed":
+                        self.assertEqual(order, ["compacted", "prompt"])
                 self.assertEqual(self.agent.compact_inputs[current.pane], "")
 
     def test_closed_conversation_compacts_before_the_next_dispatch(self) -> None:
