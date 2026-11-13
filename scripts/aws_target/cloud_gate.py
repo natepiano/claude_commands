@@ -587,7 +587,8 @@ class GateWorker:
         if 'variants' in launch:
             variants = [GateLaunchVariant(ledger.text(row, 'region'), ledger.text(row, 'instance_type'),
                 ledger.text(row, 'subnet_id'), ledger.text(row, 'zone')) for row in ledger.rows(launch, 'variants')]
-        saved_order = {key: launch[key] for key in ('variants', 'spot_price_reads') if key in launch}
+        saved_order = {key: launch[key] for key in ('variants', 'spot_price_reads', 'unauthorized_types') if key in launch}
+        unauthorized = list(cast(list[str], launch.get('unauthorized_types', [])))
         self.price_read_evidence = ledger.rows(launch, 'spot_price_reads') if 'spot_price_reads' in launch else ()
         regional_rows = {ledger.text(row, 'region'): row for row in ledger.rows(deployment, 'regions')}
         index = ledger.instant(launch, 'variant') if launch else 0
@@ -600,6 +601,8 @@ class GateWorker:
                 zone = str(launch.get('zone', ''))
             else:
                 variant = variants[offset]
+                if variant.instance_type in unauthorized:
+                    continue
                 regional = regional_rows[variant.region]
                 size = variant.instance_type
                 subnet = {'id': variant.subnet_id, 'zone': variant.zone}
@@ -684,6 +687,14 @@ class GateWorker:
             except AwsUnavailable as error:
                 # A saved request keeps its token and bytes after an uncertain reply.
                 if capacity_error(str(error)):
+                    launch = {**saved_order, 'variant': offset + 1}
+                    save(path, launch)
+                    continue
+                if launch_error_code(str(error)) == 'UnauthorizedOperation' and any(
+                        row.instance_type not in (size, *unauthorized) for row in variants[offset + 1:]):
+                    # The stack policy names its types, so another type can still launch.
+                    unauthorized.append(size)
+                    saved_order['unauthorized_types'] = unauthorized
                     launch = {**saved_order, 'variant': offset + 1}
                     save(path, launch)
                     continue
