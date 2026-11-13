@@ -15,6 +15,7 @@ from decimal import Decimal
 import fcntl
 import json
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -122,6 +123,17 @@ class AwsCli:
             return InstanceEvidence(instance_id, f'{instance_id}:{generation}', cast(ledger.InstanceState, state), now)
         except (KeyError, TypeError, AttributeError, IndexError) as error:
             raise AwsUnavailable('instance lifecycle reply is malformed') from error
+
+
+def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
+    """Return the largest known count, or zero when all types have unknown counts."""
+    largest = 0
+    for name in instance_types:
+        size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', name)
+        if size:
+            count = 2 if size[1] == 'large' else 4 * int(size[2] or '1')
+            largest = max(largest, count)
+    return largest
 
 
 USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})

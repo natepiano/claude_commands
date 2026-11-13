@@ -31,7 +31,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, largest_gate_vcpus as largest_gate_vcpus
 from scripts.aws_target.config import (
     BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
     deployment_record, deployment_outputs, gate_deployment, gate_regions, read_control_settings, read_deployment_settings, read_settings,
@@ -89,17 +89,6 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
-
-
-def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
-    """Return the largest known count, or zero when all types have unknown counts."""
-    largest = 0
-    for name in instance_types:
-        size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', name)
-        if size:
-            count = 2 if size[1] == 'large' else 4 * int(size[2] or '1')
-            largest = max(largest, count)
-    return largest
 
 
 def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
@@ -1337,7 +1326,7 @@ class Deployment:
                    + cloud_gate.settings().number('termination_timeout_s') * len(limits.spot_max_usd_per_hour))
         def execute(arguments: Sequence[str]) -> int:
             return self.execute(arguments, capture_output=False, text=True, timeout=timeout, check=False).returncode
-        return gpu_size_trial.start_service(folder.expanduser().resolve(), self.directory.resolve(),
+        return gpu_size_trial.start_service(folder, self.directory.resolve(),
                                             self.settings_path.resolve(), execute) == 0
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
