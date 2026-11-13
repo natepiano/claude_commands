@@ -92,6 +92,7 @@ from scripts.build_queue.queue_place import (  # noqa: E402
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
+TEST_HERDR_BIN = "/nonexistent/herdr"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -1119,6 +1120,7 @@ raise SystemExit(99)
         _ = executable.write_text(script)
         executable.chmod(0o755)
     return {**environment, "TMPDIR": str(root),
+            "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),

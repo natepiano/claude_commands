@@ -231,6 +231,7 @@ def paired_supervisor() -> str:
     environment = inspect.getsource(merge_gate.test_module_environment).replace(
         'Path(__file__).resolve().parents[1] / "lib/py"', 'sys.executable')
     return ('from pathlib import Path\nimport ctypes\nfrom typing import cast\n'
+            + f'TEST_HERDR_BIN = {merge_gate.TEST_HERDR_BIN!r}\n'
             + inspect.getsource(adopt_descendants) + '\n' + environment + '\n'
             + inspect.getsource(merge_gate.swapped_kib) + '\n'
             + inspect.getsource(merge_gate.process_memory_mib) + '\n'
@@ -337,7 +338,6 @@ try:
         os.chdir(repo)
         sys.path.insert(0, str(repo))
         from scripts.production import merge_gate
-        os.environ['HERDR_BIN'] = '/nonexistent/herdr'
         timings = {}
         if 'module_seconds' in links:
             get(links['module_seconds'], root / 'module_seconds.json')

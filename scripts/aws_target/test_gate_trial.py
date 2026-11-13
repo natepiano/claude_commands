@@ -208,7 +208,6 @@ class GuestTests(unittest.TestCase):
             original_run = merge_gate.run_suites
             def run_suites(repo: Path, *, full: bool, machine: merge_gate.WholeMachine,
                            module_time_limit_s: float) -> merge_gate.GateRun:
-                self.assertEqual(os.environ['HERDR_BIN'], '/nonexistent/herdr')
                 self.assertEqual(machine.module_seconds, timings)
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
@@ -263,6 +262,7 @@ class GuestTests(unittest.TestCase):
                 call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
                 self.assertEqual(call['args'], [str(suite), path.name])
                 environment = ledger.mapping(call['env'])
+                self.assertEqual(environment['HERDR_BIN'], '/nonexistent/herdr')
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)
