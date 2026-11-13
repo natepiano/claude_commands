@@ -8,11 +8,12 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -28,15 +29,27 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NewType, Protocol, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import cargo_manifest, claim_state
+if TYPE_CHECKING:
+    from scripts.build_queue import placement
+else:
+    class _DeferredPlacement:
+        """Load placement types when an offload operation uses them."""
+
+        def __getattr__(self, name: str) -> object:
+            return cast(object, getattr(import_module("scripts.build_queue.placement"), name))
+
+    placement = _DeferredPlacement()
+from scripts.lib import process_start as process_identity
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
+from scripts.direct.step_selection import Pinned
 
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -74,6 +87,7 @@ NonBusyMacDeclineReason = Literal[
     "target does not permit this command",
     "disk",
     "copy",
+    "source_changed",
 ]
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 
@@ -230,12 +244,6 @@ class LostMacRun:
 
 
 @dataclass(frozen=True)
-class InterruptedTargetRun:
-    generation: str
-    seconds: float
-
-
-@dataclass(frozen=True)
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
@@ -324,10 +332,13 @@ class AttemptEvidence:
     unresolved_count: int | UnresolvedLeftoverCount = UnresolvedLeftoverCount()
     evidence_at: float = 0.0
     traffic: buildlog_sync.TransferLedger = field(default_factory=buildlog_sync.TransferLedger)
+    execution: placement.ExecutionEvidence = field(default_factory=lambda: placement.ExecutionNotStarted())
+    launch_authorized: bool = False
+    provider: placement.ProviderClaimReference | placement.NoProviderClaim = field(default_factory=lambda: placement.NoProviderClaim())
 
 
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | InterruptedTargetRun | DeclinedMacRun | BusyMacDecline
+    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
 )
 
 
@@ -433,6 +444,159 @@ MacSource = RepositoryWorkingTree | StagedDocSnapshot
 
 
 @dataclass(frozen=True)
+class DirectOffloadRequest:
+    """A direct caller must submit its pinned destination before execution."""
+
+
+@dataclass(frozen=True)
+class AssignedOffloadRequest:
+    assignment: placement.PlacementAssignment
+
+
+@dataclass(frozen=True)
+class SettledDispatchOperations:
+    """The adapter has no unfinished claim or start child."""
+
+
+@dataclass(frozen=True)
+class PendingClaimOperation:
+    """The adapter must collect its local claim child before cleanup."""
+
+
+@dataclass(frozen=True)
+class PendingStartOperation:
+    """The remote start has no acknowledgement and can still arrive."""
+
+
+@dataclass(frozen=True)
+class AcknowledgedStartOperation:
+    """The remote command acknowledged execution; its local child still runs."""
+
+
+@dataclass(frozen=True)
+class ClaimReleaseConfirmed:
+    """The provider confirmed release of this exact claim."""
+
+
+@dataclass(frozen=True)
+class ClaimReleaseUnconfirmed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class StartSettled:
+    leftovers: LeftoverCheckResult
+
+
+@dataclass(frozen=True)
+class StartUnsettled:
+    reason: str
+    leftovers: LeftoverCheckResult
+
+
+def pending_start_key(identity: claim_state.ClaimIdentity) -> str:
+    """Name the fence for one exact provider claim."""
+    return hashlib.sha256(json.dumps([identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
+
+
+def pending_start_path(target: str, identity: claim_state.ClaimIdentity) -> Path:
+    return claim_state.state_paths(target).directory / "pending-starts" / pending_start_key(identity)
+
+
+def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
+    state = (Path(".local/state/mac-test") if target in ("", "mac")
+             else Path(".local/state/build-targets") / target)
+    return state / "dispatch-fences" / scope_key / pending_start_key(identity)
+
+
+def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
+    """Remove inactive fences from older claims in this exact provider scope."""
+    encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
+    program = '''import fcntl, pathlib, sys
+base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+for path in base.parent.glob("*.lock"):
+    if path == base.with_suffix(".lock"):
+        continue
+    try:
+        with path.open("r") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        continue
+'''
+    return shlex.join(["python3", "-c", program, encoded])
+
+
+def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
+    """Create the start identity before the probe acknowledges preparation."""
+    encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
+    program = '''import pathlib, sys
+base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+base.parent.mkdir(parents=True, exist_ok=True)
+base.with_suffix(".lock").touch()
+'''
+    return shlex.join(["python3", "-c", program, encoded])
+
+
+def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
+                        scope_key: str = "run") -> str:
+    """Use the prepared identity without permitting recreation after release."""
+    key = pending_start_key(identity)
+    relative = str(start_fence_relative(identity, target, scope_key=scope_key))
+    encoded = relative.encode().hex()
+    if settle:
+        program = '''import fcntl, pathlib, sys
+base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+path = base.with_suffix(".lock")
+try:
+    lock = path.open("r")
+except FileNotFoundError:
+    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+    sys.exit(0)
+with lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("dispatch_start_pending=" + sys.argv[2], flush=True)
+        sys.exit(0)
+    path.unlink(missing_ok=True)
+    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+'''
+        return shlex.join(["python3", "-c", program, encoded, key])
+    program = '''import fcntl, os, pathlib, sys
+base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+fcntl.flock(8, fcntl.LOCK_EX)
+try:
+    current = base.with_suffix(".lock").stat()
+except FileNotFoundError:
+    current = None
+opened = os.fstat(8)
+matches = current is not None and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+if not matches:
+    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+    sys.exit(75)
+'''
+    lock = shlex.quote(relative + ".lock")
+    missing = start_fence_command(identity, target, settle=True, scope_key=scope_key)
+    return (f'if [ ! -f "$HOME"/{lock} ]; then {missing}; exit 75; fi\n'
+            + f'exec 8<"$HOME"/{lock} || exit 75\n'
+            + shlex.join(["python3", "-c", program, encoded, key]) + " || exit 75\n")
+
+
+def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
+    """Remove the prepared identity after the existing remote command ends."""
+    return (start_fence_command(identity, target, scope_key=scope_key)
+            + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
+            + "(\n" + command + "\n)\n"
+            + "dispatch_status=$?\nexec 8<&-\n"
+            + start_fence_command(identity, target, settle=True, scope_key=scope_key)
+            + '\nexit "$dispatch_status"')
+
+
+@dataclass(frozen=True)
 class OffloadRequest:
     """One Mac verb, its arguments and the metadata sent with it.
 
@@ -457,6 +621,7 @@ class OffloadRequest:
     fetch: FetchFolder | NoFetch = NO_FETCH
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
+    placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
 
     @property
     def source_root(self) -> Path:
@@ -590,6 +755,7 @@ class LocalClaimAttempt:
 
     answer: MacClaimAnswer = MacClaimNotConfirmed("state", "", "")
     interruption: NoClaimInterrupt | OffloadInterrupted = NO_CLAIM_INTERRUPT
+    process: IdleProcess | RunningProcess = field(default_factory=IdleProcess)
 
 
 ActiveProcess = IdleProcess | RunningProcess | LocalClaimAttempt
@@ -677,12 +843,7 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
-@dataclass(frozen=True)
-class InterruptedTargetStatus:
-    generation: str
-
-
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch | MirrorUseBusy
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -693,7 +854,7 @@ class UnavailableProbe:
     detail: str = ""
 
 
-ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup | InterruptedTargetStatus
+ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup
 UNAVAILABLE_PROBE = UnavailableProbe()
 
 
@@ -758,6 +919,7 @@ class CliArguments(argparse.Namespace):
         self.episode: str = ""
         self.attempt: str = ""
         self.claim_session: str = ""
+        self.assignment_file: str = ""
         self.environment: list[str] = []
         self.fetch: str | None = None
 
@@ -769,17 +931,25 @@ class ProcessController:
         self.active: ActiveProcess = IDLE_PROCESS
         self.attempt_evidence: AttemptEvidence = AttemptEvidence()
         self.copy_failure_detail: str = ""
+        self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+        self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation = SettledDispatchOperations()
+        self.expected_claim: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
+        self.claim_settings: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
+        self.claim_target: str = ""
+        self.claim_scope_key: str = "run"
 
     def stop(self) -> None:
         active = self.active
         if isinstance(active, LocalClaimAttempt):
             return
-        self.active = IDLE_PROCESS
         if not isinstance(active, RunningProcess):
             return
         process = active.process
         if process.poll() is not None:
+            self.active = IDLE_PROCESS
+            if not isinstance(self.pending, PendingStartOperation):
+                self.pending = SettledDispatchOperations()
             return
         process.terminate()
         try:
@@ -787,6 +957,9 @@ class ProcessController:
         except subprocess.TimeoutExpired:
             process.kill()
             _ = process.wait()
+        self.active = IDLE_PROCESS
+        if not isinstance(self.pending, PendingStartOperation):
+            self.pending = SettledDispatchOperations()
 
     def defer_claim_interrupt(self, signal_number: int) -> bool:
         if not isinstance(self.active, LocalClaimAttempt):
@@ -797,6 +970,7 @@ class ProcessController:
     def complete_claim(self, arguments: Sequence[str], attempt: LocalClaimAttempt) -> None:
         """Read the bounded local claim's reply even when the runner is signalled."""
         self.active = attempt
+        self.pending = PendingClaimOperation()
         try:
             try:
                 process = subprocess.Popen(
@@ -807,15 +981,55 @@ class ProcessController:
                     start_new_session=True,
                 )
             except OSError:
+                self.attempt_evidence.provider = placement.NoProviderClaim()
                 attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
             else:
+                attempt.process = RunningProcess(process)
                 stdout, stderr = process.communicate()
                 answer = CommandOutput(process.returncode, stdout, stderr)
-                attempt.answer = read_claim_answer(answer)
+                expected = self.expected_claim
+                attempt.answer = read_claim_answer(answer, expected=expected,
+                    assigned_slot=self.placement.assignment.destination.slot
+                        if isinstance(self.placement, AssignedOffloadRequest) else 0)
                 if answer.status in (0, 13):
                     self.claim_identity = claim_state.reply_claim_identity(stdout)
+                elif isinstance(self.placement, AssignedOffloadRequest):
+                    self.inspect_claim(attempt, expected)
         finally:
+            if isinstance(attempt.process, RunningProcess) and attempt.process.process.poll() is None:
+                process = attempt.process.process
+                process.terminate()
+                try:
+                    _ = process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _ = process.wait()
             self.active = IDLE_PROCESS
+            self.pending = SettledDispatchOperations()
+
+    def inspect_claim(self, attempt: LocalClaimAttempt,
+                      expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity) -> None:
+        """Inspect an uncertain response without another acquisition."""
+        if not isinstance(self.placement, AssignedOffloadRequest) or not isinstance(expected, claim_state.ClaimIdentity):
+            return
+        assigned = self.placement.assignment
+        paths = claim_state.state_paths(assigned.destination.target)
+        with claim_state.locked(paths.lock):
+            for held in claim_state.read_claims(paths):
+                record = held.record
+                if (claim_state.claim_identity(record) != expected or held.scope != assigned.destination.scope
+                        or record["pid"] != os.getpid()
+                        or record["submitting_session"] != claim_state.session_id(assigned.session)):
+                    continue
+                start = process_identity.process_start(os.getpid())
+                if not isinstance(start, process_identity.Started) or start.start != record["proc_start"]:
+                    continue
+                self.claim_identity = expected
+                if "remote_host" in record and record.get("cleanup_pending"):
+                    attempt.answer = TakenOverMacClaim(record["remote_host"], record.get("slot", 1))
+                elif "remote_host" in record:
+                    attempt.answer = FreshMacClaim(record.get("slot", 1))
+                return
 
     def capture(
         self,
@@ -883,6 +1097,7 @@ class ProcessController:
         return result
 
     def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
+        self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
                 arguments,
@@ -890,7 +1105,10 @@ class ProcessController:
                 stderr=subprocess.STDOUT,
             )
         except OSError:
+            self.pending = SettledDispatchOperations()
             return MISSING_MAC_STATUS
+        self.attempt_evidence.execution = placement.ExecutionEvidenceUnavailable(
+            "the remote start has no final observation", time.time())
         raw_output = process.stdout
         if raw_output is None:
             process.kill()
@@ -916,6 +1134,18 @@ class ProcessController:
                     line = raw_line
                 line = line.replace("\r\n", "\n").replace("\r", "\n")
                 marker = line.rstrip("\r\n")
+                identity = self.claim_identity
+                if (isinstance(identity, claim_state.ClaimIdentity)
+                        and marker == "dispatch_start_settled=" + pending_start_key(identity)):
+                    self.pending = SettledDispatchOperations()
+                    pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
+                    if not isinstance(status, ReportedMacStatus):
+                        self.attempt_evidence.execution = placement.ExecutionNotStarted()
+                    continue
+                if (isinstance(identity, claim_state.ClaimIdentity)
+                        and marker == "dispatch_start_pending=" + pending_start_key(identity)):
+                    self.pending = PendingStartOperation()
+                    continue
                 if mirror_busy_refusal(marker):
                     mirror_refused = True
                 if marker.startswith("build_target_directory="):
@@ -930,13 +1160,6 @@ class ProcessController:
                     held_status_line = ""
                     cleanup = CleanupUnconfirmed()
                     continue
-                if marker.startswith('aws_interrupted='):
-                    generation = marker.removeprefix('aws_interrupted=')
-                    status = (InterruptedTargetStatus(generation) if generation
-                              else MISSING_MAC_STATUS)
-                    held_status_line = ''
-                    cleanup = CleanupUnconfirmed()
-                    continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None:
                     if held_status_line:
@@ -945,6 +1168,7 @@ class ProcessController:
                     mac_status = int(status_digits) if len(status_digits) <= 3 else 256
                     status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
                     if isinstance(status, ReportedMacStatus):
+                        self.pending = AcknowledgedStartOperation()
                         held_status_line = line
                     else:
                         held_status_line = ""
@@ -966,19 +1190,26 @@ class ProcessController:
             finished_output = True
             exit_status = process.wait()
         finally:
+            if process.poll() is None:
+                self.stop()
             self.active = IDLE_PROCESS
+            startup_refused = isinstance(status, UnresolvedSlotStartup)
+            if isinstance(self.pending, AcknowledgedStartOperation) or mirror_refused or mismatch or startup_refused:
+                self.pending = SettledDispatchOperations()
+            if (mirror_refused or mismatch or startup_refused) and not isinstance(status, ReportedMacStatus):
+                self.attempt_evidence.execution = placement.ExecutionNotStarted()
             output.close()
             if arguments[0] == "ssh":
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
+        if mismatch and not isinstance(status, (ReportedMacStatus)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if mirror_refused:
             return MirrorUseBusy()
-        if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
+        if isinstance(status, UnresolvedSlotStartup):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
@@ -1057,8 +1288,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
-        enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
-                 else config.text("offload") == "on"),
+        enabled=config.text("offload") == "on",
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
@@ -1133,14 +1363,11 @@ def write_result(
             print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
-    elif isinstance(result, (LostMacRun, InterruptedTargetRun)):
+    elif isinstance(result, LostMacRun):
         mac = "lost"
-        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else result.detail if target else ""
+        reason = result.detail if target else ""
         status = 75
-        if isinstance(result, InterruptedTargetRun):
-            print(f"mac_test: the {label} instance was interrupted (generation {result.generation})")
-        else:
-            print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
+        print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
@@ -1149,6 +1376,8 @@ def write_result(
         if isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
+        elif isinstance(result, DeclinedMacRun) and result.reason == "source_changed":
+            reason = "source_changed"
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
@@ -1162,8 +1391,6 @@ def write_result(
             count = str(evidence.unresolved_count) if isinstance(evidence.unresolved_count, int) else "unavailable"
             details = (f"slot={evidence.slot}\ncompletion={evidence.completion}\ncleanup={evidence.cleanup}\n"
                        + f"unresolved_count={count}\nevidence_at={evidence.evidence_at}\n")
-        if isinstance(result, InterruptedTargetRun):
-            details += f'interruption_generation={result.generation}\n'
         if isinstance(result, (PassedOnMac, PassedOnTarget)) and result.build_target_directory:
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
@@ -1333,8 +1560,16 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     copy_words = ["--copy"] if request.copy else []
     identity = (claim_state.ClaimIdentity(uuid.uuid4().hex, request.call_id, uuid.uuid4().hex)
                 if isinstance(request.admission, UnclaimedMacRun) else request.admission.identity)
+    if isinstance(request.placement, AssignedOffloadRequest):
+        assignment = request.placement.assignment
+        if isinstance(request.admission, UnclaimedMacRun):
+            identity = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
+                placement.attempt_key(assignment.episode, assignment.attempt)).hex, assignment.episode, assignment.attempt)
+        leased_slots = (assignment.destination.slot,) if assignment.destination.slot else ()
     session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
                else claim_state.session_id(request.admission.submitting_session))
+    if isinstance(request.placement, AssignedOffloadRequest):
+        session = claim_state.session_id(request.placement.assignment.session)
     identity_words = ["--claim-id", identity.claim_id, "--episode", identity.episode, "--attempt", identity.attempt]
     selection = ["--target", request.target] if request.target else []
     handoff = (["--from-pid", str(request.admission.owner_pid)]
@@ -1353,6 +1588,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         config.host,
         *copy_words,
         *identity_words,
+        *assigned_claim_arguments(request),
         "--identity", "--session", session,
         *selection,
         *handoff,
@@ -1360,10 +1596,12 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     ]
 
 
-def release_claim(controller: ProcessController, target: str = "") -> None:
+def release_claim(controller: ProcessController, target: str = "") -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
+    if not isinstance(controller.pending, SettledDispatchOperations):
+        return ClaimReleaseUnconfirmed("a claim or start operation remains pending")
     identity = controller.claim_identity
     if isinstance(identity, claim_state.NoClaimIdentity):
-        return
+        return ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
     result = controller.capture(
         [
             str(Path(__file__).resolve().parents[1] / "lib/py"),
@@ -1374,6 +1612,7 @@ def release_claim(controller: ProcessController, target: str = "") -> None:
             "--claim-id", identity.claim_id,
             "--episode", identity.episode,
             "--attempt", identity.attempt,
+            *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
             *(["--target", target] if target else []),
         ]
     )
@@ -1385,8 +1624,23 @@ def release_claim(controller: ProcessController, target: str = "") -> None:
                 transfers = cast(list[buildlog_sync.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
                 controller.attempt_evidence.traffic.transfers.extend(transfers)
 
+    if isinstance(result, CommandOutput) and result.status == 0:
+        pending_start_path(target, identity).unlink(missing_ok=True)
+        return ClaimReleaseConfirmed()
+    return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
 
-def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
+
+def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
+    if not isinstance(request.placement, AssignedOffloadRequest):
+        return []
+    from scripts.build_queue import admission_protocol as wire
+
+    return ["--assignment", wire.encode_reply(wire.Assignment(request.placement.assignment)).strip()]
+
+
+def read_claim_answer(result: CapturedCommandResult, *,
+                      expected: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY,
+                      assigned_slot: int = 0) -> MacClaimAnswer:
     if not isinstance(result, CommandOutput):
         return MacClaimNotConfirmed("state", "", "")
     slots = [line.removeprefix("slot: ") for line in result.stdout.splitlines() if line.startswith("slot: ")]
@@ -1396,6 +1650,10 @@ def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
     if result.status in (0, 13) and isinstance(claim_state.reply_claim_identity(result.stdout), claim_state.NoClaimIdentity):
         return MacClaimNotConfirmed("state", result.stdout, result.stderr)
     if result.status == 0:
+        if ((isinstance(expected, claim_state.ClaimIdentity)
+             and claim_state.reply_claim_identity(result.stdout) != expected)
+                or assigned_slot and slot != assigned_slot):
+            return MacClaimNotConfirmed("state", result.stdout, result.stderr)
         return FreshMacClaim(slot)
     if result.status == 13:
         hosts = [line.removeprefix("leftovers: ").strip() for line in result.stdout.splitlines()
@@ -1590,15 +1848,19 @@ def probe_mac(
     else:
         script = probe_script(repository, target, slot)
         timeout_s = config.probe_timeout_s
+    identity = controller.claim_identity
+    if isinstance(identity, claim_state.ClaimIdentity):
+        path = pending_start_path(target, identity)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, pending_start_key(identity))
+        script = ("(\n" + script + "\n)\nprobe_status=$?\n"
+                  + "if [ \"$probe_status\" -eq 0 ]; then\n"
+                  + prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
+                  + 'exit "$probe_status"')
     result = controller.capture(
         [*ssh_prefix(config), script],
         CommandTimeLimit(timeout_s),
     )
-    if linux and isinstance(result, CommandOutput):
-        interruptions = [line.removeprefix('aws_interrupted=') for line in result.stdout.splitlines()
-                         if line.startswith('aws_interrupted=')]
-        if interruptions:
-            return InterruptedTargetStatus(interruptions[-1])
     if (linux and isinstance(result, CommandOutput)
             and result.stdout.strip() == "linux_startup=unresolved"):
         return UnresolvedSlotStartup()
@@ -1801,13 +2063,7 @@ def nextest_words_with_skip(
 
 def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
     return {**config.values, 'selected_target': target,
-            'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', ''),
-            'selected_settings': str(config.source) if isinstance(config.source, Path) else ''}
-
-
-def expected_instance_generation(target: str) -> str:
-    instance_generation = cast(Callable[[Path], str], import_module('scripts.aws_target.aws_target').instance_generation)
-    return instance_generation(state_directory(target))
+            'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', '')}
 
 
 def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
@@ -2039,7 +2295,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
             raise ValueError("Linux cleanup requires a repository and slot")
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
-                                                   require_boot_identity=target_config.is_aws_target(configured_ssh_target(target)))
+                                                   require_boot_identity=False)
     root = mac_mirror_root().relative
     mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
@@ -2097,11 +2353,17 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
     return LeftoversEnded() if count == 0 else LeftoversRemain(count)
 
 
-def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
-                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
+@dataclass(frozen=True)
+class LeftoverObservation:
+    result: LeftoverCheckResult
+    output: str
+
+
+def read_leftovers(config: SshConnectionSettings, host: str, script: str,
+                   target: str) -> LeftoverObservation:
     """End and count one mirror's work without exposing the check to a second signal."""
     try:
-        arguments = ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)]
+        arguments = ["ssh", *ssh_options(config), host, script]
         result = subprocess.run(
             arguments,
             stdin=subprocess.DEVNULL,
@@ -2112,9 +2374,9 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
             timeout=config.leftover_timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s"), "")
     except OSError:
-        return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)"), "")
     ledger = buildlog_sync.active_transfers.get()
     if isinstance(ledger, buildlog_sync.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
@@ -2122,14 +2384,42 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownR
         if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
             if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
-                return LeftoversRemain(UnresolvedLeftoverCount())
-        return LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}")
+                return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), result.stdout)
+        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"), result.stdout)
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())
         if reason:
-            return LeftoverCheckFailed(reason)
-    return answer
+            return LeftoverObservation(LeftoverCheckFailed(reason), result.stdout)
+    return LeftoverObservation(answer, result.stdout)
+
+
+def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
+                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
+    """End and count one mirror's work on its recorded host."""
+    return read_leftovers(config, host, leftover_check_script(repository, target, slot), target).result
+
+
+def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
+                         repository: KnownRepository, target: str = "mac", slot: int = 1
+                         ) -> StartSettled | StartUnsettled:
+    """Keep the claim until the remote fence prevents a delayed start."""
+    identity = controller.claim_identity
+    if not isinstance(identity, claim_state.ClaimIdentity):
+        return StartUnsettled("the exact start identity is unavailable", LeftoverCheckFailed("the exact start identity is unavailable"))
+    try:
+        connection = read_connection_settings(config.source)
+    except (OSError, ValueError) as error:
+        return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
+    command = (start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
+               + leftover_check_script(repository, target, slot))
+    observed = read_leftovers(connection, host, command, target)
+    if (isinstance(observed.result, LeftoversEnded)
+            and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
+        controller.pending = SettledDispatchOperations()
+        pending_start_path(target, identity).unlink(missing_ok=True)
+        return StartSettled(observed.result)
+    return StartUnsettled("the original remote start has not settled", observed.result)
 
 
 def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) -> None:
@@ -2158,10 +2448,12 @@ def check_current_leftovers(
 
 
 def check_taken_over_claim(
-    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository,
+    controller: ProcessController, config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository,
     target: str = "mac",
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
+        if isinstance(controller.pending, PendingStartOperation):
+            return settle_pending_start(controller, config, claim.host, repository, target, claim.slot).leftovers
         return check_current_leftovers(config, claim.host, repository, target, claim.slot)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
@@ -2171,20 +2463,54 @@ def claim_for_run(
     leased_slots: tuple[int, ...] = (),
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
+    controller.placement = request.placement
+    controller.claim_settings = config.source
+    controller.claim_target = request.target
+    if isinstance(request.admission, MacClaimFromWait):
+        controller.expected_claim = request.admission.identity
+    elif isinstance(request.placement, AssignedOffloadRequest):
+        assigned = request.placement.assignment
+        controller.expected_claim = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
+            placement.attempt_key(assigned.episode, assigned.attempt)).hex, assigned.episode, assigned.attempt)
+    if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.expected_claim, claim_state.ClaimIdentity):
+        assigned = request.placement.assignment
+        identity = controller.expected_claim
+        controller.attempt_evidence.provider = placement.ProviderClaimReference(
+            assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
+            identity.claim_id, identity.episode, identity.attempt)
     try:
         controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
+        if isinstance(attempt.answer, (FreshMacClaim, TakenOverMacClaim)):
+            claim_path = cast(Callable[[claim_state.StatePaths, claim_state.ClaimScope], Path],
+                              getattr(import_module("scripts.mac_test.mac_test"), "claim_path"))
+
+            paths = claim_state.state_paths(request.target)
+            scope = (request.placement.assignment.destination.scope
+                     if isinstance(request.placement, AssignedOffloadRequest)
+                     else claim_state.target_claim_scope(paths, str(request.repo_root)))
+            if isinstance(scope, claim_state.RepositoryScope) and not target_config.uses_legacy_mac_layout(paths.platform):
+                scope = replace(scope, slot=attempt.answer.slot)
+            controller.claim_scope_key = claim_path(paths, scope).stem
+        if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+            assigned = request.placement.assignment
+            identity = controller.claim_identity
+            controller.attempt_evidence.provider = placement.ProviderClaimReference(
+                assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
+                identity.claim_id, identity.episode, identity.attempt)
+            if pending_start_path(request.target, identity).exists():
+                controller.pending = PendingStartOperation()
         if isinstance(attempt.interruption, OffloadInterrupted):
             raise attempt.interruption
         return attempt.answer
     except OffloadInterrupted:
         claim = attempt.answer
         if isinstance(claim, FreshMacClaim):
-            release_claim(controller, request.target)
+            _ = release_claim(controller, request.target)
         elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            checked = check_taken_over_claim(config, claim, repository, request.target)
+            checked = check_taken_over_claim(controller, config, claim, repository, request.target)
             report_leftover_check(checked, request)
             if isinstance(checked, LeftoversEnded):
-                release_claim(controller, request.target)
+                _ = release_claim(controller, request.target)
         raise
 
 
@@ -2210,8 +2536,6 @@ def claimed_run(
     evidence.slot = request.slot
     try:
         linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
-        generation = (expected_instance_generation(request.target)
-                      if target_config.is_aws_target(configured_ssh_target(request.target or "mac")) else "")
         if linux:
             expected = expected_linux_parity(controller, config)
             if isinstance(expected, UnavailableToolParity):
@@ -2226,14 +2550,6 @@ def claimed_run(
             copy_seconds = elapsed_seconds(copy_started)
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, InterruptedTargetStatus):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(checked, LeftoversEnded)
-                observe_cleanup(evidence, checked)
-                report_leftover_check(checked, request)
-                if generation and probe.generation == generation:
-                    return InterruptedTargetRun(generation, elapsed_seconds(started))
-                return LostMacRun(elapsed_seconds(started))
             if isinstance(probe, UnresolvedSlotStartup):
                 checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
@@ -2259,7 +2575,7 @@ def claimed_run(
                 return declined("disk", started)
         else:
             probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup, InterruptedTargetStatus)):
+            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
             disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
@@ -2282,27 +2598,70 @@ def claimed_run(
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
+        if isinstance(request.placement, AssignedOffloadRequest):
+            from scripts.build_queue import admission_client, admission_protocol as wire
+
+            assignment = request.placement.assignment
+            source = assignment.source_key
+            if isinstance(source, placement.SourceKeyKnown) and (
+                    not isinstance(copied.tree_key, KnownTreeKey) or copied.tree_key.value != source.key):
+                release_allowed = True
+                return DeclinedMacRun("source_changed", elapsed_seconds(started), "the copied source differs from the assignment")
+            identity = controller.claim_identity
+            start = process_identity.process_start(os.getpid())
+            if not isinstance(identity, claim_state.ClaimIdentity) or not isinstance(start, process_identity.Started):
+                return declined("state", started)
+            reference = placement.ProviderClaimReference(assignment.destination.provider,
+                assignment.destination.target, assignment.destination.scope,
+                identity.claim_id, identity.episode, identity.attempt)
+            holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+            while True:
+                try:
+                    permission = admission_client.consume_permission(wire.ConsumePermission(
+                        uuid.uuid4().hex, assignment, reference, holder))
+                except wire.AdmissionUnavailable:
+                    evidence.execution = placement.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
+                    return declined("state", started)
+                if isinstance(permission, wire.FirstAuthorization):
+                    break
+                if (not isinstance(permission.state, placement.CurrentAssignment)
+                        or not isinstance(permission.permission, placement.PermissionAvailable)):
+                    return declined("state", started)
+                from scripts.build_queue import admission_records as records
+
+                time.sleep(records.read_memory_config().waiting_pass_seconds)
+            evidence.launch_authorized = True
         release_allowed = False
+        identity = controller.claim_identity
+        command = copies.remote_use_command(request_mirror(config, request, repository),
+                                           remote_test_command(config, request, repository, copied.tree_key))
+        if isinstance(identity, claim_state.ClaimIdentity):
+            command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                copies.remote_use_command(request_mirror(config, request, repository),
-                                          remote_test_command(config, request, repository, copied.tree_key)),
+                command,
             ]
         )
         if isinstance(remote_status, MirrorUseBusy):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
-            remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
-            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            if isinstance(controller.pending, PendingStartOperation):
+                settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
+                if isinstance(settlement, StartUnsettled):
+                    observe_cleanup(evidence, settlement.leftovers)
+                    report_leftover_check(settlement.leftovers, request)
+                    return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
+                checked = settlement.leftovers
+            elif not isinstance(controller.pending, SettledDispatchOperations):
+                return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
+            else:
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
-            if isinstance(remote_status, InterruptedTargetStatus):
-                return InterruptedTargetRun(remote_status.generation, elapsed_seconds(started))
             if isinstance(remote_status, ToolVersionMismatch):
                 write_version_decline(request.target, repository.name)
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
@@ -2322,7 +2681,6 @@ def claimed_run(
             ])
             remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
                                                           else CleanupUnconfirmed()))
-        seconds = elapsed_seconds(started)
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
@@ -2335,6 +2693,7 @@ def claimed_run(
         else:
             release_allowed = True
         sync_after_release = linux
+        seconds = elapsed_seconds(started)
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
@@ -2343,7 +2702,8 @@ def claimed_run(
             return NoTestMatchedOnMac(seconds, fetched)
         return FailedOnMac(remote_status.status, seconds, fetched)
     except OffloadInterrupted:
-        if not release_allowed:
+        controller.stop()
+        if not release_allowed and isinstance(controller.pending, SettledDispatchOperations):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
@@ -2354,8 +2714,8 @@ def claimed_run(
         evidence.evidence_at = time.time()
         if release_allowed:
             evidence.unresolved_count = 0
-        if release_allowed:
-            release_claim(controller, request.target)
+        if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
+            _ = release_claim(controller, request.target)
             if sync_after_release:
                 with buildlog_sync.measure_transfers(evidence.traffic):
                     buildlog_sync.sync_target(request.target)
@@ -2501,7 +2861,9 @@ def run_offload(
             slots = (target_config.slot_capacity(config.values, repository.name,
                      missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
             leases: dict[int, ExitStack] = {}
-            for slot in range(1, slots + 1):
+            selected_slots = ((request.placement.assignment.destination.slot or 1,)
+                              if isinstance(request.placement, AssignedOffloadRequest) else range(1, slots + 1))
+            for slot in selected_slots:
                 lease = ExitStack()
                 try:
                     lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
@@ -2538,7 +2900,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
     request = replace(request, admission=UnclaimedMacRun())
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
         controller.attempt_evidence.slot = claim.slot if isinstance(claim, TakenOverMacClaim) else 0
-        checked = check_taken_over_claim(config, claim, repository, request.target)
+        checked = check_taken_over_claim(controller, config, claim, repository, request.target)
         observe_cleanup(controller.attempt_evidence, checked)
         report_leftover_check(checked, request)
         if isinstance(checked, LeftoverCheckFailed):
@@ -2546,11 +2908,18 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
             return declined("unreachable", started)
         if isinstance(checked, LeftoversRemain):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        release_claim(controller, request.target)
+        if isinstance(controller.pending, PendingStartOperation):
+            controller.attempt_evidence.cleanup = "unconfirmed"
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        _ = release_claim(controller, request.target)
+        if isinstance(request.placement, AssignedOffloadRequest):
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
+        if claim.reason in ("busy", "blocked"):
+            controller.attempt_evidence.provider = placement.NoProviderClaim()
         if not decline_already_shown(claim.reason, request.last_decline):
             if claim.stdout:
                 print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
@@ -2560,7 +2929,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
     if claim.slot not in leases:
-        release_claim(controller, request.target)
+        _ = release_claim(controller, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     for slot, lease in leases.items():
         if slot != claim.slot:
@@ -2613,6 +2982,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--target", default="")
+    _ = run.add_argument("--assignment-file", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
@@ -2647,7 +3017,18 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline = PriorMacDecline("busy")
     elif arguments.last_decline == "blocked":
         last_decline = PriorMacDecline("blocked")
+    assigned: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    if arguments.assignment_file:
+        from scripts.build_queue import admission_client, admission_protocol as wire
+
+        saved = admission_client.read_assignment(Path(arguments.assignment_file))
+        if not isinstance(saved, wire.Assignment):
+            raise ValueError("offload requires a remote assignment")
+        assigned = AssignedOffloadRequest(saved.assignment)
+        if saved.assignment.destination.target != "mac" or arguments.target:
+            arguments.target = saved.assignment.destination.target
     return OffloadRequest(
+        placement=assigned,
         repo_root=Path(arguments.repo_root).resolve(),
         source=StagedDocSnapshot(Path(arguments.source_root).resolve()) if arguments.source_root else RepositoryWorkingTree(),
         owner=copies.source_owner(Path(arguments.repo_root)),
@@ -2698,7 +3079,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         queued = Path(first).read_text().strip()
     outcome = ("passed" if isinstance(result, (PassedOnMac, PassedOnTarget)) else "failed"
                if isinstance(result, (FailedOnMac, FailedOnTarget)) else "lost"
-               if isinstance(result, (LostMacRun, InterruptedTargetRun)) else "no_tests"
+               if isinstance(result, LostMacRun) else "no_tests"
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
@@ -2720,8 +3101,99 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     record.ssh_attempt(attempt)
 
 
+class DirectPlacementConstraintBuilder(Protocol):
+    """The fixed source policy used by a direct pinned offload request."""
+
+    def __call__(self, repo_root: Path, package: str,
+                 kind: Literal["check", "lint", "doc", "test", "build", "example", "final"],
+                 command: tuple[str, ...], session: claim_state.SubmittingSession, source_key: placement.SourceIdentity,
+                 *, selection: Pinned, provider_settings: placement.ProviderSettings) -> placement.PlacementConstraints: ...
+
+
+def submit_direct_placement(request: OffloadRequest, since: float, config: OffloadConfig) -> OffloadRequest:
+    """A direct caller keeps its fixed destination through queue placement."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
+    start = process_identity.process_start(os.getpid())
+    if not isinstance(start, process_identity.Started):
+        raise wire.AdmissionUnavailable("the submitting process is unavailable")
+    measured_key = treekey.tree_key(str(request.source_root))
+    source_key = (placement.SourceKeyKnown(measured_key) if measured_key is not None
+                  else placement.SourceKeyUnavailable("the source tree key is unavailable"))
+    session = claim_state.submitting_session(claim_state.CALLING_SESSION)
+    command = ("cargo", request.verb, *(("run",) if request.verb == "nextest" else ()), *request.nextest_words)
+    episode = uuid.uuid4().hex
+    local = admission_client.step_request(list(command), str(request.repo_root),
+        wire.Owner(os.getpid(), start.start), since, "", episode)
+    builder = cast(DirectPlacementConstraintBuilder, getattr(
+        import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+    constraints = builder(request.repo_root, request.package,
+        cast(Literal["check", "lint", "doc", "test", "build", "example", "final"], request.kind or verb_kind(request.verb)),
+        command, session, source_key, selection=Pinned(request.target or "mac"),
+        provider_settings=placement.ExplicitProviderSettings(config.source.resolve())
+            if isinstance(config.source, Path) else placement.ConfiguredProviderSettings())
+    submitted = wire.PlacementRequest(episode, placement.SubmittingOwner(store.host_name(), os.getpid(), start.start),
+        since, local.profile, constraints, identity=local.identity, run=local.run,
+        prerequisite=placement.TokenNotRequired())
+    while True:
+        reply = admission_client.request_placement(submitted)
+        if isinstance(reply, wire.Assignment):
+            return replace(request, target=(request.target if reply.assignment.destination.target == "mac"
+                                            else reply.assignment.destination.target),
+                           slot=reply.assignment.destination.slot or 1,
+                           placement=AssignedOffloadRequest(reply.assignment))
+        if not isinstance(reply, wire.PlacementWait):
+            raise wire.AdmissionUnavailable("the fixed remote assignment did not permit execution")
+        time.sleep(records.read_memory_config().waiting_pass_seconds)
+
+
+def report_placement_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> None:
+    """Report a settled adapter path without inventing a remote process identity."""
+    from scripts.build_queue import admission_client, admission_protocol as wire
+
+    if not isinstance(request.placement, AssignedOffloadRequest):
+        return
+    assigned = request.placement.assignment
+    evidence = controller.attempt_evidence
+    provider = evidence.provider
+    if (isinstance(provider, placement.ProviderClaimReference)
+            and (provider.episode, provider.attempt) != (assigned.episode, assigned.attempt)):
+        if isinstance(controller.pending, SettledDispatchOperations):
+            reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "cleanup completed"
+            _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason, provider))
+        return
+    if isinstance(provider, placement.NoProviderClaim):
+        reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
+        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason))
+        return
+    outcome: placement.AttemptOutcome
+    if isinstance(result, (PassedOnMac, PassedOnTarget)):
+        outcome = placement.AttemptCompleted(0)
+    elif isinstance(result, (FailedOnMac, FailedOnTarget)):
+        outcome = placement.AttemptCompleted(result.status)
+    elif isinstance(result, NoTestMatchedOnMac):
+        outcome = placement.AttemptDeclined("no_tests")
+    elif (isinstance(result, LostMacRun) and evidence.cleanup == "confirmed"
+          and isinstance(controller.pending, SettledDispatchOperations)):
+        outcome = (placement.PrelaunchRefused("lost")
+                   if not evidence.launch_authorized and isinstance(evidence.execution, placement.ExecutionNotStarted)
+                   else placement.AttemptDeclined("lost"))
+    elif (isinstance(result, (DeclinedMacRun, BusyMacDecline))
+          and isinstance(evidence.execution, placement.ExecutionNotStarted)):
+        outcome = placement.PrelaunchRefused(result.reason)
+    elif isinstance(result, (DeclinedMacRun, BusyMacDecline)) and evidence.completion == "confirmed":
+        outcome = placement.AttemptDeclined(result.reason)
+    else:
+        outcome = placement.AttemptOutcomeUnavailable("the provider has unresolved execution or cleanup")
+    path = (placement.DispatchPathSettled() if isinstance(controller.pending, SettledDispatchOperations)
+            else placement.DispatchPathPending("a claim or start child remains active"))
+    _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
+                                                               evidence.execution, outcome, path))
+
+
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
+    from scripts.build_queue import admission_protocol as wire
+
     cli = parser()
     arguments = cli.parse_args(namespace=CliArguments())
     if arguments.environment and arguments.verb != "nextest":
@@ -2749,12 +3221,34 @@ def main() -> int:
                       + f"--target {arguments.target} settings {target_settings}")
         settings = str(target_settings)
     config = read_config(Path(settings)) if settings else read_config()
+    if isinstance(request.placement, AssignedOffloadRequest):
+        request = replace(request, slot=request.placement.assignment.destination.slot or 1)
     controller = ProcessController()
     started = time.monotonic()
     result: MacOffloadResult = LostMacRun(0, "runner did not complete")
+    direct = isinstance(request.placement, DirectOffloadRequest)
+    since = time.time()
     try:
-        with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
-            result = run_offload(controller, config, request, started)
+        if direct:
+            request = submit_direct_placement(request, since, config)
+        while True:
+            with interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
+                result = run_offload(controller, config, request, started)
+            if not direct or not isinstance(result, DeclinedMacRun) or result.reason != "source_changed":
+                break
+            from scripts.build_queue import admission_client
+
+            report_placement_result(controller, request, result)
+            persist_attempt(request, result, controller.attempt_evidence, started)
+            assert isinstance(request.placement, AssignedOffloadRequest)
+            assigned = request.placement.assignment
+            _ = admission_client.cancel_placement(wire.CancelPlacement(
+                uuid.uuid4().hex, assigned.episode, assigned.owner, "source changed before dispatch"))
+            request = replace(request, placement=DirectOffloadRequest(), admission=UnclaimedMacRun())
+            controller = ProcessController()
+            started = time.monotonic()
+            result = LostMacRun(0, "replacement placement did not complete")
+            request = submit_direct_placement(request, since, config)
         status = write_result(result, request.result, request.last_decline, request.verb, request.target,
                               controller.attempt_evidence, request.fetch)
         return status
@@ -2770,6 +3264,10 @@ def main() -> int:
                 pass
         return 75
     finally:
+        try:
+            report_placement_result(controller, request, result)
+        except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
+            print(f"offload: cannot report placement: {error}", file=sys.stderr)
         try:
             persist_attempt(request, result, controller.attempt_evidence, started)
         except (OSError, ValueError) as error:

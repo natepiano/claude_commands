@@ -125,7 +125,7 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 
     def test_ssh_route_carries_result_values_and_fixed_terminal_values(self) -> None:
         settings = self.root / "linux.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nslots=1\n", template="aws_target")
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=peer,natedev\nkind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n")

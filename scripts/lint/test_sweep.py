@@ -21,7 +21,7 @@ import unittest
 from collections.abc import Callable, Collection, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
@@ -905,7 +905,7 @@ class ProcessUseTests(SweepCase):
         nested = self.hana / "proof" / "target"
         nested.mkdir(parents=True)
         owners = sweep.TargetOwnerIndex([str(self.hana), str(nested), str(self.other)])
-        for how in ("exe", "cwd", "maps", "nextest", "nested", "sibling"):
+        for how in ("exe", "cwd", "maps", "nextest", "verify", "nested", "sibling"):
             with self.subTest(how=how):
                 if self.proc.exists():
                     shutil.rmtree(self.proc)
@@ -913,9 +913,10 @@ class ProcessUseTests(SweepCase):
                 fake_process(self.proc, 10,
                              exe=path if how == "exe" else "/usr/bin/true",
                              cwd=path if how in ("cwd", "nested") else (
-                                 str(self.workspace) if how == "nextest" else str(self.hana) + "-old"),
+                                 str(self.workspace) if how in ("nextest", "verify") else str(self.hana) + "-old"),
                              maps=f"7f00-7f10 r-xp 00000000 00:1f 42 {path}\n" if how == "maps" else "",
-                             argv=("cargo", "nextest", "run") if how == "nextest" else ("true",))
+                             argv=("cargo", "nextest", "run") if how == "nextest" else (
+                                 ("bash", "/x/verify.sh", "build", "hana") if how == "verify" else ("true",)))
                 uses = sweep.process_use(str(self.hana), owners, str(self.proc))
                 self.assertEqual(set(uses), set() if how in ("nested", "sibling") else {str(self.hana)})
                 if uses:
@@ -1027,6 +1028,23 @@ class ProcessUseTests(SweepCase):
                      cwd=str(self.workspace / "crates" / "app"),
                      argv=("/nix/store/x-cargo-nextest/bin/cargo-nextest", "nextest", "run"))
         self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace / 'crates' / 'app'}"})
+
+        cases = (
+            (("bash", "/x/verify.sh", "build", "hana"), self.workspace / "crates" / "app", (), (self.hana,)),
+            (("/x/verify.sh", "build", "hana"), self.workspace, (), (self.hana,)),
+            (("bash", "-e", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("sh", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("zsh", "-f", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("dash", "/x/verify.sh", "test"), self.workspace, (), (self.hana,)),
+            (("bash", "/x/other.sh"), self.workspace, (), ()),
+            (("bash", "/x/verify.sh", "build"), self.workspace, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), self.other.parent, (), (self.other,)),
+        )
+        for argv, cwd, environ, targets in cases:
+            with self.subTest(argv=argv, cwd=cwd, environ=environ):
+                shutil.rmtree(self.proc)
+                fake_process(self.proc, 10, cwd=str(cwd), argv=argv, environ=environ)
+                self.assertEqual(self.uses(), {str(target): f"runs verify.sh in {cwd}" for target in targets})
 
     def test_a_nextest_run_uses_the_target_its_flag_or_environment_names(self) -> None:
         for argv, environ in ((("cargo", "nextest", "run", "--target-dir", str(self.other)), ()),
@@ -1325,9 +1343,9 @@ class FloorTests(SweepCase):
     def protected_report(self, base: Path, holders: Sequence[sweep.FloorHolder] = ()) -> str:
         roots, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
         measured = sweep.measure_protected_folders(
-            frozenset(item.path for item in outputs.no_recorded_evidence), frozenset(roots))
+            frozenset(item.path for item in outputs.no_recorded_evidence), frozenset(roots), walk=sweep.CacheFolderWalk())
         return sweep.floor_out_of_reach_text(time.time(), 0, 0, 10 * GIB, holders, frozenset(), 0,
-                                             sweep.UnavailableDiskMeasurement("missing"), 0, protected=measured)
+                                             sweep.UnavailableDiskMeasurement("missing"), 0, protected=measured.sizes)
 
     def test_overridden_step_outputs_stay_protected_without_authorizing_the_default_root(self) -> None:
         base = self.base()
@@ -1396,7 +1414,7 @@ class FloorTests(SweepCase):
             protected.append(root)
         _ = write_config_fixture(conf.path("lint"), "sweep_measurement_paths=2\nsweep_message_path_widths=48\n"
                                  + "sweep_phone_floor_gib=300\n")
-        with (mock.patch.object(sweep, "directory_blocks", wraps=sweep.directory_blocks) as measure,
+        with (mock.patch.object(sweep, "measure_directory", wraps=sweep.measure_directory) as measure,
               mock.patch.object(sweep, "disk_floor_channels", return_value=sweep.FloorAlertChannels.NATEDEV),
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
             status, text = self.hold(base, 10 * GIB, [0], recorded=False)
@@ -1535,7 +1553,7 @@ class FloorTests(SweepCase):
         os.link(own, sibling / "shared-file")
         roots, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
         measured = dict(sweep.measure_protected_folders(
-            frozenset(item.path for item in outputs.no_recorded_evidence), frozenset(roots)))
+            frozenset(item.path for item in outputs.no_recorded_evidence), frozenset(roots), walk=sweep.CacheFolderWalk()).sizes)
         exclusive = sum(path.stat().st_blocks * 512 for path in
                         (own, outer / ".fingerprint" / f"outer-{APP}" / "bin-outer.json", outer.parent / sweep.RUSTC_INFO,
                          sibling_file, sibling / ".fingerprint" / f"sibling-{TOOL}" / "bin-sibling.json",
@@ -3112,17 +3130,18 @@ class FloorTests(SweepCase):
         old_tree, old = cargo_target(base, "old", APP, now - 3 * DAY)
         _, next_output = cargo_target(base, "next", DEMO, now - 2 * DAY)
         clock = [now]
-        original = sweep.directory_blocks
-        def use_during_size_walk(path: str, seen: set[sweep.InodeKey] | None = None,
-                                 excluded: Collection[str] = ()) -> int:
+        original = sweep.measure_directory
+        def use_during_size_walk(path: str, walk: sweep.CacheFolderWalk,
+                                 excluded: Collection[str] = (), *,
+                                 counted_inodes: Collection[sweep.InodeKey] = ()) -> sweep.DirectoryMeasurement:
             stamp = old_tree.parent / sweep.USE_STAMP
             if not stamp.exists():
                 stamp.touch()
                 os.utime(stamp, (now + 10, now + 10))
                 clock[0] = now + 20
-            return original(path, seen, excluded)
+            return original(path, walk, excluded, counted_inodes=counted_inodes)
         with (mock.patch.object(time, "time", side_effect=lambda: clock[0]),
-              mock.patch.object(sweep, "directory_blocks", side_effect=use_during_size_walk)):
+              mock.patch.object(sweep, "measure_directory", side_effect=use_during_size_walk)):
             status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
         self.assertEqual(status, 0)
         self.assertTrue(old.exists())
@@ -3185,7 +3204,7 @@ class FloorTests(SweepCase):
         active: list[int] = []
         acquired: list[list[str]] = []
         original_locks, original_release = sweep.lock_trees, sweep.release
-        original_scan, original_sizes = sweep.scan_roots, sweep.directory_blocks
+        original_scan, original_sizes = sweep.scan_roots, sweep.measure_directory
         def lock_one(trees: list[str]) -> sweep.TargetLocksAcquired | sweep.TargetLockBusy:
             self.assertEqual(active, [], "Two targets must never hold locks together")
             acquired.append(trees)
@@ -3200,14 +3219,15 @@ class FloorTests(SweepCase):
         def scan_unlocked(roots: list[str], trees: list[str], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
             self.assertEqual(active, [], "Candidate scan must hold no cargo locks")
             return original_scan(roots, trees, lint_settings=lint_settings)
-        def size_unlocked(path: str, seen: set[sweep.InodeKey] | None = None,
-                          excluded: Collection[str] = ()) -> int:
+        def size_unlocked(path: str, walk: sweep.CacheFolderWalk,
+                          excluded: Collection[str] = (), *,
+                          counted_inodes: Collection[sweep.InodeKey] = ()) -> sweep.DirectoryMeasurement:
             self.assertEqual(active, [], "Size walks must hold no cargo locks")
-            return original_sizes(path, seen, excluded)
+            return original_sizes(path, walk, excluded, counted_inodes=counted_inodes)
         with (mock.patch.object(sweep, "lock_trees", side_effect=lock_one),
               mock.patch.object(sweep, "release", side_effect=unlock),
               mock.patch.object(sweep, "scan_roots", side_effect=scan_unlocked),
-              mock.patch.object(sweep, "directory_blocks", side_effect=size_unlocked)):
+              mock.patch.object(sweep, "measure_directory", side_effect=size_unlocked)):
             status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
         self.assertEqual(status, 0)
         self.assertEqual(active, [])
@@ -3285,7 +3305,7 @@ class FloorTests(SweepCase):
         _, second = cargo_target(base, "second", DEMO, time.time() - DAY)
         free = [10 * GIB - 1, 10 * GIB - 1]
         baseline = self.hold(base, 10 * GIB, free, dry_run=True, recorded=True)
-        with mock.patch.object(sweep, "directory_blocks", side_effect=OSError("fixture accounting unavailable")):
+        with mock.patch.object(sweep, "measure_directory", side_effect=OSError("fixture accounting unavailable")):
             result = self.hold(base, 10 * GIB, free, dry_run=True, recorded=True)
         self.assertEqual(result, baseline)
         self.assertIn(f"from {first.parents[2]}", result[1])
@@ -3306,7 +3326,7 @@ class FloorTests(SweepCase):
         for target in targets[1:]:
             (target / "tmp").mkdir()
             os.link(shared, target / "tmp" / "shared")
-        with mock.patch.object(sweep, "directory_blocks", wraps=sweep.directory_blocks) as walks:
+        with mock.patch.object(sweep, "measure_directory", wraps=sweep.measure_directory) as walks:
             status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
         self.assertEqual(status, 0)
         self.assertFalse(payloads[0].exists())
@@ -3337,7 +3357,7 @@ class FloorTests(SweepCase):
             return result
 
         with (mock.patch.object(sweep, "scan_floor_roots", side_effect=scan),
-              mock.patch.object(sweep, "directory_blocks", wraps=sweep.directory_blocks) as walks):
+              mock.patch.object(sweep, "measure_directory", wraps=sweep.measure_directory) as walks):
             status, text = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB], recorded=True)
         self.assertEqual(status, 0, text)
         self.assertFalse(own.exists())
@@ -3419,15 +3439,285 @@ class FloorTests(SweepCase):
             status = sweep.hold_floor(floor, dry_run, policy=policy)
         return status, output.getvalue()
 
+    @staticmethod
+    def cache_folders(sizes: dict[str, int]) -> sweep.MeasuredCacheFolders:
+        """Keep synthetic folder totals separate from shared-inode fixtures."""
+        return sweep.MeasuredCacheFolders(sizes, {})
+
     def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
               push_at: float | None = None) -> None:
+        roots = fixture_target_dirs([os.environ[tmp_sweep.STATE_ENV]], lint_settings=conf.read("lint"))
+        roots.extend(path for path in conf.read("lint").words("sweep_ci_targets") if os.path.isdir(path))
+        sizes = {path: sweep.directory_blocks(path) for path in roots}
+        if sizes:
+            largest = max(sizes, key=lambda path: sizes[path])
+            sizes[largest] += caches - sum(sizes.values())
         sweep.write_floor_record(
             sweep.floor_record_path(),
             sweep.FloorRecord(time.time() - age, free, caches,
                               sweep.DeliveredAlert(alert_at) if alert_at is not None else sweep.NoDeliveredAlert(),
                               sweep.DeliveredAlert(push_at) if push_at is not None else sweep.NoDeliveredAlert(),
-                              sweep.KnownHeldRoots(frozenset())),
+                              sweep.KnownHeldRoots(frozenset()), cache_folders=self.cache_folders(sizes)),
         )
+
+    def test_cache_growth_compares_only_folders_in_both_readings(self) -> None:
+        for change in ("leaves", "joins", "shrinks"):
+            with self.subTest(change=change):
+                base = self.base()
+                tree, output = cargo_target(base, "repo", APP, time.time() - DAY)
+                root = str(tree.parent)
+                size = sweep.directory_blocks(root)
+                previous_sizes = {root: size}
+                free_fall = SIZE // 2
+                expected_growth = 0
+                if change == "leaves":
+                    previous_sizes[str(base / "unlisted" / "target")] = 152 * GIB
+                elif change == "joins":
+                    previous_sizes.clear()
+                    free_fall = size
+                else:
+                    _ = write(output, 2 * SIZE)
+                    previous_sizes[root] = sweep.directory_blocks(root)
+                    _ = output.write_bytes(b"")
+                    expected_growth = sweep.directory_blocks(root) - previous_sizes[root]
+                self.prior(10 * GIB, sum(previous_sizes.values()))
+                previous = self.saved_record()
+                sweep.write_floor_record(sweep.floor_record_path(), replace(previous,
+                    cache_folders=self.cache_folders(previous_sizes)))
+                _ = write_config_fixture(conf.path("lint"), f"sweep_unexplained_fall_bytes={SIZE}\n")
+                with (mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
+                      mock.patch.object(sweep, "floor_alert_text", wraps=sweep.floor_alert_text) as alert):
+                    status, _ = self.hold(base, 10 * GIB, [10 * GIB - free_fall, 10 * GIB], recorded=True)
+                self.assertEqual(status, 0)
+                if change == "leaves":
+                    send.assert_not_called()
+                    alert.assert_not_called()
+                else:
+                    send.assert_called_once()
+                    self.assertEqual(cast(int, alert.call_args.args[3]), free_fall)
+                    self.assertEqual(cast(int, alert.call_args.args[4]), expected_growth)
+                saved = self.saved_record()
+                self.assertIsInstance(saved.cache_folders, sweep.MeasuredCacheFolders)
+                assert isinstance(saved.cache_folders, sweep.MeasuredCacheFolders)
+                self.assertNotIn(str(base / "unlisted" / "target"), saved.cache_folders.bytes_by_path)
+                self.assertEqual(saved.build_cache_bytes, sweep.directory_blocks(root))
+
+    def test_common_folders_count_shared_inode_growth_and_removal_once(self) -> None:
+        base = self.base()
+        roots = [base / "first-cache", base / "second-cache"]
+        for root in roots:
+            root.mkdir()
+        names = frozenset(map(str, roots))
+        empty = sweep.measure_protected_folders(names, frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        shared = write(roots[0] / "shared", SIZE)
+        os.link(shared, roots[1] / "shared")
+        full = sweep.measure_protected_folders(names, frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        allocated = shared.stat().st_blocks * 512
+        self.assertGreater(allocated, 0)
+        previous = sweep.FloorRecord(100, 5, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                     cache_folders=empty)
+        self.assertEqual(sweep.cache_folder_growth(previous, full), allocated)
+        sweep.write_floor_record(sweep.floor_record_path(), replace(previous, cache_folders=full))
+        previous = self.saved_record()
+        self.assertEqual(previous.cache_folders, full)
+        shared.unlink()
+        (roots[1] / "shared").unlink()
+        removed = sweep.measure_protected_folders(names, frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        self.assertEqual(sweep.cache_folder_growth(previous, removed), -allocated)
+
+        # A shared inode stays counted when only its first folder leaves the reading.
+        key = (1, 2)
+        linked = sweep.MeasuredCacheFolders({"first": 1024, "second": 1024},
+            {key: sweep.SharedCacheInode(1024, frozenset(("first", "second")))})
+        blank = self.cache_folders({"first": 0, "second": 0})
+        for before, after, expected in ((blank, linked, 1024), (linked, blank, -1024)):
+            with self.subTest(expected=expected):
+                self.assertEqual(sweep.cache_folder_growth(replace(previous, cache_folders=before), after), expected)
+        surviving = self.cache_folders({"second": 1024})
+        self.assertEqual(sweep.cache_folder_growth(replace(previous, cache_folders=linked), surviving), 0)
+
+    def test_unlink_between_folder_measurements_counts_shared_growth_once(self) -> None:
+        base = self.base()
+        roots = [base / "first-cache", base / "second-cache"]
+        for root in roots:
+            root.mkdir()
+        names = frozenset(map(str, roots))
+        empty = sweep.measure_protected_folders(names, frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        shared = write(roots[0] / "shared", SIZE)
+        other = roots[1] / "shared"
+        os.link(shared, other)
+        allocated = shared.stat().st_blocks * 512
+        key = (shared.stat().st_dev, shared.stat().st_ino)
+        original = sweep.measure_directory
+        observations: list[int] = []
+
+        def unlink_after_first(path: str, walk: sweep.CacheFolderWalk, excluded: Collection[str] = (), *,
+                               counted_inodes: Collection[sweep.InodeKey] = ()) -> sweep.DirectoryMeasurement:
+            observations.append((Path(path) / "shared").stat().st_nlink)
+            measurement = original(path, walk, excluded, counted_inodes=counted_inodes)
+            if path == str(roots[0]):
+                shared.unlink()
+            return measurement
+
+        with mock.patch.object(sweep, "measure_directory", side_effect=unlink_after_first):
+            measured = sweep.measure_protected_folders(names, frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        previous = sweep.FloorRecord(100, 5, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                     cache_folders=empty)
+        self.assertEqual(observations, [2, 1])
+        self.assertEqual(measured.bytes_by_path, {str(root): allocated for root in roots})
+        self.assertEqual(measured.shared_inodes, {key: sweep.SharedCacheInode(allocated, names)})
+        self.assertEqual(sweep.cache_folder_growth(previous, measured), allocated)
+        sweep.write_floor_record(sweep.floor_record_path(), replace(previous, cache_folders=measured))
+        self.assertEqual(self.saved_record().cache_folders, measured)
+
+    def test_scan_keeps_hard_link_candidate_when_a_later_stat_has_one_link(self) -> None:
+        base = self.base()
+        roots = [base / "first-cache", base / "second-cache"]
+        for root in roots:
+            root.mkdir()
+        shared = write(roots[0] / "shared", SIZE)
+        os.link(shared, roots[1] / "shared")
+        key = (shared.stat().st_dev, shared.stat().st_ino)
+        names = list(map(str, roots))
+        scan = sweep.Scan(discovered_targets=tuple(names))
+        sweep.walk(names[0], None, {}, scan)
+        self.assertEqual(scan.links[key], 2)
+        shared.unlink()
+        sweep.walk(names[1], None, {}, scan)
+        self.assertEqual(scan.links[key], 1)
+        measured = sweep.CacheFolderWalk.from_scan(scan, names).snapshot()
+        allocated = (roots[1] / "shared").stat().st_blocks * 512
+        self.assertIn(key, measured.shared_inodes)
+        self.assertEqual(measured.shared_inodes[key], sweep.SharedCacheInode(allocated, frozenset(names)))
+        self.assertTrue(all(key in scan.target_links[path] for path in names))
+
+    def test_link_created_between_folder_measurements_has_no_growth_or_next_sweep_shrink(self) -> None:
+        for groups in ("protected", "protected-and-ci", "idle-and-protected"):
+            with self.subTest(groups=groups):
+                base = self.base()
+                roots = [base / "first-cache", base / "second-cache"]
+                for root in roots:
+                    root.mkdir()
+                shared = write(roots[0] / "shared", SIZE)
+                allocated = shared.stat().st_blocks * 512
+                key = (shared.stat().st_dev, shared.stat().st_ino)
+                names = frozenset(map(str, roots))
+                initial = sweep.measure_protected_folders(names, names, walk=sweep.CacheFolderWalk()).cache_folders
+                previous = sweep.FloorRecord(100, 5, allocated, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                             cache_folders=initial)
+                observations: list[int] = []
+                original = sweep.measure_directory
+
+                def link_after_first(path: str, walk: sweep.CacheFolderWalk, excluded: Collection[str] = (), *,
+                                     counted_inodes: Collection[sweep.InodeKey] = ()) -> sweep.DirectoryMeasurement:
+                    observations.append((Path(path) / "shared").stat().st_nlink)
+                    measured = original(path, walk, excluded, counted_inodes=counted_inodes)
+                    if path == str(roots[0]):
+                        os.link(shared, roots[1] / "shared")
+                    return measured
+
+                walk = sweep.CacheFolderWalk()
+                with mock.patch.object(sweep, "measure_directory", side_effect=link_after_first):
+                    if groups == "protected":
+                        measured_group = sweep.measure_protected_folders(names, names, walk=walk)
+                        self.assertEqual(len(measured_group.sizes), 2)
+                    else:
+                        if groups == "idle-and-protected":
+                            scan = sweep.Scan(discovered_targets=tuple(sorted(names)))
+                            sweep.walk(str(roots[0]), None, {}, scan)
+                            walk = sweep.CacheFolderWalk.from_scan(scan, [str(roots[0])])
+                            observations.append(shared.stat().st_nlink)
+                            os.link(shared, roots[1] / "shared")
+                            measured_group = sweep.measure_protected_folders(frozenset((str(roots[1]),)), names, walk=walk)
+                            self.assertEqual(len(measured_group.sizes), 1)
+                        else:
+                            measured_group = sweep.measure_protected_folders(frozenset((str(roots[0]),)), names, walk=walk)
+                            self.assertEqual(len(measured_group.sizes), 1)
+                            walk.folders[str(roots[1])] = sweep.measure_directory(str(roots[1]), walk)
+                measured = walk.snapshot()
+                self.assertEqual(observations, [1, 2])
+                self.assertEqual(measured.bytes_by_path, {str(root): allocated for root in roots})
+                self.assertEqual(measured.shared_inodes, {key: sweep.SharedCacheInode(allocated, names)})
+                self.assertEqual(sweep.cache_folder_growth(previous, measured), 0)
+                sweep.write_floor_record(sweep.floor_record_path(), replace(previous, cache_folders=measured))
+                saved = self.saved_record()
+                stable = sweep.measure_protected_folders(names, names, walk=sweep.CacheFolderWalk()).cache_folders
+                self.assertEqual(sweep.cache_folder_growth(saved, stable), 0)
+
+    def test_floor_shares_first_owners_between_protected_and_ci_folders(self) -> None:
+        base = self.base()
+        tree, shared = cargo_target(base, "protected", APP, time.time() - DAY)
+        protected = str(tree.parent)
+        ci = base / "ci-1"
+        ci.mkdir()
+        names = frozenset((protected, str(ci)))
+        initial = sweep.measure_protected_folders(names, names, walk=sweep.CacheFolderWalk()).cache_folders
+        previous = sweep.FloorRecord(time.time() - 60, 10 * GIB, sum(initial.bytes_by_path.values()),
+                                     sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                     cache_folders=initial)
+        sweep.write_floor_record(sweep.floor_record_path(), previous)
+        original = sweep.measure_directory
+        observations: list[int] = []
+
+        def link_into_ci(path: str, walk: sweep.CacheFolderWalk, excluded: Collection[str] = (), *,
+                         counted_inodes: Collection[sweep.InodeKey] = ()) -> sweep.DirectoryMeasurement:
+            if path in names:
+                observations.append(shared.stat().st_nlink)
+            measured = original(path, walk, excluded, counted_inodes=counted_inodes)
+            if path == protected:
+                os.link(shared, ci / "created-after-protected-scan")
+            return measured
+
+        with mock.patch.object(sweep, "measure_directory", side_effect=link_into_ci):
+            status, text = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=False)
+        self.assertEqual(status, 0, text)
+        self.assertEqual(observations, [1, 2])
+        saved = self.saved_record()
+        self.assertIsInstance(saved.cache_folders, sweep.MeasuredCacheFolders)
+        assert isinstance(saved.cache_folders, sweep.MeasuredCacheFolders)
+        self.assertEqual(sweep.cache_folder_growth(previous, saved.cache_folders), 0)
+        key = (shared.stat().st_dev, shared.stat().st_ino)
+        self.assertEqual(saved.cache_folders.shared_inodes[key].folders, names)
+        status, text = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=False)
+        self.assertEqual(status, 0, text)
+        stable = self.saved_record()
+        self.assertIsInstance(stable.cache_folders, sweep.MeasuredCacheFolders)
+        assert isinstance(stable.cache_folders, sweep.MeasuredCacheFolders)
+        self.assertEqual(sweep.cache_folder_growth(saved, stable.cache_folders), 0)
+
+    def test_many_private_files_store_no_inode_identities(self) -> None:
+        base = self.base()
+        folder = base / "private-cache"
+        folder.mkdir()
+        for number in range(1000):
+            _ = (folder / str(number)).write_bytes(b"data")
+        os.link(folder / "0", folder / "inside-link")
+        measured = sweep.measure_protected_folders(frozenset((str(folder),)), frozenset(), walk=sweep.CacheFolderWalk()).cache_folders
+        expected = sum((folder / str(number)).stat().st_blocks * 512 for number in range(1000))
+        self.assertEqual(measured.bytes_by_path, {str(folder): expected})
+        self.assertEqual(measured.shared_inodes, {})
+        record = sweep.FloorRecord(100, 5, expected, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                                   cache_folders=measured)
+        sweep.write_floor_record(sweep.floor_record_path(), record)
+        saved = cast(dict[str, object], json.loads(sweep.floor_record_path().read_text()))
+        self.assertEqual(saved["cache_folders"], {str(folder): expected})
+        self.assertEqual(saved["shared_cache_inodes"], [])
+        self.assertNotIn("cache_folder_inodes", saved)
+        self.assertEqual(self.saved_record().cache_folders, measured)
+
+    def test_cache_folder_sizes_round_trip_and_old_records_have_no_inferred_growth(self) -> None:
+        _ = self.base()
+        previous = sweep.FloorRecord(100, 5, 8, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
+        current = self.cache_folders({"/cache/kept": 4, "/cache/joined": 10})
+        self.assertEqual(sweep.cache_folder_growth(previous, current), 0)
+        sweep.write_floor_record(sweep.floor_record_path(), replace(previous, cache_folders=current))
+        self.assertEqual(self.saved_record().cache_folders, current)
+        invalid_sizes: tuple[object, ...] = (None, [], {"/cache/kept": -1}, {"/cache/kept": True}, {"/cache/kept": "4"})
+        for invalid in invalid_sizes:
+            data = cast(dict[str, object], json.loads(sweep.floor_record_path().read_text()))
+            data["cache_folders"] = invalid
+            _ = sweep.floor_record_path().write_text(json.dumps(data))
+            self.assertIsInstance(self.saved_record().cache_folders, sweep.CacheFoldersNotMeasured)
 
     def test_a_changed_held_root_set_does_not_report_its_missing_bytes_as_growth(self) -> None:
         base = self.base()
@@ -3522,6 +3812,80 @@ class FloorTests(SweepCase):
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
         self.assertIn("stale", message)
         self.assertFalse((base / "repo" / "target" / "debug" / "deps" / f"repo-{APP}").exists())
+
+        now = time.time()
+        for case, walk_age, growth, threshold, interval, seed, remains, sends in (
+            ("unnamed fall", 7201, 0, 3, 7200, "", True, 0),
+            ("threshold boundary", 7201, 0, 5, 7200, "", False, 0),
+            ("explained fall", 30, 5, 3, 0, "", False, 0),
+            ("young walk", 7199, 0, 3, 7200, "", False, 0),
+            ("changed build hold", 7201, 0, 3, 7200, "", False, 0),
+            ("old floor record", 7201, 0, 3, 7200, "", False, 0),
+            ("changed filesystem", 7201, 0, 3, 7200, "", False, 0),
+            ("existing request", 7201, 0, 3, 7200, "pending", True, 0),
+            ("completed walk", 1, 5, 3, 7200, "completed", False, 1),
+            ("refused follow-up", 1, 5, 3, 7200, "refused", True, 1),
+            ("unreadable request", 7201, 0, 3, 7200, "unreadable", True, 0),
+        ):
+            with self.subTest(case=case), mock.patch.object(time, "time", return_value=now):
+                base = self.base()
+                _ = write_config_fixture(conf.path("lint"),
+                    f"sweep_walk_request_fall_bytes={threshold * GIB}\n"
+                    + f"sweep_walk_request_interval_seconds={interval}\n")
+                self.prior(14 * GIB, 0)
+                protected: dict[str, sweep.BuildHoldTarget] = {}
+                if case == "changed build hold":
+                    held_tree, _ = cargo_target(base, "held", DEMO, now - DAY)
+                    protected[str(held_tree.parent)] = sweep.BuildHoldTarget("build-speed")
+                    self.prior(9 * GIB, 35 * GIB)
+                elif case == "old floor record":
+                    self.prior(14 * GIB, 0, age=int(conf.read("lint").number("sweep_growth_window_seconds")) + 1)
+                elif case == "changed filesystem":
+                    sweep.write_floor_record(sweep.floor_record_path(), sweep.FloorRecord(
+                        now - 60, 14 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert(),
+                        sweep.KnownHeldRoots(frozenset()), filesystem="previous-device"))
+                _ = (store.root() / store.DISK_NAME).write_text(json.dumps({
+                    "measured_at": store.utc_iso(now - walk_age),
+                    "previous_measured_at": store.utc_iso(now - walk_age - 600),
+                    "outside_build_cache_totals": [{"label": "/tmp", "bytes": 8 * GIB, "growth_bytes": growth * GIB}],
+                    "outside_build_caches": [{"path": "/tmp/traces", "bytes": 8 * GIB, "growth_bytes": growth * GIB,
+                                              "largest_child_path": None, "largest_child_growth_bytes": None}],
+                }))
+                request_path = store.root() / store.DISK_WALK_REQUEST_NAME
+                request: store.DiskWalkRequest = {"requested_at": store.utc_iso(now - 10),
+                                                  "alert_at": store.utc_iso(now - 10), "unnamed_bytes": 5 * GIB}
+                if seed == "unreadable":
+                    _ = request_path.write_text("{")
+                elif seed:
+                    store.write_disk_walk_request(request)
+                saved = request_path.read_bytes() if seed else b""
+                errors = io.StringIO()
+                delivery = FAILED_NATEDEV_ALERT if seed == "refused" else DELIVERED_NATEDEV_ALERT
+                with (mock.patch.object(sweep, "send_floor_alert", return_value=delivery) as followup,
+                      mock.patch.object(sweep, "build_hold_targets", return_value=protected),
+                      redirect_stderr(errors)):
+                    self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], recorded=True)[0], 0)
+                    self.assertEqual(followup.call_count, sends)
+                    self.assertEqual(request_path.exists(), remains)
+                    if sends:
+                        text = cast(str, followup.call_args.args[0])
+                        self.assertTrue(text.startswith(f"Folder walk for the {request['alert_at']} fall:\n"))
+                        self.assertIn("/tmp/traces: grew 5.0 GiB", text)
+                    if seed and remains:
+                        self.assertEqual(request_path.read_bytes(), saved)
+                    if case == "unnamed fall":
+                        self.assertEqual(store.read_disk_walk_request(), {
+                            "requested_at": store.utc_iso(now), "alert_at": store.utc_iso(now), "unnamed_bytes": 5 * GIB,
+                        })
+                        saved = request_path.read_bytes()
+                    if seed == "completed" or case == "unnamed fall":
+                        self.assertEqual(self.hold(base, 10 * GIB, [11 * GIB], recorded=True)[0], 0)
+                        self.assertEqual(followup.call_count, sends)
+                        if remains:
+                            self.assertEqual(request_path.read_bytes(), saved)
+                if seed == "unreadable":
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn(str(request_path), errors.getvalue())
 
     def test_target_deleted_during_the_scan_is_no_unexplained_fall(self) -> None:
         """natedev 2026-10-25 23:06 AST: 298.1 GiB free at the previous sweep, 293.5 GiB before the
@@ -4060,20 +4424,35 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         else f"In the natedev Claude session, say which {machine.value} folders to delete.")
 
     def test_crossing_session_keeps_trash_and_scratch_effects(self) -> None:
-        for folder, effect, recommendation in (
+        for folder, effect, recommendation, age in (
             ("/private/Trash", "Deleting it removes discarded files.",
-             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
             ("/private/scratch/work", "Deleting it removes temporary work; check for work you still need.",
-             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
+            ("/private/daily", "Deleting it removes its contents; their use is unknown.",
+             "Review /private/daily first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 26 * 3600),
+            ("/private/missed", "Deleting it removes its contents; their use is unknown.", "", 100801),
         ):
-            with self.subTest(folder=folder), self.crossing_delivery({}) as delivery:
-                measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+            with self.subTest(folder=folder, age=age), self.crossing_delivery({}) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_snapshot_max_age_seconds=100800\n")
+                now = time.time()
+                measurement = sweep.AvailableDiskMeasurement(datetime.fromtimestamp(now - age, UTC), sweep.NoEarlierDiskMeasurement(), [
                     sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
                 ], 0)
                 with (self.measured_output_roots((folder,)),
                       mock.patch.object(sweep, "read_disk_measurement", return_value=measurement)):
                     self.finalize_crossing(140)
                 message = delivery.attempts[0].text
+                if age > 100800:
+                    self.assertNotIn(folder, message)
+                    self.assertIn("Folder sizes are unknown.", message)
+                    self.assertIn("Folder sizes are unknown.", phone_text(delivery.attempts))
+                    details = sweep.disk_measurement_lines(
+                        measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))
+                    self.assertIn("stale", "\n".join(details))
+                    continue
+                self.assertNotIn("stale", "\n".join(sweep.disk_measurement_lines(
+                    measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))))
                 lines = [
                     "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
                     "The cleanup run freed nothing.",
@@ -6503,7 +6882,7 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.object(sweep, "PROC_DIR", str(proc)),
               mock.patch.object(sweep, "lock_trees", wraps=sweep.lock_trees) as locks,
               mock.patch.object(sweep, "scan_roots", wraps=sweep.scan_roots) as scan,
-              mock.patch.object(sweep, "directory_blocks", wraps=sweep.directory_blocks) as sizes):
+              mock.patch.object(sweep, "measure_directory", wraps=sweep.measure_directory) as sizes):
             status, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB], recorded=True)
         self.assertEqual(status, 0)
         self.assertTrue(held.exists())
@@ -6967,6 +7346,42 @@ class HolderSessionTests(unittest.TestCase):
               mock.patch.object(sessions, "live_sessions", return_value=[record])):
             self.assertEqual(sweep.holder_sessions([300, 400, 999]), {300: "hana-unit"})
         self.assertEqual(sweep.holder_sessions([]), {})
+
+        from scripts.agents import worker_lifecycle
+        from scripts.production import staff
+
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = base / "detached.json"
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "builds-director", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl2", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("worker-session"))
+        table.update({
+            500: process_table.Process(500, 1, "python3", f"python3 detached_runs.py supervise {path}"),
+            600: process_table.Process(600, 500, "verify.sh", "bash verify.sh test"),
+            700: process_table.Process(700, 600, "cargo", "cargo nextest run"),
+        })
+        for case in ("worker", "wrong pid", "missing worker", "missing parent", "finished", "missing", "unreadable"):
+            with self.subTest(case=case):
+                rows = (worker,) if case == "missing parent" else (director, worker)
+                _ = path.write_text(json.dumps({
+                    "pid": 501 if case == "wrong pid" else 500,
+                    "status": "finished" if case == "finished" else "running",
+                    "staff_id": "unknown" if case == "missing worker" else str(worker.id),
+                }))
+                if case == "missing":
+                    path.unlink()
+                elif case == "unreadable":
+                    _ = path.write_text("{")
+                with (mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(sessions, "live_sessions", return_value=[record]),
+                      mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(rows)),
+                      mock.patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as read):
+                    expected = {300: "hana-unit"}
+                    if case == "worker":
+                        expected.update({600: "builds-director", 700: "builds-director"})
+                    self.assertEqual(sweep.holder_sessions([300, 600, 700, 999]), expected)
+                    read.assert_called_once_with(path)
 
 
 class BudgetTests(unittest.TestCase):

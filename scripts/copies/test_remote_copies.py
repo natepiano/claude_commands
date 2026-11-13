@@ -197,10 +197,11 @@ class RemoteCopiesTests(unittest.TestCase):
         from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
         holder = self.list_members()[1]
+        staff_file = os.environ["STAFF_FILE"]
         fixture = OffloadCommandFixture()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        fixture.environment["STAFF_FILE"] = os.environ["STAFF_FILE"]
+        fixture.environment["STAFF_FILE"] = staff_file
         fixture.fixture["hold_run"] = True
         fixture.sync_fixture()
         process = fixture.start_command(extra={"CLAUDE_CODE_SESSION_ID": holder.current_session,
@@ -533,10 +534,10 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertIn('"owner": "alpha"', metadata.read_text())
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
 
-    def test_remote_kind_covers_mac_linux_and_aws(self) -> None:
+    def test_remote_kind_covers_mac_linux_and_named_peer(self) -> None:
         from scripts.mac_test import offload
         from scripts.build_targets import target_config
-        targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("aws", "linux"))
+        targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("peer", "linux"))
         for name, platform in targets:
             with self.subTest(target=name), mock.patch.object(offload, "configured_ssh_target",
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):

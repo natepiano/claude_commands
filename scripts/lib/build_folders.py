@@ -26,6 +26,7 @@ import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
 from scripts.lib.boot_identity import boot_identity
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -34,10 +35,6 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
-
-
-
-_CANCELLATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 @contextmanager
@@ -52,7 +49,7 @@ def defer_signals() -> Generator[None]:
         del frame
         pending.append(number)
 
-    previous = {number: signal.signal(number, record) for number in _CANCELLATION_SIGNALS}
+    previous = {number: signal.signal(number, record) for number in CANCELLATION_SIGNALS}
     try:
         yield
     finally:
@@ -572,7 +569,7 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
         del frame
         raise CommandSignal(number)
 
-    watched = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    watched = CANCELLATION_SIGNALS
     previous = {number: signal.signal(number, interrupted) for number in watched}
     try:
         with temporary_build_folder(spec) as path:
@@ -647,6 +644,8 @@ def main(argv: Sequence[str]) -> int:
     stable_parent = stable.add_mutually_exclusive_group()
     _ = stable_parent.add_argument("--parent", type=Path)
     _ = stable_parent.add_argument("--unit-root", action="store_true")
+    remove = commands.add_parser("remove")
+    _ = remove.add_argument("path", type=Path)
     run_temp = commands.add_parser("run-temp-path")
     _ = run_temp.add_argument("run", type=Path)
     run = commands.add_parser("run")
@@ -667,6 +666,15 @@ def main(argv: Sequence[str]) -> int:
                 raise ValueError("run needs --owner or --unit")
             return run_build(owner, cast(str, args.name), arguments[1:] if arguments[:1] == ["--"] else arguments,
                              showrunner=cast(str, args.showrunner), unit=cast(str, args.unit), work=cast(str, args.work))
+        if command == "remove":
+            path = cast(Path, args.path)
+            _release_build_folder(path)
+            def cleanup() -> None:
+                try:
+                    shutil.rmtree(path)
+                except FileNotFoundError:
+                    pass
+            return 0 if remove_build_folder(path, cleanup) else 1
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 

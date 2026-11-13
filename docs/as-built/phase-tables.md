@@ -141,8 +141,14 @@ The parent showrunner row supplies the production name and `doc.path`.
 A plan outside a production writes no note.
 A run whose plan file was removed, as for ad hoc work after the as-built, writes no note and prints nothing.
 
-- **Path.** `<vault root>/<showrunner session name>/<file name>.md`. The folder is `showrunners.current_name(name)` (`scripts/production/showrunners.py`). While that answers empty, the note is rewritten in the folder of the unit's most recently modified owned note; with no owned note `refresh` refuses with `the showrunner of <showrunner name> is not running`.
-- **Name.** `unit_lookup.labeled_sessions(name)[unit].claude.name` when that is a `LiveClaude` with a name; in every other case the unit id. `/` and NUL become `-`, and leading `.` characters are dropped.
+- **Path.** `<vault root>/<showrunner staff name>/<file name>.md`.
+  `refresh` matches the showrunner's `current_session` to a live native registry record.
+  The showrunner's staff name supplies the folder.
+  Without a live match, it uses the folder of the unit's most recently modified owned note.
+  Without an owned note, it refuses with `the showrunner of <showrunner name> is not running`.
+- **Name.** The unit's current staff name supplies the file name.
+  `/` and NUL become `-`, and leading `.` characters are dropped.
+  A registry name changes only the displayed heading, not the file name or ownership.
 - **Content.** The frontmatter keeps `phase_table: true`, `showrunner`, `production_file`, `unit`, and `now`. `production_file` and `now` use JSON quoting. The body keeps the unit heading and phase rows with ids, titles, and status. Rows appear in reverse plan order. The note has no timestamps, durations, progress percentages, or ETAs. `show` and the JSON output keep those values. The production link points to the promoted document when available. The link uses a vault wiki link, a GitHub URL, or a local file URI. Ownership comes from the staff rows.
 - **Publication.** The writer checks ownership under the folder lock. Identical content keeps the existing bytes, inode, and modification time. Changed content uses a temporary file with mode `0o644`. The writer replaces an owned target with `os.replace`. A first write uses `os.link` and refuses a target that appears during publication. A foreign target remains unchanged. The writer does not add a Git exclusion. Existing installations must remove the old `showrunners/` entry from the vault’s `info/exclude`. The existing `agent-notes` vault part includes live phase notes only when its own generated notes already need a content commit. Selection uses the writer’s `phase_note_ownership` parser. Deleted notes use their content from `HEAD` for this check. It includes only owned live-note deletions. It leaves unrelated changes alone. Phase notes alone cause no commit. The existing ten-minute `hanadocs-push` job pushes these commits. No new job or schedule is required.
 - **Archive.** `_archive_note(candidate, vault_root, name)` moves an owned note to `<vault>/archive/<showrunner folder>/<showrunner name>/<name>.md`. Here, `<vault>` is the parent of the live-note root. Live-note scans and commits do not include archive files. The move uses `os.link` then `unlink`. An existing target remains unchanged. A repeated archive uses `<stem>-2.md`, then `<stem>-3.md`. An operating system error raises `Refusal` with the path and cause. A failed unlink removes the new link first. The writer removes an empty source folder after the move.
@@ -159,7 +165,7 @@ A run whose plan file was removed, as for ad hoc work after the as-built, writes
   It skips a plan with no staff unit. Otherwise it runs `phase_table.py refresh`.
   A failure prints `phase table not written: <reason>` and keeps the recorder's result.
 - **Report.** `progress` reads `build_plan`: its short report's ETA line (`_phase_eta_line`, the reported phase's own row, its latest promise rather than `schedule_end`) and the clocks table's Project ETA (`_project_chain_eta`, the plan finish). `scripts/production/unit_phases.py` builds the Units table from the same record.
-- **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
+- **Shared readers.** `plan_history` holds `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`, with `read_run_events(path)` (the one run-event reader: a shared flock, invalid JSON lines skipped, no events on `OSError` or `UnicodeError`), `run_starts()`, `staff_record()` and the `history_snapshot(record)` context manager, which shares the staff record, run headers and run events for one command (`HistorySnapshot`); outside it each reader reads directly. `staff_directory` and `plan_runs` share one staff path rule (`_staff_paths`). Also `history_root`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME` and `PlanPhase`. Tests patch `plan_history.now_epoch` for the clock.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}"`. `<ProgressContract>` in `commands/unit/direct.md` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/direct/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next phase's ETA with `--phase-id <next> --basis checkpoint` before the checkpoint notice. `commands/unit/eta.md` records the ETA, range and `--basis eta-command` before the answer is sent, as `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command on every answer, with the bullets' last end time and no range.
 
 ### Production unit status
@@ -218,9 +224,13 @@ Dailies and their separate ETA judgments were retired on 2026-11-11.
 
 ## Why
 
-- **Rebuilt, not stored.** "Only the least necessary things written down to files - anything that is quickly discoverable by a script should be done that way" (user, 2026-10-08). A JSON record per unit, a stored session or showrunner name and a cache of the lookup all fail that test. The production doc holds no session name, so `current_name` reads the showrunner's from its update timer.
+- **Rebuilt, not stored.** Fixed staff ids identify each note's owners.
+  Readers obtain current names and paths from staff.
+  Native registry records prove session liveness and supply display text.
 - **Scripts write the note.** Agents that re-read and re-write each note drift on format; a script at every report keeps one format and costs the agent nothing (user, 2026-10-08).
-- **Named for the session, current phase apart, newest phase first.** The user reads `showrunners/<showrunner>/<unit>.md` beside the showrunner structure already in the vault, asked for the current phase shown separately with its metadata, and asked for the oldest phases at the bottom. A rename has to move the note, and the ownership keys make that possible with no stored name.
+- **Staff names identify note paths.** The note lives at `showrunners/<showrunner staff name>/<unit staff name>.md`.
+  Fixed ownership keys let a staff rename move the note without a stored name copy.
+  The current phase appears separately, and the oldest phases appear at the bottom.
 - **Title, then id.** History reuses phase numbers across runs of a plan; grouping events by id alone joins unrelated work.
 - **A stated ETA is its own state.** It exists with no progress report and carries a basis, so it is not optional fields on `ProjectedEta`, and `ReportedPhaseProgress` keeps `percent` only.
 - **The first target sits outside `eta`.** `current.eta` alone cannot tell a passed promise from a phase that never stated one. One key carries it, present whether or not `eta` is `null`.

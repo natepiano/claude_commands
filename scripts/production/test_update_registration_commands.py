@@ -56,11 +56,26 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertNotIn("lens", records[0])
 
     def test_missing_prompt_markers_fail_at_delivery_without_registration_changes(self) -> None:
-        for marker in ("The prompt:", "**A tick**"):
+        script = self.copied_command()
+        with self.subTest(prompt="body only"):
+            template = script.parents[2] / "commands/showrunner/produce.md"
+            _ = template.write_text("The prompt:\n\n> expected prompt\n> showrunner-timer-inside-prompt\n>\n> last line\n\n**A tick**\n")
+            result = subprocess.run([sys.executable, str(script), "prompt", "--owner", self.owner_id],
+                                    cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (0, "expected prompt\nshowrunner-timer-inside-prompt\n\nlast line\n", ""))
+            result = subprocess.run([sys.executable, str(script), "delivery", "--owner", self.owner_id],
+                                    cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (0, "showrunner-timer-example\nexpected prompt\nshowrunner-timer-inside-prompt\n\nlast line\n", ""))
+        shutil.rmtree(script.parents[2])
+        for marker in ("The prompt:", "**A tick**", "empty body"):
             with self.subTest(marker=marker):
                 script = self.copied_command()
                 template = script.parents[2] / "commands/showrunner/produce.md"
-                _ = template.write_text(template.read_text(encoding="utf-8").replace(marker, "", 1), encoding="utf-8")
+                document = ("The prompt:\n\n> \n>\n\n**A tick**\n" if marker == "empty body"
+                            else template.read_text(encoding="utf-8").replace(marker, "", 1))
+                _ = template.write_text(document, encoding="utf-8")
                 registered = self.run_copy(script, "register", "--session", "resumed-showrunner")
                 self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
                 before = self.doc.read_bytes()
@@ -68,10 +83,17 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
                 result = subprocess.run([sys.executable, str(script), "prompt", "--owner", self.owner_id],
                                         cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(marker, result.stdout + result.stderr)
+                self.assertIn("empty" if marker == "empty body" else marker, result.stdout + result.stderr)
                 self.assertEqual(self.doc.read_bytes(), before)
                 self.assertFalse(self.config.exists())
                 self.assertEqual(self.notifier_calls(), calls)
+                failure = ("prompt: failed — scheduled prompt is empty\n" if marker == "empty body"
+                           else f"register: failed — {marker} marker is missing\n")
+                self.assertEqual(result.stdout, failure)
+                if marker == "empty body":
+                    result = subprocess.run([sys.executable, str(script), "delivery", "--owner", self.owner_id],
+                                            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (2, failure, ""))
                 self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
                 shutil.rmtree(script.parents[2])
 

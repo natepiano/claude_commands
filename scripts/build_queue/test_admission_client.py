@@ -12,6 +12,7 @@ import shlex
 import socket
 import subprocess
 import time
+import threading
 from pathlib import Path
 import sys
 import unittest
@@ -29,13 +30,14 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
-from scripts.build_queue import admission_records as records, queue_evidence, step_estimator
+from scripts.build_queue import admission_records as records, admission_service as service, queue_evidence, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
-from scripts.lint.memory_test_support import commit_config_fixture, config_environment
+from scripts.build_queue.test_snapshot_codec import service_snapshot
+from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
 EXPIRED = wait_reply(records.EstimateExpired(1), 1, "head", "estimate expired")
@@ -47,6 +49,86 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_cancel_placement_cli_removes_the_queued_episode(self) -> None:
+        from scripts.build_hold.owning_session import NoOwningSession
+        from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import WHOLE_MAC
+
+        with AdmissionFixture() as fixture:
+            occupied = fixture.occupy_host()
+            fixture.free(0)
+            local = fixture.request()
+            owner = placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time)
+            destination = placement.PlacementDestination("local", "natedev", fixture.server.host, WHOLE_MAC)
+            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("private-source"),
+                ("cargo", "check"), str(fixture.root), "sample", NoOwningSession(),
+                (placement.PlacementCandidate(destination),))
+            request = wire.PlacementRequest(local.episode, owner, local.since, local.profile, constraints,
+                local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
+                    local.test_width, local.fresh_test))
+            with fixture.serving(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertIsInstance(client.request_placement(request), wire.PlacementWait)
+                self.assertIn(request.episode, fixture.server.waiters)
+                self.assertEqual(client.main(["cancel-placement", "--episode", request.episode,
+                    "--pid", str(owner.pid), "--reason", "the source changed"]), 0)
+                self.assertNotIn(request.episode, fixture.server.waiters)
+                self.assertNotIn(request.episode, fixture.server.placement_requests)
+                fixture.release(occupied)
+
+    def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
+        raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
+        snapshot = cast(dict[str, object], cast(dict[str, object], raw["data"])["snapshot"])
+        return raw, snapshot
+
+    def test_unknown_unused_service_variants_keep_the_wait_and_allow_admission(self) -> None:
+        for field in ("job_state", "service_job_state"):
+            with self.subTest(field=field), AdmissionFixture() as fixture:
+                request = fixture.request()
+                raw, snapshot = self.service_wait_record()
+                memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+                memory[field] = {"kind": "FutureServiceJob"}
+                transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.admit(request, waits.append, lambda: request)
+                self.assertEqual(result, GRANTED)
+                self.assertEqual(len(waits), 1)
+                measured = waits[0].snapshot.running[0].measured
+                assert isinstance(measured, records.UnownedSliceMemory)
+                self.assertEqual(measured.bytes, 123)
+                self.assertEqual(transport.requests, [request])
+                self.assertNotIn("memory admission check failed", output.getvalue())
+                self.doCleanups()
+
+    def test_unknown_used_wait_variant_keeps_the_named_checker_error(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            raw, snapshot = self.service_wait_record()
+            snapshot["head_reason"] = {"kind": "FutureAdmissionReason"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode()))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, wire.Refused("invalid snapshot variant"))
+            self.assertIn("memory admission check failed (invalid snapshot variant); step refused", output.getvalue())
+            self.assertEqual(transport.requests, [request])
+
+    def test_unused_service_variants_do_not_extend_the_silent_queue_deadline(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            raw, snapshot = self.service_wait_record()
+            memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+            memory["service_job_state"] = {"kind": "FutureServiceJob"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), TimeoutError()))
+            waits: list[wire.Wait] = []
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+            self.assertEqual(result, wire.Refused(
+                "build queue unreachable for 5 s; step stopped; cargo token given back"))
+            self.assertEqual(fixture.clock.monotonic(), 5)
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(transport.requests, [request])
+            self.assertNotIn("memory admission check failed", output.getvalue())
+
     def test_history_generation_reads_current_configuration_at_use(self) -> None:
         with AdmissionFixture() as fixture:
             transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))
@@ -265,6 +347,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(len(transport.requests), 1)
 
     def test_a_wait_reply_without_a_holder_keeps_the_wait_and_reports_no_holder(self) -> None:
+        real_socket = socket.socket
         with AdmissionFixture() as fixture:
             request = fixture.request()
             record = cast(dict[str, object], json.loads(wire.encode_reply(WAIT)))
@@ -280,6 +363,225 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(output.getvalue().splitlines(), ["first", 'holder {"kind":"none"}', "done"])
             self.assertEqual(len(transport.requests), 1)
+
+        from scripts.build_queue import placement
+
+        for execution_target in ("local", "mac", "mac-handoff", "mac-retry-notice", "mac-truncated-assignment"):
+            with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+                 AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+                if execution_target != "local":
+                    _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+                    _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+                    _ = write_config_fixture(fixture.root / "mac_test.conf",
+                        f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                    _ = (fixture.root / "build_targets.conf").write_text(
+                        "targets=natedev,mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                        + "kind.natedev=local\nplatform.natedev=linux\n")
+                occupied = fixture.occupy_host()
+                fixture.free(0)
+                request = fixture.request()
+                finish_probe = threading.Event()
+                local_evidence_ready = threading.Event()
+
+                def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    if key.destination.provider == "local":
+                        if not local_evidence_ready.is_set():
+                            return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "the local evidence is not ready")
+                        return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+                    if not finish_probe.wait(10):
+                        raise AssertionError("the test did not release its private evidence reader")
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+
+                fixture.server.host_probe = provider
+                assignment_file = fixture.root / "assignment.json"
+                arguments = ["place-step", "--once", "--wait-events", *(["--local-only"] if execution_target == "local" else []),
+                    "--pid", str(request.owner.pid), "--episode", request.episode,
+                    "--since", str(request.since), "--repo-root", str(fixture.root),
+                    "--assignment-file", str(assignment_file), "--", "cargo", "check"]
+                with fixture.serving(), \
+                     mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                         request.profile, step_estimator.ReusableEstimate())), \
+                     redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()) as output:
+                    try:
+                        self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                        self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
+                        with fixture.loop_turn():
+                            submitted = fixture.server.placement_requests[request.episode]
+                            local_evidence_ready.set()
+                            if execution_target != "local":
+                                remote = next(candidate.destination for candidate in submitted.constraints.candidates
+                                              if candidate.destination.provider == "mac")
+                                fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                                    fixture.server.host_evidence_key(submitted, remote), fixture.clock.now(), "",
+                                    placement.TemporaryExclusion("busy")))
+                        _ = fixture.run_pass()
+                        self.assertEqual(client.main(arguments), 78)
+                        lines = output.getvalue().splitlines()
+                        self.assertEqual(lines[0], "first")
+                        self.assertEqual(len(lines), 2)
+                        self.assertTrue(lines[1].startswith("holder "), lines)
+                        self.assertIn("waiting for memory", errors.getvalue())
+                        self.assertFalse(fixture.caller_reservations())
+                        _ = output.seek(0)
+                        _ = output.truncate()
+                        _ = errors.seek(0)
+                        _ = errors.truncate()
+                        self.assertEqual(client.main(arguments), 78)
+                        self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
+                        wait_state = assignment_file.with_name(assignment_file.name + ".wait")
+                        _ = wait_state.write_text('{"kind":')
+                        self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                        _ = output.seek(0)
+                        _ = output.truncate()
+                        _ = errors.seek(0)
+                        _ = errors.truncate()
+                        if execution_target == "local":
+                            fixture.free(60 * GIB)
+                        else:
+                            with fixture.loop_turn():
+                                remote = next(candidate.destination for candidate in submitted.constraints.candidates
+                                              if candidate.destination.provider == "mac")
+                                fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                                    fixture.server.host_evidence_key(submitted, remote), fixture.clock.now(), "",
+                                    placement.AllowedHost()))
+                        _ = fixture.run_pass()
+                        self.assertEqual(client.main(arguments), 0)
+                        lines = output.getvalue().splitlines()
+                        if execution_target == "local":
+                            self.assertEqual(lines[0], "done")
+                            self.assertTrue(lines[1].startswith("local\tnatedev\t"), lines)
+                            self.assertEqual(client.read_assignment(assignment_file).assignment.destination.provider, "local")
+                            grant = fixture.server.ledger[request.episode].reply
+                            assert isinstance(grant, wire.Admitted)
+                            fixture.release(grant)
+                        else:
+                            self.assertTrue(lines[0].startswith("left another machine is free after "), lines)
+                            self.assertTrue(lines[-1].startswith("mac\tmac\t"), lines)
+                            self.assertNotIn("another machine is free", errors.getvalue())
+                            self.assertFalse(fixture.caller_reservations())
+                            saved_remote = client.read_assignment(assignment_file).assignment
+                            if execution_target == "mac-truncated-assignment":
+                                _ = assignment_file.write_text('{"v":3,"type":')
+                                self.assertEqual(client.main(arguments), 0, errors.getvalue())
+                                recovered = client.read_assignment(assignment_file).assignment
+                                self.assertEqual(recovered, saved_remote)
+                                self.assertEqual((recovered.episode, recovered.owner),
+                                                 (submitted.episode, submitted.owner))
+                            with fixture.loop_turn():
+                                fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                                    fixture.server.host_evidence_key(submitted, saved_remote.destination), fixture.clock.now(), "",
+                                    placement.TemporaryExclusion("busy")))
+                            if execution_target == "mac-handoff":
+                                self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
+                                    str(assignment_file), "--token", "required"]), 0)
+                                fixture.free(60 * GIB)
+                            self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
+                                                          "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
+                            self.assertFalse(fixture.caller_reservations())
+
+                            if execution_target == "mac-retry-notice":
+                                assignment_file.unlink()
+                                assignment_file.with_name(assignment_file.name + ".queued").unlink(missing_ok=True)
+                                _ = output.seek(0)
+                                _ = output.truncate()
+                                previous = fixture.server.handle_request
+                                observed: list[wire.Reply] = []
+
+                                def free_after_first_reply(request: wire.Request,
+                                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+                                    if isinstance(request, wire.PrerequisiteReport):
+                                        fixture.free(60 * GIB)
+                                    replies = previous(request, connection)
+                                    if isinstance(request, wire.PlacementRequest):
+                                        observed.extend(replies)
+                                    return replies
+
+                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply):
+                                    self.assertEqual(client.main(arguments), 0, errors.getvalue())
+                                self.assertEqual(len(observed), 2, observed)
+                                self.assertIsInstance(observed[0], wire.PlacementWait)
+                                self.assertIsInstance(observed[1], wire.LocalPlacementGranted)
+                                self.assertEqual(output.getvalue().count("retry verify.sh: Mac attempt ended (lost); "), 1)
+                                self.assertIn("waiting 180 s before each retry", output.getvalue())
+                            else:
+                                def release_before_retry() -> None:
+                                    fixture.free(60 * GIB)
+
+                                token_arguments = [*arguments[:arguments.index("--")], "--token", "required",
+                                                   *arguments[arguments.index("--"):]]
+                                with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
+                                    self.assertEqual(client.main(token_arguments), 78, errors.getvalue())
+                                self.assertFalse(fixture.caller_reservations())
+                                token_arguments[token_arguments.index("required")] = "held"
+                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                            retry_grant = client.read_assignment(assignment_file)
+                            self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
+                            assert isinstance(retry_grant, wire.LocalPlacementGranted)
+                            self.assertEqual(retry_grant.assignment.episode, submitted.episode)
+                            self.assertNotEqual(retry_grant.assignment.attempt, saved_remote.attempt)
+                            fixture.release(retry_grant.grant)
+                        fixture.release(occupied)
+                    finally:
+                        finish_probe.set()
+
+        cases = (
+            (("--mac-only",), placement.TemporaryExclusion("busy"), 78),
+            (("--mac-only",), placement.TemporaryExclusion("blocked"), 2),
+            (("--mac-only",), placement.TemporaryExclusion("disk"), 2),
+            (("--mac-only",), placement.TemporaryExclusion("unreachable"), 2),
+            (("--mac-only",), placement.TemporaryExclusion("backoff"), 2),
+            (("--mac-only",), placement.TemporaryExclusion("off"), 2),
+            (("--mac-only",), placement.FixedExclusion("repo"), 2),
+            (("--mac-only",), placement.FixedExclusion("linux_only"), 2),
+            (("--target", "mac"), placement.TemporaryExclusion("busy"), 78),
+            (("--target", "mac"), placement.TemporaryExclusion("blocked"), 78),
+            (("--target", "mac"), placement.TemporaryExclusion("unreachable"), 78),
+        )
+        for selection, exclusion, expected in cases:
+            with self.subTest(selection=selection, reason=exclusion.reason), \
+                 mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+                 AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+                _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+                _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+                _ = write_config_fixture(fixture.root / "mac_test.conf",
+                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                    + "kind.natedev=local\nplatform.natedev=linux\n")
+                request = fixture.request(step="check")
+                fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+                    key, fixture.clock.now(), "the test has not published provider evidence")
+                arguments = ["place-step", "--once", "--wait-events", *selection,
+                    "--pid", str(request.owner.pid), "--episode", request.episode,
+                    "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
+                    "--assignment-file", str(fixture.root / "assignment.json"), "--", "cargo", "check"]
+                with fixture.serving(), \
+                     mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                         request.profile, step_estimator.ReusableEstimate())), \
+                     redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                    with fixture.loop_turn():
+                        submitted = fixture.server.placement_requests[request.episode]
+                        destination = next(candidate.destination for candidate in submitted.constraints.candidates
+                                           if candidate.destination.target == "mac")
+                        fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                            fixture.server.host_evidence_key(submitted, destination), fixture.clock.now(), "", exclusion))
+                    _ = fixture.run_pass()
+                    _ = output.seek(0)
+                    _ = output.truncate()
+                    self.assertEqual(client.main(arguments), expected, errors.getvalue())
+                    if expected == 2:
+                        self.assertEqual(output.getvalue(), f"refused\t{exclusion.reason}\n")
+                    if selection == ("--target", "mac") and exclusion.reason in ("busy", "blocked"):
+                        reply = client.request_placement(submitted)
+                        self.assertIsInstance(reply, wire.PlacementWait)
+                        assert isinstance(reply, wire.PlacementWait)
+                        self.assertIsInstance(reply.wait, wire.PlacementResourceWait)
+                        assert isinstance(reply.wait, wire.PlacementResourceWait)
+                        self.assertEqual((reply.wait.resource, reply.wait.reason), ("mac", exclusion.reason))
+                        self.assertFalse(fixture.server.current_assignments)
+                    self.assertFalse(any(line.startswith("{") for line in output.getvalue().splitlines()))
+                    self.assertFalse(fixture.server.reservations)
 
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:

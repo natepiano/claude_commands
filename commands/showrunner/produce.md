@@ -579,9 +579,10 @@ notice to the unit director before any merge command runs:
    phase no merge design check judged (`report` and `watch` leave it out). The
    default regime is `after`; both counts default to zero. Give `--scratch
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
-   notice, add `--shrink`; for a unit's closing as-built commit (its as-built
-   docs and the plan's deletion, after its last phase merged), add
-   `--as-built`; with either, omit `--review-trial` and `--delivers`. Add
+   notice, add `--shrink`. For a unit's closing documentation commit after its last phase merges, add `--as-built`.
+   The scope check accepts Markdown paths that include the plan's change or deletion.
+   It also accepts `docs/as-built/*.md` paths without a plan change when the plan is absent on the merge branch.
+   With either flag, omit `--review-trial` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
    watching its result or diagnosing a red run. Add `--bump` only for a user's
@@ -665,6 +666,7 @@ returns it to its unit.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
+     Landing treats each review row as a separate result on its link, including old proposals without `--separate-result`.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
    A script failure leaves the row open. Report no separate feature-log

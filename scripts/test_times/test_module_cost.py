@@ -315,6 +315,7 @@ class ModuleCostTests(unittest.TestCase):
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
                 "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
+                "HERDR_BIN": "/host/herdr",
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -331,7 +332,7 @@ class ModuleCostTests(unittest.TestCase):
             )
             output = io.StringIO()
             with redirect_stdout(output):
-                status = module_cost.main(["--tree", str(tree), "fixture/test_children.py"])
+                status = module_cost.main(["--tree", str(tree), "--commands", "10", "fixture/test_children.py"])
         self.assertEqual(status, 0, output.getvalue())
         lines = output.getvalue().splitlines()
         row = lines[1].split()

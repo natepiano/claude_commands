@@ -48,6 +48,41 @@ class BuildFolderTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
 
+    def test_cli_remove_cleans_free_records_and_keeps_a_held_folder(self) -> None:
+        allocated = self.command("unique", "--prefix", "remove-cli-")
+        self.assertEqual(allocated.returncode, 0, allocated.stderr)
+        path = Path(allocated.stdout.strip())
+        _ = (path / "output").write_text("temporary output")
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.command("remove", str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+        held = folders.create_build_folder(folders.UniqueBuildFolder("held-remove-cli-"))
+        self.addCleanup(_release_folder, held)
+        _ = (held / "output").write_text("held output")
+        result = self.command("remove", str(held))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((held / "output").read_text(), "held output")
+        self.assertTrue(held.with_name(held.name + ".lease.json").is_file())
+        self.assertTrue(held.with_name(held.name + ".lock").is_file())
+        _release_folder(held)
+        result = self.command("remove", str(held))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(held.exists())
+        self.assertFalse(held.with_name(held.name + ".lease.json").exists())
+        self.assertFalse(held.with_name(held.name + ".lock").exists())
+        local = folders.create_build_folder(folders.UniqueBuildFolder("local-remove-cli-"))
+        self.addCleanup(_release_folder, local)
+        self.assertEqual(folders.main(["remove", str(local)]), 0)
+        self.assertFalse(local.exists())
+        self.assertFalse(local.with_name(local.name + ".lease.json").exists())
+        self.assertFalse(local.with_name(local.name + ".lock").exists())
+        with self.assertRaises(StopIteration):
+            _ = folders.build_folder_lock_fd(local)
+
     def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
                                        repository="repo", owner="unit", purpose="race", suffix="fixed")

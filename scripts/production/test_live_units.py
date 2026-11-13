@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -13,11 +14,12 @@ from unittest import mock
 
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.shell_test_support import shell_functions
 from scripts.production import fake_showrunner
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship
+from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id
 
 SCRIPT = Path(__file__).with_name("live_units.py")
 
@@ -201,6 +203,10 @@ class LiveUnitsTests(unittest.TestCase):
 
     def test_each_member_is_listed_with_its_session_as_it_is_now(self) -> None:
         self.members("alpha", "beta")
+        alpha = unit_membership("show", "alpha")
+        alpha = staff.update_current_session(staff.StaffId(alpha.current_session),
+                                             staff.StaffId(fixture_runtime_id("replacement-alpha")))
+        self.assertNotEqual(alpha.current_session, alpha.id)
         self.hosts({"$1": marked("beta-label", "w5:p1", "beta"),
                                      "$2": marked("renamed-since-launch", "w4:p1", "alpha"),
                                      "$3": HostedUnit("done-label", "w6:p1", {}),
@@ -211,6 +217,21 @@ class LiveUnitsTests(unittest.TestCase):
         # The unmarked pane has no member. The other production keeps its own member.
         self.assertEqual(sorted(result.stdout.splitlines()), ["alpha\therdr:renamed-since-launch:w4:p1\tlive\trenamed-since-launch",
                                                       "beta\therdr:beta-label:w5:p1\tunknown\t"])
+        script = SCRIPT.with_name("unit_status.sh")
+        setup = script.read_text().split("NOTIFIER=", 1)[0].replace(
+            "REPO=${0:A:h:h:h}", "REPO=" + shlex.quote(str(SCRIPT.parents[2])))
+        functions = shell_functions(script, "waiting_on_user")
+        for actor, expected in (("alpha", "BLOCK in beta, open 0h0m:blocked: waiting on alpha\n"),
+                                ("session:" + alpha.current_session,
+                                 f"BLOCK in beta, open 0h0m:blocked: waiting on session:{alpha.current_session}\n"),
+                                ("renamed-since-launch", "=== DECISION for you from beta ===\nblocked: waiting on renamed-since-launch\n=== end beta ===\n")):
+            with self.subTest(waiting_on=actor):
+                command = setup + functions + "\nSEEN=/dev/null\nclear_block() { :; }\n" + \
+                    "state_record() { :; }\nblock_age() { print 0h0m; }\n" + \
+                    "waiting_on_user beta " + shlex.quote("blocked: waiting on " + actor) + "\n"
+                observed = subprocess.run(["zsh", "-s", "--", str(self.root / "status"), "UTC", "--production", "show"],
+                    input=command, env=self.environment, capture_output=True, text=True, check=False)
+                self.assertEqual((observed.returncode, observed.stdout, observed.stderr), (0, expected, ""))
 
     def test_herdr_pane_targets_match_between_live_units_and_lookup(self) -> None:
         self.members("alpha")

@@ -49,6 +49,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
         workers = NO_WORKERS
+        row: staff.StaffRow | None = None
         try:
             record = staff.snapshot()
             row = record.by_current_session(identity)
@@ -56,7 +57,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
                 workers = worker.resume_workers(row.id, record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        argv = [*argv, resume_message("you were stopped and resumed", workers=workers)]
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row)]
     return argv, restored
 
 

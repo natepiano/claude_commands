@@ -97,8 +97,6 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
              ("scripts.build_targets.targets",)),
             ("eligible", "Mac state present", "mac", True,
              ("scripts.build_targets.targets", "scripts.lint.sweep", "scripts.copies.copies")),
-            ("eligible", "AWS routing off", "aws", False,
-             ("scripts.build_targets.targets", "scripts.aws_target.ledger")),
             ("release-wait", "Mac state absent", "mac", False,
              ("scripts.build_targets.targets", "scripts.mac_test.mac_test", "scripts.mac_test.offload",
               "scripts.copies.copies")),
@@ -125,8 +123,6 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                     f"targets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
                     + f"kind.{target}=ssh\nplatform.{target}={'linux' if target == 'aws' else 'macos'}\n"
                     + f"settings.{target}={'aws_target' if target == 'aws' else 'mac_test'}.conf\n")
-                if branch == "AWS routing off":
-                    _ = write_config_fixture(configuration / "aws_target.conf", "offload=off\n", template="aws_target")
                 claims = root / "mac-state" / "claims"
                 if present:
                     claims.mkdir(parents=True)
@@ -918,7 +914,6 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                 self.assertEqual((release / "current").read_text(), "damaged")
 
 
-
     def test_hold_and_release_write_temp_log_without_writing_real_log(self) -> None:
         def record_now(command: list[str]) -> None:
             self.assertEqual(command[2], "hold-event")
@@ -979,7 +974,6 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:
         with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
             self.assertEqual(self.wait(), (0, "", ""))
-
 
 
     def test_held_call_names_holder_and_runs_after_its_recorded_release(self) -> None:
@@ -1222,21 +1216,26 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             10, "natedev is held by hana for render checks; launch after the release.\n", "",
         ))
         proc = self.root / "proc"
-        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+        for pid, parent in ((10, 1), (20, 10), (30, 1), (40, 1), (50, 1)):
             directory = proc / str(pid)
             directory.mkdir(parents=True)
             fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
             _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW,
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("kept-session", "peer"),
                                   "peer checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(40, "4000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         for pid, session, owns_hold, admitted in (
             (10, "other-session", False, True),
             (20, "other-session", False, True),
             (30, "other-session", False, False),
+            (40, "other-session", False, False),
+            (50, "other-session", False, False),
             (10, "", False, True),
             (30, "owned-session", True, False),
         ):
@@ -1471,8 +1470,6 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             self.assertIn("argument --pid:", errors.getvalue())
             self.assertIn("positive", errors.getvalue())
         self.assertFalse((self.root / "registration").exists())
-
-
 
 
 if __name__ == "__main__":

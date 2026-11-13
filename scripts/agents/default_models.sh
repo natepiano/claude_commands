@@ -30,10 +30,7 @@ usage() {
         [[ "$switched" == "codex" ]] && ex_other="claude" || ex_other="codex"
     fi
     if [[ -n "$fn" ]]; then
-        # A caller function's example rows come from the family that would run
-        # from here; from outside any session, codex stands in.
-        family="$(_agents_concrete_family "$(_models_registry_get assignments "$fn")")"
-        [[ -z "$family" && "$(_models_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && family="codex"
+        family="$(_models_registry_get assignments "$fn")"
         if [[ -n "$family" ]]; then
             ex_fn="$fn"
             [[ "$family" == "codex" ]] && ex_other="claude" || ex_other="codex"
@@ -62,9 +59,6 @@ Usage: default_models.sh [skills | <function> | <family> | <agent> | <tier>] | <
                            switches every function to that family
   <function> <family>      switch a whole function to the codex or claude family
                            — the only thing that changes which rows are live.
-                           A function assigned 'caller' (ask_a_friend) has no
-                           switch: it runs on the family of the agent asking,
-                           so both of its row sets are live, one per family
   <function> <agent>       put one function on one agent, keeping each row's
                            effort and switching it to the agent's family
   <function>.<subtask> <agent>[:<effort>]
@@ -126,9 +120,7 @@ tier_liveness() {
     else
         raw="$(_models_registry_get assignments "$fn")"
     fi
-    if [[ "$raw" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-        echo "live whenever a codex session runs $fn"
-    elif [[ "$raw" == "codex" ]]; then
+    if [[ "$raw" == "codex" ]]; then
         echo "live"
     else
         echo "dormant: ${fn}${subtask:+.$subtask} runs on $raw. Make it live with: default_models.sh $fn codex"
@@ -220,9 +212,7 @@ elif [[ "$#" -eq 2 ]]; then
     elif [[ "$1" == *.* ]]; then
         agents_set_row "$1" "$2"
         fn="${1%%.*}"
-        if [[ "$AGENT_ROW_ASSIGNMENT" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-            echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — live whenever a $AGENT_ROW_FAMILY session runs $fn"
-        elif [[ "$AGENT_ROW_ACTIVE" == "yes" ]]; then
+        if [[ "$AGENT_ROW_ACTIVE" == "yes" ]]; then
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — live"
         else
             echo "# updated [$fn.$AGENT_ROW_FAMILY] $1 — dormant:" \
@@ -233,11 +223,7 @@ elif [[ "$#" -eq 2 ]]; then
         && [[ -n "$(_agents_agent_families_inline "$2")" ]]; then
         agents_set_model "$2" "$1"
         fn="$1"
-        if [[ "$(_models_registry_get assignments "$fn")" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
-            echo "# set [$fn.$AGENT_SWEEP_FAMILY] to $2, efforts kept — live whenever a $AGENT_SWEEP_FAMILY session runs $fn"
-        else
-            echo "# switched $fn to $2 ($AGENT_SWEEP_FAMILY), efforts kept"
-        fi
+        echo "# switched $fn to $2 ($AGENT_SWEEP_FAMILY), efforts kept"
     else
         agents_set_assignment "$1" "$2"
         fn="$1"

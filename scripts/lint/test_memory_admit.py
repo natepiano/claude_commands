@@ -41,7 +41,7 @@ from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.build_steps import read_step_names
 from scripts.lib import conf
-from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
+from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
@@ -4857,11 +4857,14 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         admission = caller_admission(self, self.root, self.environment)
         grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
+        observed_grants: set[str] = set()
 
         def capture(reply: wire.Reply) -> wire.Reply:
-            if isinstance(reply, wire.Admitted):
+            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
+            if isinstance(grant, wire.Admitted) and grant.reservation not in observed_grants:
                 record, = (record for record in admission.server.reservations.values()
-                    if record.reservation_id == reply.reservation)
+                    if record.reservation_id == grant.reservation)
+                observed_grants.add(grant.reservation)
                 grants.append((record.step, record.run))
             return reply
 
@@ -4869,6 +4872,7 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
         for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
             with self.subTest(command=command):
                 grants.clear()
+                observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
                     env=self.environment, start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
@@ -5961,6 +5965,29 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.proc / "234/comm").write_text("Runner.Worker\n")
         _ = (self.ci / "cgroup.procs").write_text("123\n234\n")
 
+    def test_ci_worker_identity_distinguishes_admission_wait_and_unmatched_work(self) -> None:
+        self.start_ci_job()
+        write_process(self.proc, 235, GIB, parent=234)
+        _ = (self.ci / "cgroup.procs").write_text("123\n234\n235\n")
+        row = fixture_reservation(235, 8 * GIB)
+        waiter: admission_records.Waiter = {"pid": 235, "start_time": "235", "need": 8 * GIB,
+            "since": NOW_EPOCH, "session_id": "", "session_name": "CI", "step": "build", "folder": "/ci"}
+        for admitted, waiting, expected in (
+            (True, False, RunningServiceJob), (False, True, WaitingServiceJob),
+            (False, False, UnmatchedServiceJob),
+        ):
+            with self.subTest(admitted=admitted, waiting=waiting):
+                reading, = gate.unowned_slice_memory([row] if admitted else [], gate.process_table(self.proc), self.proc,
+                    ci_memory_slice=admission_records.read_memory_config().ci_memory_slice,
+                    waiters=[waiter] if waiting else [])
+                self.assertIsInstance(reading.service_job_state, expected)
+                self.assertIsInstance(reading.job_state, IdleService if admitted else RunningServiceJob)
+                self.assertEqual(reading.bytes, (2 if admitted else 3) * GIB)
+        waiter["start_time"] = "old-owner"
+        reading, = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc,
+            ci_memory_slice=admission_records.read_memory_config().ci_memory_slice, waiters=[waiter])
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
+
     def test_registered_and_unregistered_jobs_each_enter_the_cap_once(self) -> None:
         for shared in (0, 2):
             for pid, parent, used, program in (
@@ -6035,6 +6062,7 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.start_ci_job()
         reading = self.reading()
         self.assertIsInstance(reading.job_state, RunningServiceJob)
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
         active = self.queue_with_ci(reading).explanation.room
         assert isinstance(idle, admission_records.MemoryRoom)
         assert isinstance(active, admission_records.MemoryRoom)

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
+from dataclasses import replace
 import io
 import json
 import os
@@ -26,6 +28,11 @@ from scripts.mac_test import copy_watch, offload
 from scripts.direct import step_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
+from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
+from scripts.build_queue import placement, admission_protocol as wire
+from scripts.build_queue.test_placement import placement_request
+from scripts.mac_test import claim_state, mac_test
+from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
 from scripts.lib.process_group import send_process_group
 
 
@@ -33,9 +40,14 @@ SCRIPT = Path(__file__).with_name("copy_watch.py")
 # Ticks of the watcher at BUILD_TARGETS_POLL_S=0.05, enough for it to act on a
 # change it would act on at all.
 SETTLE_S = 0.5
+COPY_FIXTURE_WAIT_SECONDS = 20
 
 
 class ClaimRecord(TypedDict):
+    claim_id: str
+    episode: str
+    attempt: str
+    submitting_session: str
     pid: int
     proc_start: str
     what: str
@@ -97,12 +109,17 @@ import time
 root = Path(os.environ["TEST_ROOT"])
 arguments = sys.argv[1:]
 result = Path(arguments[arguments.index("--result") + 1])
+(root / "runner-pid").write_text(str(os.getpid()))
+''' + ASSIGNED_RUNNER_SETUP + r'''
 events = root / "runner-events.jsonl"
 with events.open("a") as output:
     output.write(json.dumps(arguments) + "\n")
 attempt = len(events.read_text().splitlines())
 modes = os.environ["TEST_COPY_MODES"].split(",")
 mode = modes[min(attempt, len(modes)) - 1]
+fixture_cleanup_confirmed = True
+fixture_evidence = placement.ExecutionEvidenceUnavailable("the private copy has ended", time.time())
+fixture_outcome = placement.AttemptDeclined("busy")
 if mode.endswith("+busy"):
     mode = mode.removesuffix("+busy")
     claims = Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims"
@@ -110,6 +127,10 @@ if mode.endswith("+busy"):
     (claims / "repo.json").write_text(os.environ["TEST_BUSY_CLAIM"])
 
 def write(mac, reason=""):
+    global fixture_outcome
+    fixture_outcome = (placement.AttemptCompleted(0) if mac == "passed" else
+                       placement.AttemptCompleted(42) if mac == "failed" else
+                       placement.AttemptDeclined(reason or "lost"))
     result.write_text("mac=" + mac + "\nreason=" + reason + "\nseconds=4.5\n")
 
 if mode == "hold":
@@ -211,8 +232,8 @@ class StepProgressTests(unittest.TestCase):
                 "VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc"),
             }):
                 cases = (
-                    (step_record.AnyTarget(("aws",)), step_record.StepState.WAITING_HOLD, ""),
-                    (step_record.AnyTarget(("mac", "aws"), ("mac",)), step_record.StepState.ON_SSH, "aws"),
+                    (step_record.AnyTarget(("linux",)), step_record.StepState.WAITING_HOLD, ""),
+                    (step_record.AnyTarget(("mac", "linux"), ("mac",)), step_record.StepState.ON_SSH, "linux"),
                 )
                 for permission, state, selected in cases:
                     with self.subTest(state=state):
@@ -229,7 +250,7 @@ class StepProgressTests(unittest.TestCase):
                             if candidate:
                                 watch.try_copy()
                         self.assertFalse(candidate)
-                        self.assertFalse(watch.candidate.exists())
+                        self.assertIsInstance(watch.placement, copy_watch.NoCopyPlacement)
                         start.assert_not_called()
 
     def test_still_compiling_spans_the_first_cargo_line_to_the_starting_line(self) -> None:
@@ -308,63 +329,6 @@ class StopTests(unittest.TestCase):
 
 
 @final
-class CandidateTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.directory = Path()
-        self.children: list[subprocess.Popen[bytes]] = []
-
-    @override
-    def setUp(self) -> None:
-        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.children = []
-
-    @override
-    def tearDown(self) -> None:
-        for child in self.children:
-            child.kill()
-            _ = child.wait()
-
-    def live_pid(self) -> int:
-        child = subprocess.Popen([
-            sys.executable, "-c",
-            'import os, signal; signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"])); signal.pause()',
-        ], env={**os.environ, "TEST_HANG_GUARD_SECS": str(test_hang_guard.TEST_HANG_GUARD_SECS)})
-        self.children.append(child)
-        return child.pid
-
-    def write(self, call_id: str, pid: int, started: float, proc_start: str | None = None) -> Path:
-        path = self.directory / f"{call_id}.json"
-        record: copy_watch.CandidateRecord = {
-            "pid": pid,
-            "proc_start": proc_start if proc_start is not None else (identity.start if isinstance(identity := process_identity.process_start(pid), process_identity.Started) else ""),
-            "call_started": started,
-            "call_id": call_id,
-        }
-        _ = path.write_text(json.dumps(record))
-        return path
-
-    def test_newest_live_candidate_wins_and_dead_records_are_removed(self) -> None:
-        _ = self.write("v1", self.live_pid(), 100.0)
-        _ = self.write("v2", self.live_pid(), 200.0)
-        dead = self.write("v3", self.live_pid(), 300.0, proc_start="gone")
-        _ = (self.directory / "damaged.json").write_text("{")
-        self.assertEqual(copy_watch.newest_candidate(self.directory), "v2")
-        self.assertFalse(dead.exists())
-        self.assertTrue((self.directory / "damaged.json").exists())
-
-    def test_equal_starts_fall_to_the_larger_call_id(self) -> None:
-        _ = self.write("v-a", self.live_pid(), 100.0)
-        _ = self.write("v-b", self.live_pid(), 100.0)
-        self.assertEqual(copy_watch.newest_candidate(self.directory), "v-b")
-
-    def test_no_live_candidate_names_none(self) -> None:
-        self.assertIsNone(copy_watch.newest_candidate(self.directory))
-        _ = self.write("v1", self.live_pid(), 100.0, proc_start="gone")
-        self.assertIsNone(copy_watch.newest_candidate(self.directory))
-
-
-@final
 class CopyWatchProcessTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -383,6 +347,9 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repository = self.root / "repo"
         (self.repository / ".git").mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(self.repository)], check=True, capture_output=True)
+        _ = (self.repository / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+        _ = subprocess.run(["git", "-C", str(self.repository), "add", "Cargo.toml"], check=True, capture_output=True)
         self.state = self.root / "state"
         self.info = self.root / "step-info"
         self.result = self.root / "watch-result"
@@ -391,6 +358,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = (self.root / "step.py").write_text(STEP_STUB)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
         busy: ClaimRecord = {
+            "claim_id": "busy-claim", "episode": "busy-episode", "attempt": "busy-attempt", "submitting_session": "",
             "pid": os.getpid(),
             "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
             "what": "nextest other",
@@ -406,17 +374,31 @@ class CopyWatchProcessTests(unittest.TestCase):
             "TEST_BUSY_CLAIM": json.dumps(busy),
             "TEST_COPY_MODES": "failed",
             "TEST_HANG_GUARD_SECS": str(test_hang_guard.TEST_HANG_GUARD_SECS),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "TEST_REAL_RECORD": str(SCRIPT.parents[1] / "buildlog/record.py"),
         }
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            paths = claim_state.StatePaths(self.state)
+            allowed = placement.TemporaryExclusion("busy") if mac_test.live_claims(paths) else placement.AllowedHost()
+            return private_provider_evidence(admission, key, paths, allowed)
+
+        admission.server.host_probe = provider
         self.step = None
         self.watcher = None
 
     @override
     def tearDown(self) -> None:
+        _ = (self.root / "release-runner").write_text("go\n")
         for process in (self.watcher, self.step):
             if process is not None and process.poll() is None:
-                process.kill()
+                if os.getpgid(process.pid) == process.pid:
+                    send_process_group(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
                 _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        _ = (self.root / "release-runner").write_text("go\n")
 
     def start_step(self) -> subprocess.Popen[bytes]:
         log = self.root / "step.log"
@@ -428,7 +410,8 @@ class CopyWatchProcessTests(unittest.TestCase):
     def start_watcher(self, modes: str, *, filter_run: bool = False, call_started: str = "1000.5") -> None:
         arguments = self.watcher_arguments(filter_run=filter_run, call_started=call_started)
         self.watcher = subprocess.Popen(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                        start_new_session=True)
 
     def watcher_arguments(self, *, filter_run: bool = False, call_started: str = "1000.5") -> list[str]:
         arguments = [
@@ -444,10 +427,13 @@ class CopyWatchProcessTests(unittest.TestCase):
         return arguments
 
     def wait_until(self, condition: Callable[[], bool], what: str) -> None:
-        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + COPY_FIXTURE_WAIT_SECONDS
         while time.monotonic() < deadline:
             if condition():
                 return
+            if self.watcher is not None and self.watcher.poll() is not None:
+                output, _ = self.watcher.communicate(timeout=COPY_FIXTURE_WAIT_SECONDS)
+                self.fail(f"The watcher exited {self.watcher.returncode} before {what}: {output}")
             time.sleep(0.01)
         self.fail(f"timed out waiting for {what}")
 
@@ -467,8 +453,16 @@ class CopyWatchProcessTests(unittest.TestCase):
             return []
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()]
 
-    def candidate(self) -> Path:
-        return self.state / "copy_candidates" / "repo" / "v-call.json"
+    def candidate_active(self) -> bool:
+        pid_file = self.root / "runner-pid"
+        if pid_file.exists() and Path("/proc", pid_file.read_text()).exists():
+            return False
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            requests = [request for request in admission.server.placement_requests.values()
+                        if request.episode.startswith("v-call-copy-")]
+            return any(isinstance(reply, wire.PlacementWait) for request in requests
+                       for reply in admission.server.handle_request(request))
 
     def compile_and_wait_for_copies(self, count: int) -> None:
         _ = (self.root / "compile").write_text("go\n")
@@ -492,7 +486,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--call-id") + 1], "v-call")
         self.assertEqual(arguments[arguments.index("--") + 1:], ["--no-fail-fast", "--workspace"])
         self.assertNotIn("--filter-run", arguments)
-        self.assertFalse(self.candidate().exists())
+        self.assertFalse(self.candidate_active())
 
     def test_filtered_copy_pass_first_wins(self) -> None:
         step = self.start_step()
@@ -525,6 +519,42 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertNotIn("mac", values)
         self.assertIsNone(step.poll())
 
+    def test_cancel_unavailable_preserves_the_settled_report(self) -> None:
+        from scripts.build_queue import admission_client
+
+        fixture = caller_admission(self, self.root, self.environment)
+        submitted = placement_request(fixture)
+        request = copy_watch.WatchRequest(
+            info=self.info, result=self.result, runner=self.runner,
+            settings=self.root / "mac_test.conf", repo_root=self.repository,
+            package="sample", call_id="settled-copy", call_started=1.0,
+            filter_run=False, nextest_words=(),
+        )
+        report = copy_watch.WatchReport("natedev_won", 4.5, 1, "6.0")
+        arguments = copy_watch.CliArguments()
+        arguments.parent_pid = os.getpid()
+
+        def settled(watch: copy_watch.Watch, _wakeup: copy_watch.Wakeup) -> copy_watch.WatchReport:
+            watch.placement = copy_watch.QueuedCopyPlacement(submitted)
+            return report
+
+        errors = io.StringIO()
+        with (mock.patch.object(argparse.ArgumentParser, "parse_args", return_value=arguments),
+              mock.patch.object(copy_watch, "request_from_arguments", return_value=request),
+              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("repo")),
+              mock.patch.object(copy_watch.Watch, "run", settled),
+              mock.patch.object(admission_client, "cancel_placement",
+                                side_effect=wire.AdmissionUnavailable("fixture cancellation unavailable")) as cancel,
+              mock.patch("sys.stderr", errors)):
+            self.assertEqual(copy_watch.main(), 0)
+        self.assertEqual(self.result.read_text(), copy_watch.result_text(report))
+        cancel.assert_called_once()
+        cancellation = cast(wire.CancelPlacement, cancel.call_args.args[0])
+        self.assertEqual((cancellation.episode, cancellation.owner, cancellation.reason),
+                         (submitted.episode, submitted.owner, "copy watcher ended"))
+        self.assertEqual(errors.getvalue(),
+                         "copy_watch: cannot cancel placement: fixture cancellation unavailable\n")
+
     def test_a_copy_that_gives_way_may_become_a_copy_again(self) -> None:
         _ = self.start_step()
         self.start_watcher("gave_way,hold")
@@ -537,7 +567,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.start_watcher("gave_way+busy")
         self.compile_and_wait_for_copies(1)
-        self.wait_until(self.candidate().exists, "the call to be a candidate again")
+        self.wait_until(self.candidate_active, "the call to be a candidate again")
         values = self.finish_watcher(terminate=True)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual((values["copy"], values["copy_count"]), ("gave_way", "1"))
@@ -547,7 +577,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.start_watcher("declined:no_tests")
         self.compile_and_wait_for_copies(1)
         time.sleep(SETTLE_S)
-        self.assertFalse(self.candidate().exists())
+        self.assertFalse(self.candidate_active())
         values = self.finish_watcher(terminate=True)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual((values["copy"], values["copy_count"]), ("declined", "1"))
@@ -563,7 +593,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.start_watcher("lost+busy")
         self.compile_and_wait_for_copies(1)
-        self.wait_until(self.candidate().exists, "the call to be a candidate again")
+        self.wait_until(self.candidate_active, "the call to be a candidate again")
         values = self.finish_watcher(terminate=True)
         self.assertEqual((values["copy"], values["copy_count"]), ("lost", "1"))
 
@@ -587,9 +617,9 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.start_watcher("failed")
         _ = (self.root / "compile").write_text("go\n")
-        self.wait_until(self.candidate().exists, "the call to be a candidate")
+        self.wait_until(self.candidate_active, "the call to be a candidate")
         _ = (self.root / "tests").write_text("go\n")
-        self.wait_until(lambda: not self.candidate().exists(), "candidacy to end")
+        self.wait_until(lambda: not self.candidate_active(), "candidacy to end")
         (claims / "repo.json").unlink()
         time.sleep(SETTLE_S)
         values = self.finish_watcher(terminate=True)
@@ -597,24 +627,31 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertEqual(values, {"copy": "", "copy_s": "", "copy_count": "", "natedev_s_at_end": ""})
 
     def test_a_newer_live_candidate_takes_the_copy(self) -> None:
-        newer = self.state / "copy_candidates" / "repo" / "v-newer.json"
-        newer.parent.mkdir(parents=True)
-        record: copy_watch.CandidateRecord = {
-            "pid": os.getpid(), "proc_start": (identity.start if isinstance(identity := process_identity.process_start(os.getpid()), process_identity.Started) else ""),
-            "call_started": 2000.0, "call_id": "v-newer",
-        }
-        _ = newer.write_text(json.dumps(record))
-        _ = self.start_step()
-        self.start_watcher("hold", call_started="1000,5")
-        _ = (self.root / "compile").write_text("go\n")
-        self.wait_until(self.candidate().exists, "the call to be a candidate")
-        time.sleep(SETTLE_S)
-        self.assertEqual(self.runner_events(), [])
-        newer.unlink()
-        self.wait_until(lambda: len(self.runner_events()) == 1, "the copy")
-        self.wait_until((self.root / "runner-ready").exists, "the copy to run")
-        values = self.finish_watcher(terminate=True)
-        self.assertEqual(values["copy"], "natedev_won")
+        for poll_s in ("0.05", "3600"):
+            with self.subTest(poll_s=poll_s):
+                self.environment["BUILD_TARGETS_POLL_S"] = poll_s
+                for name in ("compile", "runner-events.jsonl", "runner-ready", "runner-stopped", "runner-pid", "step.log"):
+                    (self.root / name).unlink(missing_ok=True)
+                admission = caller_admission(self, self.root, self.environment)
+                with admission.loop_turn():
+                    newer = placement_request(admission)
+                    destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+                    newer = replace(newer, episode=f"v-newer-{poll_s}", purpose=placement.SpeculativeCopy("newer-parent", 2000.0),
+                        constraints=replace(newer.constraints, candidates=(placement.PlacementCandidate(destination),)))
+                    _ = admission.server.handle_request(newer)
+                step = self.start_step()
+                self.start_watcher("hold", call_started="1000,5")
+                _ = (self.root / "compile").write_text("go\n")
+                self.wait_until(self.candidate_active, "the call to be a candidate")
+                time.sleep(SETTLE_S)
+                self.assertEqual(self.runner_events(), [])
+                _ = admission.completed_queue_change(wire.CancelPlacement("cancel-newer", newer.episode, newer.owner, "ended"))
+                self.wait_until(lambda: len(self.runner_events()) == 1, "the copy")
+                self.wait_until((self.root / "runner-ready").exists, "the copy to run")
+                values = self.finish_watcher(terminate=True)
+                self.assertEqual(values["copy"], "natedev_won")
+                send_process_group(step.pid, signal.SIGKILL)
+                _ = step.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_a_running_copy_blocks_copies_of_other_calls(self) -> None:
         # A copy claim holds the Mac against other copies: free-now --copy says busy.
@@ -626,7 +663,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.start_watcher("failed")
         _ = (self.root / "compile").write_text("go\n")
-        self.wait_until(self.candidate().exists, "the call to be a candidate")
+        self.wait_until(self.candidate_active, "the call to be a candidate")
         time.sleep(SETTLE_S)
         values = self.finish_watcher(terminate=True)
         self.assertEqual(self.runner_events(), [])
@@ -640,7 +677,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.start_watcher("failed")
         _ = (self.root / "compile").write_text("go\n")
-        self.wait_until(self.candidate().exists, "the call to be a candidate")
+        self.wait_until(self.candidate_active, "the call to be a candidate")
         started = time.monotonic()
         watcher = self.watcher
         assert watcher is not None
@@ -690,7 +727,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                 if running_copy:
                     self.wait_until((self.root / "runner-ready").exists, "the copy to run")
                 else:
-                    self.wait_until(self.candidate().exists, "the watcher to be ready")
+                    self.wait_until(self.candidate_active, "the watcher to be ready")
                 self.result.parent.rmdir()
             started = time.monotonic()
             if not before_start:
@@ -699,7 +736,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 4.0)
             self.assertNotIn("Traceback", output)
             self.assertTrue(self.result.exists())
-            self.assertFalse(self.candidate().exists(), f"watcher {watcher_pid} left its candidate")
+            self.assertFalse(self.candidate_active(), f"watcher {watcher_pid} left its candidate")
             if running_copy:
                 self.assertTrue((self.root / "runner-stopped").exists())
         finally:

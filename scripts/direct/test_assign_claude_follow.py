@@ -11,15 +11,18 @@ from dataclasses import replace
 from typing import cast
 from unittest.mock import patch
 from scripts.accounts import accounts
+from scripts.production.cli_fixture import process_boundary
 from scripts.usage import agents_log
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import claude_catalog_environment
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, fixture_session, isolated_staff_file, stopped_worker_module, transcript_fixture
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture, ClaudeLauncherFixture):
+    @process_boundary
     def test_failed_switch_delivery_retries_the_saved_handoff_before_the_assignment(self) -> None:
         session_dir = self.start_phase("claude-switch-retry")
         transcript = self.claude_worker(session_dir)
@@ -115,6 +118,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
                     for entry in entries:
                         self.assertIn("claude/" + first_model + ":high", entry)
 
+    @process_boundary
     def test_unreadable_dispatch_reports_one_anomaly_and_keeps_the_live_worker_followable(self) -> None:
         run = self.start_phase("unreadable-dispatch")
         transcript = self.claude_worker(run)
@@ -143,6 +147,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(len(transcript.read_text().splitlines()), 2)
         self.assertEqual(self.recorded_worker(run), replace(row, role=staff.KnownWorkerRole("impl")))
 
+    @process_boundary
     def test_family_switch_continues_after_an_unknown_dispatch_state(self) -> None:
         run = self.start_phase("switch-unknown-record")
         _ = self.claude_worker(run)
@@ -172,6 +177,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertIn(evidence[0][0], extract.read_text())
         self.assertIn(str(source), opening)
 
+    @process_boundary
     def test_claude_follow_records_the_dispatch_role_before_delivery(self) -> None:
         session_dir = self.start_phase("claude-role-change")
         _ = self.claude_worker(session_dir)
@@ -198,6 +204,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual(json.loads((self.root / "delivered-role.json").read_text()), "impl")
         self.assertEqual(self.open_passes(session_dir)["fixture-impl"]["status"], "completed")
 
+    @process_boundary
     def test_claude_follow_counts_turn_completed_before_first_poll(self) -> None:
         session_dir = self.start_phase("claude-short-turn")
         transcript = self.claude_worker(session_dir)

@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -43,12 +44,13 @@ from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue import placement
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -132,6 +134,22 @@ SWAP_OWNER_SLICES = {"app-agents.slice": "agents", "session.slice": "desktop",
                      "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 
 
+class MachineColors(TypedDict):
+    natedev: str
+    mac: str
+    aws: str
+
+
+class ThemeColors(TypedDict):
+    remote_memory: str
+    machines: MachineColors
+
+
+class PageColors(TypedDict):
+    light: ThemeColors
+    dark: ThemeColors
+
+
 @dataclass(frozen=True)
 class FeedConfiguration:
     output_folder: Path
@@ -139,6 +157,7 @@ class FeedConfiguration:
     history_days: int
     swap_rows: int
     report_refresh_seconds: int
+    colors: PageColors
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -150,9 +169,22 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
+
+    def color(key: str) -> str:
+        value = settings.text(key)
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+            raise ValueError(f"{key}: expected six hexadecimal digits")
+        return "#" + value
+
+    def theme(name: str) -> ThemeColors:
+        return {"remote_memory": color(f"remote_memory_{name}"), "machines": {
+            "natedev": color(f"machine_natedev_{name}"), "mac": color(f"machine_mac_{name}"),
+            "aws": color(f"machine_aws_{name}")}}
+
     return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
-                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
+                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
+                             {"light": theme("light"), "dark": theme("dark")})
 
 
 class PageArguments(CodeRootArguments):
@@ -263,7 +295,13 @@ class RowProgress(TypedDict):
     unit: Literal["modules", "units", "tests"]
 
 
-class RunRow(TypedDict):
+class RowQueueNotes(TypedDict):
+    head_text: NotRequired[str]
+    priority_text: NotRequired[str]
+
+
+class RunRow(RowQueueNotes):
+    admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
@@ -308,7 +346,7 @@ class SwapReading:
     files_read: int
 
 
-class WaitRow(TypedDict):
+class WaitRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
@@ -320,15 +358,44 @@ class WaitRow(TypedDict):
     fits: bool
 
 
-class CloudWorkRow(TypedDict):
+class MacBuildRow(RowQueueNotes):
+    kind: Literal["mac-build"]
+    name: str
+    repository: str
+    showrunner: str
+    unit: str
+    pid: int
+    machine: Literal["mac"]
+    started_at: float
+    read_at: float
+    used: float | queue_view.MacMemoryUnavailable
+    stage: queue_view.MacBuildStage
+    progress: RowProgress | NoProgress
+    vcpus: int | queue_view.MacJobsUnavailable
+
+
+class MacReadingUnavailableRow(RowQueueNotes):
+    kind: Literal["mac-unavailable"]
+    name: Literal["Mac builds"]
+    unit: Literal["—"]
+    pid: admission_records.PidNotRecorded
+    machine: Literal["mac"]
+    started_at: float
+    read_at: float
+    used: queue_view.MacMemoryUnavailable
+    stage: queue_view.MacStageUnavailable
+    vcpus: queue_view.MacJobsUnavailable
+    status: str
+
+
+class CloudWorkRow(RowQueueNotes):
     kind: Literal["cloud"]
-    work_kind: NotRequired[Literal["started on the Mac"]]
     name: str
     showrunner: str
     unit: str
     pid: int | admission_records.PidNotRecorded
     detail: str
-    machine: Literal["aws", "mac", ""]
+    machine: Literal["aws", ""]
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
@@ -386,6 +453,7 @@ class ReportNotRead(Enum):
 
 
 class MemoryPage(TypedDict):
+    colors: PageColors
     ok: bool
     read_at: float
     total: float
@@ -410,11 +478,12 @@ class MemoryPage(TypedDict):
     pressure: str
     swap_used: float
     swap_total: float
-    walk: list[RunRow | CloudRunRow]
+    walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
     cloud_slots: int
@@ -528,7 +597,7 @@ def ci_amount(value: float) -> str:
 
 
 def build_ci_row(used: float, now: float,
-                 cgroup: Path = CI_CGROUP, proc: Path = PROC) -> RunRow:
+                 cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False) -> RunRow:
     runners: list[CIRunner]
     try:
         units = sorted(child for child in cgroup.iterdir()
@@ -554,11 +623,12 @@ def build_ci_row(used: float, now: float,
     lines.append(f"hana CI uses {ci_amount(used)} now. This use is part of the work inside the cap.")
     idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
     pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
-    return {"name": "hana CI", "showrunner": "", "unit": cgroup.name, "state": detail if not busy else "",
+    return {"name": "hana CI", "showrunner": "hana CI", "unit": "hana CI", "state": detail if not busy else "",
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
+            "ci_runners": runners, "admitted": admitted,
+            "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
 def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
@@ -585,18 +655,67 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
     return {"kind": "NoProgress", "reason": reason}
 
 
-def mac_work_row(name: str, unit: str, pid: int | admission_records.PidNotRecorded, started_at: float,
-                 work_kind: Literal["started on the Mac"],
-                 counter: RowProgress | NoProgress, *, showrunner: str = unit_labels.OWNER_NOT_RECORDED,
-                 status: str = "", detail: str = "") -> CloudRunRow:
-    """Show Mac work through the same row as AWS without local memory fields."""
-    progress_text = (f"{counter['done']} of {counter['total']} {counter['unit']}"
-                     if counter["kind"] == "RowProgress" else "Progress unavailable: " + counter["reason"])
-    return {"kind": "cloud", "work_kind": work_kind, "name": name, "showrunner": showrunner,
-        "unit": unit or unit_labels.OWNER_NOT_RECORDED, "pid": pid, "detail": detail or unit,
-        "machine": "mac", "vcpus": queue_view.UnknownCpuCount(),
-        "state": "running", "status": status or f"{work_kind} · {progress_text}", "progress": counter,
-        "stale": False, "late_age": "", "started_at": started_at}
+def feed_step_labels(step: admission_records.RunningStep | admission_records.WaitingStep,
+                     labels: Mapping[str, unit_labels.UnitLabels], runners: frozenset[str]) -> unit_labels.UnitLabels:
+    """Use the CI runner record instead of an absent staff owner."""
+    if step.unit in runners:
+        return unit_labels.UnitLabels("hana CI", "hana CI", step.unit)
+    return step_labels(step, labels)
+
+
+def mac_build_units(builds: Sequence[queue_view.MacBuild]) -> Mapping[int, unit_labels.UnitLabels]:
+    """Use a Mac claim's session to resolve its staff unit."""
+    from scripts.copies import copies
+    from scripts.mac_test import claim_state
+
+    if not builds:
+        return {}
+    try:
+        claims = [claim.record for claim in claim_state.read_claims(claim_state.state_paths())
+                  if claim.record.get("remote_host", "mac") == "mac"]
+    except claim_state.StateReadError:
+        return {}
+    leases = [lease for lease in copies.held_remote_mirrors() if lease.identity.host == "mac"]
+    labels = unit_labels.unit_labels_for([claim["submitting_session"] for claim in claims], os.environ)
+
+    def contains(folder: str, project: str) -> bool:
+        folder = folder.removeprefix("/private")
+        project = project.removeprefix("/private")
+        if folder.startswith("~/"):
+            folder = folder[1:]
+            return project.endswith(folder) or folder + "/" in project
+        if not Path(folder).is_absolute():
+            return project.endswith("/" + folder) or "/" + folder + "/" in project
+        return Path(project).is_relative_to(Path(folder))
+
+    result: dict[int, unit_labels.UnitLabels] = {}
+    for build in builds:
+        sessions = {lease.session for lease in leases if contains(lease.identity.path, build.folder)}
+        if build.session:
+            sessions.add(build.session)
+        matches = {labels[claim["submitting_session"]] for claim in claims
+                   if claim["submitting_session"] in labels and
+                   (contains(claim["worktree"], build.folder) or
+                    claim["submitting_session"] in sessions and
+                    claim.get("repo_name", "") == build.repository)}
+        if len(matches) == 1:
+            result[build.pid] = next(iter(matches))
+    return result
+
+
+def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
+                 identity: unit_labels.UnitLabels) -> MacBuildRow:
+    """Keep Mac memory and its stage separate from natedev admission values."""
+    return {"kind": "mac-build", "name": queue_view.mac_step_name(build), "unit": identity.unit,
+            "repository": build.repository, "showrunner": identity.owner_text,
+            "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
+            "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
+            "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
+            "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
+                          "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
+                          "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
+                         if isinstance(build.counter, progress.ProgressCounter) else
+                         {"kind": "NoProgress", "reason": build.counter.reason})}
 
 
 def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
@@ -820,6 +939,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         raise RuntimeError("recorded room unavailable")
     labels = unit_labels.unit_labels_for(
         [step.session_id for step in (*parsed.view.running, *parsed.view.waiting)], os.environ)
+    ci_rows: dict[str, RunRow] = {}
+    for entry in explanation.running:
+        memory = entry.step.measured
+        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
+            ci_rows[memory.cgroup] = build_ci_row(gib(memory.bytes), explanation.now,
+                Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
+    ci_runners = frozenset(runner["name"] for row in ci_rows.values() for runner in row.get("ci_runners", []))
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
@@ -848,7 +975,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
-        identity = step_labels(metadata, labels) if metadata is not None else unit_labels.UnitLabels("")
+        identity = feed_step_labels(metadata, labels, ci_runners) if metadata is not None else unit_labels.UnitLabels("")
         unit = identity.unit
         name = step_text(step, names, labels=labels) if step is not None else identity.session or hold.memory.owner
         detail = unit if step is not None else SWAP_NAMES["between"]
@@ -863,15 +990,29 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
     groups: dict[str, list[RunRow]] = {}
+    remote_groups: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
-        identity = step_labels(step, labels)
+        identity = feed_step_labels(step, labels, ci_runners)
         name, detail = step_text(step, names, labels=labels), identity.unit
         unit, state = detail, ""
+        if isinstance(memory, admission_records.RemoteMemoryUnavailable):
+            key = admission_records.execution_group(step, entry.owner)
+            if key in remote_groups:
+                continue
+            remote_groups.add(key)
+            remote_row: RunRow = {"name": name, "showrunner": identity.showrunner, "unit": unit,
+                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
+                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
+                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
+                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
+                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
+            walk.append(remote_row)
+            continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
-                       or not isinstance(memory.job_state, NotServiceSlice) or bool(memory.diagnostic))
+                       or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
             if service:
                 name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
                 activity = service_activity_text(memory, explanation.now)
@@ -891,8 +1032,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "progress": row_progress((step,)),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
-                row = build_ci_row(gib(memory.bytes), explanation.now,
-                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
+                row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
+                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                                   admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
@@ -917,8 +1059,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     machine = host_name()
     vcpus = os.cpu_count()
     for row in walk:
-        row["machine"] = machine
-        row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
+        _ = row.setdefault("machine", machine)
+        _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -926,7 +1068,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for waiter in parsed.view.waiting:
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
-        identity = step_labels(waiter, labels)
+        identity = feed_step_labels(waiter, labels, ci_runners)
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
@@ -934,17 +1076,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room})
-    work_rows: list[RunRow | CloudRunRow] = list(walk)
+    work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_reading = queue_view.read_mac_builds()
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
-        work_rows.append(mac_work_row("Mac builds", "", admission_records.PidNotRecorded(), 0,
-            "started on the Mac", {"kind": "NoProgress", "reason": mac_status}, status=mac_status))
+        work_rows.append({"kind": "mac-unavailable", "name": "Mac builds", "unit": "—",
+            "pid": admission_records.PidNotRecorded(), "machine": "mac", "started_at": 0,
+            "read_at": mac_reading.read_at, "used": queue_view.MacMemoryUnavailable(),
+            "stage": queue_view.MacStageUnavailable(), "vcpus": queue_view.MacJobsUnavailable(), "status": mac_status})
     else:
-        work_rows.extend(mac_work_row(Path(build.folder).name, unit_labels.OWNER_NOT_RECORDED, build.pid, build.started_at,
-            "started on the Mac", {"kind": "NoProgress", "reason": "Mac process has no readable counter"},
-            status=queue_view.mac_build_status(mac_reading, explanation.now), detail=build.folder)
-            for build in mac_reading.builds)
+        mac_units = mac_build_units(mac_reading.builds)
+        work_rows.extend(mac_work_row(build, mac_reading, mac_units.get(build.pid, unit_labels.UnitLabels("")))
+                         for build in mac_reading.builds)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
     model = queue_view.QueueModel(
@@ -979,6 +1122,25 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
+    unmatched_priority_text = ""
+    if isinstance(explanation.priority, admission_records.QueuePriority):
+        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
+                      for entry in explanation.priority.entries}
+        matched_units: set[str] = set()
+        for work_row in (*work_rows, *waiting_rows):
+            if work_row["unit"] in priorities:
+                work_row["priority_text"] = priorities[work_row["unit"]]
+                matched_units.add(work_row["unit"])
+        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
+    if waiting_rows:
+        head_pid = waiting_rows[0]["pid"]
+        if isinstance(explanation.head, admission_records.HeadExplanation):
+            head = explanation.head.waiter
+            head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
+        for waiting_row in waiting_rows:
+            if waiting_row["pid"] == head_pid:
+                waiting_row["head_text"] = queue_view.head_text(model)
+                break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
     swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
@@ -991,6 +1153,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
     return {
+        "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
@@ -1005,6 +1168,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},

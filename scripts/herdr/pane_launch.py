@@ -327,11 +327,11 @@ def native_kind(row: staff.StaffRow) -> str:
     """Read the current backend from its native pane or Claude registry."""
     module = import_module("scripts.herdr.herdr")
     session = cast(Callable[[], str], module.shared_session)()
-    client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-    native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-    codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-    claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
     try:
+        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
+        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
+        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
+        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")
@@ -372,14 +372,11 @@ def current_kind(row: staff.StaffRow) -> Literal["claude", "codex"]:
     family = native_kind(row)
     if family in ("claude", "codex"):
         return family
-    from scripts.lib.transcripts import transcript_paths
+    from scripts.lib.transcripts import codex_transcript_homes, transcript_paths
 
-    homes = [row.home.path] if isinstance(row.home, staff.SessionHome) else []
-    homes.extend(Path.home().glob(".codex*"))
-    if home := os.environ.get("CODEX_HOME"):
-        homes.append(Path(home))
+    extra_homes = (row.home.path,) if isinstance(row.home, staff.SessionHome) else ()
     if any(transcript_paths(home / folder, f"**/*{row.current_session}.jsonl")
-           for home in dict.fromkeys(homes) for folder in ("sessions", "archived_sessions")):
+           for home in codex_transcript_homes(extra_homes) for folder in ("sessions", "archived_sessions")):
         return "codex"
     if (isinstance(row.home, staff.SessionHome) and
             transcript_paths(row.home.path / "projects", f"*/{row.current_session}.jsonl")) or sessions.transcript_locations(row.current_session):

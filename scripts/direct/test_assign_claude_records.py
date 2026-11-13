@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from scripts.accounts import accounts
+from scripts.production.cli_fixture import process_boundary
 from scripts.direct import assign_claude_test_support as support
 from scripts.direct.assign_claude_test_support import DIRECT_DIR as DIRECT_DIR
 from scripts.lib.test_models_registry import claude_catalog_environment
@@ -15,7 +16,7 @@ import sys
 from unittest.mock import patch
 
 
-class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(support.InProcessAssignClaudeLauncherFixture):
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)
@@ -139,6 +140,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    @process_boundary
     def test_failed_landed_record_leaves_error_status(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -157,6 +159,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         )
         self.assertIn("blocked:", (session_dir / "board.log").read_text(encoding="utf-8"))
 
+    @process_boundary
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
         session_dir, first = self.first_worker_launch()
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -218,6 +221,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         check = cast(dict[str, object], started["launch_check"])
         self.assertEqual(check["fix_cause"], "retry tests fail after integration")
 
+    @process_boundary
     def test_success_status_follows_pass_and_landed_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -236,6 +240,7 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
             "implemented\n",
         )
 
+    @process_boundary
     def test_worker_error_status_follows_pass_and_abandon_records(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)

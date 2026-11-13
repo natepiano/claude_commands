@@ -44,6 +44,8 @@ The Mac sends staff operations to the owner on natedev.
 | `StaffRow.id` | Fixed member identity. |
 | `StaffRow.parent` | `ReportsTo(StaffId)` or `StaffRoot`. |
 | `StaffRow.current_session` | Current native Claude session or Codex thread. |
+| `KnownWorkerRole`, `WorkerRoleUnknown` | The worker's current role or an explicit unknown role. |
+| `SessionHome`, `HomeUnknown` | The account configuration folder or an explicit unknown home. |
 | `PresentWorktree`, `RemovedWorktree`, `WorktreeUnfilled` | Current worktree location or its explicit missing state. |
 | `LiveDoc`, `WrappedDoc`, `DocUnfilled` | Production document location or its explicit missing state. |
 | `Paused`, `Exited`, `Active` | Staff hold state. |
@@ -53,6 +55,9 @@ Rows, locations, and hold records preserve unknown JSON fields through `unknown_
 A location change preserves those fields. A new hold starts a new hold record.
 An incompatible change requires a new schema number.
 The [staff accessor list](staff-accessors.md) identifies readers and writers.
+Stored references keep the fixed staff id and read other current staff facts when used.
+Dated history retains event-time facts for attribution.
+Display names do not select stored relationships or replace native identity evidence.
 
 `scripts/herdr/worker_panes.py` owns worker execution and observation.
 `observe_parents(parents, record) -> dict[StaffId, list[WorkerPane]]` shares one pane read across parents.
@@ -88,7 +93,8 @@ A shared read through `worker_lifecycle.locked_state` creates no missing state f
 `HookCompletion` records completed actions so an interrupted handler can continue.
 An already finished hook event changes no dispatch.
 A missing final transcript record does not erase a matching DONE reply supported by the dispatch prompt.
-A live detached command prevents completion. A pending command result or friend reply keeps the assignment active.
+A live detached command prevents completion.
+A pending command result keeps the assignment active.
 
 Normal DONE closure retains the staff row and native conversation.
 The next assignment resumes that conversation in a new pane.

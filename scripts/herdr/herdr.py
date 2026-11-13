@@ -2892,12 +2892,12 @@ class Herdr:
             arguments.extend(["--format", "ansi"])
         return self.run(*arguments, deadline=deadline)
 
-    def send_keys(self, pane: str, *keys: str, target: str) -> None:
+    def send_keys(self, pane: str, *keys: str, target: str, expected_text: str = "") -> None:
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
         row = self.pane_row(pane)
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
-                            pane_info=row, client=self):
+                            pane_info=row, client=self, text=expected_text):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         self._send_keys(pane, *keys)
 
@@ -3722,7 +3722,7 @@ def stop_session(name: str) -> None:
                                 f"stop {server_unit(name)}")
 
 
-def _proc_root() -> Path:
+def proc_root() -> Path:
     return Path(os.environ.get("HERDR_PROC", "/proc"))
 
 
@@ -3832,7 +3832,7 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
             return unknown
         arguments = list(process.arguments.argv)
     else:
-        arguments = _process_arguments(_proc_root() / str(pid))
+        arguments = _process_arguments(proc_root() / str(pid))
     if is_codex_process(arguments):
         options = iter(arguments[2:] if Path(arguments[0]).name in {"node", "nodejs"} else arguments[1:])
         fresh = True
@@ -4151,7 +4151,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
 
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
-    process_root = _proc_root()
+    process_root = proc_root()
     process_paths: list[Path] = []
 
     @cache
@@ -4293,7 +4293,7 @@ def process_environment(pid: int) -> dict[str, str]:
     """Read a process even outside herdr; a failed observation remains an error."""
     if _platform() == "darwin":
         return darwin_process_environment(pid)
-    return _process_environment(_proc_root() / str(pid))
+    return _process_environment(proc_root() / str(pid))
 
 
 def _process_arguments(process: Path) -> list[str]:
@@ -4392,7 +4392,7 @@ class _LinuxStartupProcesses:
     """Read startup facts from Linux process files."""
 
     def __init__(self) -> None:
-        self.root: Path = _proc_root()
+        self.root: Path = proc_root()
 
     def identity(self, pid: int) -> AgentProcessIdentity:
         stat = (self.root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
@@ -4593,7 +4593,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
     if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
-        processes = list(_proc_root().iterdir())
+        processes = list(proc_root().iterdir())
     except OSError as error:
         return ClientsUnreadable(str(error))
     count = 0
@@ -4728,7 +4728,7 @@ def server_environment(name: str) -> dict[str, str]:
         except (HerdrFailure, subprocess.TimeoutExpired) as error:
             raise HerdrFailure(f"{context}: {error}") from error
     try:
-        sockets = _proc_root().joinpath("net", "unix").read_text().splitlines()
+        sockets = proc_root().joinpath("net", "unix").read_text().splitlines()
     except (OSError, UnicodeError) as error:
         raise HerdrFailure(f"{context}: cannot read listening sockets") from error
     listening_inodes: list[str] = []
@@ -4741,7 +4741,7 @@ def server_environment(name: str) -> dict[str, str]:
         raise HerdrFailure(f"{context}: expected one listening socket, found {len(listening_inodes)}")
     listener = f"socket:[{listening_inodes[0]}]"
     try:
-        candidates = list(_proc_root().iterdir())
+        candidates = list(proc_root().iterdir())
     except OSError as error:
         raise HerdrFailure(f"{context}: cannot read process directory") from error
     matches: list[Path] = []
@@ -4842,7 +4842,7 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
 
 def linux_process_parent(pid: int) -> int:
     """Read the parent pid from the Linux process root."""
-    stat = (_proc_root() / str(pid) / "stat").read_text()
+    stat = (proc_root() / str(pid) / "stat").read_text()
     return int(stat[stat.rindex(")") + 1:].split()[1])
 
 
@@ -4851,13 +4851,13 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
-        environment = _process_environment(_proc_root() / str(pid))
+        environment = _process_environment(proc_root() / str(pid))
         if environment.get("TMUX_PANE"):
             return NotInHerdr()
         pane = environment.get("HERDR_PANE_ID", "")
         if not pane:
             return NotInHerdr()
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return NotInHerdr()
     session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
@@ -4871,13 +4871,13 @@ def herdr_places() -> dict[int, HerdrPlace]:
     if _platform() == "darwin":
         return {process.pid: process.place for process in herdr_processes()}
     try:
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return {}
     places: dict[int, HerdrPlace] = {}
     for pid, session in _process_sessions(candidates, _live_server_processes(candidates)).items():
         try:
-            environment = _process_environment(_proc_root() / str(pid))
+            environment = _process_environment(proc_root() / str(pid))
         except OSError:
             continue
         place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
@@ -4890,7 +4890,7 @@ def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
     """Identify servers by listening socket ownership, independent of argv."""
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
     try:
-        lines = _proc_root().joinpath("net", "unix").read_text().splitlines()
+        lines = proc_root().joinpath("net", "unix").read_text().splitlines()
     except OSError:
         return {}
     listeners: dict[str, str] = {}
@@ -4958,7 +4958,7 @@ def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[i
                       sessions: dict[int, str], slice_name: str) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid)), slice_name):
+        for scope in pane_scopes(_systemd_cgroups(proc_root() / str(pid)), slice_name):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -4974,7 +4974,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
             unit = server_unit(session)
         except ValueError:
             continue
-        for hierarchy, path in _systemd_cgroups(_proc_root() / str(pid)):
+        for hierarchy, path in _systemd_cgroups(proc_root() / str(pid)):
             if unit in path.parts:
                 root = Path(*path.parts[:path.parts.index(unit) + 1])
                 unit_groups[hierarchy, root] = session
@@ -5037,7 +5037,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
         # shared cgroup or HERDR_SESSION, this identifies the actual pane shell.
         for session in shared_sessions:
             for shell in _pane_shell_pids(session):
-                descendants = [(_proc_root() / str(shell), session)]
+                descendants = [(proc_root() / str(shell), session)]
                 while descendants:
                     process, owner = descendants.pop()
                     pid = int(process.name)
@@ -5280,12 +5280,12 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return processes
     sessions = _process_sessions(candidates, _live_server_processes(candidates))
     for pid, session in sessions.items():
-        process = _proc_root() / str(pid)
+        process = proc_root() / str(pid)
         try:
             if process.stat().st_uid != os.getuid():
                 continue

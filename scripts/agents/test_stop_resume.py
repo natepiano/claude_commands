@@ -859,7 +859,7 @@ class StopResumeTests(unittest.TestCase):
                 with self.subTest(kind=kind, target=target):
                     pane_record.save("agents", {self.entry["pane_id"]: self.entry})
                     row = staff.StaffRow(identity, "producer" if kind == "missing" else kind, "alpha",
-                                         staff.STAFF_ROOT, current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                                         staff.STAFF_ROOT, current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
                     expected = target or "claude4"
                     rows = () if kind == "missing" else (row,)
                     with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
@@ -910,27 +910,37 @@ class StopResumeTests(unittest.TestCase):
         self.client.rows.clear()
         return identity
 
-    def test_resume_resolves_an_exact_codex_name_and_reports_distinct_candidates(self) -> None:
+    def test_resume_rejects_codex_names_with_duplicate_or_distinct_index_entries(self) -> None:
         identity = self.saved_codex_name()
         path = self.root / ".codex2/session_index.jsonl"
         first = path.read_text()
-        with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
-              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ClaudeUp(identity, "pane", "codex1")) as once):
-            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
-            self.assertEqual(once.call_args.args[0], identity)
-            atomic_file.write_text_atomic(path, first + first)
-            self.assertIsInstance(stop_resume.resume("saved-worker"), stop_resume.ClaudeUp)
-            atomic_file.write_text_atomic(path, first + json.dumps({"id": "another-id", "thread_name": "saved-worker"}) + "\n")
-            once.reset_mock()
-            result = stop_resume.resume("saved-worker")
-            self.assertIsInstance(result, stop_resume.ResumeFailed)
-            assert isinstance(result, stop_resume.ResumeFailed)
-            self.assertIn("ambiguous name; candidates:", result.reason)
-            self.assertIn(identity, result.reason)
-            self.assertIn("another-id", result.reason)
-            once.assert_not_called()
-            once.return_value = stop_resume.SessionNotFound("saved")
-            self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
+
+        def resume_selected(target: str, **_: object) -> stop_resume.ResumeResult:
+            return (stop_resume.ClaudeUp(identity, "pane", "codex1") if target == identity
+                    else stop_resume.SessionNotFound(target))
+
+        for content in (first, first + first,
+                first + json.dumps({"id": "another-id", "thread_name": "saved-worker"}) + "\n",
+                first + json.dumps({"id": fixture_runtime_id("another-thread"), "thread_name": "saved-worker"}) + "\n"):
+            with self.subTest(content=content):
+                atomic_file.write_text_atomic(path, content)
+                with (patch.dict(os.environ, {"CODEX_HOME": str(path.parent)}),
+                      patch.object(stop_resume, "_resume_once", side_effect=resume_selected) as once,
+                      patch.object(herdr, "launch_prepared_agent") as launch):
+                    result = stop_resume.resume("saved-worker")
+                    self.assertEqual(result,
+                                     stop_resume.ResumeFailed("saved-worker", "unknown name"))
+                    self.assertIsInstance(result, stop_resume.ResumeFailed)
+                    assert isinstance(result, stop_resume.ResumeFailed)
+                    self.assertEqual(result.reason, "unknown name")
+                    self.assertNotIn(identity, result.reason)
+                    self.assertNotIn("another-id", result.reason)
+                    once.assert_called_once()
+                    self.assertEqual(once.call_args.args[0], "saved-worker")
+                    self.assertEqual(stop_resume.resume("SAVED-WORKER"), stop_resume.ResumeFailed("SAVED-WORKER", "unknown name"))
+                launch.assert_not_called()
+                self.start.assert_not_called()
+                self.assertNotIn(identity, self.launched)
 
     def test_raw_codex_id_wins_over_another_threads_name(self) -> None:
         identity = self.saved_codex_name()
@@ -1021,7 +1031,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("anomaly: pid unreadable; not blocking", errors)
         self.assertIn("observer anomaly:", errors)
 
-    def test_resume_codex_name_uses_the_workers_account_and_the_rollout_folder(self) -> None:
+    def test_resume_codex_id_uses_the_workers_account_and_the_rollout_folder(self) -> None:
         for compressed in (False, True):
             with self.subTest(compressed=compressed):
                 identity = self.saved_codex_name()
@@ -1040,7 +1050,7 @@ class StopResumeTests(unittest.TestCase):
                               self.root / "project", {"CODEX_HOME": str(self.root / f".{expected}")})) as prepare,
                           patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                               "w1:p2", herdr.PromptSubmissionNotRequired())) as launch):
-                        result = stop_resume.resume("saved-worker", to=target)
+                        result = stop_resume.resume(identity, to=target)
                         self.assertIsInstance(result, stop_resume.ClaudeUp)
                         assert isinstance(result, stop_resume.ClaudeUp)
                         self.assertEqual((result.session_id, result.account), (identity, expected))
@@ -1070,7 +1080,7 @@ class StopResumeTests(unittest.TestCase):
               patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
                   "w1:p2", herdr.PromptSubmissionNotRequired())) as launch,
               redirect_stderr(io.StringIO()) as errors):
-            result = stop_resume.resume("saved-worker")
+            result = stop_resume.resume(identity)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual(result.start_state, ClaudeStartState.STARTED)
@@ -1094,7 +1104,7 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(self.client, "open_tab") as opened,
                       patch.object(herdr, "launch_prepared_agent") as launch,
                       redirect_stderr(io.StringIO()) as errors):
-                    result = stop_resume.resume("saved-worker", to="codex1")
+                    result = stop_resume.resume(identity, to="codex1")
                 self.assertIsInstance(result, stop_resume.ClaudeUp)
                 assert isinstance(result, stop_resume.ClaudeUp)
                 self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
@@ -1106,14 +1116,14 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
                 self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
 
-    def test_resume_of_a_running_codex_name_keeps_its_current_account(self) -> None:
+    def test_resume_of_a_running_codex_id_keeps_its_current_account(self) -> None:
         identity = self.saved_codex_name()
         with (patch.dict(os.environ, {"CODEX_HOME": str(self.root / ".codex2")}),
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({identity: (456,)}, ())),
               patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex2")),
               patch.object(accounts, "codex_home_label", return_value="codex2"),
               patch.object(herdr, "launch_prepared_agent") as launch):
-            result = stop_resume.resume("saved-worker", to="codex1")
+            result = stop_resume.resume(identity, to="codex1")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         assert isinstance(result, stop_resume.ClaudeUp)
         self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
@@ -1199,7 +1209,8 @@ class StopResumeTests(unittest.TestCase):
         pane_record.save("agents", {})
         for row_kind, name, family, selected in cases:
             row = staff.StaffRow(staff.StaffId("fixed-row"), row_kind, name, staff.StaffRoot(),
-                                 current_session=staff.StaffId(identity))
+                                 current_session=staff.StaffId(identity),
+                                 unit_type=staff.UnitDetails("direct") if row_kind == "unit" else staff.NotUnit())
             record = staff.StaffSnapshot((row,))
             for target in (None, "codex2" if family == "codex" else "claude4"):
                 for panes in (self.client.rows, []):
@@ -1468,7 +1479,7 @@ class StopResumeTests(unittest.TestCase):
     def test_resume_names_use_a_fresh_snapshot_under_the_row_lock(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
-                             current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         for reference in (row.name, row.id, identity):
             self.launched.clear()
             self.client.prompts.clear()
@@ -1483,9 +1494,9 @@ class StopResumeTests(unittest.TestCase):
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
-                             current_session=identity)
+                             current_session=identity, unit_type=staff.UnitDetails("direct"))
         other = staff.StaffRow(staff.StaffId("other"), "unit", "accounts", staff.StaffRoot(),
-                               current_session=staff.StaffId("other-session"))
+                               current_session=staff.StaffId("other-session"), unit_type=staff.UnitDetails("direct"))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row, other))):
             for reference, text in (("absent", "unknown name"), ("accounts", "ambiguous name")):
                 result = stop_resume.resume(reference)
@@ -1497,7 +1508,7 @@ class StopResumeTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.reason, "unknown name")
         remote_row = staff.StaffRow(row.id, row.kind, row.name, row.parent,
-            current_session=identity, worktree=staff.PresentWorktree("other-machine", self.root))
+            current_session=identity, worktree=staff.PresentWorktree("other-machine", self.root), unit_type=row.unit_type)
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((remote_row,))):
             result = stop_resume.resume("accounts")
         self.assertEqual(result, stop_resume.ResumeFailed("accounts", "session is on other-machine"))
@@ -1720,15 +1731,15 @@ class StopResumeTests(unittest.TestCase):
         rows = (
             staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
                 current_session=staff.StaffId("accounts-session"),
-                worktree=staff.PresentWorktree(machine, self.root)),
+                worktree=staff.PresentWorktree(machine, self.root), unit_type=staff.UnitDetails("direct")),
             staff.StaffRow(staff.StaffId("team-accounts"), "showrunner", "team-accounts", staff.StaffRoot(),
                 current_session=staff.StaffId("team-session"), doc=staff.LiveDoc(machine, self.root / "plan.md")),
             staff.StaffRow(staff.StaffId("account-worker"), "worker", "accounts-worker", staff.StaffRoot(),
                 current_session=staff.StaffId("worker-session"), worktree=staff.PresentWorktree(machine, self.root)),
             staff.StaffRow(staff.StaffId("remote-accounts"), "unit", "accounts-remote", staff.StaffRoot(),
-                current_session=staff.StaffId("remote-session"), worktree=staff.PresentWorktree("other-machine", self.root)),
+                current_session=staff.StaffId("remote-session"), worktree=staff.PresentWorktree("other-machine", self.root), unit_type=staff.UnitDetails("direct")),
             staff.StaffRow(staff.StaffId("unrelated"), "unit", "herdr", staff.StaffRoot(),
-                current_session=staff.StaffId("herdr-session"), worktree=staff.PresentWorktree(machine, self.root)),
+                current_session=staff.StaffId("herdr-session"), worktree=staff.PresentWorktree(machine, self.root), unit_type=staff.UnitDetails("direct")),
         )
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)) as read:
             self.assertEqual(stop_resume.resume("acc"), stop_resume.ResumeFailed(
@@ -1818,7 +1829,7 @@ class StopResumeTests(unittest.TestCase):
     def test_resume_by_name_of_a_running_session_reports_success_without_a_launch(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
-                             current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         self.client.native_ids["w1:p2"] = identity
         self.live.return_value = sessions.LiveSessionProcess(123)
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
@@ -1832,7 +1843,7 @@ class StopResumeTests(unittest.TestCase):
     def test_resume_arguments_use_the_current_row_name_after_a_rename_and_clear(self) -> None:
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
-        owner = staff.StaffRow(fixed, "unit", "row-name", staff.StaffRoot(), current_session=current, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        owner = staff.StaffRow(fixed, "unit", "row-name", staff.StaffRoot(), current_session=current, worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         fixture_launch_transcript(self.root, {**self.entry, "session_id": str(current)}, staff.StaffSnapshot(()))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))):
             arguments = stop_resume.resume_arguments(self.entry)
@@ -3492,7 +3503,7 @@ class StopResumeTests(unittest.TestCase):
                 errors = io.StringIO()
                 identity = staff.StaffId(self.entry["session_id"])
                 row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
-                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
                 with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
                       patch.object(self.client, "native_session", return_value=proof if isinstance(proof, str) else "",
@@ -3509,7 +3520,7 @@ class StopResumeTests(unittest.TestCase):
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
-                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", side_effect=[
@@ -3526,7 +3537,7 @@ class StopResumeTests(unittest.TestCase):
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
-                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", side_effect=[
@@ -3543,7 +3554,7 @@ class StopResumeTests(unittest.TestCase):
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
-                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", side_effect=herdr_types.HerdrFailure(
@@ -3575,7 +3586,7 @@ class StopResumeTests(unittest.TestCase):
 
         self.start.side_effect = start
         identity = staff.StaffId(self.entry["session_id"])
-        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -3590,7 +3601,7 @@ class StopResumeTests(unittest.TestCase):
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
-                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(self.client, "native_session", return_value=proof) as observed,
@@ -3609,7 +3620,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production import worker
 
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
-                                current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                                current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
                              current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         record = staff.StaffSnapshot((parent, row))
@@ -3637,7 +3648,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production import worker
 
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
-                                current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                                current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
                              current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         record = staff.StaffSnapshot((parent, row))
@@ -3657,7 +3668,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.production import worker
 
         row = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
-                             current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                             current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("merge"))
         workers = ResumeWorkers(panes=[PaneWorkerResume(staff.StaffId("idle-worker"), IdleWorker())])
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(worker, "resume_workers", return_value=workers)):
@@ -3668,6 +3679,8 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("You were stopped and resumed because maintenance.", text)
         self.assertIn("for messages kept while you were down", text)
         self.assertIn("Worker idle-worker: idle", text)
+        self.assertIn("/unit:merge", text)
+        self.assertIn("~/.claude/commands/unit/merge.md", text)
 
     def test_empty_resume_message_adds_no_argument_in_the_current_pane(self) -> None:
         tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])
@@ -3741,7 +3754,7 @@ class StopResumeTests(unittest.TestCase):
         from scripts.notify.push_texts import RenderedPush
         from scripts.whoami import quota_alert
         identity = staff.StaffId(self.entry["session_id"])
-        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity)
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
         for probe in (False, True):
             for outcome in ("watchdog: alpha restarted on claude3",
@@ -3867,7 +3880,8 @@ class StopResumeTests(unittest.TestCase):
         original = self.entry.copy()
         identity = original["session_id"]
         owner = staff.StaffRow(staff.StaffId(fixture_runtime_id("fixed-shell-owner")), "unit", "alpha", staff.StaffRoot(),
-                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".claude3"), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+                              current_session=staff.StaffId(identity), home=staff.SessionHome(self.root / ".claude3"),
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         for stale_copy in (False, True):
             for agent in (None, {"kind": "id", "value": "stale-session"}):
                 with self.subTest(agent=agent, stale_copy=stale_copy):
@@ -4346,6 +4360,25 @@ class StopResumeTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["resume", "alpha", "--why", "maintenance"]), 0)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+
+    def test_own_pane_resume_by_old_tab_label_keeps_the_fixed_staff_reference(self) -> None:
+        identity = self.entry["session_id"]
+        row = staff.StaffRow(staff.StaffId("fixed-alpha"), "producer", "renamed-alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(identity))
+        self.tab_titles["w1:t9"] = "alpha"
+        retained = pane_launch.retained_launch(self.entry, staff.StaffSnapshot((row,)))
+        pane_record.save("agents", {"w1:p2": retained}, record=staff.StaffSnapshot((row,)))
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}),
+              patch.object(stop_resume, "_exec_in_own_pane", side_effect=SystemExit) as execute):
+            with self.assertRaises(SystemExit):
+                _ = stop_resume.resume(str(row.id))
+        self.assertEqual(pane_record.read("agents")["w1:p2"].get("staff_id"), row.id)
+        execute.assert_called_once()
+        launched = cast(pane_launch.CurrentLaunch, execute.call_args.args[1])
+        self.assertEqual(launched["session_id"], identity)
+        self.assertEqual(launched["name"], row.name)
 
 
 if __name__ == "__main__":

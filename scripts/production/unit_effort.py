@@ -204,7 +204,7 @@ def registry_line(row: DirectorRow, level: str, check: bool) -> str:
 def run(level: str, check: bool) -> int:
     """Exit 0 when every director that could take it was sent it, 1 when a send or the registry failed."""
     try:
-        base = models_registry.edit_base({})
+        base = models_registry.edit_base({**os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""})
         row = director_row(base)
     except OSError as error:
         print(f"unit_effort: {error}", file=sys.stderr)

@@ -10,8 +10,10 @@ import fcntl
 import io
 import json
 import os
+import select
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -38,7 +40,11 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli
+
+TIMER_DOCS = showrunners.timer_docs
 
 LIST = """# Change review list
 
@@ -141,7 +147,7 @@ class ProducerFixture(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""), unit_type=staff.UnitDetails("direct"))
 
 
     @override
@@ -539,6 +545,13 @@ class ParseTest(unittest.TestCase):
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
         self.assertEqual(change_review.problem("checkpoint(x): y", SEE, ("a.py",)), "")
+        for subject, files in (("Show waiting and starting session states", ("a.py",)),
+                               ("docs: describe session states", ("a.md",)),
+                               ("checkpoint(x): docs", ("a.md",))):
+            with self.subTest(subject=subject, files=files):
+                self.assertIn("needs three parts", change_review.problem(subject, "Change-Review: a worker reads waiting", files))
+                self.assertEqual(change_review.problem(subject, subject, files), "")
+                self.assertEqual(change_review.problem(subject, SEE, files), "")
 
     def test_a_line_without_exactly_three_full_parts_is_refused(self) -> None:
         for value in ("The grid fades | Look across the floor", "A | B | ", " | B | C", "A | B | C | D"):
@@ -887,6 +900,16 @@ def run(*arguments: str) -> tuple[int, str, str]:
     with redirect_stdout(output), redirect_stderr(error):
         code = change_review.main(list(arguments))
     return code, output.getvalue(), error.getvalue()
+
+
+def run_review_child(arguments: list[str], environment: dict[str, str]) -> int:
+    """Run the real command with private output and the fresh CLI's timer reader."""
+    with mock.patch.object(showrunners, "timer_docs", TIMER_DOCS):
+        result = invoke_cli(change_review, lambda: change_review.main(arguments), arguments,
+                            {**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, Path.cwd())
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def origin_commits(root: Path) -> tuple[Path, str, str]:
@@ -1370,18 +1393,53 @@ class ReadyListTests(ProducerFixture):
     def test_two_readiness_calls_share_the_list_lock_without_duplicate_rows(self) -> None:
         _ = self.merge_change("Change-Review: Concurrent | Read | One row")
         self.promote()
-        command = [str(Path(change_review.__file__).parents[1] / "lib/py"), str(Path(change_review.__file__)),
-                   "list-ready", "--repo", str(self.repo), "--production", "top"]
-        descriptor = os.open(self.listing.parent, os.O_RDONLY)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            processes = [subprocess.Popen(command, env=os.environ.copy(), stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE, text=True) for _ in range(2)]
-        finally:
-            os.close(descriptor)
-        for process in processes:
-            output, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(process.returncode, 0, output + error)
+        arguments = ["list-ready", "--repo", str(self.repo), "--production", "top"]
+        environment = os.environ.copy()
+        directory = self.listing.parent.stat()
+        guard = LauncherHangGuard("readiness list contention")
+
+        def ready(announcement: int) -> int:
+            real_flock = fcntl.flock
+
+            def observe_lock(descriptor: int, operation: int) -> None:
+                target = os.fstat(descriptor)
+                if operation == fcntl.LOCK_EX and (target.st_dev, target.st_ino) == (directory.st_dev, directory.st_ino):
+                    try:
+                        real_flock(descriptor, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _ = os.write(announcement, b"blocked")
+                        os.close(announcement)
+                    else:
+                        raise AssertionError("The parent must hold the list lock.")
+                    fcntl.flock = real_flock
+                real_flock(descriptor, operation)
+
+            with mock.patch.object(fcntl, "flock", observe_lock):
+                return run_review_child(arguments, environment)
+
+        with ForkChildren() as children:
+            descriptor = os.open(self.listing.parent, os.O_RDONLY)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                processes: list[ForkChild] = []
+                for _ in range(2):
+                    reader, writer = children.pipe()
+                    processes.append(children.start(lambda writer=writer: ready(writer),
+                                                    close_fds=(descriptor,), pass_fds=(writer,)))
+                    self.assertEqual(select.select([reader], [], [], guard.remaining())[0], [reader],
+                                     "readiness did not reach the list lock")
+                    announcement = os.read(reader, 7)
+                    if not announcement:
+                        result = processes[-1].result(timeout=guard.remaining())
+                        self.fail("readiness ended before the list lock: " + result.stdout + result.stderr)
+                    self.assertEqual(announcement, b"blocked")
+                self.assertTrue(all(process.is_alive() for process in processes))
+            finally:
+                os.close(descriptor)
+            for child in processes:
+                process = child.result(timeout=guard.remaining())
+                output, error = process.stdout, process.stderr
+                self.assertEqual(process.returncode, 0, output + error)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Concurrent"])
 
     def test_foreign_production_and_child_handoff_rows_keep_their_lists(self) -> None:
@@ -1654,16 +1712,26 @@ class ActionTest(unittest.TestCase):
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
         python = str(Path(__file__).resolve().parents[1] / "lib/py")
-        for path, first in ((self.fresh, 1), (self.path, 81)):
-            numbers = [subprocess.run([python, script, "add", "--repo", str(repo), "--production", DOC, "--list", str(path),
-                                       "--change", item.change, "--check", item.check, "--see", item.see,
-                                       "--merged", commits[-1][:8]],
-                                      capture_output=True, text=True, check=True).stdout.strip()
-                       for item in changes]
-            self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
-            rows = [row for row in change_review.pending(path) if row["#"] in numbers]
-            self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
-                             [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
+        environment = os.environ.copy()
+        with ForkChildren() as children:
+            for path, first in ((self.fresh, 1), (self.path, 81)):
+                numbers: list[str] = []
+                for item in changes:
+                    arguments = ["add", "--repo", str(repo), "--production", DOC, "--list", str(path),
+                                 "--change", item.change, "--check", item.check, "--see", item.see,
+                                 "--merged", commits[-1][:8]]
+                    if path == self.fresh and not numbers:
+                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                                                text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                    else:
+                        child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
+                        result = child.result()
+                        result.check_returncode()
+                    numbers.append(result.stdout.strip())
+                self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
+                rows = [row for row in change_review.pending(path) if row["#"] in numbers]
+                self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
+                                 [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
 
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
         for change, check, see in (("", "Look", "It"), ("A", " ", "It"), ("A\nB", "Look", "It"), ("A", "Look", "")):

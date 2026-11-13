@@ -103,8 +103,8 @@ def refuse(message: str) -> NoReturn:
 
 
 def call(command: list[str], env: dict[str, str], *, capture: bool = False,
-         check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, env=env, text=True, capture_output=capture)
+         check: bool = True, input: str | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(command, env=env, text=True, capture_output=capture, input=input)
     if check and result.returncode:
         if capture:
             print(result.stderr or result.stdout, file=sys.stderr, end="")
@@ -119,7 +119,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--operation", type=AssignmentOperation, choices=tuple(AssignmentOperation),
                             default=AssignmentOperation.DISPATCH)
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
-    _ = parser.add_argument("--policy", choices=("friend", "astra-reviewer", "astra-designer"), default="")
+    _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
     _ = parser.add_argument("--parent", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
@@ -144,7 +144,7 @@ def parse_arguments() -> Arguments:
         parser.error("--policy is required for this target")
     if args.target == "consultation-pane" and not args.new_worker:
         parser.error("consultation-pane requires --new-worker")
-    if args.target == "durable-design-role" and (not args.parent or args.policy == "friend"):
+    if args.target == "durable-design-role" and not args.parent:
         parser.error("durable-design-role requires --parent and an Astra policy")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
@@ -417,7 +417,15 @@ def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, show
 
 def resolve_model(args: Arguments, role: str, env: dict[str, str]) -> tuple[str, str, str, str]:
     task = role if "." in role else f"direct.{role}"
-    result = call(["bash", "-c", '''source "$1"; models_launch_configuration || exit 2; agents_resolve "$2" || exit 2
+    registry = models_registry.registry_path(env)
+    try:
+        launch_configuration = models_registry.launch_configuration(env, registry=registry)
+    except (OSError, ValueError) as error:
+        refuse(str(error))
+    result = call(["bash", "-c", '''source "$1" &&
+{ IFS= read -r -d "" table; _models_table_load "$table"; } || exit 2
+export MODELS_LAUNCH_CONFIGURATION MODELS_CONFIG_FILE
+agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_WORD}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
@@ -425,7 +433,8 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}" "$MODELS_LAUNCH_CONFIGURATION"
-''', "assign", str(SCRIPTS / "../agents/models_config.sh"), task, args.model, args.effort], env, capture=True)
+''', "assign", str(SCRIPTS / "../agents/models_config.sh"), task, args.model, args.effort], env,
+        capture=True, input=models_registry.configuration_shell(launch_configuration))
     family, model, effort, tier, configuration = result.stdout.strip().splitlines()[-5:]
     env["MODELS_LAUNCH_CONFIGURATION"] = configuration
     return family, model, effort, tier
@@ -502,7 +511,13 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               "header", slot, role], env, check=False)
     previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(recorded))
     with log.open("a") as output:
+        offset = output.tell()
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
+    with log.open() as output:
+        _ = output.seek(offset)
+        for line in output:
+            if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
+                print(line, end="")
     selected = progress_history.launch_slot(run, slot, launcher)
     passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
     if selected != slot:
@@ -558,14 +573,10 @@ def require_live_director() -> None:
 def pane_policy(name: str, *, model: str = "", effort: str = "") -> worker_panes.LaunchPolicy:
     """Resolve one explicit launch policy and its model overrides."""
     try:
-        if name == "friend":
-            task = "ask_a_friend.consultation"
-            policy = worker_panes.worker_policy(models_registry.launch_settings("ask_a_friend", "consultation"))
-        else:
-            if name not in ("astra-reviewer", "astra-designer"):
-                refuse(f"unknown pane policy: {name}")
-            task = "design_roles." + name.removeprefix("astra-")
-            policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
+        if name not in ("astra-reviewer", "astra-designer"):
+            refuse(f"unknown pane policy: {name}")
+        task = "design_roles." + name.removeprefix("astra-")
+        policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
         if model or effort:
             family, selected_model, selected_effort, tier = resolve_model(
                 Arguments(model=model, effort=effort), task, dict(os.environ))

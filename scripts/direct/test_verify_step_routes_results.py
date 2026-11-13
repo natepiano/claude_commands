@@ -11,6 +11,8 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_declined_lost_and_invalid_mac_results_return_to_waiting_mac(self) -> None:
         for answer in ("mac=declined\nreason=busy\n", "mac=lost\n", "invalid\n"):
             with self.subTest(answer=answer):
+                self.fixture.environment["TEST_STEP_REFUSAL"] = (
+                    "lost" if answer == "mac=lost\n" else "busy" if "busy" in answer else "runner")
                 root = self.fixture.root
                 holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
                 _ = (holders / "other").write_text("hold")

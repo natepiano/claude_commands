@@ -110,21 +110,19 @@ class OffloadCommandTests(SeededCleanupFixture):
                         self.assert_claim_is_kept()
                         self.assert_leftover_diagnostic(result.stderr, outcome)
 
-    def test_lost_run_time_includes_remote_cleanup(self) -> None:
+    def test_run_time_includes_remote_cleanup(self) -> None:
         self.fixture["run_lines"] = [
             {"stream": "stdout", "text": "partial output"}
         ]
-        self.fixture["run_status_reported"] = False
+        self.fixture["run_status_reported"] = True
+        self.fixture["run_cleanup_line"] = ""
         self.sync_fixture()
         result = self.command_with_cleanup_clock()
-        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("partial output\n", result.stdout)
-        self.assertIn(
-            "mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n",
-            result.stdout,
-        )
+        self.assertIn("Mac build output cleanup unconfirmed\n", result.stdout)
         wire = self.wire_result()
-        self.assertEqual(wire["mac"], "lost")
+        self.assertEqual(wire["mac"], "passed")
         self.assertEqual(wire["reason"], "")
         recorded_seconds = float(wire["seconds"])
         self.assertEqual(recorded_seconds, 8.0)
@@ -139,16 +137,17 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertTrue(cleanup["claimed"], cleanup)
         self.assert_leftover_selectors(cleanup["args"][-1])
 
-    def test_lost_run_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
-        self.fixture["run_status_reported"] = False
+    def test_run_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
+        self.fixture["run_status_reported"] = True
+        self.fixture["run_cleanup_line"] = ""
         for outcome in ("remaining", "missing_status", "timeout", "ssh_error"):
             with self.subTest(outcome=outcome):
                 self.reset_leftover_case()
                 self.set_leftover_answer(outcome)
                 result = self.command_with_cleanup_clock(separate_stderr=True)
-                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-                self.assert_wire("lost", "")
-                self.assertIn("mac_test: the Mac runner exited with status 0 without a final status; local fallback requires admission\n", result.stdout)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_wire("passed", "")
+                self.assertIn("Mac build output cleanup unconfirmed\n", result.stdout)
                 self.assert_leftover_diagnostic(result.stderr, outcome)
                 self.assert_claim_is_kept()
                 self.assertEqual(len(self.leftover_events()), 1)
@@ -160,7 +159,8 @@ class OffloadCommandTests(SeededCleanupFixture):
         selectors.mkdir()
         for name in ("pgrep", "lsof", "sleep"):
             write_shell(selectors / name, SELECTOR_STUB)
-        self.fixture["run_status_reported"] = False
+        self.fixture["run_status_reported"] = True
+        self.fixture["run_cleanup_line"] = ""
         self.config["leftover_timeout_s"] = "300"
         self.sync_config()
         for shell in ("sh", "zsh"):
@@ -172,8 +172,8 @@ class OffloadCommandTests(SeededCleanupFixture):
                     self.fixture["selector_lsof_status"] = lsof_status
                     self.sync_fixture()
                     result = self.process_command(separate_stderr=True)
-                    self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-                    self.assert_wire("lost", "")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assert_wire("passed", "")
                     cleanup = self.leftover_events()
                     self.assertEqual(len(cleanup), 1)
                     self.assert_leftover_selectors(cleanup[0]["args"][-1])

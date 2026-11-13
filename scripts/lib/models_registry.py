@@ -74,14 +74,15 @@ def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
         path, text = _decoded(encoded)
     else:
         if synchronize:
-            _sync_catalog(path)
+            _sync_catalog(path, environment)
         text = registry_text(path)
     return path, text, tuple(_records(text))
 
 
-def launch_configuration(environment: Mapping[str, str]) -> LaunchModelConfiguration:
+def launch_configuration(environment: Mapping[str, str], *, registry: Path | None = None) -> LaunchModelConfiguration:
     """Use the parent's operation configuration, or read a new configuration."""
-    return LaunchModelConfiguration(*_snapshot(environment, OPERATION_ENVIRONMENT[0], registry_path(), synchronize=True))
+    return LaunchModelConfiguration(*_snapshot(
+        environment, OPERATION_ENVIRONMENT[0], registry or registry_path(), synchronize=True))
 
 
 def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
@@ -89,20 +90,20 @@ def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
     return RegistryEditBase(*_snapshot(environment, OPERATION_ENVIRONMENT[1], registry_path(), synchronize=True))
 
 
-def _sync_catalog(path: Path) -> None:
-    if os.environ.get("MODELS_CONFIG_TIER_ONLY") == "1":
+def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
+    if environment.get("MODELS_CONFIG_TIER_ONLY") == "1":
         return
-    home = Path.home()
+    home = Path(environment.get("HOME", str(Path.home())))
     script = Path(__file__).resolve().parents[1] / "agents/sync_codex_catalog.sh"
-    state = Path(os.environ.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
-    sources = (Path(os.environ.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
-               Path(os.environ.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
+    state = Path(environment.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
+    sources = (Path(environment.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
+               Path(environment.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
     if not path.is_file() or not os.access(script, os.X_OK):
         return
     if state.is_file() and not any(source.exists() and source.stat().st_mtime > state.stat().st_mtime for source in sources):
         return
     try:
-        result = subprocess.run([str(script)], env={**os.environ, "MODELS_CONFIG_FILE": str(path)},
+        result = subprocess.run([str(script)], env={**environment, "MODELS_CONFIG_FILE": str(path)},
                                 stdout=subprocess.DEVNULL, check=False)
         if result.returncode == 0:
             return
@@ -135,9 +136,8 @@ class LaunchSettings(NamedTuple):
 def claude_model(model: str, environment: Mapping[str, str]) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
-        home = Path(environment.get("HOME", str(Path.home())))
-        path = Path(environment.get("MODELS_CONFIG_FILE") or home / ".claude/config/models.conf")
-        configuration = LaunchModelConfiguration(*_snapshot(environment, OPERATION_ENVIRONMENT[0], path))
+        configuration = LaunchModelConfiguration(*_snapshot(
+            environment, OPERATION_ENVIRONMENT[0], registry_path(environment)))
         result = subprocess.run(
             ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
              + '_agents_model_slug claude "$2"', "claude-model",
@@ -217,9 +217,14 @@ class FastForward(NamedTuple):
     registry_entry: str
 
 
-def registry_path() -> Path:
-    configured = os.environ.get("MODELS_CONFIG_FILE")
-    return Path(configured) if configured else DEFAULT_PATH
+def registry_path(environment: Mapping[str, str] | None = None) -> Path:
+    configured = (os.environ if environment is None else environment).get("MODELS_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    if environment is None:
+        return DEFAULT_PATH
+    home = Path(environment.get("HOME", str(Path.home())))
+    return home / ".claude/config/models.conf"
 
 
 def registry_text(registry: Path | None = None) -> str:

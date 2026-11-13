@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
@@ -28,7 +29,6 @@ import threading
 import time
 import subprocess
 import unittest
-from types import ModuleType
 from typing import cast, override
 from unittest import mock
 
@@ -72,6 +72,106 @@ class ImportTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class LocalHoldPlacementTests(unittest.TestCase):
+    def test_local_hold_evidence_uses_each_requesters_checked_lineage(self) -> None:
+        from scripts.build_hold import build_hold
+        from scripts.build_hold.owning_session import OwningSession
+        from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import WholeMacScope
+
+        for case, callers, holds in (
+            ("kept", ((110, "1100", True),), "single"),
+            ("descendant", ((111, "1110", True),), "single"),
+            ("unrelated", ((112, "1120", False),), "single"),
+            ("service-kept", ((112, "1120", False),), "service-kept"),
+            ("reused", ((114, "1140", False),), "single"),
+            ("unavailable", ((115, "1150", False),), "single"),
+            ("ended-hold-invalid-config", ((112, "1120", False),), "single"),
+            ("one-hold", ((111, "1110", False),), "blocking-second"),
+            ("both-holds", ((111, "1110", True),), "kept-second"),
+            ("cache-kept-first", ((111, "1110", True), (112, "1120", False)), "single"),
+            ("cache-unrelated-first", ((112, "1120", False), (111, "1110", True)), "single"),
+            ("cache-reused", ((111, "1110", True), (111, "1111", False)), "single"),
+            ("completed", ((111, "1110", True),), "single"),
+            ("cancelled", ((111, "1110", True),), "single"),
+        ):
+            with self.subTest(case=case), AdmissionFixture() as fixture:
+                directory = fixture.root / "holders"
+                directory.mkdir()
+                keep = [{"pid": 110, "start_time": "1100"}]
+                if holds == "service-kept":
+                    keep.append({"pid": os.getpid(), "start_time": "1"})
+                for key in ("holder", "second") if holds.endswith("second") else ("holder",):
+                    _ = (directory / key).write_text(json.dumps({
+                        "holder": key, "since": "2026-11-12T12:00:00+00:00",
+                        "for": "private test", "release_eta": "unknown",
+                        "keep": [] if key == "second" and holds == "blocking-second" else keep,
+                    }))
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+                write_process(fixture.proc.path, os.getpid(), start="1")
+                write_process(fixture.proc.path, 110, start="1100")
+                destination = placement.PlacementDestination("local", "natedev", fixture.server.host, WholeMacScope())
+                fixture.server.host_probe = fixture.server.read_provider_evidence
+                with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(directory)}), \
+                     mock.patch.object(build_hold, "PROC_ROOT", fixture.proc.path):
+                    for index, (pid, start, admitted) in enumerate(callers):
+                        with self.subTest(pid=pid, start=start):
+                            owner = fixture.fixture_owner(pid, start)
+                            write_process(fixture.proc.path, pid,
+                                parent=110 if pid in (111, 114) and start != "1111" else 1,
+                                start="1141" if case == "reused" else start)
+                            if case == "unavailable":
+                                (fixture.proc.path / str(pid) / "stat").unlink()
+                            local = fixture.request(owner=owner, episode=f"{case}-{index}")
+                            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("private-source"),
+                                local.argv, "fixture", "fixture", OwningSession("caller"),
+                                (placement.PlacementCandidate(destination),))
+                            request = wire.PlacementRequest(local.episode,
+                                placement.SubmittingOwner(fixture.server.host, pid, start), local.since,
+                                local.profile, constraints, identity=local.identity,
+                                local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar,
+                                    local.call, local.test_width, local.fresh_test), code_version=local.code_version)
+                            key = fixture.server.host_evidence_key(request, destination)
+                            self.assertIsInstance(fixture.server.host_evidence(key), placement.HostEvidenceUnavailable)
+                            evidence = fixture.server.read_provider_evidence(key)
+                            self.assertIsInstance(evidence, placement.FreshHostEvidence)
+                            assert isinstance(evidence, placement.FreshHostEvidence)
+                            self.assertEqual(evidence.eligibility,
+                                placement.AllowedHost() if admitted else placement.TemporaryExclusion("blocked"))
+                            fixture.allow_next_start()
+                            reply, = fixture.server.handle_request(request)
+                            if admitted:
+                                self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                                assert isinstance(reply, wire.LocalPlacementGranted)
+                                if case == "completed":
+                                    fixture.release(reply.grant)
+                                elif case == "cancelled":
+                                    self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                                        "cancel-local", request.episode, request.owner, "the caller cancelled")), [wire.Ok()])
+                                if case in ("completed", "cancelled"):
+                                    for retained in (fixture.server.host_readers, fixture.server.host_requests,
+                                                     fixture.server.host_observations):
+                                        self.assertNotIn(request.owner, [item.local_hold_owner for item in retained])
+                            else:
+                                self.assertIsInstance(reply, wire.PlacementWait)
+                                assert isinstance(reply, wire.PlacementWait)
+                                self.assertIsInstance(reply.wait, wire.PlacementResourceWait)
+                                assert isinstance(reply.wait, wire.PlacementResourceWait)
+                                self.assertEqual(reply.wait.holder,
+                                    placement.ResourceHolderUnit("second" if holds == "blocking-second" else "holder"))
+                                if case == "ended-hold-invalid-config":
+                                    (directory / "holder").unlink()
+                                    fixture.server.pending_configuration = gate.UnusableAdmissionConfiguration(
+                                        "private invalid configuration")
+                                    repeated, = fixture.server.handle_request(request)
+                                    self.assertIsInstance(repeated, wire.PlacementWait)
+                                    assert isinstance(repeated, wire.PlacementWait)
+                                    self.assertIsInstance(repeated.wait, wire.PlacementResourceWait)
+                                    assert isinstance(repeated.wait, wire.PlacementResourceWait)
+                                    self.assertEqual(repeated.wait.holder, placement.ResourceHolderUnknown())
 
 
 class FixedSystemReader:
@@ -339,6 +439,32 @@ class ReplyPublicationTests(unittest.TestCase):
                 self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies))
                 self.assertFalse(server.deferred_requests)
                 self.assertEqual(reader.requests, 1)
+
+    def test_new_placement_coordinator_waits_for_fresh_process_evidence(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, records.MemoryConfig)
+            reader = FixedSystemReader(initial)
+            server.system_reader = reader
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            self.assertNotIn(request.owner.pid, initial.processes)
+            replies = fixture.connect(request).replies()
+            self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies), replies)
+            self.assertEqual(len(replies), 1)
+            self.assertIsInstance(replies[0], wire.PlacementWait)
+            self.assertNotIn(request.episode, server.current_assignments)
+            reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            os.eventfd_write(server.reading_events, 1)
+            server.run_once(0)
+            reply, = fixture.connect(request).replies()
+            self.assertIsInstance(reply, wire.Assignment)
 
     def test_refused_deferred_connection_cannot_admit_on_a_later_read(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1516,7 +1642,9 @@ class ReadingAlertTests(unittest.TestCase):
 class PlacementRestartTests(unittest.TestCase):
     def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
 
         for version in (1, 2):
             with self.subTest(version=version), PlacementFixture() as fixture:
@@ -1541,7 +1669,7 @@ class PlacementRestartTests(unittest.TestCase):
                 pending_assignment = assignment_for(fixture, pending)
                 consumed_assignment = assignment_for(fixture, consumed)
                 claim = adopt_assignment(fixture, consumed, consumed_assignment)
-                consume = wire.ConsumePermission("first-consumption", consumed_assignment, claim)
+                consume = consume_permission("first-consumption", consumed_assignment, claim)
                 self.assertEqual(fixture.server.handle_request(consume),
                                  [wire.FirstAuthorization(consumed_assignment, claim)])
                 positions = fixture.server.places.copy()
@@ -1553,13 +1681,19 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 self.assertEqual({episode: fixture.server.waiters[episode].request for episode in waiters}, waiters)
                 self.assertEqual(assignment_for(fixture, pending), pending_assignment)
-                self.assertEqual(assignment_for(fixture, consumed), consumed_assignment)
+                consumed_reply, = fixture.connect(consumed).replies()
+                self.assertIsInstance(consumed_reply, wire.PlacementWait)
+                saved = fixture.server.assignments[placement.attempt_key(
+                    consumed_assignment.episode, consumed_assignment.attempt)]
+                self.assertEqual(saved.assignment, consumed_assignment)
+                self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                self.assertIsInstance(saved.permission, placement.PermissionConsumed)
                 status, = fixture.server.handle_request(consume)
                 self.assertIsInstance(status, wire.DispatchStatus)
                 assert isinstance(status, wire.DispatchStatus)
                 self.assertIsInstance(status.permission, placement.PermissionConsumed)
                 pending_claim = adopt_assignment(fixture, pending, pending_assignment)
-                self.assertEqual(fixture.server.handle_request(wire.ConsumePermission(
+                self.assertEqual(fixture.server.handle_request(consume_permission(
                     "pending-consumption", pending_assignment, pending_claim)),
                     [wire.FirstAuthorization(pending_assignment, pending_claim)])
 
@@ -2489,6 +2623,45 @@ class QueueLifecycleTests(unittest.TestCase):
 
 
 class CiSliceAdmissionTests(unittest.TestCase):
+
+    def test_ci_worker_uses_the_current_reservation_and_waiter_identity(self) -> None:
+        from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+
+        for admitted, expected in ((True, RunningServiceJob), (False, WaitingServiceJob)):
+            with self.subTest(admitted=admitted), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(700001, "100")
+                write_process(fixture.proc.path, 700010)
+                _ = (fixture.proc.path / "700010/comm").write_text("Runner.Worker\n")
+                write_process(fixture.proc.path, owner.pid, parent=700010, start=owner.start_time)
+                _ = (fixture.root / "ci.slice/cgroup.procs").write_text(f"700010\n{owner.pid}\n")
+                if not admitted:
+                    _ = only_admitted(fixture.server.handle_request(
+                        fixture.request(owner=fixture.fixture_owner(700020, "200"), need=GIB)))
+                request = fixture.request(owner=owner, need=GIB if admitted else 100 * GIB)
+                reply = fixture.server.handle_request(request)
+                self.assertEqual(any(isinstance(item, wire.Admitted) for item in reply), admitted)
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, expected)
+                self.assertIsInstance(ci.job_state, IdleService if admitted else RunningServiceJob)
+                self.assertEqual(len(view.reading.view.waiting), int(not admitted))
+                if admitted:
+                    grant = only_admitted(reply)
+                    fixture.release(grant)
+                else:
+                    fixture.server.waiters.clear()
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, UnmatchedServiceJob)
+                self.assertIsInstance(ci.job_state, RunningServiceJob)
 
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
         for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):
@@ -3689,40 +3862,34 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(len(fixture.server.reservations), 1)
 
     def test_unparsed_request_refusals_decode_with_both_protocol_versions(self) -> None:
-        source = subprocess.run(["git", "show", "7ab78b74e:scripts/build_queue/admission_protocol.py"],
-            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
-        legacy = ModuleType("admission_protocol_version_one")
-        with mock.patch.dict(sys.modules, {legacy.__name__: legacy}):
-            exec(compile(source, "admission_protocol_version_one.py", "exec"), legacy.__dict__)
-            decode_legacy = cast(Callable[[str], object], getattr(legacy, "parse_reply"))
-            for version in (1, 2):
-                for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
-                    with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
-                        fixture.configure(request_max_bytes=512)
-                        _ = fixture.run_pass()
-                        prefix = f'{{"v":{version},'
-                        if kind.startswith("oversize"):
-                            line = prefix + '"data":"'
-                            tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
-                            limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
-                            line += "x" * (limit + 1 - len(line) - len(tail)) + tail
-                        else:
-                            line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
-                        sent: list[str] = []
+        for version in (1, 2):
+            for kind in ("malformed", "fragmented", "oversize-newline", "oversize-incomplete"):
+                with self.subTest(version=version, kind=kind), AdmissionFixture() as fixture:
+                    fixture.configure(request_max_bytes=512)
+                    _ = fixture.run_pass()
+                    prefix = f'{{"v":{version},'
+                    if kind.startswith("oversize"):
+                        line = prefix + '"data":"'
+                        tail = '","type":"view"}\n' if kind == "oversize-newline" else ""
+                        limit = max(512, wire.CLEANUP_REQUEST_MAX_BYTES)
+                        line += "x" * (limit + 1 - len(line) - len(tail)) + tail
+                    else:
+                        line = prefix if kind == "fragmented" else prefix + '"type":"view","data": }\n'
+                    sent: list[str] = []
 
-                        def capture(line: str) -> str:
-                            sent.append(line)
-                            return line
+                    def capture(line: str) -> str:
+                        sent.append(line)
+                        return line
 
-                        with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
-                            peer = fixture.connect(line)
-                            if kind == "fragmented":
-                                self.assertEqual(peer.replies(), [])
-                                peer.socket.sendall(b'"type":"view","data": }\n')
-                            reply, = peer.replies()
-                        self.assertIsInstance(reply, wire.Refused)
-                        self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
-                        self.assertEqual(wire.parse_reply(sent[-1]), reply)
+                    with mock.patch.object(fixture.server, "line_filter", side_effect=capture):
+                        peer = fixture.connect(line)
+                        if kind == "fragmented":
+                            self.assertEqual(peer.replies(), [])
+                            peer.socket.sendall(b'"type":"view","data": }\n')
+                        reply, = peer.replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    self.assertEqual(codec.snapshot_value(decode_legacy(sent[-1])), codec.snapshot_value(reply))
+                    self.assertEqual(wire.parse_reply(sent[-1]), reply)
 
     def test_unknown_version_gets_explicit_refusal_and_socket_is_private(self) -> None:
         with AdmissionFixture() as fixture:
@@ -5484,8 +5651,6 @@ class RunPlaceTests(unittest.TestCase):
 
     def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
         from zoneinfo import ZoneInfo
-        from scripts.aws_target import aws_target
-        from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
 
@@ -5510,18 +5675,6 @@ class RunPlaceTests(unittest.TestCase):
                     if line.lstrip().startswith("1 ") and "project check" in line]
             minute_column = heading.index("min")
             self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
-            settings_path = fixture.root / "aws_target.conf"
-            _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
-                                     + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
-            configuration = conf.read(settings_path)
-            settings = read_control_settings(configuration)
-            controller = aws_target.Controller(settings_path, fixture.root / "aws", fixture.state_dir)
-            eligible_steps = cast(Callable[[ControlSettings, int, conf.ConfigRead], int],
-                                  getattr(controller, "_queued"))
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 0)
-            fixture.clock.advance(300)
-            _ = fixture.server.run_pass()
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
@@ -5689,7 +5842,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py"):
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+                         "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
                 script = fixture.root / Path(relative).name

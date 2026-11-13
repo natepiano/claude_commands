@@ -19,7 +19,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import change_review as change_review
@@ -82,12 +82,37 @@ class StoredOpenQuestion(TypedDict):
     question_id: str
     text: str
     delivery: StoredDeliveryIntent | None
+    kind: NotRequired[Literal["feedback"]]
 
 
 class StoredAnsweredQuestion(TypedDict):
     question_id: str
     text: str
     answer: str
+    kind: NotRequired[Literal["feedback"]]
+
+
+@dataclass(frozen=True)
+class OpenFeedback(OpenQuestion):
+    """The showrunner must act before this change returns to the user."""
+
+
+@dataclass(frozen=True)
+class CompletedFeedback(AnsweredQuestion):
+    """The showrunner's note returns this change to the user."""
+
+
+def _decode_slots(value: object) -> DeliverySlots:
+    slots = delivery_state.decode_value(value)
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    saved = fields.get("question")
+    question = slots.question
+    if isinstance(saved, dict) and cast(dict[str, object], saved).get("kind") == "feedback":
+        if isinstance(question, OpenQuestion):
+            return replace(slots, question=OpenFeedback(question.question_id, question.text, question.delivery))
+        if isinstance(question, AnsweredQuestion):
+            return replace(slots, question=CompletedFeedback(question.question_id, question.text, question.answer))
+    return slots
 
 
 class StoredDeliverySlots(TypedDict, total=False):
@@ -95,6 +120,12 @@ class StoredDeliverySlots(TypedDict, total=False):
     verdict: StoredDeliveryIntent
     question: StoredOpenQuestion | StoredAnsweredQuestion
     user_answer: StoredUserAnswer
+
+
+class SentCloseoutAlerts(TypedDict):
+    review_list: str
+    row: str
+    messages: list[str]
 
 
 class StoredUserAnswer(TypedDict):
@@ -207,12 +238,35 @@ class DeliveryStatus:
     def path(self, page: ReviewPage, row: str) -> Path:
         return change_routing.delivery_path(self.root, page.review_list, row)
 
+    def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
+                                recipients: tuple[staff.StaffId, ...]) -> None:
+        """Send each row's failure once, including across server restarts."""
+        if not recipients:
+            return
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        path = self.root / (".review-link-closeout-alert-" + name + ".json")
+        with self.locked():
+            try:
+                sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                sent = {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+            if message in sent["messages"]:
+                return
+            for identity in recipients:
+                send_to_staff(identity, SENDER, message)
+            sent["messages"].append(message)
+            atomic_file.write_bytes_atomic(path, (json.dumps(sent) + "\n").encode("utf-8"), mode=0o600)
+
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
         try:
             content = self.path(page, row).read_text(encoding="utf-8")
         except FileNotFoundError:
             return DeliverySlots(NoDelivery(), NoDelivery())
-        return delivery_state.decode(content)
+        try:
+            value = cast(object, json.loads(content))
+        except ValueError:
+            return DeliverySlots(NoDelivery(), NoDelivery())
+        return _decode_slots(value)
 
     def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots) -> None:
         """Write both slots while the caller holds the delivery lock."""
@@ -233,6 +287,9 @@ class DeliveryStatus:
                 if isinstance(question.delivery, DeliveryIntent) else None)}
         elif isinstance(question, AnsweredQuestion):
             fields["question"] = {"question_id": question.question_id, "text": question.text, "answer": question.answer}
+        saved_question = fields.get("question")
+        if saved_question is not None and isinstance(question, (OpenFeedback, CompletedFeedback)):
+            saved_question["kind"] = "feedback"
         path = self.path(page, row)
         published = False
         try:
@@ -282,18 +339,20 @@ class DeliveryStatus:
         updated = slots.updated(kind, NoDelivery())
         self.write_slots(page, row, updated)
 
-    def ask(self, page: ReviewPage, row: str, text: str, *, recipients: tuple[staff.StaffId, ...] = ()) -> QuestionDelivery | NoDelivery:
+    def ask(self, page: ReviewPage, row: str, text: str, *, recipients: tuple[staff.StaffId, ...] = (),
+            kind: Literal["question", "feedback"] = "question") -> QuestionDelivery | NoDelivery:
         """Save a new question without changing an existing open question."""
         with self.locked():
             slots = self.slots(page, row)
             question = slots.question
             if isinstance(question, OpenQuestion):
-                if question.text != text:
+                if question.text != text or isinstance(question, OpenFeedback) != (kind == "feedback"):
                     raise AnswerRefused("this row already has an open question")
                 return NoDelivery()
             intent = DeliveryIntent(secrets.token_hex(), "question", recipients=recipients)
             question_id = secrets.token_hex(4)
-            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=OpenQuestion(question_id, text, intent)))
+            request = OpenFeedback if kind == "feedback" else OpenQuestion
+            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=request(question_id, text, intent)))
             self.request_attempts[intent.attempt] = AttemptOwnership(self.path(page, row), "claimed")
             return QuestionDelivery(question_id, text, intent.attempt)
 
@@ -317,7 +376,8 @@ class DeliveryStatus:
             if record.get("Verdict"):
                 raise AnswerRefused("this row already has a saved answer")
             _ = row_production(page, record)
-            self.write_slots(page, row, replace(slots, question=AnsweredQuestion(question_id, question.text, text)))
+            completed = CompletedFeedback if isinstance(question, OpenFeedback) else AnsweredQuestion
+            self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)))
             return True
 
 
@@ -340,13 +400,16 @@ def document(content: str) -> bytes:
 <title>Changes to review</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
-h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
-ul,ol{margin:8px 0;padding-left:28px;overflow-wrap:anywhere}
+.id{opacity:.7;font-size:14px}.kind{font-weight:600}
+h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
+h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
+section h2{font-size:17px}section details{margin:16px 0}.secondary-actions{margin-top:8px}
+ul,ol{margin:16px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
-form{margin-top:28px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px;resize:vertical}
-button{font:inherit;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
+form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
+button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
+summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 </style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
 
 
@@ -367,18 +430,25 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row_id = html.escape(row)
     buttons: list[str] = []
     for value, label in (("works", "Works"), ("not works", "Does not work"),
-                         ("validate", "Validate yourself"), ("feedback", "Send feedback"), ("question", "Ask a question")):
-        if value == "question" and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
+                         ("validate", "Ask showrunner to check"), ("question", "Ask a question"), ("feedback", "Send feedback")):
+        if value in ("validate", "question", "feedback") and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
         selected = 'aria-pressed="true" ' if notice.outcome == value else ""
         buttons.append(f'<button {selected}name="outcome" value="{value}">{label}</button>')
     return f'''<form method="post">
 <input type="hidden" name="row" value="{row_id}">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
-<label for="feedback-{row_id}">Feedback or question</label>
+<label for="feedback-{row_id}">Comment, question or feedback</label>
 <textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
 {html.escape(notice.feedback)}</textarea>
-<div>{"".join(buttons)}</div></form>'''
+<div>{"".join(buttons[:2])}</div><div class="secondary-actions"><div>{"".join(buttons[2:3])}</div><div class="feedback-actions">{"".join(buttons[3:])}</div></div></form>'''
+
+
+def change_details(row: dict[str, str], key: str) -> str:
+    """Keep change metadata inside one closed disclosure."""
+    return ('<details><summary>Details</summary>'
+            + f'<div class="id">{html.escape(key)} · {html.escape(row.get("Merged", ""))}</div>'
+            + f'<p class="kind">{html.escape(row.get(change_review.KIND) or "Kind not recorded")}</p></details>')
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -420,11 +490,12 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
     if isinstance(question, NoQuestion):
         return ""
-    content = '<h2>Question</h2>' + review_text_html(question.text)
+    feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
+    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_text_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += '<h2>Answer</h2>' + review_text_html(question.answer)
+        content += review_text_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_text_html(question.answer)
     else:
-        content += '<p>The showrunner will answer this</p>'
+        content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content
 
 
@@ -508,9 +579,8 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         sections.append(f'''<section id="{row_id}">
 {alert}
-<p class="kind">{html.escape(row[change_review.KIND])}</p>
-<div class="id">{row_id} · {html.escape(row.get("Merged", ""))}</div>
 <h1>{html.escape(row["Change"])}</h1>
+{change_details(row, row["#"])}
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}</section>''')
     if notice.reason and not notice.row:
@@ -521,9 +591,9 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         if queue.entries:
             sections.append(f'''<form method="post">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
-<button name="outcome" value="next">Next</button></form>''')
+<button name="outcome" value="next">Skip for now</button></form>''')
         else:
-            sections.append('<p>No changes are waiting.</p>')
+            sections.append('<p>No changes to review.</p>')
     return document("".join(sections))
 
 
@@ -641,7 +711,7 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
         raise RuntimeError(error.diagnostic) from error
 
 
-def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str) -> None:
+def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str, status: DeliveryStatus) -> None:
     """Keep the row open and notify its showrunner when feature-log closeout fails."""
     try:
         close_feature_log(page, doc, row_id, verdict)
@@ -650,8 +720,7 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str)
         try:
             row = answer_row(page, row_id)
             owner = route_owner(page, row)
-            for identity in owner.showrunner_recipients:
-                send_to_staff(identity, SENDER, message)
+            status.notify_closeout_failure(page, row_id, message, owner.showrunner_recipients)
         except SEND_ERRORS as delivery_error:
             raise FeatureLogFailed(f"{message}\nNotification failed: {delivery_error}") from delivery_error
         raise FeatureLogFailed(message) from error
@@ -686,17 +755,17 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise AnswerRefused("the production document is not available")
     message_page = replace(page, production=assignment.production)
     recipients = owner.showrunner_recipients
-    if outcome == "question" and isinstance(owner, change_routing.UnroutedChange):
+    request_feedback = outcome == "feedback" and not change_review.lands(one_line)
+    if (outcome == "question" or request_feedback) and isinstance(owner, change_routing.UnroutedChange):
         raise AnswerRefused("this row has no showrunner to answer a question")
-    if outcome == "question":
+    if outcome == "question" or request_feedback:
         if row.get("Verdict"):
             raise AnswerRefused("this row already has a saved answer")
         _ = row_production(page, row)
-        intent = status.ask(page, row_id, feedback, recipients=recipients)
+        intent = status.ask(page, row_id, feedback, recipients=recipients, kind="feedback" if request_feedback else "question")
         if isinstance(intent, NoDelivery):
             return NoMessageDelivery()
-        message = review_message(message_page, row, "the user asks a question",
-                                 f"Question id: {intent.question_id}", f"Question: {intent.text}")
+        message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback)
         return MessageDelivery(message_page, row_id, recipients, message, intent.attempt, owner.showrunner_recipients)
     if isinstance(status.slots(page, row_id).question, OpenQuestion):
         raise AnswerRefused("this row has an open question")
@@ -716,7 +785,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         return NoMessageDelivery()
     doc = row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    closeout_before_save(page, doc, row_id, verdict)
+    closeout_before_save(page, doc, row_id, verdict, status)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
     try:
         production = change_review.production_doc(unit_lookup.doc_owner(page.production, staff.snapshot()).name)
@@ -735,6 +804,12 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
 def review_message(page: ReviewPage, row: dict[str, str], headline: str, *details: str) -> str:
     return "\n".join((f"Change review {row['#']}: {headline}", f"List: {page.review_list}",
                       f"Production: {unit_lookup.doc_owner(page.production, staff.snapshot()).name}", f"Change: {row['Change']}", *details))
+
+
+def _request_message(page: ReviewPage, row: dict[str, str], identity: str, text: str, feedback: bool) -> str:
+    label = "Feedback" if feedback else "Question"
+    return review_message(page, row, "the user sends feedback to act on" if feedback else "the user asks a question",
+                          f"{label} id: {identity}", f"{label}: {text}")
 
 
 def verdict_recipients(owner: change_routing.ChangeOwner, verdict: str) -> tuple[staff.StaffId, ...]:
@@ -831,7 +906,7 @@ def recover_pending(status: DeliveryStatus) -> None:
                     if any(ownership.row_file == path for ownership in status.request_attempts.values()):
                         continue
                     fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
-                    decoded = delivery_state.decode_value(fields)
+                    decoded = _decode_slots(fields)
                     intents = decoded.intents()
                     if not intents or any(intent.attempt in status.request_attempts for intent in intents):
                         continue
@@ -856,8 +931,7 @@ def recover_pending(status: DeliveryStatus) -> None:
                                   if intent.kind == "verdict" else owner.showrunner_recipients)
                     question = decoded.question
                     if intent.kind == "question" and isinstance(question, OpenQuestion):
-                        message = review_message(page, row, "the user asks a question",
-                            f"Question id: {question.question_id}", f"Question: {question.text}")
+                        message = _request_message(page, row, question.question_id, question.text, isinstance(question, OpenFeedback))
                     elif intent.kind == "validation":
                         message = review_message(page, row, "the user asks you to validate this", f"User feedback: {intent.feedback}")
                     else:

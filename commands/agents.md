@@ -12,7 +12,7 @@ Use the `agents` program.
 - Add `--finish-step` to pause or exit after the workers finish their current tasks.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
-- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a name, staff id, session id, or exact Codex thread name.
+- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
