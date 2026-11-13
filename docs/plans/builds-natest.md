@@ -3834,9 +3834,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Each run starts about 16 Python helpers: `build_targets.py` 30 starts 5.2 s, `verify_helper.py` 16 starts 2.5 s, `admission_client.py` 18 starts 2.4 s, `build_folders.py` 39 starts 2.1 s, `tree_watch.py` 49 starts 2.1 s. Imports are 15-20 ms of each start.
 - Every run is read by an assertion, so the test-only floor is the current cost. Architecture proposal to sdlc: one helper process per `verify.sh` run; the 69 verify fixture modules are 868 of 4,763 CPU s in a full gate (18%).
 
-### Phase 258 — The lint sweep tests use less CPU through fewer tests  · status: todo
+### Phase 258 — The lint sweep tests use less CPU  · status: done
 **Depends on:** Phase 257
-**Blocked by:** builds names the owner of `lint/test_sweep.py` and gives the go.
+**Owner:** report unit; builds gave the go 2026-11-13 (no open change to the file).
 
 #### Work Order
 
