@@ -3953,3 +3953,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The same test count and assertions; the module passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 257 — The verify result environment tests do less repeated work  · status: todo
+**Depends on:** Phase 250
+
+#### Work Order
+
+**Goal:** `direct/test_verify_result_environment.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** next untouched module in the descending CPU list (show.py top 15:51: rank 16, 35.9 median CPU s, 7 tests; ranks 1-15 and 17 are done, planned or running). Slowest kept test `VerifyResultEnvironmentTests.test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` 26.6 s.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_result_environment.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Remove repeated work a test does not check: repeated real `verify.sh` runs whose results no assertion reads, per-test setup that can be built once per class and copied, and repeated parsing. Keep the real `verify.sh` runs that the assertions read. Do not edit `scripts/direct/verify_mac_offload_test_support.py`: Phase 250 changes it and is in review. Report any cost in that shared fixture to the director.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/direct/test_verify_result_environment.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 250: the shared verify fixture removes inherited `UNIT_*` values before it sets private values. Phase 248: a verify routing refusal costs about 2.5 CPU s of helper starts; that is a production cost with an architecture proposal, not test work. Phases 240-247: natedev gains can come from host state; only aws pairs decide a land.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
