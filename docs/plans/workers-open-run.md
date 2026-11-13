@@ -37,32 +37,19 @@ The director's run scan at 11:35 EST: 9 units have open runs that are not the st
 
 ### Phase 1 — Workers reads the same run as Notes  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** In `/showrunner:units`, Notes and Workers of each unit row read one run: the staff row's current run when it has one, otherwise the newest run. A newer finished side run or another open run of the same unit never changes the Workers cell.
-
-**Spec:**
-
-1. **One run value.** In `table()`, select the unit's run once. Notes, the open phase rows, ETA cells and Workers all read that value. Remove any second lookup that can select a different run. Keep `newest_unit_runs` as the one selection rule.
-2. **Other open runs.** An open run that is not the selected run supplies no rows, no Notes and no workers.
-3. **Tests.** Add rows to the existing table tests in `scripts/production/test_unit_phases.py`. Build each fixture in a temporary folder from the shape of the evidence. Use no live unit.
-   - A staff current run with an open phase and two open worker passes, and a newer finished astra-review run of the same owner. Workers shows the two workers of the current run on the open phase row.
-   - The same newer finished run, and a current run between phases with a working pane worker. Workers shows that worker.
-   - The same current run and a newer open run of the same owner that is not the staff current run, with its own open phase and worker pass. Only the current run's phase rows and workers show.
-4. **Docs.** Update `commands/showrunner/units.md` and the "Unit phases" entry in `docs/as-built/showrunner-automation.md` in the same commit when their words change. State that other open runs of the unit do not show.
-5. **No repeated phase label.** When a phase title already starts with `Phase <id> —` (any case, any dash), Notes shows `phase <id> — <rest of the title>` once. Live example: port reads `phase 9 — Phase 9 — cargo-mend CLI-boundary tests run under 1 s`; it must read `phase 9 — cargo-mend CLI-boundary tests run under 1 s`. Add a row to the existing Notes test. The sdlc showrunner made this part of this phase.
+- `table()` in `unit_phases.py` selects one run per unit with `newest_unit_runs`: the staff current run, otherwise the newest run. Notes, open phase rows, ETA Next, ETA Plan and Workers read that run.
+- Other open runs of the unit supply no rows, Notes, workers or promises. A newer finished side run does not change the Workers cell.
+- `phase_table.with_run_promises(record, events)` rebuilds each row's `eta_trail` and the `plan_finish` from one run's events. Progress, Phase and duration predictions keep the plan record across all runs.
+- `phase_note_label()` shows `phase <id> — <title>` once when the title already starts with `Phase <id>` and a dash, in any case.
 
 **Files:**
-- `scripts/production/unit_phases.py` — the one run value in `table()` and the phase label in Notes.
-- `scripts/production/test_unit_phases.py` — the test rows.
-- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — docs.
+- `scripts/production/unit_phases.py` — Units table rows and cells.
+- `scripts/direct/phase_table.py` — phase records; `with_run_promises`.
+- `scripts/production/test_unit_phases.py` — table rows for side runs, other open runs, the label rule and run-scoped promises.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the selected-run rule and the label rule.
 
-**Workers:** `1 writer`
-- `impl` — writes steps 1–5 and keeps the test lane green.
+**Gotchas:** a hand-built `PhaseRecord` fixture needs a matching `eta_stated` event in its run, and a `PredictedPhaseTiming` for a predicted plan finish; `with_run_promises` recomputes both cells from events.
 
-**State:** none.
-
-**Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
-2. The Test command passes for the test lane.
-3. Live: `env PYTHONPATH="$PWD" scripts/lib/py -m scripts.production.unit_phases --production cargo-liner` shows the port and tile workers on their open phase rows. Port phase 9 Notes reads `phase 9 — cargo-mend CLI-boundary tests run under 1 s`.
+**Ruled out:** combining the workers of several open runs; only the staff current run counts.
