@@ -194,7 +194,7 @@ CODEX_ROLE = "workers"
 NO_VALUE = "—"
 TABLE_HEADINGS = (
     "Folder", "Label", "Role", "Weekly left", "Weekly resets",
-    "On credits", "Credits left", "Read",
+    "On credits", "Credits left", "Read", "Login ends",
 )
 
 
@@ -4261,6 +4261,7 @@ class StatusRow:
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
     sessions: tuple[AccountSessionDocument, ...] = ()
+    login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
 
 
 @dataclass(frozen=True)
@@ -4301,6 +4302,7 @@ class StatusAccountDocument(TypedDict):
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
+    login_ends_at: str | None
     credits: float | Literal["unlimited"] | None
     use_credits: bool
     read_at: str | None
@@ -4383,7 +4385,9 @@ def _status_row(
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
         else agent_accounts.UsageReadOutcome.OK,
-        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
+        login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
+        if login and tool == "claude" else agent_accounts.LoginEndUnknown())
 
 
 def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[str, ...]:
@@ -4413,7 +4417,9 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read_cell)
+        read_cell,
+        row.login_ends_at.at.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
+        if row.tool == "claude" and isinstance(row.login_ends_at, agent_accounts.LoginEndKnown) else NO_VALUE)
 
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -4429,6 +4435,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            login_ends_at=agent_accounts.login_end_iso(row.login_ends_at) if row.tool == "claude" else None,
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),

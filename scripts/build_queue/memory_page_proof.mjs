@@ -2,6 +2,7 @@
 // The optional third argument names the previous page for comparison images.
 // Add --queued as the fourth argument for the queued-section comparison.
 // Add --console as the fourth argument for the Builds title comparison.
+// Add --step-names as the fourth argument for owner-based step names.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -25,6 +26,7 @@ try {
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const queuedComparison = process.argv[4] === '--queued';
   const consoleComparison = process.argv[4] === '--console';
+  const stepNamesComparison = process.argv[4] === '--step-names';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -823,6 +825,24 @@ try {
           await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
         };
         const comparisons = [];
+        if (stepNamesComparison) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          for (const version of ['before','after']) {
+            await show(readings['owner_names_'+version]);
+            const names = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.walk-table tbody tr')];
+              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
+                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
+            })()`);
+            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            assert.deepEqual(names.running,expected);
+            assert.deepEqual(names.waiting,expected);
+            await capture(version+'-running-step-names','#walk');
+            comparisons.push({version,...names});
+          }
+        }
         if (consoleComparison) {
           assert.ok(beforePage,'The console comparison needs the previous page.');
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
