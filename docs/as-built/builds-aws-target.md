@@ -41,14 +41,15 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-Phase C supplies `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
+Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
 The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
 The guard and watchdog only read the permit and identity files.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
-Phase C renews permission for longer steps through `write_permit()`.
+Phase C reserves permission for longer steps.
+Phase D must deliver renewals through `write_permit()`.
 The writer uses a private temporary file and atomic rename.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
@@ -78,6 +79,65 @@ The initial limits are 4 vCPUs and 24 GiB RAM.
 Phase F2 must use this command path after checking the actual data mount.
 `test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
 No safety test needs AWS or a running systemd manager.
+
+## Hana spending permits
+
+`scripts/aws_target/hana_spend.py` reserves spending before it returns a guest permit.
+`HanaSpending` uses the account ledger lock for starts, renewals, lifecycle observations, and storage deletion.
+It makes no AWS call and delivers no permit to a guest.
+Phase D must deliver permits and schedule lifecycle reconciliation without an active caller.
+Placement remains disabled.
+
+`reserve_storage()` reserves the root and data volumes before provisioning.
+It checks current account caps and the Hana budget before returning a saved reservation.
+`issue()` reserves compute through the deadline at the configured bid ceiling.
+It includes retained storage when no storage reservation exists.
+Each issued permit has an increasing generation.
+A renewal must name the current generation and extend an unexpired deadline.
+A refused renewal leaves the saved deadline unchanged.
+The guest watchdog then stops the box when its existing permit expires.
+
+The shared ledger checks account policy, account evidence, gate exposure, bills, and the existing daily and monthly caps.
+The account daily limit remains USD 35.
+The Hana daily budget includes Hana compute and storage within that account limit.
+Open compute exposure remains reserved after permit expiry until a lifecycle observation confirms `stopped` or `terminated`.
+Storage remains reserved after stop and termination until volume deletion is confirmed.
+Storage estimates use a 30-day month.
+The ledger reserves the remaining storage cost for every day that a permit reaches.
+`reconcile()` records an automatic restart even when Hana placement is disabled.
+It reserves the boot guard interval and retains exposure until a confirmed stop.
+Unknown lifecycle state releases no exposure.
+Each lifecycle observation names the generation that the observer read before its request.
+An observation for an older generation changes no exposure or observation time.
+The ledger saves `hana_lifecycle_fence` with the latest accepted observation or permit issue time.
+An older observation cannot close a newer permit or replace a later running observation.
+The fence survives controller restarts.
+Observations at the same time as the fence leave exposure unchanged.
+
+The existing `cost-ledger.json` version remains 1.
+The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
+Older records have no Hana exposure when these collections are absent.
+A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
+The first stop confirmation saves the missing fence and retains the compute exposure.
+A newer confirmation for the same generation can then close that exposure without a running observation.
+Missing fields within a Hana exposure record make that record unusable.
+The reader never invents a zero price or deadline.
+Account guards and gate reservations include Hana exposure.
+Ledger estimates include accrued Hana compute and storage.
+
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `region` | `us-east-2` | Use Ohio for the box and retained storage. |
+| `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
+| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `root_gib` | `40` | Reserve the retained root volume. |
+| `data_gib` | `300` | Reserve the retained data volume. |
+| `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
+| `gp3_usd_per_gib_month` | `0.08` | Price standard gp3 storage without extra performance. |
+
+The account configuration has storage totals, but no shared gp3 price per GiB.
+The new rate therefore belongs to the Hana configuration.
+`test_hana_spend.py` uses private files and fake lifecycle observations.
 
 ## Removed builder: 2026-11-04
 
