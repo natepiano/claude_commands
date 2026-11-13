@@ -3638,7 +3638,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - setUp ran 11 Git commands in each of 34 tests; it now copies. Tested fetches, commits, locks, races and recovery stay real. All 34 test bodies and 277 assertion expressions did not change.
 - aws paired trial, 3 rounds: CPU 13.399 to 11.942 s; peak 165.2 to 152.2 MiB. Checkpoint `07a15ce4c`.
 
-### Phase 242 — The notifier tests start fewer shells  · status: todo
+### Phase 242 — The notifier tests start fewer shells  · status: done
 **Depends on:** none
 
 #### Work Order

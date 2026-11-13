@@ -25,6 +25,8 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib import user_zone
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -179,18 +181,32 @@ finally:
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
         owned = OwnedTestProcesses()
         command = ["zsh", str(SCRIPT), *args]
+        environment = self.owned.environment({
+            **os.environ,
+            "NOTIFIER_STATE_DIR": str(self.state_dir),
+            "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
+            "NOTIFIER_SEND": str(self.fake_send),
+            "NOTIFIER_NOW_EPOCH": str(now),
+            "FAKE_SEND_ARGS": str(self.send_args),
+            "FAKE_SEND_RC": str(send_rc),
+            "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
+        })
+        if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
+            config = environment.get("USER_ZONE_CONF") or str(
+                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
+            if not Path(config).is_absolute():
+                config = str(Path.cwd() / config)
+            try:
+                with mock.patch.object(user_zone, "CONF", config):
+                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+            except Exception:
+                # The shell ignores helper failures and uses the machine zone.
+                environment["SHOWN_ZONE"] = ""
+            else:
+                environment["SHOWN_ZONE"] = zone.stdout.rstrip("\n") if zone.returncode == 0 else ""
         child = subprocess.Popen(
             command,
-            env=self.owned.environment({
-                **os.environ,
-                "NOTIFIER_STATE_DIR": str(self.state_dir),
-                "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
-                "NOTIFIER_SEND": str(self.fake_send),
-                "NOTIFIER_NOW_EPOCH": str(now),
-                "FAKE_SEND_ARGS": str(self.send_args),
-                "FAKE_SEND_RC": str(send_rc),
-                "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
-            }),
+            env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         owned.track(child, group=True)
@@ -334,6 +350,7 @@ finally:
         _ = self.successful("tick", now=MINUTE + 180)
         self.assertEqual(len(self.lines()), 1)
 
+    @process_boundary
     def test_aligned_schedule_lands_on_the_clock(self) -> None:
         def at(zone: str, hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 5, hour, minute, 30, tzinfo=ZoneInfo(zone)).timestamp())
@@ -389,6 +406,7 @@ finally:
         _ = self.successful("tick", now=NOW + 600)
         self.assertEqual(self.state()["PAUSED"], "1")
 
+    @process_boundary
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")
         _ = self.successful("tick", now=MINUTE + 120)
