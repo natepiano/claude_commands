@@ -4,7 +4,7 @@ from __future__ import annotations
 from scripts.lib import atomic_file, build_folders
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 import io
 import json
@@ -1022,6 +1022,27 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(events, ["hold", "wait", "hold"])
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(fixture.admission.server.waiters)
+
+    def test_cleanup_mask_is_restored_when_blocking_is_interrupted(self) -> None:
+        change_mask = signal.pthread_sigmask
+        previous = change_mask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        expected = previous | {signal.SIGUSR1}
+
+        def interrupted_block(how: int, numbers: Iterable[int]) -> set[int | signal.Signals]:
+            mask = set(numbers)
+            result = change_mask(how, mask)
+            if how == signal.SIG_BLOCK and signal.SIGINT in mask:
+                raise KeyboardInterrupt
+            return result
+
+        try:
+            with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
+                with self.assertRaises(KeyboardInterrupt):
+                    with queue.defer_cleanup_signals():
+                        self.fail("The block step must interrupt entry")
+            self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
+        finally:
+            _ = change_mask(signal.SIG_SETMASK, previous)
 
     @unittest.skipUnless(hasattr(os, "fork"), "holder signal lifecycle needs fork")
     def test_holder_signals_release_and_restore_handlers(self) -> None:

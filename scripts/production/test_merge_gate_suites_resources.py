@@ -185,14 +185,14 @@ class MergeGateResourcesTests(GateSuitesFixture):
                 def stop() -> None:
                     self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
                     if delivery == "process":
-                        os.kill(os.getpid(), signal.SIGTERM)
+                        os.kill(os.getpid(), signal.SIGINT)
                     elif delivery == "sender_thread":
-                        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+                        signal.pthread_kill(threading.get_ident(), signal.SIGINT)
 
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     stopped = executor.submit(stop)
-                    with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
-                            self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
+                    with mock.patch.dict(os.environ, self.environment), \
+                            self.assertRaises(KeyboardInterrupt):
                         with merge_gate.shared_cpu_pool() as pool:
                             assert isinstance(pool, merge_gate.SharedCPUPool)
                             self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
@@ -203,7 +203,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
                                 if blocking_descriptor in readers:
                                     waiting.set()
                                     if delivery == "before_wait":
-                                        os.kill(os.getpid(), signal.SIGTERM)
+                                        os.kill(os.getpid(), signal.SIGINT)
                                 return select_ready(readers, writers, errors, timeout)
 
                             with mock.patch.object(select, "select", side_effect=observe_wait):
@@ -216,8 +216,8 @@ class MergeGateResourcesTests(GateSuitesFixture):
             with self.subTest(delivery=delivery):
                 self.supply_jobserver(b"A\0")
                 read = os.read
-                with mock.patch.dict(os.environ, self.environment), merge_gate.rollback_signals(), \
-                        self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
+                with mock.patch.dict(os.environ, self.environment), \
+                        self.assertRaises(KeyboardInterrupt):
                     with merge_gate.shared_cpu_pool() as pool:
                         assert isinstance(pool, merge_gate.SharedCPUPool)
                         self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
@@ -226,12 +226,12 @@ class MergeGateResourcesTests(GateSuitesFixture):
                         def interrupt_read(descriptor: int, count: int) -> bytes:
                             token = read(descriptor, count)
                             if descriptor == token_descriptor and delivery == "read":
-                                os.kill(os.getpid(), signal.SIGTERM)
+                                os.kill(os.getpid(), signal.SIGINT)
                             return token
 
                         with mock.patch.object(os, "read", side_effect=interrupt_read):
                             _ = pool.acquire()
-                        os.kill(os.getpid(), signal.SIGTERM)
+                        os.kill(os.getpid(), signal.SIGINT)
                 self.assertEqual(self.jobserver_tokens(), b"A\0")
 
     def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
@@ -250,11 +250,11 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
         def interrupt_after_wait(pid: int, options: int) -> tuple[int, int, resource.struct_rusage]:
             result = wait4(pid, options)
-            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGINT)
             return result
 
-        with merge_gate.rollback_signals(), mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
-            with self.assertRaisesRegex(GateRefused, "interrupted by SIGTERM"):
+        with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
+            with self.assertRaises(KeyboardInterrupt):
                 merge_gate.reap_gate_job(finished)
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)

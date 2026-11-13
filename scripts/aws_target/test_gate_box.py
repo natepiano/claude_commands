@@ -195,10 +195,9 @@ class GateBoxTests(unittest.TestCase):
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport os\n'
+                    'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
                     + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
-                    + 'rollback_signals = nullcontext\n'
                     + 'def run_suites(*args, **kwargs):\n'
                     + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
                     + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'

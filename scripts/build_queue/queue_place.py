@@ -80,8 +80,9 @@ def no_hold_wait() -> None:
 @contextmanager
 def defer_cleanup_signals() -> Generator[None]:
     """Keep ownership changes atomic with respect to runner cancellation."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     try:
+        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
         yield
     finally:
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)

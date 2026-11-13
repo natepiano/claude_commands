@@ -290,7 +290,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
             for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
                          "suite_scope_prefix", "merge_gate_governor_gib", "SampledRSSAdmission",
-                         "PassedTreeLedger", "clean_test_tree", "gate_state_dir", "process_memory_mib"):
+                         "PassedTreeLedger", "clean_test_tree", "process_memory_mib"):
                 _ = blocked.enter_context(mock.patch.object(merge_gate, name, side_effect=AssertionError(name)))
             run = merge_gate.run_suites(self.checkout, type_dirs=("scripts",), max_running_jobs=1,
                                        machine=merge_gate.WholeMachine())

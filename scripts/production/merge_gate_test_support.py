@@ -209,7 +209,8 @@ class FixtureTest(unittest.TestCase):
         if (state / "leak-child").exists() and suite == "hooks":
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=(state / "detached-child").exists())
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
