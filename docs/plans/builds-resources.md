@@ -2568,79 +2568,39 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 120 — Admission counts swapped agent memory as demand  · status: done
 
-**Source:** 2026-11-13 15:5x, builds (URGENT, ahead of 119): the user reports chronic mouse and keyboard freezes on natedev ("it's chronic"). Admission lets builds take memory that the agents then lose to swap. Plan approved by builds; land order 44 re-land, 117, 120.
+#### As-built
 
-#### Work Order
-
-**Goal:** admission does not start a build into memory that swapped agents will take back. Swapped memory outside the build and CI slices counts as demand in the room calculation.
-
-**Measured:** 2026-11-13 15:50 EST on natedev:
-- MemAvailable 13.2 GiB. app.slice (agents) 23.1 GiB resident and 12.4 GiB in swap. builds.slice 16.6 GiB resident and 4.0 GiB in swap.
-- Host swap used 19.2 GiB; 15.1 GiB of it is outside builds.slice. zram holds that swap in 6.5 GiB of RAM.
-- `memory_room` in `scripts/lint/memory_admit.py` computes room as MemAvailable minus `safety_gib` minus the holds of running builds. It reads no swap, so swapped agent memory counts as free room. With the new term, room at 15:50 is below zero.
-
-**Spec:**
-1. `memory_room` subtracts a swapped-demand term: host swap used (SwapTotal minus SwapFree) minus the `memory.swap.current` of builds.slice and of the CI slice (`ci_memory_slice`), times `agent_swap_share_percent` / 100. The term is never below zero.
-2. Add the key `agent_swap_share_percent=100` (whole, 0..100) to `config/build_admission.conf`. Its comment carries the measurement: 15:50, 15.1 GiB swap outside builds.slice, room under 0. Change no other key.
-3. Floor: with no build running, the head starts on the rule without the new term. Builds never stop; at most one build runs while agents are swapped.
-4. When a swap reading is unavailable, the term is unavailable and admission treats it as today's unavailable readings do. It never reads as zero.
-5. `MemoryRoom` carries the term as its own field. The head explanation (`scripts/build_queue/queue_evidence.py` `room_text`) shows it as its own term, for example `15.1 GiB swapped outside builds`.
-6. builds.slice keeps MemoryMax 44G as a static backstop; admission does not change it at runtime. The user (via natedev and builds): "but builds needs to be dynamic". The room term is the dynamic control: builds start only into memory that the agents and the desktop do not need now, RAM plus swap.
-
-**Tests:**
-1. Table rows in the existing `memory_room` tests: swap outside builds reduces room; builds.slice and CI swap do not; share 0 and 100; the no-running-build floor; an unavailable swap reading.
-2. A row in the existing `room_text` test for the new term.
+- `memory_room` (`scripts/lint/memory_admit.py`) subtracts `agent_swap_demand` = ceil(max(0, SwapTotal − SwapFree − build_and_ci_swap) × `agent_swap_share_percent` / 100). `MemoryRoom.agent_swap_demand` carries the term; `room_text` shows it as "− N GiB swapped outside builds".
+- `read_meminfo` reads `build_and_ci_swap` (builds.slice plus the `ci_memory_slice` cgroup `memory.swap.current`) only when the host swaps. An inactive slice (empty systemd ControlGroup) or an absent cgroup folder reads as no swap. A missing counter or a failed systemctl call makes the room unavailable.
+- With no build running, the head still starts alone (the StartsAlone basis needs a readable room).
+- `config/build_admission.conf` key `agent_swap_share_percent=100` (0..100). builds.slice keeps its static MemoryMax 44G backstop; the room term is the dynamic control.
 
 **Files:**
-- `scripts/lint/memory_admit.py`
-- `scripts/build_queue/admission_records.py`
-- `scripts/build_queue/queue_evidence.py`
-- `config/build_admission.conf`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/build_queue/test_queue_evidence.py`
+- `scripts/lint/memory_admit.py` — the term, `read_build_and_ci_swap`, `systemd_slice_group`, `slice_swap_current`.
+- `scripts/build_queue/admission_records.py` — `AdmissionPolicy.agent_swap_share_percent`, `HostMemory.build_and_ci_swap`, `MemoryRoom.agent_swap_demand`.
+- `scripts/build_queue/queue_evidence.py` — the room_text term.
+- `scripts/build_queue/memory_test_support.py` — the private CI slice writes `memory.swap.current` = 0.
 
-**Workers:** one implement worker.
+**Gotchas:**
+- Share 100 counts uncompressed swapped pages; zram holds them in less RAM, so the room is conservative. `agent_swap_share_percent` is the knob.
+- Absent SwapTotal/SwapFree lines read as no swap; only fixtures omit them.
 
-**State:** none.
-
-**Verification:**
-1. Test: `scripts.lint.test_memory_admit`, `scripts.build_queue.test_queue_evidence`, `scripts.build_queue.test_admission_service`, `scripts.build_queue.test_queue_view`.
-2. Lint: `basedpyright` on the changed Python files.
-
-**Speed:** two more `memory.swap.current` reads on each admission pass; `/proc/meminfo` is already read.
+**Ruled out:** a runtime MemoryMax change on builds.slice — the room term keeps builds dynamic.
 
 ### Phase 120b — The Builds page memory bar shows the desktop guarantee and the agents  · status: done
 
-**Source:** 2026-11-13 ~15:55, the user (via natedev and builds): "we need to reflect these larger tranches in other - show the desktop guarantee and the agents (which is more dynamic) - when i say other i mean the main memory bar at the top of the builds page". builds: split today's "other" into its own segments; read them from the same source as the Phase 120 admission room. Lands right after Phase 120.
+#### As-built
 
-#### Work Order
-
-**Goal:** the main memory bar at the top of the Builds page shows the room that admission sees: the desktop guarantee, the agents' RAM and the agents' swapped demand each have their own segment, and "other" holds only the rest.
-
-**Measured:** 2026-11-13 15:55 EST: session.slice `memory.min` reads 2147483648 (2 GiB, nixos dd9e7f6). `memory_feed.py` sets `other` = total − MemAvailable − build use; `memory_live.html` draws it as one grey segment ("Other programs and the system"). The feed reads its room from `explanation.room` (`MemoryRoom`), which carries the Phase 120 swapped-demand term.
-
-**Spec:**
-1. The feed payload adds `desktop_guarantee` (session.slice `memory.min`, read live, never a constant), `agents_ram` (the app-agents.slice working set, the slice the swap table names agents; `memory.current` minus `inactive_file`, read by `slice_working_set`; plain `memory.current` counts page cache that MemAvailable already counts as free) and `agents_swap` (the Phase 120 swapped-demand term from `MemoryRoom`). `other` becomes the rest and is never below zero.
-2. Read the session.slice and app-agents.slice values through the cgroup readers in `scripts/lint/memory_admit.py`, so that the bar and admission read one source.
-3. The bar draws three new segments: the desktop guarantee, the agents' RAM, and the agents' swapped demand. The swapped demand is drawn inside the free part of the bar, between the room and the safety segment, with its own pattern, because admission takes it from the room. Since Phase 120 the room is smaller by this term, so without the segment the bar has a blank gap of that size. Each segment has a tooltip and a legend entry in the page's style, in light and dark themes.
-4. An unavailable reading shows its segment as unavailable, never as zero.
-5. Keep apart from report phase 73's blocks banner edits in `memory_live.html`: change only the bar, its legend and its tooltips.
-
-**Tests:** table rows in the existing feed payload test for the three new values and for an unavailable reading.
+- The feed payload (`memory_feed.memory_shares`) carries `desktop_guarantee` (session.slice `memory.min`), `agents_ram` (app.slice/app-agents.slice working set: `memory.current` minus `inactive_file`), `agents_swap` (`MemoryRoom.agent_swap_demand`) and their `shown_*` widths. `other` is the rest of the memory outside builds, never below zero. An unreadable slice gives `None` and a reason in `slices_unavailable`.
+- `memory_admit.py` reads both slices: `user_manager_cgroup` (`BUILDLOG_USER_CGROUP` overrides it), `desktop_guarantee`, `agents_memory`. `builds_slice_cgroup` derives from `user_manager_cgroup`.
+- The top bar of `memory_live.html` draws Agents (purple), Desktop guarantee (dark grey) and Agents' swapped memory (hatched purple, between room and safety). Each has a legend row and a tooltip; an unreadable value shows "unavailable". A segment too narrow for its label uses a compact label before it hides it.
 
 **Files:**
-- `scripts/build_queue/memory_feed.py`
-- `scripts/build_queue/memory_live.html`
-- `scripts/lint/memory_admit.py`
-- `scripts/build_queue/test_memory_feed.py`
+- `scripts/build_queue/memory_feed.py` — `MemoryShares`, `memory_shares`.
+- `scripts/build_queue/memory_live.html` — the three segments, legend rows, tooltips, compact labels.
+- `scripts/lint/memory_admit.py` — the slice readers.
+- `scripts/build_queue/test_memory_feed.py` — `write_user_slices`; the browser fixture writes the slices.
 
-**Workers:** one implement worker (the Phase 119 `impl` worker, which owns `memory_feed.py`).
+**Gotchas:** node is not on PATH on natedev; run `memory_page_proof.mjs` through `nix shell nixpkgs#nodejs -c node`.
 
-**State:** none.
-
-**Verification:**
-1. Test: every `scripts.build_queue` test module, and `scripts.lint.test_memory_admit`.
-2. Lint: `basedpyright` on the changed Python files.
-3. Live proof: before and after shots of the bar on natedev.
-
-**Speed:** four more cgroup file reads for each page refresh (session.slice `memory.min`; app-agents.slice `memory.current`, `memory.stat`, `memory.swap.current`).
+**Ruled out:** all of app.slice as "Agents" — it also holds browsers and editors.
