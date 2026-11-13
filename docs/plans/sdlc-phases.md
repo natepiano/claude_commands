@@ -568,17 +568,11 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a director sees at once when `start-phase` sets aside a phase that was never closed.
-
-**Spec:**
-- `scripts/direct/progress_history.py` `_start_phase`: when it sets aside the current phase and no open pass belongs to that phase, print one `anomaly:` line to stderr. The line names the unit, the phase id and the phase start time in the user zone. It stops nothing.
-- A set-aside phase with an open pass prints no line: that is the parallel-phase path.
-- Tests: add rows to the existing test `test_a_phase_started_while_another_is_open_leaves_the_older_one_open` in `scripts/direct/test_progress_history.py`. Use fixtures only, no live records.
+- When `start-phase` sets aside the current phase and no open pass belongs to it, `_report_unclosed_phase` prints one line to stderr: `anomaly: start-phase: <unit>: phase <id> set aside unclosed, started <YYYY-MM-DD HH:MM zone>`. It stops nothing.
+- A set-aside phase with an open pass prints no line. A run with no unit row names the unit as `unit not recorded (<reason>)`.
 
 **Files:**
-- `scripts/direct/progress_history.py`
-- `scripts/direct/test_progress_history.py`
-
-**Workers:** `director only (no Codex workers until the workers-back notice)`
+- `scripts/direct/progress_history.py` — `_report_unclosed_phase` and its call in `_start_phase`
+- `scripts/direct/test_progress_history.py` — rows in `test_a_phase_started_while_another_is_open_leaves_the_older_one_open`
