@@ -44,7 +44,6 @@ from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import placement
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
@@ -988,26 +987,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
     groups: dict[str, list[RunRow]] = {}
-    remote_groups: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
         identity = feed_step_labels(step, labels, ci_runners)
         name, detail = step_text(step, names, labels=labels), identity.unit
         unit, state = detail, ""
-        if isinstance(memory, admission_records.RemoteMemoryUnavailable):
-            key = admission_records.execution_group(step, entry.owner)
-            if key in remote_groups:
-                continue
-            remote_groups.add(key)
-            remote_row: RunRow = {"name": name, "showrunner": identity.showrunner, "unit": unit,
-                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
-                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
-                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
-                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
-            walk.append(remote_row)
-            continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
                        or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
@@ -1057,8 +1042,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     machine = host_name()
     vcpus = os.cpu_count()
     for row in walk:
-        _ = row.setdefault("machine", machine)
-        _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
+        row["machine"] = machine
+        row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):

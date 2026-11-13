@@ -64,7 +64,7 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
                         self.end_group(process.pid)
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
-    def test_a_token_wait_ends_with_its_call(self) -> None:
+    def test_a_step_whose_call_is_gone_stops_waiting_for_the_token(self) -> None:
         board = self.root / "board"
         waiting = self.root / "waiting-for-token"
         real_sleep = shutil.which("sleep")
@@ -99,7 +99,7 @@ trap probe_local_attempt DEBUG
         while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertEqual(left, [], output.read_text(errors="replace"))
-        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertIn("the call that started this step is gone", output.read_text(errors="replace"))
 
     def test_a_token_wait_keeps_the_steps_place_and_never_starts_without_memory(self) -> None:
         # On 2026-10-21 a step waited 15 min for memory, 24 min for the token,
@@ -133,7 +133,7 @@ trap probe_local_attempt DEBUG
                        "TEST_SLEEP_LOG": str(log),
                        "BUILDLOG_MEM_POLL_S": "1", "BUILDLOG_MEM_WAIT_LIMIT_S": "2"}
         def free_after_wait(reply: wire.Reply) -> wire.Reply:
-            if isinstance(reply, wire.Wait) or (isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait)):
+            if isinstance(reply, wire.Wait):
                 with log.open("a") as stream:
                     _ = stream.write("wait\n")
                 self.admission.free(60 * admission_records.GIB)

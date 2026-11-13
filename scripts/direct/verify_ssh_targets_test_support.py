@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from contextlib import contextmanager
-
 import json
 import os
 from pathlib import Path
-from dataclasses import dataclass
 import subprocess
-from unittest import mock
 from typing import Callable, TypedDict, cast, override
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
@@ -32,9 +26,6 @@ class SshRunnerEvent(TypedDict):
     queued_at: str
     memory_reservation: str
     actions: list[str]
-    entry_claim_ids: list[str]
-    adopted_claim_ids: list[str]
-    remaining_claim_ids: list[str]
     mode: str
     result_type: str
     clock: str
@@ -51,61 +42,68 @@ class CompletedMemoryHook(TypedDict):
     attempts: int
 
 
-@dataclass(frozen=True)
-class ReleaseMemoryAtWait:
-    """Release local memory when a real queue wait occurs."""
+ADMISSION_BEFORE_RETRY = r'''
+import os
+from pathlib import Path
+import sys
+
+with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_queue import admission_client
+from scripts.build_queue.system_clock import SystemClock
 
 
-RELEASE_MEMORY_AT_WAIT = ReleaseMemoryAtWait()
+class AdmissionBeforeRetryClock(SystemClock):
+    """Keep admission before the first retry deadline during a result check."""
+
+    def monotonic(self) -> float:
+        return 0.0
 
 
-QUEUED_MEMORY_OBSERVER = r'''
+admission_client.CLOCK = AdmissionBeforeRetryClock()
+raise SystemExit(admission_client.main(sys.argv[2:]))
+'''
+
+
+OBSERVE_MEMORY_HOOK = r'''
 import json
 import os
 from pathlib import Path
 import sys
 from unittest import mock
 
-with open(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/lib/package_root.py") as package_root:
-    exec(package_root.read(), {"__file__": package_root.name})
-from scripts.build_queue import admission_client, admission_protocol as wire, placement
+source = Path(os.environ["TEST_SOURCE_REPO"])
+with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_queue import admission_client
 from scripts.lib.atomic_file import write_text_atomic
 
+root = Path(os.environ["TEST_RUNNER_STATE"])
+leave = admission_client._leave_queue
+sequence = len(tuple(root.glob("memory-hook-[0-9]*")))
 
-def main(arguments):
-    root = Path(os.environ["TEST_RUNNER_STATE"])
-    request_placement = admission_client.request_placement
+def attempts():
+    events = root / "ssh-events.jsonl"
+    return len(events.read_text().splitlines()) if events.exists() else 0
 
-    def observe(request):
-        reply = request_placement(request)
-        events = root / "ssh-events.jsonl"
-        attempts = len(events.read_text().splitlines()) if events.exists() else 0
-        if attempts < int(os.environ.get("TEST_OBSERVE_AFTER_ATTEMPTS", "0")):
-            return reply
-        sequence = len(tuple(root.glob("memory-hook-[0-9]*")))
-        if (isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait)
-                and reply.eligibility
-                and not any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in reply.eligibility)):
-            left = False
-        elif isinstance(reply, wire.Assignment) and sequence:
-            left = True
-        else:
-            return reply
-        clock = os.environ.get("TEST_ROUTING_CLOCK", "")
-        event = {"left": left, "clock": Path(clock).read_text() if clock else "", "attempts": attempts,
-                 "episode": request.episode,
-                 "attempt": reply.assignment.attempt if isinstance(reply, wire.Assignment) else ""}
-        if not left:
-            with (root / "memory-polls.jsonl").open("a") as output:
-                output.write(json.dumps(event) + "\n")
-        write_text_atomic(root / f"memory-hook-{sequence + 1}", json.dumps(event))
-        if not (root / "memory-hook-settled").exists():
-            with (root / "memory-hook-ack").open() as acknowledgment:
-                assert acknowledgment.read(len("continue")) == "continue"
-        return reply
+def observe():
+    global sequence
+    polls = root / "memory-polls.jsonl"
+    with polls.open("a") as output:
+        output.write(json.dumps({"attempts": attempts()}) + "\n")
+    left = leave()
+    with polls.open("a") as output:
+        output.write(json.dumps({"attempts": attempts()}) + "\n")
+    sequence += 1
+    clock = os.environ.get("TEST_ROUTING_CLOCK", "")
+    event = {"left": left, "clock": Path(clock).read_text() if clock else "", "attempts": attempts()}
+    write_text_atomic(root / ("memory-hook-" + str(sequence)), json.dumps(event))
+    if not (root / "memory-hook-settled").exists():
+        with (root / "memory-hook-ack").open() as acknowledgment:
+            assert acknowledgment.read(len("continue")) == "continue", "the test did not acknowledge the hook"
+    return left
 
-    with mock.patch.object(admission_client, "request_placement", side_effect=observe):
-        return admission_client.main(arguments)
+with mock.patch.object(admission_client, "_leave_queue", side_effect=observe):
+    raise SystemExit(admission_client.main(sys.argv[2:]))
 '''
 
 
@@ -122,7 +120,6 @@ from unittest import mock
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import offload, mac_test, claim_state
-from scripts.build_queue import admission_protocol as queue_wire, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
@@ -133,7 +130,6 @@ mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "
 if mode in ("disk-once", "lost-once"):
     mode = "passed" if (root / "ssh-events.jsonl").exists() else mode.removesuffix("-once")
 actions = []
-adopted_claim_ids = []
 initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
 reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_owner_pid for claim in initial))
@@ -146,18 +142,12 @@ def complete(arguments, attempt):
     parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
     text = io.StringIO()
     with redirect_stdout(text):
-        if isinstance(request.placement, offload.AssignedOffloadRequest):
-            assigned = request.placement.assignment
-            status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False,
-                                            session=assigned.session, assignment=assigned)
-        else:
-            status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False)
+        status = mac_test.command_claim(parsed, mac_test.state_paths(parsed.target), watch_claim=False)
     attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, text.getvalue(), ""))
     if status in (0, 13):
         controller.claim_identity = claim_state.reply_claim_identity(text.getvalue())
     actions.append("claim:" + str(status))
     after = mac_test.read_claims(mac_test.state_paths(parsed.target))
-    adopted_claim_ids.extend(claim.record["claim_id"] for claim in after if claim.record["pid"] == os.getpid())
     same_path = any(claim.path in before and claim.record["pid"] == os.getpid() for claim in after)
 
 def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
@@ -199,10 +189,6 @@ def copy_scripts(*arguments):
 
 def copy_source(*arguments):
     actions.append("source-copy")
-    if isinstance(request.placement, offload.AssignedOffloadRequest):
-        source = request.placement.assignment.source_key
-        return offload.CopiedTree(offload.KnownTreeKey(source.key) if isinstance(source, placement.SourceKeyKnown)
-                                  else offload.UNAVAILABLE_TREE_KEY)
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
 def stream(arguments):
@@ -219,23 +205,14 @@ def stream(arguments):
     elif mode == "lost":
         wire, status = "connection lost\n", 255
     else:
-        status = 75 if mode == "completed-decline" else 42 if mode == "failed" else 4 if mode == "no-tests" else 0
+        status = 42 if mode == "failed" else 4 if mode == "no-tests" else 0
         wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
-        if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            command = offload.start_fence_command(controller.claim_identity, request.target,
-                settle=True, scope_key=controller.claim_scope_key)
-            settled = real_run(["bash", "-c", command], capture_output=True,
-                               text=True, check=False, timeout=5)
-            assert settled.returncode == 0, settled.stderr
-            wire += settled.stdout
 
     remote_output, remote_status = wire, status
 
     class Remote:
         stdout = io.StringIO(wire)
         def wait(self):
-            return status
-        def poll(self):
             return status
 
     with mock.patch.object(subprocess, "Popen", return_value=Remote()):
@@ -247,11 +224,7 @@ def commands(arguments, **options):
         actions.append("cleanup")
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
         count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
-        fence = ""
-        if not unresolved and count == 0 and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            fence = "dispatch_start_settled=" + offload.pending_start_key(controller.claim_identity) + "\n"
-        return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
-            "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
+        return subprocess.CompletedProcess(arguments, 3 if unresolved else 0, "" if unresolved else "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
 
 started = time.monotonic()
@@ -264,54 +237,27 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
      mock.patch.object(subprocess, "run", side_effect=commands):
     result = offload.run_offload(controller, config, request, started)
 
-configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
-if not configured_mode.endswith("-once"):
-    reason = ("unreachable" if isinstance(result, offload.LostMacRun) else
-              "busy" if isinstance(result, offload.BusyMacDecline) and controller.attempt_evidence.cleanup != "confirmed" else
-              result.reason if isinstance(result, offload.DeclinedMacRun) else "")
-    outcome = root / ("provider-outcome-" + request.target + ".json")
-    if reason:
-        ready = outcome.with_suffix(".ready")
-        ready.write_text(json.dumps({"target": request.target, "reason": reason}))
-        os.replace(ready, outcome)
-    else:
-        outcome.unlink(missing_ok=True)
-
 event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.attempt_evidence.slot,
-             token_held=(Path(os.environ["TEST_TOKEN_RECORD"]).exists()
-                         and Path(os.environ["TEST_TOKEN_RECORD"]).read_text().strip() == os.environ.get("BUILDLOG_HOLD_PID", "")),
+             token_held=Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
              pinned=os.environ.get("BUILDLOG_PINNED_TARGET", ""),
              reserved=reserved, same_path=same_path, queued_at=os.environ.get("BUILDLOG_MEM_WAIT_SINCE", ""),
              memory_reservation=os.environ.get("BUILDLOG_MEM_RESERVATION", ""), actions=actions, mode=mode,
-             entry_claim_ids=[claim.record["claim_id"] for claim in initial],
-             adopted_claim_ids=adopted_claim_ids,
-             remaining_claim_ids=[claim.record["claim_id"] for claim in mac_test.read_claims(mac_test.state_paths(request.target))],
              result_type=type(result).__name__,
              remote_output=remote_output, remote_status=remote_status,
              holder=type(result.holder).__name__ if isinstance(result, offload.BusyMacDecline) else "",
              clock=Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "")
 with (root / "ssh-events.jsonl").open("a") as output:
     output.write(json.dumps(event) + "\n")
-try:
-    status = offload.write_result(result, request.result, request.last_decline, request.verb,
-                                  request.target, controller.attempt_evidence)
-finally:
-    try:
-        offload.report_placement_result(controller, request, result)
-    except (queue_wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
-        print(f"offload: cannot report placement: {error}", file=sys.stderr)
-    try:
-        offload.persist_attempt(request, result, controller.attempt_evidence, started)
-    except (OSError, ValueError) as error:
-        print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
-raise SystemExit(status)
+offload.persist_attempt(request, result, controller.attempt_evidence, started)
+raise SystemExit(offload.write_result(result, request.result, request.last_decline, request.verb,
+                                     request.target, controller.attempt_evidence))
 '''
 
 
 class VerifySshTargetsFixture(VerifyMacOffloadFixture):
     admission: AdmissionFixture  # pyright: ignore[reportUninitializedInstanceVariable]
     memory_events_enabled: bool = False
-    memory_hook_observer: Callable[[CompletedMemoryHook], bool] | ReleaseMemoryAtWait = RELEASE_MEMORY_AT_WAIT
+    memory_hook_observer: Callable[[CompletedMemoryHook], bool] = lambda event: True
 
     @override
     def build_fixture(self) -> None:
@@ -331,7 +277,6 @@ source() {
         export BUILDLOG_MEM_WAIT_SINCE=$fixture_wait_since
         export BUILDLOG_MEM_WAIT_FIRST_FILE=$fixture_wait_first_file
         buildlog_memory_python() { "$HOME/.claude/scripts/lib/py" "$@"; }
-        if [ -n "${TEST_ADMISSION_CLIENT:-}" ]; then BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_ADMISSION_CLIENT; fi
         unset -f source
     fi
     return "$status"
@@ -350,46 +295,6 @@ source() {
         self.admission = caller_admission(self, self.root, self.environment)
         # The interval also bounds admission socket reads. Keep room for scheduling delay at high load.
         self.admission.configure(waiting_pass_seconds=1, running_pass_seconds=0.25)
-        self.memory_events_enabled = False
-        self.memory_hook_observer = RELEASE_MEMORY_AT_WAIT
-        previous = self.admission.server.handle_request
-
-        def observe(request: wire.Request,
-                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            replies = previous(request, connection)
-            if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ExecutionReport, wire.ClaimFailure)):
-                targets = ({candidate.destination.target for candidate in request.constraints.candidates
-                            if candidate.destination.provider != "local"} if isinstance(request, wire.PlacementRequest)
-                           else {request.assignment.destination.target})
-                event = {"request": json.loads(wire.encode_request(request)),
-                         "replies": [json.loads(wire.encode_reply(reply)) for reply in replies],
-                         "claims": {target: [held.record for held in caller_provider_controls(self, self.admission).claims(target)]
-                                    for target in targets}}
-                with (self.runner_state / "queue-events.jsonl").open("a") as output:
-                    _ = output.write(json.dumps(event) + "\n")
-            return replies
-
-        _ = self.enterContext(mock.patch.object(self.admission.server, "handle_request", side_effect=observe))
-
-    @contextmanager
-    def spare_after_linux_refusal(self) -> Generator[None]:
-        """Make the spare available after the first provider refuses the step."""
-        controls = caller_provider_controls(self, self.admission)
-        controls.set_host("spare", placement.TemporaryExclusion("starting"))
-        previous = self.admission.server.handle_request
-
-        def observe(request: wire.Request,
-                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            replies = previous(request, connection)
-            if (isinstance(request, wire.ClaimFailure)
-                    or isinstance(request, wire.ExecutionReport)
-                    and isinstance(request.outcome, placement.PrelaunchRefused)):
-                if request.assignment.destination.target == "linux":
-                    controls.set_host("spare", placement.AllowedHost())
-            return replies
-
-        with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):
-            yield
 
     def configure(self, order: str) -> None:
         _ = (self.root / "build_targets.conf").write_text(
@@ -413,26 +318,43 @@ source() {
         return [cast(SshRunnerEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def attempts(self) -> list[dict[str, object]]:
-        rows = [cast(dict[str, object], json.loads(line))
+        return [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")
                 for line in path.read_text().splitlines()
                 if cast(dict[str, object], json.loads(line)).get("kind") == "ssh_attempt"]
-        return sorted(rows, key=lambda row: cast(str, row["at"]))
 
     def enable_mac(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\nlinux_only.case=\n")
 
-    def release_memory_after_hook(self, observe: Callable[[CompletedMemoryHook], bool] | ReleaseMemoryAtWait = RELEASE_MEMORY_AT_WAIT,
-                                  *, after_attempts: int = 0) -> None:
+    def release_memory_after_hook(self, observe: Callable[[CompletedMemoryHook], bool] = lambda event: True) -> None:
         _ = self.hold_memory()
         self.memory_events_enabled = True
         self.memory_hook_observer = observe
-        directory = self.root / "observed-client"
-        directory.mkdir(exist_ok=True)
-        client = directory / "admission_client.py"
-        self.write_executable(client, QUEUED_MEMORY_OBSERVER)
-        self.environment.update(TEST_ADMISSION_CLIENT=str(client), TEST_OBSERVE_AFTER_ATTEMPTS=str(after_attempts))
+        observer = self.root / "observe-memory-hook.py"
+        self.write_executable(observer, OBSERVE_MEMORY_HOOK)
+        self.install_admission_client(observer)
         os.mkfifo(self.runner_state / "memory-hook-ack")
+
+    def control_admission_clock(self) -> None:
+        """Keep local admission ahead of retry passes in result checks."""
+        script = self.root / "admission-before-retry.py"
+        self.write_executable(script, ADMISSION_BEFORE_RETRY)
+        self.install_admission_client(script)
+
+    def install_admission_client(self, script: Path) -> None:
+        library = self.home / ".claude/scripts/lib"
+        if library.is_symlink():
+            library.unlink()
+            library.mkdir()
+            launcher = f'exec "{REPOSITORY}/scripts/lib/py" "$@"\n'
+        else:
+            launcher = (library / "py").read_text().removeprefix("#!/bin/sh\n")
+        for source in (REPOSITORY / "scripts/lib").iterdir():
+            if source.name != "py" and not (library / source.name).exists():
+                (library / source.name).symlink_to(source)
+        self.write_executable(library / "py", '#!/bin/sh\n'
+            + 'case "${1:-}" in */admission_client.py)\n'
+            + f'  exec "{REPOSITORY}/scripts/lib/py" "{script}" "$@" ;;\nesac\n' + launcher)
 
     @override
     def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -446,19 +368,9 @@ source() {
                 while True:
                     sequence += 1
                     event_path = self.runner_state / f"memory-hook-{sequence}"
-                    self.wait_until(lambda: event_path.exists() or process.poll() is not None,
-                                    str(event_path), (process,))
-                    if not event_path.exists():
-                        with self.admission.loop_turn():
-                            authorized = any(isinstance(saved.permission, placement.PermissionConsumed)
-                                             and saved.assignment.destination.provider != "local"
-                                             for saved in self.admission.server.assignments.values())
-                        if authorized and isinstance(self.memory_hook_observer, ReleaseMemoryAtWait):
-                            return self.finish_verify(process)
-                        self.wait_for_path(event_path, (process,))
+                    self.wait_for_path(event_path, (process,))
                     event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
-                    release = (True if isinstance(self.memory_hook_observer, ReleaseMemoryAtWait)
-                               else self.memory_hook_observer(event))
+                    release = self.memory_hook_observer(event)
                     if release and not event["left"]:
                         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
                     settled = release or event["left"]
@@ -471,10 +383,7 @@ source() {
                 output, errors = process.communicate()
                 return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
             except BaseException:
-                try:
-                    self.capture_queue_state()
-                finally:
-                    self.stop_verify(process)
+                self.stop_verify(process)
                 raise
         finally:
             os.close(acknowledgment)

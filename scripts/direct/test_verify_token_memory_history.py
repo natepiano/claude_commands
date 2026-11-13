@@ -119,30 +119,16 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         shell = self.root / "board-clock.sh"
         _ = shell.write_text('export UNIT_NOW_EPOCH="$(< "$TEST_BOARD_CLOCK")"\n')
         hidden = admission.socket_path.with_suffix(".unavailable")
-        handle_request = admission.server.handle_request
-        interrupted = False
-
-        def interrupt_first_placement(request: wire.Request,
-                connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            nonlocal interrupted
-            if isinstance(request, wire.PlacementRequest) and not interrupted:
-                interrupted = True
-                _ = admission.socket_path.rename(hidden)
-                assert isinstance(connection, service.Connection)
-                connection.socket.shutdown(socket.SHUT_RDWR)
-                return []
-            return handle_request(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=interrupt_first_placement))
+        _ = admission.socket_path.rename(hidden)
         errors = self.root / "connection.err"
         with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--local", "connection renewal fixture", "--no-cache"], cwd=self.root,
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                 env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
                      "BASH_ENV": str(shell), "TEST_BOARD_CLOCK": str(clock)},
                 stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
         try:
-            self.wait_for_output(errors, "build queue not reachable; trying for", process)
+            self.wait_for_output(errors, "admission service unavailable", process)
             with admission.loop_turn():
                 self.assertEqual(admission.server.waiters, {})
                 self.assertEqual(admission.server.reservations, {})
@@ -209,7 +195,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
                     assert isinstance(connection, service.Connection)
                     connection.socket.shutdown(socket.SHUT_RDWR)
                     return []
-            elif isinstance(request, (wire.AdmitRequest, wire.PlacementRequest)):
+            elif isinstance(request, wire.AdmitRequest):
                 admission.server.build_history_generation += 1
             return handle_request(request, connection)
 

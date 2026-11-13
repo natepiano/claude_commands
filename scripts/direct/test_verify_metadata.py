@@ -157,8 +157,7 @@ class VerifyShellHelperTests(unittest.TestCase):
             output = Path(directory) / "seconds"
             script = "\n".join((
                 "set -euo pipefail", "phase_wait_finish() { :; }", "PY=false",
-                'BUILDLOG_HOLD_WAIT_FILE="$1"', shell_functions(DIRECT.parent / "lint/invoke.sh", "buildlog_now"),
-                shell_function(source, "collect_routing_wait"),
+                'BUILDLOG_HOLD_WAIT_FILE="$1"', shell_function(source, "collect_routing_wait"),
                 "unset EPOCHREALTIME; EPOCHREALTIME=103.500000; ROUTING_WAIT_STARTED=100.250000",
                 "collect_routing_wait", 'test -z "$ROUTING_WAIT_STARTED"',
                 "EPOCHREALTIME=99.000000; ROUTING_WAIT_STARTED=100.250000; collect_routing_wait",

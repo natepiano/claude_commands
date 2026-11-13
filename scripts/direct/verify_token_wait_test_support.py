@@ -3,13 +3,11 @@ from __future__ import annotations
 
 from scripts.build_queue import admission_records
 
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
-from dataclasses import replace
+from scripts.build_queue.admission_test_support import caller_admission
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 from collections.abc import Callable
 
@@ -24,7 +22,6 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest import mock
 from pathlib import Path
 from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
@@ -84,10 +81,7 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.environment = self.fixture_environment.copy()
-        admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.05)
-        admission.server.host_probe = lambda key: private_caller_provider(admission, self.environment, key)
-        _ = caller_provider_controls(self, admission)
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         _ = (self.root / "build_targets.conf").write_text(
@@ -176,7 +170,6 @@ esac
         source = self.root / "src" / "lib.rs"
         source.parent.mkdir()
         _ = source.write_text("pub fn value() -> u8 { 1 }\n")
-        (self.root / ".git").mkdir()
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         # Admission must use this test's memory state, including pressure.
@@ -239,7 +232,6 @@ esac
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
-            "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
             "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
@@ -255,9 +247,7 @@ esac
             "TEST_WAIT_HELPER": str(VERIFY.parent / "wait_for_test_state.py"),
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
             "TEST_MEMORY_EVENT": str(memory_event),
-            "TEST_RUNNER_STATE": str(self.root / "runner-state"),
         }
-        (self.root / "runner-state").mkdir()
 
     def write_wait_sleep(self, body: str) -> None:
         """Fake queue delays. Keep renewal and other delays on the real clock."""
@@ -383,29 +373,13 @@ esac
         admission = caller_admission(self, self.root, self.environment)
         with admission.loop_turn():
             waiting, = admission.server.waiters.values()
-            episode = waiting.request.episode
-            submitted = admission.server.placement_requests[episode]
-            deferred = replace(submitted.profile, peak=replace(submitted.profile.peak, bytes=60 * admission_records.GIB))
-            admission.server.placement_requests[episode] = replace(submitted, profile=deferred)
+            need = waiting.row["need"]
+            waiting.row["need"] = 60 * admission_records.GIB
             admission.free(48 * admission_records.GIB)
-        previous = admission.server.handle_request
-        paused = True
-
-        def handle(request: wire.Request,
-                   connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if paused and isinstance(request, wire.PlacementRequest) and request.episode == episode:
-                request = replace(request, profile=deferred)
-            return previous(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
 
         def resume() -> None:
-            nonlocal paused
-            if not paused:
-                return
             with admission.loop_turn():
-                paused = False
-                admission.server.placement_requests[episode] = submitted
+                waiting.row["need"] = need
                 admission.free(48 * admission_records.GIB)
 
         self.addCleanup(resume)
@@ -459,56 +433,38 @@ esac
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
-        """Add a private hold after the first local prerequisite report."""
-        admission = caller_admission(self, self.root, self.environment)
+        """A held natedev for the step's hold wait only.
+
+        verify.sh's first wait-local, before it takes the token, returns at once;
+        the step's wait-local marks `hold-waiting`, then waits for `hold-release`
+        and exits with `wait_status`. Every other verb succeeds.
+        """
         holds = self.root / "build-hold"
         holds.mkdir(exist_ok=True)
-        hold = holds / fixture_runtime_id("fixture-hold-owner")
-        released = self.root / "hold-release"
-        held_episode = ""
-        previous = admission.server.handle_request
-        original_provider = admission.server.host_probe
-        if wait_status == 75:
-            _ = (self.root / "build_targets.conf").write_text(
-                "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
-            _ = write_config_fixture(self.root / "mac-settings",
-                f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
-            from scripts.direct.verify_step_routes_test_support import RUNNER
-
-            runner = self.root / "held-mac-runner.py"
-            _ = runner.write_text(RUNNER)
-            self.environment.update({"MAC_TEST_CONFIG": str(self.root / "mac-settings"),
-                "VERIFY_MAC_RUNNER": str(runner), "TEST_MAC_EVENTS": str(self.root / "mac-events")})
-
-        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            if released.exists():
-                hold.unlink(missing_ok=True)
-            evidence = original_provider(key)
-            if key.destination.provider == "mac":
-                eligibility = placement.AllowedHost() if released.exists() else placement.TemporaryExclusion("busy")
-                if isinstance(evidence, placement.FreshHostEvidence):
-                    evidence = replace(evidence, eligibility=eligibility)
-            return evidence
-
-        def handle(request: wire.Request,
-                   connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            nonlocal held_episode
-            if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport)):
-                if not held_episode and isinstance(request.prerequisite, placement.TokenHeld):
-                    held_episode = request.episode
-                    _ = hold.write_text("private hold")
-                    for reader in admission.server.host_readers.values():
-                        if reader.key.destination.provider == "local" and isinstance(reader.latest, placement.FreshHostEvidence):
-                            admission.server.publish_host_evidence(replace(reader.latest,
-                                eligibility=placement.TemporaryExclusion("blocked")))
-                if held_episode == request.episode and hold.exists() and not (board / "locks/cargo.d").exists():
-                    (self.root / "hold-waiting").touch()
-            return previous(request, connection)
-
-        admission.server.host_probe = provider
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
-        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"}
+        _ = (holds / "holder.json").write_text("{}")
+        stub = self.root / "build_targets_stub.py"
+        _ = stub.write_text(r"""import os, sys
+from pathlib import Path
+with open(Path(os.environ["TEST_REPO"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.wait_for_test_state import wait_until
+root = Path(os.environ["TEST_HOLD_ROOT"])
+if sys.argv[1] == "eligible":
+    print("natedev_only test target")
+    print("natedev\teligible\t-\t-\t-")
+if sys.argv[1] == "wait-local":
+    calls = root / "wait-local-calls"
+    count = len(calls.read_text().splitlines()) if calls.exists() else 0
+    with calls.open("a") as stream:
+        _ = stream.write("wait-local\n")
+    if count >= 1:
+        (root / "hold-waiting").touch()
+        wait_until((root / "hold-release").exists, root)
+        raise SystemExit(int(os.environ["TEST_HOLD_STATUS"]))
+""")
+        return {**self.environment, "UNIT_RUN_DIR": str(board),
+                "UNIT_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
+                "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status),
+                "TEST_REPO": str(VERIFY.parents[2])}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
         with output.open("wb") as stream:
