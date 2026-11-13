@@ -560,6 +560,8 @@ def checkpoint_plan(request: MergeRequest) -> Path:
     pattern = (r"shrink\(([^()/\\]+)\): phase \S+ — .+" if isinstance(request.kind, ShrinkCommit)
                else r"docs\(([^()/\\]+)\): as-built")
     match = re.fullmatch(pattern, subject)
+    if match and isinstance(request.kind, AsBuiltCommit):
+        return Path("docs/plans") / (match[1] + ".md")
     return request.unit.plan.with_name(match[1] + ".md") if match else request.unit.plan
 
 
