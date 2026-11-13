@@ -36,7 +36,7 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, write_account_settings
+from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, set_config_credits, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
@@ -1408,8 +1408,9 @@ class AccountsTests(unittest.TestCase):
 
     def write_note(self, label: str, login: str, *, use_credits: str = "") -> None:
         path = Path(os.environ["AGENT_NOTES_DIR"]) / note_name(label)
-        credits = f"use_credits: {use_credits}\n" if use_credits else ""
-        _ = path.write_text(f"---\nlogin: {login}\n{credits}---\n", encoding="utf-8")
+        _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+        if use_credits:
+            set_config_credits(label, use_credits)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_notes_each_missing_group_and_uses_roles_for_configured_groups(self) -> None:
@@ -7178,7 +7179,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     self.assertEqual(outcome["kind"], "confirmed")
                 else:
                     self.assertEqual(calls, [])
-                    reason = "codex1: use_credits is off and its included usage is gone; the worker stays"
+                    reason = "codex1: it may not spend credits and its included usage is gone; the worker stays"
                     self.assertEqual(outcome, {**outcome, "kind": "failed", "reason": reason})
                     assert isinstance(result, accounts.GroupMoveStartFailed)
                     self.assertEqual({outcome.reason for outcome in result.outcomes
@@ -9355,8 +9356,7 @@ class PickerTests(unittest.TestCase):
     def test_picker_skips_paid_room_on_a_credits_off_account(self) -> None:
         self.codex("default", "workers@example.invalid")
         self.codex("codex2", "spare@example.invalid")
-        note = self.home / "notes/codex1.md"
-        _ = note.write_text("---\nlogin: workers@example.invalid\nuse_credits: off\n---\n")
+        set_config_credits("codex1", "off")
         self.reading("Codex", "workers@example.invalid", 0, 1, credits="6370")
         self.reading("Codex", "spare@example.invalid", 1, 3)
         self.assert_picked("codex2", tool="codex")
