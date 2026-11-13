@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.agents import remote
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -20,48 +21,52 @@ from scripts.production import fake_unit_host
 from scripts.production import production_lifecycle
 from scripts.production import showrunners, staff, unit_config
 from scripts.production import unit_lookup
+from scripts.production import session_records_test_support
 from scripts.production import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
-STUB = '''#!__PYTHON__
-import os
-import shutil
-from pathlib import Path
+# Only an interpreter can run the showrunners.py stub, so it stays Python and records any call.
+INTERPRETER_STUB = '''import os
 import sys
+from pathlib import Path
 
-state = Path(os.environ["LIFECYCLE_TEST_STATE"])
-name = Path(sys.argv[0]).name
-with (state / "calls").open("a") as output:
-    output.write(name + " " + " ".join(sys.argv[1:])
-                 + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "ssh":
-    print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
-    raise SystemExit(0)
-if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
-    print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else
-          '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}')
-    raise SystemExit(int((state / "board-exit").read_text()) if (state / "board-exit").exists() else 4)
-if name == "notifier.sh" and sys.argv[1:2] == ["remove"]:
-    timer = state / "notifier" / sys.argv[2]
-    if timer.exists():
-        shutil.rmtree(timer)
-    raise SystemExit(0)
-if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
-    raise SystemExit(0)
-raise SystemExit(99)
+with (Path(os.environ["LIFECYCLE_TEST_STATE"]) / "calls").open("a") as output:
+    output.write(Path(sys.argv[0]).name + " " + " ".join(sys.argv[1:]) + "\\n")
 '''
-# The session records and the message sender showrunners.py reads: nothing real is looked up or sent.
-SESSIONS = '''import json, os, pathlib, sys
-command, target = sys.argv[1:]
-for path in pathlib.Path(os.environ["NOTIFIER_SESSIONS_DIR"]).glob("*.json"):
-    record = json.loads(path.read_text())
-    if command == "socket" and target == "session:" + record["sessionId"]:
-        print(record["messagingSocketPath"])
-        raise SystemExit(0)
-raise SystemExit(1)
+# The executable stubs record the same calls without a Python start for each call.
+SHELL_STUB = '''#!/bin/sh
+state=$LIFECYCLE_TEST_STATE
+name=${0##*/}
+if [ "$name" = cargo-berth ]; then
+    printf '%s %s cwd=%s\\n' "$name" "$*" "$(pwd -P)" >> "$state/calls"
+else
+    printf '%s %s\\n' "$name" "$*" >> "$state/calls"
+fi
+case $name in
+ssh)
+    if [ -e "$state/mac-rc" ]; then printf 'rc=%s\\n' "$(cat "$state/mac-rc")"; else echo rc=0; fi
+    exit 0 ;;
+cargo-berth)
+    if [ "$1" = board ]; then
+        if [ -e "$state/reservations.json" ]; then
+            cat "$state/reservations.json"; echo
+        else
+            echo '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}'
+        fi
+        if [ -e "$state/board-exit" ]; then exit "$(cat "$state/board-exit")"; fi
+        exit 4
+    fi
+    exit 0 ;;
+notifier.sh)
+    if [ "$1" = remove ]; then rm -rf "$state/notifier/$2"; fi
+    exit 0 ;;
+py) exit 0 ;;
+esac
+exit 99
 '''
+# The message sender showrunners.py reads: nothing real is sent.
 SEND = '''import json, os, sys
 with open(os.environ["TEST_SENT"], "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -114,12 +119,11 @@ class LifecycleFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        socket_for = showrunners.socket_for
         labeled_sessions = unit_lookup.labeled_sessions
         self.staff = StaffTestCase()
         self.addCleanup(self.staff.doCleanups)
         self.staff.setUp()
-        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
+        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", self.socket_for))
         _ = self.enterContext(mock.patch.object(unit_lookup, "labeled_sessions", labeled_sessions))
         self.addCleanup(self.remove_fixture)
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
@@ -135,6 +139,11 @@ class LifecycleFixture(unittest.TestCase):
         for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
             _ = fixture_member("unit", name=name, parent=owner.id,
                                worktree=staff.PresentWorktree(remote.local_machine(), folder))
+
+    def socket_for(self, target: str, *, deadline: float = math.inf) -> str | None:
+        """Read the fixture session records as the sessions script does, without a process for each lookup."""
+        del deadline  # Fixture records answer at once.
+        return session_records_test_support.socket_path(self.state / "sessions", target)
 
     def remove_fixture(self) -> None:
         """Release the next fixture path before removal can fail."""
@@ -174,11 +183,10 @@ class LifecycleFixture(unittest.TestCase):
                     "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
                     "PHASE_TABLE_VAULT": str(self.phase_table_vault),
                     "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
-                    "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
+                    "SHOWRUNNERS_SESSIONS": session_records_test_support.__file__,
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
         self.env.update(fake_unit_host.environment(self.root))
         self.env.update(config_environment(self.root / "config"))
-        self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -196,8 +204,12 @@ class LifecycleFixture(unittest.TestCase):
 
     def stub(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.write(path, STUB.replace("__PYTHON__", sys.executable))
-        path.chmod(0o644 if path.name == "showrunners.py" else 0o755)
+        if path.name == "showrunners.py":
+            self.write(path, INTERPRETER_STUB)
+            path.chmod(0o644)
+        else:
+            self.write(path, SHELL_STUB)
+            path.chmod(0o755)
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

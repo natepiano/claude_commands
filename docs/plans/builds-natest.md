@@ -3821,3 +3821,24 @@ Checkpoint 6d2acbfb9. Only `scripts/lint/test_sweep.py` changed; no test is remo
 - `write()` allocates fixture file blocks with `posix_fallocate` on Linux, not random bytes. The sweep reads only `st_size` and `st_blocks`. Other platforms keep the random-byte write. The crossing recommendation test went from 12.7 to 0.3 local CPU s.
 - `skip_host_ci_targets` points `sweep_ci_targets` at a missing folder. `SweepCase.setUp` calls it, and the claim subtest calls it again after `local_remote_transport`. On natedev, floor tests had walked the real CI folders (about 730,000 entries).
 - Local module CPU: 40.1 s before, 13.2–13.9 s after. AWS pair (c7a.8xlarge, 3 rounds): median 15.88 → 10.95 CPU s.
+
+### Phase 259 — The production lifecycle tests start fewer processes  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### Work Order
+
+**Goal:** `production/test_production_lifecycle.py` uses less CPU in aws pairs; every behavior check stays.
+
+**Spec:**
+- Profile: 21.6 local CPU s. Fixture stubs start Python for each call: `cargo-berth` 56, `notifier.sh` 27, `sessions.py` 110 starts.
+- Replace the executable call stubs with one POSIX shell stub that writes the same `calls` lines and exit codes.
+- Keep a Python stub only for `showrunners.py`, which only an interpreter can run, so a wrong call still records its name.
+- Answer in-process `showrunners.socket_for` from the fixture session records. One function in `session_records_test_support.py` serves the in-process lookup and the process runs.
+- Test and test-support files only. Production `git` and `phase_table.py` starts stay; a production change goes to sdlc as a proposal.
+
+**Files:** `scripts/production/production_lifecycle_test_support.py`, `scripts/production/session_records_test_support.py` (new).
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:** the module passes three runs; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
