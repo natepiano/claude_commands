@@ -1125,7 +1125,29 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.sync_config()
         for verb in ("check", "clippy", "mend-check", "doc", "build"):
             with self.subTest(verb=verb):
-                self.assert_declined(self.command("--workspace", verb=verb), "linux_only")
+                self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertEqual(self.events_for("rsync"), [])
+
+    def test_named_package_is_checked_alone_for_every_verb(self) -> None:
+        # linux_only keeps the named package's own steps off the Mac; a package that depends on it still builds.
+        self.write_portable_workspace()
+        _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
+        member = self.repository / "linux-part"
+        member.mkdir(exist_ok=True)
+        _ = (member / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
+        with (self.repository / "portable/Cargo.toml").open("a") as output:
+            _ = output.write('[dependencies]\nlinux-part={path="../linux-part"}\n')
+        self.config["linux_only.hana"] = "linux-part"
+        self.sync_config()
+        config = offload.read_config(self.config_path)
+        verbs: tuple[offload.MacVerb, ...] = ("nextest", "check", "clippy", "mend-check", "doc", "build")
+        for verb in verbs:
+            with self.subTest(verb=verb):
+                self.assertIsInstance(offload.mac_step_eligibility(config, self.repository, "portable", verb),
+                                      offload.KnownRepository)
+                self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
+                self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
@@ -1151,7 +1173,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.config["linux_only.hana"] = "linux-part"
                 self.sync_config()
                 for verb in ("check", "clippy", "mend-check", "doc"):
-                    self.assert_declined(self.command("--workspace", verb=verb), "linux_only")
+                    self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
@@ -1160,7 +1182,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         with (self.repository / "portable/Cargo.toml").open("a") as output:
             _ = output.write('[dependencies]\nmissing={path="../missing"}\n')
         for verb in ("check", "clippy", "mend-check", "doc"):
-            self.assert_declined(self.command("--workspace", verb=verb), "repo")
+            self.assert_declined(self.command("--workspace", verb=verb, package=""), "repo")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
@@ -1179,7 +1201,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotIn("/staged-file.rs", copied.get("exclude", ""))
         self.config["linux_only.hana"] = "staged"
         self.sync_config()
-        self.assert_declined(self.command("--workspace", verb="doc", source=offload.StagedDocSnapshot(snapshot)), "linux_only")
+        snapshot_source = offload.StagedDocSnapshot(snapshot)
+        self.assert_declined(self.command("--workspace", verb="doc", package="", source=snapshot_source), "linux_only")
         self.assertEqual(len(self.events_for("rsync")), 1)
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:

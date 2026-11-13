@@ -19,9 +19,9 @@ A lint can leave its first mend memory wait for a free Mac.
 `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
 Its first line is `any_target` or `natedev_only <reason>`.
 Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
-A named test package uses its package rule.
-A workspace test refuses Mac offload when any member is `linux_only`.
-Check, lint, and doc require every workspace member to permit macOS.
+A step with a named package checks only that package against `linux_only.<repo>`, for every kind.
+`linux_only` keeps a package's own steps off the Mac; a package that depends on one still runs there.
+A step with no package refuses Mac offload when any workspace member is `linux_only`.
 This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
 An unreadable member keeps the step on natedev.
 Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
