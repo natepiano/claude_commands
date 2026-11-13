@@ -3826,19 +3826,11 @@ Checkpoint 6d2acbfb9. Only `scripts/lint/test_sweep.py` changed; no test is remo
 **Depends on:** none
 **Owner:** builds gave the go 2026-11-13.
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_production_lifecycle.py` uses less CPU in aws pairs; every behavior check stays.
+Checkpoint 215299cb2. Changed `production_lifecycle_test_support.py` and added `session_records_test_support.py`; no test is removed or folded.
 
-**Spec:**
-- Profile: 21.6 local CPU s. Fixture stubs start Python for each call: `cargo-berth` 56, `notifier.sh` 27, `sessions.py` 110 starts.
-- Replace the executable call stubs with one POSIX shell stub that writes the same `calls` lines and exit codes.
-- Keep a Python stub only for `showrunners.py`, which only an interpreter can run, so a wrong call still records its name.
-- Answer in-process `showrunners.socket_for` from the fixture session records. One function in `session_records_test_support.py` serves the in-process lookup and the process runs.
-- Test and test-support files only. Production `git` and `phase_table.py` starts stay; a production change goes to sdlc as a proposal.
-
-**Files:** `scripts/production/production_lifecycle_test_support.py`, `scripts/production/session_records_test_support.py` (new).
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:** the module passes three runs; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
+- One POSIX shell stub replaces the Python stub for the executable fixture commands, with the same `calls` lines, exit codes and board output.
+- `showrunners.py` keeps a Python stub, because only an interpreter runs it; a wrong call still records its name.
+- `session_records_test_support.socket_path` answers the in-process `socket_for` and serves as the `SHOWRUNNERS_SESSIONS` script for process runs.
+- AWS pair (c7a.8xlarge, 3 rounds): median 29.54 → 24.55 CPU s. The rest is production `git` and `phase_table.py` starts.
