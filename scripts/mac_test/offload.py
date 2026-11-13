@@ -708,7 +708,22 @@ class ActiveBackoff:
     """The last failed probe still suppresses remote work."""
 
 
-BackoffState = NoBackoff | ActiveBackoff
+@dataclass(frozen=True)
+class UnreadableBackoff:
+    """The backoff file exists but holds no finite time; a strict read names why."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReadBackoff:
+    """The caller has not read backoff, so the eligibility check reads it."""
+
+
+READ_BACKOFF = ReadBackoff()
+
+
+BackoffState = NoBackoff | ActiveBackoff | UnreadableBackoff
 NO_BACKOFF = NoBackoff()
 ACTIVE_BACKOFF = ActiveBackoff()
 
@@ -1195,16 +1210,16 @@ def read_failed_probe(target: str = "mac") -> FailedProbeState:
     return FailedProbe() if (state_directory(target) / "failed_probe").exists() else NoFailedProbe()
 
 
-def read_backoff(now: float, target: str = "mac") -> BackoffState:
+def read_backoff(now: float, target: str = "mac", *, strict: bool = False) -> BackoffState:
     path = backoff_path(target)
     try:
         until = float(path.read_text(encoding="utf-8").strip())
     except FileNotFoundError:
         return NO_BACKOFF
-    except (OSError, ValueError):
-        return NO_BACKOFF
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableBackoff(str(error)) if strict else NO_BACKOFF
     if not math.isfinite(until):
-        return NO_BACKOFF
+        return UnreadableBackoff("backoff time is not finite") if strict else NO_BACKOFF
     return ACTIVE_BACKOFF if until > now else NO_BACKOFF
 
 
@@ -2386,7 +2401,8 @@ def verb_kind(verb: MacVerb) -> str:
 
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
-                         verb: MacVerb, target: str = "", *, kind: str = "") -> KnownRepository | IneligibleMacStep:
+                         verb: MacVerb, target: str = "", *, kind: str = "",
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     if not config.enabled:
         return IneligibleMacStep("off")
@@ -2396,7 +2412,10 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     if target and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform):
         if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
             return IneligibleMacStep("target does not permit this command")
-        if isinstance(read_backoff(time.time(), target), ActiveBackoff):
+        current = read_backoff(time.time(), target) if isinstance(backoff, ReadBackoff) else backoff
+        if isinstance(current, UnreadableBackoff):
+            return IneligibleMacStep("state")
+        if isinstance(current, ActiveBackoff):
             return IneligibleMacStep("backoff")
         return repository
     key = f"linux_only.{repository.name}"
@@ -2412,7 +2431,10 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
                 return IneligibleMacStep("linux_only")
         except (OSError, UnicodeError, ValueError):
             return IneligibleMacStep("repo")
-    if isinstance(read_backoff(time.time(), target), ActiveBackoff):
+    current = read_backoff(time.time(), target) if isinstance(backoff, ReadBackoff) else backoff
+    if isinstance(current, UnreadableBackoff):
+        return IneligibleMacStep("state")
+    if isinstance(current, ActiveBackoff):
         return IneligibleMacStep("backoff")
     return repository
 

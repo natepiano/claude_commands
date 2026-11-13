@@ -109,6 +109,7 @@ from scripts.build_queue.admission_records import (
     NoWaiter,
     NormalOrder,
     OverrideRoom,
+    PackageNotRecorded,
     PeakDecayed,
     PeakFileUnreadable,
     PeakHistory,
@@ -2181,7 +2182,8 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                            identity["folder"], row["since"], row["need"], admission.reason, row.get("unit", ""),
                            project=step_project(row.get("repository_name", "")),
-                           run=row.get("build_run", NoLiveBuildRun()))
+                           run=row.get("build_run", NoLiveBuildRun()),
+                           package=row["package"] if "package" in row else PackageNotRecorded())
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
@@ -2502,7 +2504,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    identity["step"], identity["folder"], row["need"], memory,
                                    run=row.get("build_run", NoLiveBuildRun()), started_at=step_estimator.epoch(row["admitted_at"]),
                                    unit=identity.get("unit", ""), pid=row["pid"],
-                                   project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"])))
+                                   project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"]),
+                                   package=row["package"] if "package" in row else PackageNotRecorded()))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value,
                    pid=value.pid if isinstance(value, CompilerServiceMemory) else PidNotRecorded())

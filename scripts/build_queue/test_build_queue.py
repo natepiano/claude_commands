@@ -224,9 +224,9 @@ class QueueTests(NotificationGuardedTestCase):
     def test_mac_idle_alert_precedes_queue_and_selection_in_json(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW)
         reading = head_reading(now=NOW)
-        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
+        expected = ("MAC BLOCKED by research since "
                     + time.strftime("%H:%M", time.gmtime(NOW - 600))
-                    + " (P15 F11 L0 run); /build:mac unblock clears it.")
+                    + " (P15 F11 L0 run): 7 steps wait for the Mac, idle 10 min; /build:mac unblock clears it.")
         with mock.patch.object(time, "time", return_value=NOW), \
              mock.patch.object(build_queue, "user_zone", return_value=ZoneInfo("UTC")):
             for arguments in ((), ("1",)):
@@ -263,7 +263,7 @@ class QueueTests(NotificationGuardedTestCase):
             line = mac_idle_alert.alert_line(path, NOW, ZoneInfo("UTC"))
             elapsed = time.perf_counter() - started
         self.assertIsNotNone(line)
-        self.assertIn("Blocked by research", line or "")
+        self.assertIn("MAC BLOCKED by research", line or "")
         self.assertLess(elapsed, 0.05)
 
 

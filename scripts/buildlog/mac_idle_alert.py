@@ -6,6 +6,7 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -123,7 +124,14 @@ def clock_text(at: float, zone: ZoneInfo, *, include_zone: bool = False) -> str:
         return "unknown time"
 
 
-def alert_line(path: Path, now: float, zone: ZoneInfo) -> str | None:
+class BlockText(Enum):
+    """The Builds page shows a Mac block in its own card, so its alert keeps only the diagnostics."""
+
+    SHOWN = auto()
+    OMITTED = auto()
+
+
+def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = BlockText.SHOWN) -> str | None:
     saved = read_alert(path)
     if isinstance(saved, NoSavedAlert):
         return None
@@ -148,13 +156,16 @@ def alert_line(path: Path, now: float, zone: ZoneInfo) -> str | None:
     if elapsed < settings.alert_seconds:
         return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
     holder, detail = display_field(saved["holder"]), display_field(saved["detail"])
+    suffix = f"; {query_reason}" if query_reason else ""
     if saved["cause"] == "blocked":
-        cause = f"Blocked by {holder} since {clock_text(saved['since'], zone)} ({detail}); /build:mac unblock clears it"
-    elif saved["cause"] == "claim_idle":
+        if block is BlockText.OMITTED:
+            return f"MAC IDLE WATCH: {query_reason}." if query_reason else None
+        return (f"MAC BLOCKED by {holder} since {clock_text(saved['since'], zone)} ({detail}): {waiting} steps wait "
+                f"for the Mac, idle {int(elapsed // 60)} min; /build:mac unblock clears it{suffix}.")
+    if saved["cause"] == "claim_idle":
         cause = f"Claim of {holder} ({detail}) runs no build or test on the Mac"
     elif saved["cause"] == "disk":
         cause = "Mac disk exclusion keeps these steps on natedev"
     else:
         cause = "No block and no claim; the waiting steps do not take the Mac"
-    suffix = f"; {query_reason}" if query_reason else ""
     return f"MAC IDLE {int(elapsed // 60)} min: {waiting} steps wait for the Mac. {cause}{suffix}."

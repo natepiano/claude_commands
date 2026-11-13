@@ -375,7 +375,7 @@ function fitLabels() {}
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        payload = {"walk": [], "waiters": [], "swap_by": [], **cast(dict[str, object], data)}
+        payload: dict[str, object] = {"walk": [], "waiters": [], "swap_by": [], **cast(dict[str, object], data)}
         result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload),
             text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

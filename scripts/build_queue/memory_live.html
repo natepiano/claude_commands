@@ -13,7 +13,7 @@
   --building: #007e78; --testing: #b00079;
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
-  --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
+  --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c; --block: #8a5a00;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -24,7 +24,7 @@
     --building: #27c6b8; --testing: #ca458f;
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
+    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
   }
 }
 :root[data-theme="dark"] {
@@ -35,7 +35,7 @@
   --building: #27c6b8; --testing: #ca458f;
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
+    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -135,6 +135,24 @@ td small { color: var(--ink-3); }
 .pill.hold .pd { background: var(--cap); }
 .pill.hold { color: var(--cap); border-color: var(--cap); }
 .pill:hover { background: var(--free); }
+.targets { padding: 14px 18px 4px; }
+.target-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "head until" "reason reason" "owner since";
+  gap: 2px 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.targets .section-head + .target-row { border-top: 0; padding-top: 6px; }
+.target-head { grid-area: head; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.target-head .machine { font-weight: 600; }
+.target-state { padding: 0 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.82rem; font-weight: 600; color: var(--block); }
+.target-state.unavailable { color: var(--cap); }
+.target-reason { grid-area: reason; overflow-wrap: anywhere; }
+.target-owner { grid-area: owner; }
+.target-until { grid-area: until; }
+.target-since { grid-area: since; }
+.target-owner, .target-until, .target-since { color: var(--ink-2); font-size: 0.88rem; }
+.target-until, .target-since { text-align: right; }
+@media (max-width: 560px) {
+  .target-row { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "reason" "owner" "since" "until"; }
+  .target-until, .target-since { text-align: left; }
+}
 .gauges { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px; margin-top: 14px; }
 .gauge { grid-column: 1 / -1; padding-bottom: 22px; display: grid; grid-template-columns: subgrid; gap: var(--gap); align-items: center; font-size: 0.88rem; cursor: help; }
 .gauge > span { white-space: nowrap; }
@@ -287,6 +305,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <h1>Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
+
+  <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
   <section class="card">
     <div class="answer">
@@ -464,6 +484,24 @@ function tooltipHtml(key, data) {
     macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
     `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
 }
+function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
+function targetOwner(row) {
+  return [["Unit", row.unit], ["Showrunner", row.showrunner]]
+    .filter(([, name]) => name && name !== "—").map(([label, name]) => `${label} ${publicText(name)}`).join(" · ");
+}
+function renderTargets(rows) {
+  const box = $("targets");
+  box.hidden = !rows.length;
+  box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
+    const owner = row.state === "Unavailable" ? "" :
+      targetOwner(row) || (row.holder ? `Holder ${publicText(row.holder)}` : "Owner not recorded");
+    return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
+      `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
+      `<div class="target-until">${esc(sentence(row.until))}</div>` +
+      `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
+      `<div class="target-owner">${esc(owner)}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
+  }).join("");
+}
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
@@ -551,7 +589,7 @@ function tipText(key, d) {
   if (!text[0] && !text[1]) return text;
   const [kind, index] = key.split(":");
   const row = kind === "row" ? d.walk[+index] : kind === "wait" ? d.waiters[+index] : null;
-  const notes = row ? [row.head_text, row.priority_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
+  const notes = row ? [row.head_text, row.priority_text, row.mac_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
   if (!row || !macRow(row)) {
     const owner = row || (kind === "swap" ? d.swap_by[+index] : null);
     const fields = owner ? ownerTipFields(owner) : pageOwnerTipFields(d);
@@ -631,6 +669,7 @@ function render(d) {
   }
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
+  renderTargets(d.targets || []);
   $("room-equation").textContent = roomEquation(d);
   document.body.classList.remove("queue-unavailable");
   const t = d.total;

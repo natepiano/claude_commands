@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import Literal, Protocol, TypedDict, cast, final
+from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
@@ -213,7 +213,8 @@ def format_state(name: str, state: TargetState,
         return f"{name}: unreachable — {display_field(state.reason)}"
     if isinstance(state, StateUnreadable):
         return f"{name}: state unreadable — {display_field(state.reason)}"
-    line = f"{name}: held by {display_field(state.holder)} since {local_time(state.since)}"
+    since = f" since {local_time(state.since)}" if isinstance(state.since, datetime) else ", start not recorded"
+    line = f"{name}: held by {display_field(state.holder)}{since}"
     line += unit_label_suffix(state, labels)
     if isinstance(state.end, ExpiresAt):
         line += f" until {local_time(state.end.when)}"
@@ -335,6 +336,43 @@ def remote_verb(kind: StepKind) -> offload.MacVerb:
     return cast(offload.MacVerb, "nextest" if step == "test" else "clippy" if step in ("lint", "example") else step)
 
 
+@dataclass(frozen=True)
+class KindNotOffloaded:
+    """The recorded step has no Mac command."""
+
+
+def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
+    """Map a queue step name, such as nextest or mend, to its routing kind."""
+    from scripts.mac_test import offload
+
+    verbs = cast(tuple[offload.MacVerb, ...], get_args(offload.MacVerb))
+    for verb in verbs:
+        if offload.step_kind(verb) == step:
+            return cast(StepKind, offload.verb_kind(verb))
+    return KindNotOffloaded()
+
+
+def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
+                backoff: offload.BackoffState | offload.ReadBackoff,
+                ) -> offload.KnownRepository | ExcludedTarget:
+    """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
+    from scripts.mac_test import offload
+
+    config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
+    name = target.name if isinstance(target, SshTarget) else "mac"
+    first, *rest = offload.remote_step_kinds(kind)
+    repository = offload.mac_step_eligibility(config, repo_root, package,
+        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff)
+    if isinstance(repository, offload.IneligibleMacStep):
+        return ExcludedTarget(target, repository.reason)
+    for step in rest:
+        policy = offload.mac_step_eligibility(config, repo_root, package,
+            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
+        if isinstance(policy, offload.IneligibleMacStep):
+            return ExcludedTarget(target, policy.reason)
+    return repository
+
+
 def start_probe_recovery(target: SshTarget, repo_root: Path, package: str, kind: StepKind) -> None:
     """Start one recovery probe without delaying the eligibility answer."""
 
@@ -439,16 +477,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     try:
         config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
         name = target.name if isinstance(target, SshTarget) else "mac"
-        steps = offload.remote_step_kinds(kind)
-        eligibility = offload.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, steps[0])), name, kind=steps[0])
-        if isinstance(eligibility, offload.IneligibleMacStep):
-            return ExcludedTarget(target, eligibility.reason)
-        for step in steps[1:]:
-            policy = offload.mac_step_eligibility(config, repo_root, package,
-                remote_verb(cast(StepKind, step)), name, kind=step)
-            if isinstance(policy, offload.IneligibleMacStep):
-                return ExcludedTarget(target, policy.reason)
+        eligibility = step_policy(target, repo_root, package, kind, backoff=offload.READ_BACKOFF)
+        if isinstance(eligibility, ExcludedTarget):
+            return eligibility
         if isinstance(answer, CapacityNotRead):
             answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root, session=session)
         if answer == "blocked":

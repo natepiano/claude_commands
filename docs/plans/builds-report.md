@@ -1385,3 +1385,14 @@ From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner 
 - aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
 
 **Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
+
+### Phase 73 — The Builds page shows each block and hold · status: todo
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". From builds (not the user), 2026-11-13: the item list below.
+
+1. The Builds page shows each active block or hold: a Mac block and a natedev hold. Each names its owner (showrunner and unit), why, since and until. No AWS hold exists: the permanent AWS builder was removed, and cloud gates have no hold of their own (director decision; an AWS hold kind, if added later, gets its row then).
+2. A blocked Mac reads "blocked", not "idle". The idle time may stay as detail.
+3. An item that is eligible for the Mac but runs or waits on natedev gets a Mac line in its tooltip. The line says why it does not go to the Mac, for example "Mac: blocked by research-unit (hana) until 15:59", "Mac: busy with <run>", "Mac: excluded, linux_only" or "Mac: kind not offloaded".
+4. The answer comes from the `build_targets.py` eligible and status readers. There is no second reader.
+5. An astra design review reads the design (a mockup or a written design with the shot) before the build. Its findings are fixed and go to builds with the checkpoint.
+6. Proof: before and after shots of the same live Mac block state.
