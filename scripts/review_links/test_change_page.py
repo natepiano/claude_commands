@@ -306,6 +306,20 @@ class ChangePageTests(unittest.TestCase):
                 self.assertFalse(second.exists())
                 self.assertEqual(review_link.review_root(), second)
 
+    def test_bare_command_prints_the_console_link_with_changes_selected(self) -> None:
+        configuration = self.temporary / "config"
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", configuration / "console.conf")
+        _ = (configuration / "memory_feed.conf").write_text(f"output_folder={self.root / 'builds'}\n")
+        result = self.command(change_page, change_page.main, [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        url = urlsplit(result.stdout.strip())
+        self.assertEqual(url.query, "page=changes")
+        self.assertTrue(url.path.endswith("/console.html"), result.stdout)
+        folder = self.root / url.path.split("/")[1]
+        self.assertTrue((folder / change_page.PAGE_NAME).is_file())
+        self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
+        self.assertTrue((folder / "console.html").is_file())
+
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
                               capture_output=True, text=True, check=True).stdout.strip()
@@ -2532,11 +2546,20 @@ class ChangePageTests(unittest.TestCase):
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>'''
-        content = body.replace('</body>', probe + '</body>').encode()
+        content = body.replace('</body>', '<img src="/probe-complete" alt="" hidden>' + probe + '</body>').encode()
         results: list[list[str]] = []
+        probe_complete = threading.Event()
 
         class BrowserProbe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the asynchronous checks report their result.
+                    if not probe_complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
@@ -2548,6 +2571,7 @@ class ChangePageTests(unittest.TestCase):
                     print("Review tab measurements:", payload.decode())
                 else:
                     results.append(cast(list[str], json.loads(payload)))
+                    probe_complete.set()
                 self.send_response(204)
                 self.end_headers()
 
@@ -2558,6 +2582,7 @@ class ChangePageTests(unittest.TestCase):
                 for mode in ("light", "dark"):
                     with self.subTest(mode=mode):
                         results.clear()
+                        probe_complete.clear()
                         profile = self.temporary / ("browser-profile-" + mode)
                         profile.mkdir()
                         run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
