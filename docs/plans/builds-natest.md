@@ -3792,38 +3792,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 256 — The stall watch tests do less repeated work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_stall_watch.py` uses less CPU in aws pairs, with the same tests and assertions.
+Checkpoint d7113b552. Changed `scripts/production/cli_fixture.py`, `fake_unit_host.py` and `test_stall_watch.py`; no test is removed or folded.
 
-**Decision:** next untouched module in the descending CPU list (show.py top 15:18: rank 17, 35.9 median CPU s, 122 tests; ranks 13-16 are done in earlier phases or in review). Slowest kept test `StallWatchTests.test_a_resume_during_a_running_tick_retires_the_observation_then_observes_the_new_prompt` 11.5 s.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_stall_watch.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Remove repeated work a test does not check: per-test setup that can be built once per class and copied, process starts that a content-only test does not check (use the `invoke_cli` pattern), and repeated parsing. Keep real process starts where a test checks process integration, exit status, signals or waits. Also look for test-isolation defects: inherited `UNIT_*` variables, real run roots, real staff or home paths. Report each one.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/test_stall_watch.py`
-- `scripts/production/cli_fixture.py` (director, 17:20: `invoke_cli`'s `patch.dict(os.environ, clear=True)` was about 40% of the profiled CPU; 87 modules import the fixture)
-- `scripts/production/fake_unit_host.py` (director: one children update for each batch; 22 consumer modules)
-
-**Workers:** 1 writer; one test module. No-worker mode: the director writes it.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235-238 and 251: class seed copies; register cleanup before a copy. Phase 252: bind private run roots with `bind_private_run_roots`. Phase 242: in-process calls bind per call the module state that the real process reads at start. Phases 240-247: natedev gains can come from host state; only aws pairs decide a land.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
-- The 22 `fake_unit_host` consumers pass. About 280 test modules reach `cli_fixture`, so the land runs the full gate.
+- `invoke_cli` swaps the environment in place through `_exact_environment`. It changes only differing keys and restores the caller's environment when the swap fails.
+- `fake_unit_host` writes the children file once for each host write, not once for each process.
+- The ps stub uses shell builtins. The send.py stub writes `repr(record)`; `sent()` reads it with `ast.literal_eval`.
+- Local module CPU: 35.3 s before, 25.1 s after. AWS pair (c7a.8xlarge, 3 rounds): median 29.06 → 23.47 CPU s. `cli_fixture.py` is shared, so the land runs the full gate.
 
 ### Phase 257 — The verify result environment tests do less repeated work  · status: done
 **Depends on:** Phase 250
