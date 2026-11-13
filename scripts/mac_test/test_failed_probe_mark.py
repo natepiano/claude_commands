@@ -595,15 +595,20 @@ class StepRecoveryTests(VerifyLintScopeFixture):
             + f'    with Path({str(calls)!r}).open("a") as output:\n'
             + '        output.write(json.dumps(sys.argv[2:]) + "\\n")\n'
             + f'os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n')
+        trace = self.root / "python-trace"
         self.environment.update({"BUILD_TARGETS_SCRIPT": str(Path(build_targets.__file__)),
-            "MAC_TEST_STATE_DIR": str(state), "CLAUDE_PYTHON": str(observer)})
+            "MAC_TEST_STATE_DIR": str(state), "CLAUDE_PYTHON": str(observer), "VERIFY_PY_TRACE": str(trace)})
         self.write_config(clippy="on")
         # A held recovery lock keeps the mark while the real local steps run.
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.verify("lint", "sample", "--local", "local fixture tools")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        rows = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()]
+        rows = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()] if calls.exists() else []
+        # verify.sh runs eligibility calls in its helper process; the trace names each one.
+        helper_calls = Path(f"{trace}.calls")
+        helper_rows = [line.split("\t") for line in helper_calls.read_text().splitlines()] if helper_calls.exists() else []
+        rows += [row[1:] for row in helper_rows if row[:2] == ["build_targets.py", "eligible"]]
         local_steps = [row for row in self.cargo_calls()
                        if row[:1] in (["mend"], ["+nightly"], ["clippy"]) and "--version" not in row]
         taplo_steps = [json.loads(line) for line in self.taplo_events.read_text().splitlines()]

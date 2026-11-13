@@ -583,7 +583,9 @@ verify_helper() {
     fi
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
-            while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do forwarded+=("$entry"); done
+            while IFS= read -r -d '' entry <&"$VERIFY_RESULT_ENVIRONMENT_FD"; do
+                [[ -z "$entry" ]] || forwarded+=("$entry")
+            done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
         if lock_file_descriptor 72 2>/dev/null && (
@@ -592,7 +594,7 @@ verify_helper() {
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
             printf '\0'
-        ) >&"$VERIFY_HELPER_INPUT" 2>/dev/null \
+        ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
@@ -672,7 +674,7 @@ finish_verify_run() {
         FINAL_PASS_START=""
     fi
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
-        "$PY" "$VERIFY_START_DIR/../agents/detached_runs.py" record-exit "$UNIT_DETACHED_RECORD" "$1" || true
+        verify_helper "$DETACHED_RUNS_SCRIPT" record-exit "$UNIT_DETACHED_RECORD" "$1" --pid "$$" || true
     fi
 }
 STEP_RECORD_ACTIVE=0
@@ -786,7 +788,7 @@ run_step() {
         if [[ -f "$HOLD_WAIT_DIR/probe-marks" ]]; then
             while IFS= read -r probe_mark; do
                 [[ -f "$probe_mark" ]] || continue
-                eligibility_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${STEP_ELIGIBILITY_ARGUMENTS[@]}") || eligibility_status=$?
+                eligibility_answer=$(verify_helper "$BUILD_TARGETS_SCRIPT" "${STEP_ELIGIBILITY_ARGUMENTS[@]}") || eligibility_status=$?
                 if (( eligibility_status != 0 )); then return "$eligibility_status"; fi
                 STEP_TARGET_TABLE=${eligibility_answer#*$'\n'}
                 break
@@ -1396,10 +1398,11 @@ esac
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
+verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
-    "$PY" "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+    verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
     case "$DETACH_STATUS" in
         0) exit 0 ;;
@@ -1410,7 +1413,6 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
-verify_helper --start
 if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
     if [[ -n "$BUILDLOG_RUN_START" ]]; then
@@ -1744,7 +1746,7 @@ collect_hold_wait() {
 
 interrupt_hold_wait() {
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
-        "$PY" "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
+        verify_helper "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
 }
 
@@ -2378,7 +2380,7 @@ finish_mac_pass() {
 check_routing_hold() {
     local admission=0
     if build_hold_nothing_held; then return 0; fi
-    "$PY" "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
+    verify_helper "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
         cat "$HOLD_WAIT_DIR/routing-diagnostic" >&2
@@ -2399,7 +2401,7 @@ initialize_step_record() {
     if [[ -n "$PINNED_TARGET" ]]; then arguments+=(--target "$PINNED_TARGET"); fi
     STEP_ELIGIBILITY_ARGUMENTS=("${arguments[@]}")
     STEP_ELIGIBILITY_READY=1
-    answer=$("$PY" "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
+    answer=$(verify_helper "$BUILD_TARGETS_SCRIPT" "${arguments[@]}") || status=$?
     if (( status != 0 )); then
         printf 'verify.sh: target eligibility check failed (exit %s); step refused\n' "$status" >&2
         exit "$status"
@@ -2656,7 +2658,7 @@ release_wait_claim() {
     local claim_id="" episode="" attempt="" claim_session=""
     if [[ -s "$HOLD_WAIT_DIR/ssh-reservation.identity" ]]; then
         IFS=$'\t' read -r claim_id episode attempt claim_session < "$HOLD_WAIT_DIR/ssh-reservation.identity"
-        "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
+        verify_helper "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ --claim-id "$claim_id" \
             --episode "$episode" --attempt "$attempt" --session "$claim_session" >/dev/null 2>&1 || true
     fi
     rm -f "$HOLD_WAIT_DIR/ssh-reservation" "$HOLD_WAIT_DIR/ssh-reservation.identity"
@@ -2682,11 +2684,21 @@ ssh_reserve_hook() {
     fi
     local remote_kind
     remote_kind=$(remote_step_kind)
-    printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
-        --kind "$remote_kind" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
-        --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" --target "$name"
-    if [[ "${3:-}" == 0 ]]; then printf '%s ' --new-step; fi
-    if [[ "$(target_platform "$name")" == macos ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
+    local reserve_arguments=("$BUILD_TARGETS_SCRIPT" reserve
+        --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
+        --kind "$remote_kind" --package "$PKG" --pid $$
+        --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
+        --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" --target "$name")
+    if [[ "${3:-}" == 0 ]]; then reserve_arguments+=(--new-step); fi
+    local runner
+    # External wait callbacks run beside this shell and cannot use its descriptors.
+    printf '{ if command -v verify_helper >/dev/null 2>&1; then '
+    for runner in verify_helper "$PY"; do
+        printf '%q ' "$runner" "${reserve_arguments[@]}"
+        if [[ "$(target_platform "$name")" == macos ]]; then printf '%s' '${SSH_RESERVE_RECOVERY:-}'; fi
+        if [[ "$runner" == verify_helper ]]; then printf '; else '; fi
+    done
+    printf '; fi; }'
 }
 
 ssh_retry_hook() {
@@ -2809,7 +2821,7 @@ route_test() {
     while true; do
         if [[ -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ]]; then
             local pinned_answer
-            pinned_answer=$("$PY" "$BUILD_TARGETS_SCRIPT" eligible --kind "$CMD" \
+            pinned_answer=$(verify_helper "$BUILD_TARGETS_SCRIPT" eligible --kind "$CMD" \
                 --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG" --target "$PINNED_TARGET") || return $?
             STEP_TARGET_TABLE=${pinned_answer#*$'\n'}
             step_state waiting_ssh
