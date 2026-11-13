@@ -756,8 +756,10 @@ class GateRecovery:
                     if descriptor >= 0:
                         os.close(descriptor)
         for folder in self.folders:
+            path = Path(folder)
             try:
-                shutil.rmtree(folder)
+                if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)):
+                    raise GateRefused(f"gate recovery kept held folder {path}")
             except FileNotFoundError:
                 pass
         self.folders.clear()

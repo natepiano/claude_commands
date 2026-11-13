@@ -72,7 +72,9 @@ def feed_code_paths() -> tuple[str, ...]:
         _ = importlib.import_module(name)
     source_root = Path(__file__).resolve().parents[2]
     paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
-    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
+    paths.update((*STARTUP_FILES, "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
     for module in tuple(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if isinstance(source, str) and source.endswith(".py"):
@@ -200,11 +202,20 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
     return parser.parse_args(argv, namespace=PageArguments())
 
 
+def page_url() -> str:
+    """Return the configured page URL without publishing a reading."""
+    folder = configured_output_folder(conf.read("memory_feed")).resolve()
+    page = folder / "memory_live.html"
+    url = review_link.snapshot_url(review_link.review_root().resolve(), page)
+    if not page.is_file():
+        raise FileNotFoundError(f"Builds page is not available: {page}")
+    return url
+
+
 def page_link() -> int:
     """Print the configured page URL without publishing a reading."""
     try:
-        folder = configured_output_folder(conf.read("memory_feed")).resolve()
-        url = review_link.snapshot_url(review_link.review_root().resolve(), folder / "memory_live.html")
+        url = page_url()
     except review_link.SNAPSHOT_ERRORS as error:
         print(f"Build page link: {error}")
         return 1
@@ -480,6 +491,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    queued_priority_units: list[str]
     unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
@@ -668,11 +680,13 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild]) -> Mapping[int, unit_
     if not builds:
         return {}
     try:
-        claims = [claim.record for claim in claim_state.read_claims(claim_state.state_paths())
-                  if claim.record.get("remote_host", "mac") == "mac"]
+        held_claims = [claim for claim in claim_state.read_claims(claim_state.state_paths())
+                       if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
     except claim_state.StateReadError:
         return {}
-    leases = [lease for lease in copies.held_remote_mirrors() if lease.identity.host == "mac"]
+    claims = [claim.record for claim in held_claims]
+    leases = [lease for lease in copies.held_remote_mirrors()
+              if lease.identity.host.rsplit("@", 1)[-1] == "mac"]
     labels = unit_labels.unit_labels_for([claim["submitting_session"] for claim in claims], os.environ)
 
     def contains(folder: str, project: str) -> bool:
@@ -692,11 +706,21 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild]) -> Mapping[int, unit_
             sessions.add(build.session)
         matches = {labels[claim["submitting_session"]] for claim in claims
                    if claim["submitting_session"] in labels and
+                   (not build.session or build.session == claim["submitting_session"]) and
                    (contains(claim["worktree"], build.folder) or
                     claim["submitting_session"] in sessions and
                     claim.get("repo_name", "") == build.repository)}
         if len(matches) == 1:
             result[build.pid] = next(iter(matches))
+        elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
+              not any(contains(claim["worktree"], build.folder) for claim in claims)):
+            repository_claims = [claim for claim in held_claims
+                                 if isinstance(claim.scope, claim_state.RepositoryScope) and
+                                 claim.scope.name == build.repository]
+            if len(repository_claims) == 1:
+                session = repository_claims[0].record["submitting_session"]
+                if session in labels:
+                    result[build.pid] = labels[session]
     return result
 
 
@@ -1106,9 +1130,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
     unmatched_priority_text = ""
+    queued_priority_units: list[str] = []
     if isinstance(explanation.priority, admission_records.QueuePriority):
         priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
                       for entry in explanation.priority.entries}
+        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
         matched_units: set[str] = set()
         for work_row in (*work_rows, *waiting_rows):
             if work_row["unit"] in priorities:
@@ -1151,6 +1177,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,

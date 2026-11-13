@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.client import HTTPConnection
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
+from scripts.review_links import review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
@@ -46,10 +48,21 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ())
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
-def with_queue_priority(reading: admission_records.QueueRead) -> admission_records.QueueRead:
+def with_queue_priority(reading: admission_records.QueueRead, units: tuple[str, ...] = ("research",)
+                        ) -> admission_records.QueueRead:
     """Add a private user priority to the reading."""
-    priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "research", 'why': "the user's bump", 'set_at': reading.explanation.now, 'set_by': "fixture-user"},), admission_records.SettledPriority())
+    priority = admission_records.QueuePriority(tuple({"unit": unit, "why": "the user's bump",
+        "set_at": reading.explanation.now, "set_by": "fixture-user"} for unit in units))
     return replace(reading, explanation=replace(reading.explanation, priority=priority))
+
+
+def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...]) -> admission_records.QueueRead:
+    """Supply an ordered queue with repeated units and an older normal step."""
+    waiting = tuple(admission_records.WaitingStep(200 + index, f"wait-{index}", unit, "nextest",
+        f"/fixture/{unit}", 100 - index * 10, admission_records.GIB, admission_records.NeedsMemory(), unit=unit)
+        for index, unit in enumerate(("research", "research", "cables", "normal")))
+    current = replace(reading, view=replace(reading.view, waiting=waiting))
+    return with_queue_priority(current, units) if units else current
 
 
 def report_fixture(*, empty: bool = False) -> charts.PageData:
@@ -370,6 +383,54 @@ class MemoryFeedTests(unittest.TestCase):
                     self.assertNotIn(error, payload)
                 self.assertEqual(sum(row.get("kind") == "mac-unavailable" for row in page["walk"]), 1)
 
+    def mac_clone_units(self, build: queue_view.MacBuild, *, host: str = "mac", count: int = 1,
+                        mirror: bool = False) -> dict[int, unit_labels.UnitLabels]:
+        """Resolve a manual clone against private claims and mirror records."""
+        from scripts.copies import copies
+        from scripts.mac_test import claim_state, floor_claims
+
+        claims: list[claim_state.HeldClaim] = []
+        labels: dict[str, unit_labels.UnitLabels] = {}
+        for index in range(count):
+            session = f"claim-session-{index}"
+            record: claim_state.RemoteJobClaim = {"claim_id": f"claim-{index}", "episode": "episode",
+                "attempt": "attempt", "submitting_session": session, "pid": 900 + index,
+                "proc_start": "start", "what": "hana build", "worktree": "/home/nate/source",
+                "since": "2026-11-12T18:00:00+00:00", "remote_host": host, "repo_name": "hana"}
+            claims.append(claim_state.HeldClaim(claim_state.RepositoryScope("hana"),
+                self.root / f"claim-{index}.json", record))
+            labels[session] = unit_labels.UnitLabels("worker", "hana", "research")
+        leases = ((floor_claims.HeldMirror(floor_claims.MirrorIdentity(host, build.folder),
+                   "claim-session-0"),) if mirror else ())
+        with (mock.patch.object(claim_state, "read_claims", return_value=tuple(claims)),
+              mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            return dict(memory_feed.mac_build_units((build,)))
+
+    def test_mac_manual_clone_unit_requires_one_claim_and_a_known_non_ci_origin(self) -> None:
+        build = queue_view.MacBuild(68214, "/Users/nate/rust/hana_handmade", 200_000,
+            "cargo build -p hana", "hana", origin=queue_view.MacBuildOrigin.NON_CI)
+        cases = (
+            ("manual clone", build, "mac", 1, "research"),
+            ("SSH user", build, "natemccoy@mac", 1, "research"),
+            ("other host", build, "other", 1, "—"),
+            ("CI", replace(build, origin=queue_view.MacBuildOrigin.CI), "mac", 1, "—"),
+            ("old cache", replace(build, origin=queue_view.MacBuildOrigin.UNKNOWN), "mac", 1, "—"),
+            ("duplicate claims", build, "mac", 2, "—"),
+            ("no claim", build, "mac", 0, "—"),
+            ("other session", replace(build, session="another"), "mac", 1, "—"),
+            ("other session in worktree", replace(build, session="another", folder="/home/nate/source"), "mac", 1, "—"),
+            ("other repository", replace(build, repository="cargo-liner"), "mac", 1, "—"),
+        )
+        for name, row, host, count, expected in cases:
+            with self.subTest(name=name):
+                result = self.mac_clone_units(row, host=host, count=count)
+                self.assertEqual(result.get(row.pid, unit_labels.UnitLabels("")).unit, expected)
+
+    def test_mac_mirror_match_keeps_its_unit_with_an_unknown_origin(self) -> None:
+        build = queue_view.MacBuild(100, "/Users/nate/mirror/hana", 200_000, repository="hana")
+        self.assertEqual(self.mac_clone_units(build, host="natemccoy@mac", mirror=True)[100].unit, "research")
+
     def test_configuration_reads_all_keys_from_the_feed_config(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
@@ -399,12 +460,37 @@ class MemoryFeedTests(unittest.TestCase):
         folder = root / "fixture folder"
         _ = self.configuration.write_text(f"output_folder={folder}\n")
         _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        folder.mkdir(parents=True)
+        page = folder / "memory_live.html"
+        _ = page.write_text("published page")
         output = io.StringIO()
         with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example."}),
               mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
               redirect_stdout(output)):
+            self.assertEqual(memory_feed.page_url(), "http://fixture.example:9432/fixture%20folder/memory_live.html")
+            self.assertEqual(output.getvalue(), "")
             self.assertEqual(memory_feed.main(["link"]), 0)
         self.assertEqual(output.getvalue(), "http://fixture.example:9432/fixture%20folder/memory_live.html\n")
+        self.assertEqual(page.read_text(), "published page")
+        self.assertEqual(list(folder.iterdir()), [page])
+
+    def test_a_missing_page_raises_an_allowed_error_and_publishes_nothing(self) -> None:
+        root = self.root / "review-links"
+        folder = root / "fixture"
+        _ = self.configuration.write_text(f"output_folder={folder}\n")
+        _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
+              mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
+              redirect_stdout(output)):
+            with self.assertRaises(review_link.SNAPSHOT_ERRORS) as raised:
+                _ = memory_feed.page_url()
+            self.assertIsInstance(raised.exception, FileNotFoundError)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(memory_feed.page_link(), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertTrue(output.getvalue().startswith("Build page link: "))
+        self.assertIn("Builds page is not available", output.getvalue())
         self.assertFalse(root.exists())
 
     def test_link_refuses_a_folder_outside_the_review_root_with_one_plain_line(self) -> None:
@@ -412,10 +498,34 @@ class MemoryFeedTests(unittest.TestCase):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
               redirect_stdout(output)):
+            with self.assertRaises(review_link.SNAPSHOT_ERRORS):
+                _ = memory_feed.page_url()
             self.assertEqual(memory_feed.main(["link"]), 1)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertTrue(output.getvalue().startswith("Build page link: "))
         self.assertFalse(self.output.exists())
+
+    def test_page_url_keeps_snapshot_errors_for_the_console_caller(self) -> None:
+        with (mock.patch.object(review_link, "review_root", return_value=self.root),
+              mock.patch.object(review_link, "snapshot_url", side_effect=OSError("page unavailable"))):
+            with self.assertRaisesRegex(OSError, "page unavailable"):
+                _ = memory_feed.page_url()
+
+    def test_served_page_allows_same_origin_framing(self) -> None:
+        for name in ("review_links", "change_review"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", self.root / f"{name}.conf")
+        server_fixture = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server_fixture.doCleanups)
+        server_fixture.setUp()
+        memory_feed.publish_page(replace(memory_feed.read_configuration(), output_folder=server_fixture.root))
+        connection = HTTPConnection("127.0.0.1", server_fixture.port, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/memory_live.html")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertNotIn(response.getheader("X-Frame-Options", "").upper(), ("DENY",))
+        self.assertNotIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy", "").lower())
+        self.assertEqual(response.read().decode(), self.expected_page())
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
         def view() -> admission_records.QueueRead:
@@ -875,7 +985,7 @@ class MemoryFeedTests(unittest.TestCase):
                     sys.exit(status)
                 """)
                 result = subprocess.run([sys.executable, "-c", probe, str(installed), package, module, alias], cwd=installed,
-                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    env={**os.environ, "PYTHONPATH": str(installed / "scripts/lib/python_startup")}, capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), {"status": 1, "changed": True})
@@ -894,7 +1004,7 @@ class MemoryFeedTests(unittest.TestCase):
                         sys.exit(memory_feed.main(['--once', '--code-root', sys.argv[1]]))
                 """)
                 result = subprocess.run([sys.executable, "-c", restarted, str(installed), alias], cwd=installed,
-                    env={**os.environ, "PYTHONPATH": str(installed)}, capture_output=True, text=True,
+                    env={**os.environ, "PYTHONPATH": str(installed / "scripts/lib/python_startup")}, capture_output=True, text=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
@@ -915,6 +1025,22 @@ class MemoryFeedTests(unittest.TestCase):
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["priority_text"], expected)
+
+    def test_queued_priorities_follow_the_captured_order_and_clear_when_removed(self) -> None:
+        base = reservation_reading()
+        for units, expected in (((), []), (("research",), ["research"]),
+                                (("research", "cables"), ["research", "cables"]),
+                                (("cables", "research", "absent"), ["research", "cables"]),
+                                (("absent",), [])):
+            with self.subTest(priority=units):
+                reading = queued_reading(base, units)
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    payload = memory_feed.reading()
+                self.assertEqual(payload["queued_priority_units"], expected)
+                self.assertEqual([row["pid"] for row in payload["waiters"]], [200, 201, 202, 203])
+                self.assertEqual([row["since"] for row in payload["waiters"]], [100, 90, 80, 70])
+                decoded = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
+                self.assertEqual(decoded["queued_priority_units"], expected)
 
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(
@@ -1339,6 +1465,10 @@ def write_browser_fixture(folder: Path) -> None:
         pages: dict[str, object] = {}
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
+                pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        for name, units in (("queued_none", ()), ("queued_one", ("research",)),
+                            ("queued_two", ("research", "cables"))):
+            with mock.patch.object(admission_client, "view", return_value=queued_reading(base, units)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         readings["priority"] = with_queue_priority(base)
         with mock.patch.object(admission_client, "view", return_value=readings["priority"]):

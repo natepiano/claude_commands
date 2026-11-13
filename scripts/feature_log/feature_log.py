@@ -1707,6 +1707,8 @@ def land_review(
         if proposal["status"] == "dropped":
             raise FeatureLogError(f"proposal {row} is already dropped")
         saved_arguments = _proposal_namespace(proposal["args"])
+        # Each review row identifies a separate result, including older proposals.
+        saved_arguments.separate_result = True
         note = _new_note(saved_arguments)
         outputs = (
             _apply_add(note, saved_arguments)

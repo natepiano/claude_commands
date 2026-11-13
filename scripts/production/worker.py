@@ -55,6 +55,7 @@ class DispatchSubmitted:
     """The transcript contains the prompt without a matching final reply."""
 
     reply: str = ""
+    compacted_after_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,7 +125,7 @@ class DispatchPrompt:
     dispatch_id: str
 
 
-def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRecord],
+def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
@@ -137,6 +138,12 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 incomplete = True
                 continue
+            if isinstance(entry, dict):
+                if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, entry))):
+                    if submitted and responding and isinstance(reply, DispatchSubmitted):
+                        reply = replace(reply, compacted_after_prompt=True)
+                    continue
+                entry = worker_admission.transcript_entry(entry, set())
             if entry.startswith("user:\n"):
                 text = entry.removeprefix("user:\n").strip()
                 results = {part.removeprefix("Detached run: ") for part in text.splitlines()
@@ -201,14 +208,25 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
             raise ValueError("no review was written")
 
 
+def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend
+                     ) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+    try:
+        source = worker_admission.transcript_source(row, backend)
+    except ValueError as error:
+        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+            return
+        raise
+    yield from worker_admission.transcript_records(source)
+
+
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: Path) -> DispatchReceipt:
     """Read the shared receipt and require delivery of detached results."""
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    transcript = transcript_receipt(worker_admission.conversation_entries(row, backend, set()), line, DoneReply(dispatch_id))
+    transcript = transcript_receipt(_receipt_records(row, backend), line, DoneReply(dispatch_id))
     if isinstance(transcript.receipt, DispatchNotSubmitted):
-        transcript = transcript_receipt(worker_admission.conversation_entries(row, backend, set()), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
+        transcript = transcript_receipt(_receipt_records(row, backend), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
@@ -405,6 +423,11 @@ def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path) -> None:
                                         expected_request=handoff.assignment_id)
 
 
+def _done_instruction(dispatch_id: str) -> str:
+    return (f"End your final reply with this line alone: DONE {dispatch_id}\n"
+            "A reply that waits on a detached run is not final.")
+
+
 def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str) -> None:
     command = [sys.executable, str(Path(__file__).resolve()), "finish-dispatch", "--parent", str(parent),
                "--worker-id", str(row.id), "--session-dir", str(run), "--dispatch-id", instance]
@@ -414,6 +437,12 @@ def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: 
     except detached.DetachedStartFailure as error:
         progress_history.complete_dispatch(run, row.name, instance, status="error")
         raise herdr_types.HerdrFailure(str(error)) from error
+
+
+def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) -> ExitCode:
+    print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
+          file=sys.stderr)
+    return ExitCode.BUSY
 
 
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
@@ -437,6 +466,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return ExitCode.BUSY
         matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
             prompt=prompt, launcher_command=launcher_command)
+        if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+            return _prompt_conflict(matched)
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
                 and row is not None and worker_panes.worker_pass(row, session_dir).get("status") == "completed"):
@@ -480,18 +511,19 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             _ = cleanup.pop_all()
             _ = on_submission()
 
-        instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-            fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+        try:
+            instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
+                worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+        except progress_history.DispatchPromptRefused as refused:
+            return _prompt_conflict(refused.conflict)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
         saved = progress_history.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
         if not saved.line:
             dispatch_id = dispatch_id or instance
-            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. "
-                    f"End your final reply with this line alone: DONE {dispatch_id}\n"
-                    "A reply that waits on a detached run is not final.")
+            line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. " + _done_instruction(dispatch_id)
             handoff = worker_admission.dispatch_record(session_dir, name.value)
             if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
                 extract = worker_admission.handoff_path(session_dir, started.row)
@@ -801,6 +833,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command)
+            if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+                return _prompt_conflict(matched)
             if isinstance(matched, progress_history.MatchedDispatch):
                 name = matched.worker_name
         record = staff.snapshot()
@@ -868,6 +902,11 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
     if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
         client.answer_question(state.pane, text, target=str(row.current_session))
     else:
+        run = worker_panes.worker_run(row, record=record)
+        if isinstance(progress_history.active_dispatch(row.id, run), progress_history.ActiveDispatch):
+            delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run, record=record))
+            if delivery.completion_id:
+                text += "\n" + _done_instruction(delivery.completion_id)
         client.prompt(state.pane, text, target=str(row.current_session))
     return ExitCode.OK
 

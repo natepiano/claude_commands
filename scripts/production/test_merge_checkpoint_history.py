@@ -115,6 +115,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
         for configured_plan, closing_kind in (("docs/plans/alpha.md", "shrink"),
                                                ("docs/plans/new-alpha.md", "shrink"),
+                                               ("standby", "shrink"),
                                                ("docs/plans/new-alpha.md", "as-built"),
                                                ("docs/as-built/beta.md", "as-built")):
             with self.subTest(configured_plan=configured_plan, closing_kind=closing_kind):
@@ -143,6 +144,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 _ = config.write_text(config.read_text().replace("docs/plans/alpha.md", configured_plan))
                 result = self.run_checkpoint(sha, "--" + closing_kind, review=False)
                 self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                self.assertIn("scope: ok —", result.process.stdout)
                 self.assertEqual(len(self.events("review_regime.py")), 1)
                 self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
 

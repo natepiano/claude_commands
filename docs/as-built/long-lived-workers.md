@@ -78,6 +78,13 @@ That notice names its own pass and says it is a late result. The pane stays for 
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
 If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
+A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
+The pass records the digest before submission.
+Changed content at the same prompt path starts a new pass after completion.
+With an active pass, changed content returns busy and names that pass without printing `submitted`.
+This refusal applies when the launcher arguments change.
+The recorder repeats the content check under its lock before it changes the pass.
+The intentional second review stage keeps its existing pass across its separate prompt path.
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
@@ -110,6 +117,12 @@ The turn hook sends that reply to the director.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
 The notice includes the worker's last reply and leaves the pass active.
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+An empty turn without that compaction evidence stays ignored.
+Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
+For an active pass, `answer` adds the saved completion id to the normal DONE instruction.
+The pass and saved delivery stay unchanged, and the normal hook handles the matching DONE reply.
+A blocked Codex question receives only the supplied answer text.
 The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
 The completion rule accepts the saved DONE hook completion for the same dispatch.
 Live detached work prevents completion before pane closure.

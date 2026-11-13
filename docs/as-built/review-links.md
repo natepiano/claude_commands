@@ -411,6 +411,11 @@ Other lists use their filename's showrunner name, such as `natedev/C27`.
 A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
 A returning answer calls `drop_review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.
+The server sends one alert per list, row, and error text.
+It saves sent alerts under `.review-link-closeout-alert-*.json` in the snapshot root.
+The delivery lock serializes the alert check, send, and record write.
+Repeated saves and server restarts retain this record.
+A different error or row can send another alert.
 The server does not repeat the feature-log operation for a saved answer.
 
 The server then calls `change_review.save_verdict` with paths from the configured list and production records.

@@ -2349,3 +2349,77 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `config/mac_test.conf` — `ci_jobless_queued_minutes`
 
 **Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.
+
+### Phase 113 — A cargo version or help call runs during a build hold  · status: done
+
+#### As-built
+
+- After the subcommand is found, `scripts/build_hold/cargo` scans the later arguments up to `--`. A `-h` or `--help`, or a `-V` or `--version` with a subcommand other than `install`, runs the real cargo at once, with no Python and no scope.
+- During a hold, `cargo nextest --version` in `have_nextest()` (`scripts/lint/invoke.sh`) now succeeds, so `require_nextest()` no longer prints `cargo nextest is required`.
+- `install --version <v>` and a `--help` after `--` still go through the hold check, as in `ci_cargo_front.building_call()`.
+- No change to `invoke.sh` or to the rest of the wrapper.
+
+**Files:**
+- `scripts/build_hold/cargo` — the help and version scan after the subcommand
+- `scripts/build_hold/test_cargo_wrapper.py` — rows in `test_non_building_commands_skip_scope_and_python` for `nextest --version`, `clippy -V`, `build --help` and `test -h`; rows in the building test for `install --version 1.0 x` and `nextest run -- --help`
+
+### Phase 114 — A memory wait line names the build it waits behind  · status: todo
+
+**Depends on:** none. Merge queue's phase 44 re-land into this branch when it is on main, before the checkpoint; it edits `scripts/build_queue/admission_service.py` too.
+
+**Source (2026-11-13, builds showrunner):** "start A now". A is the first item of the plan for hana CI job 131906898560: 173 of its 183 minutes were memory-queue wait, and every wait line said `head  needs N GiB` with a blank name.
+
+#### Work Order
+
+**Goal:** each memory wait line says which build it waits behind. A hana CI front shows as `hana CI · <runner> · <step>`.
+
+**Measured:**
+1. `AdmissionService._wait_snapshot()` (`scripts/build_queue/admission_service.py`) sets `head_label` from the head waiter's `session_name` only. A CI front has no session name, so the label is empty.
+2. `admission_client.py` prints `; head {snapshot.head_label} needs …`. An empty label gives `head  needs 16.0 GiB`.
+3. `wire.Wait` gets a second head name from `inputs.ordered[0][1].get("session_name", "")` (`admission_service.py`, the wait reply loop). It has the same gap.
+4. `gate.waiter_unit_name()` (`scripts/lint/memory_admit.py`) already names a waiter: `unit`, then `session_name`, then the folder name, then the pid. `memory_feed.feed_step_labels()` already shows a CI runner's step as `hana CI` with the runner unit.
+
+**Spec:**
+1. Add one function that names a waiter for a wait line. It returns `hana CI · <runner> · <step>` for a CI front, and otherwise the same name as `gate.waiter_unit_name()`, with the step when the waiter has one.
+2. Find how a CI front is told apart from other waiters in the waiter record. Reuse that rule; add no second rule.
+3. Use the function for `head_label` in `_wait_snapshot()` and for the head name in `wire.Wait`.
+4. When the head is the waiter itself, the line says `this build is the queue head` in place of `head <name> needs`.
+5. Change no admission decision, wire field type or record format.
+
+**Tests:** add rows to the existing wait-snapshot and wait-line tests in `scripts/build_queue/test_admission_service.py` and `scripts/build_queue/test_admission_client.py`, as they fit:
+1. A CI-front head gives `head hana CI · hana-linux-2 · test needs 12.3 GiB`.
+2. A unit head with a session name keeps today's text.
+3. A head with no session name and no unit gives the folder name or the pid, never an empty name.
+4. The waiter that is the head gets the head text of Spec item 4.
+
+**Files:**
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/admission_client.py`
+- `scripts/build_queue/test_admission_service.py`
+- `scripts/build_queue/test_admission_client.py`
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.build_queue.test_admission_service` and `scripts.build_queue.test_admission_client`.
+2. Lint: `basedpyright` on the changed files, once after the edits.
+
+**Speed:** one name lookup for each wait reply; no new read of a file or of `/proc`.
+
+### Phase 116 — The Mac idle alert counts a running hana CI Mac job as Mac work  · status: done
+
+#### As-built
+
+- `mac_test.ci_activity()` returns `CiMacJobRunning` for an `in_progress` hana CI Mac job and `CiJobNotStarted` for a run whose Mac job has not started. `CiUnknown` keeps the free reading.
+- A pending block that waits on a running CI Mac job saves `waiting_on` `{"kind": "ci_mac_job"}` (`WaitingOnCiMacJob` in `claim_state.py`). A job that has not started keeps `ci_job`, and old `ci_job` records still read.
+- The block text is "Block pending for <holder>: hana CI is running on the Mac. Nothing new starts there, and you get a message when it finishes." `pending_wait_text` gives "hana CI is running on the Mac".
+- `mac_idle.mac_work()` returns `NatedevJobOnMac` for a block that waits on a running CI Mac job. With no block and no claim, it asks `ci_activity()` only while steps wait (`waiting_for_mac`) and `ci_repo` is set, and a running CI Mac job gives busy. Thus the idle alert does not send "No block and no claim" while hana CI runs on the Mac.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — the CI activity types and the block pending text
+- `scripts/mac_test/claim_state.py` — `WaitingOnCiMacJob` and its record form
+- `scripts/buildlog/mac_idle.py` — `mac_work` reads a running CI Mac job as Mac work
+- `scripts/mac_test/test_mac_test.py` — `test_busy_ci_keeps_block_pending_until_watch_sends_once` is a queued/running table
+- `scripts/buildlog/test_mac_idle.py` — rows for a running CI Mac job with a block and with no block

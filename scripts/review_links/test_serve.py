@@ -1,6 +1,8 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import importlib.util
 import os
 import select
@@ -598,7 +600,7 @@ class ServerCodeRestartTests(unittest.TestCase):
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
         driver = checkout / "driver.py"
-        _ = driver.write_text('''import importlib.util
+        _ = driver.write_text(python_tool_source('''import importlib.util
 import os
 import sys
 from contextlib import redirect_stdout
@@ -625,7 +627,7 @@ class ObservedServer(serve.ReviewLinksServer):
 serve.ReviewLinksServer = ObservedServer
 with redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
-''')
+'''))
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
