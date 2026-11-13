@@ -1367,5 +1367,15 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 - Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
 - Column gaps are equal in both tables. The headers read Target and Dur, and the freed space goes to Unit.
 - Proof: before and after shots of both tables, a Mac CI row and its tooltip, an owner tooltip and a 600px view. A live read rendered Mac CI pid 69040 as "CI nextest" over "hana CI".
+- Repair (merge test red, from builds): `test_memory_hover.py` expects the phase 71 text and checks the owner lines in each tooltip. Its page data supplies `walk`, `waiters` and `swap_by`, as the live feed does. The page does not change.
 
-**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_memory_hover.py`.
+
+### Phase 72 — AWS rows name their owner · status: todo
+
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png, pid 3184935). Cause, from aws: `cloud_gate.service_command` (scripts/aws_target/cloud_gate.py, about line 1061) starts each gate worker, and `gate_trial.py:476` each paired-trial worker, as a `systemd-run` unit without the caller's session id or unit. The worker's step record has no owner, so `queue_evidence.step_labels` falls back.
+
+1. The worker carries the caller's session id, session name and unit into its step record.
+2. A cloud gate row and a paired-trial row name their showrunner and unit, the same as a natedev row.
+3. aws owns cloud_gate.py and gate_trial.py; aws-unit is asked about the change.
+4. Proof: before and after page shots of an AWS row and its tooltip.
