@@ -739,6 +739,8 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
                                     self.assertEqual(observed["supervisor"]["group"], supervisor.pid)
                                     self.assertEqual(observed["command"]["group"], supervisor.pid)
                                     saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                                    self.assertEqual(process_start.process_start(supervisor.pid),
+                                                     process_start.Started(saved.get("supervisor_started", "")))
                                     self.assertEqual(saved.get("command_pid"), observed["command"]["pid"])
                                     self.assertEqual(process_start.process_start(saved.get("command_pid", 0)),
                                                      process_start.Started(saved.get("command_started", "")))
@@ -841,7 +843,8 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
         self.assertEqual((record["status"], record.get("exit_code"), record.get("stop_reason")),
                          ("running", 143, "fixture group stop"))
         self.assertEqual(self.pending(), {})
-        self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        with patch.object(process_start, "process_start", return_value=process_start.Gone()):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
         self.assertEqual(json.loads(path.read_text())["status"], "finished")
         messages = cast(list[str], self.pending()["messages"])
         self.assertEqual(len(messages), 1)
@@ -888,7 +891,9 @@ exit 143
 
     def test_orphan_reaping_waits_for_live_group_members_and_ignores_zombies(self) -> None:
         path = self.record(["bash", "verify.sh"])
-        self.update_record(path, pid=DEAD_PID)
+        self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
+        _ = self.stack.enter_context(patch.object(process_start, "process_start",
+                                                 return_value=process_start.Zombie("fixture-start")))
         listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} S\n", "")
         with patch.object(subprocess, "run", return_value=listing):
             self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
@@ -901,11 +906,61 @@ exit 143
 
     def test_orphan_reaping_keeps_the_run_pending_when_the_group_is_unreadable(self) -> None:
         path = self.record(["bash", "verify.sh"])
-        self.update_record(path, pid=DEAD_PID)
+        self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
+        _ = self.stack.enter_context(patch.object(process_start, "process_start",
+                                                 return_value=process_start.Zombie("fixture-start")))
         with patch.object(subprocess, "run", side_effect=OSError("unreadable process table")):
             self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(self.pending(), {})
         self.assertEqual(json.loads(path.read_text())["status"], "running")
+
+    def test_orphan_reaping_waits_for_a_command_in_a_new_session(self) -> None:
+        path = self.record(["bash", "verify.sh"])
+        checkout = Path(__file__).resolve().parents[2]
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            "import os, subprocess, sys; os.setsid(); print('ready', flush=True); "
+            + "sys.stdin.readline(); subprocess.run(sys.argv[1:], check=True); sys.exit(143)",
+            str(checkout / "scripts/lib/py"), str(checkout / "scripts/agents/detached_runs.py"),
+            "record-exit", str(path), "143"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        guard = LauncherHangGuard("command in a new session")
+        self.addCleanup(child.wait, timeout=guard.remaining())
+        self.addCleanup(child.kill)
+        assert child.stdin is not None and child.stdout is not None
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
+        self.assertEqual(child.stdout.readline(), "ready\n")
+        started = process_start.process_start(child.pid)
+        assert isinstance(started, process_start.Started)
+        self.update_record(path, pid=DEAD_PID, command_pid=child.pid, command_started=started.start)
+        self.assertNotEqual(os.getpgid(child.pid), DEAD_PID)
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(json.loads(path.read_text())["status"], "running")
+        output, _ = child.communicate("finish\n", timeout=guard.remaining())
+        self.assertEqual(child.returncode, 143, output)
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("FAIL (exit 143)", messages[0])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+    def test_orphan_reaping_ignores_a_group_without_its_saved_owner(self) -> None:
+        for observed in (process_start.Started("reused-start"), process_start.Gone()):
+            with self.subTest(observed=type(observed).__name__):
+                path = self.record(["bash", "verify.sh"])
+                self.update_record(path, pid=DEAD_PID, supervisor_started="original-start",
+                                   command_pid=DEAD_PID + 1, command_started="original-command-start")
+                listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} S\n", "")
+                with (patch.object(process_start, "process_start", return_value=observed),
+                      patch.object(subprocess, "run", return_value=listing) as group_scan):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+                    group_scan.assert_not_called()
+                self.assertEqual(json.loads(path.read_text())["status"], "finished")
+                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])

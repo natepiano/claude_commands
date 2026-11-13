@@ -81,6 +81,7 @@ class RunRecord(TypedDict):
     log: str
     started_at: float
     pid: int
+    supervisor_started: NotRequired[str]
     command_pid: NotRequired[int]
     command_started: NotRequired[str]
     director_dir: str
@@ -244,19 +245,43 @@ def _group_is_live(group: int) -> bool:
     return False
 
 
+def _saved_process(pid: object, started: object) -> process_start.ProcessStart:
+    """Read the saved process identity and reject a reused PID."""
+    if not isinstance(started, str) or not started or _integer(pid) <= 0:
+        return process_start.Gone()
+    observed = process_start.process_start(_integer(pid))
+    if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
+        return process_start.Gone()
+    return observed
+
+
 def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
-    """Recover a running record after its supervisor and live group processes end."""
+    """Recover a running record after its command and owned group processes end."""
     if raw.get("status") != "running":
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        return not detached_run_process.supervises(pid, path) and not _group_is_live(pid)
+        if detached_run_process.supervises(pid, path):
+            return False
+        command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
+        if isinstance(command, (process_start.Started, process_start.Unreadable)):
+            return False
+        supervisor = _saved_process(pid, raw.get("supervisor_started"))
+        owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
+        if not owns_group and isinstance(command, process_start.Zombie):
+            try:
+                owns_group = os.getpgid(_integer(raw.get("command_pid"))) == pid
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        return not owns_group or not _group_is_live(pid)
     started = _number(raw.get("started_at"), now)
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
-    """Recover results after the supervisor and its live group processes end.
+    """Recover results after the command and owned group processes end.
 
     Deliver the saved command status when available.
     A claim file prevents duplicate delivery.
@@ -682,6 +707,9 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
             with record_lock(path):
                 record = _read_record(path)
                 record.update(command_pid=child.pid, command_started=started.start)
+                supervisor = process_start.process_start(os.getpid())
+                if isinstance(supervisor, process_start.Started):
+                    record["supervisor_started"] = supervisor.start
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
             _ = child.stdin.write(b"start\n")
     return _exit_status(child.wait())
@@ -742,8 +770,8 @@ def command_record_exit(args: argparse.Namespace) -> int:
         record = _read_record(path)
         if record["status"] != "running" or record.get("command_pid") != caller:
             return 0
-        started = process_start.process_start(caller)
-        if not isinstance(started, process_start.Started) or started.start != record.get("command_started"):
+        started = _saved_process(caller, record.get("command_started"))
+        if not isinstance(started, process_start.Started):
             return 0
         record["exit_code"] = int(getattr(args, "exit_code", 0))
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
