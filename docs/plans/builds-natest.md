@@ -3485,35 +3485,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `scripts/direct/test_simplify_lens.py` calls `simplify_daily.main` in process through `invoke_cli`. `assign_gate.called_by_assign` refuses an in-process reviewer (unittest is the ancestor), and the guard stays. `simplify_daily.py` names its launcher path in one constant, `AGENT_EXEC`; the in-process cases bind it to a private launcher with an admission stub (the `review_launcher_test_support.py:184` pattern). The full `assign.sh` case and the status-write failure case keep the real guard. All 15 tests and 80 assertions stay; assignment starts 18 → 2. aws pairs, 3 rounds: 19.23 → 9.67 CPU s (9.56 s saved), peak 143.7 → 148.1 MiB. sdlc approved the diff. Checkpoint `8ee605e7f`.
 
-### Phase 224 — The module runner supervisor restores its signal mask on every path  · status: todo
+### Phase 224 — The module runner supervisor restores its signal mask on every path  · status: done
 **Depends on:** Phase 222
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/test_times/module_run.py` never leaves SIGTERM, SIGINT, SIGHUP or SIGCHLD blocked in a process that continues after an error or in the test child.
-
-**Decision:** builds showrunner, 2026-11-12: `run_with_descendant_cleanup():580` calls `pthread_sigmask(SIG_BLOCK, ...)` before any `try`, the pattern Phase 222 fixed in `queue_place.py`. Check it; fix it if a signal or an error there can leave the mask blocked.
-
-**Spec:**
-1. Trace each path after the block at `:580`: the `signalfd` failure at `:587`, the `pidfd_open` and `prctl` failures, the test child after `fork()`, and the supervisor end. The supervisor blocks these signals by design, so `signalfd` can read them.
-2. A path is a defect only when a process continues to run Python or a test with the mask blocked. A process that exits at once is not a defect.
-3. For each defect: read the previous mask first, block inside the `try`, and restore it in the `finally` or in the child before tests start.
-4. Add one row in `scripts/test_times/test_module_run.py` for each defect. If no path is a defect, change no code and report each path with the line that makes it safe.
-5. Add no signal handler. Keep every test and assertion.
-6. Run `test_module_run.py`, `test_module_cost.py`, `scripts/production/test_merge_gate_suites_signals.py` and basedpyright on each changed file.
-
-**Files:**
-- `scripts/test_times/module_run.py`
-- `scripts/test_times/test_module_run.py`
-
-**Workers:** 1 writer; one source file and its test.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 222: `module_run.py` installs no signal handler; the test child gets SIGKILL parent death; the supervisor keeps the SIGKILL status without a signal reset.
-
-**Acceptance gate:**
-- Each path is reported as safe or fixed with a test row; no handler; the four modules pass; basedpyright clean.
+- Audit only; no code change. `run_with_descendant_cleanup()` blocks SIGTERM, SIGINT, SIGHUP and SIGCHLD at `module_run.py:580` by design, so `signalfd` can read them. Its sole caller (`:664`) has no catch, so a `signalfd`, `pidfd_open` or `prctl` error ends the process. The test child restores SIGCHLD and the previous mask at `:607-608` before `main()`; parent loss kills it with SIGKILL. The supervisor restores the mask at `:659` before `sys.exit`; signal termination exits through `:653-658`. No path keeps a process running with the mask blocked. `test_module_run.py` (24), `test_module_cost.py` (10) and `test_merge_gate_suites_signals.py` (12) pass; basedpyright clean.
 
 ### Phase 225 — Change review tests prove contention without fresh interpreters  · status: todo
 **Depends on:** none
