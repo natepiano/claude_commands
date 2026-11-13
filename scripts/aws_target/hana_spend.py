@@ -103,6 +103,10 @@ class HanaSpending:
             state.hana_storage = candidate.hana_storage
             return StorageReserved(proposed)
 
+    def reserve_setup(self, now: int, expires: int) -> StartReserved | PermitRefused:
+        """Reserve approved setup without enabling placement or command permission."""
+        return self._reserve_compute(now, expires, expected_generation=0, approved_setup=True)
+
     def reserve_start(self, now: int, expires: int) -> StartReserved | PermitRefused:
         """Reserve a demand start before its boot identity exists."""
         return self._reserve_compute(now, expires, expected_generation=0)
@@ -137,8 +141,8 @@ class HanaSpending:
             return result
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
-    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int) -> StartReserved | PermitRefused:
-        if not self.settings.enabled:
+    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False) -> StartReserved | PermitRefused:
+        if not self.settings.enabled and not approved_setup:
             return PermitRefused('Hana is disabled')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
             return PermitRefused('The permit deadline is outside its renewal window')

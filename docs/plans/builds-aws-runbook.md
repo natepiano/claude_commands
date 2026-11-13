@@ -374,3 +374,57 @@ The report retains both statuses, wall times, and largest-process peak RSS value
 Different statuses on one machine mean `flaky`.
 A flaky natedev test makes the comparison `inconclusive`.
 Missing measurements mean `incomplete`.
+
+## Prepare the separate Hana workload
+
+Only the user runs these commands.
+Hana setup does not change the merge-gates stack.
+The setup command needs no active target or slot capacity.
+`enabled=off` remains unchanged.
+
+1. Obtain the reviewed Hana NixOS image from the Natedev owner.
+2. Set `ami_id`, `ami_owner_id`, `vpc_id`, and `subnet_id` in `config/hana_aws.conf`.
+3. Confirm that the subnet belongs to `availability_zone` and has a public HTTPS route.
+4. Run `scripts/aws_target/deploy.py prepare --workload hana`.
+5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource plan.
+6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
+7. Confirm that the command reports a stopped box.
+
+The local plan makes no AWS call.
+Approved setup uses the existing encrypted admin session and progress display.
+It reserves compute and storage costs before requesting resources.
+Setup permission does not enable command permission.
+The separate stack creates the instance, retained data volume, launch template, security group, private control bucket, and scaler policy.
+The root disk retains its data after termination.
+The Spot request is persistent and uses interruption behavior `stop`.
+Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
+Repeat approved setup after a timeout to read the existing stack and confirm its stop.
+An expired reservation cannot authorize another stack request.
+Changed resource inputs require a separate replacement review.
+
+The image must include the independent Hana guard, watchdog, data mount, and root receiver.
+The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.
+The image must start the guard and receiver on every boot.
+The receiver reads the current user data through IMDSv2 on every boot.
+Normal first-boot user-data execution does not provide this behavior.
+The image must block IMDS access from every non-root user.
+The root receiver uses runtime signed object URLs, rather than guest AWS credentials.
+The image must initialize the new data disk once and mount its retained filesystem before tool setup.
+It must identify the `/dev/sdf` attachment correctly on NVMe instances.
+The image must include Python, TLS trust, the unprivileged `hana-runner` user, and the reviewed systemd resource bounds.
+Do not install AWS credentials, repository credentials, SSH keys, or a broad instance role.
+No `/etc/nixos` file changes are part of this repository change.
+
+The scaler policy grants these actions:
+
+1. `ec2:StartInstances` and `ec2:StopInstances` for Hana-tagged instances in this deployment.
+2. `ec2:ModifyInstanceAttribute` for only their `userData` attribute.
+3. `ec2:DescribeInstances`, `ec2:DescribeSpotInstanceRequests`, and `ec2:DescribeInstanceAttribute` for lifecycle reads.
+4. `s3:GetObject` and `s3:PutObject` for only this deployment's control objects.
+
+EC2 describe actions need a wildcard resource.
+The [EC2 IAM reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html) defines the action resources and attribute condition.
+The [Spot request status reference](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-request-status.html) defines the interruption status codes.
+A stopped instance does not prove that a lost start request has settled.
+The provider retains that uncertain operation until it can confirm an outcome.
+It never repeats an uncertain start automatically.

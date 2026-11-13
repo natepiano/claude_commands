@@ -1,0 +1,419 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Separate retained Hana Spot resources",
+  "Parameters": {
+    "DeploymentId": {
+      "Type": "String"
+    },
+    "Image": {
+      "Type": "String"
+    },
+    "InstanceType": {
+      "Type": "String"
+    },
+    "AvailabilityZone": {
+      "Type": "String"
+    },
+    "VpcId": {
+      "Type": "String"
+    },
+    "SubnetId": {
+      "Type": "String"
+    },
+    "RootDevice": {
+      "Type": "String"
+    },
+    "SpotMaxPrice": {
+      "Type": "String"
+    },
+    "ScalerUser": {
+      "Type": "String"
+    },
+    "RootGiB": {
+      "Type": "Number",
+      "MinValue": 1
+    },
+    "DataGiB": {
+      "Type": "Number",
+      "MinValue": 1
+    }
+  },
+  "Resources": {
+    "DataVolume": {
+      "Type": "AWS::EC2::Volume",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "AvailabilityZone": {
+          "Ref": "AvailabilityZone"
+        },
+        "Size": {
+          "Ref": "DataGiB"
+        },
+        "VolumeType": "gp3",
+        "Encrypted": true,
+        "Tags": [
+          {
+            "Key": "HanaDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "hana"
+          }
+        ]
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Hana outbound HTTPS only",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HanaDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "hana"
+          }
+        ]
+      }
+    },
+    "ControlBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "HanaDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "hana"
+          }
+        ]
+      }
+    },
+    "ControlBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "ControlBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ControlBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${ControlBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateData": {
+          "ImageId": {
+            "Ref": "Image"
+          },
+          "InstanceType": {
+            "Ref": "InstanceType"
+          },
+          "InstanceInitiatedShutdownBehavior": "stop",
+          "InstanceMarketOptions": {
+            "MarketType": "spot",
+            "SpotOptions": {
+              "SpotInstanceType": "persistent",
+              "InstanceInterruptionBehavior": "stop",
+              "MaxPrice": {
+                "Ref": "SpotMaxPrice"
+              }
+            }
+          },
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": {
+                "Ref": "RootDevice"
+              },
+              "Ebs": {
+                "VolumeSize": {
+                  "Ref": "RootGiB"
+                },
+                "VolumeType": "gp3",
+                "Encrypted": true,
+                "DeleteOnTermination": false
+              }
+            }
+          ],
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpPutResponseHopLimit": 1,
+            "InstanceMetadataTags": "disabled"
+          },
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "SubnetId": {
+                "Ref": "SubnetId"
+              },
+              "AssociatePublicIpAddress": true,
+              "Groups": [
+                {
+                  "Ref": "SecurityGroup"
+                }
+              ]
+            }
+          ],
+          "TagSpecifications": [
+            {
+              "ResourceType": "instance",
+              "Tags": [
+                {
+                  "Key": "HanaDeployment",
+                  "Value": {
+                    "Ref": "DeploymentId"
+                  }
+                },
+                {
+                  "Key": "Workload",
+                  "Value": "hana"
+                }
+              ]
+            },
+            {
+              "ResourceType": "volume",
+              "Tags": [
+                {
+                  "Key": "HanaDeployment",
+                  "Value": {
+                    "Ref": "DeploymentId"
+                  }
+                },
+                {
+                  "Key": "Workload",
+                  "Value": "hana"
+                }
+              ]
+            },
+            {
+              "ResourceType": "spot-instances-request",
+              "Tags": [
+                {
+                  "Key": "HanaDeployment",
+                  "Value": {
+                    "Ref": "DeploymentId"
+                  }
+                },
+                {
+                  "Key": "Workload",
+                  "Value": "hana"
+                }
+              ]
+            }
+          ],
+          "UserData": {
+            "Fn::Base64": "{\"version\":1,\"setup_only\":true}"
+          }
+        }
+      }
+    },
+    "Instance": {
+      "Type": "AWS::EC2::Instance",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "AvailabilityZone": {
+          "Ref": "AvailabilityZone"
+        },
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "LaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "LaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        },
+        "Tags": [
+          {
+            "Key": "HanaDeployment",
+            "Value": {
+              "Ref": "DeploymentId"
+            }
+          },
+          {
+            "Key": "Workload",
+            "Value": "hana"
+          }
+        ]
+      }
+    },
+    "DataAttachment": {
+      "Type": "AWS::EC2::VolumeAttachment",
+      "Properties": {
+        "Device": "/dev/sdf",
+        "InstanceId": {
+          "Ref": "Instance"
+        },
+        "VolumeId": {
+          "Ref": "DataVolume"
+        }
+      }
+    },
+    "ScalerPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Users": [
+          {
+            "Ref": "ScalerUser"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:StartInstances",
+                "ec2:StopInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "ec2:ResourceTag/HanaDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "ec2:ResourceTag/Workload": "hana"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:ModifyInstanceAttribute"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "ec2:ResourceTag/HanaDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "ec2:ResourceTag/Workload": "hana",
+                  "ec2:Attribute": "userData"
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeSpotInstanceRequests",
+                "ec2:DescribeInstanceAttribute"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+              ],
+              "Resource": {
+                "Fn::Sub": "${ControlBucket.Arn}/control/${DeploymentId}/*"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "Instance": {
+      "Value": {
+        "Ref": "Instance"
+      }
+    },
+    "DataVolume": {
+      "Value": {
+        "Ref": "DataVolume"
+      }
+    },
+    "ControlBucket": {
+      "Value": {
+        "Ref": "ControlBucket"
+      }
+    },
+    "LaunchTemplate": {
+      "Value": {
+        "Ref": "LaunchTemplate"
+      }
+    }
+  }
+}
