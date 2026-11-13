@@ -122,6 +122,12 @@ class StoredDeliverySlots(TypedDict, total=False):
     user_answer: StoredUserAnswer
 
 
+class SentCloseoutAlerts(TypedDict):
+    review_list: str
+    row: str
+    messages: list[str]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -231,6 +237,25 @@ class DeliveryStatus:
 
     def path(self, page: ReviewPage, row: str) -> Path:
         return change_routing.delivery_path(self.root, page.review_list, row)
+
+    def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
+                                recipients: tuple[staff.StaffId, ...]) -> None:
+        """Send each row's failure once, including across server restarts."""
+        if not recipients:
+            return
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        path = self.root / (".review-link-closeout-alert-" + name + ".json")
+        with self.locked():
+            try:
+                sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                sent = {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+            if message in sent["messages"]:
+                return
+            for identity in recipients:
+                send_to_staff(identity, SENDER, message)
+            sent["messages"].append(message)
+            atomic_file.write_bytes_atomic(path, (json.dumps(sent) + "\n").encode("utf-8"), mode=0o600)
 
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
         try:
@@ -686,7 +711,7 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
         raise RuntimeError(error.diagnostic) from error
 
 
-def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str) -> None:
+def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str, status: DeliveryStatus) -> None:
     """Keep the row open and notify its showrunner when feature-log closeout fails."""
     try:
         close_feature_log(page, doc, row_id, verdict)
@@ -695,8 +720,7 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str)
         try:
             row = answer_row(page, row_id)
             owner = route_owner(page, row)
-            for identity in owner.showrunner_recipients:
-                send_to_staff(identity, SENDER, message)
+            status.notify_closeout_failure(page, row_id, message, owner.showrunner_recipients)
         except SEND_ERRORS as delivery_error:
             raise FeatureLogFailed(f"{message}\nNotification failed: {delivery_error}") from delivery_error
         raise FeatureLogFailed(message) from error
@@ -761,7 +785,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         return NoMessageDelivery()
     doc = row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    closeout_before_save(page, doc, row_id, verdict)
+    closeout_before_save(page, doc, row_id, verdict, status)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
     try:
         production = change_review.production_doc(unit_lookup.doc_owner(page.production, staff.snapshot()).name)
