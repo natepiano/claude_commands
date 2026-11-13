@@ -793,12 +793,12 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
-    It excludes every open phase of the newest run, including phases absent from the configured plan.
+    It excludes every open phase of the selected run, including phases absent from the configured plan.
     It excludes each queue item whose text equals Notes in the same row.
     Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
     Each displayed item or title keeps its full text and count suffix.
-    A configured plan with phases takes priority over the newest run's plan.
+    A configured plan with phases takes priority over the selected run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
