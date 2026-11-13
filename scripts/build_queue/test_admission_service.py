@@ -923,7 +923,7 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 class PendingPriorityTests(unittest.TestCase):
     def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
-        from scripts.message import roster
+        from scripts.message import roster, unit_labels
         from scripts.production import staff
 
         producer = staff.StaffRow(staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
@@ -933,8 +933,8 @@ class PendingPriorityTests(unittest.TestCase):
         worker = staff.StaffRow(staff.StaffId("worker"), "worker", "builder", staff.ReportsTo(director.id),
                                current_session=staff.StaffId("worker-session"))
         snapshot = staff.StaffSnapshot((producer, director, worker))
-        expected = {"director-session": UnitLabels("chosen", "production", "chosen"),
-                    "worker-session": UnitLabels("builder", "production", "chosen")}
+        expected = {"director-session": UnitLabels("chosen", "production", "chosen", unit_labels.OwnerRole.UNIT),
+                    "worker-session": UnitLabels("builder", "production", "chosen", unit_labels.OwnerRole.UNIT)}
         with mock.patch.object(staff, "snapshot", return_value=snapshot), \
                 mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
             self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)

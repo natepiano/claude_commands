@@ -77,10 +77,11 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     running = replace(model.reading.view.running[0], session_id=identity.session_id,
                                       session_name=identity.name, unit=identity.unit)
                     for step in (waiter, running):
-                        self.assertEqual(queue_evidence.step_labels(step, labels), UnitLabels(owner.name, "hana", "demo"))
+                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT)
+                        self.assertEqual(queue_evidence.step_labels(step, labels), expected)
                     cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
                     self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
-                                     UnitLabels(owner.name, "hana", "demo"))
+                                     expected)
 
     def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
@@ -512,6 +513,35 @@ class MacQueueViewTests(unittest.TestCase):
 
 
 class CloudQueueViewTests(unittest.TestCase):
+    def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
+        model = self.cloud_model()[0]
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        for step, owner, expected in (
+            ("targeted-test", director, "panes targeted"),
+            ("merge-gate", director, "panes merge"),
+            ("merge-gate", runner, "showrunner merge"),
+            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
+            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
+            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("build", director, "build"),
+            ("literal{step}", director, "literal{step}"),
+        ):
+            with self.subTest(step=step, owner=owner):
+                current = replace(row, identity=replace(row.identity, step=step))
+                labeled = replace(model, labels={row.identity.session_id: owner})
+                self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
+        current = replace(row, identity=replace(row.identity, step="targeted-test"))
+        settings = dict(model.names.settings)
+        settings["owned.targeted-test"] = "targeted for {unit}"
+        configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
+        self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
+        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
+        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
         empty_mac_reading(fixture)
