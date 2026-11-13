@@ -54,7 +54,7 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lib import copy_record, scratch
+from scripts.lib import cancellation, copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
@@ -253,9 +253,16 @@ class MergeGateResourcesTests(GateSuitesFixture):
             os.kill(os.getpid(), signal.SIGINT)
             return result
 
-        with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
-            with self.assertRaises(KeyboardInterrupt):
-                merge_gate.reap_gate_job(finished)
+        stopped = threading.Event()
+        worker = threading.Thread(target=stopped.wait, daemon=True)
+        cancellation.start_masked_thread(worker)
+        try:
+            with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    merge_gate.reap_gate_job(finished)
+        finally:
+            stopped.set()
+            worker.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)
         for job in jobs:

@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, conf, main_push_lock
+from scripts.lib import build_folders, cancellation, conf, main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review  # noqa: E402
@@ -88,7 +88,7 @@ from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
+    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -347,7 +347,7 @@ class SharedCPUSlot:
 
     def release(self) -> None:
         if not self.returned:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 if os.write(self.descriptor, self.token) != 1:
                     raise GateRefused("could not return the shared CPU slot")
                 self.returned = True
@@ -370,7 +370,7 @@ class SharedCPUPool:
         print("waits for a CPU slot", flush=True)
         try:
             with ExitStack() as cleanup:
-                with defer_cleanup_signals():
+                with cancellation.defer_cleanup_signals():
                     reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
                     _ = cleanup.callback(os.close, reader)
                     _ = cleanup.callback(os.close, writer)
@@ -386,7 +386,7 @@ class SharedCPUPool:
                         _ = os.read(reader, 4096)
                     if self.blocking in readable:
                         # Another gate can take the token after select returns.
-                        with defer_cleanup_signals():
+                        with cancellation.defer_cleanup_signals():
                             slot = self.try_acquire()
                         if isinstance(slot, SharedCPUSlot):
                             return slot
@@ -394,7 +394,7 @@ class SharedCPUPool:
             print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
     def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
             if not select.select([self.descriptor], [], [], 0)[0]:
                 return WaitingForCPU()
@@ -432,7 +432,7 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
         try:
             yield pool
         finally:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 try:
                     for slot in pool.owned:
                         slot.release()
@@ -534,7 +534,7 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     with ExitStack() as cleanup:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             process = cleanup.enter_context(subprocess.Popen(
                 arguments, cwd=repo, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -740,7 +740,7 @@ class GateRecovery:
         self.save()
         while self.tokens:
             token = self.tokens[-1]
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 try:
                     descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
                 except FileNotFoundError:
@@ -902,7 +902,7 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 @contextmanager
 def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
     with ExitStack() as cleanup:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
             recovery.folders.append(str(folder))
             recovery.save()
@@ -986,7 +986,7 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with defer_cleanup_signals():
+    with cancellation.defer_cleanup_signals():
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
@@ -1086,7 +1086,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started = time.monotonic()
     started_at = time.time()
     try:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
@@ -1713,7 +1713,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with defer_cleanup_signals():
+                    with cancellation.defer_cleanup_signals():
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
@@ -1750,7 +1750,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
                     job.output.close()

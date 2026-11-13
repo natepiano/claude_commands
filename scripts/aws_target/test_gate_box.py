@@ -189,11 +189,12 @@ class GateBoxTests(unittest.TestCase):
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
                 (root / 'home').mkdir()
-                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'config'):
+                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
+                _ = (repo / 'scripts/lib/cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
                     'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'

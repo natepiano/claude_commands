@@ -338,6 +338,7 @@ try:
         os.chdir(repo)
         sys.path.insert(0, str(repo))
         from scripts.production import merge_gate
+        from scripts.lib import cancellation
         timings = {}
         if 'module_seconds' in links:
             get(links['module_seconds'], root / 'module_seconds.json')
@@ -348,7 +349,7 @@ try:
         result['vcpus'] = result['max_running_jobs']
         sample_memory()
         memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-        memory_thread.start()
+        cancellation.start_masked_thread(memory_thread)
         stage('tests start')
         with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             cpu_started = busy_cpu_seconds()

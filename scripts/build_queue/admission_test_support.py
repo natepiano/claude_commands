@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import test_phase
+from scripts.lib import cancellation, test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
 
@@ -431,16 +431,19 @@ class AdmissionFixture(ExitStack):
 
         worker = threading.Thread(target=serve, name="private-admission-loop")
         self.serving_active.set()
-        worker.start()
         try:
+            cancellation.start_masked_thread(worker)
             yield self
         finally:
             stopped.set()
-            self.server.wake_loop()
-            worker.join(timeout=TEST_HANG_GUARD_SECS)
-            if worker.is_alive():
-                raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
-            self.serving_active.clear()
+            try:
+                if worker.ident is not None:
+                    self.server.wake_loop()
+                    worker.join(timeout=TEST_HANG_GUARD_SECS)
+                    if worker.is_alive():
+                        raise AssertionError(f"the private admission loop did not stop within {TEST_HANG_GUARD_SECS} seconds")
+            finally:
+                self.serving_active.clear()
             if failures:
                 raise failures[0]
 

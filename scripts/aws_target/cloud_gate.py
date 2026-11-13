@@ -31,7 +31,7 @@ from scripts.aws_target import admin_secrets, gate_box, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.queue_place import defer_cleanup_signals
+from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
@@ -296,7 +296,7 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
     try:
         yield reservation
     finally:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
 
 
@@ -791,7 +791,7 @@ class GateWorker:
                 if not row:
                     raise ValueError('The instance expired without a final result')
             finally:
-                with defer_cleanup_signals():
+                with cancellation.defer_cleanup_signals():
                     self.terminate(attempt, instance, result_seen_at=result_seen_at)
                     interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result': row}
@@ -1118,7 +1118,7 @@ def main() -> int:
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
         if cleanup is not None:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 return int(not cleanup_folder(folder, worker))
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0

@@ -1,7 +1,7 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file, build_folders
+from scripts.lib import atomic_file, build_folders, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
@@ -790,6 +790,28 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(places[0].status, 1)
             fixture.assert_released(self, reservation_id, status=1)
 
+    def test_sampler_start_failure_stops_and_reaps_the_program_before_release(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+            release = client.release
+
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+                self.assertEqual(len(fixture.children), 1)
+                child = fixture.children[0]
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(child.pid, os.WNOHANG)
+                _ = release(path, status, configuration)
+
+            with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
+                with queue.queue_place("rust-analyzer", fixture.root) as place:
+                    with self.assertRaisesRegex(RuntimeError, "sampler start failed"), \
+                            mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("sampler start failed")):
+                        _ = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
+            released.assert_called_once()
+            self.assertIsInstance(place.program, queue.StartedProgram)
+            self.assertEqual(place.status, 1)
+            fixture.assert_cleaned(self)
+
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
@@ -1038,7 +1060,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         try:
             with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
                 with self.assertRaises(KeyboardInterrupt):
-                    with queue.defer_cleanup_signals():
+                    with cancellation.defer_cleanup_signals():
                         self.fail("The block step must interrupt entry")
             self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
         finally:
