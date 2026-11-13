@@ -2331,3 +2331,21 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/test_ci_cargo_front.py` — the shared-folder row of the wrapper test makes a dead-owner, an old-form and a live-owner folder; only the live-owner folder stays
 
 **Gotchas:** at the first building call after the deploy, an old-form folder of a front that still runs is removed too.
+
+### Phase 112 — A queued hana CI run with no jobs stops holding a Mac block  · status: done
+
+#### As-built
+
+- `ci_activity()` asks `gh run list` for `databaseId,createdAt` for the `queued` and `in_progress` lists, and keeps each run's status in a `CiRun`.
+- A run from the `queued` list with an empty job list and a `createdAt` more than `ci_jobless_queued_minutes` before now does not count as CI busy. Every other run counts as before: an `in_progress` run with no jobs stays busy, and a queued run with jobs is busy until its `ci_job` is completed.
+- A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
+- `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
+- No new `gh` call, flag, cancel call or state file.
+- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
+- `scripts/mac_test/test_mac_test.py` — rows in `test_queued_or_in_progress_run_without_mac_job_is_busy` for the age limit, a configured limit, a running run with no jobs and a malformed timestamp
+- `config/mac_test.conf` — `ci_jobless_queued_minutes`
+
+**Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.

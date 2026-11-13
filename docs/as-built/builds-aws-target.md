@@ -34,15 +34,15 @@ Boxes receive signed URLs and no scaler credential file.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The target registry contains `mac,natedev`.
-The retained `offload=on` value does not register an AWS target.
+The builder configuration and offload route have been removed.
 Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
-The repository retains their implementation for compatibility and removal recovery.
+Only historical cost, ownership, and teardown compatibility remain.
 
 `deploy.py down --approve-destroy` can remove the remaining gate resources without registering the former target.
 Teardown resolves former builder claim and lock paths directly from the AWS state folder.
 It preserves the existing lock and live claim checks.
-The controller no longer releases claims after a box stop or generation change.
-That path no longer writes `release-evidence/`.
+The builder controller and remote agent have been removed.
+Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
@@ -165,7 +165,19 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by size and expected cost before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after every regional variant refuses.
+A normal gate uses natedev after all capacity choices refuse.
+A confirmed Spot interruption before a final result starts another cloud attempt.
+`spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
+The retry uses the next choice in the saved launch order.
+The route keeps its cloud slot across retries.
+The route saves the interruption count and the next choice in `current.json` before each retry.
+Resume restores both values, so a crash cannot reset the retry budget.
+Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+The worker confirms cleanup of the interrupted box and reservation before the retry.
+The final natedev fallback row includes the interruption count when retries or capacity choices end.
+A complete gate failure keeps its failed result and gets no retry.
+An unconfirmed termination or another controller error retains the existing fallback behavior.
+The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
 The home stack owns the artifact bucket and the global gate role and instance profile.
@@ -182,7 +194,7 @@ The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
-The controller searches every configured region for an expired reservation without a recorded region.
+Reconciliation searches every configured region for an expired reservation without a recorded region.
 After a valid final result, the controller books the box end at the result receipt time.
 It still requests termination and requires AWS to confirm termination before it books that time.
 A box without a valid final result uses the termination confirmation time.
@@ -230,20 +242,41 @@ Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
-The controller reads gate Spot prices every `price_refresh_seconds=3600`.
-It reads prices after the tick releases `controller.lock`, in the same process.
-It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
-The price lock stores the last refresh attempt time.
-Slow price reads leave start and stop commands free to acquire the controller lock.
-It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
-Each read requests all configured gate `instance_types` for Linux/UNIX.
-The controller keeps the latest price for each zone and type.
-It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
-Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
-An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
-The price refresh does not change `controller.json`.
-Failed attempts use the same refresh interval.
-The price read remains active when the former builder route is disabled or removed.
+`buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
+The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
+The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+No systemd unit change or NixOS rebuild is required.
+The old `aws-target.service` remains disabled.
+`aws_target.py tick` reads account charges only.
+`price_refresh_seconds` limits snapshot attempts to one per configured interval.
+The snapshot takes `spot-prices.lock` without blocking.
+It reads each distinct `spot_candidate_regions` region once.
+Each regional read requests all `instance_types` and `gpu_instance_types` prices for Linux/UNIX.
+The AWS CLI reads all pages, and the reader selects the latest price for each type and zone.
+The reader also reads applied Standard Spot and G and VT Spot quotas.
+It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
+It removes inherited administrator keys and profiles from the AWS process environment.
+The only API actions are `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota`.
+`GateGpuTrialScalerPolicy` already permits both actions on all resources without regional conditions.
+This change requires no IAM deployment.
+The snapshot atomically writes prices and quota values together in `spot-prices.json`.
+The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
+A regional failure preserves that region's previous prices, quotas, and read time.
+Other regions still refresh, and the command returns a failure status.
+A successful regional read removes previous prices for types or zones absent from the new reply.
+The snapshot does not change `controller.json`.
+
+`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
+It prints machine types as rows and candidate regions as columns.
+Each cell shows the lowest zone price in USD/h, or `-` when the snapshot has no offer.
+It splits wide tables into groups of region columns to fit the terminal.
+Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
+The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
+Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
+Standard types use the Standard quota; GPU types use the G and VT quota.
+The box counts divide the quota by the existing type-size vCPU calculation and round downward.
+An absent snapshot shows unknown quotas and box counts without creating files.
 
 A new gate ranks only variants from its deployment.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.
@@ -294,8 +327,7 @@ It preserves the configured order within each list.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
 `deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
-The price stage of `up` shows this quota for each gate region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
+`deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
@@ -318,6 +350,18 @@ A failed call prints only the AWS error code or Python error class and does not 
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 Both quota codes use these same three IAM actions.
+`python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
+It shares the quota codes and region lists with `quota-request`.
+It groups the reads by region and prints progress and a final completion time.
+Each request row shows the region, quota name, asked value, current applied value, status, case ID, and date.
+Dates use the user's zone and the last update time, with the creation time as a fallback.
+A quota with no requests prints one row with status `none`.
+The report omits account IDs, ARNs, and request IDs.
+Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
+Any regional failure makes the command exit with status 1.
+The command uses only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota`, including every history page.
+It makes no quota request, paid API call, or local state write.
+The administrator IAM action list in the runbook already includes both read actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
@@ -350,8 +394,43 @@ A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
 Preparation uses a private Cargo cache.
 It never copies the user's Rust or Cargo directories.
 It checks toolchain wrappers for home paths and tests Cargo with an empty `HOME`.
+Preparation builds all features and discovers shared libraries in the Cargo target directory.
+A nextest archive profile inherits `ci` and includes each shared library through `archive.include`.
+The archive retains the workspace's existing archive includes.
+Nextest lists the extracted tests before preparation builds the NixOS closure.
+An archive validation error includes nextest's diagnostic, which names a missing shared library.
+Each measurement run creates its extraction directory before passing it to nextest through `--extract-to`.
+Nextest 0.9.143 returns setup exit 96 when that directory does not exist.
+A failed preparation copies up to 200 final lines of each failed `nextest.log` into `prepare.log`.
+The reader seeks backward in 64 KiB chunks and reads at most 1 MiB per log.
+It retains diagnostics when a run has no valid status record.
+It then keeps only `prepare.log` and removes the other files and GC root links.
+Host trial folders must be canonical direct children of `~/.local/state/gpu-size-trial`.
+The commands refuse nested paths, outside paths, and paths through directory links before deletion.
+A new preparation removes earlier trial folders under `~/.local/state/gpu-size-trial` when no live run holds their locks.
+It refuses to create another folder while a live run holds an earlier folder.
+Preparation, its worker, the service launcher, and the online worker hold folder locks.
+The locks remain outside the trial folders.
+A successful preparation keeps only these inputs and records:
 
-The service selects the first candidate region with an applied G and VT Spot quota of at least 32.
+1. `hana-tests.tar.zst`, `closure.export`, and `source.tar`.
+2. `cargo-home/`, `runtime.env`, `gpu-trial.nix`, and `gpu_trial_wrapper.py`.
+3. `closure.json`, `request.json`, `manifest.json`, and `inventory.json`.
+4. `machines/` with baseline reports, samples, and logs, plus `prepare.log`.
+
+After the archive and closure exist, preparation replaces the build tree with the source tar's clean contents.
+It removes that source copy and the temporary Nix profile links after baseline measurement.
+Each measurement removes its extraction directory, source copy, and Cargo target directory when the run ends, including failures.
+Reports, samples, and logs remain.
+The measured inputs imply an estimated peak near 32 GiB during preparation and about 12 GiB after preparation.
+Local measurement needs about 19 GiB because only one extracted archive remains at a time.
+These estimates cover the trial folder; Nix store use is separate.
+
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+It uses the existing type-size vCPU calculation and refuses a type whose vCPU count is unknown.
+If no region fits, the refusal reports the required vCPUs and each region's applied value.
+The quota request size remains separate from this selection rule.
 It checks regional offerings and current Spot prices.
 It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
@@ -368,11 +447,17 @@ The USD6 check includes completed costs and full open reservations under the acc
 The daily and monthly limits still apply.
 A restart retains the trial ID, limit, region, and type order.
 A saved budget stop ends the trial.
+After an online run ends, the worker saves its result or error before removing the archive, closure export, source tar, and Cargo cache.
+It removes the temporary upload payload after upload, including an upload failure.
+Metadata, results, and logs remain for comparison.
+A restart uses saved hashes and uploaded inputs when upload completed.
+A failure before upload requires a new preparation.
 
 The service confirms termination before another launch.
 The guest stops five minutes before the lifetime ends.
 The expiry tag triggers two minutes before the lifetime ends.
 `ExecStopPost` cleans known boxes and uncertain launches.
+It saves an error and removes the large inputs if an interrupted worker leaves no final result.
 The service uses no new signal handler.
 
 `gpu_size_trial_root_gib=100` is an estimated disk requirement.
