@@ -5,6 +5,7 @@ import fcntl
 import subprocess
 from pathlib import Path
 
+from scripts.lib import git_files
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -29,10 +30,10 @@ def require_untracked(checkout: Path, path: str) -> None:
 
 
 def _exclude_path(checkout: Path) -> Path:
-    location = _git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
-    if location.returncode:
-        raise ExcludeRefused(f"{checkout}: cannot find git exclude file: {location.stderr.strip()}")
-    return Path(location.stdout.strip())
+    try:
+        return git_files.locate(checkout).common_dir / "info" / "exclude"
+    except git_files.NotACheckout as error:
+        raise ExcludeRefused(f"{checkout}: cannot find git exclude file: {error}") from error
 
 
 def _read_exclude(exclude: Path) -> str:
