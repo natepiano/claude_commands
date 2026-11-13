@@ -195,6 +195,8 @@ class SessionSendTests(unittest.TestCase):
                                  [sys.executable, str(sender), *arguments])
         self.assertEqual(session_send.send_argv(*arguments),
                          [sys.executable, str(session_send.SEND_SCRIPT), *arguments])
+        self.assertEqual(session_send.send_argv(*arguments, python_interpreter=session_send.PYTHON_LAUNCHER),
+                         [str(session_send.PYTHON_LAUNCHER), str(session_send.SEND_SCRIPT), *arguments])
 
     def test_general_command_reads_the_current_sender_at_call_time(self) -> None:
         sender = Path("/fixture/patched-send.py")

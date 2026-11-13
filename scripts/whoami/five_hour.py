@@ -1,7 +1,6 @@
 """Log Codex five-hour warnings and relay Claude warnings once per low spell."""
 from __future__ import annotations
 
-import sys
 import os
 import subprocess
 import fcntl
@@ -25,7 +24,7 @@ from scripts.whoami.quota_alert import (PROTOCOL, load_config, recipients, relay
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
 
-from scripts.message import escalate  # noqa: E402
+from scripts.message import escalate, session_send  # noqa: E402
 # Percent of the five-hour window left at which the alert list is told.
 THRESHOLD = 20
 STATE = Path(os.environ.get("FIVE_HOUR_STATE_DIR")
@@ -175,8 +174,8 @@ def cancel_outgoing_notices(key: str, names: list[str]) -> None:
         name = path.read_text(encoding="utf-8")
         retired = True
         for recipient in names:
-            result = subprocess.run([sys.executable, str(escalate.SEND), "retire", "--to", recipient,
-                                "--from", "quota_alert", "--key", f"5-hour {name}"],
+            result = subprocess.run(session_send.send_argv("retire", "--to", recipient,
+                                "--from", "quota_alert", "--key", f"5-hour {name}", send_script=escalate.SEND),
                                capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 retired = False

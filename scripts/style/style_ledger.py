@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from functools import wraps
+from itertools import groupby
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
@@ -55,8 +56,10 @@ from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from scripts.style.refill_inputs import RefillInputs, regex_tool_identity
+from scripts.style.refill_inputs import RefillInputs, UnstoredFact, input_identity, regex_tool_identity
 from scripts.style.refill_facts import RefillFacts
+from scripts.style.refill_cells import (CellState as CellState, CellDependencies, JudgmentCells,
+                                       JUDGMENT_READER_VERSION, cell_identity)
 from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
@@ -77,7 +80,6 @@ class BuiltEntryEvidence:
         return self.applied
 
 
-CellState = Literal["current", "stale", "open", "awaiting merge"]
 # `removed` closes a ticket cell whose file the ticket's own commits deleted; it is not a verdict on code.
 Verdict = Literal["clean", "fixed", "exception", "held", "waived", "removed"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
@@ -146,15 +148,22 @@ def _judgment_rule(component: Rule, path: str) -> Rule:
     return replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
 
 
+WORKSPACE_BUILD_INPUTS = frozenset({
+    "Cargo.toml", "Cargo.lock", ".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain",
+})
+
+
 def protected_ticket_files(files: frozenset[str], crates: tuple[str, ...]) -> frozenset[str]:
     """A ticket's edit paths and the build inputs those paths depend on."""
-    protected = {"Cargo.toml", "Cargo.lock", *files}
+    protected = {*WORKSPACE_BUILD_INPUTS, *files}
     for path in files:
-        if path in ("Cargo.toml", "Cargo.lock"):
+        if path in WORKSPACE_BUILD_INPUTS:
             continue
         crate = next((crate for crate in crates if crate == "." or path == crate or path.startswith(crate + "/")), "")
         if not crate:
-            raise LedgerError(f"unknown crate for {path}")
+            if path.endswith(".rs"):
+                raise LedgerError(f"unknown crate for {path}")
+            continue
         if path == crate:
             raise LedgerError(f"directory footprint cannot be proved for {path}")
         protected.update(str(PurePosixPath(crate) / name) for name in ("Cargo.toml", "build.rs"))
@@ -732,7 +741,7 @@ def sibling_test_file_destinations(sources: style_footprint.RevisionTree) -> dic
         if not file.endswith(".rs"):
             continue
         try:
-            spans = style_footprint.token_spans(sources.text(file))
+            spans = declarations.source_spans(sources.text(file))
             if any(span.token.kind == "unknown" for span in spans):
                 continue
             words = tuple(span.token.value for span in spans)
@@ -1050,6 +1059,36 @@ class RootedFileModule:
     """The complete module chain proved by a file's src layout."""
 
     path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ScopedTraitImport:
+    """An import's bindings and blockers in its lexical brace scope."""
+
+    scope: tuple[int, ...]
+    bindings: tuple[tuple[str, tuple[str, ...]], ...]
+    blocked: frozenset[str]
+    glob: bool
+
+
+@dataclass(frozen=True)
+class FileTraitImports:
+    """Compact import facts and brace ranges from one file scan."""
+
+    imports: tuple[ScopedTraitImport, ...]
+    blocks: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class PlainModuleLinks:
+    """Unconditional module declarations at the file level."""
+
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnprovedModuleLinks:
+    """The file has a module path attribute that the reader cannot prove."""
 
 
 @dataclass(frozen=True)
@@ -1636,7 +1675,7 @@ def _code_words(content: bytes | Folder | MissingFile) -> tuple[str, ...] | Unre
         text = content.decode()
     except UnicodeDecodeError:
         return UnreadableCode()
-    code = style_footprint.tokens(text)
+    code = declarations.source_tokens(text)
     if any(token.kind == "unknown" for token in code):
         return UnreadableCode()
     return tuple(token.value.removeprefix("r#") for token in code)
@@ -1868,6 +1907,7 @@ class RepositoryTip:
     crate_dirs: tuple[str, ...]
     rust_files: tuple[str, ...]
     entries: dict[str, TreeEntry]
+    read_objects: tuple[str, ...]
 
     def crate(self, path: str) -> str:
         """The innermost crate directory that holds path, as a decision's crate is."""
@@ -1948,6 +1988,15 @@ def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
     return parse_tree_listing(_git(repo, "ls-tree", "-rz", "--full-tree", revision))
 
 
+TIP_CONFIG_PATHS = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
+
+
+def _tip_input_blobs(blobs: dict[str, str]) -> dict[str, str]:
+    """Select every blob read to construct a repository tip."""
+    return {path: blob for path, blob in blobs.items()
+            if PurePosixPath(path).name == "Cargo.toml" or path in TIP_CONFIG_PATHS}
+
+
 def _tip(repo: Path, commit: str) -> RepositoryTip:
     command = ("git", "-C", str(repo), "rev-parse", "--end-of-options",
                f"{commit}^{{commit}}", f"{commit}^{{tree}}")
@@ -1956,19 +2005,20 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
             or any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None for object_id in reply[1:])):
         raise GitReadFailed(command, 0, f"{commit}: invalid Git response")
     commit, tree = reply[1:]
-    entries = tree_entries(repo, commit)
+    inventory = parse_tree_listing(_git(repo, "ls-tree", "-rzt", "--full-tree", commit))
+    entries = {path: entry for path, entry in inventory.items() if entry.kind != "tree"}
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
-    configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
-    inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
+    inputs = _tip_input_blobs(blobs)
     contents = {path: content.decode(errors="replace") for path, content in blob_contents(repo, inputs)}
     manifests = {path: text for path, text in contents.items() if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
-    for config in configs:
+    for config in TIP_CONFIG_PATHS:
         if config in blobs:
             ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
-    return RepositoryTip(commit, tree, blobs, directories, files, entries)
+    read_objects = (commit, tree, *(entry.object for entry in inventory.values() if entry.kind == "tree"), *inputs.values())
+    return RepositoryTip(commit, tree, blobs, directories, files, entries, read_objects)
 
 
 def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
@@ -2016,11 +2066,9 @@ def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: st
 
 @dataclass(frozen=True)
 class RustCode:
-    """What a modules judgment reads in a Rust file: its code tokens, and each inner doc with its code position."""
+    """The digest of code tokens and inner docs at their code positions."""
 
-    tokens: tuple[style_footprint.Token, ...]
-    # The count of code tokens before each doc, so a `//!` that moves into another `mod` block differs.
-    inner_docs: tuple[tuple[int, str], ...]
+    digest: bytes
 
 
 @dataclass(frozen=True)
@@ -2036,9 +2084,9 @@ def _rust_code(content: bytes) -> RustCode | NotTokenized:
         text = content.decode()
     except UnicodeDecodeError:
         return NOT_TOKENIZED
-    code = style_footprint.tokens(text)
+    code = declarations.source_tokens(text)
     try:
-        spans = style_footprint.token_spans(text)
+        spans = declarations.source_spans(text)
     except style_footprint.UnreadableTokenSpans:
         return NOT_TOKENIZED
     if len(spans) != len(code):
@@ -2046,8 +2094,10 @@ def _rust_code(content: bytes) -> RustCode | NotTokenized:
     # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
     gaps = (text[start:end] for start, end in zip((0, *(span.end for span in spans)), (*(span.start for span in spans), len(text))))
     # Module docs count toward a facade (when-to-split-a-module.md), so `//!` and `/*!` text is read as code.
-    return RustCode(code, tuple((position, doc) for position, gap in enumerate(gaps)
-                                for doc in style_footprint.documented_text(gap) if doc.startswith(("//!", "/*!"))))
+    docs = tuple((position, doc) for position, gap in enumerate(gaps)
+                 for doc in style_footprint.documented_text(gap) if doc.startswith(("//!", "/*!")))
+    identity = (tuple((token.value, token.kind) for token in code), docs)
+    return RustCode(hashlib.sha256(json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()).digest())
 
 
 def _only_comments_changed(before: dict[str, TreeEntry], after: dict[str, TreeEntry],
@@ -2114,6 +2164,43 @@ def legacy_built_at_sql(finding: str = "held_findings") -> str:
     """The build time of a built finding before schema 25, using its SQL table name or alias."""
     return (f"COALESCE((SELECT updated_at FROM tickets WHERE id={finding}.build_ticket "
             + f"AND state='merged'), {finding}.updated_at)")
+
+
+def _judgment_version_triggers() -> str:
+    """Version each source mutation and mark its existing cell subscribers."""
+    sources = (
+        ("judgments", "id", "judgments"),
+        ("rule_generations", "rule", "rule_generations"),
+        ("invalidated_held_judgments", "judgment_id", "judgments"),
+        ("held_cell_corrections", "judgment_id", "judgments"),
+        ("lint_runs", "id", "lint_runs"),
+        ("sync", "id", "sync"),
+    )
+    statements: list[str] = []
+    for table, primary_key, dependency in sources:
+        statements.append(f"INSERT OR IGNORE INTO refill_tables VALUES ('{table}',0,0);")
+        for event, references in (("INSERT", ("NEW",)), ("UPDATE", ("OLD", "NEW")), ("DELETE", ("OLD",))):
+            body = [f"UPDATE refill_tables SET version=version+1 WHERE source_table='{table}';"]
+            for reference in references:
+                key = f"cast({reference}.{primary_key} AS TEXT)"
+                present = int(reference == "NEW")
+                body.append(
+                    "INSERT INTO refill_rows "
+                    + f"SELECT '{table}',{key},version,{present} FROM refill_tables WHERE source_table='{table}' "
+                    + "ON CONFLICT(source_table,source_key) DO UPDATE SET version=excluded.version,present=excluded.present;")
+                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "judgments":
+                    match += (f" OR (source_kind='judgment_cell' AND "
+                              + f"source_key=json_array({reference}.rule,{reference}.path))")
+                elif table == "lint_runs":
+                    match += f" OR (source_kind='lint_tool' AND source_key={reference}.tool)"
+                body.append(
+                    "UPDATE refill_cells SET dirty_version=dirty_version+1 WHERE consumer_key IN "
+                    + f"(SELECT consumer_key FROM refill_dependencies WHERE consumer_table='refill_cells' AND ({match}));")
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS refill_{table}_{event.lower()} AFTER {event} ON {table} BEGIN "
+                + " ".join(body) + " END;")
+    return "\n".join(statements)
 
 
 MIGRATIONS = {
@@ -2404,6 +2491,34 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS refill_object_declarations
             ON refill_objects(object_store, reader_version, fact_kind, declaration_name);
     """,
+    42: """
+        CREATE TABLE IF NOT EXISTS refill_tables (
+            source_table TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_version INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS refill_rows (
+            source_table TEXT NOT NULL, source_key TEXT NOT NULL, version INTEGER NOT NULL, present INTEGER NOT NULL,
+            PRIMARY KEY(source_table,source_key)
+        );
+        CREATE INDEX IF NOT EXISTS refill_changed_rows ON refill_rows(source_table,version);
+        CREATE TABLE IF NOT EXISTS refill_inputs (
+            object_store TEXT NOT NULL, input_kind TEXT NOT NULL, input_identity TEXT NOT NULL,
+            comparator_version INTEGER NOT NULL, result TEXT NOT NULL,
+            PRIMARY KEY(object_store,input_kind,input_identity,comparator_version)
+        );
+        CREATE TABLE IF NOT EXISTS refill_cells (
+            consumer_key TEXT PRIMARY KEY, catalog TEXT NOT NULL, rule TEXT NOT NULL, path TEXT NOT NULL,
+            view TEXT NOT NULL, input_identity TEXT NOT NULL, state TEXT NOT NULL, verdict TEXT NOT NULL,
+            dirty_version INTEGER NOT NULL, objects TEXT NOT NULL,
+            crate TEXT NOT NULL DEFAULT '', family TEXT, tier TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS refill_cell_domain ON refill_cells(catalog,view,rule,crate);
+        CREATE VIEW IF NOT EXISTS refill_cell_counts AS
+            SELECT catalog,view,rule,crate,family,state,count(*) AS cells,
+                sum(state='current' AND verdict='held') AS held
+            FROM refill_cells GROUP BY catalog,view,rule,crate,family,state;
+        DELETE FROM refill_cells;
+        DELETE FROM refill_dependencies WHERE consumer_table='refill_cells';
+    """ + _judgment_version_triggers(),
 }
 
 
@@ -2543,6 +2658,11 @@ class Ledger:
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
                  resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
+        self._maintain_judgments: bool = access == LedgerAccess.READ_WRITE
+        self._maintaining_cell: bool = False
+        self._judgment_objects: dict[str, bool] = {}
+        self._judgment_reads: set[str] = set()
+        self._judgment_read_failures: int = 0
         self._finding_reads: list[HeldFindingReads] = []
         self._refill_changes: int = 0
         self._refill_object_store: str = ""
@@ -2567,8 +2687,12 @@ class Ledger:
         self._named_files: dict[tuple[str, str, tuple[str, ...]], tuple[str, ...]] = {}
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._binding_proofs: dict[tuple[str, str, str], BindingProof] = {}
-        self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
+        self._parsed_files: dict[tuple[str, str], DeclaredFile] = {}
+        self._declared_blobs: dict[str, DeclaredFile] = {}
+        self._active_declarations: dict[str, DeclaredFile] = {}
+        self._declared_files: dict[tuple[str, str], tuple[DeclaredItem, ...]] = {}
         self._site_sources: dict[str, finding_sites.SourceSites] = {}
+        self._used_site_sources: set[str] = set()
         self._finding_histories: dict[str, FindingSourceHistory] = {}
         self._finding_anchors: dict[HeldFinding, FindingAnchor | NeedsJudgment] = {}
         self._site_maps: dict[tuple[str, str, str], dict[int, int]] = {}
@@ -2584,6 +2708,11 @@ class Ledger:
         self._test_file_destinations: dict[str, dict[str, TestFileDestination]] = {}
         self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
+        self._extern_file_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
+        self._trait_imports: dict[tuple[str, str], FileTraitImports] = {}
+        self._trait_positions: dict[tuple[str, str, int, str], ImplPosition] = {}
+        self._module_links: dict[tuple[str, str], PlainModuleLinks | UnprovedModuleLinks] = {}
+        self._type_header_conditions: dict[tuple[str, str, DeclaredItem], bool] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
@@ -2626,9 +2755,13 @@ class Ledger:
                 raise CheckCouldNotRun(f"unsupported ledger schema version {version}")
             for number, migration in sorted(MIGRATIONS.items()):
                 if number > version:
-                    for statement in migration.split(";"):
-                        if statement.strip():
-                            _ = self._connection.execute(statement)
+                    statement = ""
+                    for fragment in migration.split(";"):
+                        statement += fragment + ";"
+                        if sqlite3.complete_statement(statement):
+                            if statement.strip("; \n"):
+                                _ = self._connection.execute(statement)
+                            statement = ""
                     _ = self._connection.execute("DELETE FROM schema_version")
                     _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
             self._connection.commit()
@@ -2708,10 +2841,14 @@ class Ledger:
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if isinstance(self.git_cache, GitReadCache):
-            return self.git_cache.tip(commit)
-        if commit not in self._tips:
-            self._tips[commit] = _tip(self.repo, commit)
-        return self._tips[commit]
+            tip = self.git_cache.tip(commit)
+        else:
+            if commit not in self._tips:
+                self._tips[commit] = _tip(self.repo, commit)
+            tip = self._tips[commit]
+        if self._maintaining_cell:
+            self._judgment_reads.update(tip.read_objects)
+        return tip
 
     def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
         key = _input_key(tip, scope, path)
@@ -2726,15 +2863,60 @@ class Ledger:
             self._inputs[key] = _inputs(tip, scope, path)
         return self._inputs[key]
 
+    def _judgment_facts(self) -> RefillFacts:
+        if not self._refill_object_store:
+            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        objects = Path(self._refill_object_store) / "objects"
+        status = objects.stat()
+        store = input_identity((self._refill_object_store, status.st_dev, status.st_ino))
+        return RefillFacts(self._connection, store, "", on_derived_write=self._note_refill_changes)
+
+    def _note_refill_changes(self, changes: int) -> None:
+        self._refill_changes += changes
+
+    def _judgment_objects_available(self, objects: tuple[str, ...]) -> bool:
+        unread = tuple(dict.fromkeys(name for name in objects if name not in self._judgment_objects))
+        groups: dict[Path, list[tuple[str, str]]] = {}
+        for name in unread:
+            if name.startswith("rule:"):
+                repository, object_id = cast(tuple[str, str], json.loads(name.removeprefix("rule:")))
+                groups.setdefault(Path(repository), []).append((name, object_id))
+            else:
+                groups.setdefault(self.repo, []).append((name, name))
+        for repository, names in groups.items():
+            result = _git_bytes(repository, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                                input="".join(object_id + "\n" for _, object_id in names).encode())
+            replies = result.stdout.decode(errors="replace").splitlines()
+            for (name, object_id), reply in zip(names, replies, strict=True):
+                self._judgment_objects[name] = reply.startswith(object_id + " ") and not reply.endswith(" missing")
+        return all(self._judgment_objects[name] for name in objects)
+
+    def _judgment_rule_matches(self, blob: str, rule: Rule) -> bool:
+        repository = next((parent for parent in rule.path.parents if (parent / ".git").exists()), None)
+        if repository is not None and blob != rule.blob:
+            self._judgment_reads.add("rule:" + json.dumps((str(repository), blob), separators=(",", ":")))
+        return rule_catalog.judged_text_unchanged(blob, rule)
+
     def _rust_code(self, blob: str) -> RustCode | NotTokenized:
         """What _rust_code reads in a blob, read once."""
+        self._judgment_reads.add(blob)
+        facts = self._judgment_facts() if self._maintaining_cell else None
+        if facts is not None and self._judgment_objects_available((blob,)):
+            stored = facts.input_fact("rust_code", blob, JUDGMENT_READER_VERSION)
+            if not isinstance(stored, UnstoredFact):
+                return RustCode(bytes.fromhex(stored)) if stored else NOT_TOKENIZED
         if blob not in self._rust_codes:
             if isinstance(self.git_cache, GitReadCache):
                 self.git_cache.read_blobs((blob,))
                 self._rust_codes[blob] = _rust_code(self.git_cache.contents[blob])
-                return self._rust_codes[blob]
-            result = _git_bytes(self.repo, "cat-file", "blob", blob)
-            self._rust_codes[blob] = _rust_code(result.stdout)
+            else:
+                result = _git_bytes(self.repo, "cat-file", "blob", blob)
+                self._rust_codes[blob] = _rust_code(result.stdout)
+        if facts is not None:
+            code = self._rust_codes[blob]
+            with facts.publication():
+                facts.store_input("rust_code", blob, JUDGMENT_READER_VERSION,
+                                  code.digest.hex() if isinstance(code, RustCode) else "")
         return self._rust_codes[blob]
 
     def _judged_commit_missing(self, commit: str) -> bool:
@@ -2743,6 +2925,35 @@ class Ledger:
         return result.returncode == 1
 
     def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
+        """Reuse only comparisons with the same immutable inputs and policy."""
+        if not self._maintaining_cell:
+            return self._compare_judgment_inputs(row, tip, scope, path, family)
+        effective = _comparison_scope(row.declared_scope, scope)
+        member = (path if isinstance(row.reads, ReadFiles) else _input_key(tip, effective, path)[2])
+        key = (row.commit, row.input_fingerprint, row.input_scope, row.declared_scope,
+               asdict(row.reads), tip.commit, effective, member, family)
+        facts = self._judgment_facts()
+        stored = facts.input_fact("scope_comparison", key, JUDGMENT_READER_VERSION)
+        if not isinstance(stored, UnstoredFact):
+            matched, required = cast(tuple[bool, list[str]], json.loads(stored))
+            self._judgment_reads.update(required)
+            if self._judgment_objects_available(tuple(required)):
+                return matched
+        previous = self._judgment_reads
+        self._judgment_reads = {row.commit, tip.commit}
+        failures = self._judgment_read_failures
+        try:
+            matched = self._compare_judgment_inputs(row, tip, scope, path, family)
+            required = sorted(self._judgment_reads)
+            if failures == self._judgment_read_failures and self._judgment_objects_available(tuple(required)):
+                with facts.publication():
+                    facts.store_input("scope_comparison", key, JUDGMENT_READER_VERSION, json.dumps((matched, required)))
+            return matched
+        finally:
+            previous.update(self._judgment_reads)
+            self._judgment_reads = previous
+
+    def _compare_judgment_inputs(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
         """Whether the judged inputs are unchanged at tip.
 
         Names rules judge comment text, so their inputs must be byte equal. A modules judgment also matches when only
@@ -2767,17 +2978,28 @@ class Ledger:
             return _only_comments_changed(self._scope_inputs(self._tip(row.commit), scope, path),
                                           self._scope_inputs(tip, scope, path), self._rust_code)
         except GitReadFailed:
+            self._judgment_read_failures += 1
             if self._judged_commit_missing(row.commit):
                 return False
             raise
         except LedgerError:
+            self._judgment_read_failures += 1
             return False
 
     def _is_ancestor(self, commit: str, tip: str) -> bool:
+        self._judgment_reads.update((commit, tip))
         key = (commit, tip)
+        facts = self._judgment_facts() if self._maintaining_cell else None
+        if facts is not None:
+            stored = facts.input_fact("ancestor", key, JUDGMENT_READER_VERSION)
+            if not isinstance(stored, UnstoredFact) and self._judgment_objects_available(key):
+                return stored == "true"
         if key not in self._ancestors:
             result = _git_bytes(self.repo, "merge-base", "--is-ancestor", commit, tip, answers=GitExitAnswers(frozenset({0, 1})))
             self._ancestors[key] = result.returncode == 0
+        if facts is not None and self._judgment_objects_available(key):
+            with facts.publication():
+                facts.store_input("ancestor", key, JUDGMENT_READER_VERSION, "true" if self._ancestors[key] else "false")
         return self._ancestors[key]
 
     def set_tip(self, tip: str, style_branch: str | None = None) -> None:
@@ -3792,7 +4014,7 @@ class Ledger:
                     return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
                 ticket = self._ticket(id)
                 if ticket["base"]:
-                    before, after = self._file_at(ticket["base"], finding.path), self._file_at(commit, finding.path)
+                    before, after = self._commit_file(ticket["base"], finding.path), self._commit_file(commit, finding.path)
                     if not isinstance(before, bytes) or not isinstance(after, bytes):
                         renames = self._binding_renames(ticket, finding.path, commit)
                         unchecked = BindingProof({pair: NoAppliedCheck("rename") for pair in renames}, {}, False, {})
@@ -3806,14 +4028,14 @@ class Ledger:
                     self._binding_proofs[key] = binding_admission_check(source, renames, proof, current=after.decode(errors="replace"))
                     return self._binding_proofs[key].checks.get(rename, NoAppliedCheck("rename"))
         return applied_check(finding.kind, finding.before, finding.after, finding.path,
-                             lambda path: self._file_at(commit, path))
+                             lambda path: self._commit_file(commit, path))
 
     def rename_authority(self, finding: HeldFinding) -> approved_renames.AnchoredRenameSource | approved_renames.RenameAnchorUnavailable:
         """The ledger alone resolves the judgment/follow anchor; build bases never replace it."""
         anchor = self.finding_anchor(finding)
         if isinstance(anchor, NeedsJudgment):
             return approved_renames.RenameAnchorUnavailable(anchor.reason)
-        source = self._file_at(anchor.commit, anchor.path)
+        source = self._commit_file(anchor.commit, anchor.path)
         if not isinstance(source, bytes):
             return approved_renames.RenameAnchorUnavailable("source anchor file is missing")
         try:
@@ -3836,7 +4058,7 @@ class Ledger:
     def _built_check(self, finding: HeldFinding, commit: str) -> BuiltEntryEvidence:
         """A built boundary requires current-snapshot admission beside the applied/person proof."""
         check = self.applied_check(finding, commit)
-        source = self._file_at(commit, finding.path)
+        source = self._commit_file(commit, finding.path)
         companions: tuple[BindingRename, ...] = ()
         for identity in self._binding_proof_tickets(finding, commit):
             key = (identity, finding.path, commit)
@@ -5464,13 +5686,74 @@ class Ledger:
             self._commit_files[key] = self._file_at(commit, path)
         return self._commit_files[key]
 
+    def _declared_blob(self, blob: str, source: str) -> DeclaredFile:
+        """Keep compact parsing by blob until the declaration step ends."""
+        parsed = self._declared_blobs.get(blob)
+        if parsed is None:
+            parsed = read_declarations(source)
+            self._declared_blobs[blob] = parsed
+        self._active_declarations[blob] = parsed
+        return parsed
+
     def _declared_file(self, commit: str, path: str) -> DeclaredFile:
-        """The items of path at commit. A path that is not a file there reads as no text, so it declares no item."""
+        """Share compact parsing across all findings in the declaration step."""
+        key = (commit, path)
+        parsed = self._parsed_files.get(key)
+        if parsed is None:
+            blob = self._tip(commit).blobs.get(path, "")
+            parsed = self._declared_blobs.get(blob)
+            if parsed is None:
+                content = self._commit_file(commit, path)
+                parsed = self._declared_blob(blob, content.decode(errors="replace") if isinstance(content, bytes) else "")
+            self._parsed_files[key] = parsed
+            self._declared_files[key] = parsed.declared_items
+        self._active_declarations[self._tip(commit).blobs.get(path, "")] = parsed
+        return parsed
+
+    def _file_items(self, commit: str, path: str) -> tuple[DeclaredItem, ...]:
+        """Keep item metadata after a file scan releases its parsing indexes."""
         key = (commit, path)
         if key not in self._declared_files:
-            content = self._commit_file(commit, path)
-            self._declared_files[key] = read_declarations(content.decode(errors="replace") if isinstance(content, bytes) else "")
+            self._declared_files[key] = self._declared_file(commit, path).declared_items
         return self._declared_files[key]
+
+    def _source_sites(self, blob: str, source: str) -> finding_sites.SourceSites:
+        return finding_sites.SourceSites(source, lambda text: self._declared_blob(blob, text))
+
+    @contextmanager
+    def _parsed_source_scope(self) -> Generator[None]:
+        """Keep full parsing only for the current source work."""
+        try:
+            yield
+        finally:
+            for parsed in self._active_declarations.values():
+                parsed.release_source()
+            self._active_declarations.clear()
+            for blob in self._used_site_sources:
+                self._site_sources[blob].release_parsed()
+            self._used_site_sources.clear()
+            self._item_bodies.clear()
+            self._outside_diffs.clear()
+            style_footprint.tokenized_text.cache_clear()
+
+    def _plain_module_links(self, commit: str, path: str) -> PlainModuleLinks | UnprovedModuleLinks:
+        """Keep module links without retaining the file's word tuple."""
+        key = (commit, path)
+        if key not in self._module_links:
+            words = self._declared_file(commit, path).word_values
+            attributes = style_footprint.decorated_items(words)
+            if any(words[index] == "mod" and "path" in attribute for index, attribute in attributes.items()):
+                self._module_links[key] = UnprovedModuleLinks()
+            else:
+                depth = 0
+                names: list[str] = []
+                for index, word in enumerate(words):
+                    if word == "mod" and depth == 0 and index not in attributes and index + 2 < len(words):
+                        if style_footprint.IDENTIFIER.fullmatch(words[index + 1]) and words[index + 2] == ";":
+                            names.append(words[index + 1])
+                    depth += (word in ("{", "(", "[")) - (word in ("}", ")", "]"))
+                self._module_links[key] = PlainModuleLinks(tuple(names))
+        return self._module_links[key]
 
     def _crate_file_modules(self, commit: str, crate: str) -> dict[str, RootedFileModule]:
         """Prove file modules through plain declarations, with one scan per crate and commit."""
@@ -5496,18 +5779,10 @@ class Ledger:
             content = self._commit_file(commit, path)
             if not isinstance(content, bytes):
                 return modules
-            words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace")))
-            attributes = style_footprint.decorated_items(words)
-            if any(words[index] == "mod" and "path" in attribute for index, attribute in attributes.items()):
+            fact = self._plain_module_links(commit, path)
+            if isinstance(fact, UnprovedModuleLinks):
                 return modules
-            depth = 0
-            names: list[str] = []
-            for index, word in enumerate(words):
-                if word == "mod" and depth == 0 and index not in attributes and index + 2 < len(words):
-                    if style_footprint.IDENTIFIER.fullmatch(words[index + 1]) and words[index + 2] == ";":
-                        names.append(words[index + 1])
-                depth += (word in ("{", "(", "[")) - (word in ("}", ")", "]"))
-            links[path] = tuple(names)
+            links[path] = fact.names
         src = PurePosixPath(crate) / "src"
         pending: list[tuple[str, tuple[str, ...]]] = [(str(src / name), ("crate",)) for name in ("lib.rs", "main.rs") if str(src / name) in files]
         while pending:
@@ -5555,18 +5830,24 @@ class Ledger:
         return ResolvedTraitPath((*parts, *trait[index:]))
 
     def _trait_site_position(self, commit: str, path: str, line: int, spelling: str) -> ImplPosition:
+        key = (commit, path, line, spelling)
+        if key not in self._trait_positions:
+            self._trait_positions[key] = self._read_trait_site_position(commit, path, line, spelling)
+        return self._trait_positions[key]
+
+    def _read_trait_site_position(self, commit: str, path: str, line: int, spelling: str) -> ImplPosition:
         """Read the qualifier's scope, or the declared item's header scope when the qualifier is absent."""
         content = self._commit_file(commit, path)
         if not isinstance(content, bytes):
             return UnprovedImplPosition()
-        tokenized = style_footprint.tokenized_text(content.decode(errors="replace"))
-        words = tuple(token.value for token in tokenized.tokens)
-        wanted = tuple(token.value for token in style_footprint.tokens(spelling.split(";", 1)[0]))
+        declared = self._declared_file(commit, path)
+        words = declared.word_values
+        wanted = tuple(token.value for token in declarations.source_tokens(spelling.split(";", 1)[0]))
         if not wanted:
             return UnprovedImplPosition()
         blocks: list[int] = []
         scopes: dict[tuple[int, ...], int] = {}
-        for index, (word, number) in enumerate(zip(words, tokenized.lines, strict=True)):
+        for index, (word, number) in enumerate(zip(words, declared.word_lines, strict=True)):
             if number == line and words[index:index + len(wanted)] == wanted:
                 scopes[tuple(blocks)] = index
             if word == "{":
@@ -5589,31 +5870,27 @@ class Ledger:
         scope, index = next(iter(scopes.items()))
         return BlockScopedImpl(index) if scope else FileLevelImpl()
 
-    def _trait_import_path(self, commit: str, path: str, trait: tuple[str, ...],
-                           position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
-        """Read only imports visible at the header; enclosing block imports still block their names."""
-        if isinstance(position, UnprovedImplPosition):
-            return UnresolvedTraitPath()
-        content = self._commit_file(commit, path)
-        words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace"))) if isinstance(content, bytes) else ()
+    def _file_trait_imports(self, commit: str, path: str) -> FileTraitImports:
+        """Read each file's import bindings and blockers once per declaration step."""
+        key = (commit, path)
+        if key in self._trait_imports:
+            return self._trait_imports[key]
+        words = self._declared_file(commit, path).word_values
         blocks: list[int] = []
+        ranges: list[tuple[int, int]] = []
         enclosing: dict[int, tuple[int, ...]] = {}
         for index, word in enumerate(words):
-            if word == "use" or isinstance(position, BlockScopedImpl) and index == position.header_word:
+            if word == "use":
                 enclosing[index] = tuple(blocks)
             if word == "{":
                 blocks.append(index)
             elif word == "}" and blocks:
-                _ = blocks.pop()
-        header_blocks = enclosing.get(position.header_word, ()) if isinstance(position, BlockScopedImpl) else ()
-        imports: dict[str, list[tuple[str, ...]]] = {}
-        blocked: set[str] = set()
-        glob = False
+                ranges.append((blocks.pop(), index))
+        ranges.extend((opening, len(words)) for opening in blocks)
+        imports: list[ScopedTraitImport] = []
         for item in style_footprint.use_items(words):
             use = words.index("use", item.start, item.end)
             use_blocks = enclosing.get(use, ())
-            if use_blocks and (len(use_blocks) > len(header_blocks) or header_blocks[:len(use_blocks)] != use_blocks):
-                continue
             body = words[use + 1:item.end - 1]
             bindings: list[tuple[str, tuple[str, ...]]] = []
             if "as" in body:
@@ -5624,15 +5901,33 @@ class Ledger:
             else:
                 bindings.extend((imported[-1], imported) for imported in item.paths)
             supported = bool(bindings) and not item.attributed and not use_blocks and words[item.start] == "use"
-            if "*" in body:
-                glob = True
+            blocked: set[str] = set()
             if not supported:
-                # An unread visible import can bind either end of the trait path.
                 blocked.update(name for name, _ in bindings)
                 if not bindings:
                     blocked.update(word for word in body if style_footprint.IDENTIFIER.fullmatch(word))
+            imports.append(ScopedTraitImport(use_blocks, tuple(bindings) if supported else (), frozenset(blocked), "*" in body))
+        fact = FileTraitImports(tuple(imports), tuple(sorted(ranges)))
+        self._trait_imports[key] = fact
+        return fact
+
+    def _trait_import_path(self, commit: str, path: str, trait: tuple[str, ...],
+                           position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
+        """Resolve paths from compact import facts in the header's lexical scope."""
+        if isinstance(position, UnprovedImplPosition):
+            return UnresolvedTraitPath()
+        fact = self._file_trait_imports(commit, path)
+        header_blocks = (tuple(start for start, end in fact.blocks if start < position.header_word <= end)
+                         if isinstance(position, BlockScopedImpl) else ())
+        imports: dict[str, list[tuple[str, ...]]] = {}
+        blocked: set[str] = set()
+        glob = False
+        for item in fact.imports:
+            if item.scope and (len(item.scope) > len(header_blocks) or header_blocks[:len(item.scope)] != item.scope):
                 continue
-            for name, imported in bindings:
+            blocked.update(item.blocked)
+            glob = glob or item.glob
+            for name, imported in item.bindings:
                 imports.setdefault(name, []).append(imported)
         seen: set[tuple[str, str]] = set()
         # A binding must not expand twice, even when each expansion grows the path.
@@ -5659,7 +5954,7 @@ class Ledger:
         crate = tip.crate(path)
         homes = [candidate for candidate in self.files_naming(commit, trait[-1])
                  if candidate in tip.rust_files and tip.crate(candidate) == crate
-                 for item in self._declared_file(commit, candidate).declared_items
+                 for item in self._file_items(commit, candidate)
                  if item.declaration.keyword == "trait" and item.declaration.name == trait[-1]
                  and not isinstance(item.declaration.owner, ImplOrTraitItem)]
         modules: dict[str, str] = {}
@@ -5733,7 +6028,7 @@ class Ledger:
     def _matching_items(self, finding: HeldFinding, declaration: Declaration, requirement: TraitRequirement,
                         commit: str, path: str) -> tuple[DeclaredItem, ...] | TraitIdentityUncertain:
         matches: list[DeclaredItem] = []
-        for item in self._declared_file(commit, path).declared_items:
+        for item in self._file_items(commit, path):
             identity = self._matches_declaration(item, declaration, requirement, commit, path)
             if identity == TraitIdentity.UNCERTAIN:
                 return TraitIdentityUncertain(finding, declaration)
@@ -5754,7 +6049,7 @@ class Ledger:
         if key not in self._crate_names:
             self._crate_names[key] = any(item.declaration.name == name
                                          for path in tip.rust_files if tip.crate(path) == crate
-                                         for item in self._declared_file(tip.commit, path).declared_items)
+                                         for item in self._file_items(tip.commit, path))
         return self._crate_names[key]
 
     def _outside_body_check(self, read: str, old_path: str, old: DeclaredItem, commit: str, path: str,
@@ -5782,45 +6077,68 @@ class Ledger:
             self._item_bodies[key] = declarations.item_body(self._declared_file(commit, path), item)
         return self._item_bodies[key]
 
-    def _outside_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
-        """Read extern names only to refuse argument proof, never to resolve an alias."""
+    def _file_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
+        """Keep each file's extern names for every argument comparison in the step."""
         key = (commit, path)
-        if key in self._extern_names:
-            return self._extern_names[key]
-        tip = self._tip(commit)
-        crate = PurePosixPath(tip.crate(path))
-        files = {path, *(str(crate / "src" / root) for root in ("lib.rs", "main.rs"))}
+        if key in self._extern_file_names:
+            return self._extern_file_names[key]
+        if not isinstance(self._commit_file(commit, path), bytes):
+            self._extern_file_names[key] = UnresolvedTypeArguments()
+            return self._extern_file_names[key]
         names: set[str] = set()
-        for file in sorted(files & tip.blobs.keys()):
-            content = self._commit_file(commit, file)
-            if not isinstance(content, bytes):
-                self._extern_names[key] = UnresolvedTypeArguments()
-                return self._extern_names[key]
-            tokens = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace")))
-            attribute_ends = {end for _, end in style_footprint.attribute_spans(tokens)}
-            depth = 0
-            for cursor, token in enumerate(tokens):
-                if tokens[cursor:cursor + 2] == ("extern", "crate"):
-                    end = next((stop for stop in range(cursor + 2, len(tokens)) if tokens[stop] == ";"), len(tokens))
-                    body = tokens[cursor + 2:end]
-                    match body:
-                        case (crate_name,):
-                            name = crate_name
-                        case (crate_name, "as", name):
-                            pass
-                        case _:
-                            self._extern_names[key] = UnresolvedTypeArguments()
-                            return self._extern_names[key]
-                    start = cursor - 1 if cursor and tokens[cursor - 1] == "pub" else cursor
-                    if (depth or start in attribute_ends or start > 0 and tokens[start - 1] not in (";", "}")
-                            or end == len(tokens)
-                            or not all(style_footprint.IDENTIFIER.fullmatch(part) for part in (crate_name, name))):
-                        self._extern_names[key] = UnresolvedTypeArguments()
-                        return self._extern_names[key]
-                    names.update((crate_name, name))
-                depth += (token in ("{", "(", "[")) - (token in ("}", ")", "]"))
-        self._extern_names[key] = frozenset(names)
+        tokens = self._declared_file(commit, path).word_values
+        attribute_ends = {end for _, end in style_footprint.attribute_spans(tokens)}
+        depth = 0
+        for cursor, token in enumerate(tokens):
+            if tokens[cursor:cursor + 2] == ("extern", "crate"):
+                end = next((stop for stop in range(cursor + 2, len(tokens)) if tokens[stop] == ";"), len(tokens))
+                body = tokens[cursor + 2:end]
+                match body:
+                    case (crate_name,):
+                        name = crate_name
+                    case (crate_name, "as", name):
+                        pass
+                    case _:
+                        self._extern_file_names[key] = UnresolvedTypeArguments()
+                        return self._extern_file_names[key]
+                start = cursor - 1 if cursor and tokens[cursor - 1] == "pub" else cursor
+                if (depth or start in attribute_ends or start > 0 and tokens[start - 1] not in (";", "}")
+                        or end == len(tokens)
+                        or not all(style_footprint.IDENTIFIER.fullmatch(part) for part in (crate_name, name))):
+                    self._extern_file_names[key] = UnresolvedTypeArguments()
+                    return self._extern_file_names[key]
+                names.update((crate_name, name))
+            depth += (token in ("{", "(", "[")) - (token in ("}", ")", "]"))
+        self._extern_file_names[key] = frozenset(names)
+        return self._extern_file_names[key]
+
+    def _outside_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
+        """Combine compact extern facts from the file and its crate roots."""
+        key = (commit, path)
+        if key not in self._extern_names:
+            tip = self._tip(commit)
+            crate = PurePosixPath(tip.crate(path))
+            files = {path, *(str(crate / "src" / root) for root in ("lib.rs", "main.rs"))}
+            names: set[str] = set()
+            for file in sorted(files & tip.blobs.keys()):
+                fact = self._file_extern_names(commit, file)
+                if isinstance(fact, UnresolvedTypeArguments):
+                    self._extern_names[key] = fact
+                    return fact
+                names.update(fact)
+            self._extern_names[key] = frozenset(names)
         return self._extern_names[key]
+
+    def _conditional_type_header(self, commit: str, path: str, item: DeclaredItem) -> bool:
+        key = (commit, path, item)
+        if key not in self._type_header_conditions:
+            declared = self._declared_file(commit, path)
+            header = tuple(token.value for token in declarations.source_tokens("\n".join(
+                declared.source_lines[item.first_line - 1:item.keyword_line])))
+            self._type_header_conditions[key] = any(
+                header[span[0] + 2:span[0] + 3] in (("cfg",), ("cfg_attr",))
+                for span in style_footprint.attribute_spans(header))
+        return self._type_header_conditions[key]
 
     def _outside_type_arguments(self, commit: str, path: str, arguments: tuple[str, ...],
                                 position: ImplPosition, contexts: tuple[tuple[str, str], ...],
@@ -5868,10 +6186,7 @@ class Ledger:
                 if len(local) > 1:
                     return UnresolvedTypeArguments()
                 for item in local:
-                    header = tuple(token.value for token in style_footprint.tokens("\n".join(
-                        declared.source_lines[item.first_line - 1:item.keyword_line])))
-                    if any(header[span[0] + 2:span[0] + 3] in (("cfg",), ("cfg_attr",))
-                           for span in style_footprint.attribute_spans(header)):
+                    if self._conditional_type_header(commit, path, item):
                         return UnresolvedTypeArguments()
                 # Only a proved local root receives the file module; other paths stay external.
                 if local:
@@ -5927,8 +6242,7 @@ class Ledger:
         for path in sorted(set(tip.rust_files) & changed):
             if tip.crate(path) != crate:
                 continue
-            destination = self._declared_file(tip.commit, path)
-            for item in destination.declared_items:
+            for item in self._file_items(tip.commit, path):
                 if item.declaration.keyword != target.keyword:
                     continue
                 if item.declaration.owner not in (target.owner, old.declaration.owner):
@@ -5949,8 +6263,7 @@ class Ledger:
                         checks.append(OutsideFailure.TRAIT_UNCERTAIN)
                     elif identity == TraitIdentity.DIFFERENT:
                         checks.append(OutsideFailure.WRONG_OWNER)
-                prior = self._declared_file(read, path)
-                if any(other.declaration == item.declaration for other in prior.declared_items):
+                if any(other.declaration == item.declaration for other in self._file_items(read, path)):
                     checks.append(OutsideFailure.NOT_GAINED)
                 unchanged, count, body_checks = self._outside_body_check(read, finding.path, old, tip.commit, path, item)
                 checks.extend(body_checks)
@@ -6009,7 +6322,7 @@ class Ledger:
         crate = tip.crate(finding.path)
         owners = [(path, item) for path in self.files_naming(read, membership.path[-1])
                   if self._tip(read).crate(path) == crate
-                  for item in self._declared_file(read, path).declared_items
+                  for item in self._file_items(read, path)
                   if item.declaration.keyword == "trait" and item.declaration.name == membership.path[-1]
                   and self._trait_identity(membership, read, finding.path,
                                            ImplementedTrait((item.declaration.name,), membership.arguments, item.import_position),
@@ -6028,7 +6341,7 @@ class Ledger:
             return failed
         trait = ImplementedTrait((proof.declaration.name,), membership.arguments, renamed_owner[0].import_position)
         children = [(path, item) for path in sorted(set(tip.rust_files) & changed) if tip.crate(path) == crate
-                    for item in self._declared_file(tip.commit, path).declared_items
+                    for item in self._file_items(tip.commit, path)
                     if item.declaration == old.declaration
                     and self._outside_type_identity(old, read, finding.path, item, tip.commit, path) == TraitIdentity.SAME
                     and self._trait_identity(trait, tip.commit, proof.path, item.implemented_trait,
@@ -6156,7 +6469,7 @@ class Ledger:
 
     def _refresh_site_rows(self) -> None:
         version = (cast(tuple[int], self._connection.execute("PRAGMA data_version").fetchone())[0],
-                   self._connection.total_changes)
+                   self._connection.total_changes - self._refill_changes)
         if version == self._site_rows_version:
             return
         self._site_rows_version = version
@@ -6199,12 +6512,16 @@ class Ledger:
         """Read each needed immutable blob once, using Git's existing batch reader."""
         self._refresh_site_rows()
         wanted: dict[str, str] = {}
+        coordinates: dict[str, set[tuple[str, str]]] = {}
         for finding in findings:
             # Collect both legacy candidates before proving any anchor, so all source reads share one batch.
-            for tree in (*(self._tip(commit) for commit in self._anchor_candidates(finding)), tip):
+            trees = (*(self._tip(commit) for commit in self._anchor_candidates(finding)), tip)
+            for tree in trees:
                 blob = tree.blobs.get(finding.path, "")
-                if blob and blob not in self._site_sources:
-                    wanted[blob] = blob
+                if blob:
+                    coordinates.setdefault(blob, set()).add((tree.commit, finding.path))
+                    if blob not in self._site_sources:
+                        wanted[blob] = blob
         if isinstance(self.git_cache, GitReadCache):
             self.git_cache.read_blobs(wanted)
             cached = self.git_cache.contents
@@ -6212,8 +6529,10 @@ class Ledger:
         else:
             contents = blob_contents(self.repo, wanted)
         for blob, content in contents:
+            for key in coordinates[blob]:
+                self._commit_files[key] = content
             try:
-                self._site_sources[blob] = finding_sites.SourceSites(content.decode())
+                self._site_sources[blob] = self._source_sites(blob, content.decode())
             except UnicodeDecodeError:
                 # Non-UTF-8 is not source evidence.
                 continue
@@ -6223,12 +6542,10 @@ class Ledger:
         if not blob:
             return finding_sites.SourceSites("")
         if blob not in self._site_sources:
-            if isinstance(self.git_cache, GitReadCache):
-                self.git_cache.read_blobs((blob,))
-                content = self.git_cache.contents[blob]
-            else:
-                content = next(blob_contents(self.repo, {path: blob}))[1]
-            self._site_sources[blob] = finding_sites.SourceSites(content.decode())
+            content = self._commit_file(tip.commit, path)
+            assert isinstance(content, bytes)
+            self._site_sources[blob] = self._source_sites(blob, content.decode())
+        self._used_site_sources.add(blob)
         return self._site_sources[blob]
 
     def _unchanged_site_lines(self, before: str, after: str, path: str) -> dict[int, int]:
@@ -6653,7 +6970,7 @@ class Ledger:
                        and any(item.declaration.name == owner.name
                                and item.declaration.keyword in ("struct", "enum", "union", "trait", "type")
                                and not isinstance(item.declaration.owner, ImplOrTraitItem)
-                               for item in self._declared_file(read, path).declared_items)
+                               for item in self._file_items(read, path))
                        for path in self.files_naming(read, owner.name))
 
         owners = renamed(owner.name, owner_item)
@@ -6679,7 +6996,7 @@ class Ledger:
                         and not isinstance(item.declaration.owner, ImplOrTraitItem)
                         for candidate in self.files_naming(built.before_commit, path[-1])
                         if candidate in tip.rust_files and tip.crate(candidate) == crate
-                        for item in self._declared_file(built.before_commit, candidate).declared_items)
+                        for item in self._file_items(built.before_commit, candidate))
                     if isinstance(resolved, ResolvedTraitPath) and resolved.path == path and not declared:
                         identity = TraitIdentity.SAME
                 if identity == TraitIdentity.UNCERTAIN:
@@ -6796,47 +7113,70 @@ class Ledger:
         built_renames: list[BuiltRename] = []
         built_findings = self.held_findings(HeldFindingsInState("built"))
         for finding in built_findings:
-            rename = _item_rename(finding.kind, finding.before, finding.after)
-            if isinstance(finding.state, Built) and isinstance(rename, ItemRename):
-                judged = self.judged_commit(finding)
-                if isinstance(judged, NoJudgedCommit):
-                    continue
-                read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
-                before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
-                before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
-                history = self._finding_histories[finding.finding_id]
-                # The preceding coordinate belongs to the preceding follow, not the first judgment.
-                previous = (history.previous_site_commit or judged.commit) if isinstance(finding.follow, FollowedDeclaration) else history.anchor_commit or judged.commit
-                anchor = FindingAnchor(previous, before_path, before_line)
-                if isinstance(rename.scope, SelfQualified):
-                    item = self._declared_file(read.commit, finding.path).declaration_at(finding.line)
-                    if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
+            with self._parsed_source_scope():
+                rename = _item_rename(finding.kind, finding.before, finding.after)
+                if isinstance(finding.state, Built) and isinstance(rename, ItemRename):
+                    judged = self.judged_commit(finding)
+                    if isinstance(judged, NoJudgedCommit):
                         continue
-                    rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
-                built_renames.append(BuiltRename(
-                    rename, finding.path, read.commit, before_path, anchor.commit, finding.state.proposal,
-                    self._trait_site_position(anchor.commit, before_path, before_line, finding.before),
-                    self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
+                    read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
+                    before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
+                    before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
+                    history = self._finding_histories[finding.finding_id]
+                    # The preceding coordinate belongs to the preceding follow, not the first judgment.
+                    previous = (history.previous_site_commit or judged.commit) if isinstance(finding.follow, FollowedDeclaration) else history.anchor_commit or judged.commit
+                    anchor = FindingAnchor(previous, before_path, before_line)
+                    if isinstance(rename.scope, SelfQualified):
+                        item = self._declared_file(read.commit, finding.path).declaration_at(finding.line)
+                        if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
+                            continue
+                        rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
+                    built_renames.append(BuiltRename(
+                        rename, finding.path, read.commit, before_path, anchor.commit, finding.state.proposal,
+                        self._trait_site_position(anchor.commit, before_path, before_line, finding.before),
+                        self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         evidence = BuiltRenameEvidence(built_findings, tuple(built_renames))
         self._built_rename_evidence[tip.commit] = evidence
         return evidence
 
     def _release_declaration_commit(self, commit: str) -> None:
-        """Release declaration caches that name this completed group's historical commit."""
-        self._declared_files = {key: value for key, value in self._declared_files.items() if key[0] != commit}
+        """Release historical bytes and comparison data after their findings finish."""
         self._commit_files = {key: value for key, value in self._commit_files.items() if key[0] != commit}
         self._item_bodies = {key: value for key, value in self._item_bodies.items() if key[0] != commit}
         self._outside_bodies = {key: value for key, value in self._outside_bodies.items() if key[0] != commit and key[2] != commit}
         self._outside_diffs = {key: value for key, value in self._outside_diffs.items() if commit not in key[:2]}
         self._file_modules = {key: value for key, value in self._file_modules.items() if key[0] != commit}
         self._extern_names = {key: value for key, value in self._extern_names.items() if key[0] != commit}
-        # Binding proofs use (ticket, path, commit); site maps use (before, after, path).
         self._binding_proofs = {key: value for key, value in self._binding_proofs.items() if key[2] != commit}
         self._site_maps = {key: value for key, value in self._site_maps.items() if commit not in key[:2]}
-        _ = self._tips.pop(commit, None)
 
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
                              approved: Callable[[Path], bool]) -> DeclarationReading:
+        try:
+            return self._read_declaration_groups(finding_ids, tip, approved)
+        finally:
+            self._site_sources.clear()
+            self._used_site_sources.clear()
+            self._parsed_files.clear()
+            self._declared_blobs.clear()
+            self._active_declarations.clear()
+            self._commit_files.clear()
+            self._item_bodies.clear()
+            self._outside_diffs.clear()
+            self._tips.clear()
+            self._inputs.clear()
+            self._declared_files = {key: items for key, items in self._declared_files.items() if key[0] == tip.commit}
+            self._file_modules.clear()
+            self._extern_names.clear()
+            self._extern_file_names.clear()
+            self._trait_imports.clear()
+            self._trait_positions.clear()
+            self._module_links.clear()
+            self._type_header_conditions.clear()
+            style_footprint.tokenized_text.cache_clear()
+
+    def _read_declaration_groups(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
+                                 approved: Callable[[Path], bool]) -> DeclarationReading:
         findings = tuple(self._held(finding_id) for finding_id in finding_ids)
         self._prepare_sites(findings, tip)
         rust_files = frozenset(tip.rust_files)
@@ -6844,33 +7184,36 @@ class Ledger:
         self._refresh_site_rows()
         groups: dict[str | int, list[tuple[int, HeldFinding]]] = {}
         for index, finding in enumerate(findings):
-            anchor = self.finding_anchor(finding)
+            with self._parsed_source_scope():
+                anchor = self.finding_anchor(finding)
             # A finding without an anchor uses its input position as its group key.
             group_key = anchor.commit if isinstance(anchor, FindingAnchor) else index
             groups.setdefault(group_key, []).append((index, finding))
         outcomes: dict[int, DeclarationOutcome] = {}
         for commit, group in groups.items():
-            for index, finding in group:
-                outcome = self._declaration_outcome(self._held(finding.finding_id), tip, rust_files, approved,
-                                                    built.renames, built.findings)
-                outcomes[index] = outcome
-                finding = outcome.finding
-                if isinstance(outcome, FindingSite):
-                    evidence = outcome.evidence
-                elif isinstance(outcome, DeclarationMoved):
-                    anchor = self.finding_anchor(finding)
-                    evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
-                                if isinstance(anchor, FindingAnchor) else anchor)
-                elif isinstance(outcome, DeclarationRemoved):
-                    evidence = NeedsJudgment("no source site after proved declaration removal")
-                elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
-                    # Existing untracked findings remain eligible for filing without historical carry.
-                    evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
-                elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
-                    evidence = self._site_proof(finding, tip.commit)
-                else:
-                    evidence = NeedsJudgment("existing declaration proof refused this transition")
-                self._follow_evidence[(finding, tip.commit)] = evidence
+            for _path, members in groupby(group, key=lambda entry: entry[1].path):
+                with self._parsed_source_scope():
+                    for index, finding in members:
+                        outcome = self._declaration_outcome(self._held(finding.finding_id), tip, rust_files, approved,
+                                                            built.renames, built.findings)
+                        outcomes[index] = outcome
+                        finding = outcome.finding
+                        if isinstance(outcome, FindingSite):
+                            evidence = outcome.evidence
+                        elif isinstance(outcome, DeclarationMoved):
+                            anchor = self.finding_anchor(finding)
+                            evidence = (UnchangedSite(outcome.path, outcome.line, anchor)
+                                        if isinstance(anchor, FindingAnchor) else anchor)
+                        elif isinstance(outcome, DeclarationRemoved):
+                            evidence = NeedsJudgment("no source site after proved declaration removal")
+                        elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                            # Existing untracked findings remain eligible for filing without historical carry.
+                            evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
+                        elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
+                            evidence = self._site_proof(finding, tip.commit)
+                        else:
+                            evidence = NeedsJudgment("existing declaration proof refused this transition")
+                        self._follow_evidence[(finding, tip.commit)] = evidence
             if isinstance(commit, str) and commit != tip.commit:
                 self._release_declaration_commit(commit)
         return DeclarationReading(tip.commit, tuple(outcomes[index] for index in range(len(findings))))
@@ -7797,7 +8140,7 @@ class Ledger:
                     pass
                 continue
             judged = True
-            if row.declared_scope != declared or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
+            if row.declared_scope != declared or not self._judgment_rule_matches(row.rule_blob, rule):
                 continue
             try:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
@@ -7825,6 +8168,37 @@ class Ledger:
         if pending:
             return "awaiting merge", pending
         return ("stale" if judged else "open"), ""
+
+    def _cell_dependencies(self, rule: Rule, path: str, tip: RepositoryTip) -> CellDependencies:
+        rows = cast(list[tuple[int]], self._connection.execute(
+            "SELECT id FROM judgments WHERE rule=? AND path=?", (rule.rule_id, path)).fetchall())
+        scope = _cell_scope(rule, path, tip)
+        return CellDependencies((
+            ("judgment_cell", json.dumps((rule.rule_id, path), separators=(",", ":"), ensure_ascii=False), ""),
+            ("rule_generations", base_rule(rule.rule_id), ""),
+            ("scope_membership", json.dumps(_input_key(tip, scope, path)[1:]), tip.tree),
+            ("history", tip.commit, tip.commit),
+            ("removal_barriers", json.dumps((rule.rule_id, path)), tip.commit),
+            *(("judgments", str(id), "") for (id,) in rows),
+            *(("git_object", object_id, object_id) for object_id in sorted(self._judgment_reads)),
+        ))
+
+    def _maintained_judgment(self, cells: JudgmentCells, rule: Rule, path: str,
+                             tip: RepositoryTip, crate: str, branch: str) -> tuple[CellState, str]:
+        self._judgment_reads = {tip.commit}
+        identity = cell_identity((tip.commit, branch, cells.facts.object_store, rule.rule_id,
+                                  rule.blob, rule.judgment_identity, rule.tier, rule.family, rule.input_scope, path))
+        def calculate() -> tuple[CellState, str]:
+            previous = self._maintaining_cell
+            self._maintaining_cell = True
+            try:
+                return self._judgment_state(rule, path, tip)
+            finally:
+                self._maintaining_cell = previous
+        return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
+                            calculate,
+                            lambda: self._cell_dependencies(rule, path, tip),
+                            crate=crate, family=rule.family, tier=rule.tier)
 
     def _style_branch(self) -> StyleBranch:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -7896,22 +8270,53 @@ class Ledger:
         return StyleMergeChanges(style_branch.name, changed) if changed else NoStyleMergeChange()
 
     def _lint_coverage(self, tool: LintTool, tip: RepositoryTip) -> LintCoverage:
-        rows = cast(list[tuple[str, str, int, str, str]], self._connection.execute(
-            "SELECT tree,config_hash,passed,diagnostics_json,rule_blobs_json FROM lint_runs WHERE tool=? AND scope='workspace' ORDER BY id DESC", (tool,),
-        ).fetchall())
         config_hash = _config_hash(self.repo, tip, tool)
+        rows = cast(list[tuple[str, str, int, str, str]], self._connection.execute(
+            "SELECT tree,config_hash,passed,diagnostics_json,rule_blobs_json FROM lint_runs "
+            + "WHERE tool=? AND scope='workspace' AND tree=? AND config_hash=? ORDER BY id DESC",
+            (tool, tip.tree, config_hash),
+        ).fetchall())
         for tree, config, passed, serialized, rule_blobs_json in rows:
             if tree == tip.tree and config == config_hash:
                 diagnostics = cast(dict[str, int], json.loads(serialized))
                 rule_blobs = cast(dict[str, str], json.loads(rule_blobs_json))
                 return LintCoverage(True, bool(passed), diagnostics, rule_blobs)
-        return LintCoverage(bool(rows), False, {}, {})
+        has_runs = self._connection.execute(
+            "SELECT 1 FROM lint_runs WHERE tool=? AND scope='workspace' LIMIT 1", (tool,)).fetchone() is not None
+        return LintCoverage(has_runs, False, {}, {})
 
     def _coverage(self, rule_id: str | None = None, crate: str | None = None) -> Iterator[tuple[Cell, str]]:
         self._catalog = self._load_rules()
         self._branch_tips.clear()
         tip = self._synced_tip()
         self._refresh_sites(tip)
+        self._judgment_objects.clear()
+        roots = tuple(sorted({str(rule.path.parent) for rule in self._catalog}))
+        rule_stores: list[tuple[str, int, int]] = []
+        for root in roots:
+            repository = next((parent for parent in Path(root).parents if (parent / ".git").exists()), None)
+            if repository is not None:
+                identity = rule_catalog.RuleRepositoryIdentity.at(repository)
+                rule_stores.append((str(identity.common_dir), *identity.object_store_identity))
+        facts = self._judgment_facts()
+        facts.catalog = input_identity((str(self.repo), tuple(map(str, self._rule_checkouts)), roots, rule_stores))
+        maintained = JudgmentCells(facts, "synced")
+        if self._maintain_judgments:
+            facts.observe_sources()
+            objects = cast(list[tuple[str]], self._connection.execute(
+                "SELECT DISTINCT d.source_key FROM refill_dependencies d JOIN refill_cells c "
+                + "ON c.consumer_key=d.consumer_key WHERE d.consumer_table='refill_cells' "
+                + "AND d.source_kind='git_object' AND c.catalog=? AND c.view='synced'",
+                (facts.catalog,)).fetchall())
+            _ = self._judgment_objects_available(tuple(name for (name,) in objects))
+        style_branch = self._style_branch()
+        branch = ""
+        if isinstance(style_branch, StoredStyleBranch):
+            try:
+                branch = self._branch_commit(style_branch.name)
+            except (LedgerError, GitReadFailed) as error:
+                branch = str(error)
+        observed_rules: list[str] = []
         lint_tools: dict[LintTool, LintCoverage] = {}
         if rule_id is not None:
             if rule_id.endswith("#uncovered"):
@@ -7937,14 +8342,17 @@ class Ledger:
             if definition.tier == "B" and definition.candidates is not None and definition.candidates.surface == "partial":
                 components.append((replace(definition, rule_id=definition.rule_id + "#uncovered", tier="C"), files))
             lint_coverage = LintCoverage(False, False, {}, {})
+            lint_key = ""
             if definition.tier == "A":
                 tool = cast(LintTool, style_rules.parse_frontmatter(definition.path)["mechanism"][0])
+                lint_key = tool
                 if tool not in lint_tools:
                     lint_tools[tool] = self._lint_coverage(tool, tip)
                 lint_coverage = lint_tools[tool]
             for component, component_paths in components:
                 if rule_id is not None and rule_id.endswith("#uncovered") and component.rule_id != rule_id:
                     continue
+                observed_rules.append(component.rule_id)
                 for path in component_paths:
                     cell_crate = path if component.tier == "D" and component.input_scope == "manifest" else tip.crate(path)
                     if crate is not None and cell_crate != crate:
@@ -7955,9 +8363,22 @@ class Ledger:
                             state = "current" if (lint_coverage.passed and lint_coverage.diagnostics.get(path, 0) == 0
                                                   and rule_catalog.judged_text_unchanged(lint_coverage.rule_blobs.get(component.rule_id, ""), component)) else "stale"
                         verdict = ""
+                        if self._maintain_judgments:
+                            self._judgment_reads = {tip.commit}
+                            identity = cell_identity((tip.commit, component.blob, component.judgment_identity,
+                                                      asdict(lint_coverage), facts.object_store))
+                            state, verdict = maintained.result(
+                                component.rule_id, path, identity, self._judgment_objects_available,
+                                lambda: (state, verdict),
+                                lambda: CellDependencies((("lint_tool", lint_key, ""), ("git_object", tip.commit, tip.commit))),
+                                crate=cell_crate, family=component.family, tier=component.tier)
                     else:
-                        state, verdict = self._judgment_state(_judgment_rule(component, path), path, tip)
+                        judged_rule = _judgment_rule(component, path)
+                        state, verdict = (self._maintained_judgment(maintained, judged_rule, path, tip, cell_crate, branch)
+                                          if self._maintain_judgments else self._judgment_state(judged_rule, path, tip))
                     yield Cell(component.rule_id, path, cell_crate, cast(Tier, component.tier), component.family, state), verdict
+        if self._maintain_judgments:
+            maintained.finish(observed_rules, crate, all_rules=rule_id is None)
 
     def cells(self, rule: str | None = None, crate: str | None = None) -> Iterator[Cell]:
         for cell, _ in self._coverage(rule, crate):

@@ -109,6 +109,14 @@ def wait_until(condition: Callable[[], bool], seconds: float) -> bool:
 
 
 def group_running(group: int) -> bool:
+    # Earlier tests can enable adoption. Reap exited children before probing their group.
+    while True:
+        try:
+            pid, _ = os.waitpid(-group, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            break
     try:
         send_process_group(group, 0)
     except ProcessLookupError:

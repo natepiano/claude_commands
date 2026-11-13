@@ -1336,6 +1336,78 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(result, herdr.PromptSubmitted)
         self.assertGreater(cursor.offsets[self.path], before)
 
+    def check_start_cursor(self, *, supplied: bool, native_identity_changes: bool) -> None:
+        self.write_turn("prelaunch-only-history", kind="assistant", seconds_after_launch=-1)
+        historical_size = self.path.stat().st_size
+        requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                     if native_identity_changes else self.transcript)
+        source = self.path.with_name(requested.session_id + ".jsonl")
+        if source != self.path:
+            _ = source.write_bytes(self.path.read_bytes())
+        cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+        if supplied:
+            cursor = herdr.TranscriptCursor(requested, self.launched_at)
+            cursor.skip_existing_turns()
+        publications: list[herdr.SessionTranscript] = []
+        seen: list[herdr.TranscriptCursor] = []
+        positions: list[dict[Path, int]] = []
+        original_read = herdr.TranscriptCursor.read_turns
+
+        def read_turns(reader: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+            seen.append(reader)
+            positions.append(dict(reader.offsets))
+            return original_read(reader)
+
+        def start(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.write_turn("resume the saved work")
+            self.write_turn("Resumed work", kind="assistant", seconds_after_launch=2)
+            return subprocess.CompletedProcess(["fixture agent start"], 0, "", "")
+
+        def publish(actual: herdr.SessionTranscript) -> None:
+            publications.append(actual)
+
+        def native_session(*_args: object, **_kwargs: object) -> str:
+            native.return_value = herdr.NativeAgentProcess(
+                herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})
+            return self.transcript.session_id
+
+        cast(Mock, self.start).side_effect = start
+        with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(requested.session_id), "fixture-prompt-recipient", {})) as native,
+              patch.object(self.client, "native_session", side_effect=native_session),
+              patch.object(herdr.TranscriptCursor, "read_turns", read_turns),
+              patch.object(json, "loads", wraps=json.loads) as parsed):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id],
+                herdr.OpeningPrompt("resume the saved work", requested, publish, cursor), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        cast(Mock, self.start).assert_called_once()
+        self.assertEqual(self.typed, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(publications, [self.transcript])
+        self.assertTrue(seen)
+        self.assertTrue(all(reader is seen[0] for reader in seen))
+        if supplied:
+            self.assertIs(seen[0], cursor)
+        self.assertEqual(seen[0].transcript, self.transcript)
+        self.assertEqual(positions[0], {} if native_identity_changes else {self.path: historical_size})
+        self.assertEqual(len(seen[0].read_turns()), 2)
+        self.assertEqual(any("prelaunch-only-history" in str(value)
+                            for parsed_call in parsed.call_args_list
+                            for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
+
+    def test_start_positions_an_automatic_cursor_before_the_agent_command(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=False)
+
+    def test_start_keeps_a_supplied_cursor_and_its_publication_callback(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=False)
+
+    def test_start_moves_a_supplied_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=True)
+
+    def test_start_moves_an_automatic_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=True)
+
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
         first_size = self.path.stat().st_size

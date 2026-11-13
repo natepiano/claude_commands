@@ -64,9 +64,10 @@ def tell_showrunner(staff_id: str, summary: str, text: str) -> bool:
     if address:
         sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
         try:
-            result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "--to", address,
+            result = subprocess.run(session_send.send_argv("--to", address,
                                      "--from", "bevy-upgrade", "--key", instance(staff_id),
-                                     "--summary", summary, "--text", text],
+                                     "--summary", summary, "--text", text, send_script=Path(sender),
+                                     python_interpreter=session_send.PYTHON_LAUNCHER),
                                     capture_output=True, text=True, check=False)
         except OSError as error:
             outcome = f"FAILED: {error}"
@@ -85,8 +86,9 @@ def retire_message(staff_id: str) -> None:
         if not address:
             return
         sender = os.environ.get("BEVY_UPGRADE_SEND", str(session_send.SEND_SCRIPT))
-        result = subprocess.run([str(SCRIPTS / "lib/py"), sender, "retire", "--to", address,
-                                 "--from", "bevy-upgrade", "--key", instance(staff_id)],
+        result = subprocess.run(session_send.send_argv("retire", "--to", address,
+                                 "--from", "bevy-upgrade", "--key", instance(staff_id), send_script=Path(sender),
+                                 python_interpreter=session_send.PYTHON_LAUNCHER),
                                 capture_output=True, text=True, check=False)
     except OSError as error:
         outcome = str(error)
