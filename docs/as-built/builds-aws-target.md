@@ -339,10 +339,19 @@ Old snapshots without failure records remain readable.
 The `failure_streak` record stores `since` and `notice_claimed` while any candidate region fails.
 The reader also accepts the previous `notified` field.
 The snapshot saves each failure before it attempts a user notice.
-It uses `message/send.py --to user --text-id nate.adhoc` with a key from the streak's start time.
-The notice names the failed regions, UTC times, AWS errors, and the repair.
-Permission errors request `deploy.py up --workload merge-gates --approve-resources`.
-Other errors request a check of scaler credentials and network access.
+It renders the registered `aws.snapshot_failed` text and sends it through `push_texts.user_send_argv`.
+The message key comes from the streak's start time.
+The notice names only regions with permission errors and their AWS error codes.
+`AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
+The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
+That command updates permissions but does not replace scaler credentials.
+Credential errors, timeouts, network errors, and throttling send no phone notice.
+`deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
+The table continues to show each regional failure.
+A failure without a notice preserves the streak without claiming a notice.
+A later permission error in that streak can send one notice.
+The registry requires user approval for the new text.
+The approval file remains unchanged.
 The snapshot saves the notice claim before it calls the message process.
 The claim prevents another send for that streak after a crash.
 A crash before delivery can suppress that streak's notice.

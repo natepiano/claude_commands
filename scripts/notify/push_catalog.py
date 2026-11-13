@@ -15,6 +15,15 @@ def mac_idle_reservation(holder: str, detail: str) -> str:
 
 
 ENTRIES = (
+    # These examples use regional permission errors.
+    PushText("aws.snapshot_failed", "buildlog", "note", "AWS prices cannot refresh",
+        ActionTemplate("On natedev, run deploy.py up --workload merge-gates --approve-resources in a terminal."),
+        "The /aws_prices command cannot refresh AWS prices or quotas.\n{failures}",
+        (PushExample("permission", {
+            "failures": "AWS denied the price read in us-east-2 (UnauthorizedOperation)."}),
+         PushExample("regional_permissions", {
+            "failures": "AWS denied the price read in us-east-2 (UnauthorizedOperation).\nAWS denied the Standard quota read in us-west-2 (AccessDenied)."})),
+        purpose="AWS denied a regional read that the gate deployment can repair."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",

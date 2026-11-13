@@ -20,6 +20,8 @@ from scripts.aws_target import admin_secrets, aws_target, deploy, ledger, spot_t
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
+from scripts.notify import push_texts
+from scripts.notify.user_action import ActionRequired
 
 
 class ControlTests(CostFixture):
@@ -31,9 +33,10 @@ class ControlTests(CostFixture):
     gpu: tuple[str, ...] = ()
     failure: str = ''
     failure_reason: str = ''
+    regional_failure_reasons: dict[str, str] = {}
     omitted: str = ''
     quota: int = 0
-    notices: list[tuple[str, str, float]] = []
+    notices: list[tuple[str, push_texts.RenderedPush, float]] = []
     notice_accepted: bool = True
 
     @override
@@ -43,6 +46,7 @@ class ControlTests(CostFixture):
         self.calls = []
         self.failure = ''
         self.notices = []
+        self.regional_failure_reasons = {}
         self.notice_accepted = True
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
@@ -89,7 +93,7 @@ class ControlTests(CostFixture):
             raise subprocess.TimeoutExpired('fixture price read', timeout)
         if self.failure == 'all' or region == self.regions[0] and (self.failure == operation or
                 self.failure == 'gpu-quota' and operation == 'get-service-quota' and 'L-3819A6DF' in arguments):
-            return subprocess.CompletedProcess(arguments, 1, '', self.failure_reason)
+            return subprocess.CompletedProcess(arguments, 1, '', self.regional_failure_reasons.get(region, self.failure_reason))
         reply: dict[str, object]
         if operation == 'get-service-quota':
             code = arguments[arguments.index('--quota-code') + 1]
@@ -107,9 +111,10 @@ class ControlTests(CostFixture):
                 reply['NextToken'] = 'fixture-page'
         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
-    def notify(self, key: str, text: str, timeout: float) -> bool:
+    def notify(self, key: str, text: push_texts.RenderedPush, timeout: float) -> bool:
         saved = aws_target.read_snapshot(self.state)
         self.assertTrue(aws_target.snapshot_failures(saved))
+        self.assertTrue(ledger.mapping(saved['failure_streak'])['notice_claimed'])
         self.notices.append((key, text, timeout))
         return self.notice_accepted
 
@@ -363,7 +368,7 @@ class ControlTests(CostFixture):
         table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
         for region in self.regions:
             self.assertIn(region + ': last read failed at', table)
-            self.assertIn(region, self.notices[0][1])
+            self.assertIn(region, self.notices[0][1].body)
         self.assertNotIn(' -', table)
 
     def test_failure_with_cached_prices_shows_the_error_and_the_last_good_age(self) -> None:
@@ -388,8 +393,8 @@ class ControlTests(CostFixture):
             self.clock.advance(interval)
         self.assertEqual(len(self.notices), 1)
         key, text, timeout = self.notices[0]
-        self.assertIn(self.failure_reason, text)
-        self.assertIn('Run deploy.py up --workload merge-gates --approve-resources.', text)
+        self.assertIn('UnauthorizedOperation', text.body)
+        self.assertEqual(text.action, ActionRequired('On natedev, run deploy.py up --workload merge-gates --approve-resources in a terminal.'))
         self.assertEqual(timeout, conf.read(self.settings).number('snapshot_notification_timeout_s'))
         self.failure = ''
         self.assertEqual(self.snapshot(), 0)
@@ -405,7 +410,7 @@ class ControlTests(CostFixture):
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
 
-        def deliver_then_crash(key: str, text: str, timeout: float) -> bool:
+        def deliver_then_crash(key: str, text: push_texts.RenderedPush, timeout: float) -> bool:
             _ = self.notify(key, text, timeout)
             raise RuntimeError('fixture crash after delivery')
 
@@ -434,7 +439,7 @@ class ControlTests(CostFixture):
         self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['notice_claimed'])
 
     def test_failed_notice_retries_without_changing_its_key(self) -> None:
-        self.failure = 'timeout'
+        self.failure = 'describe-spot-price-history'
         self.notice_accepted = False
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
@@ -444,24 +449,104 @@ class ControlTests(CostFixture):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 2)
         self.assertEqual(self.notices[0][0], self.notices[1][0])
-        self.assertIn('network access', self.notices[1][1])
+        self.assertEqual(self.notices[1][1].action, ActionRequired('On natedev, run deploy.py up --workload merge-gates --approve-resources in a terminal.'))
         self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 2)
 
+    def test_other_failures_preserve_the_streak_without_claiming_a_notice(self) -> None:
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        since = int(self.clock.now)
+        for failure, reason in (
+                ('timeout', ''),
+                ('describe-spot-price-history', 'Could not connect to the endpoint URL: fixture-endpoint'),
+                ('describe-spot-price-history', 'ThrottlingException: fixture rate limit'),
+                ('describe-spot-price-history', 'InvalidClientTokenId: fixture key rejected'),
+                ('describe-spot-price-history', 'ExpiredToken: fixture token expired'),
+                ('describe-spot-price-history', 'AuthFailure: fixture authentication failed'),
+                ('describe-spot-price-history', 'Unable to locate credentials'),
+                ('describe-spot-price-history', 'fixture unknown failure')):
+            with self.subTest(failure=failure, reason=reason):
+                self.failure, self.failure_reason = failure, reason
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(self.snapshot(), 1)
+                saved = aws_target.read_snapshot(self.state)
+                self.assertEqual(saved['failure_streak'], {'since': since, 'notice_claimed': False})
+                self.assertTrue(aws_target.snapshot_failures(saved))
+                self.assertEqual(self.notices, [])
+                self.assertIn('read failed', spot_table.render(self.state, int(self.clock.now), settings_path=self.settings))
+                self.clock.advance(interval)
+        self.failure_reason = 'AccessDenied: fixture read denied'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(self.notices[0][0], f'aws-spot-snapshot:{since}')
+        self.clock.advance(interval)
+        self.failure = 'timeout'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.clock.advance(interval)
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_mixed_failures_alert_only_for_the_permission_error(self) -> None:
+        self.failure = 'all'
+        self.failure_reason = 'ThrottlingException: fixture rate limit'
+        self.regional_failure_reasons[self.regions[1]] = 'AccessDenied: fixture read denied'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(aws_target.snapshot_failures(aws_target.read_snapshot(self.state))), len(self.regions))
+        self.assertEqual(len(self.notices), 1)
+        self.assertNotIn(self.regions[0], self.notices[0][1].body)
+        self.assertIn(self.regions[1], self.notices[0][1].body)
+        self.assertNotIn('ThrottlingException', self.notices[0][1].body)
+
+    def test_permission_error_forms_send_a_notice(self) -> None:
+        for reason in ('AccessDenied: fixture refusal', 'AccessDeniedException: fixture refusal',
+                       'UnauthorizedOperation: fixture refusal', 'The caller is not authorized to read prices.'):
+            with self.subTest(reason=reason):
+                self.failure = 'describe-spot-price-history'
+                self.failure_reason = reason
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(self.snapshot(), 1)
+                self.assertEqual(len(self.notices), 1)
+                self.failure = ''
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                self.assertEqual(self.snapshot(), 0)
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                self.notices.clear()
+
     def test_notice_uses_the_registered_user_template_and_a_bounded_command(self) -> None:
         timeout = conf.read(self.settings).number('snapshot_notification_timeout_s')
+        push = aws_target.snapshot_failure_push((aws_target.SnapshotFailure(
+            self.regions[0], int(self.clock.now), 'price', 'AwsUnavailable', 'UnauthorizedOperation: fixture price read denied'),))
         with mock.patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
-            self.assertTrue(aws_target.snapshot_failure_notice('fixture-streak', 'fixture AWS error', timeout))
+            self.assertTrue(aws_target.snapshot_failure_notice('fixture-streak', push, timeout))
         arguments = cast(list[str], run.call_args.args[0])
         self.assertEqual(arguments[arguments.index('--to') + 1], 'user')
-        self.assertEqual(arguments[arguments.index('--text-id') + 1], 'nate.adhoc')
+        self.assertEqual(arguments[arguments.index('--text-id') + 1], 'aws.snapshot_failed')
         self.assertEqual(arguments[arguments.index('--key') + 1], 'fixture-streak')
-        self.assertIn('description=fixture AWS error', arguments)
+        self.assertEqual(arguments, push_texts.user_send_argv(push, key='fixture-streak'))
+        self.assertEqual(push.action, ActionRequired('On natedev, run deploy.py up --workload merge-gates --approve-resources in a terminal.'))
+        self.assertEqual(set(push.values), {'failures'})
+        self.assertIn(f'AWS denied the price read in {self.regions[0]} (UnauthorizedOperation).', push.body)
         self.assertEqual(run.call_args.kwargs['timeout'], timeout)
         with mock.patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture notice', timeout)):
-            self.assertFalse(aws_target.snapshot_failure_notice('fixture-streak', 'fixture AWS error', timeout))
+            self.assertFalse(aws_target.snapshot_failure_notice('fixture-streak', push, timeout))
+
+    def test_notice_names_each_aws_error_without_copying_the_cli_error_line(self) -> None:
+        reason = ('An error occurred (UnauthorizedOperation) when calling the DescribeSpotPriceHistory operation: '
+                  + 'fixture price read denied ' * conf.read(self.settings).whole('snapshot_error_reason_max_chars'))
+        failures = tuple(aws_target.SnapshotFailure(region, int(self.clock.now), 'price', 'AwsUnavailable', reason)
+                         for region in self.regions)
+        push = aws_target.snapshot_failure_push(failures)
+        for region in self.regions:
+            self.assertIn(f'AWS denied the price read in {region} (UnauthorizedOperation).', push.body)
+        self.assertNotIn('DescribeSpotPriceHistory', push.body)
+        self.assertNotIn(reason, push.body)
 
     def test_saved_failure_has_the_same_bounded_redacted_reason_as_the_log(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -470,7 +555,7 @@ class ControlTests(CostFixture):
             self.assertEqual(self.snapshot(), 1)
         failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
         self.assertEqual(len(failure.reason), conf.read(self.settings).whole('snapshot_error_reason_max_chars'))
-        self.assertIn(failure.reason, self.notices[0][1])
+        self.assertIn('AccessDenied', self.notices[0][1].body)
 
     def test_fresh_reply_without_an_offer_names_the_missing_price(self) -> None:
         self.omitted = self.gpu[-1]

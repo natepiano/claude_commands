@@ -26,6 +26,7 @@ from scripts.aws_target import ledger, measurement
 from scripts.aws_target.config import read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.notify import push_texts
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -173,38 +174,35 @@ def snapshot_failures(document: dict[str, object]) -> tuple[SnapshotFailure, ...
         for row in ledger.rows(document, 'failures')) if 'failures' in document else ()
 
 
-def snapshot_failure_notice(key: str, text: str, timeout: float) -> bool:
+def snapshot_failure_notice(key: str, push: push_texts.RenderedPush, timeout: float) -> bool:
     """Send a keyed user notice through the existing message interface."""
-    command = Path(__file__).resolve().parents[1] / 'message/send.py'
     try:
-        result = subprocess.run([sys.executable, str(command), '--to', 'user',
-            '--text-id', 'nate.adhoc', '--value', 'sender=buildlog',
-            '--value', 'title=AWS Spot snapshot failed', '--value', 'description=' + text,
-            '--key', key], capture_output=True, text=True, check=False, timeout=timeout)
+        result = subprocess.run(push_texts.user_send_argv(push, key=key),
+                                capture_output=True, text=True, check=False, timeout=timeout)
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def snapshot_failure_text(failures: Sequence[SnapshotFailure]) -> str:
-    """Name each regional error and its repair."""
-    lines = ['AWS Spot snapshot failed.']
+def snapshot_permission_failure(failure: SnapshotFailure) -> bool:
+    """Select permission failures that the gate deployment can repair."""
+    return re.search(r'\b(?:AccessDenied(?:Exception)?|UnauthorizedOperation|not authorized)\b',
+                     failure.error + ' ' + failure.reason, re.IGNORECASE) is not None
+
+
+def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.RenderedPush:
+    """Name each regional permission error and its repair."""
+    lines: list[str] = []
     for failure in failures:
-        stamp = datetime.fromtimestamp(failure.at, UTC).isoformat()
-        lines.append(f'{failure.region} at {stamp}: {failure.read}: {failure.error}: {failure.reason}')
-    denied = any(any(word in row.reason.lower() for word in (
-        'accessdenied', 'unauthorizedoperation', 'not authorized', 'permission')) for row in failures)
-    if denied:
-        lines.append('Run deploy.py up --workload merge-gates --approve-resources.')
-    else:
-        lines.append('Check the saved AWS error and restore the scaler credentials or network access.')
-    lines.append('The next hourly read retries.')
-    return '\n'.join(lines)
+        code_match = re.search(r'\(([A-Za-z][A-Za-z0-9_.]*)\)|\b([A-Z][A-Za-z0-9_.]*):', failure.reason)
+        code = (code_match[1] or code_match[2]) if code_match else failure.error
+        lines.append(f'AWS denied the {failure.read} read in {failure.region} ({code}).')
+    return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
-             notify: Callable[[str, str, float], bool] = snapshot_failure_notice) -> int:
+             notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
     """Replace successful regional reads and preserve failed regional reads."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
@@ -289,11 +287,12 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             streak = SnapshotFailureStreak(since, notice_claimed)
             output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
         write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-        if isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
+        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
+        if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
             # Save the claim before delivery because note keys alone do not suppress repeats.
             output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
             write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_text(current_failures),
+            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
                           configuration.number('snapshot_notification_timeout_s')):
                 output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
                 write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
