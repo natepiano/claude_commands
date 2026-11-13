@@ -2044,7 +2044,8 @@ sys.exit(7)
                         return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [{'StackStatus': 'CREATE_FAILED'}]}), '')
                     if operation == 'create-change-set' and operation in arguments:
                         failed = True
-                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'reservation refused ' + notification + ' AWS_SESSION_TOKEN=fixture-token')
                     result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
                     if 'describe-change-set' in arguments and result.returncode == 0:
                         reply = ledger.mapping(cast(object, json.loads(result.stdout)))
@@ -2052,7 +2053,8 @@ sys.exit(7)
                         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                     if operation == 'wait' and 'wait' in arguments:
                         failed = True
-                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'reservation refused ' + notification + ' AWS_SESSION_TOKEN=fixture-token')
                     return result
                 _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [{
                     'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'LogicalResourceId': 'Foundation',
@@ -2062,8 +2064,10 @@ sys.exit(7)
                 try:
                     with self.assertRaises(aws_target.AwsUnavailable) as failure:
                         _ = subject.apply(approve_resources=True)
-                    reason = str(failure.exception)
+                    reason = subject.admin.redact(str(failure.exception))
                     self.assertIn('reservation refused <notification address>', reason)
+                    self.assertIn('AWS_SESSION_TOKEN=[redacted]', reason)
+                    self.assertNotIn('fixture-token', reason)
                     self.assertIn('Foundation (AWS::CloudFormation::Stack): CREATE_FAILED: event reason <notification address>', reason)
                     self.assertIn('stack status: CREATE_FAILED', reason)
                     self.assertNotIn(notification, reason)
