@@ -1061,7 +1061,7 @@ class WorkerCommandTests(unittest.TestCase):
                     atomic_file.write_text_atomic(prompt, f"Review round {round_number}.")
                     destination = Path(summary).with_name(f"reply-{name}-{round_number}.md") if summary else prompt.with_name(prompt.stem + "_reply.txt")
                     args = assign.Arguments(target="durable-design-role", parent=str(self.fixture.parent.id),
-                        to=name, policy="astra-reviewer", prompt=str(prompt), summary=str(destination) if summary else "",
+                        to=name, policy="astra-reviewer", prompt=str(prompt), reply_file=str(destination) if summary else "",
                         session_dir=str(self.run_dir), phase="8")
                     router = PaneCommandRouter()
                     with (patch.object(subprocess, "run", side_effect=router.run),
@@ -2831,7 +2831,7 @@ class WorkerCommandTests(unittest.TestCase):
         for changed_at in ("before lookup", "after lookup"):
             with self.subTest(prompt="changed active content and launcher", changed_at=changed_at):
                 self.fixture.world.locations[submitted_pane]["agent_status"] = "idle"
-                changed_args = (*args[:-1], json.dumps(["assign.sh", "--prompt", str(self.prompt), "--summary", str(self.reply)]))
+                changed_args = (*args[:-1], json.dumps(["assign.sh", "--prompt", str(self.prompt), "--reply-file", str(self.reply)]))
                 read_dispatch = progress_history.dispatch_worker
 
                 def change_after_lookup(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,

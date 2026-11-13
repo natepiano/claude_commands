@@ -234,7 +234,7 @@ class AstraReviewTests(StaffTestCase):
         report = self.root / "selected-review.md"
         arguments = ["--role", "review", "--operation", "astra-review", "--target", "consultation-pane",
                      "--policy", "astra-reviewer", "--new-worker", "selected-reviewer",
-                     "--prompt", str(self.document), "--summary", str(report),
+                     "--prompt", str(self.document), "--reply-file", str(report),
                      "--model", "gpt-review-fixture", "--effort", "high"]
         result = invoke_cli(assign, assign.main, arguments, self.environment, self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
