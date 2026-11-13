@@ -13,7 +13,6 @@ from collections.abc import Callable, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -29,9 +28,9 @@ from uuid import uuid4
 
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, largest_gate_vcpus as largest_gate_vcpus
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
-from scripts.lib import conf
+from scripts.lib import conf, user_zone
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
@@ -85,11 +84,28 @@ class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
 
 
-def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
-    """Read the regional Spot vCPU quota for the supplied code."""
-    reply = api.call('get-service-quota', '--service-code', 'ec2',
-                     '--quota-code', code, service='service-quotas')
-    return conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
+def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
+    """Share the configured regions and quota codes between requests and reports."""
+    values = conf.read_or_repository('cloud_gate')
+    return (
+        (gate_regions(home, values), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+        (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+    )
+
+
+def quota_date(value: object) -> str:
+    """Format AWS timestamps in the user's zone."""
+    if value is None:
+        return '-'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        moment = datetime.fromtimestamp(value, UTC)
+    elif isinstance(value, str):
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+    else:
+        raise ValueError('The quota request date is invalid')
+    return moment.astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
 def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
@@ -1029,33 +1045,61 @@ class Deployment:
                 print(f'{region}: G and VT Spot quota unknown: {reason}')
             zones = [ledger.text(row, 'ZoneName') for row in ledger.rows(target.call('describe-availability-zones',
                 '--filters', 'Name=state,Values=available'), 'AvailabilityZones')]
-            rows = ledger.rows(target.call('describe-spot-price-history', '--instance-types', *sizes,
-                '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(self.clock(), UTC).isoformat()),
-                'SpotPriceHistory')
-            latest: dict[tuple[str, str], dict[str, object]] = {}
-            for row in rows:
-                key = ledger.text(row, 'InstanceType'), ledger.text(row, 'AvailabilityZone')
-                if key not in latest or str(row.get('Timestamp', '')) > str(latest[key].get('Timestamp', '')):
-                    latest[key] = row
+            prices = fetch_spot_prices(target, sizes, int(self.clock()))
+            latest = {(row.instance_type, row.zone): row.usd_per_hour for row in prices}
             for size in sizes:
                 for zone in sorted(zones):
-                    row = latest.get((size, zone), {})
-                    print(region, size, zone, str(row.get('SpotPrice', 'unavailable')))
+                    print(region, size, zone, str(latest.get((size, zone), 'unavailable')))
+
+    def spot_table(self) -> None:
+        """Print the local snapshot without AWS credentials or network calls."""
+        from scripts.aws_target import spot_table
+        print(spot_table.render(self.directory, int(self.clock()), settings_path=self.settings_path))
 
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
         settings = read_deployment_settings(self.settings_path, self.directory)
-        values = conf.read_or_repository('cloud_gate')
         api = self._api(settings)
-        requests = (
-            (gate_regions(settings.region), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
-            (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
-        )
         success = True
-        for regions, code, desired, label in requests:
+        for regions, code, desired, label in quota_targets(settings.region):
             for region in regions:
                 if not request_spot_quota(api.in_region(region), code, desired, label):
                     success = False
+        return success
+
+    def quota_status(self) -> bool:
+        """Report applied quotas and request history without changing AWS or local state."""
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        regional: dict[str, list[tuple[str, str]]] = {}
+        for regions, code, _desired, label in quota_targets(settings.region):
+            for region in dict.fromkeys(regions):
+                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
+        _ = self.admin.get()
+        print('region | quota | asked vCPUs | applied vCPUs | status | case id | updated')
+        success = True
+        for region, quotas in regional.items():
+            with step('quota-status', 'reading quotas in ' + region, self.settings_path):
+                target = api.in_region(region)
+                for code, name in quotas:
+                    try:
+                        applied = f'{spot_quota(target, code).normalize():f}'
+                        history = target.call('list-requested-service-quota-change-history-by-quota',
+                            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+                        for request in ledger.rows(history, 'RequestedQuotas') or [{}]:
+                            asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}' if request else '-'
+                            status = ledger.text(request, 'Status') if request else 'none'
+                            case = str(request.get('CaseId') or '-')
+                            date = quota_date(request.get('LastUpdated') or request.get('Created'))
+                            print(' | '.join((region, name, asked, applied, status, case, date)))
+                    except (admin_secrets.SecretsRefused, DeploymentRefused):
+                        raise
+                    except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                        match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                        reason = match[1] if match else type(error).__name__
+                        print(f'{region}: {name} quota status failed: {reason}')
+                        success = False
+        print('quota-status: done at ' + quota_date(self.clock()), flush=True)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
@@ -1291,7 +1335,7 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'quota-request', 'prepare', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates',), default='merge-gates')
@@ -1318,10 +1362,14 @@ def main() -> int:
             return 0 if deploy.remove_builder(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'remove-images':
             return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
+        elif args.command == 'spot-table':
+            deploy.spot_table()
         elif args.command == 'prices':
             deploy.prices()
         elif args.command == 'quota-request':
             return 0 if deploy.quota_request() else 1
+        elif args.command == 'quota-status':
+            return 0 if deploy.quota_status() else 1
         elif args.command == 'prepare':
             prepared = deploy.prepare()
             print(json.dumps({'at': prepared.at, 'fingerprint': prepared.fingerprint, 'output': str(args.output)}))
