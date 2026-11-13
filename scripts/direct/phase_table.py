@@ -480,11 +480,12 @@ def _phase_instances(
     return list(instances.values())
 
 
-def _newest_open_instance(
+def _open_instances(
     runs: list[list[dict[str, object]]],
-) -> OpenPhaseInstance | NoOpenPhase:
+) -> list[OpenPhaseInstance]:
+    """Read every unfinished phase instance in the newest run."""
     if not runs:
-        return NoOpenPhase()
+        return []
     events = runs[-1]
     started: list[PhaseInstance] = []
     closed: set[str] = set()
@@ -512,10 +513,7 @@ def _newest_open_instance(
                 finish=PhaseInstanceWithoutFinish(),
             )
         )
-    for instance in reversed(started):
-        if instance.instance_id not in closed:
-            return _open_instance(runs, instance)
-    return NoOpenPhase()
+    return [_open_instance(runs, instance) for instance in started if instance.instance_id not in closed]
 
 
 def _open_instance(
@@ -963,10 +961,9 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
                   for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     current_run = _current_run_events(run_events, resolver.record)
-    open_instance = _newest_open_instance(current_run)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
-        [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+        _open_instances(current_run),
     )
 
 
@@ -1000,13 +997,13 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
             phase=_text(event.get("phase_id")) or (instance.phase if instance else ""),
             title=_text(event.get("phase_title")) or (instance.title if instance else ""),
             start=instance.start if instance else at - timedelta(seconds=seconds),
-            finish=InstanceFinished(at=at, status="completed", seconds=seconds, written_at=index),
+            finish=InstanceFinished(at=at, status=_text(event.get("status")), seconds=seconds, written_at=index),
         ))
     opened = [instance for instance in instances if instance.instance_id not in finished_ids]
     ordered = finished + opened
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,
-         "done": isinstance(instance.finish, InstanceFinished)}
+         "done": isinstance(instance.finish, InstanceFinished) and instance.finish.status == "completed"}
         for instance in ordered
     ]
     return _build_phase_record(
@@ -1060,7 +1057,7 @@ def _build_phase_record(
         ]
         row_instances.append(related)
         row_open = next(
-            (candidate for candidate in open_instances if any(
+            (candidate for candidate in reversed(open_instances) if any(
                 instance.instance_id == candidate.phase.instance_id for instance in assigned[index]
             )),
             NoOpenPhase(),
@@ -1070,7 +1067,7 @@ def _build_phase_record(
                 (instance.start for instance in related),
                 default=row_open.phase.start,
             )
-            current = OpenPhase(
+            opened = OpenPhase(
                 phase=phase["id"],
                 title=phase["title"],
                 started=earliest,
@@ -1079,7 +1076,9 @@ def _build_phase_record(
                 first_stated=row_open.first_stated,
                 instance_id=row_open.phase.instance_id,
             )
-            rows.append(current)
+            rows.append(opened)
+            if row_open is open_instance:
+                current = opened
         elif phase["done"]:
             rows.append(_done_phase(phase, related))
         else:
