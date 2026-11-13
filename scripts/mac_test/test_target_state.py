@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
     from scripts.buildlog import record, store
-    from scripts.lib import conf
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 else:
@@ -39,12 +38,11 @@ else:
     from scripts.build_hold import build_hold
     from scripts.buildlog import record
     from scripts.buildlog import store
-    from scripts.lib import conf
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
-TARGET_NAMES = ("mac", "aws", "linux-two")
+TARGET_NAMES = ("mac", "linux", "linux-two")
 
 
 class HoldClock(datetime):
@@ -81,7 +79,7 @@ class IsolatedTargetState(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "build_targets.conf"
         self.mac_state = self.root / "legacy-mac"
-        lines = ["targets=mac,aws,linux-two,natedev"]
+        lines = ["targets=mac,linux,linux-two,natedev"]
         for name, hours in zip(TARGET_NAMES, (4, 1, 2), strict=True):
             settings = self.root / f"{name}.conf"
             _ = write_config_fixture(settings,
@@ -130,8 +128,8 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(store, "host_name", return_value="fixture-host"))
 
     def use_generic_linux_target(self) -> None:
-        _ = self.config.write_text(self.config.read_text().replace("aws", "linux-one"), encoding="utf-8")
-        _ = (self.root / "aws.conf").rename(self.root / "linux-one.conf")
+        _ = self.config.write_text(self.config.read_text().replace('targets=mac,linux,', 'targets=mac,linux-one,').replace('.linux=', '.linux-one=').replace('=linux.conf', '=linux-one.conf'), encoding="utf-8")
+        _ = (self.root / "linux.conf").rename(self.root / "linux-one.conf")
 
     def record_command(self, arguments: list[str], **_options: object) -> mock.Mock:
         """Write hold events synchronously and refuse all other child commands."""
@@ -265,7 +263,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertEqual(self.snapshot(), before)
 
     def test_state_reader_reports_named_read_errors_and_preserves_unexpected_errors(self) -> None:
-        target = self.selected_target("aws")
+        target = self.selected_target("linux")
         for error in (mac_test.StateReadError("bad state"), targets.ConfigError("bad target")):
             with self.subTest(error=type(error)), mock.patch.object(mac_test, "state_paths", side_effect=error):
                 state = targets.target_state(target)
@@ -276,36 +274,20 @@ class TargetStateTests(IsolatedTargetState):
             with self.assertRaisesRegex(ValueError, "unexpected reader defect"):
                 _ = targets.target_state(target)
 
-    def test_aws_drain_reserve_covers_its_configured_maximum_duration(self) -> None:
-        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
-        reserve = float(values["limit_reserve_usd"])
-        minutes = float(values["drain_max_minutes"])
-        self.assertGreater(minutes, 0)
-        self.assertGreater(reserve, 0)
-        self.assertGreaterEqual(reserve, float(values["fallback_usd_per_hour"]) * minutes / 60)
-        self.assertLess(reserve, float(values["daily_limit_usd"]))
 
-    def test_aws_repository_budgets_fit_the_build_budget(self) -> None:
-        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
-        ceiling = float(values["build_budget_gib"])
-        for key, value in values.items():
-            if key == "target_budget_gib" or key.startswith("target_budget_gib."):
-                with self.subTest(setting=key):
-                    self.assertGreater(float(value), 0)
-                    self.assertLessEqual(float(value), ceiling)
 
     def test_hold_activation_warning_and_expiry_notify_the_selected_target(self) -> None:
         result = self.block("mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         mac_before = (self.mac_state / "block.json").read_bytes()
-        result = self.claim("aws")
+        result = self.claim("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.release("aws")
+        result = self.release("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        paths = mac_test.state_paths("aws")
-        config = mac_test.read_config("aws")
+        paths = mac_test.state_paths("linux")
+        config = mac_test.read_config("linux")
         notifications: list[HoldNotification] = []
 
         def receive_message(recipient: str, summary: str, key: str, repeat_minutes: float, text: str) -> bool:
@@ -317,25 +299,25 @@ class TargetStateTests(IsolatedTargetState):
             outcome = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             self.assertIsInstance(outcome.block, mac_test.ActiveMacBlock)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws is free")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-free-"))
-            self.assertIn("aws is free", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux is free")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-free-"))
+            self.assertIn("linux is free", notifications[-1]["text"])
             self.assertNotIn("Mac", notifications[-1]["text"])
             messages.reset_mock()
             with mock.patch.object(mac_test, "utc_now", return_value=NOW + timedelta(minutes=50)):
                 _ = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws block nearing its time limit")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-block-warn-"))
-            self.assertIn("aws block", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux block nearing its time limit")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-block-warn-"))
+            self.assertIn("linux block", notifications[-1]["text"])
             messages.reset_mock()
             with mock.patch.object(mac_test, "utc_now", return_value=NOW + timedelta(hours=1)):
                 outcome = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             self.assertIsInstance(outcome.block, mac_test.NoMacBlock)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws block lifted")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-block-expired-"))
-            self.assertIn("aws block", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux block lifted")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-block-expired-"))
+            self.assertIn("linux block", notifications[-1]["text"])
             self.assertNotIn("Mac", notifications[-1]["text"])
         self.assertEqual((self.mac_state / "block.json").read_bytes(), mac_before)
 
@@ -402,7 +384,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertEqual(self.snapshot(), before)
 
     def test_free_now_uses_only_the_selected_targets_backoff(self) -> None:
-        offload.write_backoff(NOW.timestamp() + 30, "aws")
+        offload.write_backoff(NOW.timestamp() + 30, "linux")
         for name, answer in zip(TARGET_NAMES, ("free", "backoff", "free"), strict=True):
             result = self.invoke_mac(["free-now", "--target", name, "--repo-root", str(self.root)])
             self.assertEqual(result.stdout.strip(), answer, result.stderr)
@@ -447,48 +429,48 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(result.stdout.strip(), "free")
         self.assertEqual(self.snapshot(), before)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         result = self.claim("linux-two")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        for name, expected in zip(TARGET_NAMES, ("free", "inspect aws", "test linux-two"), strict=True):
+        for name, expected in zip(TARGET_NAMES, ("free", "inspect linux", "test linux-two"), strict=True):
             result = self.invoke_mac(["status", "--target", name])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(expected, result.stdout)
-            if name != "aws":
-                self.assertNotIn("inspect aws", result.stdout)
+            if name != "linux":
+                self.assertNotIn("inspect linux", result.stdout)
             if name != "linux-two":
                 self.assertNotIn("test linux-two", result.stdout)
         self.assertEqual(self.snapshot(), before)
 
     def test_malformed_block_refuses_only_its_target(self) -> None:
-        self.directory("aws").mkdir(parents=True)
-        path = self.directory("aws") / "block.json"
+        self.directory("linux").mkdir(parents=True)
+        path = self.directory("linux") / "block.json"
         for content in ("{broken", "[]", '{"holder":"alice"}'):
             with self.subTest(content=content):
                 _ = path.write_text(content, encoding="utf-8")
-                result = self.claim("aws")
+                result = self.claim("linux")
                 self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
                 self.assertEqual(path.read_text(encoding="utf-8"), content)
-                self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.StateUnreadable)
+                self.assertIsInstance(targets.target_state(self.selected_target("linux")), targets.StateUnreadable)
                 self.assertIsInstance(targets.target_state(self.selected_target("mac")), targets.Free)
                 self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
                 before = self.snapshot()
-                result = self.invoke_mac(["status", "--target", "aws"])
+                result = self.invoke_mac(["status", "--target", "linux"])
                 self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
                 self.assertEqual(self.snapshot(), before)
 
     def test_state_reads_preserve_stale_claims_and_expired_blocks(self) -> None:
         result = self.claim("linux-two")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
                 mock.patch.object(targets, "utc_now", return_value=NOW + timedelta(days=1)):
             self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
-            state = targets.target_state(self.selected_target("aws"))
+            state = targets.target_state(self.selected_target("linux"))
             self.assertIsInstance(state, targets.Held)
             if isinstance(state, targets.Held):
                 self.assertIsInstance(state.end, targets.AwaitingBlockRemoval)

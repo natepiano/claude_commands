@@ -38,7 +38,6 @@ class AwsReportTests(MeasurementFixture):
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n")
         self.state: Path = self.root / ".local/state/build-targets/aws"
         self.seed_cost()
-        self.text_setting("host", "aws-build")
         mac_settings = self.root / "mac_test.conf"
         source = mac_settings.read_text().splitlines()
         _ = mac_settings.write_text("\n".join(
@@ -52,8 +51,14 @@ class AwsReportTests(MeasurementFixture):
             output = report.report(connection, day)
         return output
 
+    def add_spare_peer(self) -> None:
+        path = self.root / 'build_targets.conf'
+        _ = path.write_text(path.read_text().replace('targets=natedev,mac', 'targets=natedev,mac,spare')
+            + 'kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n')
+        _ = (self.root / 'spare.conf').write_text('host=fixture-spare\n')
+
     def exchange(self, target: str, *, ok: bool, at: int) -> None:
-        host = "aws-build" if target == "aws" else "fixture-mac"
+        host = "fixture-spare" if target == "spare" else "fixture-mac"
         with mock.patch.object(time, "time", return_value=float(at)):
             sync.write_status(host, ok, target)
 
@@ -76,7 +81,7 @@ class AwsReportTests(MeasurementFixture):
         _ = registry.write_text(registry.read_text().replace(
             "sync.hosts.natedev=natedev", "sync.hosts.natedev=natedev,local-alias")
             + "kind.worker=local\nplatform.worker=linux\nsync.hosts.worker=worker-host\n")
-        _ = registry.write_text(registry.read_text().replace("targets=natedev,mac,aws", "targets=natedev,worker,mac,aws"))
+        _ = registry.write_text(registry.read_text().replace("targets=natedev,mac", "targets=natedev,worker,mac"))
         identity = record.local_step_identity()
         self.assertEqual(set(identity.hosts), {"natedev", "local-alias", "worker-host"})
         for number, host in enumerate((*identity.hosts, "aws-build")):
@@ -438,56 +443,61 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('| estimate |', output)
 
     def test_aws_failure_preserves_mac_success_without_an_aws_data_sync_line(self) -> None:
+        self.add_spare_peer()
         self.exchange("mac", ok=True, at=NOW - 180)
-        self.exchange("aws", ok=True, at=NOW - 120)
-        self.exchange("aws", ok=False, at=NOW - 60)
+        self.exchange("spare", ok=True, at=NOW - 120)
+        self.exchange("spare", ok=False, at=NOW - 60)
         output = self.render()
-        aws, mac = self.peer_line(output, "aws"), self.peer_line(output, "mac")
-        self.assertIn("failed", aws)
-        self.assertIn("last successful exchange", aws)
-        self.assertIn("latest failure", aws)
-        self.assertIn("buildlog sync", aws)
+        spare, mac = self.peer_line(output, "spare"), self.peer_line(output, "mac")
+        self.assertIn("failed", spare)
+        self.assertIn("last successful exchange", spare)
+        self.assertIn("latest failure", spare)
+        self.assertIn("buildlog sync", spare)
         self.assertIn("current", mac)
         self.assertIn("latest failure none", mac)
         self.assertNotIn("AWS report data synchronized at", output)
         self.assertNotIn("AWS report data never synchronized", output)
 
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
-        self.exchange("aws", ok=True, at=NOW - 120)
+        self.add_spare_peer()
+        self.exchange("spare", ok=True, at=NOW - 120)
         self.exchange("mac", ok=True, at=NOW - 180)
         self.exchange("mac", ok=False, at=NOW - 60)
         output = self.render()
         self.assertIn("failed", self.peer_line(output, "mac"))
-        self.assertIn("current", self.peer_line(output, "aws"))
-        self.assertIn("latest failure none", self.peer_line(output, "aws"))
+        self.assertIn("current", self.peer_line(output, "spare"))
+        self.assertIn("latest failure none", self.peer_line(output, "spare"))
 
     def test_first_failure_and_never_synchronized_peers_show_the_recovery_action(self) -> None:
-        self.exchange("aws", ok=False, at=NOW - 60)
+        self.add_spare_peer()
+        self.exchange("spare", ok=False, at=NOW - 60)
         output = self.render()
-        aws = self.peer_line(output, "aws")
-        self.assertIn("last successful exchange never", aws)
-        self.assertIn("latest failure", aws)
-        self.assertIn("buildlog sync", aws)
+        spare = self.peer_line(output, "spare")
+        self.assertIn("last successful exchange never", spare)
+        self.assertIn("latest failure", spare)
+        self.assertIn("buildlog sync", spare)
         self.assertIn("never synchronized; run buildlog sync", self.peer_line(output, "mac"))
         self.assertNotIn("AWS report data never synchronized", output)
 
     def test_global_pause_names_resume_for_each_active_peer(self) -> None:
-        self.exchange("aws", ok=True, at=NOW - 120)
+        self.add_spare_peer()
+        self.exchange("spare", ok=True, at=NOW - 120)
         paused = self.root / "buildlog" / store.SYNC_PAUSED_NAME
         _ = paused.write_text(json.dumps({"since": store.utc_iso(NOW - 60), "why": "fixture maintenance"}))
         output = self.render()
-        for target in ("mac", "aws"):
+        for target in ("mac", "spare"):
             line = self.peer_line(output, target)
             self.assertIn("globally paused", line)
             self.assertIn("fixture maintenance", line)
             self.assertIn("buildlog sync resume", line)
 
     def test_recovery_keeps_the_latest_failure_and_the_legacy_mac_status(self) -> None:
+        self.add_spare_peer()
         self.exchange("mac", ok=True, at=NOW - 180)
-        self.exchange("aws", ok=False, at=NOW - 120)
-        self.exchange("aws", ok=True, at=NOW - 60)
+        self.exchange("spare", ok=False, at=NOW - 120)
+        self.exchange("spare", ok=True, at=NOW - 60)
         output = self.render()
-        line = self.peer_line(output, "aws")
+        line = self.peer_line(output, "spare")
         self.assertIn("recovered", line)
         self.assertNotIn("latest failure none", line)
         expected = sync.sync_time(store.utc_iso(NOW - 120), datetime.now())
