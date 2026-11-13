@@ -138,6 +138,14 @@ class MacDeliveryTests(unittest.TestCase):
                     "message": "Action: Check the build\nThe build passed.", "detail": "reviewed",
                     "key": "build", "text_id": "fixture.admitted", "due": "",
                     "need": "blocked" if priority == "2" else "note", "reference": push_reference.NO_REFERENCE})
+                asked.clear()
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    code = pushover.deliver(draft, detail="reviewed", key="build", text_id="fixture.admitted", asker=asker,
+                                            silence_policy=silence.SilencePolicy.SEND_THROUGH_SILENCE)
+                self.assertEqual(code, status)
+                forwarded = cast(dict[str, str], json.loads(asked[0][1]))
+                self.assertEqual(forwarded["silence_policy"], "send_through_silence")
+                self.assertEqual(forwarded["priority"], priority)
 
     def test_cancel_asks_natedev_and_preserves_its_reply(self) -> None:
         for status, out, error in ((0, "pushover: cancelled 1\n", ""), (2, "", "pushover: fixture refusal\n")):
@@ -848,6 +856,8 @@ class PushoverTests(unittest.TestCase):
     def test_withheld_session_note_is_not_posted_but_approved_finished_plan_note_is(self) -> None:
         with mock.patch.object(review, "review", return_value=review.Withheld(self.draft(), "No user action or timely information.")):
             self.assertEqual(self.run_send(["--no-action", "Still working", "The tests are running."]), (6, {}))
+            self.assertEqual(self.run_send(["--through-silence", "--text-id", "nate.adhoc", "--value", "sender=Build",
+                "--value", "title=still working", "--value", "description=The tests are running."]), (6, {}))
         self.assertEqual(self.run_send(["--no-action", "Plan finished", "The whole plan finished and merged."])[0], 0)
 
     def test_blocked_review_failure_is_posted_and_reported(self) -> None:
@@ -1145,24 +1155,39 @@ class PushoverTests(unittest.TestCase):
 
     def test_silence_keeps_a_push_and_exits_zero_without_posting(self) -> None:
         self.silence_on()
+        arguments = ["--text-id", "nate.adhoc", "--value", "sender=Build", "--value", "title=done",
+                     "--value", "description=You asked to be told when the build passed. The build passed."]
         with redirect_stdout(io.StringIO()) as output:
-            code, form = self.run_send(["--no-action", "Build done", "The build passed."])
+            code, form = self.run_send(arguments)
         self.assertEqual((code, form), (0, {}))
         self.assertIn("pushover: kept: silence until off\n", output.getvalue())
         self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
         self.assertEqual(self.log_lines()[-1]["outcome"], "kept: silence until off")
+        with redirect_stdout(io.StringIO()):
+            code, form = self.run_send(["--through-silence", *arguments])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["priority"], ["0"])
+        self.assertTrue({"retry", "expire", "tags"}.isdisjoint(form))
+        self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
 
     def test_natedev_delivery_command_keeps_or_posts_the_reviewed_push(self) -> None:
-        for silent, priority in ((False, "0"), (True, "0"), (True, "2")):
-            with (self.subTest(silent=silent, priority=priority),
+        for silent, priority, policy in (
+            (False, "0", silence.SilencePolicy.KEEP_DURING_SILENCE),
+            (True, "0", silence.SilencePolicy.KEEP_DURING_SILENCE),
+            (True, "2", silence.SilencePolicy.KEEP_DURING_SILENCE),
+            (True, "0", silence.SilencePolicy.SEND_THROUGH_SILENCE),
+        ):
+            with (self.subTest(silent=silent, priority=priority, policy=policy),
                   mock.patch.dict(os.environ, {"HOME": str(self.keys.parent),
-                      "NOTIFY_STATE_DIR": str(self.keys.parent / f"state-{silent}-{priority}")})):
+                      "NOTIFY_STATE_DIR": str(self.keys.parent / f"state-{silent}-{priority}-{policy.value}")})):
                 if silent:
                     self.silence_on()
                 push: silence.KeptPush = {"source": "Mac unit", "priority": priority, "title": "Build done",
                     "message": "Action: Check the build\nThe build passed.", "detail": "reviewed",
                     "key": "build", "text_id": "fixture.admitted", "due": "",
                     "need": "blocked" if priority == "2" else "note", "reference": push_reference.NO_REFERENCE}
+                if policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
+                    push["silence_policy"] = policy
                 posted: list[dict[str, list[str]]] = []
 
                 def post(_url: str, data: bytes) -> tuple[int, bytes]:
@@ -1174,7 +1199,7 @@ class PushoverTests(unittest.TestCase):
                     code = pushover.main(["deliver"], self.keys, post)
                 self.assertEqual(code, 0, errors.getvalue())
                 self.assertEqual(errors.getvalue(), "")
-                if silent and priority != "2":
+                if silent and priority != "2" and policy == silence.SilencePolicy.KEEP_DURING_SILENCE:
                     self.assertEqual(output.getvalue(), "pushover: kept: silence until off\n")
                     self.assertEqual(posted, [])
                     self.assertEqual(silence.read_kept(), [push])

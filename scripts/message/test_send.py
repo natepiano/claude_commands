@@ -2959,9 +2959,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_a_note_to_the_user_with_one_key_has_no_window_without_repeat_minutes(self) -> None:
         note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
                 "--text", "The build passed."]
-        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-            self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
-        self.assertEqual(channel.call_count, 2)
+        for extra in ([], ["--through-silence"]):
+            note.extend(extra)
+            with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+                self.assertEqual([send.send(send.parse(registered_arguments(note))).outcome for _ in range(2)], ["sent", "sent"])
+            self.assertEqual(channel.call_count, 2)
+            command = cast(list[str], channel.call_args.args[0])
+            self.assertEqual("--through-silence" in command, bool(extra))
+            self.assertEqual(command[command.index("--priority") + 1], "0")
+            self.assertNotIn("--repeat-minutes", command)
 
     def test_a_remote_emergency_push_holds_its_window_on_this_host_only(self) -> None:
         with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
@@ -5062,12 +5068,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ("FAILED: post failed fallback text:", "Build stopped — Action: Choose in natedev terminal.", 3),
         ):
             with self.subTest(header=header), mock.patch.object(send, "run", return_value=(code, "remote banner\n" + header + "\n" + payload + "\n", "")) as run:
-                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev"))))
+                result = send.send(send.parse(registered_arguments(self.user_arguments("--machine", "natedev", "--through-silence"))))
             if code == 3:
                 self.assertEqual(result.detail, "on natedev: post failed " + send.UNREVIEWED_FALLBACK)
             else:
                 self.assertEqual(result.detail, "on natedev: " + header.partition(": ")[2] + "\n" + payload)
             self.assertIn("--answerable", cast(list[str], run.call_args.args[0])[-1])
+            self.assertIn("--through-silence", cast(list[str], run.call_args.args[0])[-1])
             self.assertTrue(cast(list[str], run.call_args.args[0])[-1].startswith("CLAUDE_PID= "))
             if code == 3:
                 marker = send.as_dict(send.loads(self.failure_marker().read_text()))
@@ -5234,7 +5241,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.action, send.NoUserRecipient())
 
     def test_action_flags_are_only_for_user_messages(self) -> None:
-        for action in (["--no-action"], ["--action", "reply"]):
+        for action in (["--no-action"], ["--action", "reply"], ["--through-silence"]):
             errors = io.StringIO()
             with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", errors):
                 _ = local_options(["--to", "natedev", *action, "--text", "hello"])
