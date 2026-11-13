@@ -314,7 +314,8 @@ class ConversationPauseTests(ConversationPauseFixture):
                     "foreground_processes": [{"pid": 998042, "argv": ["claude"]}]}}), \
                 patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(herdr.EnvironmentThread(SESSION), "fixture-start", {})), \
                 patch.object(herdr.Herdr, "composer", return_value=herdr.ComposerInput("")):
-            conversation_pause.record_scheduled_prompts(SESSION, (resume,))
+            conversation_pause.record_scheduled_prompts(
+                SESSION, (conversation_pause.ScheduledTaskPrompt("resume", resume, False),))
             with patch.object(herdr.Herdr, "prompt") as transmitted:
                 session_pane.type_place(Place("demo", pane), relay, target=SESSION)
             transmitted.assert_called_once_with(pane, script_prompt(relay), target=SESSION)
@@ -696,7 +697,8 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertFalse((self.escalate_root / "typed").exists())
 
     def test_recorded_scheduled_prompt_does_not_pause_but_different_prompt_does(self) -> None:
-        instance = self.create_instance("unit-abc")
+        self.record_activity()
+        instance = self.create_instance(self.showrunner_timer("demo"))
         recorded = self.run_stop(
             extra={"session_crons": [scheduled_wakeup("  recurring status  ")]}
         )
@@ -704,11 +706,61 @@ class ConversationPauseTests(ConversationPauseFixture):
             (recorded.returncode, recorded.stdout, recorded.stderr), (0, "", "")
         )
 
-        scheduled = self.run_prompt("recurring status")
+        for arrival in (1, 2):
+            with self.subTest(recurring_arrival=arrival):
+                scheduled = self.run_prompt("recurring status")
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                self.assertEqual(self.scheduled_prompts(), ["  recurring status  "])
 
-        self.assertEqual(
-            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+        prompt = (
+            "P7 ETA 07:00 EST is due. If the Phase 7 landing notice is not sent, "
+            "send hana a new ETA with what slowed it."
         )
+        tasks = [scheduled_wakeup(prompt, task_id=task_id, recurring=False)
+                 for task_id in ("first-eta", "3aabfc24")]
+        recorded = self.run_stop(extra={"session_crons": tasks})
+        self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+        for arrival in (1, 2):
+            with self.subTest(one_shot_arrival=arrival):
+                scheduled = self.run_prompt(prompt)
+                self.assertEqual(
+                    (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                )
+                if arrival == 1:
+                    self.assertEqual(json.loads(self.scheduled_prompts_path().read_text()), [
+                        {"id": "3aabfc24", "prompt": prompt, "recurring": False}])
+                    stopped = self.run_stop(extra={"session_crons": [
+                        scheduled_wakeup("a new task", task_id="new-task")]})
+                    self.assertEqual((stopped.returncode, stopped.stdout, stopped.stderr), (0, "", ""))
+                    self.assertEqual(self.scheduled_prompts(), ["a new task", prompt])
+                else:
+                    self.assertEqual(self.scheduled_prompts(), ["a new task"])
+        self.assertEqual([call[2] for call in self.activity_calls(4)], ["ScriptPrompt"] * 4)
+
+        rows = (
+            (False, ("check build B", "check build A"), ["check build… [+40 chars]"], 6),
+            (True, ("check build B", "check build A", "check build B"),
+             ["check build… [+40 chars]", "check build B"], 9),
+        )
+        for recurring_b, arrivals, remaining_after_b, activity_count in rows:
+            with self.subTest(recurring_b=recurring_b):
+                recorded = self.run_stop(extra={"session_crons": [
+                    scheduled_wakeup("check build… [+40 chars]", task_id="build-a", recurring=False),
+                    scheduled_wakeup("check build B", task_id="build-b", recurring=recurring_b),
+                ]})
+                self.assertEqual((recorded.returncode, recorded.stdout, recorded.stderr), (0, "", ""))
+                for arrival, prompt in enumerate(arrivals):
+                    with self.subTest(overlapping_prompt=prompt, arrival=arrival):
+                        scheduled = self.run_prompt(prompt)
+                        self.assertEqual(
+                            (scheduled.returncode, scheduled.stdout, scheduled.stderr), (0, "", "")
+                        )
+                        if arrival == 0:
+                            self.assertEqual(self.scheduled_prompts(), remaining_after_b)
+                self.assertEqual([call[2] for call in self.activity_calls(activity_count)],
+                                 ["ScriptPrompt"] * activity_count)
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse((self.escalate_root / "typed").exists())
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
@@ -958,10 +1010,13 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual(self.record(), before)
 
     def test_stop_hook_records_scheduled_prompts_without_pause_record(self) -> None:
+        path = self.scheduled_prompts_path()
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(["an old scheduled prompt"]))
         result = self.run_stop(extra={
             "session_crons": [
                 scheduled_wakeup("first scheduled prompt"),
-                scheduled_wakeup("second scheduled prompt"),
+                scheduled_wakeup("second scheduled prompt", task_id="scheduled-2"),
             ]
         })
 
