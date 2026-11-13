@@ -419,7 +419,17 @@ After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
 The selection includes producers, such as brain, morty, and dwight.
-It saves each row ID before its stop. It starts nothing.
+A complete unscoped read prunes recorded rows whose sessions still run.
+Each prune checks current liveness again while it holds the row lock.
+A refused row lock preserves the entry.
+A partial liveness read prints an anomaly and prunes nothing.
+Recorded stopped rows remain pending.
+Each stop holder saves its selected rows while it holds their row locks.
+A refused stop removes its provisional entry before the row lock releases.
+No command clears the whole record.
+It starts nothing.
+`stop --all --only ID[,ID...]` and `stop --all --account ACCOUNT` merge selected rows into the record.
+These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
@@ -500,6 +510,12 @@ A running row gets no continuation message.
 Producers keep their existing start behavior.
 Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
+`stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
+Upkeep, account moves, watchdog recovery, and named resume share this removal.
+Named resume also removes a row after a successful continuation message.
+Retired recovery removes a row after it proves the resumed native session.
+These removals and restart cleanup occur before the row locks release.
+Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -511,6 +527,14 @@ Both commands change nothing.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
+`shutdown_record.update` holds the record lock for each change.
+Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.
+It checks current liveness again under each row lock.
+It saves the live tab positions and preserves recorded stopped rows.
+`held-sessions ACCOUNT` and `held-sessions --only ID[,ID...]` merge selected rows and preserve other saved rows.
+A failed staff read preserves the record.
+A partial live-row read prunes nothing.
+The stop loop can still save rows that it stops.
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.

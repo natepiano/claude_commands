@@ -13,17 +13,21 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from typing import cast, final, override
+from collections.abc import Generator
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase
 from scripts.production.staff_test_support import fixture_member, fixture_worker
 from scripts.agents import shutdown, restart, shutdown_record, stop_resume, inventory
 from scripts.herdr import herdr, worker_panes
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, completion_receipt, unit_config, worker
+from scripts.production.production_doc import Production
 from scripts.whoami.account import UnreadableAccount
 from scripts.agents.inventory import Inventory
+from scripts.agents.stop_results import ClaudeStartState
 
 
 LOGIN = "owner@example.com"
@@ -119,16 +123,116 @@ class ShutdownStatusTests(ShutdownTestCase):
             self.assertEqual(text.count("anomaly: impl: terminal changed"), 1, text)
             self.assertIn(expected, text)
 
-    def test_record_precedes_worker_window(self) -> None:
-        row = staff.StaffRow(staff.StaffId("retained-worker"), "worker", "impl", staff.STAFF_ROOT,
-                             current_session=staff.StaffId("native-worker"))
+    def test_live_record_pruning_precedes_worker_window(self) -> None:
+        row = fixture_member("producer", name="held-live")
         record = staff.StaffSnapshot((row,))
+        shutdown_record.save([str(row.id), "down-row"])
+
         def window(selected: staff.StaffSnapshot) -> None:
             self.assertIs(selected, record)
-            self.assertEqual(shutdown_record.read(), [row.id])
+            self.assertEqual(shutdown_record.read(), ["down-row"])
+
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              patch.object(restart, "live_rows", return_value=[row]), patch.object(shutdown, "wait_for_workers", side_effect=window)):
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([row])),
+              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
+              patch.object(shutdown, "wait_for_workers", side_effect=window)):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
+
+    def test_scoped_held_sessions_merges_selected_rows(self) -> None:
+        first = fixture_member("producer", name="first")
+        other = fixture_member("producer", name="other")
+        record = staff.StaffSnapshot((first, other))
+        shutdown_record.save([str(other.id), "earlier"])
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([first])) as live,
+              patch.object(shutdown, "wait_for_workers")):
+            self.assertEqual(shutdown.main(["held-sessions", "--only", str(first.id)]), 0)
+        self.assertEqual(shutdown_record.read(), [str(other.id), "earlier", str(first.id)])
+        self.assertEqual(live.call_args.kwargs["selection"], restart.SelectedRestartRows(frozenset({first.id})))
+
+    def test_direct_resume_removes_only_the_confirmed_live_row(self) -> None:
+        row = fixture_member("producer", name="resume-target")
+        for reference in (row.name, str(row.id), str(row.current_session)):
+            for state in (ClaudeStartState.STARTED, ClaudeStartState.ALREADY_RUNNING):
+                with self.subTest(reference=reference, state=state):
+                    shutdown_record.save(["earlier", str(row.id)])
+                    result = stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2", start_state=state)
+                    with patch.object(stop_resume, "_resume_once", return_value=result):
+                        self.assertEqual(stop_resume.resume(reference), result)
+                    self.assertEqual(shutdown_record.read(), ["earlier"])
+        shutdown_record.save(["earlier", str(row.id)])
+        failed = stop_resume.ResumeFailed(row.current_session, "fixture failure")
+        with patch.object(stop_resume, "_resume_once", return_value=failed):
+            self.assertEqual(stop_resume.resume(str(row.id)), failed)
+        self.assertEqual(shutdown_record.read(), ["earlier", str(row.id)])
+
+    def test_named_resume_cleanup_precedes_a_stop_after_the_row_lock_releases(self) -> None:
+        row = fixture_member("producer", name="resume-race")
+        shutdown_record.save([str(row.id)])
+        operation = staff.row_operation
+        stopped_again: list[str] = []
+        depth = 0
+
+        @contextmanager
+        def lock(reference: str) -> Generator[None]:
+            nonlocal depth
+            depth += 1
+            with operation(reference):
+                yield
+            depth -= 1
+            if depth == 0 and not stopped_again:
+                stopped_again.append(reference)
+                with operation(reference):
+                    shutdown_record.update(started=[], pending=[reference])
+
+        with (patch.object(stop_resume, "_resume_once", return_value=
+                           stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2")),
+              patch.object(staff, "row_operation", side_effect=lock)):
+            self.assertEqual(shutdown.main(["resume", str(row.id)]), 0)
+        self.assertEqual(stopped_again, [str(row.id)])
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+
+    def test_retired_resume_clears_only_a_proven_native_session(self) -> None:
+        owner = fixture_member("showrunner", name="recovery-owner")
+        row = fixture_member("unit", name="recovery-unit", parent=owner.id,
+                             worktree=staff.PresentWorktree("natedev", self.root / "unit"))
+        production = Production(self.root / "production.md", owner.name, "production", self.root,
+                                self.root / "log.md", ZoneInfo("UTC"), owner)
+        unit = shutdown.RetiredUnitRecovery(production, row.name, self.root / "unit", row.name,
+                                            unit_config.StandbyPlan(), row.current_session)
+        receipt = completion_receipt.OwnedReceipt(row, {"session_id": row.current_session,
+                                                       "doc": str(production.doc), "unit": row.name})
+        for already, proven in ((False, False), (False, True), (True, True)):
+            with self.subTest(already=already, proven=proven):
+                shutdown_record.save(["earlier", str(row.id)])
+                with (patch.object(shutdown, "recovery_find_unit", return_value=
+                                   shutdown.NoRecoveryRequired(production, row.name) if already else unit),
+                      patch.object(shutdown, "recovery_resume_record", return_value=self.root / "resume"),
+                      patch.object(completion_receipt, "read_receipt", return_value=receipt),
+                      patch.object(shutdown, "recovery_refusals", return_value=[]),
+                      patch.object(shutdown, "recovery_make_worktree"),
+                      patch.object(unit_config, "restore"), patch.object(unit_config, "discard_parked"),
+                      patch.object(staff, "restore_unit", return_value=row),
+                      patch.object(shutdown, "recovery_launch"),
+                      patch.object(shutdown, "recovery_resumed_session_proven", return_value=proven),
+                      patch.object(completion_receipt, "write_receipt"),
+                      patch.object(worker, "restore", return_value=worker.ExitCode.OK)):
+                    self.assertEqual(shutdown.main(["resume", str(row.id), "--retired"]), 0 if proven else 1)
+                self.assertEqual(shutdown_record.read(), ["earlier"] if proven else ["earlier", str(row.id)])
+
+    def test_paused_resume_removes_the_row_only_after_a_delivered_continuation(self) -> None:
+        owner = fixture_member("showrunner", name="resume-owner")
+        row = fixture_member("unit", name="resume-unit", parent=owner.id)
+        for delivered in (True, False):
+            with self.subTest(delivered=delivered):
+                _ = staff.pause(str(row.id), "maintenance")
+                shutdown_record.save(["earlier", str(row.id)])
+                outcome = {"kind": "sent"} if delivered else {"kind": "unconfirmed", "reason": "fixture failure"}
+                with (patch.object(stop_resume, "running_on_account",
+                                   return_value=stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2")),
+                      patch.object(shutdown, "_message", return_value=outcome)):
+                    self.assertEqual(shutdown.main(["resume", str(row.id)]), 0 if delivered else 1)
+                self.assertEqual(shutdown_record.read(), ["earlier"] if delivered else ["earlier", str(row.id)])
 
 
     def __init__(self, methodName: str = "runTest") -> None:

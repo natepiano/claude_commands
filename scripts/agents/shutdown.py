@@ -242,7 +242,7 @@ USAGE = """usage: agents COMMAND
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
-  agents stop SESSION [--dry-run] | --all [--dry-run]
+  agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
 """
 
@@ -575,27 +575,30 @@ def _lifecycle(options: CommandLine) -> int:
                 print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                 code = 2
                 continue
-            if _paused_resume_needs_message(row):
-                _ = staff.resume(str(row.id))
-                delivery = _message(row, "Continue where you stopped. Resume your existing workers. Do not open new workers.")
-                if restart_support.message_was_delivered(delivery):
-                    print(f"{row.name}: active")
-                else:
-                    _ = staff.set_hold(str(row.id), row.paused)
-                    code = 1
-            else:
+            with staff.row_operation(str(row.id)):
                 started = False
-                try:
-                    if isinstance(row.paused, staff.Paused):
-                        _ = staff.resume(str(row.id))
-                    result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
-                    started = isinstance(result, stop_resume.ClaudeUp)
-                    if started and isinstance(row.exited, staff.Exited):
-                        _ = staff.resume(str(row.id))
-                    code = max(code, _result_code(result))
-                finally:
-                    if not started and isinstance(row.paused, staff.Paused):
+                if _paused_resume_needs_message(row):
+                    _ = staff.resume(str(row.id))
+                    delivery = _message(row, "Continue where you stopped. Resume your existing workers. Do not open new workers.")
+                    if restart_support.message_was_delivered(delivery):
+                        started = True
+                        shutdown_record.remove_started([str(row.id)])
+                        print(f"{row.name}: active")
+                    else:
                         _ = staff.set_hold(str(row.id), row.paused)
+                        code = 1
+                else:
+                    try:
+                        if isinstance(row.paused, staff.Paused):
+                            _ = staff.resume(str(row.id))
+                        result = stop_resume.resume(str(row.id), why=options.why, to=options.to)
+                        started = isinstance(result, stop_resume.ClaudeUp)
+                        if started and isinstance(row.exited, staff.Exited):
+                            _ = staff.resume(str(row.id))
+                        code = max(code, _result_code(result))
+                    finally:
+                        if not started and isinstance(row.paused, staff.Paused):
+                            _ = staff.set_hold(str(row.id), row.paused)
             continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
         held = row if already_exited else staff.pause(str(row.id), options.why)
@@ -622,6 +625,20 @@ def _lifecycle(options: CommandLine) -> int:
     return code
 
 
+def _restart_account(requested: str | None) -> restart.AllRestartAccounts | accounts.AccountSelection:
+    """Resolve an optional account for restart selection."""
+    if not requested:
+        return restart.AllRestartAccounts()
+    parsed = note_file.parse_account_label(requested)
+    if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "codex":
+        if not isinstance(note_file.read_note(note_file.note_path(parsed.label)), note_file.Note):
+            raise UnknownAccountName(f"unknown account {parsed.label}")
+        home = agent_accounts.codex_account_home(parsed.label)
+        return accounts.CodexWorkersAccount(home.label, home.home)
+    named = named_claude_account(requested)
+    return accounts.NamedAccount(named.label, accounts.account_dir(named.label))
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if not arguments or arguments in (["help"], ["--help"], ["-h"]):
@@ -636,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = selection.add_argument("session", nargs="?")
     _ = selection.add_argument("--all", action="store_true")
     _ = command.add_argument("--dry-run", action="store_true")
+    _ = command.add_argument("--only", default="")
+    _ = command.add_argument("--account", dest="account")
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
@@ -678,7 +697,9 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("records")
     _ = command.add_argument("--json", action="store_true", dest="as_json")
     _ = command.add_argument("--here", action="store_true")
-    _ = commands.add_parser("held-sessions")
+    command = commands.add_parser("held-sessions")
+    _ = command.add_argument("--only", default="")
+    _ = command.add_argument("account", nargs="?")
     command = commands.add_parser("remote-control")
     _ = command.add_argument("session")
     _ = command.add_argument("--pid", type=int, required=True)
@@ -690,7 +711,9 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
         if options.command == "stop" and options.all:
-            return restart.stop_all(dry_run=options.dry_run)
+            return restart.stop_all(dry_run=options.dry_run,
+                                    only=tuple(item for item in options.only.split(",") if item),
+                                    account=_restart_account(options.account))
         if options.command == "move":
             move_arguments = ["move", options.session, note_file.canonical_label(options.target)]
             if options.dry_run:
@@ -699,33 +722,41 @@ def main(argv: list[str] | None = None) -> int:
                 move_arguments.extend(("--why", options.why))
             return accounts.main(move_arguments)
         if options.command == "restart":
-            selected_account: restart.AllRestartAccounts | accounts.AccountSelection = restart.AllRestartAccounts()
-            if options.account:
-                parsed = note_file.parse_account_label(options.account)
-                if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "codex":
-                    if not isinstance(note_file.read_note(note_file.note_path(parsed.label)), note_file.Note):
-                        raise UnknownAccountName(f"unknown account {parsed.label}")
-                    home = agent_accounts.codex_account_home(parsed.label)
-                    selected_account = accounts.CodexWorkersAccount(home.label, home.home)
-                else:
-                    named = named_claude_account(options.account)
-                    selected_account = accounts.NamedAccount(named.label, accounts.account_dir(named.label))
             return restart.restart(stop_all=options.all, dry_run=options.dry_run,
                                    only=tuple(item for item in options.only.split(",") if item),
-                                   account=selected_account, why=options.why)
+                                   account=_restart_account(options.account), why=options.why)
         if options.command == "records":
             print(json.dumps(shutdown_record.read()))
             return 0
         if options.command == "held-sessions":
             record = staff.StaffSnapshot(())
             rows: list[staff.StaffRow] = []
+            account = _restart_account(options.account)
+            scoped = bool(options.only) or not isinstance(account, restart.AllRestartAccounts)
             try:
                 record = staff.initial_snapshot()
-                rows = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True)
+                if options.only:
+                    selection = restart.SelectedRestartRows(frozenset(row.id for reference in options.only.split(",")
+                        if (row := record.by_member_reference(reference)) is not None))
+                    reading = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True,
+                                             account=account, selection=selection)
+                else:
+                    reading = restart.live_rows(record, herdr.Herdr(herdr.shared_session()), save_tabs=True, account=account)
             except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
                 print(f"restart: save anomaly: {error}", file=sys.stderr)
-            shutdown_record.update(started=[], pending=[str(row.id) for row in rows])
-            print(f"saved {len(rows)} rows for restart at {time.strftime('%H:%M')}", flush=True)
+            else:
+                rows = reading.rows
+                if not scoped:
+                    restart.prune_live_rows(reading)
+                else:
+                    for row in rows:
+                        try:
+                            with staff.row_operation(str(row.id)):
+                                shutdown_record.update(started=[], pending=[str(row.id)])
+                        except staff.StaffRefused as error:
+                            print(f"restart: save anomaly: {error}", file=sys.stderr)
+            saved = "rows for restart" if scoped else "live row tabs"
+            print(f"saved {len(rows)} {saved} at {time.strftime('%H:%M')}", flush=True)
             wait_for_workers(record)
             return 0
         if options.command == "remote-control":
@@ -1745,6 +1776,7 @@ def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> i
     recovery_launch(unit)
     if not recovery_resumed_session_proven(unit.production.name, unit.name, unit.session_id, row):
         raise RecoveryRefused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
+    shutdown_record.remove_started([str(row.id)])
     completed = recovery_resume_record(unit.production, unit.name).with_suffix(".done")
     completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
                                                    "doc": str(unit.production.doc), "unit": unit.name})
@@ -1797,22 +1829,24 @@ def recovery_apply(name: str, *,
     try:
         record = staff.initial_snapshot()
         row = named_staff_unit(name, record)
-        unit = recovery_find_unit(unit_production_name(row, record), str(row.id), record=record)
-        completed = completion_receipt.read_receipt(recovery_resume_record(unit.production, unit.name).with_suffix(".done"),
-                                                record)
-        if (isinstance(unit, NoRecoveryRequired) and isinstance(completed, completion_receipt.OwnedReceipt)
-                and completed.owner.kind == "unit" and completed.fields.get("doc") == str(unit.production.doc)
-                and completed.fields.get("unit") == unit.name
-                and isinstance(completed.owner.worktree, staff.PresentWorktree)
-                and isinstance(completed.fields.get("session_id"), str)
-                and recovery_resumed_session_proven(unit.production.name, unit.name,
-                    cast(str, completed.fields["session_id"]), completed.owner)):
-            code = worker.restore(completed.owner.id)
-            print(f"{unit.name} already resumed")
-            return int(code)
-        if isinstance(unit, NoRecoveryRequired):
-            raise RecoveryRefused(f"{unit.name} is not retired")
-        return recovery_resume(replace(unit, account=account), record)
+        with staff.row_operation(str(row.id)):
+            unit = recovery_find_unit(unit_production_name(row, record), str(row.id), record=record)
+            completed = completion_receipt.read_receipt(recovery_resume_record(unit.production, unit.name).with_suffix(".done"),
+                                                    record)
+            if (isinstance(unit, NoRecoveryRequired) and isinstance(completed, completion_receipt.OwnedReceipt)
+                    and completed.owner.kind == "unit" and completed.fields.get("doc") == str(unit.production.doc)
+                    and completed.fields.get("unit") == unit.name
+                    and isinstance(completed.owner.worktree, staff.PresentWorktree)
+                    and isinstance(completed.fields.get("session_id"), str)
+                    and recovery_resumed_session_proven(unit.production.name, unit.name,
+                        cast(str, completed.fields["session_id"]), completed.owner)):
+                shutdown_record.remove_started([str(completed.owner.id)])
+                code = worker.restore(completed.owner.id)
+                print(f"{unit.name} already resumed")
+                return int(code)
+            if isinstance(unit, NoRecoveryRequired):
+                raise RecoveryRefused(f"{unit.name} is not retired")
+            return recovery_resume(replace(unit, account=account), record)
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
     except RecoveryFactsMissing as error:

@@ -41,7 +41,7 @@ from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
-from scripts.agents import member_account, pane_record
+from scripts.agents import member_account, pane_record, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -1082,6 +1082,18 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
             client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
+    result = _resume_from_names(session, names, why=why, to=to, requester=requester, client=client)
+    if isinstance(result, ClaudeUp):
+        members = [row for row in names.tab_record.rows
+                   if row.current_session == result.session_id or row.id == session or row.name == session]
+        if len(members) == 1:
+            with staff.row_operation(str(members[0].id)):
+                shutdown_record.remove_started([str(members[0].id)])
+    return result
+
+
+def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
+                       client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
