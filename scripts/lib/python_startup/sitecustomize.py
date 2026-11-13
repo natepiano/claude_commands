@@ -48,7 +48,6 @@ def select_checkout(arguments: list[str]) -> str:
         state.__path__ = []
     selected = next(iter(state.__path__), "")
     if selected and state.__dict__.get("completed_selection") == (selected, _selection_inputs(sys.path)):
-        _start_test_run(selected, arguments, state)
         return selected
     if not selected:
         script = arguments[0] if arguments else ""
@@ -72,13 +71,19 @@ def select_checkout(arguments: list[str]) -> str:
         paths.insert(position, selected)
     sys.path[:] = paths
     state.__dict__["completed_selection"] = (selected, _selection_inputs(sys.path))
-    _start_test_run(selected, arguments, state)
     return selected
 
 
-def _start_test_run(selected: str, arguments: list[str], state: ModuleType) -> None:
-    """Allocate for direct test runners after checkout selection."""
-    if state.__dict__.get("test_run_started") or os.environ.get("MERGE_GATE_PARENT_PID"):
+def start_process(arguments: list[str]) -> str:
+    """Select the checkout at interpreter startup and give a direct test run its folder."""
+    selected = select_checkout(arguments)
+    _start_test_run(selected, arguments)
+    return selected
+
+
+def _start_test_run(selected: str, arguments: list[str]) -> None:
+    # Decide before any import; module_run.py removes the gate variable later.
+    if os.environ.get("MERGE_GATE_PARENT_PID"):
         return
     original = sys.orig_argv
     unittest_module = ("-munittest" in original
@@ -89,7 +94,6 @@ def _start_test_run(selected: str, arguments: list[str], state: ModuleType) -> N
     # Partial fixture checkouts can contain only the startup files.
     if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):
         return
-    state.__dict__["test_run_started"] = True
     from scripts.lib.testing_folders import start_test_run
 
     start_test_run()
@@ -156,6 +160,6 @@ if __name__ in sys.modules:
 if __name__ == "sitecustomize":
     # Save the hook order before selection removes this startup directory.
     following = sys.path[:]
-    _ = select_checkout(sys.argv)
+    _ = start_process(sys.argv)
     next_sitecustomize(__file__, following)
     finish_startup(__file__, sys.argv)

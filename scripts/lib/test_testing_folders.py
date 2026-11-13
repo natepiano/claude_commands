@@ -26,6 +26,13 @@ class Fixture(unittest.TestCase):
         print(json.dumps([os.environ['TMPDIR'], str(path), os.getpid()]), flush=True)
         sys.stdin.read(1)
 """
+GATE_FIXTURE = """import os, unittest
+from scripts.lib import build_folders
+class Fixture(unittest.TestCase):
+    def test_folder(self):
+        print('TMPDIR=' + os.environ['TMPDIR'], flush=True)
+"""
+MODULE_RUN = Path(__file__).resolve().parents[1] / "test_times/module_run.py"
 
 
 class TestRunFolderTests(unittest.TestCase):
@@ -99,6 +106,17 @@ class TestRunFolderTests(unittest.TestCase):
         output, errors = live.communicate("x", timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(live.returncode, 0, output + errors)
         self.assertEqual(list(live_folder.parent.iterdir()), [])
+
+    def test_a_gate_job_keeps_its_folder_when_a_test_imports_the_maker(self) -> None:
+        _ = (self.root / "test_gate_fixture.py").write_text(GATE_FIXTURE)
+        environment = {**self.environment(), "MERGE_GATE_PARENT_PID": str(os.getpid()), "PYTHONPATH": str(self.root)}
+        _ = environment.pop("TEST_TIMES_OUT", None)
+        result = subprocess.run([str(SHIM), str(MODULE_RUN), str(self.root), "test_gate_fixture.py"],
+                                cwd=self.root, env=environment, text=True, capture_output=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"TMPDIR={self.root}\n", result.stdout + result.stderr)
+        self.assertFalse((self.root / "test-runs").exists())
 
     def test_the_context_resets_tempfile_and_restores_the_callers_environment(self) -> None:
         with mock.patch.dict(os.environ, self.environment()), mock.patch.object(tempfile, "tempdir", str(self.root)):

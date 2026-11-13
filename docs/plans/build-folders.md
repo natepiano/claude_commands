@@ -383,8 +383,9 @@ Run the existing complete gate after the final migration.
 
 ## Phase 9 — Test run folders
 
-**Status:** built in bf9 (609b743ff).
+**Status:** built in bf9 (609b743ff); bf9r moved the start to interpreter startup only.
 **Implementation:** Direct unittest and timed runs allocate through the shared Python bootstrap.
+The startup hook and the shim bootstrap start the folder; `package_root.py` selects the checkout only.
 `targeted_test.py` uses the same maker context.
 Each run holds its lock and sets TMPDIR for itself and its children.
 Normal exit removes the complete allocation.
