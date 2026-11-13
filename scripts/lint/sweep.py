@@ -137,18 +137,18 @@ combines them with the journal and legacy removals.jsonl rows; nothing writes
 the legacy file.
 
 Concurrency. cargo 1.98.1 holds flock() on .cargo-lock, .cargo-build-lock
-and .cargo-artifact-lock for the whole build (checked 2026-09-15 by probing
-each with LOCK_EX|LOCK_NB while a build script slept). This takes all of them
-without waiting, in every build tree, before scanning, and skips the sweep if
-any is held: a delete under a running build leaves cargo failing to write
-into fingerprint dirs that vanished. Holding them makes a build that starts
-mid-sweep wait until the sweep finishes. A test run holds none of those locks:
-nextest executes its binaries straight from deps/ after the build, and on
-2026-10-15 a floor sweep at test 2105 of 4072 left 1965 hana tests failing to
-exec theirs. So a target is also busy while a live process runs from it, works
-in it or maps a file under it (/proc/<pid>/exe, cwd, maps), or while a
-cargo-nextest runs whose workspace owns it, which covers the moments between two
-test binaries. A running app counts too, so its target waits for it to exit.
+and .cargo-artifact-lock for the whole build.
+Probes with LOCK_EX|LOCK_NB confirmed this on 2026-09-15 while a build script slept.
+The sweep takes these locks in every build tree without waiting before it scans.
+If any lock is held, it skips the sweep.
+These locks prevent deletion during a build and make a new build wait until the sweep finishes.
+A nextest test run holds none of these locks and executes binaries from deps/.
+On 2026-10-15, a floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
+A target is also busy when a live process uses an executable, working directory, or mapped file under it.
+The scan reads /proc/<pid>/exe, cwd and maps for this check.
+A cargo-nextest or verify.sh process keeps its workspace targets busy.
+This protection includes time between test binaries and time in the build queue.
+A running app also keeps its target busy until the app exits.
 """
 
 from __future__ import annotations
@@ -1206,17 +1206,16 @@ def mapped_files(maps: bytes) -> Iterator[str]:
 
 
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
-    """Each target a live process uses, with one such process: its exe, its working directory or a
-    file it maps lies under the target, or it is a cargo-nextest run whose workspace owns the target.
+    """Find one live process that uses each target, with one scan of /proc.
 
-    nextest's run phase holds none of cargo's locks: it executes test binaries straight from
-    deps/, and between two of them no child may be running from the target, so the nextest
-    process itself counts. Without /proc (the Mac) no use can be seen.
+    A process uses a target when its executable, working directory, or a mapped file lies under it.
+    A cargo-nextest or verify.sh process also uses the targets of its workspace.
+    This keeps targets busy between test binaries and while verify.sh waits in the build queue.
+    Without /proc, as on the Mac, the scan finds no use.
 
-    An exe or mapped file that reads "(deleted)" is not a use: its blocks come back only when the
-    process exits, and the sweep can neither take nor break it. So a stale process whose exe and
-    mappings under a target are all deleted, working outside it, does not keep the target busy: a
-    hung cargo-berth resolve held 26 GiB of cargo-liner's target that way for three days (2026-10-21).
+    Ignore executable and mapped paths that end with "(deleted)".
+    Their blocks remain until the process exits, and the sweep cannot remove or damage those files.
+    A process with only deleted files under a target does not keep it busy if its working directory is outside.
     """
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
     found: dict[str, TargetUse] = {}
@@ -1260,10 +1259,14 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
                 _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}"))
-        if NEXTEST_ARG in argv[1:2] or (argv and os.path.basename(argv[0]) == f"cargo-{NEXTEST_ARG}"):
-            for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), owners):
+        command = os.path.basename(argv[0]) if argv else ""
+        verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
+            next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
+        if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
+            runner = "verify.sh" if verify else "cargo-nextest"
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
                 if target in checked:
-                    _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
+                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
     return {target: found[target] for target in owners if target in found}
 
 
@@ -1574,7 +1577,7 @@ def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, c
     return os.path.realpath(setting.base / value)
 
 
-def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:

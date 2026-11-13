@@ -22,12 +22,8 @@ REPO=${0:A:h:h:h}
 # One line per unit: its id, its place now, whether Claude runs there, its session name now.
 unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" --status "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
-# What a gate line may call a peer: its unit id, or its session name now.
+# Staff supplies peer names, fixed identities and current session ids.
 names=()
-for line in $units; do
-  fields=("${(@ps:\t:)line}")
-  names+=($fields[1] $fields[4])
-done
 PY=$REPO/scripts/lib/py
 staff_lines=$("$PY" - "$REPO" "${production[@]}" <<'PYTHON'
 import sys
@@ -38,7 +34,7 @@ record = staff.snapshot()
 owner = owner_for(arguments[1] if arguments[0] == "--production" else arguments[0], record=record)
 for row in record.find(parent=owner.id, kind="unit"):
     run = str(row.run.path) if isinstance(row.run, staff.OpenRun) else ""
-    print(f"{row.name}\t{row.id}\t{run}")
+    print(f"{row.name}\t{row.id}\t{run}\t{row.current_session}")
 PYTHON
 ) || exit 1
 staff_rows=("${(@f)staff_lines}")
@@ -47,6 +43,7 @@ for line in $staff_rows; do
   fields=("${(@ps:\t:)line}")
   state_keys[$fields[1]]=$fields[2]
   open_runs[$fields[1]]=$fields[3]
+  names+=($fields[1] $fields[2] $fields[4])
 done
 NOTIFIER=$REPO/scripts/message/notifier.sh
 mkdir -p "$DIR"

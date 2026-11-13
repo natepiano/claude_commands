@@ -248,7 +248,7 @@ try {
                 queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
                 queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
-                stages:[...table.querySelectorAll('tbody tr[data-tip] .stage')].map(e=>e.textContent),
+                stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
                 layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
                 rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
                   const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
@@ -287,12 +287,12 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
-            assert.ok(proof.stages.at(-1)==='');
+            assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
             for(const offsets of proof.rowOffsets)
               assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
             assert.equal(proof.machine, 'fixture');
@@ -501,7 +501,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -589,6 +589,29 @@ try {
                 await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
+            }
+            await show(base);
+
+            for (const state of ['idle','busy']) {
+              const ciReading=structuredClone(base);
+              ciReading.walk.push({name:'hana CI',ci:true,queued:false,used:0.125,reserved:0,
+                counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
+                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state}]});
+              ciReading.ci_ram=0.125;
+              ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
+              await show(ciReading);
+              const ciProof=await evaluate(`(() => {
+                const key='row:'+(latest.walk.length-1);
+                const table=document.querySelector('.walk-table tr[data-tip="'+key+'"]');
+                const chart=document.querySelector('.wrow[data-tip="'+key+'"]');
+                return {table:!!table,chart:!!chart,stage:table?.querySelector('.place').textContent,
+                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram};
+              })()`);
+              assert.equal(ciProof.table,state==='busy');
+              assert.equal(ciProof.chart,state==='busy');
+              if(state==='busy') assert.equal(ciProof.stage,'—');
+              assert.equal(ciProof.ci,0.125);
+              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
             }
             await show(base);
 

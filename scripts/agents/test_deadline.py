@@ -40,7 +40,7 @@ class DeadlineTests(unittest.TestCase):
 
     def row(self) -> staff.StaffRow:
         return staff.StaffRow(staff.StaffId("row"), "unit", "alpha", staff.StaffRoot(),
-                              current_session=staff.StaffId("session"))
+                              current_session=staff.StaffId("session"), unit_type=staff.UnitDetails("direct"))
 
     def test_stop_row_limits_a_blocking_pane_read(self) -> None:
         with (patch.object(subprocess, "run", side_effect=self.block),

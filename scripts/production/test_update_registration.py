@@ -60,6 +60,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
         self.assertEqual(updates[updates.index("--prompt") + 1], "scheduled")
         self.assertNotIn("--prompt-file", updates)
+        self.assertNotIn("--from", updates)
         self.assertFalse((self.state / "showrunner" / self.owner_id / "prompt.txt").exists())
         self.assertIn("automatic reports are off", first.stdout)
         for instance in ("stall-watch",):
