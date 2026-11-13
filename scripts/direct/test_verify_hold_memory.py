@@ -8,6 +8,7 @@ import json
 import subprocess
 import unittest
 from datetime import datetime
+from pathlib import Path
 from typing import cast, override
 
 from scripts.direct.verify_hold_wait_test_support import (
@@ -94,16 +95,27 @@ run_once cargo check
 
     def test_memory_admission_hold_wait_is_recorded_by_verify_after_release(self) -> None:
         observation = self.observe_waits()
-        before_admission = self.admission.server.before_admission
-
-        def hold_during_admission() -> None:
-            if not self.cycle_file.exists():
-                self.hold(purpose="memory admission")
-            before_admission()
-
-        self.admission.server.before_admission = hold_during_admission
+        observer = Path(self.fixture.environment["CLAUDE_PYTHON"])
+        source = observer.read_text().replace(
+            'os.execv(os.environ["TEST_REAL_PYTHON"],',
+            '''if len(sys.argv) > 2 and sys.argv[1].endswith("/build_queue/admission_client.py") and sys.argv[2] == "admit":
+    path = Path(os.environ["TEST_CYCLE_FILE"])
+    if not path.exists():
+        from datetime import datetime
+        now = datetime.now().astimezone().isoformat()
+        holders = Path(os.environ["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        (holders / "hana").write_text(json.dumps({"holder": "hana", "since": now, "for": "memory admission", "release_eta": "unknown"}))
+        path.parent.mkdir(parents=True)
+        (path.parent.parent / "current").write_text(path.parent.name)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"id": path.parent.name, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
+        os.replace(temporary, path)
+os.execv(os.environ["TEST_REAL_PYTHON"],''',
+        )
+        _ = observer.write_text(source)
         self.fixture.environment.update({
-            "BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1",
+            "TEST_CYCLE_FILE": str(self.cycle_file), "BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1",
         })
         process = self.start("test", "sample", "--local", "memory admission test", "--filter", "smoke")
         _ = self.wait_for_call(process)

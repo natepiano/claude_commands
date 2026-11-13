@@ -7,8 +7,7 @@ import shutil
 import subprocess
 import unittest
 from typing import cast, override
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
-from scripts.build_queue import placement
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_protocol as wire
 
 from scripts.direct import test_verify_mac_offload as offload_tests
@@ -19,19 +18,9 @@ CHECK_STUB = '''
 import os
 from pathlib import Path
 import sys
-import runpy
 
 command = sys.argv[1]
-broken = os.environ.get("TEST_BROKEN_CHECK")
-if command == "register-local" and os.environ.get("TEST_RELEASE_CHECK"):
-    release = Path(os.environ["TEST_RELEASE_CHECK"])
-    seen = release.with_suffix(".seen")
-    if seen.exists():
-        runpy.run_path(str(release), run_name="__main__")
-    seen.touch()
-    raise SystemExit(10)
-if (command == broken or (command == "constraints" and broken == "eligible")
-        or (command == "register-local" and broken == "wait-local")):
+if command == os.environ.get("TEST_BROKEN_CHECK"):
     mode = os.environ["TEST_CHECK_FAILURE"]
     if mode == "usage":
         print("usage: invalid choice: check-admission", file=sys.stderr)
@@ -51,16 +40,14 @@ if (command == broken or (command == "constraints" and broken == "eligible")
         raise SystemExit(10)
     if mode == "error":
         raise SystemExit(12)
+if command == "eligible":
+    print("any_target" if os.environ.get("TEST_ELIGIBLE_MAC") else "natedev_only test target")
+    print("natedev\\teligible\\t-\\t-\\t-")
+    if os.environ.get("TEST_ELIGIBLE_MAC"):
+        print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
 if command == "wait-local" and os.environ.get("TEST_REMOVE_CHECK") == "1":
     Path(__file__).unlink()
-if command in ("register-local", "check-local", "wait-local"):
-    raise SystemExit(0)
-source = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2]
-if command == "constraints" and os.environ.get("TEST_ELIGIBLE_MAC"):
-    Path(os.environ["CONF_DIR"], "build_targets.conf").write_text(
-        "targets=mac,natedev\\nkind.natedev=local\\nplatform.natedev=linux\\n"
-        + "kind.mac=ssh\\nplatform.mac=macos\\nsettings.mac=mac_test.conf\\n")
-runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
+raise SystemExit(0)
 '''
 
 
@@ -114,10 +101,6 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             "BUILDLOG_CHECK_FAILED_FILE": "", "LINT_SKIP_SWEEP": "1",
         })
         self.admission = caller_admission(self, self.fixture.root, self.fixture.environment)
-        _ = (self.fixture.root / "build_targets.conf").write_text(
-            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        controls = caller_provider_controls(self, self.admission)
-        controls.set_host("natedev", placement.AllowedHost())
         self.admission.server.line_filter = self.failure_line
 
     def restore_client(self) -> None:
@@ -275,13 +258,11 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         release = self.fixture.root / "broken-release.py"
         _ = release.write_text('raise RuntimeError("release check failed")\n')
         self.fixture.environment.update({
-            "TEST_RELEASE_CHECK": str(release), "BUILD_TARGETS_POLL_S": "0.01",
+            "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(release),
             "TEST_ELIGIBLE_MAC": "1", "TEST_BROKEN_CHECK": "register-local",
             "TEST_CHECK_FAILURE": "held", "TEST_RUNNER_MAC": "declined",
             "TEST_RUNNER_REASON": "busy", "TEST_RUNNER_STATUS": "75",
         })
-        controls = caller_provider_controls(self, self.admission)
-        controls.set_host("natedev", placement.TemporaryExclusion("blocked"))
         self.assert_refused(self.fixture.verify("test", "sample", "--filter", "smoke", "--no-cache"))
 
     def test_check_failure_cannot_continue_to_a_format_step(self) -> None:

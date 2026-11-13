@@ -2091,9 +2091,10 @@ class StopResumeTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.entry = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", str(self.root),
-            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3"), "SHOWRUNNER_UNIT": "alpha"},
-            ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "sonnet"])
+        with patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
+            self.entry = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", str(self.root),
+                {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3"), "SHOWRUNNER_UNIT": "alpha"},
+                ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "sonnet"])
         self.client = FakeClient([{"pane_id": "w1:p2", "tab_id": "w1:t9", "label": "alpha", "workspace_id": "w1",
                                    "agent_session": {"kind": "id", "value": "019b3a40-4250-7000-8000-000000000102"}}])
         self.client_result = self.client.result

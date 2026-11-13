@@ -9,7 +9,6 @@ from typing import cast
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.build_queue.admission_test_support import caller_provider_controls
 
 
 class VerifySshRetryTests(VerifySshTargetsFixture):
@@ -21,20 +20,16 @@ class VerifySshRetryTests(VerifySshTargetsFixture):
         def observe_retry(event: support.CompletedMemoryHook) -> bool:
             if event["clock"] == "100":
                 self.assertFalse(event["left"])
-                self.assertEqual(event["attempts"], 1, json.dumps(self.ssh_events())
-                                 + repr(self.admission.server.assignments))
+                self.assertEqual(event["attempts"], 1)
                 self.assertEqual(len(self.ssh_events()), 1)
                 self.assertEqual(clock.read_text(), "100")
-                polls = (self.runner_state / "memory-polls.jsonl").read_text().splitlines()
-                if len(polls) >= 2:
-                    _ = clock.write_text("281")
-                    caller_provider_controls(self, self.admission).advance(181)
+                _ = clock.write_text("281")
                 return False
             self.assertTrue(event["left"])
             self.assertEqual(event["clock"], "281")
             return True
 
-        self.release_memory_after_hook(observe_retry, after_attempts=1)
+        self.release_memory_after_hook(observe_retry)
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"lost-once"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()

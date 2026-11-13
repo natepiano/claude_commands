@@ -1,7 +1,6 @@
 """Real verify step routing: restart."""
 from __future__ import annotations
 
-from typing import override
 from pathlib import Path
 import unittest
 
@@ -9,12 +8,6 @@ from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixtu
 
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        config = self.fixture.root / "build_targets.conf"
-        _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-
     def test_stopped_local_check_is_routed_again(self) -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         (holders / "other").unlink()

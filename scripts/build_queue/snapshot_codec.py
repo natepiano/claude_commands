@@ -52,50 +52,6 @@ def record_field_names(schema: type) -> tuple[str, ...]:
     return tuple(member.name for member in fields(schema))
 
 
-def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
-    """Keep existing wire fields compatible with the pinned client."""
-    if (schema.__module__ == "scripts.build_queue.placement"
-            and schema.__name__ in ("PlacementAssignment", "PlacementConstraints")):
-        source = record.get("source_identity", record.get("source_key"))
-        if writing:
-            assert isinstance(source, dict)
-            identity = cast(dict[str, object], source)
-            return {**record, "source_identity": identity, "source_key": identity.get("key", "")}
-        legacy = record.get("source_key")
-        if (isinstance(legacy, str) and isinstance(source, dict)
-                and cast(dict[str, object], source).get("key", "") != legacy):
-            source = legacy
-        if isinstance(source, str):
-            source = ({"kind": "SourceKeyKnown", "key": source} if source else
-                      {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
-        return {**record, "source_key": source}
-    if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
-        if writing:
-            running = record["running"]
-            assert isinstance(running, list)
-            rows = cast(list[object], running)
-            local_rows = [row for row in rows if not remote_memory_row(row)]
-            if len(local_rows) != len(rows):
-                return {**record, "running": local_rows, "running_with_remote": rows}
-        elif "running_with_remote" in record:
-            return {**record, "running": record["running_with_remote"]}
-    return record
-
-
-def remote_memory_row(value: object) -> bool:
-    """Identify remote rows that the pinned memory schema cannot represent."""
-    if not isinstance(value, dict):
-        return False
-    row = cast(dict[str, object], value)
-    step = row.get("step") if row.get("kind") == "ExplainedRunningStep" else row
-    if not isinstance(step, dict):
-        return False
-    measured = cast(dict[str, object], step).get("measured")
-    return (isinstance(measured, dict)
-            and cast(dict[str, object], measured).get("kind") == "RemoteMemoryUnavailable")
-
-
-
 def snapshot_value(value: object) -> object:
     """Convert each shared record once within this encoding."""
     converted: dict[int, object] = {}
@@ -109,9 +65,8 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = wire_record(type(item),
-                {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
-                 for name in record_field_names(type(item))}}, writing=True)
+            result = {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
+                for name in record_field_names(type(item))}}
         elif isinstance(item, Mapping):
             result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
         elif isinstance(item, frozenset):
@@ -182,7 +137,6 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
-    record = wire_record(schema, record, writing=False)
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")
