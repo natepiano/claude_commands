@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.client import HTTPConnection
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, ScopeProcess, ScopeProcesses
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
+from scripts.review_links import review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
@@ -410,12 +412,37 @@ class MemoryFeedTests(unittest.TestCase):
         folder = root / "fixture folder"
         _ = self.configuration.write_text(f"output_folder={folder}\n")
         _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        folder.mkdir(parents=True)
+        page = folder / "memory_live.html"
+        _ = page.write_text("published page")
         output = io.StringIO()
         with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example."}),
               mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
               redirect_stdout(output)):
+            self.assertEqual(memory_feed.page_url(), "http://fixture.example:9432/fixture%20folder/memory_live.html")
+            self.assertEqual(output.getvalue(), "")
             self.assertEqual(memory_feed.main(["link"]), 0)
         self.assertEqual(output.getvalue(), "http://fixture.example:9432/fixture%20folder/memory_live.html\n")
+        self.assertEqual(page.read_text(), "published page")
+        self.assertEqual(list(folder.iterdir()), [page])
+
+    def test_a_missing_page_raises_an_allowed_error_and_publishes_nothing(self) -> None:
+        root = self.root / "review-links"
+        folder = root / "fixture"
+        _ = self.configuration.write_text(f"output_folder={folder}\n")
+        _ = (self.root / "review_links.conf").write_text("# whole: 1..65535\nserver_port=9432\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
+              mock.patch.object(memory_feed, "publish_page", side_effect=AssertionError("The link must not publish the page")),
+              redirect_stdout(output)):
+            with self.assertRaises(review_link.SNAPSHOT_ERRORS) as raised:
+                _ = memory_feed.page_url()
+            self.assertIsInstance(raised.exception, FileNotFoundError)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(memory_feed.page_link(), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertTrue(output.getvalue().startswith("Build page link: "))
+        self.assertIn("Builds page is not available", output.getvalue())
         self.assertFalse(root.exists())
 
     def test_link_refuses_a_folder_outside_the_review_root_with_one_plain_line(self) -> None:
@@ -423,10 +450,34 @@ class MemoryFeedTests(unittest.TestCase):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root), "REVIEW_LINKS_HOST": "fixture.example"}),
               redirect_stdout(output)):
+            with self.assertRaises(review_link.SNAPSHOT_ERRORS):
+                _ = memory_feed.page_url()
             self.assertEqual(memory_feed.main(["link"]), 1)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertTrue(output.getvalue().startswith("Build page link: "))
         self.assertFalse(self.output.exists())
+
+    def test_page_url_keeps_snapshot_errors_for_the_console_caller(self) -> None:
+        with (mock.patch.object(review_link, "review_root", return_value=self.root),
+              mock.patch.object(review_link, "snapshot_url", side_effect=OSError("page unavailable"))):
+            with self.assertRaisesRegex(OSError, "page unavailable"):
+                _ = memory_feed.page_url()
+
+    def test_served_page_allows_same_origin_framing(self) -> None:
+        for name in ("review_links", "change_review"):
+            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", self.root / f"{name}.conf")
+        server_fixture = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server_fixture.doCleanups)
+        server_fixture.setUp()
+        memory_feed.publish_page(replace(memory_feed.read_configuration(), output_folder=server_fixture.root))
+        connection = HTTPConnection("127.0.0.1", server_fixture.port, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/memory_live.html")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertNotIn(response.getheader("X-Frame-Options", "").upper(), ("DENY",))
+        self.assertNotIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy", "").lower())
+        self.assertEqual(response.read().decode(), self.expected_page())
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
         def view() -> admission_records.QueueRead:
