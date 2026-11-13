@@ -266,27 +266,26 @@ try:
     memory_thread.start()
     stage('tests start')
     with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-        with merge_gate.rollback_signals():
-            cpu_started = busy_cpu_seconds()
-            result['gate_started_at'] = time.time()
-            if links.get('production'):
-                gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
-                                            module_time_limit_s=links['module_time_limit_s'],
-                                            selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
-                                            mode=merge_gate.SuiteMode(links['mode']))
-            else:
-                gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
-                                            module_time_limit_s=links['module_time_limit_s'])
-            if links.get('production'):
-                result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                     result['gate_started_at'], time.time(), links['mode'])
-                dirty = gate_request['dirty_paths']
-                result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
-                                        dirty_path_count=len(dirty))
-                result.update(attempt=links['attempt'], commit=links['commit'], tree=links['tree'],
-                              host=os.uname().nodename, gate=encode_run(gate))
-            result['gate_finished_at'] = time.time()
-            cpu_finished = busy_cpu_seconds()
+        cpu_started = busy_cpu_seconds()
+        result['gate_started_at'] = time.time()
+        if links.get('production'):
+            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+                                        module_time_limit_s=links['module_time_limit_s'],
+                                        selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
+                                        mode=merge_gate.SuiteMode(links['mode']))
+        else:
+            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+                                        module_time_limit_s=links['module_time_limit_s'])
+        if links.get('production'):
+            result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
+                                                 result['gate_started_at'], time.time(), links['mode'])
+            dirty = gate_request['dirty_paths']
+            result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
+                                    dirty_path_count=len(dirty))
+            result.update(attempt=links['attempt'], commit=links['commit'], tree=links['tree'],
+                          host=os.uname().nodename, gate=encode_run(gate))
+        result['gate_finished_at'] = time.time()
+        cpu_finished = busy_cpu_seconds()
     result['verdict'] = 'pass' if gate.passed else 'fail'
     result['modules'] = []
     for job in gate.jobs:

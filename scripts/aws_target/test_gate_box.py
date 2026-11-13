@@ -95,6 +95,13 @@ class GateBoxTests(unittest.TestCase):
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
         self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
 
+    def test_guest_names_no_merge_gate_signal_function(self) -> None:
+        for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):
+            self.assertNotIn('rollback_signals', code)
+            self.assertNotIn('defer_signals', code)
+            self.assertNotRegex(code, r'\bmerge_gate\.\w*signal\w*')
+            self.assertNotIn('signal.signal', code)
+
     def test_boot_timestamps_use_local_kernel_and_cached_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -190,7 +197,7 @@ class GateBoxTests(unittest.TestCase):
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
         self.production_boot_stubs(('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'))
 
-    def test_candidate_renamed_suite_context_uses_its_own_entry_point(self) -> None:
+    def test_candidate_renamed_suite_runner_uses_its_own_entry_point(self) -> None:
         self.production_boot_stubs(('',), candidate_change='rename')
 
     def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
@@ -223,9 +230,8 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport os\n'
+                    'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
-                    + 'rollback_signals = nullcontext\n'
                     + 'def run_suites(*args, **kwargs):\n'
                     + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
@@ -236,7 +242,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 if candidate_change == 'rename':
                     for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
                         path = repo / relative
-                        _ = path.write_text(path.read_text().replace('rollback_signals', 'candidate_suite_context'))
+                        _ = path.write_text(path.read_text().replace('run_suites', 'candidate_suites'))
                 elif candidate_change == 'missing':
                     path = repo / 'scripts/aws_target/gate_box.py'
                     _ = path.write_text(path.read_text().replace('def run_guest(', 'def old_guest('))

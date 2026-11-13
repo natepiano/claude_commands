@@ -206,7 +206,9 @@ The live `gate_box.GUEST` program contains the bootstrap code.
 The bootstrap downloads or clones the candidate and verifies its requested tree.
 It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.
 The entry point accepts the box directory, links, and mutable result dictionary.
-The candidate supplies its own suite, rollback, timing, and record code.
+The candidate supplies its own suite, timing, and record code.
+The guest installs no signal handler.
+The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
