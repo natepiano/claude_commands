@@ -1070,40 +1070,19 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 ### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: done
 
-Found by the Phase 52 reviews (finding F001, routed here).
-
 From the user (via the builds showrunner), 2026-11-12: "approve. Question: allow a 28-hour-old folder snapshot for the disk floor alert (sweep_snapshot_max_age_seconds 900 -> 100800)."
 
-Problem: `folder_choices` offers folders only when the last walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders and marks the measurement "stale".
+#### As-built
 
-`/tune` published 100800 on main (d83275f72). Two walks can be 90,120 seconds apart on the day clocks go back.
-
-#### Work Order
-
-**Goal:** A floor-crossing alert offers folder choices from the last daily disk walk, and calls the measurement stale only when a daily walk was missed.
-
-**Spec:**
-- `config/lint.conf`: `/tune` set the value on main. On this branch change only the comment above it: the disk walk runs once a day, and the limit covers a 25-hour day, timer drift and the walk time. Do not edit the value line.
-- Folder freshness stays on `measured_at` (the walk time). `capacity_measured_at` does not make folder sizes fresh. No code change in `sweep.py` is expected.
-- `docs/as-built/build-followups.md` **Measuring** paragraph: say that `snapshot()` walks only when no full previous snapshot exists, or when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` (user's zone). Other runs refresh free and used space only and set `capacity_measured_at`. Add the two-time report line beside the one-time example.
-- Add rows to the existing tests in `scripts/lint/test_sweep.py` (do not add a new test):
-  - in `test_unavailable_crossing_measurement_names_no_folder`'s neighbor that checks offered choices: a measurement 26 hours old under the approved limit offers its folders;
-  - a measurement older than the limit offers none and says "stale".
-  - The rows set the limit in their own settings. They do not read the live config.
+- `/tune` set `sweep_snapshot_max_age_seconds=100800` on main (d83275f72). Two daily walks can be 90,120 seconds apart on the day clocks go back; the limit adds timer drift and the walk time.
+- `folder_choices` and `disk_measurement_lines` read the limit at use, so no code changed. Folder freshness uses `measured_at`; `capacity_measured_at` does not make folder sizes fresh.
+- `config/lint.conf`: the comment above the value states the daily walk.
+- `docs/as-built/build-followups.md` **Measuring**: the walk rule (no full snapshot, or `DISK_WALK_MINUTES` old in the `DISK_WALK_HOUR` hour, or a newer walk request) and the two-time report line.
 
 **Files:**
-- `config/lint.conf`
-- `scripts/lint/test_sweep.py`
-- `docs/as-built/build-followups.md`
-
-**Workers:** `1 writer`
-- writer: the config comment, the Measuring paragraph and the sweep test rows.
-
-**State:** none.
-
-**Acceptance gate:**
-- `scripts.lint.test_sweep` passes, with the two new rows.
-- `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
+- `config/lint.conf` — the comment.
+- `scripts/lint/test_sweep.py` — `test_crossing_session_keeps_trash_and_scratch_effects` rows with their own 100800 limit: a 26-hour-old walk offers its folders; an older one offers none and says "stale".
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
 
 ### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
 
