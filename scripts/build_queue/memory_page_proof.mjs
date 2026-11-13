@@ -207,6 +207,13 @@ try {
           for (const width of [1400,900,390]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
+            const timeCells = await evaluate(`({
+              short:ago(latest.read_at-15,latest.read_at),
+              waiting:[...document.querySelectorAll('tr[data-tip^="wait:"] .duration')].map(cell=>cell.textContent)
+            })`);
+            assert.equal(timeCells.short,'<1 min');
+            assert.ok(timeCells.waiting.length>0);
+            assert.ok(timeCells.waiting.every(text=>!text.startsWith('waits ')));
             const proof = await evaluate(`(() => {
               const rect = element => {
                 const r = element.getBoundingClientRect();
