@@ -232,6 +232,7 @@ class MacTestConfig:
     ci_workflow: str
     ci_job: str
     gh_timeout_s: float
+    ci_jobless_queued_minutes: float
     block_hours: float
     block_max_hours: float
     block_warn_minutes: float
@@ -351,6 +352,7 @@ def read_config(target: str = "") -> MacTestConfig:
         ci_workflow=ci_fields["ci_workflow"],
         ci_job=ci_fields["ci_job"],
         gh_timeout_s=config.number("gh_timeout_s"),
+        ci_jobless_queued_minutes=config.number("ci_jobless_queued_minutes") if ci_repo else 0.0,
         block_hours=config.number("block_hours"),
         block_max_hours=config.number("block_max_hours"),
         block_warn_minutes=config.number("block_warn_minutes"),
@@ -838,23 +840,17 @@ def jobs_for_run(config: MacTestConfig, database_id: int) -> list[object] | GhFa
     return cast(list[object], jobs)
 
 
-def run_ids(answer: GhAnswer) -> list[int] | GhFailure:
-    items = json_items(answer)
-    if isinstance(items, GhFailure):
-        return items
-    ids: list[int] = []
-    for item in items:
-        if not isinstance(item, dict):
-            return GhFailure("gh returned invalid JSON")
-        database_id = cast(dict[str, object], item).get("databaseId")
-        if type(database_id) is not int:
-            return GhFailure("gh returned invalid JSON")
-        ids.append(database_id)
-    return ids
+@dataclass(frozen=True)
+class CiRun:
+    """A CI run that can still need the Mac."""
+
+    status: Literal["queued", "in_progress"]
+    created_at: datetime
 
 
 def ci_activity(config: MacTestConfig) -> CiActivity:
-    ids: list[int] = []
+    runs: dict[int, CiRun] = {}
+    now = utc_now()
     for status in ("queued", "in_progress"):
         answer = run_gh(
             config,
@@ -867,18 +863,35 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             "--status",
             status,
             "--json",
-            "databaseId",
+            "databaseId,createdAt",
         )
         if isinstance(answer, GhFailure):
             return CiUnknown(answer.line)
-        status_ids = run_ids(answer)
-        if isinstance(status_ids, GhFailure):
-            return CiUnknown(status_ids.line)
-        ids.extend(status_ids)
-    for database_id in dict.fromkeys(ids):
+        items = json_items(answer)
+        if isinstance(items, GhFailure):
+            return CiUnknown(items.line)
+        for item in items:
+            if not isinstance(item, dict):
+                return CiUnknown("gh returned invalid JSON")
+            run = cast(dict[str, object], item)
+            database_id = run.get("databaseId")
+            created = run.get("createdAt")
+            if type(database_id) is not int or not isinstance(created, str):
+                return CiUnknown("gh returned invalid JSON")
+            try:
+                created_at = datetime.fromisoformat(created)
+            except ValueError:
+                return CiUnknown("gh returned invalid JSON")
+            if created_at.tzinfo is None:
+                return CiUnknown("gh returned invalid JSON")
+            runs[database_id] = CiRun(status, created_at)
+    for database_id, run in runs.items():
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
             return CiUnknown(jobs.line)
+        if (run.status == "queued" and not jobs
+                and now - run.created_at > timedelta(minutes=config.ci_jobless_queued_minutes)):
+            continue
         mac_job_completed = False
         for raw_job in jobs:
             if not isinstance(raw_job, dict):
