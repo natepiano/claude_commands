@@ -3722,6 +3722,51 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("/unit:merge", text)
         self.assertIn("~/.claude/commands/unit/merge.md", text)
 
+    def test_no_worker_mode_resumes_the_director_alone_with_the_notice(self) -> None:
+        from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers
+        from scripts.production import worker
+        from scripts.whoami import quota_alert
+
+        row = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
+                             current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
+        workers = ResumeWorkers(panes=[PaneWorkerResume(staff.StaffId("idle-worker"), IdleWorker())])
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(quota_alert, "no_worker_mode", return_value=True),
+              patch.object(quota_alert, "no_worker_notice", return_value="Codex workers have no capacity. Send no assign."),
+              patch.object(worker, "resume_workers", return_value=workers) as listed):
+            result = stop_resume.resume(str(row.id), why="maintenance")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        listed.assert_not_called()
+        self.assertEqual(len(self.client.prompts), 1)
+        text = self.client.prompts[0][1].text
+        self.assertIn("You were stopped and resumed because maintenance.", text)
+        self.assertIn("Codex workers have no capacity. Send no assign.", text)
+        self.assertNotIn("Worker idle-worker", text)
+
+    def test_no_worker_mode_refuses_a_codex_worker_before_any_launch(self) -> None:
+        from scripts.message import session_records as sessions
+        from scripts.whoami import quota_alert
+
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "alpha", staff.ReportsTo(parent.id),
+                             current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        for kind, held in (("codex", True), ("claude", True), ("codex", False)):
+            with (self.subTest(kind=kind, held=held),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((parent, row))),
+                  patch.object(pane_launch, "saved_kind", return_value=kind),
+                  patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+                  patch.object(quota_alert, "no_worker_mode", return_value=held)):
+                self.launched.clear()
+                result = stop_resume.resume(str(row.id), why="maintenance")
+                if kind == "codex" and held:
+                    self.assertEqual(result, stop_resume.ResumeFailed(self.entry["session_id"],
+                                                                      "no-worker mode keeps Codex workers stopped"))
+                    self.assertEqual(self.launched, set())
+                else:
+                    self.assertNotEqual(result, stop_resume.ResumeFailed(self.entry["session_id"],
+                                                                         "no-worker mode keeps Codex workers stopped"))
+
     def test_empty_resume_message_adds_no_argument_in_the_current_pane(self) -> None:
         tab = herdr.TabSession("w1:p2", "alpha", "w1", self.entry["session_id"])
         with (patch.object(os, "chdir"), patch.object(os, "execvpe", side_effect=SystemExit) as execute):

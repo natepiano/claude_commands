@@ -221,18 +221,25 @@ class ShutdownStatusTests(ShutdownTestCase):
                 self.assertEqual(shutdown_record.read(), ["earlier"] if proven else ["earlier", str(row.id)])
 
     def test_paused_resume_removes_the_row_only_after_a_delivered_continuation(self) -> None:
+        from scripts.whoami import quota_alert
+
         owner = fixture_member("showrunner", name="resume-owner")
         row = fixture_member("unit", name="resume-unit", parent=owner.id)
-        for delivered in (True, False):
-            with self.subTest(delivered=delivered):
+        notice = "Codex workers have no capacity. Send no assign."
+        for delivered, held in ((True, False), (False, False), (True, True)):
+            with self.subTest(delivered=delivered, held=held):
                 _ = staff.pause(str(row.id), "maintenance")
                 shutdown_record.save(["earlier", str(row.id)])
                 outcome = {"kind": "sent"} if delivered else {"kind": "unconfirmed", "reason": "fixture failure"}
                 with (patch.object(stop_resume, "running_on_account",
                                    return_value=stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2")),
-                      patch.object(shutdown, "_message", return_value=outcome)):
+                      patch.object(quota_alert, "no_worker_mode", return_value=held),
+                      patch.object(quota_alert, "no_worker_notice", return_value=notice),
+                      patch.object(shutdown, "_message", return_value=outcome) as message):
                     self.assertEqual(shutdown.main(["resume", str(row.id)]), 0 if delivered else 1)
                 self.assertEqual(shutdown_record.read(), ["earlier"] if delivered else ["earlier", str(row.id)])
+                self.assertEqual(message.call_args.args[1], f"Continue where you stopped. {notice}" if held else
+                                 "Continue where you stopped. Resume your existing workers. Do not open new workers.")
 
 
     def __init__(self, methodName: str = "runTest") -> None:

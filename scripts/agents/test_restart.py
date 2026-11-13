@@ -36,7 +36,7 @@ from scripts.agents.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff, worker
 from scripts.production import test_worker
 from scripts.accounts import accounts
-from scripts.whoami import agent_accounts, note_file
+from scripts.whoami import agent_accounts, note_file, quota_alert
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record
@@ -2471,19 +2471,22 @@ class RestartTests(RestartTestCase):
             current_session=staff.StaffId(str(uuid5(NAMESPACE_URL, "restart-held-session"))),
             parent=staff.ReportsTo(parent.id)), *self.rows[1:])
         cases: tuple[tuple[Literal["unit", "showrunner"], staff.Active | staff.Paused | staff.Exited,
-                           tuple[str, ...], str, Literal["claude", "codex"], ContinuationDelivery], ...] = (
-            ("unit", staff.Active(), (), "agents restart ran", "claude", ContinuationDelivery.SENT),
-            ("showrunner", staff.Active(), (), "agents restart ran", "claude", ContinuationDelivery.SENT),
+                           tuple[str, ...], str, Literal["claude", "codex"], ContinuationDelivery, bool], ...] = (
+            ("unit", staff.Active(), (), "agents restart ran", "claude", ContinuationDelivery.SENT, False),
+            ("showrunner", staff.Active(), (), "agents restart ran", "claude", ContinuationDelivery.SENT, False),
             ("unit", staff.Active(), ("--why", "scheduled maintenance"), "scheduled maintenance",
-             "claude", ContinuationDelivery.SENT),
-            ("unit", staff.Active(), (), "agents restart ran", "codex", ContinuationDelivery.FAILED),
+             "claude", ContinuationDelivery.SENT, False),
+            ("unit", staff.Active(), (), "agents restart ran", "codex", ContinuationDelivery.FAILED, False),
             ("unit", staff.Paused("2026-11-11", "user", "wait for review"), (), "",
-             "claude", ContinuationDelivery.SENT),
+             "claude", ContinuationDelivery.SENT, False),
             ("unit", staff.Exited("2026-11-11", "user", "finished"), (), "",
-             "claude", ContinuationDelivery.SENT),
+             "claude", ContinuationDelivery.SENT, False),
+            ("unit", staff.Active(), (), "agents restart ran", "claude", ContinuationDelivery.SENT, True),
         )
-        for kind, hold, flags, cause, family, delivery in cases:
-            with self.subTest(kind=kind, hold=hold, flags=flags, cause=cause, family=family, delivery=delivery):
+        notice = "Codex workers have no capacity. Send no assign."
+        for kind, hold, flags, cause, family, delivery, workers_held in cases:
+            with self.subTest(kind=kind, hold=hold, flags=flags, cause=cause, family=family, delivery=delivery,
+                              workers_held=workers_held):
                 native_id = str(self.rows[0].current_session)
                 shutdown_record.save([str(self.rows[0].id)])
                 folder = self.root / "renamed-folder"
@@ -2504,6 +2507,8 @@ class RestartTests(RestartTestCase):
                       if held else patch.object(staff, "initial_snapshot", return_value=record),
                       patch.object(restart, "session_launch", return_value=(family, {}, arguments)),
                       patch.object(herdr, "prepare_session_environment", return_value=prepared) as prepare,
+                      patch.object(quota_alert, "no_worker_mode", return_value=workers_held),
+                      patch.object(quota_alert, "no_worker_notice", return_value=notice),
                       patch.object(herdr.Herdr, "prompt", side_effect=(
                           herdr_types.HerdrFailure("fixture prompt failed\nsecond error line")
                           if delivery is ContinuationDelivery.FAILED else None)) as prompt,
@@ -2536,6 +2541,7 @@ class RestartTests(RestartTestCase):
                     self.assertIsInstance(opening, herdr.OpeningPrompt)
                     self.assertIn(cause, opening.text)
                     self.assertIn("Continue where you stopped.", opening.text)
+                    self.assertEqual(notice in opening.text, workers_held)
                     prompt.assert_not_called()
                     self.assertEqual(errors.getvalue(), "")
                 else:
