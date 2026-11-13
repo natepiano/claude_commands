@@ -746,7 +746,7 @@ class ReviewLinksConfigTests(unittest.TestCase):
         for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
             with self.subTest(key=key):
                 self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
+        for key, expected in {'page_refresh_seconds': 15.0, 'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
             with self.subTest(key=key):
                 self.assertEqual(settings.number(key), expected)
 

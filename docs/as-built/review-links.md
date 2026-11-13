@@ -89,6 +89,17 @@ The review page has Questions, Changes, and Rebuilds type tabs with waiting coun
 Each type tab shows its own count. The page has no combined total.
 The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
 The document title remains Changes to review.
+The page updates itself through its existing GET URL without a full reload.
+`page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
+The page loads updates only while its browser tab is visible.
+It loads an update at once when the tab becomes visible again.
+Updates retain the selected type, showrunner, waiting card, open Details sections, and scroll position.
+If the card no longer waits, the page selects the next waiting item in the same tab.
+Typed text or an active save holds replacement; the page keeps only the newest loaded update.
+The page applies that update when all unsaved fields are empty or the save ends.
+A successful save requests a fresh update so an older response cannot restore the saved item.
+Updates preserve a retained field's focus and cursor.
+A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 Questions and Changes show **Showrunner** before their staff-based tabs and show one card at a time.
 Switching types retains each type's selected showrunner and card.

@@ -135,6 +135,14 @@ When the user asks to review changes, follow [Bare command](#bare-command).
 The page has Questions, Changes, and Rebuilds tabs with waiting counts.
 Questions and Changes show **Showrunner** before their staff-based tabs and show one card at a time.
 Each type tab shows its own count. The page has no combined total.
+The page updates itself without a full reload through its existing GET URL.
+`page_refresh_seconds` starts at 15 seconds and permits 5 to 300 seconds.
+The page loads updates only while visible and loads at once when its browser tab becomes visible again.
+An update retains the type, showrunner, waiting card, open Details sections, scroll position, and retained field focus and cursor.
+Typed text or an active save holds replacement; only the newest loaded update waits.
+Replacement continues when all unsaved fields are empty or the save ends.
+After a successful save, the page requests a fresh update to exclude older responses.
+A failed load changes nothing; the next interval tries again.
 The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
 An empty showrunner tab shows `No questions for this showrunner.` or `No changes for this showrunner.`
 An empty type shows `No questions to answer.` or `No changes to review.`

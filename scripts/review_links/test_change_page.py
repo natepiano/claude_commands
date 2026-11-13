@@ -1929,6 +1929,18 @@ class ChangePageTests(unittest.TestCase):
                     self.assertIn('resize:vertical', content)
                     self.assertEqual(sum(call.args == ("review_links",) for call in read.call_args_list), 1)
 
+        for interval in (15, 5, 300):
+            with self.subTest(page_refresh_seconds=interval):
+                _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
+                path, _, content = self.browser()
+                del path
+                self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
+        for interval in ("4", "301", "nan"):
+            with self.subTest(page_refresh_seconds=interval, range="invalid"):
+                _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
+                with self.assertRaises(conf.Unusable), conf.diagnostics(report=False):
+                    _ = conf.read(settings).number("page_refresh_seconds")
+
     def test_a_missing_feedback_rows_setting_refuses_the_render(self) -> None:
         settings = self.temporary / "config/review_links.conf"
         _ = settings.write_text(settings.read_text().replace("feedback_rows=5", ""))
@@ -2235,6 +2247,24 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("row.dataset.pending='false';form.hidden=true", body)
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
+        with self.subTest(refresh="visibility, held content, and position"):
+            for rule in ("document.visibilityState!=='visible'", "setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000)",
+                         "document.addEventListener('visibilitychange'", "fetch(location.href,{cache:'no-store'})",
+                         "new DOMParser()", "content.replaceWith(fresh)", "fresh.outerHTML===shownPage",
+                         "if(!heldPage || activeSaves", "field.value!==''", "document.addEventListener('input'",
+                         "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
+                         "row.dataset.key===current?.dataset.key", "rows.slice(previous+1)"):
+                self.assertIn(rule, body)
+            self.assertNotIn('location.reload', body)
+        with self.subTest(refresh="one automatic load and a replacement load after saving"):
+            self.assertIn("activeLoads && !supersede", body)
+            self.assertIn("activeLoads++", body)
+            self.assertIn("finally{activeLoads--;}", body)
+            self.assertIn("heldPage=null;newestRequest++;refreshPage(true)", body)
+            self.assertIn("if(request!==newestRequest || !fresh) return", body)
+        with self.subTest(refresh="a visible tab replaces an active load"):
+            self.assertIn("async function refreshPage(supersede=false)", body)
+            self.assertIn("if(document.visibilityState==='visible') refreshPage(true)", body)
         with self.subTest(controls="labels and action groups"):
             self.assertIn('<p>Showrunner</p><nav', body)
             self.assertIn('>Comment or question</label>', body)
@@ -2285,7 +2315,10 @@ class ChangePageTests(unittest.TestCase):
    for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
    navigate(type);const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');field.value=comment;
    let sent;
-   window.fetch=async(url,request)=>{sent=request.body;return {ok:true,json:async()=>({answer:outcome})};};
+   window.fetch=async(url,request)=>{
+    if(request.method!=='POST') return {ok:false};
+    sent=request.body;return {ok:true,json:async()=>({answer:outcome})};
+   };
    await save(row,form,outcome);
    check(sent.get('outcome')===outcome && sent.get('feedback')===comment,type+' '+outcome+' sends the shared field');
    check(current!==row && row.dataset.pending==='false' && form.hidden,type+' '+outcome+' advances after saving');
