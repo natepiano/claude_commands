@@ -14,6 +14,7 @@ from typing import TextIO, cast
 import unittest
 
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
@@ -121,6 +122,18 @@ class CargoLifetimeTests(unittest.TestCase):
                 job_temporary = fixture.root / "job-temporary"
                 for folder in (front_dir, cargo_dir, devshell_dir, shim_dir, shared, job_temporary):
                     folder.mkdir()
+                expected_shared: list[Path] = []
+                prefix = f"build-admission-ci-{os.getuid()}-"
+                if use_shared:
+                    with subprocess.Popen([sys.executable, "-c", "pass"]) as finished:
+                        self.assertEqual(finished.wait(timeout=3), 0)
+                    live_start = records.process_start_time(os.getpid())
+                    self.assertIsNotNone(live_start)
+                    live_folder = shared / f"{prefix}{os.getpid()}-{live_start}-live"
+                    for leftover in (shared / f"{prefix}{finished.pid}-1-dead", shared / f"{prefix}old", live_folder):
+                        leftover.mkdir()
+                        _ = (leftover / "cargo.cgroup").write_text("")
+                    expected_shared = [live_folder]
                 wrapper = front_dir / "cargo"
                 cargo = cargo_dir / "cargo"
                 compiler = devshell_dir / "cc"
@@ -149,6 +162,9 @@ class CargoLifetimeTests(unittest.TestCase):
                 with fixture.loop_turn():
                     record, = fixture.server.reservations.values()
                     self.assertEqual(Path(record.sidecar).parent.parent, shared if use_shared else job_temporary)
+                    if use_shared:
+                        self.assertTrue(Path(record.sidecar).parent.name.startswith(
+                            f"{prefix}{child.pid}-{record.owner.start_time}-"))
                 os.kill(int(str(data["pid"])), signal.SIGUSR1)
                 output, errors = child.communicate(timeout=8)
                 self.assertEqual(child.returncode, 0, output + errors)
@@ -159,7 +175,7 @@ class CargoLifetimeTests(unittest.TestCase):
                 self.assertEqual(paths.split(os.pathsep),
                     [*(str(folder) for folder in expected_folders), *os.environ["PATH"].split(os.pathsep)])
                 self.assertEqual((temporary, module_path), (str(job_temporary), "job-module-path"))
-                self.assertEqual(list(shared.iterdir()), [])
+                self.assertEqual(list(shared.iterdir()), expected_shared)
                 self.assertEqual(list(job_temporary.iterdir()), [])
                 self.assertEqual(len(fixture.history()), 1)
                 with fixture.loop_turn():

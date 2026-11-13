@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from functools import partial
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -107,6 +108,26 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
+def remove_abandoned_folders(shared_folder: Path) -> None:
+    """Remove this user's shared admission folders when their owners are not live."""
+    uid = os.getuid()
+    prefix = f"build-admission-ci-{uid}-"
+    with os.scandir(shared_folder) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                if not entry.is_dir(follow_symlinks=False) or entry.stat(follow_symlinks=False).st_uid != uid:
+                    continue
+                owner = entry.name[len(prefix):].split("-", 2)
+                if (len(owner) == 3 and owner[0].isdecimal() and owner[1].isdecimal()
+                        and records.process_start_time(int(owner[0])) == owner[1]):
+                    continue
+                shutil.rmtree(entry.path)
+            except FileNotFoundError:
+                pass
+
+
 def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
     pid = os.getpid()
     start = records.process_start_time(pid)
@@ -116,7 +137,11 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
-    with tempfile.TemporaryDirectory(prefix=f"build-admission-ci-{os.getuid()}-",
+    prefix = f"build-admission-ci-{os.getuid()}-"
+    if isinstance(shared_folder, Path):
+        remove_abandoned_folders(shared_folder)
+        prefix += f"{pid}-{start}-"
+    with tempfile.TemporaryDirectory(prefix=prefix,
                                      dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
