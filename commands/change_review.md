@@ -180,7 +180,8 @@ An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
 The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
 It combines these needs with cached system comparisons without duplicate machines.
-`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds; failed or empty evaluations retry on the next refresh.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds.
+`rebuild.eval_retry_seconds` sets a 600-second wait after failed or partial evaluations; a new commit bypasses this wait.
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
