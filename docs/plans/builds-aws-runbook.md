@@ -12,11 +12,11 @@ Local fake tests do not prove live quota, capacity, or deployment state.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The registry contains `targets=mac,natedev`.
-The retained `offload=on` value does not register an AWS target.
+The builder configuration and offload route have been removed.
 Builder slots, warm mirrors, idle stop, and controller activation are historical features.
-The repository retains their code for compatibility and removal recovery.
+Only historical cost, ownership, and teardown compatibility remain.
 Use `up --workload merge-gates` for gate deployment.
-The default `up` command selects the retained builder workflow.
+The default `up` command now selects gate deployment.
 
 ## Configuration and state
 
@@ -110,6 +110,17 @@ Deployment records each completed regional stack in `gate-deployment.json`.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
 
+## Foundation maintenance
+
+`prepare` validates the retained deployment inputs and records the foundation plan.
+`apply --approve-resources` creates or updates the Budget and scaler foundation with compute disabled.
+It also confirms the scaler credential file.
+These commands do not create a permanent builder.
+Gate deployment requires the saved foundation ownership record.
+The removed `price`, `bootstrap`, and `setup-start` commands are unavailable.
+The removed builder service commands `start`, `stop`, and `serve` are unavailable.
+Use `aws_target.py tick` for account bill and regional price refresh.
+
 ## Merge gates and ranking
 
 The production merge gate selects the cloud path through `cloud_gate.py`.
@@ -122,7 +133,7 @@ The normal module counter replaces the setup stage when tests start.
 Before ranking, the worker reads live Spot prices from all deployed regions in parallel.
 `spot_price_live_read_timeout_s` bounds the complete read.
 Failed regional reads retain applicable hourly prices from `spot-prices.json`.
-The controller's price refresh remains available when builder routing is disabled.
+`aws_target.py tick` refreshes cached prices and account bills without builder routing.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.
@@ -133,7 +144,19 @@ Equal costs preserve configured order.
 The worker saves its ranking and price evidence before launch.
 A resumed launch keeps that ranking and its client tokens.
 Capacity refusals select the next variant.
-A normal gate uses natedev after all variants refuse.
+A normal gate uses natedev after all capacity choices refuse.
+A confirmed Spot interruption before a final result starts another cloud attempt.
+`spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
+The retry uses the next choice in the saved launch order.
+The route keeps its cloud slot across retries.
+The route saves the interruption count and the next choice in `current.json` before each retry.
+Resume restores both values, so a crash cannot reset the retry budget.
+Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+The worker confirms cleanup of the interrupted box and reservation before the retry.
+The final natedev fallback row includes the interruption count when retries or capacity choices end.
+A complete gate failure keeps its failed result and gets no retry.
+An unconfirmed termination or another controller error retains the existing fallback behavior.
+The launch path uses Spot only; it has no on-demand choice.
 
 ## Paired gate trials
 
@@ -186,7 +209,8 @@ It checks saved ownership and live claims before deletion.
 6. It removes `deployment.json`, `up.json`, the setup proofs, and the prepared bundle.
 
 It keeps the encrypted administrator file, the ledger, and the charge history.
-A later `deploy.py up` must create the foundation, scaler credentials, and Budget again.
+After complete removal, run `deploy.py prepare` and `deploy.py apply --approve-resources` to create the foundation again.
+Then run `deploy.py up --approve-resources` to create gate resources.
 Correct a reported removal failure before repeating the approved command.
 Preserve `down.json` until removal completes.
 
@@ -206,7 +230,27 @@ python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
 `prepare` prints the trial folder.
 It waits for build admission and a natedev hold release.
 It builds the archive and NixOS closure, then runs the archive twice on natedev.
-Use that same folder for the online run and each restart.
+Use that same folder for the online run and each restart after upload.
+Host trial folders must be canonical direct children of `~/.local/state/gpu-size-trial`.
+The commands refuse nested paths, outside paths, and paths through directory links before deletion.
+A new preparation removes earlier folders under `~/.local/state/gpu-size-trial` when no live run holds their locks.
+It refuses to create a second folder while an earlier folder is held.
+The active preparation and online service hold those locks.
+Preparation deletes the build tree after it creates the archive and closure.
+It keeps a clean source copy only until baseline measurement ends.
+Each measurement deletes its extracted archive, source copy, and Cargo target directory on success or failure.
+The reports, samples, and logs remain.
+
+The prepared folder keeps these files:
+
+1. `hana-tests.tar.zst`, `closure.export`, and `source.tar`.
+2. `cargo-home/`, `runtime.env`, `gpu-trial.nix`, and `gpu_trial_wrapper.py`.
+3. `closure.json`, `request.json`, `manifest.json`, and `inventory.json`.
+4. `machines/` with baseline results and `prepare.log`.
+
+With the measured inputs, preparation peaks near 32 GiB and keeps about 12 GiB when ready.
+Local measurement uses about 19 GiB with one extracted archive.
+These estimates cover the trial folder; Nix store use is separate.
 
 The Rust tools come from Nix.
 Old preparations require a new `prepare` run before the service can use them.
@@ -230,12 +274,21 @@ The existing gate policy remains unchanged.
 The separate GPU policy permits quota and offering reads.
 
 The second command checks the private scaler credential file and starts a transient service.
-The service selects the first configured candidate region with an applied G and VT quota of at least 32.
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+An unknown type-size vCPU count stops selection before AWS reads.
+If no region fits, the refusal shows the required vCPUs and each region's applied value.
+`gpu_spot_quota_request_vcpus` still controls the separate quota request size.
 It reports `not offered` for missing types.
 It reports `price above max` when no offered zone fits the configured maximum.
 It never substitutes another type or region.
 
 The service uploads the archive, closure, manifest, and runtime files to the home-region bucket.
+It removes its temporary upload payload after upload, including an upload failure.
+When the online run ends, it saves the result or error and removes the archive, closure export, source tar, and Cargo cache.
+Metadata, reports, samples, and logs remain for comparison.
+A restart uses the uploaded inputs and saved hashes.
+A failure before upload requires a new preparation.
 Boxes receive signed URLs.
 They receive no AWS credential file.
 Each box imports the prepared NixOS closure and reboots once.
@@ -247,6 +300,7 @@ It starts termination five minutes before the configured lifetime ends.
 The expiry tag triggers two minutes before the lifetime ends.
 An unconfirmed termination blocks the next box.
 The service's `ExecStopPost` command repeats cleanup after a failure.
+It saves an error and removes large inputs when an interrupted worker leaves no final result.
 
 The ledger reserves the type maximum multiplied by the lifetime hours, plus the configured box extra.
 It counts completed costs and open reservations against the same trial ID.

@@ -23,7 +23,8 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
-A failed compaction prints one error line, and the dispatch continues without compaction.
+A compaction must write its transcript record within `WORKER_COMPACT_SECONDS`.
+A failed compaction prints one error line, and the dispatch sends no prompt.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
@@ -356,6 +357,8 @@ The original `review` worker appears only when a displayed stage assigns it.
 `resume_message` builds one prompt for resumed conversations.
 `ResumeWorkers(results, cwd, panes)` combines child resume results with pane worker states.
 `inventory.worker_resumes` reads direct Claude worker children and preserves their saved launcher arguments.
+Each child's `KnownWorkerRole` supplies its current role.
+An unknown staff role produces `Unavailable`; the reader does not use dated assignments as a fallback.
 Pane observations supply native worker resume state.
 `AccountMove` names the source and destination accounts.
 A busy recipient gets only its `own_pass` continuation.
@@ -435,7 +438,8 @@ The record has no `holder` field.
 The binding is `DesignUnbound` or `DesignBoundToPhase(run_directory, phase, repository, output_paths)`.
 `HeldDesign` and `DesignBoundToPhase` have a keyword-only `checkout` field.
 Its value is `UnitCheckout(owner)` or `IndependentCheckout()`, with the independent checkout as the default.
-When an opened checkout matches the caller unit's staff worktree, the design and binding store `repository_owner: <unit staff id>`.
+An explicitly unit-owned checkout stores `repository_owner: <unit staff id>` in the design and binding.
+The saved owner supplies the checkout path; matching paths never establish ownership.
 An owned record stores no `repository` path.
 Its `document` is relative to the checkout.
 `design_repository` and `binding_repository` resolve the owner's current staff worktree.
@@ -479,9 +483,11 @@ It saves the headed prompt, checks the current lifecycle and generation, then re
 `recover` proves the recorded worker idle and clears its uncertain claim without creating a replacement.
 `rebind` requires a reason and the expected generation.
 It records a transition and advances the authority generation before it publishes a new binding, checkout or document.
-Rebinding to the current checkout preserves the recorded checkout ownership for any caller.
-It also preserves the binding's checkout reference.
-It then refreshes the census and clears the transition.
+Rebind and checkout moves preserve the recorded checkout owner for any caller.
+Both operations preserve the binding's checkout reference.
+Each operation refreshes the census and clears the transition.
+An interrupted checkout move resumes its saved transition before applying any destination shortcut.
+The retry uses the saved target and generation after the staff worktree moves.
 `end` confirms release before it records `RoleEnded`.
 A failed end retains its transition record for retry.
 `list` shows an active role with an incomplete transition as `RoleNeedsRecovery`.
@@ -518,9 +524,13 @@ The authority host comes from `[ownership]` in `config/design_roles.conf`.
 The configured authority host owns placement.
 Both roles remain on the design's recorded host.
 Host transfer is unsupported.
-Repository registration requires each host's absolute checkout mapping.
+Repository registration requires each host's checkout mapping.
 Supply every host mapping on the first registration.
 Use `register_repository` for multiple mappings.
+Use `register --repository-owner <unit staff id>` for a unit-owned checkout.
+The library accepts `UnitCheckout(owner)` for the same mapping.
+Path-only registration stays independent, including when its path matches a unit's worktree.
+`ConfiguredCheckout(path)` also records an independent mapping.
 Repeated registration must keep the same mappings.
 Placement uses a hash of the repository id and relative document path.
 The authority supports registration, reservation, lookup, generation advance, checkout changes, and aliases.
@@ -575,11 +585,16 @@ An unresolved phase returns exit 2.
 
 ### Census for cargo-handler
 
-`astra_roles.py` stores `staff_id`, `held_at`, `session_dir`, `worker` and `pid` under `ASTRA_ROLES_STATE`.
-Durable holds also record `design_id` and `role_id`.
-The record copies no role, thread, account home or manager.
-Staff and assignment logs supply those values.
+`astra_roles.py` stores `staff_id` and `held_at` under `ASTRA_ROLES_STATE`.
+A process hold also stores `pid` and `pid_start` to identify its process lifetime.
+A durable hold stores `pid: null`, `design_id`, and `role_id`.
+The record stores no session directory, worker name, thread, account home, or manager.
+Staff supplies the current session, name, account, parent, and process-hold role.
+`hold` sets `astra-designer` or `astra-reviewer` through `staff.set_worker_role`.
+It separately records dated `impl` or `review` attribution when the agents log does not already show that assignment.
+Repeated holds with matching dated attribution append no duplicate assignment.
 `hold`, `release` and `live_roles` manage the census.
+Their record writes and removals share the exclusive `role_lock` under the state directory.
 A missing runtime does not erase a durable design identity.
 Cargo-handler reads staff names and parents from schema 2.
 The [session roster](session-roster.md) shows open roles through their current staff identity.

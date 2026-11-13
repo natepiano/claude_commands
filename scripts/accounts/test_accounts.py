@@ -5837,6 +5837,10 @@ with path.with_name(path.name + ".lock").open("a") as lock:
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
+        repair_file = self.home / ".codex1/session_index.jsonl"
+        repair_file.unlink(missing_ok=True)
+        _ = repair_file.write_text("fixture shared entry\n")
+        repair_line = f"codex1: {repair_file} is a real file; move it aside or merge it into ~/.codex"
         code, table, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         code, output, error = self.run_cli("status", "--json")
@@ -5861,8 +5865,13 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
         self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
         notes = table.split("\n\n", 2)[2].strip().splitlines()
+        problems = cast(list[str], document["problems"])
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
-        self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
+        self.assertIn(repair_line, notes)
+        self.assertNotIn(repair_line, problems)
+        self.assertEqual(problems, [note.removeprefix("* ") for note in notes if note != repair_line])
+        usage_line = next(note for note in notes if "usage unavailable" in note)
+        self.assertIn(usage_line.removeprefix("* "), problems)
         self.assertTrue(any(note.startswith("* ") for note in notes))
         for row in rows:
             self.assertNotIn("login", row)
@@ -7716,6 +7725,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
             (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
+                                               + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
                                                + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                                                + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
@@ -10223,6 +10233,35 @@ class StatusProblemCauseTests(unittest.TestCase):
                 assert isinstance(problem.step, accounts.ProblemStep)
                 self.assertIn(step, problem.step.instruction)
                 self.assertEqual(accounts.render_status_problem(problem).split(":", 1)[0], problem.subject)
+
+    def test_shared_home_repairs_have_a_typed_cause_and_keep_their_text(self) -> None:
+        path = self.home / ".codex1/sessions"
+        target = self.home / ".codex/sessions"
+        cases = (
+            (f"{path} is a real file; move it aside or merge it into ~/.codex", True),
+            (f"repair {path}: resolve clashing entries fixture with {target}, then rerun", True),
+            (f"repair {path}: move its contents into a shared folder at {target}, then rerun", True),
+            (f"repair {path}: atomic no-replace moves to {target} are unavailable; "
+             + "move the entries without replacing shared content, then rerun", True),
+            (f"repair {path}: could not move into {target}: fixture failure; then rerun", True),
+            (f"repair {path}: fixture unrelated failure", False),
+        )
+        for diagnostic, home_repair in cases:
+            with self.subTest(diagnostic=diagnostic):
+                problem = accounts.status_check_problem("accounts: " + diagnostic, "codex1",
+                    setup="run accounts.py setup codex1", login="run codex login")
+                self.assertEqual(isinstance(problem.cause, accounts.SharedHomeRepair), home_repair)
+                expected = "codex1: " + diagnostic
+                if "; " not in diagnostic:
+                    expected += "; run accounts.py setup codex1"
+                self.assertEqual(accounts.render_status_problem(problem), expected)
+                reading = self.reading("fixture@notexample.com", noted=True, diagnostics=("accounts: " + diagnostic,))
+                self.assertIn(expected, accounts.render_status_table(reading).splitlines())
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual(expected in document["problems"], not home_repair)
+                usage_line = next(note for note in reading.notes if "usage unavailable" in note)
+                self.assertIn(usage_line, accounts.render_status_table(reading).splitlines())
+                self.assertIn(usage_line.removeprefix("* "), document["problems"])
 
     def test_account_state_merge_uses_the_cause_after_wording_changes(self) -> None:
         directory = self.home / ".claude2"
