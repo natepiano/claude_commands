@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Refresh regional gate prices and account charges."""
+"""Reconcile Hana lifecycle state and refresh regional prices and account charges."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -7,8 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -24,6 +23,7 @@ from typing import Protocol, cast, final, get_args
 
 from scripts.aws_target import ledger, measurement
 from scripts.aws_target.config import read_settings
+from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -247,17 +247,6 @@ def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
     return (*readings[:-1], replace(readings[-1], query_usd=read_usd * pages))
 
 
-@contextmanager
-def control_lock(directory: Path) -> Generator[None, None, None]:
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / 'controller.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-
-
 @final
 class AccountRefresh:
     def __init__(self, settings_path: Path, directory: Path, *,
@@ -283,16 +272,51 @@ class AccountRefresh:
         return measurement.read_charges(self.settings_path, self.directory, now, fetch)
 
 
+def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *,
+                    lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None) -> int:
+    """Recover lifecycle state before an independent account refresh attempt."""
+    from scripts.aws_target.hana_box import HanaController, ProviderNotInstalled
+    status = 0
+    controller = HanaController(directory, settings_path, workload_path, ProviderNotInstalled())
+    for name, step in (('Hana lifecycle', controller.tick if lifecycle is None else lifecycle),
+                       ('account refresh', AccountRefresh(settings_path, directory).tick if refresh is None else refresh)):
+        try:
+            _ = step()
+        except (OSError, ValueError, RuntimeError, ArithmeticError, subprocess.SubprocessError) as error:
+            print(f'aws_target: {name} unavailable: {type(error).__name__}', file=sys.stderr)
+            status = 1
+    return status
+
+
+def serve(settings_path: Path, directory: Path, workload_path: Path, *,
+          run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+          pause: Callable[[float], None] = time.sleep, keep_running: Callable[[], bool] = lambda: True) -> int:
+    """Bound each tick in a child process and release all tick locks between attempts."""
+    from scripts.aws_target.hana_box import read_settings as lifecycle_settings
+    while keep_running():
+        settings = lifecycle_settings(conf.read(workload_path))
+        try:
+            _ = run([sys.executable, str(Path(__file__).resolve()), 'tick', '--settings', str(settings_path),
+                '--directory', str(directory), '--hana-settings', str(workload_path)],
+                timeout=settings.controller_tick_timeout_s, check=False, text=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f'aws_target: bounded tick failed: {type(error).__name__}', file=sys.stderr)
+        pause(settings.tick_interval_s)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('tick', 'snapshot'))
+    _ = parser.add_argument('command', choices=('tick', 'snapshot', 'serve'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
+    _ = parser.add_argument('--hana-settings', type=Path)
     args = parser.parse_args(namespace=RefreshArguments())
     if args.command == 'snapshot':
         return snapshot(args.settings, args.directory)
-    AccountRefresh(args.settings, args.directory).tick()
-    return 0
+    if args.command == 'serve':
+        return serve(args.settings, args.directory, args.hana_settings)
+    return controller_tick(args.settings, args.directory, args.hana_settings)
 
 
 class RefreshArguments(argparse.Namespace):
@@ -301,6 +325,7 @@ class RefreshArguments(argparse.Namespace):
         self.command: str = ''
         self.settings: Path = conf.path('aws_target')
         self.directory: Path = ssh_target_state_directory('aws')
+        self.hana_settings: Path = conf.path('hana_aws')
 
 
 if __name__ == '__main__':

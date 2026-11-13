@@ -55,6 +55,11 @@ class PermitRefused:
 
 
 @dataclass(frozen=True)
+class StartReserved:
+    exposure: ledger.HanaComputeExposure
+
+
+@dataclass(frozen=True)
 class StorageReserved:
     exposure: ledger.HanaStorageExposure
 
@@ -98,14 +103,45 @@ class HanaSpending:
             state.hana_storage = candidate.hana_storage
             return StorageReserved(proposed)
 
+    def reserve_start(self, now: int, expires: int) -> StartReserved | PermitRefused:
+        """Reserve a demand start before its boot identity exists."""
+        return self._reserve_compute(now, expires, expected_generation=0)
+
+    def check_start(self, now: int, generation: int) -> StartReserved | PermitRefused:
+        """Recheck an existing reservation before a start or permit mutation."""
+        if not self.settings.enabled:
+            return PermitRefused('Hana is disabled')
+        with self.book.transaction() as state:
+            for row in state.hana_compute:
+                if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen) and now < row.expires:
+                    decision = self._check(state, now)
+                    return decision if isinstance(decision, PermitRefused) else StartReserved(row)
+            return PermitRefused('The start reservation is expired or its generation is old')
+
+    def bind_start(self, now: int, generation: int, boot_id: str) -> PermitIssued | PermitRefused:
+        """Authorize an existing reservation after the controller verifies its boot identity."""
+        if not boot_id.strip():
+            return PermitRefused('The guest boot identity is missing')
+        result = self.check_start(now, generation)
+        if isinstance(result, PermitRefused):
+            return result
+        row = result.exposure
+        return PermitIssued(hana_guest.WorkPermit(float(row.expires), str(generation), boot_id), row)
+
     def issue(self, now: int, expires: int, boot_id: str, *, expected_generation: int = 0) -> PermitIssued | PermitRefused:
         """Reserve a start or renewal before returning its increasing generation."""
+        if not boot_id.strip():
+            return PermitRefused('The guest boot identity is missing')
+        result = self._reserve_compute(now, expires, expected_generation=expected_generation)
+        if isinstance(result, PermitRefused):
+            return result
+        return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
+
+    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int) -> StartReserved | PermitRefused:
         if not self.settings.enabled:
             return PermitRefused('Hana is disabled')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
             return PermitRefused('The permit deadline is outside its renewal window')
-        if not boot_id.strip():
-            return PermitRefused('The guest boot identity is missing')
         with self.book.transaction() as state:
             fence = state.hana_lifecycle_fence
             if isinstance(fence, ledger.HanaLifecycleFence) and now < fence.at:
@@ -131,7 +167,7 @@ class HanaSpending:
                 return decision
             state.hana_compute, state.hana_storage = candidate.hana_compute, candidate.hana_storage
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, generation)
-            return PermitIssued(hana_guest.WorkPermit(float(expires), str(generation), boot_id), proposed)
+            return StartReserved(proposed)
 
     def reconcile(self, now: int, observed: ledger.InstanceState, *, generation: int) -> None:
         """Apply an observation only to its generation and after the saved lifecycle time."""

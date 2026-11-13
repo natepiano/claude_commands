@@ -139,6 +139,94 @@ The account configuration has storage totals, but no shared gp3 price per GiB.
 The new rate therefore belongs to the Hana configuration.
 `test_hana_spend.py` uses private files and fake lifecycle observations.
 
+## Hana lifecycle controller
+
+`aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
+Each child attempts Hana lifecycle recovery before account charge refresh.
+Either operation can fail without suppressing the other operation.
+The supervisor continues after a failed or timed-out child.
+It releases all child-owned locks when the child exits.
+
+`hana_box.HanaController` stores its journal in `hana/lifecycle.json` beneath the account directory.
+`controller_lock.py` holds the existing `controller.lock` implementation.
+`aws_target.control_lock` remains available through the same import.
+Claims, lifecycle decisions, and operation intents take that lock before any ledger lock.
+The controller releases both locks before each provider call.
+It checks the saved deployment identity and operation token before applying the response.
+Each tick performs at most one provider step.
+
+The journal stores these lifecycle states:
+
+| State | Meaning |
+| --- | --- |
+| Unprovisioned | No setup has registered a deployment. |
+| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Interrupted | Only EC2 can restart the interrupted Spot instance. |
+| Stopped-unknown | An unknown stop cause forbids a manual restart. |
+| Starting | A committed claim owns the unresolved demand start. |
+| Ready | A verified boot can accept a permit for its current claim. |
+| Stopping | A saved stop intent blocks new claims. |
+| Replacement-pending | A terminated instance needs the later replacement path. |
+
+The journal records deployment, instance, Spot request, operation, boot, generation, and execution identities.
+A claim records whether work is committed incoming work or active work.
+The initial controller allows one claim.
+A caller timeout retains an unresolved start claim.
+The controller refuses claim release while a start or provider operation remains unresolved.
+Idle stop and claim creation use the same lock.
+A committed claim prevents idle stop.
+A saved idle-stop intent refuses a later claim until stop confirmation.
+A confirmed interruption takes priority over a pending idle stop.
+The controller records `INTERRUPTED` and refuses a manual restart.
+
+Phase C reserves compute before the next boot identity exists through `reserve_start()`.
+`check_start()` rechecks current caps before bootstrap, start, and permit publication.
+A cap refusal preserves the pending mutation and its token until the provider confirms the outcome.
+The controller calls the read-only `HanaProvider.recover()` when spending refuses another mutation attempt.
+Recovery continues after a cap refusal or reservation expiry.
+`MutationUnresolved` means the original request can still complete.
+Its stopped observation cannot close the compute exposure or replace the pending mutation.
+`MutationSettled` confirms that the original request cannot produce further changes.
+A settled stopped observation can close exposure and permit claim release.
+An unknown stop cause still forbids a manual restart.
+Recovery records exposure for a running box before it schedules a stop.
+Recovery never starts the box or publishes a permit.
+Each bootstrap, start, or publication attempt still needs accepted spending.
+`bind_start()` checks spending after the provider verifies the boot identity.
+A publication includes the expected prior generation and the current execution identity.
+Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
+Renewal retains the execution identity and advances the permit generation.
+A refused or lost publication does not extend the guest deadline.
+The controller reserves exposure until stop confirmation through the Phase C ledger.
+It reconciles automatic restarts without a caller, including while placement is disabled.
+An automatic restart cannot reuse an interrupted execution's boot challenge.
+
+`HanaProvider.step()` defines the typed provider boundary.
+A provider must bound its calls and use the saved operation tokens.
+Its `recover()` method reads status without repeating a mutation.
+It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
+The provider refreshes bootstrap access before a demand start.
+It must verify root receiver responses against deployment and demand-start identities.
+It must install a renewed generation and permit together before acknowledging publication.
+Phase D2 supplies the concrete AWS and root receiver transport with approved setup.
+The D1 default refuses provider calls for a registered deployment until that transport exists.
+An unprovisioned tick makes no provider call.
+D1 adds no setup command, resource, target registration, or placement activation.
+
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `idle_stop_seconds` | `600` | Retain short bursts before a deliberate idle stop. |
+| `start_timeout_seconds` | `120` | Bound caller waiting while retaining unresolved claims. |
+| `tick_interval_s` | `5` | Reconcile before the independent boot guard expires. |
+| `controller_tick_timeout_s` | `45` | Bound each supervisor child and failed provider step. |
+
+The controller validates these intervals against the guest guard and permit windows.
+Renewal starts with enough margin for two bounded steps and three tick intervals.
+Tests use private journals, injected clocks, and a fake provider.
+They verify that neither the controller lock nor the ledger lock remains held during provider work.
+Regression tests cover expired bootstrap, start, and publication recovery.
+They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
+
 ## Removed builder: 2026-11-04
 
 `builder-removal.json` records the removal on 2026-11-04.
