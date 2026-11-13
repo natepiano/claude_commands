@@ -54,32 +54,22 @@ The showrunner's ruling: "Split /showrunner:units into two tables. Table 1: Unit
 
 ### Phase 2 — The units view prints in a few seconds  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:units` prints in a few seconds. Today `scripts/lib/py scripts/production/unit_phases.py --production sdlc` takes 77 to 105 s wall time on natedev, on main and on this branch.
-
-The sdlc showrunner's ruling on 2026-11-12: "make /showrunner:units fast. 77 to 105 s is far too slow for a status command. Measure where the time goes (paired runs, not cProfile alone), fix the slowest parts, and give before/after wall times. Target: a few seconds."
-
-**Spec:**
-
-1. **Measure.** Find where the wall time goes for `--production sdlc`. Use paired wall-time runs (the same command before and after one change, run alternately, at least 3 pairs). A profiler (`cProfile`, `py-spy`) may point at candidates, but a gain is named only from paired wall times. Look at subprocess calls (git, herdr, ssh, `ps`), repeated file reads (run histories, staff, plan docs, queue files) and work repeated per unit or per row. Run each heavy probe under `systemd-run --user --scope -p MemoryMax=2G`.
-2. **Fix the slowest parts.** Remove repeated work: read each file and run each subprocess once per command, and skip work whose result no cell shows. Keep every cell's content the same. Fix a cause in the module where it lives, also when that module is outside `scripts/production/`.
-3. **Report.** Give the before and after wall times (median of the pairs) and the share of each fixed cause, in the summary.
+- `unit_phases.main` takes one `staff.snapshot()` and opens `plan_history.history_snapshot(snapshot)` inside `herdr.observation_snapshot()`. The reader thread runs `live_units.read_units(name, record=snapshot, ...)` under `copy_context()`, so it shares the same snapshot.
+- `plan_history.HistorySnapshot` holds the staff record, the run headers (`starts`) and the run events per path for one command. `staff_record()`, `run_starts()` and `read_run_events(path)` use it when it is set, and read directly when it is not.
+- `plan_history.read_run_events(path)` is the one run-event reader: a shared flock, invalid JSON lines skipped, `OSError` or `UnicodeError` gives no events. `phase_table.build_plan` and the work table cells use it.
+- `plan_history._staff_paths(fields, row)` is the one path rule for `staff_directory` and `plan_runs`.
+- `live_units.read_units` takes an optional `record: staff.StaffSnapshot`.
+- On natedev, `--production sdlc` prints in a median of 1.7 s (52.4 s before). Run headers are read 398 times (4776 before) and staff snapshots once (9 before).
 
 **Files:**
-- `scripts/production/unit_phases.py` — the units view.
-- `scripts/production/display_cells.py` — shared cells.
-- `scripts/production/test_unit_phases.py` — rows.
+- `scripts/direct/plan_history.py` — the command snapshot, the shared readers and the staff path rule.
+- `scripts/direct/phase_table.py` — the shared event reader and staff record.
+- `scripts/production/live_units.py` — `read_units(..., record=)`.
+- `scripts/production/unit_phases.py` — one snapshot per command, shared with the reader thread.
+- `scripts/production/test_unit_phases.py` — `test_main_reads_shared_history_once_for_multiple_unit_plans` counts real header, staff and file reads.
 
-Other modules on the slow path are in scope when the measurement names them; name each one in the summary.
+**Gotchas:** a thread started inside the snapshot sees it only through `copy_context().run`; a bare `submit` reads everything again.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — measures, then fixes the slowest parts in the production modules.
-- `test` — measures the baseline independently at the phase baseline commit with paired runs, keeps the test lane green, and adds rows only where a fix changes a function's contract. Reports its own before/after wall times when `impl` posts `done`.
-
-**State:** none.
-
-**Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
-2. The Test command passes for the test lane and for the tests of each changed module.
-3. Live: `scripts/lib/py scripts/production/unit_phases.py --production sdlc` prints the same two tables as before the change (time-dependent cells aside), and its median wall time over 3 runs is a few seconds.
+**Ruled out:** a per-path cache that ignores which reader filled it — the two old readers handled lock errors differently.
