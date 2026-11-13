@@ -119,7 +119,7 @@ exec python3 "$TEST_WAIT_HELPER" "$STUB_CLAUDE_ROOT/never-release"
         # This backend has no native worker panes to remove.
         _ = (self.assign_script.parent / "remove_workers.py").write_text("")
         copies = self.root / "scripts/copies"
-        copies.mkdir()
+        copies.mkdir(exist_ok=True)
         _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
         environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
         with patch.dict(os.environ, environment):

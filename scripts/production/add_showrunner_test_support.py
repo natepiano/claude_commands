@@ -2,6 +2,8 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import write_python_tool
+
 from scripts.agents import remote
 
 import json
@@ -196,8 +198,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
 '''
         source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
-        _ = fake.write_text(source)
-        fake.chmod(0o755)
+        write_python_tool(fake, source)
         self.on_start = {}
         self.herdr_overrides = {}
         self.processes = []
