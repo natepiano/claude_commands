@@ -9,9 +9,10 @@ import shutil
 import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Generator, Iterable
-from contextlib import AbstractContextManager, closing, contextmanager
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
@@ -121,7 +122,8 @@ class UnitRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.checkout, self.home / ".claude", self.root / "state/sessions", self.root / "scratch"):
+        for path in (self.checkout, self.home / ".claude", self.root / "state/sessions", self.root / "scratch",
+                     self.root / "proc"):
             path.mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
                    json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
@@ -218,7 +220,13 @@ class UnitRenameFixture(StaffTestCase):
 
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
-        with mock.patch.object(subprocess, "run", run):
+        with mock.patch.object(subprocess, "run", run), ExitStack() as children:
+            # Keep real child processes visible in the private process directory.
+            if sys.platform != "darwin":
+                for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split():
+                    process = Path(self.env["HERDR_PROC"]) / pid
+                    process.symlink_to(Path("/proc") / pid, target_is_directory=True)
+                    _ = children.callback(process.unlink)
             return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
@@ -308,6 +316,7 @@ class FolderRenameFixture(StaffTestCase):
             "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
         }
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.env)))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         self.home.mkdir(exist_ok=True)
         (self.root / "proc").mkdir()
         self.checkout.mkdir()
@@ -351,12 +360,24 @@ class FolderRenameFixture(StaffTestCase):
         if row is None or not isinstance(row.worktree, staff.PresentWorktree):
             raise AssertionError("The fixture needs a present worktree")
         folder = row.worktree
-        fake_unit_host.process(os.environ, 998040, 1, ["zsh"], {}, cwd=folder.path)
+        process_root = Path(os.environ["HERDR_PROC"])
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json"
+        if not live and (process_root / str(pid)).exists():
+            shutil.rmtree(process_root / str(pid))
+        if not live:
+            registry.unlink(missing_ok=True)
+        fake_unit_host.process(os.environ, 998039, 1, ["herdr", "--session", "agents", "server"], {}, cwd=self.root)
+        fake_herdr.herdr_listener(process_root, 998039, "agents", os.environ)
+        marks = {"HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p1"}
+        fake_unit_host.process(os.environ, 998040, 998039, ["zsh"], marks, cwd=folder.path)
         arguments = [kind, "resume", self.owner.current_session] if kind == "codex" else [kind]
         environment = {"CODEX_HOME": str(self.home / ".codex")} if kind == "codex" else {
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "CLAUDE_CODE_SESSION_ID": self.owner.current_session}
-        fake_unit_host.process(os.environ, pid, 998040 if live else 1, arguments if live else [],
-                               environment, cwd=folder.path)
+        if live:
+            fake_unit_host.process(os.environ, pid, 998040, arguments, {**marks, **environment}, cwd=folder.path)
+            write_text_atomic(registry, json.dumps({"pid": pid, "procStart": "1",
+                "sessionId": self.owner.current_session, "name": self.owner.name, "updatedAt": 1,
+                "formerNames": [], "tmux": "", "messagingSocketPath": ""}))
 
     def transcript(self, kind: Literal["claude", "codex"]) -> None:
         for directory in (self.home / ".claude", self.home / ".codex"):

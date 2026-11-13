@@ -311,7 +311,7 @@ class CodexSnapshotTests(RestartTestCase):
         self.assertEqual(listed.call_args_list.count(call("pane")), 1)
 
     def test_live_rows_scans_codex_once_for_members_and_unassigned_candidates(self) -> None:
-        with (patch.object(herdr, "_proc_root", return_value=self.proc) as scans,
+        with (patch.object(herdr, "proc_root", return_value=self.proc) as scans,
               patch.object(herdr.Herdr, "save_layout") as save,
               redirect_stderr(io.StringIO()) as errors):
             selected = restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), save_tabs=False)
@@ -324,12 +324,12 @@ class CodexSnapshotTests(RestartTestCase):
 
     def test_live_members_with_only_claude_rows_does_not_scan_codex(self) -> None:
         rows = self.rows[::2]
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(rows, staff.StaffSnapshot(self.rows)), list(rows))
         scans.assert_not_called()
 
     def test_live_members_shares_one_scan_and_reads_fresh_evidence_each_pass(self) -> None:
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(iter(self.rows), staff.StaffSnapshot(self.rows)), list(self.rows))
             scans.assert_called_once()
             self.codex[998081] = "changed-thread"
@@ -338,7 +338,7 @@ class CodexSnapshotTests(RestartTestCase):
 
     def test_live_members_uses_a_supplied_snapshot_without_a_scan(self) -> None:
         snapshot = herdr.CodexConversations({"codex-a": (998081,)}, ())
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows), codex=snapshot), list(self.rows[:3]))
         scans.assert_not_called()
 
@@ -2626,11 +2626,127 @@ class RestartTests(RestartTestCase):
                           reported_unknown=reported_unknown, codex=codex)
 
         with (patch.object(herdr, "launch_prepared_agent", side_effect=fail_first),
-              redirect_stderr(io.StringIO()) as errors):
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.restart(), 0)
         self.assertEqual(shutdown_record.read(), [identities[0]])
-        self.assertEqual(errors.getvalue(), "unit-0: restart anomaly: fixture launch failed\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn("unit-0: down: fixture launch failed", output.getvalue().splitlines())
         self.assertCountEqual([name for name, _ in self.launches], [row.name for row in self.rows[1:]])
+
+    def test_stopped_director_start_retries_once_with_the_same_arguments(self) -> None:
+        self.running.clear()
+        for kind in ("unit", "showrunner"):
+            with self.subTest(kind=kind):
+                row = replace(self.rows[0], kind=kind)
+                shutdown_record.save([str(row.id)])
+                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()) as read,
+                      patch.object(restart, "start_row", side_effect=[ValueError("fixture placement failed"), "w1:p0"]) as start,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(why="fixture restart cause"), 0)
+                self.assertEqual(start.call_count, 2)
+                read.assert_called_once_with(str(row.current_session))
+                first = cast(tuple[object, ...], start.call_args_list[0].args)
+                second = cast(tuple[object, ...], start.call_args_list[1].args)
+                self.assertEqual(first, second)
+                first_options = cast(dict[str, object], start.call_args_list[0].kwargs)
+                second_options = cast(dict[str, object], start.call_args_list[1].kwargs)
+                for key in ("present", "observed", "opening", "resume_checks"):
+                    self.assertEqual(first_options[key], second_options[key])
+                self.assertEqual(output.getvalue(), f"{row.name}: down; started\n")
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(shutdown_record.read(), [])
+
+    def test_stopped_director_retry_prints_one_success_line_through_start_row(self) -> None:
+        self.running.clear()
+        for kind in ("unit", "showrunner"):
+            with self.subTest(kind=kind):
+                row = replace(self.rows[0], kind=kind)
+                shutdown_record.save([str(row.id)])
+                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                      patch.object(herdr, "launch_prepared_agent", side_effect=[
+                          ValueError("fixture placement failed"),
+                          herdr.AgentLaunched("w1:p0", herdr.PromptSubmissionNotRequired()),
+                      ]) as launch,
+                      patch.object(restart.DirectorResumeCheck, "progress", return_value=restart.ResumeCheckState.RESUMED),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(), 0)
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual([line for line in output.getvalue().splitlines()
+                                  if line.startswith(f"{row.name}: ")], [f"{row.name}: down; started"])
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(shutdown_record.read(), [])
+
+    def test_empty_retry_error_keeps_the_row_pending_and_allows_the_next_retry(self) -> None:
+        failed, restored = self.rows[:2]
+        self.running.clear()
+        shutdown_record.save([str(failed.id), str(restored.id)])
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(restart, "start_row", side_effect=[
+                  ValueError("first failure"), ValueError("first failure"), OSError(), "w1:p1",
+              ]) as start,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(start.call_count, 4)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"{failed.name}: down: OSError", f"{restored.name}: down; started",
+        ])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(shutdown_record.read(), [str(failed.id)])
+
+    def test_director_that_becomes_live_during_retry_prints_only_unchanged(self) -> None:
+        self.running.clear()
+        for kind in ("unit", "showrunner"):
+            for stopped_retry_reads in (0, 1):
+                with self.subTest(kind=kind, stopped_retry_reads=stopped_retry_reads):
+                    row = replace(self.rows[0], kind=kind)
+                    shutdown_record.save([str(row.id)])
+                    with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                          patch.object(herdr, "read_conversation", side_effect=[
+                              *[herdr.StoppedConversation()] * (3 + stopped_retry_reads),
+                              herdr.LiveConversation("claude", (990100,)),
+                          ]) as read,
+                          patch.object(member_account, "repair_home") as repair,
+                          patch.object(herdr, "launch_prepared_agent",
+                                       side_effect=ValueError("fixture placement failed")) as launch,
+                          redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(restart.restart(), 0)
+                    self.assertEqual(read.call_count, 4 + stopped_retry_reads)
+                    launch.assert_called_once()
+                    repair.assert_called_once_with(row, "claude", 990100)
+                    self.assertEqual(output.getvalue(), f"{row.name}: unchanged\n")
+                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(shutdown_record.read(), [])
+
+    def test_stopped_director_second_start_failure_stays_pending_without_an_anomaly(self) -> None:
+        row = self.rows[0]
+        self.running.clear()
+        shutdown_record.save([str(row.id)])
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(restart, "start_row", side_effect=[ValueError("first failure"), OSError("second failure\nextra detail")]) as start,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(output.getvalue(), f"{row.name}: down: second failure\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(shutdown_record.read(), [str(row.id)])
+
+    def test_failed_live_or_unknown_director_start_keeps_its_anomaly_without_retry(self) -> None:
+        row = self.rows[0]
+        self.running.clear()
+        for current in (herdr.LiveConversation("claude", (990100,)), herdr.UnknownConversation("fixture identity unreadable")):
+            with self.subTest(current=current):
+                shutdown_record.save([str(row.id)])
+                with (patch.object(herdr, "read_conversation", return_value=current) as read,
+                      patch.object(restart, "start_row", side_effect=ValueError("fixture placement failed")) as start,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(), 0)
+                start.assert_called_once()
+                read.assert_called_once_with(str(row.current_session))
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), f"{row.name}: restart anomaly: fixture placement failed\n")
+                self.assertEqual(shutdown_record.read(), [str(row.id)])
 
     def test_restart_staff_read_error_preserves_fixed_references(self) -> None:
         shutdown_record.save([str(self.rows[0].id)])
@@ -2845,11 +2961,11 @@ class RestartTests(RestartTestCase):
         self.running.clear()
         shutdown_record.save([str(row.id) for row in self.rows])
         with (patch.object(staff, "initial_snapshot", return_value=record),
-              redirect_stderr(io.StringIO()) as errors):
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.restart(), 0)
         self.assertCountEqual([name for name, _ in self.launches], [row.name for row in self.rows[1:]])
-        self.assertEqual(errors.getvalue().splitlines(), [
-            "unit-0: restart anomaly: unit-0: the staff worktree is unavailable"])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn("unit-0: down: unit-0: the staff worktree is unavailable", output.getvalue().splitlines())
         self.assertEqual(shutdown_record.read(), [str(self.rows[0].id)])
 
     def test_socketless_running_sessions_restart_or_print_and_unassigned_sessions_print_once(self) -> None:

@@ -15,8 +15,10 @@ while :; do
 done
 
 subcommand=
+subcommand_index=0
 skip_value=0
 for arg in "$@"; do
+    (( subcommand_index += 1 ))
     if (( skip_value )); then
         skip_value=0
         continue
@@ -34,6 +36,16 @@ case "$subcommand" in
     build|b|check|c|clippy|test|t|nextest|run|r|bench|doc|d|rustc|rustdoc|fix|install|miri|mend) ;;
     *) exec "$real_cargo" "$@" ;;
 esac
+
+for arg in "${@:subcommand_index+1}"; do
+    case "$arg" in
+        --) break ;;
+        -h|--help) exec "$real_cargo" "$@" ;;
+        -V|--version)
+            [[ "$subcommand" == install ]] || exec "$real_cargo" "$@"
+            ;;
+    esac
+done
 
 [[ "$OSTYPE" == linux* ]] || exec "$real_cargo" "$@"
 

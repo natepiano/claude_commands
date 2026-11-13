@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 
 # These indexes support repeated queries over the current schema.
@@ -176,6 +176,7 @@ TEST_COLUMNS: list[Column] = [
 ]
 
 GATE_RUN_COLUMNS: list[Column] = [
+    ("vcpus", "INTEGER", "vCPU count; absent for old records"),
     ("step", "TEXT", "targeted-test or merge-gate; empty for old records"),
     ("id", "TEXT PRIMARY KEY", "gate run identity"),
     ("src", "TEXT", "source file"),

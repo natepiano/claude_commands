@@ -10,11 +10,14 @@ from dataclasses import replace
 from typing import cast
 from unittest.mock import patch
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
+from scripts.production.cli_fixture import process_boundary
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_worker, isolated_staff_file, transcript_fixture, stopped_worker_module
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture, ClaudeLauncherFixture):
+    @process_boundary
     def test_codex_slot_uses_claude_start_and_receives_the_extract_after_publication(self) -> None:
         run = self.start_phase("codex-to-claude")
         with isolated_staff_file(self.root / "staff.json", {}):
@@ -88,6 +91,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         self.assertEqual((run / "impl_status_impl").read_text(), "implemented\n")
         self.assertFalse((self.root / "launch_args.json").exists())
 
+    @process_boundary
     def test_claude_process_observes_its_durable_staff_parent(self) -> None:
         run = self.start_phase("claude-durable-admission")
         stub = self.root / "claude-original.py"
