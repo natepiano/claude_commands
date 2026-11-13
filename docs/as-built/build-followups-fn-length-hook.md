@@ -191,8 +191,10 @@ The receipt stores `owner`, `caller`, `resume` and `started_at`.
 It stores no `session_id`.
 A pending receipt also stores `doc` and `config_dir` as creation claims.
 
-`finish_publication` saves `config_dir` as the owner's home through `staff.set_home`.
-It then rewrites the receipt without `doc` and `config_dir`.
+`finish_publication` completes an unknown home through `staff.set_home(..., only_unknown=True)`.
+The setter checks the current home inside the staff transaction.
+A stale receipt cannot overwrite a home that another writer records first.
+Publication then removes `session_id`, `doc`, and `config_dir` from the receipt.
 The first launch and a repeated owned launch with creation claims both call `finish_publication`.
 This order lets a repeated launch complete an interrupted home write.
 

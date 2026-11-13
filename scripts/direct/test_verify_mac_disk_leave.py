@@ -23,7 +23,7 @@ class VerifyMacDiskLeaveTests(VerifyMacMemoryRetryFixture):
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,linux")
                               + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=off\n", template="aws_target")
+        _ = write_config_fixture(self.root / "linux.conf", "offload=off\n", template="mac_test")
         self.assert_disk_decline_leaves_for_mac()
 
     def assert_disk_decline_leaves_for_mac(self) -> None:

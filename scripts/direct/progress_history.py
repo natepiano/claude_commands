@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -20,14 +21,15 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
+from importlib import import_module
 from pathlib import Path
-from typing import Literal, NoReturn, TypedDict, cast
+from typing import Literal, NoReturn, Protocol, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import plan_history, recorder_state  # noqa: E402
@@ -6553,14 +6555,60 @@ def _read_receipts(args: argparse.Namespace) -> None:
                       "receipts": selected, "missing": missing, "problems": problems}, sort_keys=True))
 
 
-def _finish_phase(args: argparse.Namespace) -> None:
+@dataclass(frozen=True)
+class InterruptedWorkerPasses:
+    """Close these workers after the recorder releases the progress lock."""
+
+    worker_ids: tuple[staff.StaffId, ...] = ()
+
+
+class KeptWorkerPane(Protocol):
+    @property
+    def blocker(self) -> str: ...
+
+
+class FailedWorkerPaneClose(Protocol):
+    @property
+    def reason(self) -> str: ...
+
+
+def _close_interrupted_workers(passes: InterruptedWorkerPasses) -> None:
+    from scripts.herdr import herdr_types
+
+    module = import_module("scripts.herdr.worker_panes")
+    close = cast(Callable[[staff.StaffId, staff.WorkerName], object], module.close)
+    closed = cast(type[object], module.Closed)
+    kept = cast(type[object], module.Kept)
+
+    for identity in passes.worker_ids:
+        try:
+            record = staff.snapshot()
+            row = record.by_id(identity)
+            if row is None or row.kind != "worker":
+                continue
+            parent = record.parent_of(row)
+            if parent is None:
+                continue
+            with redirect_stderr(io.StringIO()):
+                result = close(parent.id, staff.WorkerName.parse(row.name))
+            if isinstance(result, closed):
+                continue
+            reason = (cast(KeptWorkerPane, result).blocker if isinstance(result, kept)
+                      else cast(FailedWorkerPaneClose, result).reason)
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            reason = str(error)
+        print(f"anomaly: finish-phase: worker {identity}: pane retained: {' '.join(reason.splitlines())}", file=sys.stderr)
+
+
+def _finish_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
     # The run lock is already held. External starts use this same history lock,
     # through the cleanup scan and publication of phase_finished.
     with _external_wait_lock():
-        _finish_phase_with_wait_lock(args)
+        return _finish_phase_with_wait_lock(args)
 
 
-def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
+def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerPasses:
     """Close one open phase: the one --phase-id names, else the current one.
 
     Only that phase's own passes close with it; another open phase keeps its
@@ -6582,7 +6630,7 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     elif current is not None and current_open:
         phase = current
     else:
-        return
+        return InterruptedWorkerPasses()
     is_current = phase is current
     now = plan_history.now_epoch()
     finished_at = _optional_epoch(args, "finished_at", "--finished-at", now)
@@ -6603,10 +6651,14 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     # Every window this phase left open, one per team member: the launchers that
     # would have closed them are gone. A pass from before passes carried their
     # phase belongs to the current one.
+    interrupted: list[staff.StaffId] = []
     for slot, record in sorted(_open_passes(state).items()):
         owner = _pass_phase_instance(record)
         if owner == instance_id or (is_current and not owner):
-            _ = _close_slot_pass(session_dir, state, slot, "interrupted", now)
+            if _close_slot_pass(session_dir, state, slot, "interrupted", now):
+                identity = _string(record.get("worker_id"))
+                if identity:
+                    interrupted.append(staff.StaffId(identity))
     if is_current:
         _close_active_activity(session_dir, state, "interrupted", "", now)
         _ = _clear_armed_review(session_dir, state, "phase ended", now)
@@ -6636,6 +6688,7 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
         if state_kind in phase_reservation.BOARD_STATES.values():
             _ = phase_reservation.clear(phase_dir)
     _refresh_phase_table(session_dir)
+    return InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
 
 
 def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
@@ -6645,25 +6698,27 @@ def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> Non
             _ = staff.clear_run(row.id, session_dir)
 
 
-def _finish_run(args: argparse.Namespace) -> None:
+def _finish_run(args: argparse.Namespace) -> InterruptedWorkerPasses:
     session_dir = _session_dir(args)
     record = staff.initial_snapshot()
     state = _read_state(session_dir, record=record)
     now = plan_history.now_epoch()
     run_status = _arg_string(args, "status")
+    interrupted: list[staff.StaffId] = []
     # Every open phase, newest first: closing the current one makes the next
     # older one current.
     while recorder_state.open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
-        _finish_phase(finish_args)
+        interrupted.extend(_finish_phase(finish_args).worker_ids)
         state = _read_state(session_dir, record=record)
+    passes = InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
     if not unit_runs.run_is_open(session_dir, record=record):
         _clear_run_pointer(session_dir, record=record)
-        return
+        return passes
     # A repeated finish clears a restored pointer without recording the outcome again.
     if worker_lifecycle.finished_run_status(str(session_dir)):
         _clear_run_pointer(session_dir, record=record)
-        return
+        return passes
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir, record=record)
     event = _event(state, "run_finished", now)
@@ -6682,6 +6737,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     _write_state(session_dir, state)
     _clear_run_pointer(session_dir, record=record)
     _refresh_phase_table(session_dir)
+    return passes
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
@@ -7121,23 +7177,25 @@ def main() -> None:
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
-    handler = cast(Callable[[argparse.Namespace], None], handler_value)
+    handler = cast(Callable[[argparse.Namespace], object], handler_value)
     if _arg_string(args, "command") in ("waits", "receipts"):
-        handler(args)
+        _ = handler(args)
         return
     session_value: object = getattr(args, "session_dir", "")
     session_text = _string(session_value)
     if not session_text:
-        handler(args)
+        _ = handler(args)
         return
     session_dir = Path(session_text).expanduser().resolve()
     session_dir.mkdir(parents=True, exist_ok=True)
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            handler(args)
+            result = handler(args)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    if isinstance(result, InterruptedWorkerPasses):
+        _close_interrupted_workers(result)
 
 
 if __name__ == "__main__":

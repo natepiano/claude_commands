@@ -81,11 +81,11 @@ class TranscriptCache:
     limit: int
 
     def __init__(self, settings: TranscriptReadSettings | TranscriptSettingsSource =
-                 TranscriptSettingsSource.LOCAL_CONFIG) -> None:
+                 TranscriptSettingsSource.LOCAL_CONFIG, *, database_name: str = "summaries.sqlite3") -> None:
         self.limit = read_settings(settings).cache_max_megabytes * 1024 * 1024
         folder = Path.home() / ".cache/context_economy"
         folder.mkdir(parents=True, exist_ok=True)
-        self.database = sqlite3.connect(folder / "summaries.sqlite3")
+        self.database = sqlite3.connect(folder / database_name)
         _ = self.database.execute("PRAGMA journal_mode=WAL")
         self.database.row_factory = sqlite3.Row
         self.accessed: dict[str, int] = {}

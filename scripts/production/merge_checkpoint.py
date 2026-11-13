@@ -97,7 +97,7 @@ class ShrinkCommit(NamedTuple):
 
 
 class AsBuiltCommit(NamedTuple):
-    """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
+    """A unit's closing documentation commit after its last phase merged."""
 
 
 class ReviewTrial(NamedTuple):
@@ -467,7 +467,7 @@ def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
-    """Check required review lines and count checkpoints and commits without a descendant checkpoint."""
+    """Check review lines and count selected commits with valid lines."""
     previous = request.production.merge_branch
     try:
         commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
@@ -476,7 +476,9 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise checkpoint_gate.Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise checkpoint_gate.Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
-    selected = change_review.review_commits(commits)
+    selected = [commit for commit in change_review.review_commits(commits)
+                if (lines := change_review.entries(commit.message))
+                and not any(isinstance(line, change_review.Malformed) for line in lines)]
     checkpoint_gate.report("change review", "ok", f"{len(selected)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 
@@ -560,6 +562,8 @@ def checkpoint_plan(request: MergeRequest) -> Path:
     pattern = (r"shrink\(([^()/\\]+)\): phase \S+ — .+" if isinstance(request.kind, ShrinkCommit)
                else r"docs\(([^()/\\]+)\): as-built")
     match = re.fullmatch(pattern, subject)
+    if match and isinstance(request.kind, AsBuiltCommit):
+        return Path("docs/plans") / (match[1] + ".md")
     return request.unit.plan.with_name(match[1] + ".md") if match else request.unit.plan
 
 
@@ -582,9 +586,16 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         plan = checkpoint_plan(request).as_posix()
         unexpected = [path for path in paths if not path.endswith(".md")]
         if unexpected or plan not in paths:
-            raise checkpoint_gate.Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
-                       + f"got {', '.join(paths)}",
-                       "commit only the as-built docs and the plan's deletion, then resend the as-built")
+            plan_exists = bool(good(git(request.production.checkout, "ls-tree", "--name-only",
+                                        request.production.merge_branch, "--", plan), "scope"))
+            if plan_exists or unexpected or any(PurePosixPath(path).parent != PurePosixPath("docs/as-built")
+                                                for path in paths):
+                rule = (f"an as-built commit carries only docs and must change or delete {plan}; " if plan_exists
+                        else f"an as-built commit without {plan} on the merge branch allows only docs/as-built/*.md; ")
+                raise checkpoint_gate.Stop("scope", "held", rule
+                           + f"got {', '.join(paths)}",
+                           "commit only the as-built docs" + (" and the plan's deletion" if plan_exists else "")
+                           + ", then resend the as-built")
     checkpoint_gate.report("scope", "ok", f"{len(paths)} changed paths"
            + (f"; {imported} came from origin merge branches" if imported else ""))
 

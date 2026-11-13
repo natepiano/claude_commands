@@ -31,8 +31,10 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, unit_runs
+from scripts.lib import atomic_file, detached, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lib.transcripts import open_transcript
+from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.message import send, sessions
@@ -51,6 +53,8 @@ class DispatchAgent:
         self.compactions: list[tuple[str, int]] = []
         self.compacting: set[str] = set()
         self.compact_error = ""
+        self.compact_proof: Literal["compacted", "task_started", "absent"] = "compacted"
+        self.compact_inputs: dict[str, str] = {}
         self.notice_failures = 0
         self.members: dict[str, staff.StaffId] = {}
         self.replies: list[str] = []
@@ -210,7 +214,8 @@ class DispatchAgent:
         if args[0] != "/nonexistent/herdr":
             return self.run_process(args, **kwargs)
         action, pane = args[4:6]
-        self.fixture.assertNotIn("--timeout", args)
+        if not (action == "prompt" and args[6] == "/compact"):
+            self.fixture.assertNotIn("--timeout", args)
         if "--until" in args:
             self.fixture.assertEqual(args[-2:], ["--until", "working"])
         if action == "prompt":
@@ -223,6 +228,18 @@ class DispatchAgent:
                 self.compacting.add(pane)
                 self.fixture.world.locations[pane]["agent_status"] = "working"
                 self.compactions.append((pane, len(self.submitted)))
+                self.compact_inputs[pane] = "/compact" if self.compact_proof == "absent" else ""
+                if self.compact_proof != "absent":
+                    row = self.row(pane)
+                    backend = staff.backend(row)
+                    assert isinstance(backend, staff.CodexBackend)
+                    source = worker_admission.transcript_source(row, backend)
+                    with open_transcript(source) as stream:
+                        content = stream.read()
+                    source = source.with_suffix("") if source.suffix == ".zst" else source
+                    record = ({"type": "compacted"} if self.compact_proof == "compacted" else
+                              {"type": "event_msg", "payload": {"type": "task_started"}})
+                    atomic_file.write_bytes_atomic(source, content + (json.dumps(record) + "\n").encode())
                 return subprocess.CompletedProcess(args, 0, "{}", "")
             if pane in self.compacting:
                 self.fixture.assertIn(self.fixture.world.locations[pane]["agent_status"], ("idle", "done"))
@@ -739,6 +756,8 @@ class WorkerCommandTests(unittest.TestCase):
                 "role": "user", "content": f"End your final reply with DONE {dispatch}."}}) + "\n")
             agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
             agents_log.append(native.current_session, "impl", None, datetime.now(timezone.utc))
+            _ = staff.set_worker_role(child.id, staff.KnownWorkerRole("impl"))
+            _ = staff.set_worker_role(native.id, staff.KnownWorkerRole("impl"))
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
         saved = next(item for item in result.results if isinstance(item, Resumable))
         self.assertEqual(saved.seat["staff_id"], child.id)
@@ -747,7 +766,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(result.cwd, str(self.fixture.root))
         missing = next(item for item in result.results if isinstance(item, Unavailable))
         self.assertEqual(missing.staff_id, unavailable.id)
-        self.assertIn("last assignment is unavailable", missing.reason)
+        self.assertIn("staff worker role is unavailable", missing.reason)
         child_ids = {staff.StaffId(item.staff_id if isinstance(item, Unavailable) else item.seat["staff_id"])
                      for item in result.results}
         self.assertEqual(child_ids, {child.id, unavailable.id})
@@ -1035,6 +1054,253 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertNotIn(pane, self.fixture.world.locations)
                 self.assertEqual(identities[0], identities[1])
 
+    def test_compaction_proof_precedes_the_dispatch_prompt(self) -> None:
+        class CompactionClock:
+            seconds: float = 100.0
+
+            def monotonic(self) -> float:
+                return self.seconds
+
+        for proof in ("absent", "compacted", "task_started", "delayed", "bounded"):
+            with self.subTest(proof=proof):
+                self.agent.compact_proof = ("absent" if proof == "delayed" else
+                                            "compacted" if proof == "bounded" else proof)
+                current = self.opened("compact-proof-" + proof)
+                backend = staff.backend(current.row)
+                assert isinstance(backend, staff.CodexBackend)
+                source = worker_admission.transcript_source(current.row, backend)
+                with source.open("a") as stream:
+                    _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
+                    _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+                before = len(self.agent.submitted)
+                send_keys = self.fixture.world.send_keys
+                wait_turn_end = self.fixture.world.wait_turn_end
+                order: list[str] = []
+                compact_commands: list[list[str]] = []
+                clock = CompactionClock()
+
+                def run_compaction(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    result = self.agent.run(arguments, **options)
+                    if len(arguments) > 6 and arguments[6] == "/compact":
+                        compact_commands.append(arguments)
+                        if proof == "bounded":
+                            clock.seconds = 195.0
+                    return result
+
+                def finish_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+                    if proof == "bounded":
+                        self.assertEqual(timeout_ms, 205000)
+                    if proof == "delayed" and pane in self.agent.compacting:
+                        # Model a 95-second compaction without a real delay.
+                        if timeout_ms < 95000:
+                            return herdr.WaitTimedOut()
+                        with source.open("a") as stream:
+                            _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
+                        self.agent.compact_inputs[pane] = ""
+                        order.append("compacted")
+                    return wait_turn_end(pane, timeout_ms)
+
+                def clear(pane: str, *keys: str, target: str, expected_text: str = "") -> None:
+                    send_keys(pane, *keys, target=target, expected_text=expected_text)
+                    self.agent.compact_inputs[pane] = ""
+
+                def compact_composer(pane: str) -> herdr.ComposerInput:
+                    return herdr.ComposerInput(self.agent.compact_inputs.get(pane, ""))
+
+                with (patch.object(self.fixture.world, "composer", side_effect=compact_composer),
+                      patch.object(worker, "time", new=clock),
+                      patch.object(subprocess, "run", side_effect=run_compaction),
+                      patch.object(self.fixture.world, "send_keys", side_effect=clear) as keys,
+                      patch.object(self.fixture.world, "wait_turn_end", side_effect=finish_compaction),
+                      patch.object(self.agent, "during_prompt", new=lambda: order.append("prompt")),
+                      redirect_stderr(io.StringIO()) as errors):
+                    result = worker.dispatch_turn(self.fixture.parent.id, current, self.fixture.world,
+                        "End your final reply with DONE compact-proof", "compact-proof", run=self.run_dir)
+                if proof == "bounded":
+                    self.assertEqual(len(compact_commands), 1)
+                    command = compact_commands[0]
+                    self.assertIn("--timeout", command)
+                    self.assertEqual(command[command.index("--timeout") + 1], "300000")
+                if proof in {"absent", "task_started"}:
+                    self.assertEqual(result, worker.ExitCode.REFUSED)
+                    self.assertEqual(len(self.agent.submitted), before)
+                    self.assertIn("compaction has no transcript proof", errors.getvalue())
+                    self.assertIn("no prompt sent", errors.getvalue())
+                    if proof == "absent":
+                        keys.assert_called_once_with(current.pane, "ctrl-u", target=str(current.row.current_session),
+                                                     expected_text="/compact")
+                    else:
+                        keys.assert_not_called()
+                else:
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    self.assertEqual(self.agent.submitted[before:], [(current.pane,
+                        script_prompt("End your final reply with DONE compact-proof"))])
+                    keys.assert_not_called()
+                    if proof == "delayed":
+                        self.assertEqual(order, ["compacted", "prompt"])
+                self.assertEqual(self.agent.compact_inputs[current.pane], "")
+
+    def test_compaction_dispatch_returns_before_completion_and_reports_detached_failure(self) -> None:
+        class DispatchClock:
+            seconds: float = 100.0
+
+            def monotonic(self) -> float:
+                self.seconds += 1
+                return self.seconds
+
+            def sleep(self, seconds: float) -> None:
+                self.seconds += seconds
+
+        for outcome in ("compacted", "no proof", "timeout", "no receipt", "first staff read", "hook write",
+                        "reply write", "notice failure", "attached"):
+            with self.subTest(outcome=outcome):
+                current = self.opened("detached-" + outcome.replace(" ", "-"))
+                backend = staff.backend(current.row)
+                assert isinstance(backend, staff.CodexBackend)
+                source = worker_admission.transcript_source(current.row, backend)
+                with source.open("a") as stream:
+                    _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "last_token_usage": {"input_tokens": 43000 if outcome == "attached" else 43001,
+                                             "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+                self.agent.compact_proof = "absent"
+                self.agent.compact_inputs[current.pane] = ""
+                self.agent.defer_prompt_transcript = outcome == "no receipt"
+                self.agent.finish_after = 1
+                self.agent.notice_failures = int(outcome == "notice failure")
+                notices_before = len(self.agent.notices)
+                failure_steps: list[str] = []
+                commands: list[list[str]] = []
+                order: list[str] = []
+                before = len(self.agent.submitted)
+                compacted = len(self.agent.compactions)
+                status = self.run_dir / (current.row.name + "_status")
+                atomic_file.write_text_atomic(status, "running\n")
+
+                def queue(command: list[str], **_options: object) -> int:
+                    commands.append(command)
+                    return 123
+
+                wait_turn_end = self.fixture.world.wait_turn_end
+
+                def finish_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+                    if outcome == "timeout":
+                        return herdr.WaitTimedOut()
+                    ended = wait_turn_end(pane, timeout_ms)
+                    if outcome not in {"no proof", "hook write", "reply write", "notice failure"}:
+                        with source.open("a") as stream:
+                            _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
+                        self.agent.compact_inputs[pane] = ""
+                        order.append("compacted")
+                    return ended
+
+                send_keys = self.fixture.world.send_keys
+
+                def clear(pane: str, *keys: str, target: str, expected_text: str = "") -> None:
+                    send_keys(pane, *keys, target=target, expected_text=expected_text)
+                    self.agent.compact_inputs[pane] = ""
+
+                def compact_composer(pane: str) -> herdr.ComposerInput:
+                    return herdr.ComposerInput(self.agent.compact_inputs.get(pane, ""))
+
+                with (patch.object(detached, "start_detached", side_effect=queue),
+                      patch.object(worker, "time", new=DispatchClock()),
+                      patch.object(self.fixture.world, "wait_turn_end", side_effect=finish_compaction),
+                      patch.object(self.fixture.world, "composer", side_effect=compact_composer),
+                      patch.object(self.fixture.world, "send_keys", side_effect=clear),
+                      patch.object(self.agent, "during_prompt", new=lambda: order.append("prompt")),
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    result = worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(current.row.name), "impl", self.prompt,
+                        session_dir=self.run_dir, slot=current.row.name, phase="8", kind="impl", launcher_command=["assign.sh"],
+                        reply=self.run_dir / (current.row.name + "_reply.md"),
+                        completion_actions=progress_history.CompletionActions(status_file=str(status),
+                            summary_file=str(self.run_dir / "failed-summary.md") if outcome == "reply write" else ""))
+                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                    if outcome == "attached":
+                        self.assertEqual(commands, [])
+                        self.assertEqual(order, ["prompt"])
+                        self.assertEqual(len(self.agent.submitted), before + 1)
+                        continue
+                    self.assertEqual(len(commands), 1)
+                    self.assertEqual(len(self.agent.compactions), compacted)
+                    self.assertEqual(len(self.agent.submitted), before)
+                    self.assertIn("compaction runs detached; the prompt follows", output.getvalue())
+                    self.assertIsInstance(progress_history.active_dispatch(current.row.id, self.run_dir), progress_history.ActiveDispatch)
+                    order.append("returned")
+                    snapshot = staff.snapshot
+                    reads = 0
+
+                    def staff_read() -> staff.StaffSnapshot:
+                        nonlocal reads
+                        reads += 1
+                        if reads == 1:
+                            raise staff.StaffUnreadable("first staff read failed")
+                        return snapshot()
+
+                    complete_dispatch = progress_history.complete_dispatch
+                    save_hook_completion = progress_history.save_hook_completion
+                    save_reply = worker.save_reply
+                    run_finished = turn_end.run_finished
+
+                    def end_pass(run: Path, slot: str, instance: str, *,
+                                 status: Literal["completed", "error"] = "completed") -> None:
+                        failure_steps.append("pass end")
+                        complete_dispatch(run, slot, instance, status=status)
+
+                    def save_completion(run: Path, instance: str, completion: progress_history.HookCompletion) -> None:
+                        failure_steps.append("hook completion")
+                        save_hook_completion(run, instance, completion)
+
+                    def write_reply(path: Path, text: str) -> None:
+                        failure_steps.append("error reply")
+                        save_reply(path, text)
+
+                    def notify(thread_id: str) -> None:
+                        failure_steps.append("notice")
+                        run_finished(thread_id)
+
+                    with ExitStack() as failures:
+                        if outcome == "first staff read":
+                            _ = failures.enter_context(patch.object(staff, "snapshot", side_effect=staff_read))
+                        if outcome == "hook write":
+                            _ = failures.enter_context(patch.object(progress_history, "save_hook_completion",
+                                side_effect=OSError("hook completion write failed")))
+                        if outcome == "notice failure":
+                            _ = failures.enter_context(patch.object(progress_history, "complete_dispatch", side_effect=end_pass))
+                            _ = failures.enter_context(patch.object(progress_history, "save_hook_completion", side_effect=save_completion))
+                            _ = failures.enter_context(patch.object(worker, "save_reply", side_effect=write_reply))
+                            _ = failures.enter_context(patch.object(turn_end, "run_finished", side_effect=notify))
+                        if outcome == "reply write":
+                            _ = failures.enter_context(patch.object(worker, "save_reply", side_effect=OSError("reply write failed")))
+                        code = worker.main(commands[0][2:])
+                if outcome == "compacted":
+                    self.assertEqual(code, worker.ExitCode.OK)
+                    self.assertEqual(order, ["returned", "compacted", "prompt"])
+                    self.assertEqual(len(self.agent.submitted), before + 1)
+                    self.assertIsInstance(progress_history.active_dispatch(current.row.id, self.run_dir), progress_history.ActiveDispatch)
+                elif outcome == "no receipt":
+                    self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                    passed = worker_panes.worker_pass(current.row, self.run_dir)
+                    self.assertEqual(passed.get("status"), "active")
+                    self.assertIsInstance(progress_history.hook_completion(passed), progress_history.NoHookCompletion)
+                    self.assertIn(current.pane, self.fixture.world.locations)
+                    self.assertIn("submission is unproved", self.agent.notices[-1])
+                    self.assertEqual(len(self.agent.submitted), before + 1)
+                    self.assertEqual(status.read_text(), "running\n")
+                else:
+                    self.assertNotEqual(code, worker.ExitCode.OK)
+                    self.assertEqual(worker_panes.worker_pass(current.row, self.run_dir).get("status"), "error")
+                    self.assertEqual(status.read_text(), "running\n" if outcome in {"hook write", "reply write"} else "error\n")
+                    if outcome == "notice failure":
+                        self.assertEqual(len(self.agent.notices), notices_before)
+                        self.assertEqual(failure_steps[:4], ["pass end", "hook completion", "error reply", "notice"])
+                        self.assertEqual(errors.getvalue().count("dispatch notice failed: director message failed"), 1)
+                    else:
+                        self.assertEqual(len(self.agent.notices), notices_before + 1)
+                        self.assertIn("error", self.agent.notices[-1])
+                    self.assertEqual(len(self.agent.submitted), before)
+                self.assertEqual(self.agent.compact_inputs[current.pane], "")
+
     def test_closed_conversation_compacts_before_the_next_dispatch(self) -> None:
         for index, (tokens, failure) in enumerate(((43000, ""), (43001, ""), (43001, "compact unavailable"))):
             with self.subTest(tokens=tokens, failure=failure):
@@ -1054,18 +1320,29 @@ class WorkerCommandTests(unittest.TestCase):
                 following = self.prompt.with_name(f"next-{index}.md")
                 atomic_file.write_text_atomic(following, "Review the next change.")
                 before = len(self.agent.submitted)
-                with redirect_stderr(io.StringIO()) as errors:
+                commands: list[list[str]] = []
+
+                def queue(command: list[str], **_options: object) -> int:
+                    commands.append(command)
+                    return 123
+
+                with (patch.object(detached, "start_detached", side_effect=queue),
+                      redirect_stderr(io.StringIO()) as errors):
                     result = worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "impl", following,
                         session_dir=self.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh", str(following)],
                         reply=self.reply)
+                    if commands:
+                        self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                        result = worker.main(commands[0][2:])
                 if failure:
-                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
-                    self.assertEqual(len(self.agent.submitted), before + 1)
+                    self.assertIs(result, worker.ExitCode.REFUSED)
+                    self.assertEqual(len(self.agent.submitted), before)
                     self.assertIn(failure, errors.getvalue())
                     self.assertIn(f"{name}: compaction failed:", errors.getvalue())
-                    self.assertIn("prompt is sent without compaction", errors.getvalue())
+                    self.assertIn("no prompt sent", errors.getvalue())
                     self.assertEqual(len(errors.getvalue().splitlines()), 1)
                     self.assertNotIn("prompt delivered to pane", errors.getvalue())
+                    continue
                 self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                 reopened = self.agent.submitted[-1][0]
                 self.assertNotEqual(reopened, pane)
@@ -1941,12 +2218,12 @@ class WorkerCommandTests(unittest.TestCase):
                                     case.assertIsInstance(case.dispatch(), worker.ExitCode)
                             else:
                                 code = case.dispatch(dispatch_id="TEST-other-pass" if failure == "dispatch id" else "")
-                                case.assertEqual(code, worker.ExitCode.REFUSED if failure == "dispatch id" else
+                                case.assertEqual(code, worker.ExitCode.REFUSED if failure in ("dispatch id", "compact") else
                                                  worker.ExitCode.BUSY if failure == "busy" else worker.ExitCode.UNCERTAIN)
                         case.assertEqual(case.agent.submitted, [])
                         if failure == "compact":
-                            case.assertIn("TEST compact failed; prompt is sent without compaction", errors.getvalue())
-                            case.assertIn("dispatch target is unproved", errors.getvalue())
+                            case.assertIn("TEST compact failed; no prompt sent", errors.getvalue())
+                            case.assertNotIn("dispatch target is unproved", errors.getvalue())
                         if existing:
                             case.assertEqual(staff.snapshot().rows, before[0])
                             case.assertEqual(set(case.fixture.world.locations), before[1])

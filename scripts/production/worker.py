@@ -15,13 +15,14 @@ from importlib import import_module
 from functools import partial
 import io
 import json
+import math
 import os
 import re
 import time
 from pathlib import Path
 import subprocess
 import sys
-from typing import Literal, cast, final
+from typing import Literal, Protocol, cast, final
 
 from scripts.agents import detached_runs, worker_lifecycle
 from scripts.herdr import herdr_types
@@ -29,7 +30,7 @@ from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib import atomic_file, conf, detached, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
@@ -232,6 +233,7 @@ def _client() -> herdr.Herdr:
 
 
 def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "", *,
+                   deadline: float = math.inf,
                    on_submission: Callable[[], object] = lambda: None) -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
@@ -240,22 +242,31 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
     if action == "prompt":
         arguments.append(script_prompt(line))
     elif action == "compact":
-        arguments.extend(("/compact", "--wait"))
+        arguments.extend(("/compact", "--timeout", str(max(0, int((deadline - time.monotonic()) * 1000))), "--wait"))
     command = client.argv(*arguments)
     _ = on_submission()
     result = subprocess.run(command, text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
 
-def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
-    """Compact a large Codex conversation between assignments."""
-    backend = staff.backend(current.row)
+@dataclass(frozen=True)
+class CompactionRequired:
+    backend: staff.CodexBackend
+    offset: int
+
+
+class CompactionNotRequired(Enum):
+    SKIP = "the conversation needs no compaction"
+
+
+def _compaction_plan(row: staff.StaffRow) -> CompactionRequired | CompactionNotRequired:
+    backend = staff.backend(row)
     if not isinstance(backend, staff.CodexBackend):
-        return
+        return CompactionNotRequired.SKIP
     try:
-        source = worker_admission.transcript_source(current.row, backend)
+        source = worker_admission.transcript_source(row, backend)
     except ValueError:
-        return
+        return CompactionNotRequired.SKIP
     tokens = 0
     with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
@@ -267,11 +278,31 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
             usage = rollouts.token_usage(record)
             if usage is not None:
                 tokens = usage.uncached_input + usage.cached_input + usage.output
-    if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS"):
-        _agent_command(client, current, "compact")
-        ended = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
-        if isinstance(ended, herdr.WaitTimedOut):
-            raise herdr_types.HerdrFailure("compaction did not finish before the settle bound", "timeout")
+        offset = stream.tell()
+    return (CompactionRequired(backend, offset) if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+            else CompactionNotRequired.SKIP)
+
+
+def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
+    """Compact a large Codex conversation between assignments."""
+    plan = _compaction_plan(current.row)
+    if not isinstance(plan, CompactionRequired):
+        return
+    deadline = time.monotonic() + conf.read("direct").number("WORKER_COMPACT_SECONDS")
+    _agent_command(client, current, "compact", deadline=deadline)
+    ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
+    if isinstance(ended, herdr.WaitTimedOut):
+        raise herdr_types.HerdrFailure("compaction did not finish before the compaction bound", "timeout")
+    source = worker_admission.transcript_source(current.row, plan.backend)
+    with open_transcript(source) as stream:
+        _ = stream.seek(plan.offset)
+        for line in stream:
+            if not line.endswith(b"\n"):
+                break
+            record = rollouts.decode_rollout(line.decode("utf-8"))
+            if record is not None and rollouts.is_compaction(record):
+                return
+    raise herdr_types.HerdrFailure("compaction has no transcript proof", "not_submitted")
 
 
 def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCode:
@@ -358,6 +389,31 @@ class SendNoticesAfterDispatch:
 
 
 SEND_NOTICES_AFTER_DISPATCH = SendNoticesAfterDispatch()
+COMPACTION_STARTED_TEXT = "compaction runs detached; the prompt follows"
+
+
+class AttachedCompaction(Enum):
+    RUN = "run compaction in this process"
+
+
+def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path) -> None:
+    handoff = worker_admission.dispatch_record(run, row.name)
+    if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED,
+                         worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
+        allowed = worker_admission.WorkerStartAllowed(row.name, parent, run, worker_admission.ExistingWorkerSlot(row))
+        worker_admission.record_dispatch(allowed, handoff.assignment_id, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
+                                        expected_request=handoff.assignment_id)
+
+
+def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str) -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), "finish-dispatch", "--parent", str(parent),
+               "--worker-id", str(row.id), "--session-dir", str(run), "--dispatch-id", instance]
+    try:
+        _ = detached.start_detached(command, ready=lambda: True, within=herdr.PROGRAM_TIMEOUT_SECONDS,
+                                    output=detached.AppendLog(run / f"compact-{instance}.log"))
+    except detached.DetachedStartFailure as error:
+        progress_history.complete_dispatch(run, row.name, instance, status="error")
+        raise herdr_types.HerdrFailure(str(error)) from error
 
 
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
@@ -445,16 +501,20 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             saved = progress_history.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
+        deferred = False
+
+        def defer_compaction() -> None:
+            nonlocal deferred
+            _detach_dispatch(parent, started.row, session_dir, instance)
+            deferred = True
+            print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
+
         result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
-                               run=session_dir, on_submission=submitted)
+                               run=session_dir, on_submission=submitted, defer_compaction=defer_compaction)
         if result is DispatchSubmission.SUBMITTED:
             submitted()
-        handoff = worker_admission.dispatch_record(session_dir, name.value)
-        if (result is DispatchSubmission.SUBMITTED and handoff.state in
-                (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)):
-            allowed = worker_admission.WorkerStartAllowed(name.value, parent, session_dir, worker_admission.ExistingWorkerSlot(started.row))
-            worker_admission.record_dispatch(allowed, handoff.assignment_id, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
-                                            expected_request=handoff.assignment_id)
+        if result is DispatchSubmission.SUBMITTED and not deferred:
+            _accept_dispatch(parent, started.row, session_dir)
         return result
 
 
@@ -489,7 +549,9 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
 
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                    line: str, dispatch_id: str, *, run: Path,
-                   on_submission: Callable[[], object] = lambda: None) -> DispatchSubmission | ExitCode:
+                   on_submission: Callable[[], object] = lambda: None,
+                   defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
+                   ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
     if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
         return _blocked_question(client, started)
@@ -515,10 +577,20 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
         return ExitCode.BUSY
     try:
+        if callable(defer_compaction) and isinstance(_compaction_plan(current.row), CompactionRequired):
+            defer_compaction()
+            return DispatchSubmission.SUBMITTED
         _compact_before_dispatch(client, current)
-    except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         reason = " ".join(str(error).splitlines())
-        print(f"{current.row.name}: compaction failed: {reason}; prompt is sent without compaction", file=sys.stderr)
+        try:
+            composer = client.composer(current.pane)
+            if isinstance(composer, herdr.ComposerInput) and composer.text.strip() == "/compact":
+                client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
+            reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
+        print(f"{current.row.name}: compaction failed: {reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
@@ -564,6 +636,108 @@ def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker, *, d
     else:
         print(question.rstrip("\n"), file=sys.stderr)
     return ExitCode.BLOCKED
+
+
+class PreparedDirectorNotice(Protocol):
+    def send_notice(self) -> None: ...
+
+
+def _dispatch_notice(parent: StaffId, identity: StaffId, run: Path, instance: str,
+                     passed: dict[str, object], outcome: Literal["error", "uncertain"], detail: str) -> None:
+    """Send the existing director notice without completing the worker turn."""
+    record = staff.snapshot()
+    owner = record.by_id(parent)
+    if owner is None:
+        raise ValueError(f"{parent}: notice recipient is not in staff")
+    row = record.by_id(identity)
+    name = row.name if row is not None else str(passed.get("team_slot", identity))
+    module = import_module("scripts.herdr.turn_end")
+    prepare = cast(Callable[[str, staff.StaffRow, Path, dict[str, object], str, object, Path, str, str],
+                            PreparedDirectorNotice], module._prepare_notice)
+    turn_outcome = cast(Callable[[str], object], module.TurnOutcome)(outcome)
+    prepare(name, owner, run, passed, instance, turn_outcome, run, "", detail).send_notice()
+
+
+def _dispatch_failure_step(identity: StaffId, step: str, action: Callable[[], None]) -> bool:
+    """Report each failed step and return whether it succeeds."""
+    try:
+        action()
+        return True
+    except (Exception, SystemExit) as error:
+        print(f"anomaly: {identity}: dispatch {step} failed: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return False
+
+
+def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str) -> int:
+    """Finish a saved dispatch outside the caller's process group."""
+    passed: dict[str, object] = {}
+    path = run / f"compact-{instance}_dispatch_error.txt"
+    diagnostics = io.StringIO()
+    result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
+    try:
+        with redirect_stderr(diagnostics):
+            record = staff.snapshot()
+            row = record.by_id(identity)
+            if row is None:
+                raise ValueError(f"{identity}: worker staff row is unavailable")
+            with worker_panes.worker_lock(parent, WorkerName.parse(row.name), blocking=True) as hold:
+                if isinstance(hold, worker_panes.Kept):
+                    raise ValueError(hold.blocker)
+                passed = worker_panes.worker_pass(row, run)
+                if passed.get("instance_id") != instance or passed.get("status") != "active":
+                    return ExitCode.OK
+                delivery = progress_history.dispatch_delivery(passed)
+                if delivery.reply_file:
+                    reply = Path(delivery.reply_file)
+                    path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
+                current = worker_panes.observe_worker(parent, row, staff.snapshot())
+                if not isinstance(current, worker_panes.OpenWorker):
+                    raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
+                result = dispatch_turn(parent, current, _client(), delivery.line, delivery.completion_id, run=run)
+                if result is DispatchSubmission.SUBMITTED:
+                    _accept_dispatch(parent, row, run)
+                    return result
+        detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
+        print(detail, file=sys.stderr)
+        if result is ExitCode.UNCERTAIN:
+            _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
+                parent, identity, run, instance, passed, "uncertain", detail))
+            return result
+    except (Exception, SystemExit) as error:
+        result = ExitCode.UNCERTAIN
+        detail = diagnostics.getvalue().strip()
+        detail = (detail + "\n" if detail else "") + str(error)
+        print(detail, file=sys.stderr)
+
+    def end_pass() -> None:
+        nonlocal passed
+        if not passed:
+            state = worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+            no_pass: dict[str, object] = {}
+            passed = next((item for item in _pass_records(state)
+                           if item.get("instance_id") == instance and item.get("worker_id") == identity), no_pass)
+        slot = str(passed.get("team_slot", ""))
+        if not slot:
+            raise ValueError(f"{instance}: dispatch pass is unavailable")
+        progress_history.complete_dispatch(run, slot, instance, status="error")
+
+    def notice() -> None:
+        if not completion_saved or not reply_saved:
+            _dispatch_notice(parent, identity, run, instance, passed, "error", detail)
+            return
+        row = staff.snapshot().by_id(identity)
+        if row is None:
+            _dispatch_notice(parent, identity, run, instance, passed, "error", detail)
+        else:
+            notify = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
+            notify(str(row.current_session))
+
+    _ = _dispatch_failure_step(identity, "pass end", end_pass)
+    completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
+        run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
+    reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
+    _ = _dispatch_failure_step(identity, "notice", notice)
+    return result
 
 
 def _role_number(name: str, role: WorkerRole) -> int:
@@ -1354,6 +1528,7 @@ class Arguments(argparse.Namespace):
     lens: str = ""
     reply: str = ""
     dispatch_id: str = ""
+    worker_id: str = ""
     fix_cause: str = ""
     fix_pass: int = 0
     activity: str = ""
@@ -1400,8 +1575,13 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--fix-pass", "--pass", type=int, default=0)
     _ = assignment.add_argument("--launcher-command", required=True, help="JSON list of launcher arguments")
     _ = assignment.add_argument("--completion-actions", default="{}")
+    finishing = commands.add_parser("finish-dispatch", help=argparse.SUPPRESS)
+    for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
+        _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
+        if args.command == "finish-dispatch":
+            return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir), args.dispatch_id)
         if args.command == "list" and args.all_parents:
             record = staff.local_snapshot()
             return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)

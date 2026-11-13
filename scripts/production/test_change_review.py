@@ -539,6 +539,13 @@ class ParseTest(unittest.TestCase):
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
         self.assertEqual(change_review.problem("checkpoint(x): y", SEE, ("a.py",)), "")
+        for subject, files in (("Show waiting and starting session states", ("a.py",)),
+                               ("docs: describe session states", ("a.md",)),
+                               ("checkpoint(x): docs", ("a.md",))):
+            with self.subTest(subject=subject, files=files):
+                self.assertIn("needs three parts", change_review.problem(subject, "Change-Review: a worker reads waiting", files))
+                self.assertEqual(change_review.problem(subject, subject, files), "")
+                self.assertEqual(change_review.problem(subject, SEE, files), "")
 
     def test_a_line_without_exactly_three_full_parts_is_refused(self) -> None:
         for value in ("The grid fades | Look across the floor", "A | B | ", " | B | C", "A | B | C | D"):

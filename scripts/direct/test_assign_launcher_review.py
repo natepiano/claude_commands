@@ -130,8 +130,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
             "astra-reviewer", staff.ReportsTo(self.panes.command_case.fixture.parent.id)))
         self.assertEqual({key: value for key, value in records[0].items() if key not in ("held_at", "pid_start")}, {
             "staff_id": row.id, "pid": next(pid for pid, process in self.panes.world.processes.items()
-                                            if process.identity.id == row.current_session),
-            "session_dir": None, "worker": None})
+                                            if process.identity.id == row.current_session)})
         self.assertEqual(len(self.panes.world.launches), 1)
         self.assertEqual(len(self.panes.command_case.agent.submitted), 1)
         run = self.panes.root / "astra-run"

@@ -189,7 +189,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
 
 
     def test_old_row_keeps_unknown_role_and_home_absent(self) -> None:
-        _, _, member = self.tree()
+        _, unit, member = self.tree()
         value = member.to_json()
         self.assertNotIn("role", value)
         self.assertNotIn("home", value)
@@ -200,6 +200,23 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         with redirect_stderr(io.StringIO()):
             staff._transaction(lambda rows: None)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(self.staff_file.read_bytes(), before)
+        for machine in ("natedev", "mac"):
+            row = fixture_worker(f"home-{machine}", unit.id)
+            initial = self.root / f"{machine}-initial-home"
+            newer = self.root / f"{machine}-newer-home"
+            with self.subTest(machine=machine), self.machine(machine):
+                for requested, flags, expected in ((initial, ("--only-unknown",), initial),
+                                                   (newer, ("--only-unknown",), initial),
+                                                   (newer, (), newer)):
+                    with self.subTest(requested=requested, flags=flags):
+                        before_home = self.staff_state()
+                        result = self.cli("set-home", row.id, str(requested), *flags, "--json")
+                        changed = replace(row, home=staff.SessionHome(expected))
+                        self.assertEqual(json.loads(result.stdout), changed.to_json())
+                        self.assertEqual(staff.by_id(row.id), changed)
+                        if requested == newer and flags:
+                            self.assertEqual(self.staff_state(), before_home)
+        self.assertTrue(any("--only-unknown" in command for command in self.ssh_commands()))
 
     def test_run_pointer_edits_preserve_other_fields_and_a_newer_run(self) -> None:
         _, unit, _ = self.tree()

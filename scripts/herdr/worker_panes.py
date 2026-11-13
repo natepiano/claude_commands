@@ -827,7 +827,8 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
             completion = _completed_turn(worker.row, passed.get("instance_id"))
         else:
-            return _final_reply(worker.row)
+            return (CloseAllowed() if worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
+                    else Kept(f"agent state is {worker.status.value}"))
     else:
         return _final_reply(worker.row)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
