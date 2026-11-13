@@ -972,6 +972,39 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(self.world.closed, expected)
                 self.assertEqual(self.staff_state(), before)
 
+    def test_pass_end_and_restore_close_an_interrupted_worker_without_a_reply_and_keep_a_live_turn(self) -> None:
+        from scripts.production import worker
+
+        cases = (("restore", "idle"), ("restore", "done"), ("restore", "working"),
+                 ("finish-phase", "idle"), ("finish-phase", "working"), ("finish-run", "idle"))
+        for index, (operation, status) in enumerate(cases, start=1):
+            with self.subTest(operation=operation, status=status):
+                row = self.worker(f"interrupted-{index}")
+                pane = f"w1:p{index}"
+                self.world.add(row, pane)
+                backend = staff.backend(row)
+                assert isinstance(backend, staff.ClaudeBackend)
+                write_text_atomic(worker_admission.transcript_source(row, backend), "")
+                self.world.locations[pane]["agent_status"] = status
+                run = self.run_state()
+                phase = "earlier"
+                if operation in {"finish-phase", "finish-run"}:
+                    phase = f"finish-{index}"
+                    self.record_command("start-phase", "--phase-id", phase, "--phase-title", "Interrupted", at=1)
+                prompt = run / "prompt.md"
+                write_text_atomic(prompt, "Preserve the source behavior.\n")
+                _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
+                    worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
+                before = self.staff_state()
+                if operation in {"finish-phase", "finish-run"}:
+                    self.record_command(operation, "--status", "completed", at=3)
+                else:
+                    self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)
+                    self.assertEqual(worker.restore(self.parent.id, only=frozenset({row.id}),
+                        runs={str(self.parent.current_session): [str(run)]}), worker.ExitCode.OK)
+                self.assertEqual(pane in self.world.locations, status == "working")
+                self.assertEqual(self.staff_state(), before)
+
     def test_unbound_idle_worker_can_close_and_end_its_own_labelled_pane(self) -> None:
         from scripts.production import worker
 
