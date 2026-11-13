@@ -3641,35 +3641,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 242 — The notifier tests start fewer shells  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `message/test_notifier.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 open module; sdlc owner go 2026-11-13 14:40, profile first. Cached gate median 36.4 CPU s. Each `run_cli` (`test_notifier.py:178`) starts zsh; timer fixtures also start Python monitors.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD message/test_notifier.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Remove repeated process starts that a test does not check. Keep a real zsh start where a test checks shell integration, exit status, signals or waits. Use the existing `invoke_cli` pattern where a test checks only content.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/message/test_notifier.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 205: content tests run in process; shell starts that check integration stay.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `run_cli` in `message/test_notifier.py` computes the shown zone in process (`invoke_cli`, `user_zone.CONF` bound per call) and passes `SHOWN_ZONE` to zsh; two zone-read cases keep the real shell (`@process_boundary`).
+- aws pairs: median CPU 11.749 -> 9.014 s; peak 112.8 -> 109.2 MiB. 35 tests and 172 assertions unchanged.
+- Review F001 (config binding, then relative paths) and F002 (helper failure keeps the shell start) closed in two repair rounds. Checkpoint 4afd7c4f5.
 
 ### Phase 243 — The rename tests reuse their restored fixture state  · status: done
 **Depends on:** none
