@@ -2330,6 +2330,12 @@ class RestartTests(RestartTestCase):
                 observed = herdr.NativeAgentProcess(herdr.EnvironmentThread(
                     "wrong" if failure == "wrong identity" else producer.current_session), "fixture-start",
                     {"HERDR_PANE_ID": "new", "HERDR_SESSION": "agents", "CLAUDE_CONFIG_DIR": str(self.root / ".claude2")})
+                process_info = client.result
+                def current_process(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments == ("pane", "process-info", "--pane", "new") and producer.current_session in self.running:
+                        return {"process_info": {"shell_pid": 998042, "foreground_process_group_id": 456,
+                            "foreground_processes": [{"pid": 456, "name": "claude", "argv": ["claude"]}]}}
+                    return process_info(*arguments, deadline=deadline)
                 def close_source(pane: str) -> bool:
                     source_client.close_tab_of(pane)
                     return True
@@ -2347,6 +2353,7 @@ class RestartTests(RestartTestCase):
                       patch.object(herdr, "shared_session", return_value="agents"),
                       patch.object(herdr, "Herdr", side_effect=client_for), source_scope,
                       patch.object(client, "panes", side_effect=panes),
+                      patch.object(client, "result", side_effect=current_process),
                       patch.object(client, "pane_activity", side_effect=activity),
                       patch.object(client, "close_tab_confirmed", side_effect=close_destination) as destination_close,
                       (patch.object(source_client, "close_tab_confirmed", side_effect=close_source)
@@ -2361,7 +2368,7 @@ class RestartTests(RestartTestCase):
                         self.assertEqual(pane_record.read("agents"), {"old": original})
                     else:
                         self.assertEqual(restart.start_row(producer, record, client), "new")
-                        self.assertEqual(list(pane_record.read("agents")), ["new"])
+                        self.assertEqual(list(pane_record.read("agents")), ["new"] if cross else ["new", "old"])
                         second = stop_resume.resume(producer.name)
                         self.assertIsInstance(second, stop_resume.ClaudeUp)
                         assert isinstance(second, stop_resume.ClaudeUp)
@@ -3000,6 +3007,34 @@ class RestartTests(RestartTestCase):
         self.assertEqual(launch.call_args.args[1], herdr.ExistingPane("w1:p0", "original-terminal"))
         opened.assert_not_called()
         closed.assert_not_called()
+
+        with self.subTest(source="agent exits after the scan"):
+            reads = 0
+
+            def process_info(*arguments: str) -> dict[str, object]:
+                nonlocal reads
+                self.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p0"))
+                reads += 1
+                pid = 990100 if reads == 1 else 990090
+                return {"process_info": {"shell_pid": 990090, "foreground_process_group_id": pid,
+                    "foreground_processes": [{"pid": pid, "name": "claude" if reads == 1 else "zsh",
+                                               "argv": ["claude"] if reads == 1 else ["zsh"]}]}}
+
+            with (patch.object(pane_record, "publication_for_session", return_value=self.retained_director()),
+                  patch.object(herdr.Herdr, "saved_row_tab", return_value=herdr.NewTab("saved", row.name)),
+                  patch.object(herdr.Herdr, "panes", return_value=[pane]),
+                  patch.object(herdr.Herdr, "result", side_effect=process_info),
+                  patch.object(herdr, "native_process", side_effect=herdr.NativeRegistryUnavailable(
+                      "pid 990100: native registry identity is unavailable")),
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired())) as launch,
+                  patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell()),
+                  patch.object(herdr, "open_tab") as opened,
+                  patch.object(herdr.Herdr, "close_tab_confirmed") as closed):
+                self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents")), "w1:p0")
+            self.assertEqual(launch.call_args.args[1], herdr.ExistingPane("w1:p0", "original-terminal"))
+            opened.assert_not_called()
+            closed.assert_not_called()
 
     def test_retained_shell_from_another_session_keeps_the_saved_destination(self) -> None:
         row = self.rows[0]

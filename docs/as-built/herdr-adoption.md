@@ -323,6 +323,22 @@ A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
 
+Restart refreshes each retained unknown director pane once, without a delay.
+It reuses that pane when the read proves a shell with no native agent.
+A successful replacement closes the retained shell through the existing restore path.
+A pane with a live agent or another row stays open.
+The source record stays until closure, absence, or another native owner is proved.
+Producer publication also keeps a prior binding while its pane remains open.
+It removes a prior binding when a read proves absence or another native owner.
+Consumers select a proved native pane before retained bindings.
+When no native pane exists, consumers select the newest retained publication and keep the older records.
+
+Retirement stops the unit and its workers before it closes their panes.
+It closes each owned retained shell across tabs, even when the director pane is absent.
+It keeps foreign panes and live agents.
+herdr removes a tab when its last pane closes.
+Retirement cannot find an idle shell whose launch record was lost before this fix.
+
 Producers use their current `[producers]` model and effort through the shared launch code.
 Codex producers select the workers account; Claude producers select the showrunners account.
 An explicit target account overrides that selection.

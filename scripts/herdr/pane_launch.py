@@ -218,7 +218,7 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
                     record: staff.StaffSnapshot, client: NativePaneServer,
                     entries: Mapping[str, PaneLaunch], *,
                     evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT) -> list[dict[str, object]]:
-    """Select the current native pane, or its retained shell after the process stops."""
+    """Select the current native pane, or its newest retained shell after the process stops."""
     owner = record.by_id(reference.id) if isinstance(reference, StaffLaunchReference) else None
     if isinstance(reference, StaffLaunchReference) and owner is None:
         return []
@@ -247,11 +247,16 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     occupied = {str(pane["pane_id"]) for matches in found.values() for pane in matches}
     candidates = [pane for pane in panes
                   if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
-                  and str(pane["pane_id"]) not in unknown]
+                  and (owner is None or owner.kind != "worker" or str(pane["pane_id"]) not in unknown)]
     if owner is not None:
-        return [dict(pane) for pane in candidates
-                if _retained_native_owner(client, pane, owner, record)]
-    return [dict(pane) for pane in candidates if not decoded[str(pane["pane_id"])]]
+        retained_matches = [dict(pane) for pane in candidates
+                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
+                                _retained_native_owner(client, pane, owner, record))]
+    else:
+        retained_matches = [dict(pane) for pane in candidates
+                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
+                                not decoded[str(pane["pane_id"])])]
+    return sorted(retained_matches, key=lambda pane: entries[str(pane["pane_id"])]["written_at"], reverse=True)[:1]
 
 
 class NativePaneDecoder(Protocol):
@@ -263,6 +268,10 @@ class NativePaneDecoder(Protocol):
 
 def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
     info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
+    return _native_sessions(info, pane)
+
+
+def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
     identities: set[str] = set()
     for process in cast(list[dict[str, object]], info.get("foreground_processes", [])):
@@ -271,6 +280,17 @@ def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set
         if kind:
             identities.add(decoder.pane_native_process(info, kind, pane).current_identity)
     return identities
+
+
+def _retained_shell(client: NativePaneServer, pane: Mapping[str, object]) -> bool:
+    """Refresh a retained unknown pane once after its agent can exit."""
+    try:
+        info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
+        shell = info.get("shell_pid")
+        return (isinstance(shell, int) and shell > 0 and info.get("foreground_process_group_id") == shell
+                and not _native_sessions(info, pane))
+    except (OSError, ValueError, herdr_types.HerdrFailure):
+        return False
 
 
 def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
@@ -690,7 +710,7 @@ def write(path: Path, launch: PaneLaunch, *, sources: Sequence[Path] = ()) -> No
 def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
                       membership: staff.StaffSnapshot, sources: Sequence[Path],
                       request: ProducerLaunchRequest | ProducerLaunchFromStaff) -> None:
-    """Commit one proved producer binding and remove its other bindings without closing panes."""
+    """Commit the producer binding. Keep open prior bindings unless another native owner holds the pane."""
     paths = sorted({path.absolute(), *(source.absolute() for source in sources)})
     if any(source.parent != path.absolute().parent for source in paths):
         raise ValueError("producer publication paths must share the record directory")
@@ -751,9 +771,31 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         raise ValueError("producer process changed before publication")
     committed = retained_launch(launch, membership)
     committed["producer_binding"] = True
-    updates = {source: {pane: entry for pane, entry in entries.items()
-                         if launch_reference(entry, membership) != StaffLaunchReference(owner.id)}
-               for source, entries in records.items()}
+    updates = {source: entries.copy() for source, entries in records.items()}
+    for source, entries in records.items():
+        prior = {pane for pane, entry in entries.items()
+                 if launch_reference(entry, membership) == StaffLaunchReference(owner.id)
+                 and (source != path.absolute() or pane != launch["pane_id"])}
+        if not prior:
+            continue
+        try:
+            client = cast(Callable[[str], NativePaneServer],
+                          import_module("scripts.herdr.herdr").Herdr)(source.stem)
+            present = {str(pane["pane_id"]): pane for pane in client.panes()}
+        except (OSError, ValueError, herdr_types.HerdrFailure):
+            continue
+        dropped = prior - present.keys()
+        for pane in prior & present.keys():
+            try:
+                identities = native_sessions(client, present[pane])
+                if identities and all(current is not None and current.id != owner.id
+                                      for identity in identities
+                                      for current in (membership.by_member_reference(identity),)):
+                    dropped.add(pane)
+            except (OSError, ValueError, herdr_types.HerdrFailure):
+                continue
+        for pane in dropped:
+            del updates[source][pane]
     updates[path.absolute()][launch["pane_id"]] = committed
     changed = {source: entries for source, entries in updates.items() if entries != records[source]}
     if len(changed) > 1:
@@ -835,6 +877,7 @@ class ResumeSourcePane:
 
 class ResumeSourceAbsent(Enum):
     CURRENT = "the operation found no source pane"
+    OTHER_OWNER = "another native owner holds the recorded pane"
 
 
 def resume_attempt(path: Path, pane_id: str) -> ResumeAttempt:
@@ -971,7 +1014,7 @@ def finish_restore(path: Path, original: PaneLaunch, attempt: ResumeAttempt,
                            source_pane=source_pane)
         raise
     source_close = close if isinstance(close_source, ResumeRecord) else close_source
-    if source and source_close(source) is not True:
+    if source_pane is not ResumeSourceAbsent.OTHER_OWNER and (not source or source_close(source) is not True):
         return
     if destination_path == path:
         retire_launch(path, original["pane_id"], original, replacement=retained)

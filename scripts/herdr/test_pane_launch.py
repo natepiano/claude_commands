@@ -62,7 +62,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
     def test_producer_publication_replaces_only_its_proved_binding(self) -> None:
         cases = ("control same pane", "move", "native reference", "different records", "interrupted records", "interrupted then unit write",
                  "wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process",
-                 "stale publication", "repeated publication", "requested account", "wrong requested account", "separate wrong requested account", "compaction after clear", "staff facts removed")
+                 "stale publication", "repeated publication", "requested account", "wrong requested account", "separate wrong requested account", "compaction after clear", "staff facts removed", "closed prior pane", "foreign prior pane")
         for kind in ("claude", "codex"):
             for case in cases:
                 with self.subTest(kind=kind, case=case), tempfile.TemporaryDirectory() as directory:
@@ -113,10 +113,20 @@ class LaunchEnvironmentTests(unittest.TestCase):
                              root / "destination-account" if case in ("requested account", "compaction after clear") else root / "account")})
                     request = pane_launch.ProducerLaunchRequest(owner.id, owner.current_session, kind,
                                                                root, root / "destination-account")
+                    def native_process(pid: int, family: str, reported: str = "") -> herdr.NativeAgentProcess:
+                        del family, reported
+                        return (replace(observed, identity=herdr.EnvironmentThread(other.current_session))
+                                if pid == 999 else observed)
                     with (patch.object(staff, "initial_snapshot", return_value=record),
                           patch.object(staff, "local_snapshot", return_value=record),
                           patch.dict("os.environ", {"MODELS_CONFIG_FILE": str(registry)}),
-                          patch.object(herdr, "native_process", return_value=observed),
+                          patch.object(herdr, "native_process", side_effect=native_process),
+                          patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                              "shell_pid": 998, "foreground_process_group_id": 999,
+                              "foreground_processes": [{"pid": 999, "name": kind, "argv": [kind]}]}})
+                          if case == "foreign prior pane" else nullcontext(),
+                          patch.object(herdr.Herdr, "panes", return_value=[] if case == "closed prior pane" else
+                                       [{"pane_id": "old"}]),
                           pane_launch.producer_launch_request(request) if case in ("requested account", "wrong requested account", "compaction after clear") else nullcontext()):
                         if case == "separate wrong requested account":
                             environment = {"HERDR_PRODUCER_LAUNCH_REQUEST" + owner.id.encode().hex(): json.dumps({
@@ -139,9 +149,9 @@ class LaunchEnvironmentTests(unittest.TestCase):
                         if case in ("interrupted records", "interrupted then unit write"):
                             publish = atomic_file.write_text_atomic
                             def interrupt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
-                                if path == source:
-                                    raise OSError("fixture interrupted publication")
                                 publish(path, text, new_file_mode=new_file_mode)
+                                if path == destination:
+                                    raise OSError("fixture interrupted publication")
                             with patch.object(atomic_file, "write_text_atomic", side_effect=interrupt):
                                 with self.assertRaises(OSError):
                                     pane_launch.write(destination, launch, sources=(source, destination))
@@ -177,7 +187,9 @@ class LaunchEnvironmentTests(unittest.TestCase):
                             pane_launch.write(destination, launch, sources=(source, destination))
                             self.assertEqual(destination.read_bytes(), before)
                     combined = {pane: entry for path in {source, destination} for pane, entry in pane_launch.read_strict(path).items()}
-                    self.assertEqual(combined, {**unrelated, target: committed})
+                    prior = ({"old": pane_launch.retained_launch(old, record)}
+                             if target != "old" and case not in ("closed prior pane", "foreign prior pane") else {})
+                    self.assertEqual(combined, {**unrelated, **prior, target: committed})
                     self.assertEqual(cast(pane_launch.StaffPaneLaunch, committed)["staff_id"], owner.id)
 
     def test_readout_keeps_a_staffed_pane_with_an_unknown_home(self) -> None:

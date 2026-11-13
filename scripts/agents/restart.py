@@ -499,6 +499,11 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                         and (pane in evidence.scan.found.get(row.id, ())
                              or isinstance(client.pane_activity(str(pane["pane_id"])), herdr.PaneAtShell))):
                     target = herdr.ExistingPane(str(pane["pane_id"]), str(pane["terminal_id"]))
+            elif original is not None and not any(pane["pane_id"] == original["pane_id"] for pane in locations):
+                source_pane = pane_launch.ResumeSourcePane(original["pane_id"])
+            elif original is not None and any(pane["pane_id"] == original["pane_id"]
+                    for owner_id, matches in evidence.scan.found.items() if owner_id != row.id for pane in matches):
+                source_pane = pane_launch.ResumeSourceAbsent.OTHER_OWNER
         except (OSError, ValueError, herdr_types.HerdrFailure) as error:
             _anomaly(row, error)
         # Read liveness again immediately before the launch.
