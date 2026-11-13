@@ -3532,3 +3532,32 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `unit_move.processes_inside` scanned the host `/proc` and ignored `HERDR_PROC`, so one move mixed host processes with private test records. It now reads `herdr.proc_root()`; `herdr._proc_root` is renamed with no alias. The fixtures (`rename_unit_test_support.py`, `rename_test_support.py`) publish the private process records the host scan never needed; `UnitRenameFixture` links only its own direct children for one call and skips that bridge on Darwin. A direct test in `test_unit_move.py` covers exact, descendant, unrelated and deleted cwd paths. No assertion changes. aws pairs: unit move 18.22 to 17.47 CPU s, shutdown CLI 36.95 to 36.54 CPU s, lower in every pair; peak 148.0 to 147.4 and 226.7 to 225.7 MiB. natedev medians fell 32–35%, because natedev has many host processes. On the aws trial guest, 18 shutdown CLI resume tests fail on base and changed alike; impl4 diagnoses. Checkpoint `46ab6fa60`.
 
+### Phase 230 — Find the tests that scan every host process  · status: todo
+**Depends on:** Phase 229
+
+#### Work Order
+
+**Goal:** a measured list of every test path that scans all host processes, with the cost of each scan on natedev and the fix for each.
+
+**Decision:** director, 2026-11-13. Phase 229 found that `unit_move.processes_inside` scanned the host `/proc` in tests. That cost 32–35% of two modules' CPU on natedev and about 1–4% on the aws guest, which has few processes. Targeted test runs happen on natedev, so the same defect class elsewhere costs the user directly. About 28 production files read `/proc`. This is a research phase: it changes no repository file.
+
+**Spec:**
+1. List each production function that walks all processes: `Path("/proc").iterdir()`, a `/proc` glob, `ps -e`/`ps ax`, `pgrep`, `lsof` with no pid filter, or `psutil.process_iter`. Give file:line.
+2. For each function, say whether it honors the selected process root (`herdr.proc_root()` or `HERDR_PROC`). Say which test modules reach it, and how often per module run. Use a counting probe or a sampling profiler. Do not trust cProfile totals.
+3. Measure on natedev the CPU each scan costs per module run. Use paired runs: the module as is, against the module with that scan pointed at a small private process root. Run each heavy probe under `systemd-run --user --scope -q -p MemoryMax=2G`.
+4. Rank the functions by total CPU across all modules. For each one above 0.5 CPU s, propose the fix where the defect lives. A test that proves a real process boundary keeps its real process.
+5. Also run `module_cost.py --tests 10 --commands 15` on `direct/test_verify_wait_holder.py`, `production/test_fast_track.py` and `style/test_crate_run.py`, the three slowest gate modules now. Name their top costs.
+6. Send the director one report with the two ranked tables. Change no repository file. Delete raw traces after you read them.
+
+**Files:** none (read only). Probe scripts stay under the phase folder.
+
+**Workers:** 1 writer (read only); the report is one document.
+- impl: all probes.
+
+**Constraints from prior phases:**
+- Phase 229: `herdr.proc_root()` is the one public process-root reader. Fixtures that use a private root must publish every process record the code reads.
+- Phase 190: the verify harness target commands are near a practical floor; name any new cost against that finding.
+
+**Acceptance gate:**
+- Two ranked tables with file:line, reaching modules, measured CPU and a proposed fix.
+- No repository file changes.
