@@ -133,9 +133,18 @@ class SessionSendTests(unittest.TestCase):
             sender = root / "send.py"
             _ = sender.write_text("print('fake sender ran')\n")
             _ = (root / "lint.conf").write_text("# range: 1..\nsweep_sender_timeout_seconds=17\n")
+            startup = root / "startup"
+            startup.mkdir()
+            helper = Path(__file__).resolve().parents[1] / "lib/python_startup/sitecustomize.py"
+            _ = (startup / "sitecustomize.py").write_text(
+                "import runpy, sys\n" + f"startup = runpy.run_path({str(helper)!r})\n"
+                + "startup['select_checkout'](sys.argv)\n"
+                + "startup['next_sitecustomize'](__file__)\n"
+                + "startup['finish_startup'](__file__, sys.argv)\n")
             environment = {**os.environ, "HOME": str(root / "home"), "CONF_DIR": str(root),
                            "BUILDLOG_DIR": str(root / "buildlog"),
-                           "TEST_SENDER_GUARD": str(root / "refused")}
+                           "TEST_SENDER_GUARD": str(root / "refused"),
+                           "PYTHONPATH": os.pathsep.join((str(startup), os.environ.get("PYTHONPATH", "")))}
             return subprocess.run(
                 [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", GUARD_PROBE, str(sender), mode],
                 cwd=Path(__file__).resolve().parents[2], env=environment,
@@ -186,6 +195,8 @@ class SessionSendTests(unittest.TestCase):
                                  [sys.executable, str(sender), *arguments])
         self.assertEqual(session_send.send_argv(*arguments),
                          [sys.executable, str(session_send.SEND_SCRIPT), *arguments])
+        self.assertEqual(session_send.send_argv(*arguments, python_interpreter=session_send.PYTHON_LAUNCHER),
+                         [str(session_send.PYTHON_LAUNCHER), str(session_send.SEND_SCRIPT), *arguments])
 
     def test_general_command_reads_the_current_sender_at_call_time(self) -> None:
         sender = Path("/fixture/patched-send.py")

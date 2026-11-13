@@ -53,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from scripts.message import session_send
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
@@ -478,9 +479,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
 
 def request_template_fix(record: ReviewedPushRecord) -> None:
     """Direct timer callers use the sender's daily repair-notice handler too."""
-    sender = Path(__file__).resolve().parents[1] / "message/send.py"
     try:
-        _ = subprocess.Popen([sys.executable, str(sender), "template-fix", json.dumps(record)],
+        _ = subprocess.Popen(session_send.send_argv("template-fix", json.dumps(record)),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as error:

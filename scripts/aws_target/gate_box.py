@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import hmac
+import inspect
 import json
 import shlex
 from pathlib import Path
@@ -12,6 +13,8 @@ from urllib.parse import quote
 from typing import TYPE_CHECKING, cast
 from enum import StrEnum
 import math
+
+from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
@@ -349,7 +352,7 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
 
 
 # The live bootstrap verifies the tree before it calls the candidate entry point.
-GUEST = r'''import concurrent.futures, datetime, importlib, json, os, pathlib, sqlite3, subprocess, sys, time, traceback
+GUEST = (r'''import concurrent.futures, datetime, importlib, json, os, pathlib, sqlite3, subprocess, sys, time, traceback
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
@@ -426,7 +429,12 @@ try:
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
-        sys.path.insert(0, str(repo))
+        from types import ModuleType
+        startup = ModuleType('_devtools_python_startup')
+        startup.__file__ = __GATE_STARTUP_FILENAME__
+        sys.modules[startup.__name__] = startup
+        exec(__GATE_STARTUP_SOURCE__, startup.__dict__)
+        startup.select_checkout(sys.argv)
         candidate_path = repo / 'scripts/aws_target/gate_box.py'
         if not candidate_path.is_file():
             raise RuntimeError('candidate predates guest entry point')
@@ -464,7 +472,8 @@ finally:
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
-'''
+'''.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup)))
+    .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
 
 
 def log_upload(links: dict[str, str]) -> str:

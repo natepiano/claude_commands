@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tomllib
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
@@ -279,7 +278,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                     target = members[staff.StaffId(current["unit_id"])] if recipient == "unit" else owner
                     address = f"session:{target.current_session}"
                     result = subprocess.run(
-                        [sys.executable, script, "--to", address, "--from", owner.name, "--text", text],
+                        session_send.send_argv("--to", address, "--from", owner.name, "--text", text, send_script=Path(script)),
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:

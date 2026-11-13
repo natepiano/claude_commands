@@ -128,10 +128,10 @@ class NoticeRetryTests(unittest.TestCase):
         self.assertEqual((self.state / codex_winddown.QUIET).read_text(encoding="utf-8"), "sent\n")
 
     def test_a_running_count_before_the_quiet_claim_cancels_the_pass(self) -> None:
-        def prepare(_push: object) -> list[str]:
+        def prepare(_push: object, *, send_script: Path) -> list[str]:
             self.assertFalse((self.state / codex_winddown.QUIET).exists())
             codex_winddown.announce_quiet(1)
-            return [sys.executable, str(self.state / "fake-send.py")]
+            return [sys.executable, str(send_script)]
 
         with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
