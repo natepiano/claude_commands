@@ -2391,7 +2391,7 @@ class StopResumeTests(unittest.TestCase):
         task = ["--role", "review", "--model", "gpt-6.1", "--effort", "high",
                 "--image", "/image one.png", "--image", "/image two.png", "--operation", "follow",
                 "--held-role", "reviewer", "--held-design", "design-id", "--family", "codex",
-                "--phase", "3t", "--lens", "contract", "--pass", "4", "--summary", "/summary file",
+                "--phase", "3t", "--lens", "contract", "--pass", "4", "--reply-file", "/summary file",
                 "--early-ready", "/ready file", "--style-since", "abc", "--style-until", "def",
                 "--diff", "/saved diff", "--log", "/saved log", "--id-file", "/saved id",
                 "--from-session-dir", "/former run", "--fix-cause", "keep this cause", "--paths", "/saved paths"]

@@ -4142,7 +4142,7 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(resumed, first)
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
             original_prompt = prompt.read_text()
-            for changed_command in (command, [*command, "--summary", str(self.root / "summary.txt")]):
+            for changed_command in (command, [*command, "--reply-file", str(self.root / "summary.txt")]):
                 with self.subTest(prompt="changed active content", launcher=changed_command):
                     _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
                     with self.assertRaisesRegex(RuntimeError, "different prompt content"):

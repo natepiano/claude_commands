@@ -38,6 +38,10 @@ Usage reports compare checkpointed phases through the usage store.
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery or an accepted detached compaction. Both return exit 0.
+`assign.sh` and `assign.py` accept `--reply-file <absolute path>` for the reply output.
+Text, relative paths, and empty values exit 2 before dispatch.
+The old `--summary` option exits 2 and names `--reply-file`.
+Both reply writes and dispatch reply paths use the checked `Arguments.reply_file` value.
 The early return prints `compaction runs detached; the prompt follows` with the worker name.
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
