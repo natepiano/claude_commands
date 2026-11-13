@@ -669,19 +669,10 @@ class WaitOutput:
         snapshot = reply.snapshot
         decision, peak = snapshot.decision, snapshot.peak
         subject = f"{snapshot.repo} {snapshot.step}".strip()
-        count = peak.count
-        descriptions = {"measured": f"the 90th percentile of {count} measured runs",
-            "buildlog": f"0.65 of the 90th percentile peak of {count} runs",
-            "pooled": f"the 90th percentile of {count} measured runs of this step in every repo",
-            "shape": ("the same-shape fallback: no earlier builds" if not count else
-                      f"a same-shape promise from {count} earlier builds")}
-        description = descriptions.get(peak.source, "no history, so the fallback")
         prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
                   if first else f"still waiting for memory ({int(now - self.started) // 60} min)")
         text = (f"{prefix}: the machine has {snapshot.available / records.GIB:.1f} GiB free; "
             f"a build starts at {decision.threshold / records.GIB:.1f} ({subject}: {peak.bytes / records.GIB:.3f} GiB needed")
-        if first:
-            text += f", {description}"
         if reply.position == 1 and self.last_position != 1:
             text += "; this step is now first in line"
         self.last_position = reply.position

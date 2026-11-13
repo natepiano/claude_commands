@@ -439,8 +439,27 @@ StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | Compiler
 
 
 @dataclass(frozen=True)
-class NoPressureHold:
+class PressureMeasurements:
+    full_avg10: float
+    some_avg10: float
+    swap_used_percent: float
+
+
+@dataclass(frozen=True)
+class PressureMeasurementsNotRecorded:
     pass
+
+
+PRESSURE_MEASUREMENTS_NOT_RECORDED = PressureMeasurementsNotRecorded()
+
+
+@dataclass(frozen=True, init=False)
+class NoPressureHold:
+    measurements: PressureMeasurements | PressureMeasurementsNotRecorded
+
+    def __init__(self, measurements: PressureMeasurements | PressureMeasurementsNotRecorded = PRESSURE_MEASUREMENTS_NOT_RECORDED) -> None:
+        # The wire requires this field, including an explicit unrecorded state.
+        object.__setattr__(self, "measurements", measurements)
 
 
 @dataclass(frozen=True)

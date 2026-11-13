@@ -21,6 +21,8 @@ try {
   const page = await readFile(join(folder, 'memory_live.html'));
   const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
+  const layoutBeforePage = page.toString('utf8').replace('.walk.measuring .walk-table { position: static; left: auto; width: max-content; overflow: visible; }', '');
+  const shortfallBeforePage = process.argv[4] ? (await readFile(process.argv[4], 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -48,6 +50,7 @@ try {
     {name:'not in a group',detail:'user.slice',kind:'ungrouped',bytes:1024,swap:1024/1024**3},
     {name:'not attributed',detail:'Host swap minus the named groups.',kind:'unattributed',bytes:7,swap:7/1024**3},
     {name:'Total',detail:'SwapTotal minus SwapFree',kind:'total',bytes:base.swap_used*1024**3,swap:base.swap_used}];
+  base.psi.swap = 100 * base.swap_used / base.swap_total;
   readings.shrink = structuredClone(base);
   const extra = structuredClone(base.walk.find(row => row.queued));
   extra.name = 'second nextest'; extra.pid = 222;
@@ -91,7 +94,7 @@ try {
   const server = createServer((req, res) => {
     const isData = req.url.startsWith('/memory.json');
     res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : req.url === '/layout-before.html' ? layoutBeforePage : req.url === '/shortfall-before.html' ? shortfallBeforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
@@ -192,12 +195,21 @@ try {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
           const data = ${JSON.stringify(reading)};
-          data.read_at = Date.now()/1000;
+          const shift=Date.now()/1000-data.read_at;
+          for(const row of data.walk) if(row.started_at) row.started_at+=shift;
+          for(const row of data.waiters) row.since+=shift;
+          data.read_at+=shift;
           latest = data;
           window.renderReading(data);
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          fitLabels();
+          const before={layout:$('walk').className,cap:$('mark').getBoundingClientRect().left};
+          fitLabels();
+          const after={layout:$('walk').className,cap:$('mark').getBoundingClientRect().left};
+          if(before.layout!==after.layout || Math.abs(before.cap-after.cap)>0.1)
+            throw new Error('Layout changes on repeated measurement: '+JSON.stringify({before,after}));
           return true;
         })()`);
         for (const theme of ['light','dark']) {
@@ -252,6 +264,7 @@ try {
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
                 queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
                 stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
+                upper:[...document.querySelectorAll('#ticks-top span')].filter(e=>!e.hidden).map(e=>Number(e.textContent)),
                 layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
                 rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
                   const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
@@ -305,7 +318,7 @@ try {
             assert.ok(!/pid (70|80)\b/.test(proof.leftover), 'The leftover list includes a live build or compiler service.');
             assert.equal(proof.historyWindow,'Oct 31, 2026 – Nov 7, 2026 · America/New_York');
             assert.match(proof.costWindow,/^Nov 4, 2026 – Nov 7, 2026 · America\/New_York/);
-            assert.equal(proof.pressureReason,'Pressure is unreadable: /private/proc/pressure/memory');
+            assert.match(proof.pressureReason,/not recorded|unavailable|unreadable/i);
             assert.ok(proof.charts > 0, 'The history section has no chart.');
             assert.match(proof.top, /Memory wait/);
             assert.match(proof.top, /fixture-owner/);
@@ -324,7 +337,7 @@ try {
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
             assert.ok(proof.swapContrast >= 4.5, 'The swap text contrast is below 4.5:1.');
             assert.ok(Math.abs(proof.swapBaseline) <= 1, 'The swap labels use different baselines.');
-            assert.ok(proof.lower.every(value => value < base.cap), 'The lower axis reaches the cap.');
+            assert.deepEqual(proof.lower,proof.upper,'The Running axis differs from the summary axis.');
             assert.ok(Math.abs(proof.rowLeft-proof.headingLeft)<=1, 'The rows miss the card text edge.');
             assert.equal(proof.reservedAmount,proof.dimColor);
             assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
@@ -338,6 +351,7 @@ try {
             const shot = await call('Page.captureScreenshot', {format:'png', captureBeyondViewport:true,
               clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
             const pixels = Buffer.from(shot.data,'base64');
+            await writeFile(join(folder,`${theme}-${width}.png`),pixels);
             const pixel=pngPixels(pixels);
             const expected=proof.progressColor.match(/[0-9.]+/g).slice(0,3).map(Number);
             const x=Math.floor(proof.progress.left+proof.progress.width/2);
@@ -501,7 +515,7 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
+                slots:'cloud '+latest.cloud_slots_used+' of '+latest.cloud_slots+' slots',
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
             assert.deepEqual(cloudProof.headings,['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
@@ -563,35 +577,18 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
-            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
-              ['priority_unmatched',''],['good','']]) {
+            for (const [name, matched] of [['priority',true],['priority_unmatched',false],['good',false]]) {
               await show(readings[name]);
-              const priority=await evaluate(`(() => {
-                const index=latest.walk.findIndex(row=>row.queued);
-                return tipText('row:'+index,latest).join(' ');
-              })()`);
-              assert.equal(priority.includes("queue priority:"),!!expected);
-              if(expected) assert.ok(priority.includes(expected));
-              const heading=await evaluate("tipText('walkhead',latest).join(' ')");
-              const unmatched=name==='priority_unmatched';
-              assert.equal(heading.includes("queue priority:"),unmatched);
-              if(unmatched) assert.equal(heading.split("queue priority: research (the user's bump)").length-1,1);
-              if(unmatched && theme==='dark' && width===1400) {
-                const clip=await evaluate(`(() => {
-                  const heading=document.querySelector('[data-tip="walkhead"]');
-                  heading.scrollIntoView({block:'start'});
-                  const h=heading.getBoundingClientRect();
-                  heading.dispatchEvent(new MouseEvent('click',{bubbles:true,clientX:h.left+10,clientY:h.bottom}));
-                  const tip=document.querySelector('#tip');
-                  if(!tip.classList.contains('on') || !tip.textContent.includes(latest.unmatched_priority_text))
-                    throw new Error('The heading click loses the unmatched priority.');
-                  const r=heading.closest('.card').getBoundingClientRect();
-                  return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
-                })()`);
-                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
-                await evaluate("hideTip();window.scrollTo(0,0)");
+              const priority = await evaluate(`tipText('row:'+latest.walk.findIndex(row=>row.queued),latest).join(' ')`);
+              assert.equal(priority.includes('Priority:'), matched);
+              if(matched) assert.ok(priority.includes("Priority: the user's bump"));
+              const list = await evaluate("document.querySelector('#priorities').textContent");
+              assert.equal(list.includes('Priority:'), name === 'priority_unmatched');
+              if(name==='priority_unmatched') {
+                assert.ok(list.includes("Priority: the user's bump · research"));
+                assert.equal(list.split('Priority:').length-1,1);
               }
+              assert.ok(!priority.includes('queue priority:'));
             }
             await show(base);
 
@@ -614,7 +611,7 @@ try {
               assert.equal(ciProof.chart,state==='busy');
               if(state==='busy') assert.equal(ciProof.stage,'—');
               assert.equal(ciProof.ci,0.125);
-              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
+              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' GiB of '+ciReading.cap.toFixed(1)+' GiB taken');
             }
             await show(base);
 
@@ -629,7 +626,7 @@ try {
                   unit:table.querySelector('.unit').textContent,percent:chart.querySelector('.progress-amount').textContent,
                   used:chart.querySelector('.seg-used').getBoundingClientRect().width,
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
-                  tip:tooltipHtml('row:'+index,latest),
+                  tip:renderTooltip(tooltipFor('row:'+index,latest)),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
                   tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead').getBoundingClientRect().bottom};
               });
@@ -649,6 +646,23 @@ try {
               assert.equal(row.hatched,false);
               assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
               assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
+            }
+            if(theme==='dark' && width===1400) {
+              const macTooltip=await evaluate(`(() => {
+                const index=latest.walk.findIndex(row=>row.kind==='mac-build');
+                const key='row:'+index;
+                showTip(key,700,400);
+                const element=document.querySelector('#tip');
+                return {key,spec:tooltipFor(key,latest),width:element.getBoundingClientRect().width,
+                  aligned:[...element.querySelectorAll('dd')].every(cell=>getComputedStyle(cell).textAlign==='right')};
+              })()`);
+              assert.ok(macTooltip.width<=300.5 && macTooltip.aligned,'The Mac tooltip violates the shared shape.');
+              assert.ok(macTooltip.spec.rows.some(row=>row.name==='Status'));
+              assert.ok(macTooltip.spec.rows.some(row=>row.name==='Reading age'));
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+              await writeFile(join(folder,'mac-row-tooltip.png'),Buffer.from(shot.data,'base64'));
+              await writeFile(join(folder,'mac-row-tooltip.json'),JSON.stringify(macTooltip,null,2)+'\n');
+              await evaluate('hideTip()');
             }
             await show(readings.mac_failed);
             const failedMac=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -800,48 +814,250 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
+        const refreshLayoutProofs=[];
+        const pressureDemand=structuredClone(base);
+        const reservedRun=pressureDemand.walk.find(row=>row.queued);
+        const increase=pressureDemand.available+pressureDemand.floor-pressureDemand.reserved;
+        reservedRun.reserved+=increase;
+        reservedRun.counted+=increase;
+        pressureDemand.reserved+=increase;
+        pressureDemand.taken+=increase;
+        pressureDemand.room=0;
+        pressureDemand.shortfall=pressureDemand.floor+pressureDemand.reserved-pressureDemand.available;
+        const refreshLayout = async reading => evaluate(`(async () => {
+          const data=${JSON.stringify(reading)},shift=Date.now()/1000-data.read_at;
+          for(const row of data.walk) if(row.started_at) row.started_at+=shift;
+          for(const row of data.waiters) row.since+=shift;
+          data.read_at+=shift;
+          const previousFetch=window.fetch,previousRender=window.render;
+          try {
+            window.fetch=async()=>({ok:true,json:async()=>structuredClone(data)});
+            window.render=window.renderReading;
+            await tick();
+            await document.fonts.ready;
+            await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+            fitLabels();
+            const cap=document.querySelector('#mark').getBoundingClientRect();
+            return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',cap:cap.left,
+              readAt:latest.read_at,shortfall:latest.shortfall};
+          } finally { window.fetch=previousFetch;window.render=previousRender; }
+        })()`);
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+        for(const version of ['before','after']) {
+          await navigate(version==='before'?'layout-before.html':'memory_live.html');
+          const loaded=await refreshLayout(base);
+          const held=await refreshLayout(pressureDemand);
+          const recovered=await refreshLayout(base);
+          assert.equal(loaded.layout,'beside','A fresh wide page does not use the available table space.');
+          assert.equal(held.layout,'stacked','Full reservation demand does not move the table below the chart.');
+          assert.equal(recovered.layout,version==='before'?'stacked':'beside','Feed recovery retains an incorrect table width.');
+          if(version==='after') assert.ok(Math.abs(recovered.cap-loaded.cap)<0.1,'The same reading moves the cap after a feed refresh.');
+          refreshLayoutProofs.push({version,loaded,held,recovered});
+        }
         const comparisons = [];
-        if (beforePage) {
-          const review = structuredClone(readings.spacing);
-          review.priority_text = "queue priority: port (the user's bump)";
-          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
-          const head = review.waiters[0];
-          Object.assign(head, {name:'port nextest',unit:'port',need:1.9,reason:'free memory',
-            head_text:review.head_text,priority_text:review.priority_text});
-          review.waiters.push({...head,name:'trunk nextest',unit:'trunk',pid:201,
-            reason:'head protection · behind #1',head_text:'',priority_text:''});
-          review.waiters.push({...head,name:'fps nextest',unit:'fps',pid:202,
-            reason:'estimate expired',head_text:'',priority_text:''});
-          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          for (const version of ['after','before']) {
-            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-            await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
-            for (const width of [1400,390]) {
-              await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
-              await show(review);
-              const comparison = await evaluate(`(() => {
-                const walk=document.querySelector('#walk'),card=walk.closest('.card');
-                const r=card.getBoundingClientRect();
-                return {tables:walk.querySelectorAll('table').length,
-                  lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
-                  layout:walk.classList.contains('beside')?'beside':'stacked',
-                  head:tipText('wait:0',latest).join(' '),
-                  clip:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}};
-              })()`);
-              assert.equal(comparison.tables, version === 'after' ? 1 : 0);
-              assert.equal(comparison.lists, version === 'after' ? 0 : 3);
-              if(version === 'after') {
-                assert.equal(comparison.layout,width===1400?'beside':'stacked');
-                for(const value of [review.head_text,review.priority_text,'free memory'])
-                  assert.equal(comparison.head.split(value).length-1,1);
-              }
-              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:comparison.clip});
-              await writeFile(join(folder,`${version}-${width}.png`),Buffer.from(shot.data,'base64'));
-              comparisons.push({version,width,...comparison});
+        const review = structuredClone(base);
+        Object.assign(review,{total:60.5,available:7.6,used:12.4,ci_ram:0,reserved:15.8,taken:28.2,
+          floor:3,shown_safety:3,cap:17,room:0,shortfall:11.2,other:40.5,shown_reserved:4.6});
+        const firstRun = structuredClone(review.walk.find(row => row.queued));
+        review.walk = [{...firstRun,name:'assembly build',unit:'assembly',used:4.5,reserved:11.3,counted:15.8},
+          {...firstRun,name:'widget nextest',unit:'widget',pid:222,used:7.9,reserved:4.5,counted:12.4}];
+        const head = {...review.waiters[0],name:'port nextest',unit:'port',need:1.9,since:review.read_at-420,
+          reason:'free memory',showrunner:'cargo-liner',head:true,priority:{unit:'port',why:'setter unavailable',set_at:0,set_by:''},
+          head_text:'Head: free 7.6 GiB; reserve 3.0 GiB; need 1.9 GiB',
+          priority_text:"queue priority: port (the user's bump)"};
+        review.waiters = [head];
+        const shortfallLayoutProofs=[];
+        for(const width of [1400,390]) {
+          await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
+          for(const version of shortfallBeforePage ? ['before','after'] : ['after']) {
+            await navigate(version==='before'?'shortfall-before.html':'memory_live.html');
+            await show(review);
+            const layout=await evaluate(`(() => {
+              hideTip();
+              const table=document.querySelector('.walk-table');
+              const cells=[...table.querySelectorAll('.step .cell-text,.unit .cell-text')].map(cell=>({
+                text:cell.textContent,width:cell.clientWidth,content:cell.scrollWidth}));
+              const axis=id=>[...document.querySelectorAll('#'+id+' span')].map(tick=>({
+                value:Number(tick.textContent),position:tick.style.left,hidden:tick.hidden}));
+              return {cells,upper:axis('ticks-top'),lower:axis('ticks'),
+                tableWidth:table.clientWidth,tableContent:table.scrollWidth,
+                pageWidth:document.documentElement.clientWidth,pageContent:document.documentElement.scrollWidth};
+            })()`);
+            const clipped=layout.cells.filter(cell=>cell.content>cell.width+1);
+            if(version==='before') {
+              assert.ok(clipped.length,'The old shortfall table does not reproduce clipped names.');
+              assert.notDeepEqual(layout.lower,layout.upper,'The old Running axis does not reproduce the missing range.');
+            } else {
+              assert.deepEqual(clipped,[],'The shortfall table clips Step or Unit text.');
+              assert.deepEqual(layout.lower,layout.upper,'The shortfall axes use different ranges or ticks.');
+              assert.ok(layout.pageContent<=layout.pageWidth,'The shortfall table overflows the page.');
+              if(width===1400) assert.ok(layout.tableContent<=layout.tableWidth,'The wide shortfall table requires scrolling.');
             }
+            shortfallLayoutProofs.push({width,version,...layout});
           }
         }
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+        await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'dark'}]});
+        for (const version of beforePage ? ['before','after'] : ['after']) {
+          await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+          await show(review);
+          const comparison = await evaluate(`(() => {
+            window.scrollTo(0,0);
+            const waiter=document.querySelector('.wrow.wait');
+            const r=waiter.getBoundingClientRect();
+            showTip('wait:0',r.left+180,r.top+10);
+            return {text:document.querySelector('#tip').textContent,rows:document.querySelectorAll('#tip dl > div').length,
+              tables:document.querySelectorAll('#walk table').length,
+              legacyLists:document.querySelectorAll('#priority-line,#head-line,#wait-reasons').length};
+          })()`);
+          assert.ok(comparison.text.includes('7 min'),'The screenshot fixture lost its seven-minute wait.');
+          if (version === 'after') {
+            assert.equal(comparison.rows,8);
+            assert.equal(comparison.tables,1);
+            assert.equal(comparison.legacyLists,0);
+            for (const term of ['Waiting','Reason','Free','Safety','Reserved','Next step room','Shortfall','Priority'])
+              assert.ok(comparison.text.includes(term),term);
+            const drawing=await evaluate(`(() => {
+              const width=document.querySelector('#barwrap').getBoundingClientRect().width;
+              const scale=chartScale(latest);
+              const reservation=document.querySelector('#s-reserved').getBoundingClientRect();
+              const cap=document.querySelector('.walk-bud').getBoundingClientRect();
+              const rowHatching=[...document.querySelectorAll('.wrow[data-run] .hatch')].map(e=>e.getBoundingClientRect().width);
+              return {unit:width/scale,reserved:reservation.width,rows:rowHatching,
+                beyond:reservation.right > cap.left,
+                shortfall:document.querySelector('#shortfall-bracket').getBoundingClientRect().width,
+                free:document.querySelector('#free-bracket').getBoundingClientRect().width};
+            })()`);
+            assert.ok(Math.abs(drawing.reserved-15.8*drawing.unit)<1,'The summary reservation is clipped.');
+            assert.ok(Math.abs(drawing.rows[0]-11.3*drawing.unit)<1,'The first reservation is clipped.');
+            assert.ok(Math.abs(drawing.rows[1]-4.5*drawing.unit)<1,'The second reservation is clipped.');
+            assert.ok(Math.abs(drawing.shortfall-11.2*drawing.unit)<1,'The shortfall bracket has the wrong width.');
+            assert.ok(Math.abs(drawing.free-7.6*drawing.unit)<1,'The Free bracket has the wrong width.');
+            assert.ok(drawing.beyond,'The full reservations do not extend beyond the cap.');
+            comparisons.push({version,...comparison,drawing});
+          } else {
+            const drawing=await evaluate(`(() => {
+              const width=document.querySelector('#barwrap').getBoundingClientRect().width;
+              return {reserved:document.querySelector('#s-reserved').getBoundingClientRect().width/width*latest.total,
+                shortfall:!!document.querySelector('#shortfall-bracket')};
+            })()`);
+            assert.ok(Math.abs(drawing.reserved-4.6)<0.1,'The original fixture does not reproduce clipped reservations.');
+            assert.ok(!drawing.shortfall,'The original page unexpectedly shows the shortfall bracket.');
+            comparisons.push({version,...comparison,drawing});
+          }
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+            clip:{x:0,y:0,width:1400,height:1200,scale:1}});
+          await writeFile(join(folder,`waits-${version}.png`),Buffer.from(shot.data,'base64'));
+        }
+        const extendedDemandProofs=[];
+        const extended=structuredClone(review);
+        extended.total=20;extended.other=0;
+        for(const width of [1400,390]) {
+          await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(extended);
+          const extendedProof=await evaluate(`(() => {
+            const marker=document.querySelector('#ram-end'),range=document.querySelector('#barwrap').getBoundingClientRect();
+            return {scale:chartScale(latest),marker:!marker.hidden,note:document.querySelector('#range-note').textContent,
+              markerAt:(marker.getBoundingClientRect().left-range.left)/range.width*chartScale(latest),
+              scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+          })()`);
+          assert.ok(Math.abs(extendedProof.scale-28.2)<1e-9,'The demand range is clipped to RAM.');
+          assert.ok(extendedProof.marker && Math.abs(extendedProof.markerAt-20)<0.1,'The physical RAM boundary is incorrect.');
+          assert.ok(extendedProof.note.includes('20.0 GiB'),'The extended range has no RAM label.');
+          assert.ok(extendedProof.scroll<=extendedProof.client,'The extended range overflows the page.');
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+          await writeFile(join(folder,`extended-demand-${width}.png`),Buffer.from(shot.data,'base64'));
+          extendedDemandProofs.push({width,...extendedProof});
+        }
+        await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+        const tooltipReading=structuredClone(review);
+        tooltipReading.walk.push(...structuredClone(readings.cloud.walk.filter(r=>r.kind==='cloud')),
+          ...structuredClone(base.walk.filter(r=>!r.queued && !r.ci && r.kind!=='cloud')),
+          {name:'hana CI',ci:true,queued:false,used:0,reserved:0,counted:0,started_at:review.read_at-60,
+            machine:'natedev',pid:300,progress:{kind:'NoProgress'},
+            ci_runners:[{state:'busy',job:'/private/jobs/fixture-job'}]});
+        tooltipReading.waiters.push({...structuredClone(head),name:'trunk nextest',pid:201,need:2,
+          head:false,priority:undefined,reason:'head protection · behind #1'},
+          ...structuredClone(readings.cloud.waiters.filter(r=>r.kind==='cloud')));
+        tooltipReading.walk.push({name:'Codex servers',group:'Codex servers',used:0.25,reserved:0,counted:0,
+          queued:false,started_at:0,progress:{kind:'NoProgress'},parts:[{who:'fixture Codex server',gib:0.25}]});
+        tooltipReading.waiters[0].estimate={kind:'RecordedNeed',source:'shape',runs:20,history_days:14,
+          scope:'full',package:'fixture',filters:[],test_threads:{kind:'WidthNotRecorded'},
+          basis:{kind:'ShapeRankedPeak',runs:20,share_percent:10,floor:{kind:'NoFloor'},
+            factor:{kind:'ReleaseHeadroom',factor:1.15},cap:{kind:'UnderBudget'}}};
+        await show(tooltipReading);
+        const keys=await evaluate(`([...Object.keys(TIPS),...latest.walk.map((_,i)=>'row:'+i),
+          ...latest.waiters.map((_,i)=>'wait:'+i),...latest.waiters.flatMap((r,i)=>r.kind==='cloud'?[]:['estimate:wait:'+i]),
+          ...latest.swap_by.map((_,i)=>'swap:'+i),...chartTips.keys()])`);
+        const tooltipProofs=[];
+        for (const [index,key] of keys.entries()) {
+          const detail=await evaluate(`(() => {
+            const key=${JSON.stringify(key)};
+            const target=document.querySelector('[data-tip="'+key+'"]');
+            if(target) target.scrollIntoView({block:'center'}); else window.scrollTo(0,0);
+            showTip(key,700,400);
+            const element=document.querySelector('#tip');
+            const r=element.getBoundingClientRect();
+            const spec=tooltipFor(key,latest);
+            return {key,spec,width:r.width,rows:element.querySelectorAll('dl > div').length,
+              escaped:!element.querySelector('script,img'),aligned:[...element.querySelectorAll('dd')].every(e=>getComputedStyle(e).textAlign==='right')};
+          })()`);
+          assert.ok(detail.width<=300.5,key+' exceeds the width limit.');
+          assert.ok(detail.rows<=8,key+' has too many rows.');
+          assert.ok(detail.escaped && detail.aligned,key+' violates the shared shape.');
+          assert.ok(detail.spec.definition.split(/\s+/).length<=20,key+' has a long definition.');
+          tooltipProofs.push(detail);
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+          await writeFile(join(folder,`tooltip-${String(index).padStart(3,'0')}-${key.replaceAll(':','-')}.png`),Buffer.from(shot.data,'base64'));
+        }
+        await show(readings.missing_use);
+        const unavailable=await evaluate(`(() => {
+          const index=latest.walk.findIndex(row=>row.queued),key='row:'+index;
+          showTip(key,700,400);
+          return {key,spec:tooltipFor(key,latest)};
+        })()`);
+        assert.ok(unavailable.spec.rows.some(row=>row.name==='Builds use' && row.value==='unavailable'));
+        assert.ok(unavailable.spec.rows.some(row=>row.name==='Counted' && row.value==='unavailable'));
+        const unavailableShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+        await writeFile(join(folder,'tooltip-unavailable-use.png'),Buffer.from(unavailableShot.data,'base64'));
+        tooltipProofs.push({case:'unavailable use',...unavailable});
+        const repairedTooltips = [
+          {name:'ci-unreadable',key:'ci',reading:{...structuredClone(review),ci_ram:1,
+            walk:[{name:'hana CI',ci:true,used:1,reserved:0,counted:0,queued:false,progress:{kind:'NoProgress'},ci_runners:[{state:'unreadable'}]}]},status:'1 runner unreadable',jobs:'unavailable'},
+          {name:'ci-mixed',key:'ci',reading:{...structuredClone(review),ci_ram:1,
+            walk:[{name:'hana CI',ci:true,used:1,reserved:0,counted:0,queued:false,progress:{kind:'NoProgress'},ci_runners:[{state:'busy',job:'/private/jobs/check'},{state:'unreadable'}]}]},
+            status:'1 job running · 1 runner unreadable',jobs:'check'},
+          ...['measured','buildlog','pooled','fallback'].map(source=>({name:'estimate-'+source,key:'estimate:wait:0',
+            reading:{...structuredClone(review),waiters:[{...structuredClone(head),estimate:{kind:'RecordedNeed',
+              source,runs:source==='fallback'?0:7,history_days:14,basis:source}}]},source})),
+        ];
+        for(const item of repairedTooltips) {
+          await show(item.reading);
+          const detail=await evaluate(`(() => {
+            window.scrollTo(0,0);
+            const key=${JSON.stringify(item.key)};
+            showTip(key,700,400);
+            const element=document.querySelector('#tip');
+            return {key,spec:tooltipFor(key,latest),width:element.getBoundingClientRect().width,
+              rows:element.querySelectorAll('dl > div').length,escaped:!element.querySelector('script,img'),
+              aligned:[...element.querySelectorAll('dd')].every(e=>getComputedStyle(e).textAlign==='right')};
+          })()`);
+          assert.ok(detail.width<=300.5 && detail.rows<=8 && detail.escaped && detail.aligned,item.name);
+          if(item.status) {
+            assert.equal(detail.spec.rows.find(row=>row.name==='Status').value,item.status);
+            assert.equal(detail.spec.rows.find(row=>row.name==='Jobs').value,item.jobs);
+          } else {
+            const from=detail.spec.rows.find(row=>row.name==='From').value;
+            assert.ok(!from.includes('not recorded'),item.name+' hides its recorded source.');
+            assert.ok(from.includes({measured:'anonymous memory peaks',buildlog:'build log memory peaks',
+              pooled:'across projects',fallback:'configured default'}[item.source]),item.name);
+          }
+          tooltipProofs.push({case:item.name,...detail});
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+          await writeFile(join(folder,'tooltip-'+item.name+'.png'),Buffer.from(shot.data,'base64'));
+        }
+        await writeFile(join(folder,'tooltips.json'),JSON.stringify(tooltipProofs,null,2)+'\n');
+        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,extendedDemandProofs,refreshLayoutProofs,shortfallLayoutProofs,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
       } finally {

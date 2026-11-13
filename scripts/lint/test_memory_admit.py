@@ -244,6 +244,7 @@ def setUpModule() -> None:
     )
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
         "BUILDLOG_DIR": str(root / "buildlog"),
+        "TMPDIR": str(root),
         "BUILDLOG_MEMINFO": str(root / "meminfo"),
         "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get(
@@ -4965,15 +4966,17 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.stdout, "target-admitted\n")
         self.assertEqual(result.stderr, "")
 
-    def test_shape_without_earlier_builds_names_the_fallback(self) -> None:
+    def test_fallback_estimate_omits_terminal_source_prose(self) -> None:
         text = self.formatted(admission_records.ExpectedPeak(17_000_000_000, "shape", 0, admission_records.ShapeFallback(admission_records.UnderBudget())))
-        self.assertIn("fallback", text)
+        self.assertNotIn("fallback", text)
+        self.assertIn("15.832 GiB needed", text)
         self.assertNotIn("0 earlier builds", text)
 
-    def test_first_wait_line_names_a_same_shape_promise_without_claiming_p90(self) -> None:
+    def test_first_wait_line_omits_the_estimate_source(self) -> None:
         text = self.formatted(admission_records.ExpectedPeak(17_000_000_000, "shape", 2, admission_records.ShapeLargest(2, admission_records.NoFloor(), admission_records.NoHeadroom(), admission_records.UnderBudget())))
         self.assertEqual(len(text.splitlines()), 1)
-        self.assertIn("same-shape promise", text)
+        self.assertNotIn("same-shape promise", text)
+        self.assertIn("15.832 GiB needed", text)
         self.assertNotIn("percentile", text)
         self.assertNotIn("p90", text)
         self.assertNotIn("fallback", text)
@@ -5808,6 +5811,20 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                 self.assertIn(raw, str(refused.exception))
                 self.assertEqual(errors.getvalue(), "")
 
+
+    def test_clear_pressure_keeps_the_measurements_and_the_equality_boundary(self) -> None:
+        policy = admission_policy_fixture()
+        limits = policy.pressure
+        result = gate.pressure_from_readings(limits.full_avg10_limit, limits.some_avg10_limit,
+                                            limits.swap_used_limit, policy)
+        self.assertEqual(result, admission_records.NoPressureHold(admission_records.PressureMeasurements(
+            limits.full_avg10_limit, limits.some_avg10_limit, limits.swap_used_limit)))
+        self.assertIsInstance(gate.pressure_from_readings(limits.full_avg10_limit + 0.01, 0, 0, policy),
+                              admission_records.MemoryPressure)
+        self.assertIsInstance(gate.pressure_from_readings(0, limits.some_avg10_limit + 0.01,
+                              limits.swap_used_limit, policy), admission_records.NoPressureHold)
+        self.assertIsInstance(gate.pressure_from_readings(0, limits.some_avg10_limit + 0.01,
+                              limits.swap_used_limit + 0.01, policy), admission_records.MemoryPressure)
 
     def test_pressure_reader_uses_the_supplied_thresholds_after_config_edit(self) -> None:
         self.write_config(full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12")

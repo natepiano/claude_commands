@@ -159,6 +159,31 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
                 self.assertEqual(page["taken"], 0.125)
 
+    def test_full_reservations_and_shortfall_reach_the_page(self) -> None:
+        reading = captured_reading()
+        room = reading.explanation.room
+        assert isinstance(room, admission_records.MemoryRoom)
+        holds = (
+            admission_records.RunKeepAside(admission_records.RunMemory("first", 16 * admission_records.GIB,
+                admission_records.AnonymousRunUse(4 * admission_records.GIB)), 12 * admission_records.GIB),
+            admission_records.RunKeepAside(admission_records.RunMemory("second", 3 * admission_records.GIB,
+                admission_records.AnonymousRunUse(8 * admission_records.GIB)), 0),
+        )
+        changed = replace(reading, explanation=replace(reading.explanation, room=replace(room,
+            available=7 * admission_records.GIB, safety=3 * admission_records.GIB, used=12 * admission_records.GIB,
+            kept=12 * admission_records.GIB, signed_room=-8 * admission_records.GIB,
+            cap=16 * admission_records.GIB, runs=holds)))
+        with mock.patch.object(admission_client, "view", return_value=changed):
+            page = memory_feed.reading()
+        self.assertEqual(page["reserved"], 12)
+        self.assertEqual(page["shortfall"], 8)
+        self.assertEqual(page["room"], 0)
+        self.assertEqual(page["taken"], 24)
+        self.assertEqual(sum(cast(memory_feed.RunRow,row)["reserved"] for row in page["walk"] if row.get("queued")), 12)
+        self.assertNotIn("shown_reserved", page)
+        # Clamping combined need minus combined use would incorrectly return 7 GiB.
+        self.assertNotEqual(page["reserved"], (16 + 3) - (4 + 8))
+
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
         self.assertIn('id="answer" data-tip="answer">Next step room</div>', page)
@@ -207,6 +232,22 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertTrue(row.get("queued"))
 
 
+    def test_pressure_gauges_use_the_admission_measurements(self) -> None:
+        baseline = reservation_reading()
+        for pressure in (admission_records.NoPressureHold(admission_records.PressureMeasurements(1.25, 2.5, 62.9)),
+                         admission_records.MemoryPressure(5.01, 3, 70, condition="full")):
+            with self.subTest(pressure=pressure):
+                inputs = replace(baseline.explanation.decided_from, pressure=pressure)
+                reading = gate.queue_read_from(inputs, admission_policy_fixture())
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                if isinstance(pressure, admission_records.NoPressureHold):
+                    self.assertEqual(page["psi"], {"full":1.25,"some":2.5,"swap":62.9})
+                    self.assertEqual(page["pressure"], "none")
+                else:
+                    self.assertEqual(page["psi"], {"full":5.01,"some":3,"swap":70})
+                    self.assertNotEqual(page["pressure"], "none")
+
     def test_pressure_text_on_the_page_rounds_down_to_one_decimal(self) -> None:
         baseline = reservation_reading()
         for pressure in (admission_records.MemoryPressure(0, swap_used_percent=95.99, condition="swap"),
@@ -247,7 +288,7 @@ class MemoryFeedTests(unittest.TestCase):
             "done": 7, "total": 10, "percent": 70})
         for field in ("counted", "reserved", "need"):
             self.assertNotIn(field, row)
-        for field in ("used", "reserved", "taken", "room", "cap", "other", "shown_reserved"):
+        for field in ("used", "reserved", "taken", "room", "cap", "other"):
             self.assertEqual(page.get(field), before.get(field), field)
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
@@ -514,7 +555,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(page["read_error"], "queue unavailable")
 
     def test_missing_pressure_has_a_named_state(self) -> None:
-        pressure = memory_feed.read_stalls()
+        pressure = memory_feed.captured_pressure(admission_records.NoPressureHold(), admission_records.HostMemory(0, 0))
         self.assertIsInstance(pressure["some"], memory_feed.PressureNotRecorded)
         self.assertIsInstance(pressure["full"], memory_feed.PressureNotRecorded)
 
@@ -589,12 +630,13 @@ class MemoryFeedTests(unittest.TestCase):
         _ = (path / "memory.swap.current").write_text(str(swapped))
         return path
 
-    def host_swap(self, total: int, used: int) -> None:
+    def host_swap(self, total: int, used: int) -> admission_records.HostMemory:
         _ = (self.root / "proc/meminfo").write_text(
             f"SwapTotal: {total // 1024} kB\nSwapFree: {(total - used) // 1024} kB\n")
+        return admission_records.HostMemory(0, 0, total, total - used)
 
     def test_swap_accounts_for_the_host_and_names_the_agent_owner_once(self) -> None:
-        self.host_swap(32 * admission_records.GIB, 20 * admission_records.GIB)
+        host = self.host_swap(32 * admission_records.GIB, 20 * admission_records.GIB)
         _ = self.cgroup("user.slice", 16 * admission_records.GIB)
         user = "user.slice/user@1000.service"
         _ = self.cgroup(user, 15 * admission_records.GIB)
@@ -621,7 +663,7 @@ class MemoryFeedTests(unittest.TestCase):
 
         names = read_step_names()
         with mock.patch.object(Path, "read_text", new=read):
-            swap = memory_feed.read_swap((queued, queued), {}, 6, names)
+            swap = memory_feed.read_swap((queued, queued), {}, 6, names, host)
         assert isinstance(swap, memory_feed.SwapReading)
         rows = {row["name"]: row for row in swap.rows}
         self.assertEqual(rows["agent sessions (2)"]["bytes"], 10 * admission_records.GIB)
@@ -639,9 +681,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertNotIn(agent / "memory.swap.current", reads)
 
     def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
-        self.host_swap(2 ** 20, 2 ** 20)
+        host = self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 - 7)
-        swap = memory_feed.read_swap((), {}, 6, read_step_names())
+        swap = memory_feed.read_swap((), {}, 6, read_step_names(), host)
         assert isinstance(swap, memory_feed.SwapReading)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
         self.assertEqual(residual["bytes"], 7)
@@ -649,9 +691,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("not attributed: 7 B", memory_feed.swap_text(swap.rows))
 
     def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
-        self.host_swap(2 ** 20, 2 ** 20)
+        host = self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 + 7)
-        swap = memory_feed.read_swap((), {}, 6, read_step_names())
+        swap = memory_feed.read_swap((), {}, 6, read_step_names(), host)
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
@@ -659,19 +701,19 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
 
     def test_swap_names_ci_instead_of_the_raw_service_step(self) -> None:
-        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        host = self.host_swap(2 * admission_records.GIB, admission_records.GIB)
         _ = self.cgroup("hana.slice", admission_records.GIB)
         path = self.cgroup("hana.slice/hana-ci.slice", admission_records.GIB)
         step = admission_records.RunningStep("", "hana-ci.slice", "service", str(path), 0,
             admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner="hana-ci.slice",
                                     pid=admission_records.PidNotRecorded(), job_state=IdleService()), pid=admission_records.PidNotRecorded())
-        swap = memory_feed.read_swap((step,), {}, 6, read_step_names())
+        swap = memory_feed.read_swap((step,), {}, 6, read_step_names(), host)
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["name"], "hana CI")
         self.assertEqual(swap.rows[0]["bytes"], admission_records.GIB)
 
     def test_swap_names_between_steps_owners_in_the_shared_rows(self) -> None:
-        self.host_swap(4 * admission_records.GIB, 2 * admission_records.GIB)
+        host = self.host_swap(4 * admission_records.GIB, 2 * admission_records.GIB)
         _ = self.cgroup("builds.slice", 2 * admission_records.GIB)
         steps: list[admission_records.RunningStep] = []
         labels = {name: unit_labels.UnitLabels(name) for name in ("owner-a", "owner-b")}
@@ -680,16 +722,23 @@ class MemoryFeedTests(unittest.TestCase):
             steps.append(admission_records.RunningStep(owner, owner, "between steps", str(path), 0,
                 admission_records.UnownedSliceMemory(admission_records.GIB, cgroup=str(path), owner=owner, pid=admission_records.PidNotRecorded()),
                 pid=admission_records.PidNotRecorded()))
-        swap = memory_feed.read_swap(steps, labels, 6, read_step_names())
+        swap = memory_feed.read_swap(steps, labels, 6, read_step_names(), host)
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
 
-    def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
-        self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
+    def test_swap_small_groups_and_total_use_the_captured_host_reading(self) -> None:
+        host = self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
         for number in range(3):
             _ = self.cgroup(f"owner-{number}.slice", admission_records.GIB // 2)
-        with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+        reading = captured_reading()
+        captured_host = reading.explanation.decided_from.host
+        assert isinstance(captured_host, admission_records.HostMemory)
+        reading = gate.queue_read_from(replace(reading.explanation.decided_from, host=replace(captured_host,
+            swap_total=host.swap_total, swap_free=host.swap_free)), admission_policy_fixture())
+        # A newer host file must not change the captured pressure display.
+        _ = (self.root / "proc/meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
+        with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
         self.assertEqual(page["swap_used"], 3)
         self.assertEqual(page["swap_total"], 4)
@@ -710,8 +759,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertTrue(all(row.get("detail") == "between steps" for row in page["walk"]))
 
     def test_pressure_failure_names_the_path_without_the_python_error(self) -> None:
-        values = memory_feed.read_stalls()
-        for value in values.values():
+        values = memory_feed.captured_pressure(admission_records.PressureUnavailable(
+            f"Pressure is unreadable: {self.root / 'proc/pressure/memory'}"), admission_records.HostMemory(0, 0))
+        for value in (values["some"], values["full"]):
             assert isinstance(value, memory_feed.PressureNotRecorded)
             self.assertEqual(value.reason, f"Pressure is unreadable: {self.root / 'proc/pressure/memory'}")
             self.assertNotIn("Errno", value.reason)
@@ -878,7 +928,8 @@ class MemoryFeedTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     payload = memory_feed.reading()
-                self.assertEqual(payload["priority_text"], expected)
+                self.assertEqual([entry["unit"] for entry in payload["unmatched_priorities"]],
+                                 ["research", "cables"] if reading is two else ["research"] if reading is first else [])
 
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(
@@ -894,12 +945,37 @@ class MemoryFeedTests(unittest.TestCase):
                     page = memory_feed.reading()
                 for row in (*page["walk"], *page["waiters"]):
                     expected = "queue priority: research (the user's bump)" if priority and row["unit"] == "research" else ""
-                    self.assertEqual(row.get("priority_text", ""), expected)
-                self.assertEqual(page["unmatched_priority_text"],
-                    "queue priority: research (the user's bump)" if priority and unit == "other" else "")
-                notes = [row["head_text"] for row in page["waiters"] if "head_text" in row]
-                self.assertEqual(notes, [page["head_text"]])
-                self.assertIn("cloud 1 of 1 slots", notes[0])
+                    self.assertEqual(row.get("priority", {}).get("why", ""), "the user's bump" if expected else "")
+                self.assertEqual([entry["unit"] for entry in page["unmatched_priorities"]],
+                                 ["research"] if priority and unit == "other" else [])
+                heads = [row for row in page["waiters"] if row.get("head")]
+                self.assertEqual(len(heads), 1)
+                self.assertEqual(page["cloud_slots_used"], 1)
+                self.assertEqual(page["cloud_slots"], 1)
+
+    def test_queue_head_and_priority_fields_follow_their_rows(self) -> None:
+        reading = cloud_reading(with_queue_priority(with_wait_reason(
+            reservation_reading(), admission_records.StartSpacingWait(110))))
+        for priority, unit in ((True, "research"), (False, "research"), (True, "other")):
+            with self.subTest(priority=priority, unit=unit):
+                labels = {step.session_id: unit_labels.UnitLabels("fixture", "fixture-production", unit)
+                          for step in (*reading.view.running, *reading.view.waiting)}
+                current = reading if priority else replace(reading, explanation=replace(
+                    reading.explanation, priority=admission_records.NoQueuePriority()))
+                with (mock.patch.object(admission_client, "view", return_value=current),
+                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+                    page = memory_feed.reading()
+                for row in (*page["walk"], *page["waiters"]):
+                    expected = "queue priority: research (the user's bump)" if priority and row["unit"] == "research" else ""
+                    self.assertEqual(row.get("priority", {}).get("why", ""), "the user's bump" if expected else "")
+                self.assertEqual([entry["unit"] for entry in page["unmatched_priorities"]],
+                                 ["research"] if priority and unit == "other" else [])
+                notes = [row["pid"] for row in page["waiters"] if row.get("head")]
+                head = current.explanation.head
+                head_pid = (head.waiter.run.pid if isinstance(head.waiter.run, LiveBuildRun) else head.waiter.pid
+                            ) if isinstance(head, admission_records.HeadExplanation) else page["waiters"][0]["pid"]
+                self.assertEqual(notes, [head_pid])
+                self.assertEqual((page["cloud_slots_used"], page["cloud_slots"]), (1, 1))
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -989,7 +1065,7 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertNotIn("cloud_heading", payload)
                 self.assertEqual(page["cloud_slots_used"], 1)
                 self.assertEqual(page["cloud_slots"], 1)
-                self.assertIn("cloud 1 of 1 slots", page["head_text"])
+                self.assertEqual((page["cloud_slots_used"], page["cloud_slots"]), (1, 1))
                 runs = cast(list[dict[str, object]], payload["walk"])
                 waits = cast(list[dict[str, object]], payload["waiters"])
                 remote, = [row for row in runs if row.get("kind") == "cloud"]
@@ -1183,9 +1259,10 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertIsInstance(page["cap"], admission_records.CapUnavailable)
                 self.assertEqual(page["room"], room.room / admission_records.GIB)
                 self.assertTrue(page["walk"])
-                self.assertIn("unavailable", page["cap_text"])
                 if cap.runs:
-                    self.assertIn("private memory.stat is missing", page["cap_text"])
+                    missing = cap.runs[0].use
+                    assert isinstance(missing, admission_records.RunUseUnavailable)
+                    self.assertEqual(missing.reason, "private memory.stat is missing")
 
     def test_an_unavailable_run_use_keeps_its_named_reason(self) -> None:
         reading = reservation_reading()
@@ -1247,9 +1324,6 @@ def write_browser_fixture(folder: Path) -> None:
     fixture = MemoryFeedTests()
     fixture.setUp()
     _ = cast(object, fixture.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"})))
-    pressure_missing = memory_feed.PressureNotRecorded("Pressure is unreadable: /private/proc/pressure/memory")
-    _ = cast(object, fixture.enterContext(mock.patch.object(memory_feed, "read_stalls",
-        return_value={"some": pressure_missing, "full": pressure_missing})))
     try:
         folder.mkdir(parents=True, exist_ok=True)
         configuration = replace(memory_feed.read_configuration(), output_folder=folder)
@@ -1264,7 +1338,7 @@ def write_browser_fixture(folder: Path) -> None:
         live = replace(live, pid=70, measured=replace(memory,
             activity=replace(activity, run=LiveBuildRun(70, "live", 199_000))))
         compiler = replace(live, pid=80, measured=admission_records.CompilerServiceMemory(admission_records.GIB, pid=80))
-        inputs = replace(inputs, now=200_000, running=(*inputs.running, leftover_step(45,
+        inputs = replace(inputs, now=200_000, pressure=admission_records.PressureUnavailable("Pressure is unreadable: /private/proc/pressure/memory"), running=(*inputs.running, leftover_step(45,
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper"))),
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())

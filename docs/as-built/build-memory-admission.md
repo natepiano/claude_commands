@@ -225,7 +225,7 @@ The memory page keeps this memory in Other.
 
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The display shows zero room for a shortfall. The cap explanation shows the shortfall.
+The display shows zero room for a shortfall. A labelled bracket shows the full shortfall beyond the cap.
 These readings never reduce a promise from history.
 
 Waiting runs follow priority, first run arrival, and PID order.
@@ -1745,7 +1745,7 @@ The Mac row uses the local used-memory style and the same GiB scale.
 Its memory is the sum of resident memory for the run's process tree.
 The Mac row has no reservation or hatching and changes no natedev memory total.
 The Mac tooltip states that its memory does not count against natedev.
-It aligns Machine, Started, Used, and Reading age in labelled rows.
+It uses the shared tooltip renderer for Machine, Status, Started, Used, and Reading age.
 A readable counter adds a Progress row.
 A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
 The feed log retains raw errors; the page shows only the status and reading age.
@@ -1937,3 +1937,63 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+
+## Build page tooltips and reservation demand
+
+The page uses one tooltip renderer for memory items, running steps, waiting steps, swap rows, and chart points.
+Each tooltip has a title, at most one short definition, and at most eight aligned name/value rows.
+The width stays at 300 pixels or less.
+The renderer escapes all titles, definitions, names, and values.
+Chart points retain accessible descriptions and support keyboard focus.
+
+The page uses these labels consistently: Free, Safety, Reserved, Needs, Next step room, and Shortfall.
+Free means available RAM, including memory the system can reclaim.
+Safety means the policy allowance that the queue excludes from the cap.
+Reserved means memory held for existing runs.
+The page sums each run's own reservation; it does not clamp combined need minus combined use.
+
+The summary separates physical RAM from reservation demand.
+A Free bracket includes Safety.
+The reservation track shows full hatching, including demand beyond the cap.
+A Shortfall bracket labels the amount beyond the cap.
+Running rows use the same scale and retain their full reservations.
+The scale extends when demand exceeds physical RAM, and a marker identifies the physical RAM boundary.
+The page moves the step table below the chart when shortfall requires the space beyond the cap.
+
+Calculation tooltips show signed terms, a rule line, and a result.
+The result uses `=` only when the displayed terms reconcile.
+It uses `≈` when independent rounding changes the displayed sum.
+One memory formatter serves page labels and tooltips, including small amounts in MiB, KiB, or bytes.
+
+Waiting tooltips put Waiting and Reason first.
+The first local waiter's tooltip also shows Free, Safety, Reserved, Next step room, and Shortfall.
+The Priority row uses the stored priority reason.
+Unmatched priorities appear in a visible list.
+Estimate targets show the recorded source, history window, failed run, extra room, and limit.
+Long member lists stay in expandable page details.
+
+Pressure admission remains unchanged: Full exceeds its limit, or Some and Swap both exceed their limits.
+Individual gauge labels say Limit.
+A value equal to its limit does not indicate a pressure hold.
+The pressure decision, gauges, and tooltips use the same captured reading.
+Unavailable pressure evidence stays unavailable.
+
+Swap totals also come from the captured host reading.
+The feed reads cgroup attribution separately and retains the signed difference from those totals.
+It does not read host swap totals again while building the pressure display.
+
+The page measures the table at its intrinsic width before choosing its position.
+A shortfall can move the table below the chart.
+When room returns, the same reading restores the original cap position and table layout.
+The browser proof checks this through ordinary feed refreshes without taking screenshots during the check.
+
+The Running axis uses the same range and ticks as the summary axis, including demand beyond the cap.
+When the table sits below the chart, Step and Unit retain their full text.
+A narrow screen scrolls the table horizontally instead of clipping those values.
+The table fits without scrolling when the page has sufficient width.
+
+CI tooltips keep the count of unreadable runners, including readings with busy and unreadable runners.
+When all runner readings fail, the Jobs row says unavailable instead of none.
+Estimate tooltips describe recorded measured, buildlog, pooled, and fallback sources, including their recorded run counts where applicable.
+A recorded source remains visible when its detailed basis is not recorded.
