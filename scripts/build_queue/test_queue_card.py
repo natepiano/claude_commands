@@ -7,11 +7,12 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 
 from dataclasses import replace
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_card, queue_evidence, queue_view
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.test_queue_view import QueueViewFixtureTests, cloud_reading, with_converted_executions
+from scripts.build_queue.test_queue_view import QueueViewFixtureTests, cloud_reading, empty_mac_reading, with_converted_executions
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixture, queue_read_fixture, with_waiting, write_memory_config
 from scripts.build_queue.queue_lines import plain
@@ -20,6 +21,31 @@ from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+from scripts.message import unit_labels
+
+
+
+
+class MacQueueCardTests(unittest.TestCase):
+    def test_native_mac_cards_show_the_folder_and_reading_status(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 45)
+            for read_at, error in ((now, ""), (now - 90, ""), (0, "Mac reading missing")):
+                with self.subTest(read_at=read_at, error=error):
+                    reading = queue_view.MacBuildReading(read_at, (build,), error)
+                    with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                        text = plain(queue_card.render_selection(model, "id-widget", 240))
+                    if read_at == now and not error:
+                        self.assertIn("started on the Mac", text)
+                        self.assertIn("mac-clone", text)
+                        self.assertIn("Progress unavailable", text)
+                    else:
+                        self.assertIn("Mac reading is old", text)
+                        self.assertNotIn("pid 710001", text)
 
 
 class CloudQueueCardTests(unittest.TestCase):
@@ -38,7 +64,8 @@ class CloudQueueCardTests(unittest.TestCase):
                         self.assertIn("transport unavailable", text)
 
     def test_cloud_card_reads_progress_from_a_private_service(self) -> None:
-        with AdmissionFixture() as fixture:
+        with (AdmissionFixture() as fixture,
+              mock.patch.object(unit_labels, "unit_labels_for", return_value={})):
             sidecar = fixture.root / "cloud.cgroup"
             _ = sidecar.write_text("")
             request = fixture.request(step="merge-gate")
@@ -61,6 +88,7 @@ class CloudQueueCardTests(unittest.TestCase):
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
+        empty_mac_reading(fixture)
         write_memory_config(fixture.root / "build_admission.conf",
             cloud_gate_slots="1", cloud_gate_stale_pushes="3")
         _ = (fixture.root / "cloud_gate.conf").write_text(
@@ -123,7 +151,7 @@ class QueueCardTests(QueueViewFixtureTests):
         model = replace(model, reading=replace(model.reading,
             view=replace(model.reading.view, waiting=(step, *waiting[1:]))))
         heading = plain(queue_card.render_card(model, [1], 140)).splitlines()[0]
-        self.assertIn(" · targeted test · ", heading)
+        self.assertIn(" · cables targeted test · ", heading)
         self.assertNotIn("targeted-test", heading)
 
     def test_running_and_release_sentences_use_step_prose(self) -> None:
@@ -135,8 +163,8 @@ class QueueCardTests(QueueViewFixtureTests):
                 self.fixture.write_running(used=int(5.1 * admission_records.GIB), need=int(11.1 * admission_records.GIB), step=step)
                 model = self.fixture.model()
                 text = plain(queue_card.render_card(model, [1], 400))
-                self.assertIn(f", hana {prose}: admitted ", text)
-                self.assertIn(f"Frees when: widget-enhancements-title hana {prose} end ", text)
+                self.assertIn(f", widget {prose}: admitted ", text)
+                self.assertIn(f"Frees when: widget-enhancements-title widget {prose} end ", text)
 
     def test_running_card_names_the_private_machine_after_pid(self) -> None:
         model = self.fixture.model()
@@ -145,7 +173,7 @@ class QueueCardTests(QueueViewFixtureTests):
                 lines = queue_card.render_selection(model, "1", columns)
                 text = plain(lines)
                 record = " ".join(text.split())
-                self.assertIn("pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, hana nextest:", record)
+                self.assertIn("pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, widget nextest:", record)
                 self.assertEqual(record.count("pid 900"), 1)
                 self.assertEqual(record.count("0 min ago"), 1)
                 self.assertNotIn("min machine", text)
@@ -162,11 +190,11 @@ class QueueCardTests(QueueViewFixtureTests):
                 explanation=replace(model.reading.explanation,
                     head=replace(head, waiter=model.reading.view.waiting[0]))))
         text = plain(queue_card.render_card(model, [2], 400))
-        self.assertIn("hana nextest", text.splitlines()[0])
+        self.assertIn("cables nextest", text.splitlines()[0])
         ahead, = [line for line in text.splitlines() if "#1 pid" in line]
-        self.assertIn("nateroids nextest", ahead)
+        self.assertIn("cables nextest", ahead)
         first_line, = [line for line in text.splitlines() if "First in line:" in line]
-        self.assertIn("nateroids nextest", first_line)
+        self.assertIn("cables nextest", first_line)
 
     def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
         model = self.fixture.model()
@@ -386,7 +414,7 @@ class QueueCardTests(QueueViewFixtureTests):
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("Next? No.", text)
         self.assertNotIn("Next? Yes.", text)
-        self.assertIn("#1 pid 101 ·    large nextest", text)
+        self.assertIn("#1 pid 101 ·    owner not recorded · large nextest", text)
 
     def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
@@ -405,7 +433,7 @@ class QueueCardTests(QueueViewFixtureTests):
         assert isinstance(facts, head_facts.HeadFacts)
         model = replace(model, facts=replace(facts, bump_records=()))
         text = plain(queue_card.render_card(model, [4], 400))
-        self.assertIn("#2 pid 1001 · ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it", text)
+        self.assertIn("#2 pid 1001 · ↑  tool-based-ui · cables · work-lead cables nextest  joined 10:40, 32 min after it", text)
         self.assertNotIn("0 min before it", text)
 
     def test_position_id_recorded_name_and_folder_select_the_same_step(self) -> None:
@@ -476,7 +504,7 @@ class QueueCardTests(QueueViewFixtureTests):
 
     def test_running_selector_prints_one_complete_running_evidence_record(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "id-widget", 400))
-        expected = ("Selected running step: pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, hana nextest: "
+        expected = ("Selected running step: pid 900 · fixture-host · tool-based-ui / widget / widget-enhancements-title, widget nextest: "
                     "admitted 10:45 (0 min ago); need 11.1 GiB; anonymous use 5.1 GiB; "
                     "held slot 0.0 GiB; kept aside 6.0 GiB")
         self.assertEqual(text.count(expected), 1)

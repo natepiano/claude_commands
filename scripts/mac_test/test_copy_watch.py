@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 from dataclasses import replace
 import io
@@ -517,6 +518,42 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertEqual((values["copy"], values["copy_count"]), ("natedev_won", "1"))
         self.assertNotIn("mac", values)
         self.assertIsNone(step.poll())
+
+    def test_cancel_unavailable_preserves_the_settled_report(self) -> None:
+        from scripts.build_queue import admission_client
+
+        fixture = caller_admission(self, self.root, self.environment)
+        submitted = placement_request(fixture)
+        request = copy_watch.WatchRequest(
+            info=self.info, result=self.result, runner=self.runner,
+            settings=self.root / "mac_test.conf", repo_root=self.repository,
+            package="sample", call_id="settled-copy", call_started=1.0,
+            filter_run=False, nextest_words=(),
+        )
+        report = copy_watch.WatchReport("natedev_won", 4.5, 1, "6.0")
+        arguments = copy_watch.CliArguments()
+        arguments.parent_pid = os.getpid()
+
+        def settled(watch: copy_watch.Watch, _wakeup: copy_watch.Wakeup) -> copy_watch.WatchReport:
+            watch.placement = copy_watch.QueuedCopyPlacement(submitted)
+            return report
+
+        errors = io.StringIO()
+        with (mock.patch.object(argparse.ArgumentParser, "parse_args", return_value=arguments),
+              mock.patch.object(copy_watch, "request_from_arguments", return_value=request),
+              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("repo")),
+              mock.patch.object(copy_watch.Watch, "run", settled),
+              mock.patch.object(admission_client, "cancel_placement",
+                                side_effect=wire.AdmissionUnavailable("fixture cancellation unavailable")) as cancel,
+              mock.patch("sys.stderr", errors)):
+            self.assertEqual(copy_watch.main(), 0)
+        self.assertEqual(self.result.read_text(), copy_watch.result_text(report))
+        cancel.assert_called_once()
+        cancellation = cast(wire.CancelPlacement, cancel.call_args.args[0])
+        self.assertEqual((cancellation.episode, cancellation.owner, cancellation.reason),
+                         (submitted.episode, submitted.owner, "copy watcher ended"))
+        self.assertEqual(errors.getvalue(),
+                         "copy_watch: cannot cancel placement: fixture cancellation unavailable\n")
 
     def test_a_copy_that_gives_way_may_become_a_copy_again(self) -> None:
         _ = self.start_step()

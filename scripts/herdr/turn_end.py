@@ -16,9 +16,10 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 from scripts.direct import progress_history
+from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch
 from scripts.herdr import herdr, worker_panes
 from scripts.production import staff, worker, worker_admission
@@ -70,10 +71,13 @@ def _friend_pending(client: herdr.Herdr, state: worker_panes.WorkerPane | worker
     kind = "codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"
     address = ("codex:" if kind == "codex" else "session:") + str(row.current_session)
     for pane in panes:
-        if not (pane.get("tab_id") == tab and str(pane.get("label", "")).startswith("friend-")
+        if not (pane.get("tab_id") == tab and pane["pane_id"] != state.pane
                 and client.readiness(pane["pane_id"])["agent_status"] == herdr.AgentStatus.WORKING):
             continue
-        native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        try:
+            native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        except herdr_types.HerdrFailure:
+            continue
         backend = (staff.CodexBackend(Path(native.environment["CODEX_HOME"])) if kind == "codex"
                    else staff.ClaudeBackend())
         source = worker_admission.transcript_source(replace(row, current_session=staff.native_id(native.current_identity)), backend)
@@ -95,14 +99,25 @@ def _kept_pane_anomaly(row: staff.StaffRow, state: worker_panes.WorkerPane | wor
     return message
 
 
-def _send_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed: dict[str, object],
-                 instance: str, outcome: TurnOutcome, path: Path, reply: str, details: str,
-                 runs: tuple[str, ...] = ()) -> None:
+@dataclass(frozen=True)
+class TurnDecision:
+    outcome: TurnOutcome
+    send_notice: Callable[[], None]
+
+
+def _no_notice() -> None:
+    pass
+
+
+def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed: dict[str, object],
+                    instance: str, outcome: TurnOutcome, path: Path, reply: str, details: str,
+                    runs: tuple[str, ...] = ()) -> TurnDecision:
+    """Decide the notice under the worker lock; send it after release."""
     from scripts.message import send
 
     stamp = hashlib.sha256("\n".join((outcome.value, reply, *runs)).encode()).hexdigest()
     if passed.get("hook_notice") == stamp:
-        return
+        return TurnDecision(outcome, _no_notice)
     phase = passed.get("phase", {})
     phase_id = str(cast(dict[str, object], phase).get("id", "")) if isinstance(phase, dict) else ""
     address = ("codex:" if isinstance(staff.backend(parent), staff.CodexBackend) else "session:") + str(parent.current_session)
@@ -123,34 +138,45 @@ def _send_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed: di
         sender = (send.ClaudeSender(identity) if member is not None and isinstance(staff.backend(member), staff.ClaudeBackend)
                   else send.CodexSender(identity))
     options = send.parse(["--to", address, "--from", worker_name, "--text", message])
-    result = send.send(options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name)))
-    if result.outcome not in ("sent", "skipped"):
-        raise ValueError(result.detail)
-    progress_history.record_dispatch_notice(run, instance, stamp)
+    options = options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name))
+
+    def send_notice() -> None:
+        current = staff.snapshot().by_id(parent.id)
+        if current is None:
+            raise ValueError(f"{parent.id}: notice recipient is not in staff")
+        address = ("codex:" if isinstance(staff.backend(current), staff.CodexBackend) else "session:") + str(current.current_session)
+        result = send.send(options._replace(selection=send.RosterLookup(address)))
+        if result.outcome not in ("sent", "skipped"):
+            raise ValueError(result.detail)
+        progress_history.record_dispatch_notice(run, instance, stamp)
+
+    return TurnDecision(outcome, send_notice)
 
 
 def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path,
-                             passed: dict[str, object]) -> None:
-    """Send the saved completion once for an explicit completed-dispatch rerun."""
+                             passed: dict[str, object]) -> Callable[[], None]:
+    """Prepare the saved notice for delivery after the caller releases its lock."""
     delivery = progress_history.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     outcome = TurnOutcome(completion.outcome) if isinstance(completion, progress_history.HookCompletion) else TurnOutcome.DONE
     path = Path(completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file)
     details = "\n".join(completion.details) if isinstance(completion, progress_history.HookCompletion) else ""
     repeated = {key: value for key, value in passed.items() if key != "hook_notice"}
-    _send_notice(worker_name, parent, run, repeated, str(passed["instance_id"]), outcome, path, path.read_text(), details)
+    decision = _prepare_notice(worker_name, parent, run, repeated, str(passed["instance_id"]), outcome, path, path.read_text(), details)
+
     if delivery.actions.status_file:
         atomic_file.write_text_atomic(Path(delivery.actions.status_file), "done\n")
+    return decision.send_notice
 
 
 def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_panes.WorkerPane,
                   client: herdr.Herdr, run: Path, passed: dict[str, object], instance: str,
-                  delivery: progress_history.DispatchDelivery) -> TurnOutcome:
+                  delivery: progress_history.DispatchDelivery) -> TurnOutcome | TurnDecision:
     with redirect_stderr(io.StringIO()) as diagnostics:
         try:
             result = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
                       if isinstance(state, worker_panes.OpenWorker) else worker.ExitCode.UNCERTAIN)
-        except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
@@ -160,15 +186,14 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
     path = Path(delivery.reply_file)
     path = path.with_name(path.stem + "_turn" + path.suffix)
     worker.save_reply(path, details)
-    _send_notice(row.name, parent, run, passed, instance, outcome, path, details, details)
-    return outcome
+    return _prepare_notice(row.name, parent, run, passed, instance, outcome, path, details, details)
 
 
 def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, passed: dict[str, object],
                        instance: str, delivery: progress_history.DispatchDelivery,
                        completion: progress_history.HookCompletion,
                        state: worker_panes.WorkerPane | worker_panes.WorkerNotObserved,
-                       hold: worker_panes.WorkerLockHold) -> TurnOutcome:
+                       hold: worker_panes.WorkerLockHold) -> TurnDecision:
     from scripts.direct import assign
     from scripts.message import send
     path = Path(completion.reply_file)
@@ -214,7 +239,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
                 astra_roles.release(delivery.actions.held_role)
             completion = replace(completion, role_released=True)
             progress_history.save_hook_completion(run, instance, completion)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         details.append(_kept_pane_anomaly(row, state, str(error)))
     if not completion.recording_done:
@@ -228,24 +253,33 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             details.append(reason)
     completion = replace(completion, details=tuple(details))
     progress_history.save_hook_completion(run, instance, completion)
-    _send_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
-    if completion.pane_closed and completion.role_released:
-        if delivery.actions.end_worker:
-            _ = staff.retire(row.id)
-        progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
-    return outcome
+    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
+
+    def send_notice() -> None:
+        decision.send_notice()
+        if completion.pane_closed and completion.role_released:
+            with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name), blocking=True) as final_hold:
+                if isinstance(final_hold, worker_panes.Kept):
+                    raise ValueError(final_hold.blocker)
+                if delivery.actions.end_worker:
+                    current = worker_panes.worker_pass(row, worker_panes.worker_run(row))
+                    if current.get("instance_id") == instance:
+                        _ = staff.retire(row.id)
+                progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
+
+    return TurnDecision(outcome, send_notice)
 
 
 def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: worker_panes.WorkerLockHold,
-                           new_held_role: str) -> None:
-    """Report the worker's unfinished result before a new dispatch replaces its run link."""
+                           new_held_role: str) -> Callable[[], None]:
+    """Prepare the unfinished result before a new dispatch replaces its run link."""
     recorded = progress_history.recorded_dispatch_run(row.id)
     if not isinstance(recorded, progress_history.RecordedDispatchRun):
-        return
+        return _no_notice
     passed = worker_panes.worker_pass(row, recorded.directory)
     completion = progress_history.hook_completion(passed)
     if not isinstance(completion, progress_history.HookCompletion) or completion.finished:
-        return
+        return _no_notice
     delivery = progress_history.dispatch_delivery(passed)
     same_hold = delivery.actions.held_role == new_held_role
     instance = str(passed.get("instance_id", ""))
@@ -253,13 +287,23 @@ def finish_late_completion(row: staff.StaffRow, parent: staff.StaffRow, hold: wo
     details = completion.details if late in completion.details else (*completion.details, late)
     state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
     try:
-        _ = _finish_completion(row, parent, recorded.directory, passed, instance,
-                               replace(delivery, actions=replace(delivery.actions, end_worker=False)),
-                               replace(completion, pane_closed=True,
-                                       role_released=completion.role_released or same_hold, details=details), state, hold)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError,
+        decision = _finish_completion(row, parent, recorded.directory, passed, instance,
+            replace(delivery, actions=replace(delivery.actions, end_worker=False)),
+            replace(completion, pane_closed=True,
+                    role_released=completion.role_released or same_hold, details=details), state, hold)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
         print(f"anomaly: {row.name}: late result of pass {instance} was not reported: {error}; the result is in {completion.reply_file}", file=sys.stderr)
+        return _no_notice
+
+    def send_notice() -> None:
+        try:
+            decision.send_notice()
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            print(f"anomaly: {row.name}: late result of pass {instance} was not reported: {error}; the result is in {completion.reply_file}", file=sys.stderr)
+
+    return send_notice
 
 
 def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> TurnOutcome:
@@ -274,7 +318,16 @@ def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> T
 
 
 def handle(event: WorkerEvent) -> TurnOutcome:
-    """Recover unfinished completion steps without retaining a watcher."""
+    """Send the decided notice after the worker lock is released."""
+    decision = _handle_locked(event)
+    if isinstance(decision, TurnDecision):
+        decision.send_notice()
+        return decision.outcome
+    return decision
+
+
+def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
+    """Recover completion records while holding the worker lock."""
     record = staff.snapshot()
     row = record.by_current_session(event.thread_id) if event.thread_id else None
     if row is None:
@@ -289,18 +342,26 @@ def handle(event: WorkerEvent) -> TurnOutcome:
             return _ignored(event, f"the worker lock was kept: {hold.blocker}", row.name)
         run = worker_panes.worker_run(row, record=record)
         passed = worker_panes.worker_pass(row, run)
+
+        def ignore_turn(reason: str) -> TurnOutcome:
+            if event.kind == EventKind.TURN_END:
+                dispatch = worker_panes.worker_dispatch_state(row, run, hold)
+                if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                    _ = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+            return _ignored(event, reason, row.name)
+
         completion = progress_history.hook_completion(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.finished:
-            return _ignored(event, "the hook completion is already finished", row.name)
+            return ignore_turn("the hook completion is already finished")
         active = progress_history.active_dispatch(row.id, run)
         if not isinstance(active, progress_history.ActiveDispatch) and not (
                 isinstance(completion, progress_history.HookCompletion) or
                 passed.get("status") in ("completed", "error")):
-            return _ignored(event, "no active dispatch or recoverable completion exists", row.name)
+            return ignore_turn("no active dispatch or recoverable completion exists")
         instance = active.instance_id if isinstance(active, progress_history.ActiveDispatch) else str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)
         if not delivery.line:
-            return _ignored(event, "the dispatch delivery line is empty", row.name)
+            return ignore_turn("the dispatch delivery line is empty")
         client = herdr.Herdr(herdr.shared_session())
         state = worker_panes.observe_worker(parent.id, row, record)
         if isinstance(state, worker_panes.WorkerNotObserved):
@@ -311,17 +372,20 @@ def handle(event: WorkerEvent) -> TurnOutcome:
         if isinstance(receipt, worker.DispatchNotSubmitted):
             if event.kind == EventKind.STAGE_READY and delivery.completion_id != instance:
                 return _submit_stage(parent, row, state, client, run, passed, instance, delivery)
-            return _ignored(event, "the transcript has no matching dispatch prompt", row.name)
+            return ignore_turn("the transcript has no matching dispatch prompt")
         if isinstance(receipt, worker.DispatchEvidenceUnknown):
             return _ignored(event, f"the transcript evidence is unknown: {receipt.reason}", row.name)
         turn_reply = receipt.reply if isinstance(receipt, worker.DispatchWaitingForRuns) else receipt
         reply = turn_reply.last_reply if isinstance(turn_reply, worker.DispatchAwaitingReply) else turn_reply.reply
         if (event.kind == EventKind.TURN_END and reply != event.reply
-                and event.reply.rstrip().splitlines()[-1:] == [f"DONE {delivery.completion_id}"]
+                and worker_admission.reply_ends_dispatch(event.reply, delivery.completion_id)
                 and not (isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.has_live_run)):
             receipt = worker.DispatchComplete(event.reply,
                 receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ())
             reply = event.reply
+        if (event.kind == EventKind.RUN_FINISHED and not isinstance(receipt, worker.DispatchComplete)
+                and isinstance(state, worker_panes.OpenWorker) and state.status == herdr.AgentStatus.WORKING):
+            return TurnOutcome.WAITING_ON_REPLY
         if isinstance(receipt, worker.DispatchSubmitted) and not receipt.reply:
             if event.kind == EventKind.STAGE_READY:
                 return TurnOutcome.SUBMITTED
@@ -338,7 +402,7 @@ def handle(event: WorkerEvent) -> TurnOutcome:
                     completion_id = worker_panes.stage_two_completion_id(instance)
                     diff = delivery.early_ready.removesuffix(".ready") + ".diff"
                     line = (f"Stage 2: the final diff is at {json.dumps(diff)}. "
-                            + delivery.line.replace(f"DONE {instance}.", f"DONE {completion_id}."))
+                            + delivery.line.replace(f"DONE {instance}", f"DONE {completion_id}"))
                     delivery = replace(delivery, line=line, completion_id=completion_id)
                     progress_history.save_dispatch_delivery(run, instance, delivery)
                     return _submit_stage(parent, row, state, client, run, passed, instance, delivery)
@@ -363,8 +427,37 @@ def handle(event: WorkerEvent) -> TurnOutcome:
             return _finish_completion(row, parent, run, passed, instance, delivery, completion, state, hold)
         details = "\n".join(anomalies) or reply
         runs = receipt.runs if isinstance(receipt, worker.DispatchWaitingForRuns) else ()
-        _send_notice(row.name, parent, run, passed, instance, outcome, path, reply, details, runs)
-        return outcome
+        return _prepare_notice(row.name, parent, run, passed, instance, outcome, path, reply, details, runs)
+
+
+def report_quota_refusals() -> list[str]:
+    """Report a pane Codex worker's quota refusal once per pass; Codex runs no Stop hook for that turn."""
+    from scripts.accounts import refusal_watch
+    from scripts.whoami import agent_accounts, note_file, quota_alert
+
+    record = staff.local_snapshot()
+    lines: list[str] = []
+    for row in record.rows:
+        parent = record.parent_of(row)
+        recorded = progress_history.recorded_dispatch_run(row.id)
+        if row.kind != "worker" or parent is None or not isinstance(recorded, progress_history.RecordedDispatchRun):
+            continue
+        active = progress_history.active_dispatch(row.id, recorded.directory)
+        backend = staff.backend(row)
+        if (not isinstance(active, progress_history.ActiveDispatch) or not isinstance(backend, staff.CodexBackend)
+                or worker_panes.worker_pass(row, recorded.directory).get("quota_refusal")):
+            continue
+        refusal = refusal_watch.transcript_refusal(str(row.current_session), config_dir=backend.codex_home)
+        if not isinstance(refusal, refusal_watch.TranscriptRefusal):
+            continue
+        try:
+            stopped = quota_alert.StoppedWorker(str(parent.current_session), row.name)
+            lines += quota_alert.blocked(list(note_file.read_notes()), agent_accounts.codex_account(backend.codex_home),
+                                         window=refusal.window, refused_at=refusal.refused_at, stopped=stopped)
+            progress_history.record_quota_refusal(recorded.directory, active.instance_id, refusal.entry_id)
+        except (OSError, ValueError) as error:
+            lines.append(f"anomaly: {row.name}: quota refusal not reported: {' '.join(str(error).splitlines())}")
+    return lines
 
 
 def run_finished(thread_id: str) -> None:
@@ -394,7 +487,7 @@ def main(arguments: list[str] | None = None) -> int:
             with cast(io.BufferedWriter, child.stdin) as stream:
                 _ = stream.write(payload.encode())
         return 0
-    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         print(f"turn_end: {error}", file=sys.stderr)
         return 1
 

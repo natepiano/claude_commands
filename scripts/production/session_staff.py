@@ -6,7 +6,6 @@ except FileNotFoundError:
     pass
 
 import sys
-import fcntl
 import json
 import shlex
 import subprocess
@@ -22,11 +21,12 @@ from typing import NamedTuple, cast
 from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
-from scripts.agents import remote
+from scripts.agents import remote, worker_lifecycle
 from scripts.message import morty_identity, process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch, agent_kind, without_staff_labels
+from scripts.herdr import pane_launch
 from scripts.lib import legacy_identity
 from scripts.production import unit_names
 
@@ -108,7 +108,7 @@ def morty_thread(identity: str) -> bool:
     return bool(identity) and morty_identity.matches(f"codex:{identity}")
 
 
-WORKER_FACT_KEYS = ("thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
+WORKER_FACT_KEYS = ("name", "thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")
 
 PresentWorktree = staff.PresentWorktree
 RemovedWorktree = staff.RemovedWorktree
@@ -154,7 +154,8 @@ def codex_thread(entry: Mapping[str, object], record: staff.StaffSnapshot | None
 
 def worker_row(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> staff.StaffRow | None:
     record = record if record is not None else staff.local_snapshot()
-    return record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
+    row = record.by_id(staff.StaffId(str(entry.get("staff_id", ""))))
+    return row if row is not None and row.kind == "worker" else None
 
 
 def worker_session(entry: Mapping[str, object], record: staff.StaffSnapshot | None = None) -> str:
@@ -181,6 +182,14 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
         paths.append(Path(current))
     found: dict[staff.StaffId, WorkerRunEvidence] = {}
     for run in sorted(dict.fromkeys(paths), key=lambda run: run.stat().st_mtime if run.exists() else 0):
+        fields = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        reference = fields.get(unit_runs.OWNER_FIELD)
+        owner = record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else None
+        if not isinstance(owner, staff.StaffRow):
+            owner = next((row for row in owners.values()
+                          if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == run.resolve()), owner)
+        if not isinstance(owner, staff.StaffRow):
+            continue
         records: dict[staff.StaffId, dict[str, object]] = {}
         try:
             entries = [cast(object, json.loads(path.read_text())) for path in run.glob("impl_worker_*.json")]
@@ -189,6 +198,9 @@ def _worker_runs(record: staff.StaffSnapshot, rows: Iterable[staff.StaffRow]) ->
         except (OSError, ValueError) as error:
             report_anomaly(f"{run}: {error}")
         for identity in records.keys() | marked.get(run, set[staff.StaffId]()):
+            row = record.by_id(identity)
+            if row is None or row.kind != "worker" or row.parent != staff.ReportsTo(owner.id):
+                continue
             evidence = found.setdefault(identity, WorkerRunEvidence([], []))
             evidence.runs.append(run)
             if identity in records:
@@ -231,15 +243,19 @@ def worker_home(entry: Mapping[str, object], record: staff.StaffSnapshot | None 
 
 def stored_worker_records(entries: Mapping[str, object]) -> dict[str, object]:
     """Store fixed references and run details without copying staff facts."""
-    return {name: {key: value for key, value in cast(dict[str, object], raw).items()
-                   if key not in WORKER_FACT_KEYS}
-            for name, raw in entries.items() if isinstance(raw, dict)}
+    return {str(cast(dict[str, object], raw)["staff_id"]): {
+                key: value for key, value in cast(dict[str, object], raw).items() if key not in WORKER_FACT_KEYS}
+            for raw in entries.values() if isinstance(raw, dict) and cast(dict[str, object], raw).get("staff_id")}
 
 
-def read_worker_roster(path: Path) -> dict[str, object]:
-    from scripts.agents import worker_lifecycle
-    with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as handle:
-        return handle.read_object()
+def run_workers(state: Mapping[str, object], record: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Read the selected run's workers from the same staff snapshot as its owner."""
+    from scripts.lib import unit_runs
+
+    owner = unit_runs.run_owner(state, record)
+    if isinstance(owner, unit_runs.RunOwnerUnrecorded):
+        return ()
+    return tuple(record.find(kind="worker", parent=owner.id))
 
 
 def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> Path:
@@ -390,7 +406,7 @@ class RowResolver:
             )
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine,
+                    ["ssh", "-o", "BatchMode=yes", machine,
                      "~/.claude/scripts/lib/py -B -c " + shlex.quote(code)],
                     input=json.dumps(requests), capture_output=True, text=True, check=False,
                 )
@@ -419,7 +435,7 @@ class RowResolver:
             return LocationUnfilled("the worktree is not recorded")
         retired = isinstance(tree, RemovedWorktree)
         if retired:
-            home = Path.home() if tree.machine == remote.local_machine() else Path("~")
+            home = None if tree.machine == remote.local_machine() else Path("~")
             path = configuration.parked_path(holder.id, home=home)
         else:
             path = tree.path / ".unit.toml"
@@ -453,11 +469,9 @@ class RowResolver:
         if isinstance(tree, WorktreeUnfilled):
             return LocationUnfilled("the worktree is not recorded")
         if isinstance(tree, RemovedWorktree):
-            config = self.unit_config(holder)
-            if isinstance(config, UnitConfig) and isinstance(config.retired, configuration.RetiredSession):
-                return Branch(config.retired.branch.value)
-            return RetiredFactsUnavailable(config.reason if isinstance(config, (ConfigMissing, RetiredFactsUnavailable))
-                                          else "parked retirement facts are missing")
+            if isinstance(tree.branch, staff.ParkedBranch):
+                return Branch(tree.branch.value)
+            return RetiredFactsUnavailable("the parked branch is not recorded in staff")
         state, text = self._fact(tree.machine, "git", tree.path)
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
@@ -776,7 +790,7 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
             candidates = set(pane_rows.get(unit.place, ()))
             for launch in launches:
                 if unit.place.session == shared_session and launch["pane_id"] == unit.place.pane:
-                    owner = record.by_current_session(launch["session_id"])
+                    owner = record.by_member_reference(pane_launch.reference_id(launch))
                     if owner is not None:
                         candidates.add(owner.id)
             if candidates:
@@ -863,11 +877,11 @@ class LaunchMembership:
         return cls(record, member_sources())
 
     def environment(self, launch: PaneLaunch) -> dict[str, str]:
-        if agent_kind(launch) == "codex":
+        if agent_kind(launch, record=self.record) == "codex":
             return legacy_identity.without_legacy_identity(launch["environment"])
         labels = StaffLabels(self.record)
-        owner = self.record.by_member_reference(launch["session_id"])
-        session_id = owner.current_session if owner is not None else launch["session_id"]
+        owner = self.record.by_member_reference(pane_launch.reference_id(launch))
+        session_id = owner.current_session if owner is not None else pane_launch.reference_id(launch)
         return labels.environment(launch["environment"], session_id)
 
 
@@ -894,7 +908,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
 
     record = staff.snapshot()
     history = pane_record.launches()
-    newest = {entry["session_id"]: entry["written_at"]
+    newest = {pane_launch.reference_id(entry): entry["written_at"]
               for entry in sorted(history, key=lambda item: item["written_at"])}
     live = sessions.running_sessions()
     repaired: list[RepairedSessionLabels] = []
@@ -908,7 +922,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
             if session is None or session["sessionId"] in seen:
                 continue
             seen.add(session["sessionId"])
-            if pane_record.matching_launch(process.place, session["sessionId"]) is not None:
+            if pane_launch.matching_launch(pane_record.read(process.place.session), process.place, session["sessionId"]) is not None:
                 continue
             try:
                 entry = pane_record.running_launch(session, process.place, process.cwd)
@@ -917,16 +931,16 @@ def repair_marks() -> list[RepairedSessionLabels]:
             if record.by_current_session(entry["session_id"]) is None:
                 continue
             pane_record.write(process.place.session, entry)
-            newest[entry["session_id"]] = entry["written_at"]
+            newest[pane_launch.reference_id(entry)] = entry["written_at"]
             repaired.append(RepairedSessionLabels(
-                f"{process.place.session}:{process.place.pane}:{entry['session_id']}",
+                f"{process.place.session}:{process.place.pane}:{pane_launch.reference_id(entry)}",
                 (), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)
             changed = False
             for pane, entry in entries.items():
-                if entry["written_at"] != newest.get(entry["session_id"]):
+                if entry["written_at"] != newest.get(pane_launch.reference_id(entry)):
                     continue
                 restored = entry.copy()
                 restored["environment"] = pane_record.retained_environment(entry, history)
@@ -935,7 +949,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
                     entries[pane] = restored
                     before, after = entry["environment"], restored["environment"]
                     repaired.append(RepairedSessionLabels(
-                        f"{path.stem}:{pane}:{entry['session_id']}",
+                        f"{path.stem}:{pane}:{pane_launch.reference_id(entry)}",
                         tuple((key, value) for key, value in sorted(after.items()) if before.get(key) != value),
                         tuple(sorted(key for key in before if key not in after))))
                     changed = True

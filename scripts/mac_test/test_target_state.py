@@ -15,7 +15,10 @@ import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 import unittest
 from unittest import mock
@@ -116,7 +119,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
@@ -209,6 +212,19 @@ class TargetStateTests(IsolatedTargetState):
             self.assertNotIsInstance(block, mac_test.NoMacBlock)
             if not isinstance(block, mac_test.NoMacBlock):
                 self.assertEqual(block.expires - block.since, timedelta(hours=4))
+        self.assertEqual(self.invoke_mac(["unblock", "--holder", "alice"]).returncode, 0)
+        with isolated_staff_file(self.root / "staff.json", {}):
+            member = fixture_member("producer", name="before-rename")
+            self.assertEqual(self.block("mac", member.id).returncode, 0)
+            member = staff.rename(member.id, "after-rename")
+            status = self.invoke_mac(["status", "--target", "mac"])
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertIn("blocked by after-rename since ", status.stdout)
+            state = targets.target_state(self.selected_target("mac"))
+            self.assertIsInstance(state, targets.Held)
+            assert isinstance(state, targets.Held)
+            self.assertEqual(state.holder, member.name)
+            self.assertEqual(self.invoke_mac(["unblock", "--holder", member.id, "--target", "mac"]).returncode, 0)
 
     def test_explicit_mac_free_now_reads_the_registry_offload_setting(self) -> None:
         legacy = self.root / "mac_test.conf"

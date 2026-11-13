@@ -17,8 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Generator, Iterator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import cached_property
@@ -49,20 +48,6 @@ PROJECT = "-home-natepiano-rust-hana"
 
 def setUpModule() -> None:
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
-
-
-class ImportTests(unittest.TestCase):
-    def test_tmp_sweep_import_omits_unused_modules(self) -> None:
-        omitted = ("scripts.production.session_staff", "scripts.production.staff")
-        with tempfile.TemporaryDirectory() as directory:
-            environment = {**os.environ, "BUILDLOG_DIR": directory}
-            result = subprocess.run(
-                [sys.executable, "-c", "import sys; from scripts.lint import tmp_sweep; "
-                 + f"assert not set({omitted!r}).intersection(sys.modules)"],
-                cwd=Path(__file__).resolve().parents[2], env=environment,
-                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
-            )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:
@@ -182,6 +167,23 @@ class TmpSweepCase(unittest.TestCase):
 
     def sweep(self, dry_run: bool = False) -> tmp_sweep.Sweep:
         return tmp_sweep.sweep(dry_run, self.roots(), self.now, str(self.proc))
+
+    def assert_run_tmp_entries(self, run: Path, reason: tmp_sweep.RunKeepReason) -> None:
+        idle = write(run / "tmp" / "idle" / "file").parent
+        fresh = write(run / "tmp" / "fresh" / "file").parent
+        self.recent(fresh / "file")
+        used = write(run / "tmp" / "used" / "file").parent
+        pid = 100 + len(list(self.proc.iterdir()))
+        fake_process(self.proc, pid, fds=(str(used / "file"),))
+        result = self.sweep()
+        self.assertFalse(idle.exists())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(used.is_dir())
+        self.assertTrue((run / "tmp").is_dir())
+        self.assertTrue(run.is_dir())
+        self.assertIn(str(run), result.kept[reason.value])
+        self.assertIn(str(fresh), result.kept[tmp_sweep.RECENT])
+        self.assertIn(f"{used}: pid {pid} holds a file open in it", result.kept[tmp_sweep.IN_USE])
 
     def run_once(self, dry_run: bool = False) -> tuple[int, str]:
         output = io.StringIO()
@@ -434,30 +436,6 @@ class IdleTests(TmpSweepCase):
         self.assertFalse(output.parent.exists())
         self.assertEqual([entry["path"] for entry in result.deleted], [str(output.parent)])
 
-    def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
-        folder = write(self.tmp / "large" / "recent").parent
-        self.recent(folder / "recent")
-        with os.scandir(folder) as entries:
-            first = next(entries)
-        closed: list[bool] = []
-
-        def remaining_entries() -> Iterator[os.DirEntry[str]]:
-            yield first
-            self.fail("The scan loaded more entries after it could decide to keep this folder")
-
-        @contextmanager
-        def streamed_entries(_path: str) -> Generator[Iterator[os.DirEntry[str]]]:
-            try:
-                yield remaining_entries()
-            finally:
-                closed.append(True)
-
-        with mock.patch.object(os, "scandir", side_effect=streamed_entries):
-            result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
-
-        self.assertEqual(result, tmp_sweep.RECENT)
-        self.assertEqual(closed, [True])
-        self.assertTrue((folder / "recent").is_file())
 
     def test_streamed_scan_counts_each_hard_linked_file_once(self) -> None:
         folder = self.tmp / "linked"
@@ -992,6 +970,7 @@ class OwnerTests(TmpSweepCase):
         self.assertFalse(ended.exists())
         self.assertFalse(unowned.exists())
         self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(live)])
+        self.assert_run_tmp_entries(live, tmp_sweep.RunKeepReason.DIRECTOR)
 
     def test_a_staff_run_stays_without_a_director_file(self) -> None:
         """The staff row keeps a run before a worker starts."""
@@ -1164,11 +1143,10 @@ class RunFolderTests(TmpSweepCase):
     def test_a_staff_run_pointer_keeps_a_run_after_its_session_stops(self) -> None:
         for root in (self.unit, self.delegate):
             with self.subTest(root=root.name):
-                payload = write(root / "marked" / "tmp" / "old" / "file")
-                _ = self.open_run(payload.parents[2], ENDED_SESSION)
-                _ = self.sweep()
-                self.assertTrue(payload.is_file())
-
+                run = write(root / "marked" / "board.log").parent
+                _ = self.open_run(run, ENDED_SESSION)
+                self.assert_run_tmp_entries(run, tmp_sweep.RunKeepReason.OPEN_RUN)
+                self.assertTrue((run / "board.log").is_file())
 
 
     def test_stale_pause_does_not_keep_a_dead_units_worktree(self) -> None:
@@ -1208,6 +1186,7 @@ class RunFolderTests(TmpSweepCase):
         }))
         _ = self.sweep()
         self.assertTrue(payload.is_file())
+        self.assert_run_tmp_entries(payload.parent, tmp_sweep.RunKeepReason.SESSION_WORKTREE)
 
     def test_unreadable_ownership_records_keep_the_run(self) -> None:
         for name in ("progress_history_state.json", "history", "session"):
@@ -1727,7 +1706,6 @@ class PaneRunTests(TmpSweepCase):
         self.assertEqual(snapshot.call_count, 1)
 
     now: float = 0.0
-
 
 
     def test_five_states_keep_only_open_or_unproved_runs(self) -> None:

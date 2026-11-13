@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
 from scripts.agents import remote
@@ -410,7 +411,7 @@ class MergeGateFixture(unittest.TestCase):
         home = self.root / "home"
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),

@@ -134,16 +134,15 @@ class QueueDiskRecoveryTests(unittest.TestCase):
                     fixture.server.publish_host_evidence(evidence)
                 request = replace(request, constraints=replace(request.constraints, candidates=candidates))
                 _ = publish_candidate(fixture, request, placement.TemporaryExclusion("disk"))
-                fixture.server.priority = {"unit": "fixture", "why": "disk recovery",
-                                           "set_at": fixture.clock.now(), "set_by": "fixture-director",
-                                           "transition": records.SettledPriority()}
+                fixture.server.priority = records.QueuePriority(({"unit": "fixture", "why": "disk recovery",
+                                           "set_at": fixture.clock.now(), "set_by": "fixture-director"},))
                 reply, = fixture.connect(request).replies()
                 self.assertIsInstance(reply, wire.PlacementWait)
                 self.assertEqual(set(fixture.server.placement_requests), {request.episode})
                 self.assertEqual(fixture.caller_reservations(), {})
                 original_place = dict(fixture.server.run_places)
                 self.assertTrue(original_place)
-                original_priority = dict(fixture.server.priority)
+                original_priority = fixture.server.priority
                 remote_commands = fixture.root / "remote-commands"
                 for reason in ("disk", "busy", "unreachable", "blocked", "spending"):
                     _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))

@@ -49,7 +49,7 @@ def setUpModule() -> None:
 
 class ClientTests(unittest.TestCase):
     def test_cancel_placement_cli_removes_the_queued_episode(self) -> None:
-        from scripts.build_hold.build_hold import NoOwningSession
+        from scripts.build_hold.owning_session import NoOwningSession
         from scripts.build_queue import placement
         from scripts.mac_test.claim_state import WHOLE_MAC
 
@@ -944,6 +944,7 @@ class ClientTests(unittest.TestCase):
             "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
+            "priority-clear-unit": lambda: client.priority_clear("director", "demo"),
             "token-wait": lambda: client.token_wait("stem", records.read_memory_config())}
         for kind in ("admit", "launch", *mutations):
             with self.subTest(kind=kind), AdmissionFixture() as fixture:

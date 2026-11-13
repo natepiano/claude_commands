@@ -81,8 +81,8 @@ and say so in `<Report/>`.
 
 **Every todo phase states its dependencies** on the line after its heading:
 `**Depends on:** Phase 2, Phase 4` (the plan phases that must be done before it
-starts), or `**Depends on:** none`. Use phase ids only. `phase_table.py parallel` reads these lines; renumbering
-fixes them like any other reference.
+starts), or `**Depends on:** none`. Use phase ids only.
+Update these references when you renumber phases.
 </PhaseNumbering>
 
 ---

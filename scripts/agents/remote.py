@@ -46,18 +46,7 @@ def run_remote(
         remote_command += f" {arguments}"
     remote_command += '; printf "rc=%s\\n" $?'
     try:
-        command = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-        ]
-        if limit["kind"] == "while link alive":
-            command.extend(
-                ("-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
-            )
-        command.extend((other_machine(), remote_command))
+        command = ["ssh", "-o", "BatchMode=yes", other_machine(), remote_command]
         if limit["kind"] == "time limit":
             completed = subprocess.run(
                 command,

@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from typing import ClassVar, override
 
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test.offload_test_support import CommandFixture, OffloadCommandFixture
 
 
@@ -26,10 +27,12 @@ class SeededCleanupFixture(OffloadCommandFixture):
         cls.seed = OffloadCommandFixture()
         try:
             cls.seed.setUp()
-            # FIFO descriptors belong to each test, never the copied seed. Preserve
-            # absolute tool symlinks by restoring every case at the original path.
-            _ = shutil.copytree(cls.seed.root, cls.snapshot, symlinks=True,
-                                ignore=lambda _directory, names: set(names).intersection(cls.gates))
+            admission = caller_admission(cls.seed, cls.seed.root, cls.seed.environment)
+            with admission.loop_turn():
+                # Keep admission files stable while the fixture copies its seed.
+                # Each test owns its FIFO descriptors and restores the same paths.
+                _ = shutil.copytree(cls.seed.root, cls.snapshot, symlinks=True,
+                                    ignore=lambda _directory, names: set(names).intersection(cls.gates))
         finally:
             _ = cls.seed.doCleanups()
 

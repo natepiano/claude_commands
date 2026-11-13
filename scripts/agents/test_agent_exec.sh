@@ -206,18 +206,31 @@ assert_equal "fallback followed its caller instead of the workers role" "$HOME/.
 
 # A named Claude route applies only to worker launches and lasts until it closes.
 "$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
-import sys
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from scripts.accounts import role_map
 from scripts.whoami.account_test_support import create_claude_account
 create_claude_account("claude4", "route@example.invalid")
+for label in ("claude2", "claude4"):
+    target = f"claude-opus-{label}-fixture"
+    catalog = Path.home() / ("." + label) / "cache/model-catalog/fixture-cc.json"
+    catalog.parent.mkdir(parents=True)
+    _ = catalog.write_text(json.dumps({"fetchedAt": 1, "catalog": {"config": {
+        "provider_alias_targets": {"opus": {"default": target}},
+        "models": [{"id": target, "min_claude_code_version": "2.1.319"}],
+    }}}))
 role_map.write_role_map(role_map.WorkersClaudeRouteChange(
     role_map.NamedWorkersClaudeAccount("claude4", datetime.now(timezone.utc) + timedelta(days=2)), "queued workers route", datetime.now(timezone.utc).isoformat()))
 PYTHON
 cat > "$TEST_DIR/bin/claude" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then
+    printf '%s\n' '2.1.319 (Claude Code)'
+    exit 0
+fi
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
+printf '%s\n' "$@" > "$TEST_CLAUDE_ARGUMENTS_FILE"
 cat > "$TEST_CLAUDE_PROMPT_FILE"
 if [[ -n "${TEST_CLAUDE_RESULT:-}" ]]; then
     printf '%s\n' "$TEST_CLAUDE_RESULT"
@@ -231,9 +244,14 @@ chmod +x "$TEST_DIR/bin/claude"
 export TEST_CLAUDE_HOME_FILE="$TEST_DIR/claude-home"
 export TEST_CLAUDE_PROMPT_FILE="$TEST_DIR/claude-prompt"
 export TEST_CLAUDE_BACKGROUND_FILE="$TEST_DIR/background-disabled"
+export TEST_CLAUDE_ARGUMENTS_FILE="$TEST_DIR/claude-arguments"
+recorded_claude_model() {
+    awk 'previous == "--model" { print; exit } { previous = $0 }' "$TEST_CLAUDE_ARGUMENTS_FILE"
+}
 run_exec_fixture claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "workers ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "Claude worker lost its prompt" "test prompt" "$(cat "$TEST_CLAUDE_PROMPT_FILE")"
+assert_equal "print worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 
 test_extraction_failure_preserves_the_task_exit_policy() {
     local task claude_exit expected actual
@@ -280,6 +298,7 @@ test_every_claude_print_launch_keeps_agents_and_reports_errors
 export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 run_exec_fixture direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
+assert_equal "simplify used the worker catalog" "claude-opus-claude2-fixture" "$(recorded_claude_model)"
 
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
@@ -312,7 +331,7 @@ from pathlib import Path
 from scripts.direct import claude_worker
 name, run, cwd, prompt, summary, log, workers = sys.argv[1:]
 turn = claude_worker.ClaudeTurn(name, Path(run), Path(cwd), Path(prompt), Path(summary), Path(log),
-    "", "", "", "", workers == "1", dict(os.environ))
+    "opus", "max", "", "", workers == "1", dict(os.environ))
 result = claude_worker.open_worker(turn)
 raise SystemExit(result.code if isinstance(result, claude_worker.NotDelivered) else 0)
 PYTHON
@@ -329,6 +348,7 @@ PYTHON
 cat > "$TEST_DIR/bin/claude-bg" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
+printf '%s\n' "$@" > "$TEST_CLAUDE_ARGUMENTS_FILE"
 "$FIXTURE_CHECKOUT/scripts/lib/py" - <<'PYTHON'
 import os, sys
 from scripts.production.staff_test_support import record_fixture_claude_start
@@ -342,13 +362,7 @@ CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
     fixture-worker "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/summary" "$LOG_FILE" 1
 assert_equal "background worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-worker)"
-
-# A caller's helper does not opt in to the workers route.
-export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
-    fixture-friend "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE" 0
-assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-friend)"
+assert_equal "background worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 
 # CLI assignments also come from the registry.
 write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
@@ -356,6 +370,7 @@ cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
 MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
+assert_equal "CLI worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 "$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
 from pathlib import Path
@@ -366,5 +381,6 @@ role_map.write_role_map(role_map.WorkersClaudeRouteChange(
 PYTHON
 run_exec_fixture claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "a closed route still replaced the caller account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
+assert_equal "the closed route kept the worker catalog" "claude-opus-claude2-fixture" "$(recorded_claude_model)"
 
 echo "agent_exec tests passed"

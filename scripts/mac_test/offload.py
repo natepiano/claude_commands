@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, Protocol, TextIO, 
 from urllib.parse import quote
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import cargo_manifest, claim_state
 if TYPE_CHECKING:
     from scripts.build_queue import placement
@@ -2515,7 +2516,8 @@ def claim_for_run(
     try:
         controller.complete_claim(claim_arguments(request, config, leased_slots), attempt)
         if isinstance(attempt.answer, (FreshMacClaim, TakenOverMacClaim)):
-            from scripts.mac_test.mac_test import claim_path
+            claim_path = cast(Callable[[claim_state.StatePaths, claim_state.ClaimScope], Path],
+                              getattr(import_module("scripts.mac_test.mac_test"), "claim_path"))
 
             paths = claim_state.state_paths(request.target)
             scope = (request.placement.assignment.destination.scope
@@ -3048,13 +3050,12 @@ def holder_session() -> str:
     from scripts.build_hold import build_hold
 
     owner = build_hold.owning_session()
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
 
 
 def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
-    from scripts.build_hold.build_hold import NoOwningSession, OwningSession
     from scripts.copies import copies
 
     words = arguments.nextest_words
@@ -3262,8 +3263,12 @@ def main() -> int:
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
     settings = arguments.settings
-    if not settings and arguments.target:
-        settings = str(configured_ssh_target(arguments.target).settings)
+    if arguments.target:
+        target_settings = configured_ssh_target(arguments.target).settings.expanduser().resolve()
+        if settings and Path(settings).expanduser().resolve() != target_settings:
+            cli.error(f"--settings {Path(settings).expanduser().resolve()} differs from "
+                      + f"--target {arguments.target} settings {target_settings}")
+        settings = str(target_settings)
     config = read_config(Path(settings)) if settings else read_config()
     if isinstance(request.placement, AssignedOffloadRequest):
         request = replace(request, slot=request.placement.assignment.destination.slot or 1)

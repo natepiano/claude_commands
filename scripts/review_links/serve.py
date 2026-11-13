@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import html
 import ipaddress
 import json
 import os
@@ -28,8 +29,10 @@ STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
 from scripts.production import change_routing
-from scripts.review_links import change_page, change_browser
+from scripts.review_links import branch_page, change_page, change_browser
 from scripts.review_links.review_link import private_name
+
+BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 
 
 class TailscaleAddressLost(RuntimeError):
@@ -111,6 +114,25 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     @override
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
+        try:
+            branches = branch_page.page_at(root, self.path)
+        except FileNotFoundError:
+            pass
+        except branch_page.PageSubmitted:
+            self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
+            return None
+        except (OSError, ValueError) as error:
+            print(f"review-links branches: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>This branch page is not available.</p>"))
+            return None
+        else:
+            server = cast(ReviewLinksServer, self.server)
+            with server.branch_deletions_lock:
+                if branches.folder in server.branch_deletions:
+                    self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
+                    return None
+            self.html_response(200, branch_page.render(branches))
+            return None
         try:
             browser = change_browser.page_at(root, self.path)
         except FileNotFoundError:
@@ -219,6 +241,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         try:
+            branches = branch_page.page_at(server.root, self.path)
+        except FileNotFoundError:
+            pass
+        except branch_page.PageSubmitted:
+            self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
+            return
+        except (OSError, ValueError) as error:
+            print(f"review-links branches: {error}", file=sys.stderr)
+            self.html_response(404, change_page.document("<p>This branch page is not available.</p>"))
+            return
+        else:
+            self.delete_branches(branches)
+            return
+        try:
             browser = change_browser.page_at(server.root, self.path)
         except FileNotFoundError:
             pass
@@ -264,6 +300,47 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def delete_branches(self, page: branch_page.BranchPage) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        with server.branch_deletions_lock:
+            if page.folder in server.branch_deletions:
+                self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
+                return
+            if (page.folder / branch_page.USED).exists():
+                self.html_response(200, change_page.document(f"<p>{branch_page.SUBMITTED}</p>"))
+                return
+            server.branch_deletions.add(page.folder)
+        try:
+            self.run_branch_deletion(page)
+        finally:
+            with server.branch_deletions_lock:
+                server.branch_deletions.remove(page.folder)
+
+    def run_branch_deletion(self, page: branch_page.BranchPage) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty branch selection")
+            body = self.rfile.read(length).decode("utf-8")
+            deletion = branch_page.submit(page, body)
+        except ValueError as error:
+            self.html_response(400, change_page.document(f"<p>{html.escape(str(error))}</p>"))
+            return
+        except OSError as error:
+            print(f"review-links branch delete: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The request could not be read. No branches were deleted.</p>"))
+            return
+        notice = (f"Deleting {len(deletion.selected)} branches. The result and a new link go to "
+                  + f"{deletion.publisher_name} by message.")
+        try:
+            self.html_response(200, change_page.document(f"<p>{html.escape(notice)}</p>"))
+            self.wfile.flush()
+        finally:
+            try:
+                branch_page.deliver(deletion)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                print(f"review-links branch delivery: {error}", file=sys.stderr)
+
     def browser_answer(self, browser: change_browser.ReviewBrowser) -> None:
         server = cast(ReviewLinksServer, self.server)
         try:
@@ -273,7 +350,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(length).decode("utf-8")
             delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.browser_failure(400, "Check the answer and submit it again.", error)
+            self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
             return
         except change_page.FeatureLogFailed as error:
             self.browser_failure(503, "The feature log could not be updated.", error)
@@ -320,6 +397,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.root: Path = root.resolve()
         self.bound_address: str = address[0]
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
+        self.branch_deletions: set[Path] = set()
+        self.branch_deletions_lock: threading.Lock = threading.Lock()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
@@ -356,6 +435,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
                         or (path in self.module_stamps and self.module_stamps[path] != stamp)):
                     with self.delivery_status.locked():
                         if self.delivery_status.request_attempts:
+                            return
+                    with self.branch_deletions_lock:
+                        if self.branch_deletions:
                             return
                     raise CodeChanged(f"code changed: {path}")
             self.module_stamps.update(stamps)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker
+from scripts.herdr import herdr_types
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 
@@ -23,7 +24,7 @@ from scripts.production import staff, staff_sources, session_staff
 from scripts.production.production_doc import ProductionDocument
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.agents import pane_record, remote
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.production import showrunners
 from scripts.production.session_staff import MemberSources
 
@@ -61,7 +62,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(staff.by_id(row.id), row)
         saved = pane_record.read("TEST-showrunner")["TEST-pane"]
         self.assertNotIn("config_dir", saved)
-        self.assertEqual(saved["session_id"], row.id)
+        self.assertEqual(saved.get("staff_id"), row.id)
 
     def test_live_pane_workers_keep_all_five_states_and_report_unknown_evidence(self) -> None:
         fixture = self.row_production()
@@ -168,7 +169,9 @@ class StaffSourcesTests(StaffTestCase):
     def director_pane(self, pane_id: str, row: staff.StaffRow, folder: Path, environment: dict[str, str]) -> None:
         self.pane(pane_id, session_id=row.id, environment=environment)
         entries = pane_record.read("agents")
-        entries[pane_id]["cwd"] = str(folder)
+        entry = entries[pane_id]
+        if "session_id" in entry:
+            entry["cwd"] = str(folder)
         pane_record.save("agents", entries)
 
 
@@ -331,7 +334,7 @@ class StaffSourcesTests(StaffTestCase):
             "staff sources: Codex process 42401: process disappeared"])
 
     def test_codex_worker_without_a_launch_record_is_staff(self) -> None:
-        from scripts.message import codex_daemon, process_table
+        from scripts.message import process_table
 
         owner = unit_membership("show", "unit")
         worker = fixture_worker("impl", owner.id, backend=staff.CodexBackend(self.root / "codex"))
@@ -355,13 +358,16 @@ class StaffSourcesTests(StaffTestCase):
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane")),
                       mock.patch.object(herdr.Herdr, "result", return_value={
-                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}}),
-                      mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
-                          codex_daemon.DaemonSession(worker.current_session, "impl", str(self.root), "idle")])):
+                          "pane": pane, "process_info": {"foreground_processes": [{"pid": 42401, "argv": arguments}]}})):
                     evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources(()), current_only=True)
-                self.assertEqual(evidence.diagnostics, ())
-                self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
-                self.assertEqual([entry.row for entry in evidence.workers], [worker])
+                if source == "terminal":
+                    self.assertEqual(evidence.identities, {})
+                    self.assertEqual(evidence.workers, ())
+                    self.assertEqual(evidence.diagnostics, ())
+                else:
+                    self.assertEqual(evidence.diagnostics, ())
+                    self.assertEqual(evidence.identities[worker.id], {"codex": worker.current_session})
+                    self.assertEqual([entry.row for entry in evidence.workers], [worker])
 
     def test_only_the_panes_foreground_codex_can_use_its_metadata(self) -> None:
         from scripts.message import process_table
@@ -407,7 +413,7 @@ class StaffSourcesTests(StaffTestCase):
                 with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}),
                       mock.patch.object(herdr, "process_environment", return_value=environment),
                       mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "test:pane"),
-                          side_effect=herdr.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
+                          side_effect=herdr_types.HerdrFailure("pane read failed") if evidence == "herdr read failure" else None),
                       mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
                           "foreground_processes": [{"pid": 42402, "argv": ["codex"]}]}}),
                       mock.patch.object(process_table, "snapshot", return_value=table),
@@ -468,7 +474,7 @@ class StaffSourcesTests(StaffTestCase):
 
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
         for failure in (FileNotFoundError("process exited"), PermissionError("permission denied"),
-                        herdr.HerdrFailure("process 42401: exited")):
+                        herdr_types.HerdrFailure("process 42401: exited")):
             with (self.subTest(failure=type(failure).__name__),
                   mock.patch.object(process_table, "snapshot", side_effect=[table, {}]),
                   mock.patch.object(herdr, "process_environment", side_effect=failure),
@@ -629,7 +635,10 @@ class StaffSourcesTests(StaffTestCase):
                 # The first case is the writer's retained A; the second models a
                 # retained observation already carrying the live conversation C.
                 if reference == third:
-                    launch["session_id"] = reference
+                    launch = pane_launch.NativePaneLaunch(pane_id=launch["pane_id"], session_id=reference,
+                        cwd=str(self.root), name=current.name, kind="claude", model=launch["model"],
+                        remote_control=launch["remote_control"], environment=launch["environment"],
+                        flags_read=launch["flags_read"], written_at=launch["written_at"])
                     pane_record.save("agents", {launch["pane_id"]: launch})
                 before = path.read_bytes(), path.stat().st_mtime_ns
                 record = staff.snapshot()

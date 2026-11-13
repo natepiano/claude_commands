@@ -25,15 +25,12 @@ def write_timer(notifier_dir: Path, production_name: str, session_id: str, zone:
         row = staff.update_current_session(row.current_session, runtime)
     instance = notifier_dir / f"showrunner-{row.id}"
     instance.mkdir(parents=True, exist_ok=True)
-    prompt = instance / "prompt.txt"
-    _ = prompt.write_text(f"Run `zsh unit_status.sh /scratch/unit_status {zone} --production {row.name}`.\n",
-                          encoding="utf-8")
     path = Path(doc)
     held = path.read_text(encoding="utf-8") if path.is_file() else ""
     if zone and "- **User zone:** " not in held:
         _ = path.write_text(f"- **User zone:** {zone}\n{held}", encoding="utf-8")
     _ = (instance / "conf").write_text(
-        f"TARGET=session:{row.id}\nPROMPT_FILE={prompt}\nCHECK=zsh /scripts/production_check.sh {row.id}\n",
+        f"TARGET=session:{row.id}\nPROMPT=scheduled\nCHECK=zsh /scripts/production_check.sh {row.id}\n",
         encoding="utf-8")
     return instance
 

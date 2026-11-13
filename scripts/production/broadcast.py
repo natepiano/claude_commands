@@ -299,7 +299,7 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
                + ' "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/broadcast.py" '
                + shlex.join(_remote_arguments(sender, texts)))
     try:
-        done = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+        done = subprocess.run(["ssh", "-o", "BatchMode=yes", host, command],
                               capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         why = "timed out" if isinstance(error, subprocess.TimeoutExpired) else str(error).splitlines()[0]

@@ -26,14 +26,14 @@ from unittest import mock
 from urllib.request import Request
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, ledger, measurement, remote
+from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, measurement, remote
 from scripts.aws_target.config import read_control_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
 from scripts.buildlog import sync
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -234,6 +234,8 @@ elif service == 'budgets' and operation == 'describe-budget':
 elif service == 'budgets' and operation == 'delete-budget':
     (root / 'deleted-budget').touch(); reply({})
 elif operation == 'describe-instances':
+    if '--filters' in args:
+        reply({'Reservations': []}); sys.exit(0)
     if (root / 'missing-instance').exists():
         print('InvalidInstanceID.NotFound: instance does not exist', file=sys.stderr)
         sys.exit(1)
@@ -274,6 +276,8 @@ elif operation == 'start-instances':
 elif operation == 'describe-spot-price-history':
     reply({'SpotPriceHistory': [{'Timestamp': datetime.datetime.fromtimestamp(clock, datetime.UTC).isoformat(),
                                  'SpotPrice': '0.1'}]})
+elif operation == 'get-service-quota':
+    reply({'Quota': {'Value': 128}})
 elif operation == 'get-cost-and-usage':
     period = args[args.index('--time-period') + 1]
     assert all(len(part.split('=')[1]) == 10 for part in period.split(','))
@@ -344,24 +348,21 @@ class FixtureExecutor:
 
 
 class GateImageAws:
-    """Keep the image lifecycle and temporary instance in local test state."""
+    """Keep the gate stack, the saved gate image and its snapshot in local test state."""
     def __init__(self, failure: str = '') -> None:
         self.failure: str = failure
         self.commands: list[list[str]] = []
-        self.launches: list[dict[str, object]] = []
-        self.terminated: bool = False
-        self.image_count: int = 0
-        self.image_reads: int = 0
         self.version: int = 1
         self.gate_changes: list[dict[str, object]] = []
-        self.image_parameter: str = 'ami-fixture'
+        self.image_parameter: str = 'ami-old'
         self.manifest: Path = Path()
         self.live_template: dict[str, object] = {'Resources': {
             'GateExpiryFunction': {'live': 'keep'}, 'GateScalerPolicy': {'Properties': {
                 'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': ['ec2:RunInstances'],
                     'Resource': {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}'}}]}}}}}
         self.images: dict[str, dict[str, object]] = {
-            'ami-old': self.image('ami-old', 'snap-old'),
+            'ami-old': {'ImageId': 'ami-old', 'State': 'available', 'Tags': self.tags(),
+                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': 'snap-old', 'VolumeSize': 32}}]},
             'ami-builder': {'ImageId': 'ami-builder', 'Tags': [{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}]}}
         self.snapshots: dict[str, dict[str, object]] = {
             'snap-old': {'SnapshotId': 'snap-old', 'Tags': self.tags()},
@@ -371,11 +372,6 @@ class GateImageAws:
     def tags() -> list[dict[str, str]]:
         return [{'Key': gate_box.GATE_IMAGE_OWNER_TAG, 'Value': 'true'}]
 
-    @classmethod
-    def image(cls, name: str, snapshot: str) -> dict[str, object]:
-        return {'ImageId': name, 'State': 'available', 'Tags': cls.tags(),
-                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda', 'Ebs': {'SnapshotId': snapshot, 'VolumeSize': 32}}]}
-
     def __call__(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
         args = list(arguments)
         self.commands.append(args)
@@ -384,8 +380,6 @@ class GateImageAws:
         error = ''
         if operation == 'get-cost-and-usage':
             reply = account_reply(arguments)
-        elif operation == 'export-credentials':
-            reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
         elif operation == 'describe-stacks':
             reply = {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'StackId': 'fixture-stack',
                 'Parameters': [{'ParameterKey': 'GateImage', 'ParameterValue': self.image_parameter},
@@ -419,54 +413,14 @@ class GateImageAws:
             reply = {'StackEvents': []}
         elif operation == 'delete-change-set':
             pass
-        elif operation == 'run-instances':
-            self.launches.append(ledger.mapping(cast(object, json.loads(args[args.index('--cli-input-json') + 1]))))
-            self.terminated = False
-            if self.failure == 'lost launch':
-                raise subprocess.TimeoutExpired('fixture launch', 1)
-            reply = {'Instances': [{'InstanceId': 'i-image'}]}
-        elif operation == 'get-object':
-            if self.failure == 'interrupt':
-                raise KeyboardInterrupt
-            if self.failure == 'timeout':
-                error = 'NoSuchKey'
+        elif operation in ('describe-images', 'describe-snapshots'):
+            owner = ledger.text(ledger.rows({'rows': cast(object, json.loads(args[args.index('--filters') + 1]))},
+                                            'rows')[0], 'Name').removeprefix('tag:')
+            tags = [{'Key': owner, 'Value': 'true'}]
+            if operation == 'describe-images':
+                reply = {'Images': [row for row in self.images.values() if row.get('Tags') == tags]}
             else:
-                _ = Path(args[args.index('--key') + 2]).write_text(json.dumps({'status': 7 if self.failure == 'prepare' else 0}))
-        elif operation == 'describe-instances':
-            reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-image',
-                'LaunchTime': '2026-11-09T00:00:00Z', 'State': {'Name': 'terminated' if self.terminated else 'running'}}]}]}
-        elif operation == 'terminate-instances':
-            self.terminated = True
-        elif operation == 'create-image':
-            if self.failure == 'create':
-                error = 'fixture image failure'
-            else:
-                self.image_count += 1
-                self.image_reads = 0
-                name, snapshot = f'ami-gate-{self.image_count}', f'snap-gate-{self.image_count}'
-                self.images[name] = self.image(name, snapshot)
-                self.images[name]['State'] = 'pending'
-                self.snapshots[snapshot] = {'SnapshotId': snapshot, 'Tags': self.tags()}
-                reply = {'ImageId': name}
-        elif operation == 'describe-images':
-            if '--image-ids' in args:
-                name = args[args.index('--image-ids') + 1]
-                if name not in self.images:
-                    error = 'InvalidAMIID.NotFound'
-                else:
-                    self.image_reads += 1
-                    if self.failure == 'image interrupt':
-                        self.failure = ''
-                        raise KeyboardInterrupt
-                    if self.failure == 'image':
-                        self.images[name]['State'] = 'failed'
-                    elif self.image_reads > 1 and self.failure != 'image timeout':
-                        self.images[name]['State'] = 'available'
-                    reply = {'Images': [self.images[name]]}
-            else:
-                reply = {'Images': [row for row in self.images.values() if row.get('Tags') == self.tags()]}
-        elif operation == 'describe-snapshots':
-            reply = {'Snapshots': [row for row in self.snapshots.values() if row['Tags'] == self.tags()]}
+                reply = {'Snapshots': [row for row in self.snapshots.values() if row['Tags'] == tags]}
         elif operation == 'deregister-image':
             del self.images[args[args.index('--image-id') + 1]]
         elif operation == 'delete-snapshot':
@@ -474,7 +428,8 @@ class GateImageAws:
         else:
             raise AssertionError(operation)
         if self.manifest.exists():
-            selected = ledger.text(remote.read_record(self.manifest), 'image')
+            record = remote.read_record(self.manifest)
+            selected = ledger.text(ledger.rows(record, 'regions')[0] if 'regions' in record else record, 'image')
             if selected not in self.launchable_images():
                 raise AssertionError(f'The selected image {selected} has no launch permission')
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
@@ -550,6 +505,12 @@ class DeploymentTests(CostFixture):
         })
         for key, value in values.items():
             self.replace(key, value)
+        gates = self.root / 'cloud_gate.conf'
+        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        text_setting(gates, 'regions', 'us-east-1')
+        # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
+        _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
+                                    re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
         _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'
@@ -765,7 +726,7 @@ sys.exit(7)
         self.assertEqual(self.previous_output(output.getvalue(), 'secrets'), '')
 
     def test_gate_trial_command_prints_progress_around_the_trial(self) -> None:
-        arguments = ['deploy.py', 'gate-trial', '--step', 'size', '--repo', str(self.root), '--approve-resources']
+        arguments = ['deploy.py', 'gate-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
         with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(gate_trial, 'main', return_value=0) as trial,
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 0)
@@ -880,113 +841,97 @@ sys.exit(7)
         subject.directory.mkdir()
         book = ledger.CostLedger(subject.directory)
         book.record_inventory(ledger.ResourceInventory(self.now - 1,
-            (ledger.PricedResource('gate-shared', aws_config.money('1')),), 'fixture', builder_removed=True))
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+            (ledger.PricedResource('gate-shared', aws_config.money('1')),
+             ledger.PricedResource('gate-image', aws_config.money('1.60'))), 'fixture', builder_removed=True))
         _ = (subject.directory / 'deployment.json').write_text(json.dumps({
             'stack_id': 'fixture-stack', 'stack': 'fixture-build'}))
         _ = (subject.directory / 'gate-deployment.json').write_text(json.dumps({
             'deployment_id': 'fixture', 'bucket': 'fixture-bucket', 'template': 'fixture-template',
-            'version': '1', 'security_group': 'fixture-group', 'revision': 'f' * 40, 'image': 'ami-fixture',
+            'version': '1', 'security_group': 'fixture-group', 'revision': 'f' * 40, 'image': 'ami-old',
             'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]}))
-        def advance(seconds: float) -> None:
-            self.set_clock(self.now + max(1, int(seconds)))
-        subject.pause = advance
+        (subject.directory / 'gate-image').mkdir()
+        _ = (subject.directory / 'gate-image/image.json').write_text('{"image_id":"ami-old"}')
+        _ = (subject.directory / 'image.json').write_text('{"image_id":"ami-builder"}')
         fake = GateImageAws(failure)
         fake.manifest = subject.directory / 'gate-deployment.json'
         _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
             'fixture-admin', 'us-east-1', 1, execute=fake)))
         return subject, fake
 
-    def test_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
+    def test_remove_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
         self.credentials.unlink()
         before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
         with mock.patch.object(admin_secrets.AdminSecretSession, 'get') as credentials, redirect_stdout(StringIO()) as output:
-            self.assertTrue(self.deployment().gate_image())
+            self.assertTrue(self.deployment().remove_images())
         credentials.assert_not_called()
-        self.assertIn('gate-image --approve-resources', output.getvalue())
+        self.assertIn('remove-images --approve-destroy', output.getvalue())
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
-    def test_gate_image_reuses_tools_and_replaces_only_after_input_changes(self) -> None:
+    def test_remove_gate_image_switches_to_the_official_image_before_deleting_the_gate_image(self) -> None:
         subject, fake = self.gate_image_fixture()
-        with mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40) as revision:
-            with mock.patch.object(box, 'create_saved_image', wraps=box.create_saved_image) as create, redirect_stdout(StringIO()) as output:
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(create.call_count, 1)
-            self.assertIn('32 GiB; monthly snapshot estimate $1.60', output.getvalue())
-            self.assertTrue(fake.terminated)
-            self.assertNotIn('ami-old', fake.images)
-            self.assertNotIn('snap-old', fake.snapshots)
-            self.assertIn('ami-builder', fake.images)
-            self.assertIn('snap-builder', fake.snapshots)
-            operations = [args[args.index('--region') + 3] for args in fake.commands]
-            self.assertLess(operations.index('create-image'), operations.index('terminate-instances'))
-            self.assertLess(operations.index('terminate-instances'), operations.index('deregister-image'))
-            self.assertEqual(fake.images['ami-gate-1']['State'], 'available')
-            with mock.patch.object(gate_box, 'GUEST', 'changed gate code'), redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 1)
-            path = self.root / 'cloud_gate.conf'
-            _ = path.write_text(path.read_text().replace('packages=git ', 'packages=hello git '))
-            with redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 2)
-            self.assertNotIn('ami-gate-1', fake.images)
-            self.assertNotIn('snap-gate-1', fake.snapshots)
-            revision.return_value = 'e' * 40
-            with redirect_stdout(StringIO()):
-                self.assertTrue(subject.gate_image(approve_resources=True))
-            self.assertEqual(len(fake.launches), 3)
-        manifest = remote.read_record(subject.directory / 'gate-deployment.json')
-        self.assertEqual(manifest['image'], 'ami-gate-3')
-        self.assertEqual(manifest['revision'], 'e' * 40)
-        self.assertEqual(manifest['version'], '4')
-        self.assertEqual(len(fake.gate_changes), 6)
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertIn('remove-images: done; gates boot from the official image', output.getvalue())
+        manifest = remote.read_record(fake.manifest)
+        home = ledger.rows(manifest, 'regions')[0]
+        self.assertEqual((home['image'], home['version'], manifest['revision']), ('ami-fixture', '2', 'f' * 40))
+        self.assertEqual(len(fake.gate_changes), 2)
         for index, change in enumerate(fake.gate_changes):
             template = ledger.mapping(change['Template'])
             self.assertEqual(ledger.mapping(template['Resources'])['GateExpiryFunction'], {'live': 'keep'})
             image_policy = ledger.mapping(ledger.mapping(ledger.mapping(
                 ledger.mapping(template['Resources'])['GateScalerPolicy'])['Properties'])['PolicyDocument'])
             statements = ledger.rows(image_policy, 'Statement')
-            self.assertEqual(len(statements), 2 if index % 2 == 0 else 1)
-            if index % 2 == 0:
-                previous = 'ami-fixture' if index == 0 else 'ami-gate-' + str(index // 2)
-                self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
-                    'Action': ['ec2:RunInstances'], 'Resource': {
-                        'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/' + previous}})
-            else:
-                self.assertEqual(template, fake.live_template)
             rows = ledger.rows(change, 'Parameters')
             self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'EnableCompute'),
                              {'ParameterKey': 'EnableCompute', 'UsePreviousValue': True})
             image_parameter = next(row for row in rows if row['ParameterKey'] == 'GateImage')
-            self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'ParameterValue':
-                'ami-gate-' + str(index // 2 + 1)} if index % 2 == 0 else {
-                    'ParameterKey': 'GateImage', 'UsePreviousValue': True})
-        self.assertEqual(fake.launches[0]['ImageId'], 'ami-fixture')
-        data = ledger.text(fake.launches[0], 'UserData')
-        self.assertIn('cloud-gate-image-expiry', data)
-        self.assertNotIn('source.bundle', data)
-        self.assertNotIn('fixture-secret', data)
+            if index == 0:
+                self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
+                    'Action': ['ec2:RunInstances'], 'Resource': {
+                        'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/ami-old'}})
+                self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'ParameterValue': 'ami-fixture'})
+            else:
+                self.assertEqual(len(statements), 1)
+                self.assertEqual(template, fake.live_template)
+                self.assertEqual(image_parameter, {'ParameterKey': 'GateImage', 'UsePreviousValue': True})
+        self.assertEqual(fake.launchable_images(), {'ami-fixture'})
+        operations = [args[args.index('--region') + 3] for args in fake.commands]
+        last_change = len(operations) - operations[::-1].index('execute-change-set') - 1
+        self.assertLess(last_change, operations.index('deregister-image'))
+        self.assertLess(operations.index('deregister-image'), operations.index('delete-snapshot'))
+        self.assertEqual((fake.images, fake.snapshots), ({}, {}))
+        self.assertFalse((subject.directory / 'gate-image').exists())
+        self.assertFalse((subject.directory / 'image.json').exists())
+        self.assertIn('no saved image remains', output.getvalue())
         inventories = ledger.CostLedger(subject.directory).read_snapshot().inventories
         self.assertTrue(inventories[-1].builder_removed)
-        self.assertEqual(inventories[-1].resources[-1], ledger.PricedResource('gate-image', aws_config.money('1.60')))
+        self.assertEqual(inventories[-1].resources, (ledger.PricedResource('gate-shared', aws_config.money('1')),))
+        # A second run finds nothing to change or delete.
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertIn('remove-images: nothing to remove', output.getvalue())
+        self.assertEqual(len(fake.gate_changes), 2)
 
-    def test_gate_image_retries_activation_without_rebuilding_or_deleting_the_old_snapshot(self) -> None:
-        subject, fake = self.gate_image_fixture('activate')
-        with mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40), redirect_stdout(StringIO()):
-            with self.assertRaises(aws_target.AwsUnavailable):
-                _ = subject.gate_image(approve_resources=True)
-            self.assertTrue(fake.terminated)
-            self.assertIn('snap-old', fake.snapshots)
-            self.assertEqual(remote.read_record(subject.directory / 'gate-deployment.json')['image'], 'ami-fixture')
-            fake.failure = ''
-            self.assertTrue(subject.gate_image(approve_resources=True))
-        self.assertEqual(len(fake.launches), 1)
-        self.assertNotIn('snap-old', fake.snapshots)
-        self.assertEqual(remote.read_record(subject.directory / 'gate-deployment.json')['image'], 'ami-gate-1')
+    def test_remove_images_preserves_regional_stacks_and_copied_images(self) -> None:
+        subject, fake = self.gate_image_fixture()
+        manifest = aws_config.gate_deployment(fake.manifest, 'us-east-1')
+        regional: dict[str, object] = {'region': 'us-west-2', 'stack': 'fixture-west', 'image': 'ami-west'}
+        manifest['regions'] = [*ledger.rows(manifest, 'regions'), regional]
+        write_text_atomic(fake.manifest, json.dumps(manifest))
+        records = {'regional-stacks.json': {'us-west-2': 'fixture-west'},
+                   'regional-images.json': {'copy': {'region': 'us-west-2', 'image': 'ami-west'}}}
+        for name, record in records.items():
+            _ = (subject.directory / name).write_text(json.dumps(record))
+        before = {name: (subject.directory / name).read_bytes() for name in records}
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.remove_images(approve_destroy=True))
+        self.assertEqual(ledger.rows(remote.read_record(fake.manifest), 'regions')[1], regional)
+        self.assertEqual({name: (subject.directory / name).read_bytes() for name in records}, before)
+        self.assertTrue(all(command[command.index('--region') + 1] == 'us-east-1' for command in fake.commands))
 
-    def test_gate_image_keeps_the_selected_image_launchable_when_publication_fails(self) -> None:
-        for failure in ('waiter', 'manifest', 'narrow waiter'):
+    def test_remove_gate_image_keeps_the_selected_image_launchable_when_a_step_fails(self) -> None:
+        for failure in ('activate', 'waiter', 'manifest', 'narrow waiter'):
             with self.subTest(failure=failure):
                 subject, fake = self.gate_image_fixture(failure)
                 atomic_write = write_text_atomic
@@ -994,90 +939,30 @@ sys.exit(7)
                     if path == fake.manifest and fake.failure == 'manifest':
                         raise OSError('fixture manifest write failure')
                     atomic_write(path, text)
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40),
-                      mock.patch.object(deploy, 'write_text_atomic', side_effect=write), redirect_stdout(StringIO())):
+                with mock.patch.object(deploy, 'write_text_atomic', side_effect=write), redirect_stdout(StringIO()):
                     with self.assertRaises((aws_target.AwsUnavailable, OSError)):
-                        _ = subject.gate_image(approve_resources=True)
-                    selected = ledger.text(remote.read_record(fake.manifest), 'image')
-                    self.assertEqual(selected, 'ami-gate-1' if failure == 'narrow waiter' else 'ami-fixture')
+                        _ = subject.remove_images(approve_destroy=True)
+                    selected = ledger.text(ledger.rows(remote.read_record(fake.manifest), 'regions')[0], 'image')
+                    self.assertEqual(selected, 'ami-fixture' if failure == 'narrow waiter' else 'ami-old')
                     self.assertIn(selected, fake.launchable_images())
-                    self.assertEqual(fake.image_parameter, 'ami-gate-1')
                     self.assertIn('snap-old', fake.snapshots)
+                    self.assertTrue((subject.directory / 'gate-image').exists())
                     fake.failure = ''
-                    self.assertTrue(subject.gate_image(approve_resources=True))
-                self.assertEqual(len(fake.launches), 1)
-                self.assertEqual(fake.launchable_images(), {'ami-gate-1'})
+                    self.assertTrue(subject.remove_images(approve_destroy=True))
+                self.assertEqual(fake.launchable_images(), {'ami-fixture'})
                 self.assertNotIn('snap-old', fake.snapshots)
-
-    def test_gate_image_keeps_the_selected_image_after_interrupted_record_promotion(self) -> None:
-        for stale_record_returns in (False, True):
-            with self.subTest(stale_record_returns=stale_record_returns):
-                subject, fake = self.gate_image_fixture('stale-' + str(stale_record_returns))
-                pending = subject.directory / 'gate-image/pending/image.json'
-                saved = subject.directory / 'gate-image/image.json'
-                original_unlink = Path.unlink
-                def interrupted_unlink(path: Path, missing_ok: bool = False) -> None:
-                    if path == pending:
-                        raise KeyboardInterrupt
-                    original_unlink(path, missing_ok=missing_ok)
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40) as revision,
-                      redirect_stdout(StringIO())):
-                    with (mock.patch.object(Path, 'unlink', autospec=True, side_effect=interrupted_unlink),
-                          self.assertRaises(KeyboardInterrupt)):
-                        _ = subject.gate_image(approve_resources=True)
-                    self.assertEqual(remote.read_record(saved), remote.read_record(pending))
-                    self.assertTrue(fake.terminated)
-                    self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-fixture')
-                    self.assertTrue(subject.gate_image(approve_resources=True))
-                    self.assertFalse(pending.exists())
-                    self.assertEqual(len(fake.launches), 1)
-                    self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-gate-1')
-                    if stale_record_returns:
-                        write_text_atomic(pending, saved.read_text())
-                    revision.return_value = 'e' * 40
-                    fake.failure = 'prepare'
-                    with self.assertRaises(deploy.DeploymentRefused):
-                        _ = subject.gate_image(approve_resources=True)
-                self.assertEqual(len(fake.launches), 2)
-                self.assertTrue(fake.terminated)
-                self.assertEqual(remote.read_record(fake.manifest)['image'], 'ami-gate-1')
-                self.assertIn('ami-gate-1', fake.images)
-                self.assertIn('snap-gate-1', fake.snapshots)
-                self.assertEqual(remote.read_record(saved)['image_id'], 'ami-gate-1')
-                self.assertFalse(pending.exists())
-                self.assertEqual(fake.launchable_images(), {'ami-gate-1'})
-
-    def test_gate_image_terminates_the_box_on_failure_timeout_and_interruption(self) -> None:
-        self.replace('gate_image_timeout_s', '60')
-        for failure in ('prepare', 'timeout', 'create', 'image', 'image timeout', 'image interrupt', 'lost launch', 'interrupt'):
-            with self.subTest(failure=failure):
-                subject, fake = self.gate_image_fixture(failure)
-                manifest = remote.read_record(fake.manifest)
-                manifest['image'] = 'ami-old'
-                write_text_atomic(fake.manifest, json.dumps(manifest))
-                fake.image_parameter = 'ami-old'
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40),
-                      self.assertRaises((deploy.DeploymentRefused, aws_target.AwsUnavailable,
-                                         subprocess.TimeoutExpired, KeyboardInterrupt)), redirect_stdout(StringIO())):
-                    _ = subject.gate_image(approve_resources=True)
-                self.assertEqual(len(fake.launches), 1)
-                self.assertTrue(fake.terminated)
-                self.assertFalse((subject.directory / 'gate-image/image.json').exists())
-                self.assertIn('ami-old', fake.images)
-                self.assertIn('snap-old', fake.snapshots)
-                self.assertNotIn('ami-gate-1', fake.images)
-                self.assertNotIn('snap-gate-1', fake.snapshots)
-                self.assertFalse((subject.directory / 'gate-image/pending/image.json').exists())
-                self.assertIn('ami-builder', fake.images)
-                self.assertIn('snap-builder', fake.snapshots)
-                reservations = ledger.CostLedger(subject.directory).read_snapshot().gate_reservations
-                self.assertIsInstance(reservations[-1].state, ledger.GateTerminated)
+                self.assertFalse((subject.directory / 'gate-image').exists())
 
     def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        _ = (self.root / 'cloud_gate.conf').write_bytes(
-            (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        # The fixture keeps two sizes, so the shipped type list can change without these cases.
+        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        text_setting(self.settings, 'region', 'us-east-2')
+        text_setting(self.settings, 'availability_zone', 'us-east-2a')
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
                    'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}
@@ -1110,25 +995,677 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
         return subject, commands
 
-    def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:
-        for command, updates in (('up', 1), ('gate-image', 2)):
-            with self.subTest(command=command):
-                subject, _ = self.gate_fixture() if command == 'up' else self.gate_image_fixture()
-                with (mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='f' * 40),
-                      redirect_stdout(StringIO()) as output):
-                    action = subject.gate_up if command == 'up' else subject.gate_image
-                    self.assertTrue(action(approve_resources=True))
+    def test_gate_up_records_regional_stack_after_home_stack(self) -> None:
+        subject, commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
+        west: dict[str, object] = {'region': 'us-west-2', 'image': 'ami-west', 'subnets': [],
+            'template': 'lt-west', 'version': '1', 'security_group': 'sg-west', 'stack': 'fixture-west'}
+        def regional(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                     _parameters: dict[str, str], region: str) -> dict[str, object]:
+            self.assertTrue(any('execute-change-set' in command for command in commands))
+            self.assertEqual(region, 'us-west-2')
+            return west
+        with mock.patch.object(subject, 'regional_gate_stack', side_effect=regional):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        saved = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
+        self.assertEqual(ledger.rows(saved, 'regions')[1], west)
+
+    def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
+        subject = self.deployment()
+        text_setting(self.settings, 'region', 'us-east-2')
+        text_setting(self.settings, 'availability_zone', 'us-east-2a')
+        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
+        gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
+        price_regions: list[str] = []
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            region = args[args.index('--region') + 1]
+            if 'get-service-quota' in args:
+                code = args[args.index('--quota-code') + 1]
+                self.assertIn(code, ('L-34B43A08', 'L-3819A6DF'))
+                reply: dict[str, object] = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
+            elif 'describe-availability-zones' in args:
+                reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
+            else:
+                self.assertIn('describe-spot-price-history', args)
+                price_regions.append(region)
+                sizes = args[args.index('--instance-types') + 1:args.index('--product-descriptions')]
+                self.assertTrue(set(gpu_types).issubset(sizes))
+                self.assertEqual(len(sizes), len(set(sizes)))
+                reply = {'SpotPriceHistory': [
+                    {'InstanceType': size, 'AvailabilityZone': region + 'a', 'SpotPrice': '.25', 'Timestamp': 'fixture'}
+                    for size in ('m7a.8xlarge', *gpu_types)]}
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        with (mock.patch.object(subject, '_api', return_value=aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)),
+              redirect_stdout(StringIO()) as output):
+            subject.prices()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(price_regions, ['us-east-2', 'us-west-2', 'us-east-1'])
+        self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
+        for region in ('us-east-2', 'us-west-2', 'us-east-1'):
+            self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
+            self.assertEqual(lines[lines.index(f'{region}: Spot quota 128 vCPUs') + 1],
+                             f'{region}: G and VT Spot quota 48 vCPUs')
+            for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
+                self.assertIn(f'{region} {size} {region}a unavailable', lines)
+            for size in gpu_types:
+                self.assertIn(f'{region} {size} {region}a .25', lines)
+        self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
+
+    def test_prices_and_up_report_regional_quotas_through_the_admin_executor(self) -> None:
+        cases: tuple[tuple[str, dict[str, int | str], int], ...] = (
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 32}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 16}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'AccessDenied: fixture-admin-secret'}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 64, 'us-west-2': 32}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'AccessDenied: fixture-admin-secret', 'us-west-2': 64}, 32),
+            ('m7a.4xlarge m7a.8xlarge', {'us-east-1': 'timeout', 'us-west-2': 32}, 32),
+            ('m7a.xlarge', {'us-east-1': 2, 'us-west-2': 4}, 4),
+            ('m7a.large', {'us-east-1': 1, 'us-west-2': 2}, 2),
+            ('m7a', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a.metal', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a.unknown', {'us-east-1': 1, 'us-west-2': 32}, 0),
+            ('m7a m7a.metal m7a.large m7a.8xlarge m7a.xlarge', {'us-east-1': 16, 'us-west-2': 32}, 32))
+        for command in ('prices', 'up'):
+            for instance_types, quotas, largest in cases:
+                with self.subTest(command=command, quotas=quotas, instance_types=instance_types):
+                    gates = self.root / 'cloud_gate.conf'
+                    text_setting(gates, 'regions', ' '.join(quotas))
+                    text_setting(gates, 'spot_candidate_regions', ' '.join(quotas))
+                    text_setting(gates, 'instance_types', instance_types)
+                    subject = self.deployment()
+                    subject.admin.credentials = subject.admin.get()
+                    calls: list[tuple[str, str]] = []
+                    execute = subject.execute
+
+                    def quota_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                                      timeout: float, check: bool,
+                                      env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                        region = arguments[arguments.index('--region') + 1] if '--region' in arguments else ''
+                        if 'get-service-quota' in arguments:
+                            code = arguments[arguments.index('--quota-code') + 1]
+                            self.assertNotIn('--profile', arguments)
+                            self.assertIsNotNone(env)
+                            self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                            self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                            self.assertEqual(list(arguments[arguments.index('service-quotas'):]),
+                                ['service-quotas', 'get-service-quota', '--service-code', 'ec2',
+                                 '--quota-code', code, '--output', 'json'])
+                            calls.append((region, code))
+                            if code == 'L-3819A6DF':
+                                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 48}}), '')
+                            self.assertEqual(code, 'L-34B43A08')
+                            quota = quotas[region]
+                            if quota == 'timeout':
+                                raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
+                            return subprocess.CompletedProcess(arguments, 1 if isinstance(quota, str) else 0,
+                                '' if isinstance(quota, str) else json.dumps({'Quota': {'Value': quota}}),
+                                quota if isinstance(quota, str) else '')
+                        if 'describe-availability-zones' in arguments:
+                            return subprocess.CompletedProcess(arguments, 0,
+                                json.dumps({'AvailabilityZones': [{'ZoneName': region + 'a'}]}), '')
+                        if 'describe-spot-price-history' in arguments and '--availability-zone' not in arguments:
+                            return subprocess.CompletedProcess(arguments, 0, json.dumps({'SpotPriceHistory': []}), '')
+                        self.assertNotIn('describe-instance-types', arguments)
+                        return execute(arguments, capture_output=capture_output, text=text,
+                                       timeout=timeout, check=check, env=env)
+
+                    subject.execute = quota_execute
+                    with mock.patch.object(deploy, 'largest_gate_vcpus', wraps=deploy.largest_gate_vcpus) as count_vcpus:
+                        if command == 'up':
+                            success, output = self.up_output(subject)
+                            self.assertTrue(success, output)
+                            self.assertIn('scaler-key:', output)
+                        else:
+                            with redirect_stdout(StringIO()) as captured:
+                                subject.prices()
+                            output = captured.getvalue()
+                            self.assertIn('us-east-1 r7a.8xlarge us-east-1a unavailable', output)
+                        count_vcpus.assert_called_once_with(tuple(instance_types.split()))
+                    codes = ('L-34B43A08', 'L-3819A6DF') if command == 'prices' else ('L-34B43A08',)
+                    self.assertEqual(calls, [(region, code) for region in quotas for code in codes])
+                    self.assertEqual([line for line in output.splitlines() if ': G and VT' in line],
+                                     [f'{region}: G and VT Spot quota 48 vCPUs' for region in quotas]
+                                     if command == 'prices' else [])
+                    lines = [line for line in output.splitlines()
+                             if ': Spot' in line or ': cannot run' in line or ': gate vCPU' in line]
+                    expected: list[str] = []
+                    for region, quota in quotas.items():
+                        if isinstance(quota, str):
+                            line = next(line for line in lines if line.startswith(region + ': Spot vCPU quota unknown:'))
+                            if quota == 'timeout':
+                                self.assertIn('timed out', line)
+                            else:
+                                self.assertIn('AccessDenied: [redacted]', line)
+                            expected.append(line)
+                        else:
+                            expected.append(f'{region}: Spot quota {quota} vCPUs')
+                            if largest == 0:
+                                expected.append(f'{region}: gate vCPU count is unknown')
+                            elif quota < largest:
+                                expected.append(f'{region}: cannot run one gate ({largest} vCPUs); ask AWS for a Spot vCPU quota increase in this region.')
+                    self.assertEqual(lines, expected)
+                    self.assertNotIn('fixture-admin-secret', output)
+
+    def test_prices_prints_whole_quotas_and_the_header_after_the_passphrase_prompt(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-east-1')
+        subject = self.deployment()
+        credentials = subject.admin.get()
+        prompted = False
+
+        def unlock() -> admin_secrets.AdminCredentials:
+            nonlocal prompted
+            if not prompted:
+                print('Admin passphrase: ')
+                prompted = True
+            return credentials
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if 'get-service-quota' in arguments:
+                reply: dict[str, object] = {'Quota': {'Value': 300.0}}
+            elif 'describe-availability-zones' in arguments:
+                reply = {'AvailabilityZones': []}
+            else:
+                reply = {'SpotPriceHistory': []}
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject.execute = execute
+        with mock.patch.object(subject.admin, 'get', side_effect=unlock), redirect_stdout(StringIO()) as captured:
+            subject.prices()
+        lines = captured.getvalue().splitlines()
+        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs',
+                                'us-east-1: G and VT Spot quota 300 vCPUs'])
+
+    def test_prices_continues_after_a_failed_g_quota_read_without_error_details(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        for failure, reason in (('denied', 'AccessDeniedException'), ('timeout', 'TimeoutExpired'), ('malformed', 'KeyError')):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    args = list(arguments)
+                    region = args[args.index('--region') + 1]
+                    reply: dict[str, object]
+                    if 'get-service-quota' in args:
+                        code = args[args.index('--quota-code') + 1]
+                        if code == 'L-3819A6DF' and region == 'us-east-1':
+                            if failure == 'denied':
+                                return subprocess.CompletedProcess(args, 1, '',
+                                    'An error occurred (AccessDeniedException) when calling GetServiceQuota: '
+                                    + 'fixture-admin-secret arn:aws:iam::123456789012:user/private')
+                            if failure == 'timeout':
+                                raise subprocess.TimeoutExpired('fixture-admin-secret', 1)
+                            reply = {}
+                        else:
+                            reply = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
+                    elif 'describe-availability-zones' in args:
+                        reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
+                    else:
+                        self.assertIn('describe-spot-price-history', args)
+                        reply = {'SpotPriceHistory': []}
+                    return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    subject.prices()
                 lines = output.getvalue().splitlines()
-                progress = [line for line in lines if line.startswith(command + ': updating the stack')]
-                self.assertEqual(len(progress), updates * 2)
-                for index in range(updates):
-                    self.assertEqual(progress[index * 2], command + ': updating the stack (can take several minutes)')
-                    self.assertRegex(progress[index * 2 + 1], '^' + command + r': updating the stack done in \d+ s$')
-                if command == 'gate-image':
-                    stop = [line for line in lines if line.startswith('gate-image: stopping the temporary box')]
-                    self.assertEqual(len(stop), 2)
-                    self.assertEqual(stop[0], 'gate-image: stopping the temporary box')
-                    self.assertRegex(stop[1], r'^gate-image: stopping the temporary box done in \d+ s$')
+                self.assertIn(f'us-east-1: G and VT Spot quota unknown: {reason}', lines)
+                self.assertIn('us-west-2: G and VT Spot quota 48 vCPUs', lines)
+                self.assertIn('us-west-2 r7a.8xlarge us-west-2a unavailable', lines)
+                self.assertNotIn('fixture-admin-secret', output.getvalue())
+                self.assertNotIn('arn:', output.getvalue())
+                self.assertNotIn('123456789012', output.getvalue())
+
+    def test_quota_request_without_an_environment_override_reaches_aws_with_the_configured_file(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        text_setting(gates, 'credential_file', str(self.credentials))
+        expected = str(Path(conf.read(gates).text('credential_file')).expanduser())
+        subject = self.deployment()
+        calls: list[str] = []
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(capture_output and text)
+            self.assertFalse(check)
+            self.assertGreater(timeout, 0)
+            self.assertIsNotNone(env)
+            self.assertEqual(cast(dict[str, str], env)['AWS_SHARED_CREDENTIALS_FILE'], expected)
+            self.assertIn('get-service-quota', arguments)
+            calls.append(arguments[arguments.index('--region') + 1])
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 300}}), '')
+
+        subject.execute = execute
+        with (mock.patch.dict(os.environ), mock.patch.object(deploy, 'Deployment', return_value=subject),
+              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors):
+            _ = os.environ.pop('AWS_SHARED_CREDENTIALS_FILE', None)
+            self.assertEqual(deploy.main(), 0, errors.getvalue())
+            self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], expected)
+        self.assertTrue(calls)
+
+    def test_quota_request_prints_one_credential_refusal_and_stops_before_aws(self) -> None:
+        message = 'Run deploy.py secrets in a terminal to restore the encrypted credentials'
+        for error in (admin_secrets.SecretsRefused(message), deploy.DeploymentRefused(message)):
+            with self.subTest(error=type(error).__name__):
+                subject = self.deployment()
+                with (mock.patch.object(subject.admin, 'get', side_effect=error) as get,
+                      mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')) as execute,
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                get.assert_called_once_with()
+                execute.assert_not_called()
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
+
+    def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
+        get_quota = 'get-service-quota'
+        history = 'list-requested-service-quota-change-history-by-quota'
+        request = 'request-service-quota-increase'
+        cases = (
+            (300.0, '', '', '', True),
+            (128, '', '', '', True),
+            (5, 'PENDING', '', '', True),
+            (5, 'CASE_OPENED', '', '', True),
+            (5, 'IN_PROGRESS', '', '', True),
+            (5, '', 'PENDING', '', True),
+            (5, 'APPROVED', 'CASE_OPENED', '', True),
+            (5, 'DENIED', 'PENDING', '', True),
+            (5, 'CASE_CLOSED', 'PENDING', '', True),
+            (5, 'NOT_APPROVED', 'PENDING', '', True),
+            (5, 'INVALID_REQUEST', 'PENDING', '', True),
+            (5, '', '', get_quota, False),
+            (5, '', '', history, False),
+            (5, '', '', request, False),
+            (5, '', '', 'timeout', False),
+            (5, '', '', 'uncoded', False),
+            (5, '', 'NOT_APPROVED', '', False))
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(re.sub(r'(?m)^regions=.*$', 'regions=us-east-1 us-west-2',
+                                  re.sub(r'(?m)^spot_candidate_regions=.*$',
+                                         'spot_candidate_regions=us-east-2 us-west-2', path.read_text())))
+        request_id = 'req-ab12cd34ef56'
+        case_id = '9876543210'
+        account_id = '123456789012'
+        for quota, history_status, request_status, failure, success in cases:
+            with self.subTest(quota=quota, history=history_status, request=request_status, failure=failure):
+                subject = self.deployment()
+                subject.admin.credentials = subject.admin.get()
+                calls: list[tuple[str, str]] = []
+                gpu_regions: list[str] = []
+
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                            timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    self.assertTrue(capture_output)
+                    self.assertTrue(text)
+                    self.assertFalse(check)
+                    region = arguments[arguments.index('--region') + 1]
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    self.assertNotIn('--profile', arguments)
+                    self.assertIsNotNone(env)
+                    self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                    self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                    if arguments[arguments.index('--quota-code') + 1] == 'L-3819A6DF':
+                        self.assertEqual(operation, get_quota)
+                        gpu_regions.append(region)
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 4}}), '')
+                    expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', 'L-34B43A08']
+                    if operation == request:
+                        expected.extend(['--desired-value', '128'])
+                    self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
+                    calls.append((region, operation))
+                    if region == 'us-west-2':
+                        self.assertEqual(operation, get_quota)
+                        reply: dict[str, object] = {'Quota': {'Value': 300.0}}
+                    elif operation == failure:
+                        code = 'TooManyRequestsException' if operation == request else 'AccessDeniedException'
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            f'An error occurred ({code}) when calling the quota operation: '
+                            + f'fixture-admin-secret arn:aws:iam::{account_id}:user/private RequestId: {request_id} CaseId: {case_id}')
+                    elif failure == 'timeout' and operation == request:
+                        raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
+                    elif failure == 'uncoded' and operation == request:
+                        return subprocess.CompletedProcess(arguments, 1, '', f'private failure {request_id} {case_id}')
+                    elif operation == get_quota:
+                        reply = {'Quota': {'Value': quota}}
+                    elif operation == history:
+                        reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 256.0,
+                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []}
+                    else:
+                        self.assertEqual(operation, request)
+                        reply = {'RequestedQuota': {'Status': request_status, 'DesiredValue': 128.0,
+                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as captured):
+                    self.assertEqual(deploy.main(), 0 if success else 1)
+                lines = [line for line in captured.getvalue().splitlines() if 'G and VT' not in line]
+                self.assertEqual(gpu_regions, ['us-east-2', 'us-west-2'])
+                self.assertEqual([line for line in captured.getvalue().splitlines() if 'G and VT' in line],
+                    [f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gpu_regions])
+                self.assertEqual(lines[-1], 'us-west-2: Spot quota 300 vCPUs; no request is needed for 128 vCPUs')
+                expected_operations = [get_quota]
+                if quota < 128 and failure != get_quota:
+                    expected_operations.append(history)
+                    if failure != history and history_status not in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                        expected_operations.append(request)
+                self.assertEqual(calls, [('us-east-1', operation) for operation in expected_operations] + [('us-west-2', get_quota)])
+                if failure:
+                    reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable',
+                              request: 'TooManyRequestsException'}.get(failure, 'AccessDeniedException')
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota request failed: {reason}')
+                elif quota >= 128:
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota {int(quota)} vCPUs; no request is needed for 128 vCPUs')
+                elif history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                    self.assertEqual(lines[0], f'us-east-1: open Spot quota request 256 vCPUs; status {history_status}')
+                else:
+                    self.assertEqual(lines[0], f'us-east-1: Spot quota request 128 vCPUs; status {request_status}')
+                for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
+                    self.assertNotIn(private, captured.getvalue())
+
+    def test_gpu_quota_request_cases_and_failures_in_each_candidate_region(self) -> None:
+        get_quota = 'get-service-quota'
+        history = 'list-requested-service-quota-change-history-by-quota'
+        request = 'request-service-quota-increase'
+        candidates = ('us-west-2', 'us-east-2')
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', ' '.join(candidates))
+        cases = (
+            (8, '', '', '', True),
+            (4, '', '', '', True),
+            (0, 'PENDING', '', '', True),
+            (0, 'CASE_OPENED', '', '', True),
+            (0, 'IN_PROGRESS', '', '', True),
+            (0, '', 'PENDING', '', True),
+            (0, 'APPROVED', 'CASE_OPENED', '', True),
+            (0, 'DENIED', 'PENDING', '', True),
+            (0, 'CASE_CLOSED', 'PENDING', '', True),
+            (0, 'NOT_APPROVED', 'PENDING', '', True),
+            (0, 'INVALID_REQUEST', 'PENDING', '', True),
+            (0, '', 'DENIED', '', False),
+            (0, '', 'NOT_APPROVED', '', False),
+            (0, '', 'INVALID_REQUEST', '', False),
+            (0, '', '', get_quota, False),
+            (0, '', '', history, False),
+            (0, '', '', request, False),
+            (0, '', '', 'timeout', False),
+            (0, '', '', 'uncoded', False),
+            (0, '', '', 'malformed', False),
+        )
+        for selected_region in candidates:
+            for quota, history_status, request_status, failure, success in cases:
+                with self.subTest(region=selected_region, quota=quota, history=history_status,
+                                  request=request_status, failure=failure):
+                    subject = self.deployment()
+                    calls: list[tuple[str, str, str]] = []
+
+                    def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                                timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                        self.assertTrue(capture_output)
+                        self.assertTrue(text)
+                        self.assertFalse(check)
+                        self.assertNotIn('--profile', arguments)
+                        self.assertIsNotNone(env)
+                        self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                        region = arguments[arguments.index('--region') + 1]
+                        code = arguments[arguments.index('--quota-code') + 1]
+                        operation = arguments[arguments.index('service-quotas') + 1]
+                        calls.append((region, code, operation))
+                        expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', code]
+                        if operation == request:
+                            expected.extend(['--desired-value', '4'])
+                        self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
+                        if code == 'L-34B43A08':
+                            self.assertEqual(region, 'us-east-1')
+                            self.assertEqual(operation, get_quota)
+                            reply: dict[str, object] = {'Quota': {'Value': 128}}
+                        elif region != selected_region:
+                            self.assertEqual(code, 'L-3819A6DF')
+                            self.assertEqual(operation, get_quota)
+                            reply = {'Quota': {'Value': 4}}
+                        elif operation == failure:
+                            return subprocess.CompletedProcess(arguments, 1, '',
+                                'An error occurred (AccessDeniedException) when calling the quota operation: '
+                                + 'private-request private-case private-account fixture-admin-secret')
+                        elif operation == request and failure == 'timeout':
+                            raise subprocess.TimeoutExpired('private-request', timeout)
+                        elif operation == request and failure == 'uncoded':
+                            return subprocess.CompletedProcess(arguments, 1, '', 'private-request private-case private-account')
+                        elif operation == get_quota:
+                            reply = {'Quota': {'Value': quota}}
+                        elif operation == history:
+                            reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 8,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}]
+                                if history_status else []}
+                        else:
+                            self.assertEqual(operation, request)
+                            reply = {} if failure == 'malformed' else {'RequestedQuota': {'Status': request_status,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}}
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                    subject.execute = execute
+                    with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                          mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                          redirect_stdout(StringIO()) as captured):
+                        self.assertEqual(deploy.main(), 0 if success else 1)
+                    expected_calls = [('us-east-1', 'L-34B43A08', get_quota)]
+                    for region in candidates:
+                        expected_calls.append((region, 'L-3819A6DF', get_quota))
+                        if region == selected_region and quota < 4 and failure != get_quota:
+                            expected_calls.append((region, 'L-3819A6DF', history))
+                            if failure != history and history_status not in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                                expected_calls.append((region, 'L-3819A6DF', request))
+                    self.assertEqual(calls, expected_calls)
+                    lines = captured.getvalue().splitlines()
+                    self.assertEqual(lines[0], 'us-east-1: Spot quota 128 vCPUs; no request is needed for 128 vCPUs')
+                    if failure:
+                        reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable', 'malformed': 'KeyError'}.get(
+                            failure, 'AccessDeniedException')
+                        expected_line = f'{selected_region}: G and VT Spot quota request failed: {reason}'
+                    elif quota >= 4:
+                        expected_line = f'{selected_region}: G and VT Spot quota {quota} vCPUs; no request is needed for 4 vCPUs'
+                    elif history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                        expected_line = f'{selected_region}: open G and VT Spot quota request 8 vCPUs; status {history_status}'
+                    else:
+                        expected_line = f'{selected_region}: G and VT Spot quota request 4 vCPUs; status {request_status}'
+                    self.assertEqual(lines, [lines[0], *[
+                        expected_line if region == selected_region else
+                        f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in candidates]])
+                    for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
+                        self.assertNotIn(private, captured.getvalue())
+
+    def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
+        subject, commands = self.gate_fixture()
+        home_api = subject._api(aws_config.read_deployment_settings(self.settings, self.state))  # pyright: ignore[reportPrivateUsage]
+        original = home_api.execute
+        copied = False
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            region = args[args.index('--region') + 1]
+            operation = args[args.index('--region') + 3]
+            reply: dict[str, object] = {}
+            nonlocal copied
+            if operation == 'describe-vpcs':
+                reply = {'Vpcs': [{'VpcId': 'vpc-fixture-west'}]}
+            elif operation == 'describe-images':
+                reply = {'Images': [{'ImageId': 'ami-fixture-home', 'Name': 'fixture-nixos', 'OwnerId': 'fixture-owner'}]
+                         if region == 'us-east-2' else []}
+            elif operation == 'copy-image':
+                copied = True
+                reply = {'ImageId': 'ami-fixture-west'}
+            elif operation == 'describe-stacks' and region == 'us-west-2':
+                reply = {'Stacks': [{'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in
+                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '2', 'GateSecurityGroup': 'sg-west'}.items()]}]}
+            elif operation not in ('deploy', 'wait'):
+                return original(arguments, capture_output=True, text=True, timeout=1, check=False)
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        home = {'GateProfileArn': 'fixture-profile', 'GateRoleArn': 'fixture-role'}
+        result = subject.regional_gate_stack(api, settings, home, {}, 'us-west-2')
+        self.assertTrue(copied)
+        self.assertEqual(result['image'], 'ami-fixture-west')
+        self.assertEqual(result['region'], 'us-west-2')
+        self.assertEqual(subject.regional_gate_stack(api, settings, home, {}, 'us-west-2'), result)
+        self.assertEqual(sum('copy-image' in command for command in commands), 1)
+        self.assertTrue(any('deploy' in command and settings.stack_name + '-gates-us-west-2' in command for command in commands))
+        query = next(command for command in commands if 'describe-images' in command and '--owners' in command)
+        self.assertIn('fixture-owner', query)
+        self.assertIn('Name=name,Values=fixture-nixos', query)
+        resources = ledger.mapping(deploy.region_gate_template()['Resources'])
+        self.assertEqual(len(resources), 9)
+        self.assertIn('GateGpuTrialScalerPolicy', resources)
+        self.assertNotIn('GateBucket', resources)
+        self.assertNotIn('GateProfile', resources)
+        for name, key in (('GateExpiryRole', 'RoleName'), ('GateExpiryFunction', 'FunctionName')):
+            properties = ledger.mapping(ledger.mapping(resources[name])['Properties'])
+            value = ledger.text(ledger.mapping(properties[key]), 'Fn::Sub')
+            self.assertLessEqual(len(value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', 'us-west-2')), 64)
+
+    def test_regional_image_uses_matching_name_without_copy(self) -> None:
+        subject = self.deployment()
+        calls: list[list[str]] = []
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            calls.append(args)
+            home = args[args.index('--region') + 1] == 'us-east-2'
+            image = {'ImageId': 'ami-home' if home else 'ami-west', 'Name': 'fixture-nixos', 'OwnerId': 'fixture-owner'}
+            return subprocess.CompletedProcess(args, 0, json.dumps({'Images': [image]}), '')
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        self.assertEqual(subject.regional_image(api, aws_config.read_deployment_settings(self.settings), 'us-west-2'), 'ami-west')
+        self.assertFalse(any('copy-image' in command for command in calls))
+
+    def test_regional_gate_stack_refuses_missing_default_vpc(self) -> None:
+        subject = self.deployment()
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(arguments, 0, '{"Vpcs": []}', '')
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'us-west-2: no default VPC'):
+            _ = subject.regional_gate_stack(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
+                aws_config.read_deployment_settings(self.settings), {}, {}, 'us-west-2')
+
+    def test_regional_gate_stack_refuses_no_public_subnet(self) -> None:
+        subject = self.deployment()
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            reply: dict[str, object] = {'Vpcs': [{'VpcId': 'vpc-fixture'}]}
+            if 'describe-route-tables' in args:
+                reply = {'RouteTables': []}
+            elif 'describe-subnets' in args:
+                reply = {'Subnets': [{'SubnetId': 'subnet-fixture', 'AvailabilityZone': 'us-west-2a', 'State': 'available'}]}
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'no available public subnet'):
+            _ = subject.regional_gate_stack(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
+                aws_config.read_deployment_settings(self.settings), {}, {}, 'us-west-2')
+
+    def test_regional_image_cleanup_recovers_after_deregistration_record_failure(self) -> None:
+        from scripts.aws_target import teardown
+        path = self.state / 'regional-images.json'
+        _ = path.write_text(json.dumps({'copy': {'region': 'us-west-2', 'image': 'ami-west'}}))
+        deleted = False
+        snapshots: list[str] = []
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal deleted
+            args = list(arguments)
+            reply: dict[str, object] = {}
+            error = ''
+            if 'describe-images' in args:
+                reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
+            elif 'deregister-image' in args:
+                if deleted:
+                    error = 'InvalidAMIID.NotFound'
+                deleted = True
+            elif 'delete-snapshot' in args:
+                snapshots.append(args[args.index('--snapshot-id') + 1])
+            return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        write = write_text_atomic
+        def fail_record(destination: Path, text: str) -> None:
+            if 'deregistered' in text:
+                raise OSError('fixture record failure')
+            write(destination, text)
+        with mock.patch.object(teardown, 'write_text_atomic', side_effect=fail_record):
+            with self.assertRaisesRegex(OSError, 'fixture record failure'):
+                _ = teardown.remove_regional_gates(api, self.state)
+        self.assertTrue(deleted)
+        self.assertTrue(teardown.remove_regional_gates(api, self.state))
+        self.assertEqual(snapshots, ['snap-west'])
+        self.assertFalse(teardown.remove_regional_gates(api, self.state))
+
+    def test_down_removes_regional_stack_and_copied_image_before_snapshot(self) -> None:
+        from scripts.aws_target import teardown
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
+        cloud_gate_record = {'deployment_id': 'fixture', 'regions': [{'region': 'us-east-2'},
+            {'region': 'us-west-2', 'stack': 'fixture-gates-us-west-2'}]}
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps(cloud_gate_record))
+        _ = (self.state / 'regional-images.json').write_text(json.dumps({'copy': {'region': 'us-west-2', 'image': 'ami-west'}}))
+        calls: list[list[str]] = []
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            calls.append(args)
+            reply: dict[str, object] = {'Reservations': []}
+            if 'describe-images' in args:
+                reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        self.assertTrue(teardown.remove_regional_gates(api, self.state))
+        operations = [command[command.index('--region') + 3] for command in calls]
+        self.assertLess(operations.index('delete-stack'), operations.index('deregister-image'))
+        self.assertLess(operations.index('deregister-image'), operations.index('delete-snapshot'))
+        sweeps = [command for command in calls if 'describe-instances' in command]
+        self.assertEqual([command[command.index('--region') + 1] for command in sweeps], ['us-east-2', 'us-west-2'])
+        self.assertTrue(all(command[command.index('--region') + 1] == 'us-west-2' for command in calls if command not in sweeps))
+        self.assertFalse(teardown.remove_regional_gates(api, self.state))
+
+    def test_down_sweeps_regions_removed_from_configuration(self) -> None:
+        from scripts.aws_target import teardown
+        _ = (self.root / 'cloud_gate.conf').write_text('regions=us-east-2\n')
+        manifest = {'deployment_id': 'fixture', 'regions': [{'region': 'us-east-2'},
+                    {'region': 'us-west-2', 'stack': 'fixture-west'}]}
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps(manifest))
+        _ = (self.state / 'regional-stacks.json').write_text(json.dumps({'us-west-1': 'fixture-west-1'}))
+        calls: list[tuple[str, str]] = []
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            index = args.index('--region')
+            region, operation = args[index + 1], args[index + 3]
+            calls.append((region, operation))
+            reply: dict[str, object] = {}
+            if operation == 'describe-instances':
+                reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-' + region}]}]}
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+        self.assertTrue(teardown.remove_regional_gates(api, self.state, include_home=True))
+        self.assertEqual({region for region, operation in calls if operation == 'describe-instances'},
+                         {'us-east-2', 'us-west-1', 'us-west-2'})
+        for region in ('us-west-1', 'us-west-2'):
+            self.assertLess(calls.index((region, 'terminate-instances')), calls.index((region, 'delete-stack')))
+            self.assertLess(calls.index((region, 'wait')), calls.index((region, 'delete-stack')))
+
+    def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:
+        image_titles = ('switching gates to the official image', 'removing the old image permission')
+        for command, titles in (('up', ('updating the stack',)), ('remove-images', image_titles)):
+            with self.subTest(command=command):
+                if command == 'up':
+                    subject, _ = self.gate_fixture()
+                    with redirect_stdout(StringIO()) as output:
+                        self.assertTrue(subject.gate_up(approve_resources=True))
+                else:
+                    subject, _ = self.gate_image_fixture()
+                    with redirect_stdout(StringIO()) as output:
+                        self.assertTrue(subject.remove_images(approve_destroy=True))
+                lines = output.getvalue().splitlines()
+                for title in titles:
+                    progress = [line for line in lines if line.startswith(f'{command}: {title}')]
+                    self.assertEqual(len(progress), 2)
+                    self.assertEqual(progress[0], f'{command}: {title} (can take several minutes)')
+                    self.assertRegex(progress[1], '^' + re.escape(f'{command}: {title}') + r' done in \d+ s$')
 
     def test_gate_deployment_preserves_rust_parameters_and_records_scoped_resources(self) -> None:
         subject, commands = self.gate_fixture()
@@ -1140,15 +1677,59 @@ sys.exit(7)
         for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
+        self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
+                         ','.join(gpu_size_trial.settings().spot_max_usd_per_hour))
         self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
         self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual(saved['artifact_prefix'], 'artifacts/fixture-role:')
         self.assertEqual(saved['revision'], 'fixture-revision')
-        self.assertEqual([row['zone'] for row in ledger.rows(saved, 'subnets')], ['a', 'b'])
+        self.assertEqual([row['zone'] for row in ledger.rows(ledger.rows(saved, 'regions')[0], 'subnets')], ['a', 'b'])
         after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output')
+        with mock.patch.object(gpu_size_trial, 'start_service', return_value=0) as service:
+            with self.assertRaisesRegex(deploy.DeploymentRefused, '--approve-resources'):
+                _ = subject.gpu_size_trial(self.root / 'trial')
+            service.assert_not_called()
+            with mock.patch.object(subject, '_check_credentials') as credentials:
+                self.assertTrue(subject.gpu_size_trial(self.root / 'trial', approve_resources=True))
+            credentials.assert_called_once_with()
+        service.assert_called_once()
+
+    def test_gpu_trial_cli_routes_the_approved_run(self) -> None:
+        folder = self.root / 'trial'
+        argv = ['deploy.py', 'gpu-size-trial', 'run', '--trial-folder', str(folder),
+                '--settings', str(self.settings), '--directory', str(self.state), '--approve-resources']
+        with (mock.patch.object(sys, 'argv', argv),
+              mock.patch.object(deploy.Deployment, 'gpu_size_trial', return_value=True) as run):
+            self.assertEqual(deploy.main(), 0)
+        run.assert_called_once_with(folder, approve_resources=True)
+
+    def test_gpu_trial_permission_preserves_normal_gate_scope(self) -> None:
+        source = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(source['Resources'])
+        properties = [ledger.mapping(ledger.mapping(resources[name])['Properties'])
+                      for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')]
+        statements = tuple(row for policy in properties for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement'))
+        scopes = [ledger.mapping(ledger.mapping(row['Condition'])['StringEquals'])
+                  for row in statements if row.get('Condition')
+                  and 'ec2:InstanceType' in ledger.mapping(ledger.mapping(row['Condition']).get('StringEquals', {}))]
+        self.assertEqual([row['ec2:InstanceType'] for row in scopes],
+                         [{'Ref': 'GateInstanceTypes'}, {'Ref': 'GateGpuInstanceTypes'}])
+        for row in scopes:
+            self.assertEqual(row['aws:RequestTag/Workload'], 'cloud-claude-gate')
+            self.assertEqual(row['ec2:InstanceMarketType'], 'spot')
+        regional = deploy.region_gate_template()
+        self.assertIn('GateGpuInstanceTypes', ledger.mapping(regional['Parameters']))
+        self.assertIn('GateGpuTrialScalerPolicy', ledger.mapping(regional['Resources']))
+        gpu_statements = ledger.rows(ledger.mapping(properties[1]['PolicyDocument']), 'Statement')
+        gpu_instance = gpu_statements[0]
+        self.assertEqual(ledger.mapping(ledger.mapping(gpu_instance['Condition'])['Null'])['aws:RequestTag/GpuSizeTrial'], 'false')
+        self.assertIn('ec2:InstanceProfile', ledger.mapping(ledger.mapping(gpu_instance['Condition'])['ArnEquals']))
 
     def test_gate_deployment_rejects_a_change_to_a_rust_resource(self) -> None:
         subject, commands = self.gate_fixture('Instance')
@@ -1791,7 +2372,8 @@ sys.exit(7)
         settings = self.settings.read_bytes()
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
+            'price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
         commands = self.commands()
         operations = [cast(list[str], row['args'])[5] for row in commands]
         self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
@@ -1803,7 +2385,8 @@ sys.exit(7)
         before = len(self.commands())
         success, output = self.up_output(self.deployment())
         self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
+        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
+            'price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
         later = self.commands()[before:]
         self.assertEqual(sum('describe-spot-price-history' in cast(list[str], row['args']) for row in later), 1)
         for row in later:
@@ -1859,7 +2442,7 @@ else: raise AssertionError(args)
                 return policy(method, endpoint, body, headers, timeout)
             raise AssertionError((method, endpoint))
         _ = cast(object, self.enterContext(mock.patch.object(box, 'tailnet_request', side_effect=tailnet)))
-        _ = cast(object, self.enterContext(mock.patch.object(mac_test, 'state_paths', return_value=mac_test.StatePaths(self.state, 'aws'))))
+        _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         return devices
 
     def join_fixture(self, devices: dict[str, object], arguments: Sequence[str], key: str,
@@ -2007,7 +2590,9 @@ else: raise AssertionError(args)
         for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
             _ = ledger.mapping(ledger.mapping(template['Resources'])[name]).pop('Condition')
         _ = (self.root / 'live-template.json').write_text(json.dumps(template))
-        _ = (self.state / 'gate-deployment.json').write_text('{"bucket":"fixture-bucket","template":"fixture-template"}\n')
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({
+            'bucket': 'fixture-bucket', 'template': 'fixture-template',
+            'deployment_id': aws_config.deployment_record(self.state)['deployment_id']}))
         self.set_clock(self.now + 1)
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.now, book.read_snapshot().inventories[-1].resources + (
@@ -2139,6 +2724,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()
         with self.credentials.open('a') as handle:
@@ -2609,7 +3195,7 @@ else: raise AssertionError(args)
 
     def test_price_command_requires_private_credentials_before_any_aws_read(self) -> None:
         self.credentials.chmod(0o644)
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'AWS_SHARED_CREDENTIALS_FILE'):
+        with self.assertRaisesRegex(deploy.DeploymentRefused, 'mode 0600'):
             _ = self.deployment().price()
         self.assertEqual(self.commands(), [])
 
@@ -2954,11 +3540,11 @@ else: raise AssertionError(args)
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_configuration_enables_approved_aws_control_and_exchange(self) -> None:
+    def test_repository_configuration_keeps_aws_settings_without_registering_the_builder(self) -> None:
         root = Path(__file__).resolve().parents[2]
         self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
         self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
-                         ['mac', 'natedev', 'aws'])
+                         ['mac', 'natedev'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -3269,7 +3855,11 @@ else: raise AssertionError(args)
         source = self.settings.read_text().replace('# range: 0.001..\nidle_stop_minutes=',
                                                    '# range: 10..20\nidle_stop_minutes=')
         _ = self.settings.write_text(source)
-        self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        reads = self.root / 'config-reads'
+        _ = reads.write_text('')
+        with conf_reads.record_reads(reads):
+            self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
+        self.assertEqual(reads.read_text().splitlines(), [self.settings.stem] * 2)
 
     def fake_commands(self, source: str, *names: str) -> None:
         for name in names:

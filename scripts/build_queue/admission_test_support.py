@@ -1,7 +1,7 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
-from scripts.build_queue import step_estimator
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -34,7 +34,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import placement
 from scripts.mac_test import claim_state
-from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib import build_folders
@@ -358,6 +358,8 @@ class AdmissionFixture(ExitStack):
         self.root: Path = root if root is not None else self.enter_context(
             build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
                 prefix=build_folders.FOLDER_PREFIXES["admit-test"])))
+        self.temporary: Path = self.root / "tmp"
+        self.temporary.mkdir(parents=True, exist_ok=True)
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
         self.socket_dir: Path = Path(self.enter_context(
             short_socket_directory(build_folders.FOLDER_PREFIXES["admit-sock"])))
@@ -386,7 +388,8 @@ class AdmissionFixture(ExitStack):
             "BUILDLOG_RUN": "",
             "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
-            "HOME": str(self.root)}
+            "HOME": str(self.root), "TMPDIR": str(self.temporary),
+            **interpreter_cache_environment(self.root / "cache")}
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
@@ -695,6 +698,8 @@ class AdmissionFixture(ExitStack):
         _ = (path.parent / "memory.current").write_text(str(used))
 
     def history(self) -> list[dict[str, object]]:
+        from scripts.build_queue import step_estimator
+
         path = self.state_dir / "anon_peaks.jsonl"
         return list(step_estimator.anonymous_history_rows(path))
 
@@ -1089,7 +1094,7 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
     if not launcher.exists():
         launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
+    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
         environment[key] = os.environ[key]
     _ = fixture.enter_context(fixture.serving())

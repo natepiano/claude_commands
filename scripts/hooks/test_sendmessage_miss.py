@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from contextlib import contextmanager
 from collections.abc import Generator
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.message.recipient_test_support import staff_child_command
 from unittest.mock import patch
@@ -47,7 +48,7 @@ class SendMessageMissTests(unittest.TestCase):
             executable.chmod(0o755)
         _ = (binaries / "ps").write_text("#!/bin/sh\nexit 0\n")
         self.environment = {
-            "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(self.root / "agents"),
+            **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(self.root / "agents"),
             "PROCESS_TABLE_PS": str(binaries / "ps"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
@@ -119,6 +120,10 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_relay_name_miss_finds_the_real_senders_session(self) -> None:
         write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        path = self.root / f"sessions/{os.getpid()}.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["name"] = "Different registry title"
+        _ = path.write_text(json.dumps(fields))
         with self.loaded_daemon(self.home, {"thread": "natedev"}):
             text = self.additional_context(self.run_hook(relay_session_name("natedev")))
         self.assertIn("natedev: codex freestanding, account codex2", text)
@@ -182,7 +187,7 @@ class SendMessageMissTests(unittest.TestCase):
         self.assertIn("--to Morty", text)
 
     def test_multiple_matches_list_addresses_instead_of_choosing_one(self) -> None:
-        with loaded_session_daemon(self.home, {"one": "Morty", "two": "morty"}):
+        with self.loaded_daemon(self.home, {"one": "Morty", "two": "morty"}):
             text = self.additional_context(self.run_hook("MORTY"))
         self.assertIn("codex:one", text)
         self.assertIn("codex:two", text)

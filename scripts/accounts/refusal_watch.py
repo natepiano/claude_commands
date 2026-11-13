@@ -29,6 +29,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
 from scripts.lib import conf
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
@@ -413,13 +414,13 @@ class NewestExchange:
 
 @dataclass(frozen=True)
 class NoExchange:
-    """No readable user or assistant entry is present in the transcript."""
+    """The transcript has no readable exchange or turn start."""
 
 
 def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchange:
-    """Read the newest user or assistant turn, ignoring trailing bookkeeping."""
+    """Read the newest exchange or turn start and ignore later bookkeeping."""
     try:
-        with path.open("rb") as source:
+        with open_transcript(path) as source:
             position = source.seek(0, os.SEEK_END)
             pending = b""
             while position:
@@ -440,8 +441,9 @@ def _newest_exchange(path: Path, chunk_bytes: int) -> NewestExchange | NoExchang
                         payload = entry.get("payload")
                         if isinstance(payload, dict):
                             message = cast(dict[str, object], payload)
-                            if (entry.get("type") == "event_msg" and message.get("type") in (
-                                    "user_message", "agent_message", "error") or
+                            if (entry.get("type") == "event_msg" and (message.get("type") in (
+                                    "user_message", "agent_message", "error", "task_started")
+                                    or message.get("type") == "task_complete" and isinstance(message.get("error"), dict)) or
                                     entry.get("type") == "response_item" and message.get("type") == "message"
                                     and message.get("role") in ("user", "assistant")):
                                 return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
@@ -455,11 +457,11 @@ def transcript_refusal(session_id: str, *, config_dir: Path | None = None, scree
     account_config = accounts.read_account_settings(account_config)
     root = config_dir if config_dir is not None else Path.home() / ".claude"
     try:
-        paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
+        paths = transcript_paths(root / "projects", "*/" + session_id + ".jsonl")
         if not paths:
             homes = [config_dir] if config_dir is not None else agent_accounts.codex_homes(agent_accounts.codex_home())
             paths = [path for home in homes for folder in ("sessions", "archived_sessions")
-                     for path in (home / folder).rglob(f"*{session_id}.jsonl")]
+                     for path in transcript_paths(home / folder, f"**/*{session_id}.jsonl")]
     except OSError:
         paths = []
     return _transcript_refusal(paths, account_config.whole("transcript_chunk_bytes"), screen_text=screen_text)
@@ -484,9 +486,13 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int, *, screen_text: str
             if not isinstance(payload_value, dict):
                 return NoSessionRefusal()
             payload = cast(dict[str, object], payload_value)
-            if payload.get("type") != "error":
+            error = payload.get("error")
+            if payload.get("type") == "task_complete" and isinstance(error, dict):
+                text = str(cast(dict[str, object], error).get("message", ""))
+            elif payload.get("type") == "error":
+                text = str(payload.get("message", ""))
+            else:
                 return NoSessionRefusal()
-            text = str(payload.get("message", ""))
             entry_id = entry.get("uuid") or hashlib.sha256((str(timestamp or "") + text).encode()).hexdigest()
         else:
             if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
@@ -550,7 +556,7 @@ def session_refusal(session_id: str, *, account_config: conf.ConfigRead | accoun
 
 
 def session_refusals(session_ids: list[str], *, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal]:
-    """Find this pass's transcripts with one directory scan per project."""
+    """Find transcripts for this pass without a persistent cache."""
     account_config = accounts.read_account_settings(account_config)
     detected: dict[str, TranscriptRefusal | ProofRefusal | NoSessionRefusal] = {
         session_id: assumed_refusal(session_id) for session_id in session_ids}
@@ -566,19 +572,20 @@ def session_refusals(session_ids: list[str], *, account_config: conf.ConfigRead 
                 try:
                     if not project.is_dir():
                         continue
-                    with os.scandir(project.path) as transcripts:
-                        for transcript in transcripts:
-                            if transcript.name in wanted:
-                                paths[wanted[transcript.name]].append(Path(transcript.path))
+                    transcripts = transcript_paths(Path(project.path), "*.jsonl")
                 except OSError:
-                    # A project may permit known-file reads without directory listing.
+                    transcripts = []
+                if not transcripts:
+                    # A project can permit known-file reads without directory listing.
                     for name, session_id in wanted.items():
-                        candidate = Path(project.path) / name
                         try:
-                            if candidate.exists():
-                                paths[session_id].append(candidate)
+                            paths[session_id].extend(transcript_paths(Path(project.path), name))
                         except OSError:
                             continue
+                for transcript in transcripts:
+                    name = uncompressed_path(transcript).name
+                    if name in wanted:
+                        paths[wanted[name]].append(transcript)
     except OSError:
         pass
     chunk_bytes = account_config.whole("transcript_chunk_bytes")
@@ -1359,7 +1366,7 @@ def main(argv: list[str] | None = None, *, account_config: conf.ConfigRead | acc
         for probe in [name, *(args.proof_group or [])]:
             matching = [session for session in owners if session["session_id"] == probe
                         or (member.name if (member := record.by_current_session(session["session_id"]))
-                            is not None else session["name"]) == probe]
+                            is not None else "") == probe]
             if len(matching) != 1:
                 parser.error("name or id must identify one local live owner")
             selected[matching[0]["session_id"]] = matching[0]

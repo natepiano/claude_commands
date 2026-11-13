@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, cast
 import unittest
 
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
@@ -89,6 +90,41 @@ class WaitingChild(unittest.TestCase):
         if cls.child.poll() is None:
             cls.child.kill()
         cls.child.communicate(timeout=10)
+'''
+
+WAITING_SPAWN = '''\
+class WaitingSpawn(unittest.TestCase):
+    child: int
+    release: int
+
+    @classmethod
+    def start_child(cls) -> None:
+        incoming, cls.release = os.pipe()
+        ready, outgoing = os.pipe()
+        try:
+            cls.child = os.posix_spawn(
+                sys.executable,
+                [sys.executable, "-I", "-c", "import os; os.write(1, b'ready'); os.read(0, 1)"],
+                dict(os.environ),
+                file_actions=[(os.POSIX_SPAWN_DUP2, incoming, 0), (os.POSIX_SPAWN_DUP2, outgoing, 1)])
+        finally:
+            os.close(incoming)
+            os.close(outgoing)
+        cls.addClassCleanup(cls.finish_child)
+        try:
+            if os.read(ready, 5) != b"ready":
+                raise AssertionError("The unheld child did not start")
+        finally:
+            os.close(ready)
+
+    @classmethod
+    def finish_child(cls) -> None:
+        try:
+            _ = os.write(cls.release, b"x")
+            if os.waitpid(cls.child, 0) != (cls.child, 0):
+                raise AssertionError("The unheld child failed")
+        finally:
+            os.close(cls.release)
 '''
 
 THREAD_PRELUDE = '''\
@@ -174,7 +210,7 @@ class CoverageOverlapTests(unittest.TestCase):
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/py", "lib/conf.py", "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "lib/py", "lib/conf.py", "lib/conf_reads.py", "lib/terminal_cells.py", "buildlog/treekey.py",
                     "production/gate_modules.py", "test_times/module_run.py",
                 )),
             ):
@@ -194,7 +230,7 @@ class CoverageOverlapTests(unittest.TestCase):
             output = root / "coverage.json"
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("GIT_", "NATEST_COVERAGE_"))}
-            env.update({"HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
+            env.update({**interpreter_cache_environment(root / "cache"), "HOME": str(root / "home"), "CONF_DIR": str(root / "config"),
                    "BUILDLOG_DIR": str(root / "buildlog"), "PYTHONDONTWRITEBYTECODE": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                    "COVERAGE_OUT": str(output)})
@@ -664,12 +700,192 @@ class ThreadChild(unittest.TestCase):
         self.assertFalse(parent["candidate"])
 
     @unittest.skipUnless(hasattr(os, "posix_spawn"), "The fixture needs os.posix_spawn")
-    def test_launch_without_popen_or_report_stays_unknown_for_later_tests(self) -> None:
-        fixture = self.run_fixture({"scripts/fixture/test_spawn.py": PRELUDE + '''
-class Spawn(unittest.TestCase):
-    def test_a_spawn(self) -> None:
+    def test_unobserved_launch_does_not_mark_later_modules_unknown(self) -> None:
+        origins = {
+            "runner": {"scripts/fixture/test_a_origin.py": PRELUDE + '''
+class Origin(unittest.TestCase):
+    def test_a_origin(self) -> None:
         child = os.posix_spawn(sys.executable, [sys.executable, "-I", "-c", "pass"], dict(os.environ))
         self.assertEqual(os.waitpid(child, 0), (child, 0))
+        self.assertEqual(left(), "left")
+'''},
+            "descendant": child_script_sources("a_origin", '''
+import os
+import sys
+from product import left
+
+child = os.posix_spawn(sys.executable, [sys.executable, "-I", "-c", "pass"], dict(os.environ))
+if os.waitpid(child, 0) != (child, 0):
+    raise AssertionError("The descendant failed")
+print(left())
+''', '''
+class Origin(unittest.TestCase):
+    def test_a_origin(self) -> None:
+        self.assertEqual(run_child().stdout.strip(), "left")
+'''),
+        }
+        for origin, sources in origins.items():
+            with self.subTest(origin=origin):
+                fixture = self.run_fixture({
+                    **sources,
+                    "scripts/fixture/test_b_known.py": PRELUDE + '''
+class Known(unittest.TestCase):
+    def test_b_known(self) -> None:
+        self.assertEqual(right(), "right")
+''',
+                    "scripts/fixture/test_c_repeat.py": PRELUDE + '''
+class Repeat(unittest.TestCase):
+    def test_c_repeat(self) -> None:
+        slow()
+        self.assertEqual(right(), "right")
+''',
+                })
+                kept = fixture.row("test_b_known")
+                repeat = fixture.row("test_c_repeat")
+                for row in (kept, repeat):
+                    self.assertEqual(row["status"], "pass")
+                    self.assertEqual(row["child"], "none")
+                    self.assertEqual(row["line_count"], 1)
+                self.assertFalse(kept["candidate"])
+                self.assertTrue(repeat["candidate"])
+                self.assertEqual(repeat["covered_by"], [kept["id"]])
+                owner = fixture.row("test_a_origin")
+                self.assertIn("python children,", owner["child"])
+                self.assertNotIn("child outlived its test", owner["child"])
+                self.assertFalse(owner["candidate"])
+
+    def test_test_clock_changes_do_not_change_child_lifetimes(self) -> None:
+        fixture = self.run_fixture({
+            "scripts/fixture/test_a_before.py": PRELUDE + '''
+class Before(unittest.TestCase):
+    def test_a_before(self) -> None:
+        self.assertEqual(right(), "right")
+''',
+            "scripts/fixture/test_b_clock.py": PRELUDE + '''
+from unittest import mock
+import time
+
+class Clock(unittest.TestCase):
+    def test_b_clock(self) -> None:
+        with mock.patch.object(time, "monotonic", return_value=100):
+            subprocess.run([sys.executable, "-I", "-c", "pass"], check=True)
+        self.assertEqual(left(), "left")
+''',
+            "scripts/fixture/test_c_after.py": PRELUDE + '''
+class After(unittest.TestCase):
+    def test_c_after(self) -> None:
+        self.assertEqual(right(), "right")
+''',
+        })
+        before = fixture.row("test_a_before")
+        after = fixture.row("test_c_after")
+        for row in (before, after):
+            self.assertEqual(row["status"], "pass")
+            self.assertEqual(row["child"], "none")
+            self.assertEqual(row["line_count"], 1)
+        clock = fixture.row("test_b_clock")
+        self.assertEqual(clock["child"], "unknown: 1 python children, 0 reported")
+        self.assertFalse(clock["candidate"])
+        slower, faster = sorted((before, after), key=lambda row: (-row["seconds"], row["id"]))
+        self.assertTrue(slower["candidate"])
+        self.assertEqual(slower["covered_by"], [faster["id"]])
+        self.assertFalse(faster["candidate"])
+
+    def test_live_unreported_child_marks_only_overlapping_modules_unknown(self) -> None:
+        fixture = self.run_fixture({
+            "scripts/fixture/test_a_owner.py": PRELUDE + WAITING_CHILD + '''
+import atexit
+
+atexit.register(WaitingChild.tearDownClass)
+
+class Owner(unittest.TestCase):
+    def test_a_owner(self) -> None:
+        WaitingChild.report_coverage = False
+        WaitingChild.start_child()
+        self.assertEqual(cast(TextIO, WaitingChild.child.stdout).readline().strip(), "ready")
+        self.assertEqual(left(), "left")
+''',
+            "scripts/fixture/test_b_overlap.py": PRELUDE + '''
+from scripts.fixture import test_a_owner as owner
+
+class Overlap(unittest.TestCase):
+    def test_b_overlap(self) -> None:
+        self.assertEqual(right(), "right")
+        owner.WaitingChild.child.communicate(input="finish", timeout=10)
+        self.assertEqual(owner.WaitingChild.child.returncode, 0)
+''',
+            "scripts/fixture/test_c_after.py": PRELUDE + '''
+class After(unittest.TestCase):
+    def test_c_after(self) -> None:
+        self.assertEqual((left(), right()), ("left", "right"))
+''',
+        })
+        owner = fixture.row("test_a_owner")
+        self.assertIn("1 python children, 0 reported", owner["child"])
+        self.assertIn("child outlived its test", owner["child"])
+        overlap = fixture.row("test_b_overlap")
+        self.assertEqual(overlap["child"], "unknown: child outlived its test")
+        for row in (owner, overlap):
+            self.assertFalse(row["candidate"])
+        after = fixture.row("test_c_after")
+        self.assertEqual(after["child"], "none")
+        self.assertEqual(after["line_count"], 2)
+        self.assertFalse(after["candidate"])
+
+    def test_live_unreported_child_at_collection_end_stays_unknown(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_alive.py": PRELUDE + WAITING_CHILD + '''
+class Alive(WaitingChild):
+    report_coverage = False
+
+    def test_a_start(self) -> None:
+        type(self).start_child()
+        self.assertEqual(cast(TextIO, self.child.stdout).readline().strip(), "ready")
+        self.assertEqual(left(), "left")
+
+    def test_b_still_alive(self) -> None:
+        self.assertIsNone(self.child.poll())
+        self.assertEqual(right(), "right")
+'''})
+        owner = fixture.row("test_a_start")
+        self.assertIn("1 python children, 0 reported", owner["child"])
+        self.assertIn("child outlived its test", owner["child"])
+        later = fixture.row("test_b_still_alive")
+        self.assertEqual(later["child"], "unknown: child outlived its test")
+        for row in (owner, later):
+            self.assertEqual(row["status"], "pass")
+            self.assertFalse(row["candidate"])
+
+    @unittest.skipUnless(hasattr(os, "posix_spawn"), "The fixture needs os.posix_spawn")
+    def test_unheld_setup_child_without_report_marks_live_tests_unknown(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_shared_spawn.py": PRELUDE + WAITING_SPAWN + '''
+class SharedSpawn(WaitingSpawn):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.start_child()
+
+    def test_a_left(self) -> None:
+        self.assertEqual(os.waitpid(self.child, os.WNOHANG), (0, 0))
+        self.assertEqual(left(), "left")
+
+    def test_b_right(self) -> None:
+        self.assertEqual(os.waitpid(self.child, os.WNOHANG), (0, 0))
+        self.assertEqual(right(), "right")
+'''})
+        for method in ("test_a_left", "test_b_right"):
+            with self.subTest(method=method):
+                row = fixture.row(method)
+                self.assertEqual(row["status"], "pass")
+                self.assertEqual(row["child"], "unknown: shared child")
+                self.assertEqual(row["line_count"], 1)
+                self.assertFalse(row["candidate"])
+
+    @unittest.skipUnless(hasattr(os, "posix_spawn"), "The fixture needs os.posix_spawn")
+    def test_launch_without_popen_or_report_stays_unknown_for_later_tests(self) -> None:
+        fixture = self.run_fixture({"scripts/fixture/test_spawn.py": PRELUDE + WAITING_SPAWN + '''
+class Spawn(WaitingSpawn):
+    def test_a_spawn(self) -> None:
+        type(self).start_child()
+        self.assertEqual(os.waitpid(self.child, os.WNOHANG), (0, 0))
         self.assertEqual(left(), "left")
 
     def test_b_later(self) -> None:

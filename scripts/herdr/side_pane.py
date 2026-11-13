@@ -8,7 +8,6 @@ except FileNotFoundError:
 import argparse
 import os
 import signal
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +15,13 @@ from threading import Event
 from time import monotonic
 from typing import Literal, cast, final, get_args
 
-from scripts.herdr import herdr, worker_panes
+from scripts.herdr import herdr, pane_launch, worker_panes
+from scripts.herdr import herdr_types
 from scripts.lib import conf, nix_env
 from scripts.production import staff
 from scripts.agents import stop_resume
 
-SideCommand = Literal["open", "send", "close"]
+SideCommand = Literal["send", "close"]
 
 
 class SidePaneRefused(ValueError):
@@ -88,22 +88,75 @@ def _caller(panes: list[herdr.PaneIdentity]) -> CallerPane:
     return CallerPane(identity, kind, pane["pane_id"], tab)
 
 
+def _helper_process(client: herdr.Herdr, pane: herdr.PaneIdentity) -> bool:
+    """Exclude another launch or a staffed native owner from name recovery."""
+    identity = pane["pane_id"]
+    entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+    entry = entries.get(identity)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", identity).get("process_info"),
+                             "consultation process info")
+    for value in herdr.json_items(info.get("foreground_processes"), "consultation processes"):
+        process = herdr.json_object(value, "consultation process")
+        arguments = [str(argument) for argument in herdr.json_items(process.get("argv"), "consultation arguments")]
+        kind = "codex" if herdr.is_codex_process(arguments) else "claude" if herdr.is_claude_process(arguments) else ""
+        if not kind:
+            continue
+        try:
+            native = herdr.pane_native_process(info, kind, pane)
+        except (herdr.CodexPaneStarting, herdr.CodexSessionPending):
+            # A pending consultation restart can replace its previous native launch.
+            return entry is None or "staff_id" not in entry and bool(entry.get("name"))
+        if entry is not None and "staff_id" not in entry and (
+                entry.get("session_id") == native.current_identity
+                or entry.get("pid") == process.get("pid") and entry.get("proc_start") == native.started):
+            return True
+        record = staff.initial_snapshot()
+        if record.by_member_reference(native.current_identity) is not None:
+            return False
+        if entry is None:
+            return False
+        return pane_launch.matching_launch({identity: entry}, herdr.HerdrPlace(client.session, identity),
+                                          native.current_identity) is not None
+    return entry is None
+
+
 def _find(client: herdr.Herdr, panes: list[herdr.PaneIdentity], caller: CallerPane, label: str) -> SidePane:
+    candidates: list[herdr.PaneIdentity] = []
+    activities: dict[str, herdr.PaneAtShell | herdr.PaneRunning] = {}
+    entries = pane_launch.read(pane_launch.record_directory() / f"{client.session}.json")
+    for pane in panes:
+        if pane["pane_id"] == caller.pane or pane.get("tab_id") != caller.tab:
+            continue
+        identity = pane["pane_id"]
+        entry = entries.get(identity)
+        if entry is not None:
+            if "staff_id" in entry or entry.get("name") != label:
+                continue
+        # Consultation starts use names only before a native identity and launch record exist.
+        elif pane.get("label") != label:
+            continue
+        try:
+            activity = client.pane_activity(identity)
+            if isinstance(activity, herdr.PaneAtShell):
+                eligible = True
+            else:
+                eligible = _helper_process(client, pane)
+            if eligible:
+                candidates.append(pane)
+                activities[identity] = activity
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            return _note(client, identity, str(error))
     try:
-        pane = worker_panes.labelled_pane(panes, caller.tab, label, exclude=caller.pane)
+        pane = worker_panes.selected_pane(panes, candidates, label)
     except ValueError as error:
         raise SidePaneRefused(str(error)) from error
     if isinstance(pane, herdr.NoPane):
         return AbsentSidePane()
     identity = str(pane["pane_id"])
     terminal = str(pane["terminal_id"])
-    try:
-        activity = client.pane_activity(identity)
-        if isinstance(activity, herdr.PaneAtShell):
-            return StoppedSidePane(identity, terminal)
-        return OpenSidePane(identity, terminal)
-    except (herdr.HerdrFailure, OSError, ValueError) as error:
-        return _note(client, identity, str(error))
+    if isinstance(activities[identity], herdr.PaneAtShell):
+        return StoppedSidePane(identity, terminal)
+    return OpenSidePane(identity, terminal)
 
 
 def _context() -> tuple[herdr.Herdr, list[herdr.PaneIdentity], CallerPane]:
@@ -130,8 +183,11 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
     else:
         ratio = config.number("WORKER_SPLIT_RATIO")
         destination = herdr.SplitPane(caller.pane, "right", ratio, label)
+    arguments = worker_panes.launch_arguments(policy, "", cwd)
+    if policy.settings.kind == "claude":
+        arguments.extend(["-n", label])
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
-        worker_panes.launch_arguments(policy, "", cwd), herdr.NoOpeningPrompt(),
+        arguments, herdr.NoOpeningPrompt(),
         int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
@@ -141,6 +197,21 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
         # The agent just launched in this call, so it holds no draft and needs no composer check.
         text = f"{question}\n{caller.reply_command}" if isinstance(delivery, worker_panes.ReplyToCaller) else question
         client.prompt_terminal(result.pane, result.terminal, text)
+        if policy.settings.kind == "codex":
+            deadline = monotonic() + config.number("PANE_AGENT_START_SECONDS")
+            while True:
+                try:
+                    _ = client.native_pane_process(result.pane, "codex", max(0, deadline - monotonic()))
+                    entry = client.codex_launch(result.pane)
+                except (herdr.CodexPaneStarting, herdr.CodexSessionPending) as error:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return _note(client, result.pane, str(error))
+                    _ = Event().wait(min(0.1, remaining))
+                else:
+                    entry["name"] = label
+                    pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
+                    break
     return result
 
 
@@ -198,11 +269,9 @@ def close(label: str) -> ClosedSidePane | SidePaneCloseUnavailable:
 
 @final
 class Arguments(argparse.Namespace):
-    command: SideCommand = "open"
+    command: SideCommand = "send"
     label: str = ""
-    question_file: str = ""
     message_file: str = ""
-    cwd: str = ""
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -211,21 +280,11 @@ def main(arguments: list[str] | None = None) -> int:
     for command in cast(tuple[SideCommand, ...], get_args(SideCommand)):
         subcommand = commands.add_parser(command)
         _ = subcommand.add_argument("label")
-        if command == "open":
-            _ = subcommand.add_argument("--question-file", default="")
-            _ = subcommand.add_argument("--cwd", default=str(Path.cwd()))
-        elif command == "send":
+        if command == "send":
             _ = subcommand.add_argument("--message-file", required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
-        if args.command == "open":
-            command = ["bash", str(Path(__file__).resolve().parents[1] / "direct/assign.sh"),
-                       "--role", "implement", "--target", "consultation-pane", "--policy", "friend",
-                       "--new-worker", args.label, "--cwd", args.cwd]
-            if args.question_file:
-                command += ["--prompt", args.question_file]
-            return subprocess.run(command, check=False).returncode
-        elif args.command == "send":
+        if args.command == "send":
             result = send(args.label, Path(args.message_file).read_text())
         else:
             result = close(args.label)
@@ -238,7 +297,7 @@ def main(arguments: list[str] | None = None) -> int:
     except SidePaneRefused as error:
         print(str(error), file=sys.stderr)
         return worker_panes.ExitCode.REFUSED
-    except (herdr.HerdrFailure, conf.Unusable, OSError, ValueError) as error:
+    except (herdr_types.HerdrFailure, conf.Unusable, OSError, ValueError) as error:
         print(f"anomaly: {args.label}: {error}; pane retained", file=sys.stderr)
         return worker_panes.ExitCode.UNCERTAIN
 

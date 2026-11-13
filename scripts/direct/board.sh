@@ -56,6 +56,8 @@ set -euo pipefail
 BOARD_SCRIPT=${BASH_SOURCE[0]}
 [[ ! -L "$BOARD_SCRIPT" && "$BOARD_SCRIPT" == */* ]] || BOARD_SCRIPT=$(readlink -f -- "$BOARD_SCRIPT")
 BOARD_DIR=${BOARD_SCRIPT%/*}
+# shellcheck source=/dev/null
+source "$BOARD_DIR/file_lock.sh"
 UNIT_ENV_SHIM="$BOARD_DIR/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -91,11 +93,14 @@ now_epoch() {
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
 flatten() {
-  "$BOARD_DIR/../lib/py" -c '
-import sys
-text = sys.argv[2].translate(str.maketrans({"\n": " ", "\r": " ", "\t": " "}))
-print("".join(character for character in text if character.isprintable())[:int(sys.argv[1])], end="")
-' "$MAX_MESSAGE_CHARS" "$*"
+  # Clean as UTF-8 in every caller locale; glibc builds C.UTF-8 in and the Mac has en_US.UTF-8.
+  local LC_ALL text="$*" probe=$'\xc3\xa9'
+  for LC_ALL in C.UTF-8 en_US.UTF-8 UTF-8; do ((${#probe} == 1)) && break; done 2>/dev/null
+  text=${text//$'\n'/ }
+  text=${text//$'\r'/ }
+  text=${text//$'\t'/ }
+  text=${text//[^[:print:]]/}
+  printf '%s' "${text:0:MAX_MESSAGE_CHARS}"
 }
 
 # `ask` and `answer` are deliberately absent. A question to a peer is a message
@@ -175,11 +180,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if "${BASH_SOURCE[0]%/*}/../lib/py" -c 'import fcntl, sys
-try:
-    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    sys.exit(75)' 9 2>/dev/null; then
+  if lock_file_descriptor 9 nonblocking 2>/dev/null; then
     return 0
   else
     status=$?

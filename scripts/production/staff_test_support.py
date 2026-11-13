@@ -30,10 +30,12 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
+from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
 
@@ -129,7 +131,15 @@ def fixture_session(identity: str, backend: staff.ClaudeBackend | staff.CodexBac
     path = _prepare_fixture_session(identity, backend)
     path.touch(exist_ok=True)
     if isinstance(backend, staff.CodexBackend):
-        os.environ["CODEX_HOME"] = str(fixture_account_home(backend.codex_home))
+        home = fixture_account_home(backend.codex_home)
+        os.environ["CODEX_HOME"] = str(home)
+        row = staff.initial_snapshot().by_current_session(identity)
+        if row is None:
+            entry = pane_launch.launch("fixture-" + identity, identity, str(home),
+                                       {"CODEX_HOME": str(home)}, ["codex"], kind="codex")
+            pane_launch.write(pane_launch.record_directory() / ("fixture-" + identity + ".json"), entry)
+        elif row.home != staff.SessionHome(home):
+            _ = staff.set_home(row.id, staff.SessionHome(home))
 
 
 def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
@@ -237,8 +247,9 @@ def fixture_member(kind: staff.Kind, *, name: str,
     if kind == "worker":
         if parent_id is None:
             raise staff.StaffRefused("a fixture worker requires a parent")
+        row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
-        return staff.ensure_worker(staff.native_id(identity), name, parent_id)
+        return staff.by_id(row.id) or row
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -246,11 +257,7 @@ def fixture_member(kind: staff.Kind, *, name: str,
 def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "",
                    backend: staff.ClaudeBackend | staff.CodexBackend = CLAUDE_BACKEND) -> staff.StaffRow:
     """Publish the fake worker backend's native identity through the real writer."""
-    existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
-                if row.name == name and row.parent == staff.ReportsTo(parent)]
-    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
-    fixture_session(identity, backend)
-    return staff.ensure_worker(staff.native_id(identity), name, parent)
+    return fixture_member("worker", name=name, parent=parent, runtime_id=runtime_id, backend=backend)
 
 
 def fixture_roster(entries: dict[str, object], parent: staff.StaffId,
@@ -571,11 +578,9 @@ if os.environ.get('STAFF_TEST_SSH_FAIL'):
     if reason:
         print(reason, file=sys.stderr)
     raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if (len(arguments) < 6 or arguments[:3] != ['-o', 'BatchMode=yes', '-o']
-        or not arguments[3].startswith('ConnectTimeout=') or arguments[4] != 'natedev'
-        or int(arguments[3].split('=', 1)[1]) <= 0):
+if len(arguments) < 4 or arguments[:3] != ['-o', 'BatchMode=yes', 'natedev']:
     raise SystemExit('unexpected SSH target or options')
-command = arguments[5:]
+command = arguments[3:]
 if len(command) == 1:
     command = shlex.split(command[0])
 if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/staff.py']:
@@ -768,7 +773,7 @@ class StaffTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root / "home"),
-            "CLAUDE_PYTHON": sys.executable,
+            **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -783,6 +788,7 @@ class StaffTestCase(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
         })))
+        _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
 
@@ -1030,10 +1036,21 @@ class StaffTestCase(unittest.TestCase):
         """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
+        record = staff.local_snapshot()
+        owner = record.by_current_session(director)
+        if owner is None:
+            owner = next(row for row in record.find(kind="unit") if row.name == unit)
+        participants: dict[str, object] = {}
+        for passed in passes:
+            reference = passed.get("worker_id")
+            member = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+                      next((row for row in record.find(kind="worker", parent=owner.id)
+                            if row.name == passed.get("worker_name")), None))
+            if member is not None and member.parent == staff.ReportsTo(owner.id):
+                participants[str(passed.get("team_slot") or member.id)] = {
+                    **{key: value for key, value in passed.items() if key != "worker_name"}, "worker_id": member.id}
         self.write_json(run / "progress_history_state.json", {
-            "production": production_name, "unit": unit,
-            "main_agent": {"family": "claude", "session_id": director},
-            "pass": {str(passed["worker_name"]): passed for passed in passes},
+            "owner_staff_id": owner.id, "pass": participants,
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:
@@ -1077,10 +1094,9 @@ class StaffTestCase(unittest.TestCase):
         commands: list[list[str]] = []
         for line in self.ssh_log.read_text().splitlines():
             arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:3], ["-o", "BatchMode=yes", "-o"])
-            self.assertEqual(arguments[4], "natedev")
-            self.assertRegex(arguments[3], r"^ConnectTimeout=[1-9][0-9]*$")
-            command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
+            self.assertEqual(arguments[:2], ["-o", "BatchMode=yes"])
+            self.assertEqual(arguments[2], "natedev")
+            command = shlex.split(arguments[3]) if len(arguments) == 4 else arguments[3:]
             self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
             self.assertIn("--json", command[2:])
             commands.append(command[2:])

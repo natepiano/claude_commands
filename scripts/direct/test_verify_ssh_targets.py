@@ -10,6 +10,7 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
@@ -17,7 +18,6 @@ from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test, claim_state
-from scripts.build_hold.build_hold import NoOwningSession
 
 from scripts.lib import process_start as process_identity
 

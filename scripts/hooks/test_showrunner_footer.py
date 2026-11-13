@@ -9,12 +9,17 @@ import os
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from collections.abc import Generator
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest import mock
 from typing import cast
 
 from scripts.hooks import showrunner_footer
 from scripts.production.update_registration import QuestionStaff
+from scripts.production import update_registration as registration
+from scripts.production.update_registration import due
+from scripts.production.cli_fixture import production_paths
 from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
@@ -22,7 +27,70 @@ from scripts.production.staff_test_support import (
 from scripts.statusline import counts_row
 
 
+AT = "2026-10-04T11:00"
+
+
+@contextlib.contextmanager
+def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Generator[Path]:
+    environment = {**source_environment(root / "sources"), "HOME": str(root / "home"),
+                   "USER_ZONE": "America/Los_Angeles",
+                   "HERDR_BIN": "/nonexistent/herdr"}
+    with (isolated_staff_file(root / "staff.json", environment),
+          mock.patch.dict(os.environ, environment), production_paths(environment)):
+        folder = root / "issues"
+        folder.mkdir(exist_ok=True)
+        doc = root / "reader-production.md"
+        _ = doc.write_text(f"> **Status: PRODUCTION — running.** reader\n- **Proposals:** {folder}\n")
+        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
+        timer = Path(environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{owner.id}"
+        timer.mkdir(parents=True, exist_ok=True)
+        _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")
+        path = showrunner_footer.outstanding_path(owner.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        reminders: list[dict[str, object]] = []
+        for index, item in enumerate(entries):
+            if "question" not in item and "reviewed" not in item:
+                reminders.append(item)
+                continue
+            fields = {**item, "asked_by": str(owner.id)}
+            _ = (folder / f"question-{index}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
+        _ = path.write_text(json.dumps(reminders))
+        yield path
+
+
 class QuestionLibraryTests(unittest.TestCase):
+    def test_open_questions_filters_the_asker_and_excludes_deferred_items(self) -> None:
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "Owner question", "question": "Choose the layout?"},
+            {"since": AT, "text": "Legacy reminder"},
+        ]
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{path.stem}"
+            production = showrunner_footer.read_production(timer)
+            assert production is not None
+            own = fixture_member("unit", name="own", parent=production.owner.id)
+            other = fixture_member("unit", name="other", parent=production.owner.id)
+            empty = fixture_member("unit", name="empty", parent=production.owner.id)
+            folder = Path(scratch) / "issues"
+            for index, (source, after) in enumerate(((own.id, ""), (own.id, ""),
+                                                    (other.id, ""), ("unknown-staff", ""),
+                                                    (own.id, "2099-01-02T08:00"))):
+                fields = {"since": AT, "text": f"Question {index}", "question": "Choose the route?",
+                          "asked_by": source}
+                if after:
+                    fields["after"] = after
+                _ = (folder / f"question-source-{index}.md").write_text(
+                    "---\nrecord_type: question\nstatus: open\n"
+                    + f"production_id: {production.owner.id}\nasked_by: {source}\n"
+                    + f"registration: {json.dumps(fields)}\n---\n")
+            for source, expected in (("", 6), (own.id, 2), (other.id, 1), (empty.id, 0)):
+                with self.subTest(source=source):
+                    self.assertEqual(showrunner_footer.open_questions([production], source=source), expected)
+
     def test_invalid_timer_text_does_not_hide_a_valid_staff_timer(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -35,7 +103,18 @@ class QuestionLibraryTests(unittest.TestCase):
                 valid = root / f"showrunner-{owner.id}"
                 valid.mkdir()
                 _ = (valid / "conf").write_text(f"TARGET=session:{owner.id}\n")
-                self.assertEqual(showrunner_footer.targeted_instances(owner.current_session), [valid])
+                parent = fixture_member("showrunner", name="parent")
+                for kind, enabled in (("showrunner", 1), ("showrunner", 0), ("unit", 0)):
+                    with self.subTest(kind=kind, enabled=enabled):
+                        _ = (valid / "state").write_text(f"ENABLED={enabled}\n")
+                        if kind == "unit":
+                            _ = staff.change_director(owner.id, staff.UnitRole(owner.name, parent.id,
+                                                     staff.PresentWorktree("natedev", root)))
+                        errors = io.StringIO()
+                        with contextlib.redirect_stderr(errors):
+                            self.assertEqual(showrunner_footer.targeted_instances(owner.current_session),
+                                             [valid] if kind == "showrunner" else [])
+                        self.assertEqual(errors.getvalue(), "")
 
     def test_read_production_uses_one_staff_read_and_the_timer_folder_owner(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -52,7 +131,7 @@ class QuestionLibraryTests(unittest.TestCase):
                 with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as read_staff:
                     production = showrunner_footer.read_production(instance)
                 self.assertEqual(production, showrunner_footer.Production(
-                    owner.name, doc, "UTC", showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED, owner))
+                    owner.name, doc, "UTC", owner))
                 read_staff.assert_called_once_with()
 
     def test_deferred_time_reports_missing_owner_and_keeps_a_known_owner(self) -> None:
@@ -102,8 +181,9 @@ class QuestionLibraryTests(unittest.TestCase):
                 _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
                 identities = QuestionStaff.for_record(staff.StaffSnapshot(()))
                 errors = io.StringIO()
+                paths: list[Path] = []
                 with contextlib.redirect_stderr(errors):
-                    line, due, paths = counts_row.row(instance, identities=identities)
+                    line, due = counts_row.row(instance, paths, identities=identities)
                 self.assertEqual(line, "For you: 1 efficiency")
                 self.assertEqual(due, "")
                 self.assertIn(document, paths)
@@ -119,13 +199,11 @@ class QuestionLibraryTests(unittest.TestCase):
                   mock.patch.dict(os.environ, environment)):
                 owner = fixture_member("showrunner", name="display-name", runtime_id=fixture_runtime_id("footer-owner"))
                 _ = staff.update_current_session(owner.current_session, staff.native_id(fixture_runtime_id("footer-current")))
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
                 self.assertEqual(showrunner_footer.outstanding_path(owner.id),
                                  root / "showrunner/outstanding" / f"{owner.id}.json")
                 _ = staff.rename(owner.id, "renamed-owner")
-                self.assertEqual(showrunner_footer.review_pause_path(owner.id),
-                                 root / "showrunner/review-paused" / f"{owner.id}.json")
+                self.assertEqual(showrunner_footer.outstanding_path(owner.id),
+                                 root / "showrunner/outstanding" / f"{owner.id}.json")
 
     def test_read_production_skips_wrapped_doc(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -138,6 +216,20 @@ class QuestionLibraryTests(unittest.TestCase):
                 instance.mkdir()
                 _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {owner.id}\n")
                 self.assertIsNone(showrunner_footer.read_production(instance))
+
+    def test_read_production_reports_document_read_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            doc = root / "production.md"
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc(remote.local_machine(), doc))
+                instance = root / f"showrunner-{owner.id}"
+                for failure in ("missing", "invalid encoding"):
+                    with self.subTest(failure=failure):
+                        if failure == "invalid encoding":
+                            _ = doc.write_bytes(b"\xff")
+                        with self.assertRaises(showrunner_footer.FooterError):
+                            _ = showrunner_footer.read_production(instance)
 
     def test_counts_and_deferred_time_share_one_question_staff_context(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -171,11 +263,12 @@ class QuestionLibraryTests(unittest.TestCase):
                         + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
                         + f"registration: {json.dumps(fields)}\n---\n# {title}\n", encoding="utf-8")
                 identities = QuestionStaff.read()
+                sources: list[Path] = []
                 with (mock.patch.object(counts_row, "showrunner_footer", showrunner_footer),
                       mock.patch.object(QuestionStaff, "read", return_value=identities) as read_context,
                       mock.patch.object(showrunner_footer, "outstanding_path",
                                         wraps=showrunner_footer.outstanding_path) as outstanding):
-                    line, due, sources = counts_row.row(instance)
+                    line, due = counts_row.row(instance, sources)
                 self.assertTrue(outstanding.call_args_list)
                 for call in outstanding.call_args_list:
                     self.assertIs(cast(object, call.kwargs["identities"]), identities)
@@ -185,6 +278,68 @@ class QuestionLibraryTests(unittest.TestCase):
                 for record in folder.glob("*.md"):
                     self.assertIn(record, sources)
                 read_context.assert_called_once_with()
+
+    def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
+        question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "reminder"},
+            {"since": AT, "text": "facts needed", "question": question},
+            {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+            {"since": AT, "text": "review failed", "question": question,
+             "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+        ]
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
+            items = registration.parse_outstanding_entries(entries, path)
+            self.assertIsInstance(items[0], registration.OutstandingReminder)
+            awaiting = items[1]
+            self.assertIsInstance(awaiting, registration.OutstandingQuestion)
+            assert isinstance(awaiting, registration.OutstandingQuestion)
+            self.assertEqual(awaiting.question, question)
+            reviewed = items[2]
+            self.assertIsInstance(reviewed, registration.ReviewedOutstandingQuestion)
+            assert isinstance(reviewed, registration.ReviewedOutstandingQuestion)
+            self.assertEqual(reviewed.reviewed, "Use the short route?")
+            unavailable = items[3]
+            self.assertIsInstance(unavailable, registration.ReviewUnavailableOutstandingQuestion)
+            assert isinstance(unavailable, registration.ReviewUnavailableOutstandingQuestion)
+            self.assertEqual(unavailable.question, question)
+            self.assertEqual(unavailable.reason, "reviewer unavailable")
+            self.assertEqual(due(items, datetime.fromisoformat(AT)), items[:3])
+            self.assertEqual(due(items, datetime(2026, 10, 4, 12)), items)
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{path.stem}"
+            production = showrunner_footer.read_production(timer)
+            self.assertIsNotNone(production)
+            assert production is not None
+            class FooterClock:
+                @staticmethod
+                def now(zone: ZoneInfo) -> datetime:
+                    return datetime.fromisoformat(AT).replace(tzinfo=zone)
+
+            with mock.patch.object(showrunner_footer, "datetime", FooterClock):
+                self.assertEqual(showrunner_footer.open_questions([production]), 3)
+            output = showrunner_footer.counts_line([production], 3)
+            self.assertIsNotNone(output)
+            assert output is not None
+            self.assertIn("3 questions", output)
+            self.assertNotIn("Which route?", output)
+
+    def test_outstanding_reader_refuses_conflicting_or_incomplete_review_evidence(self) -> None:
+        cases: list[dict[str, object]] = [
+            {"reviewed": "Choose now?"},
+            {"question": "Choose now?", "reviewed": "Choose now?", "review_unavailable": "offline"},
+            {"question": ""},
+            {"question": "Choose now?", "reviewed": 42},
+            {"question": "Choose now?", "review_unavailable": 42},
+            {"question": None},
+            {"question": "Choose now?", "reviewed": None},
+            {"question": "Choose now?", "review_unavailable": None},
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as scratch:
+                with canonical_outstanding(Path(scratch), [{"since": AT, "text": "route", **fields}]) as path:
+                    with self.assertRaises(registration.InputError):
+                        _ = registration.parse_outstanding_entries([{"since": AT, "text": "route", **fields}], path)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 import json
 import os
+import subprocess
+import time
 import unittest
 from typing import Self, cast, override
 from unittest import mock
@@ -25,14 +27,86 @@ from scripts.build_queue.queue_fixture import (
     ci_step,
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import QueueLines, json_form, plain, wrap
+from scripts.build_queue.queue_lines import QueueLines, cut_tail, json_form, plain, wrap
 from scripts.lib.build_steps import read_step_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
-from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config, write_process
+
+
+class RecordedOwnerQueueTests(unittest.TestCase):
+    def test_parentless_owner_keeps_its_name_without_changing_the_step_name(self) -> None:
+        with QueueFixture() as fixture:
+            model = fixture.model()
+            waiter = replace(model.reading.view.waiting[0], session_id="solo", session_name="solo",
+                             unit="", project="repository", step="check")
+            model = with_waiting(model, [waiter])
+            model = replace(model, labels={"solo": UnitLabels("solo")})
+            lines = queue_view.render_view(model, 120)
+            self.assertIn("solo", plain(lines))
+            self.assertIn("repository check", plain(lines))
+            self.assertNotIn("solo check", plain(lines))
+            self.assertEqual(queue_view.name_text(waiter, model), "solo")
+
+    def test_detached_and_systemd_rows_resolve_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="demo", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            current = fixture_runtime_id("owner-after-session-restart")
+            worker = staff.update_current_session(worker.current_session, staff.native_id(current))
+            model = fixture.model()
+            for source, owner in (("detached", worker), ("systemd", unit)):
+                with self.subTest(source=source), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
+                }), mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
+                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    self.assertEqual(identity.session_id, owner.current_session)
+                    labels = unit_labels.unit_labels_for([identity.session_id], os.environ)
+                    waiter = replace(model.reading.view.waiting[0], session_id=identity.session_id,
+                                     session_name=identity.name, unit=identity.unit)
+                    running = replace(model.reading.view.running[0], session_id=identity.session_id,
+                                      session_name=identity.name, unit=identity.unit)
+                    for step in (waiter, running):
+                        self.assertEqual(queue_evidence.step_labels(step, labels), UnitLabels(owner.name, "hana", "demo"))
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
+                                     UnitLabels(owner.name, "hana", "demo"))
+
+    def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
+        from scripts.build_queue import admission_client
+
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "live-session", "CLAUDE_CODE_SESSION_ID": "",
+                                         "BUILDLOG_OWNER_STAFF_ID": "other-owner"}):
+            self.assertEqual(admission_client.step_identity("nextest", "").session_id, "live-session")
+
+    def test_missing_owner_records_have_explicit_labels_on_every_destination(self) -> None:
+        from scripts.build_queue import admission_client
+        from scripts.production.staff_test_support import isolated_staff_file
+
+        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            model = fixture.model()
+            for reference in ("", "missing-staff-row"):
+                with self.subTest(reference=reference), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": reference,
+                }):
+                    identity = admission_client.step_identity("targeted-test", "")
+                    self.assertEqual(identity.session_id, "")
+                    for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
+                        label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
+                        self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
+                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
+                    label = queue_view.cloud_step_labels(cloud, replace(model, labels={}))
+                    self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
 
 
 def queue_json_text(data: QueueLines) -> str:
@@ -94,9 +168,78 @@ def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
         reading.diagnostics, rows, 1, cloud_gate_stale_pushes=3)
 
 
+
+
+
+
+def empty_mac_reading(fixture: QueueFixture) -> None:
+    """Keep existing renderer tests on a fresh private Mac reading."""
+    path = fixture.root / "mac-builds.json"
+    _ = path.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+    _ = (fixture.root / "memory_feed.conf").write_text("# whole: 1..\nmac_activity_refresh_seconds=30\n")
+    _ = fixture.enter_context(mock.patch.object(queue_view, "mac_reading_path", return_value=path))
+    _ = fixture.enter_context(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
+
+
+class MacQueueViewTests(unittest.TestCase):
+    def test_periodic_reader_preserves_folders_and_elapsed_days(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            _ = (fixture.root / "mac_test.conf").write_text(
+                "host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\nmirror_root=~/.local/state/mac-test/mirror\n")
+            path = fixture.root / "mac-builds.json"
+            now = NOW
+            for elapsed, seconds in (("03:04", 184), ("02:03:04", 7384), ("1-02:03:04", 93784)):
+                with self.subTest(elapsed=elapsed):
+                    result = subprocess.CompletedProcess(["ssh"], 0,
+                        stdout=f"710001\t{elapsed}\t/Users/nate/mac clone\nrc=0\n", stderr="")
+                    with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
+                          mock.patch.object(subprocess, "run", return_value=result),
+                          mock.patch.object(time, "time", return_value=now)):
+                        queue_view.refresh_mac_builds()
+                        reading = queue_view.read_mac_builds()
+                    self.assertEqual(reading.error, "")
+                    self.assertEqual(reading.read_at, now)
+                    build, = reading.builds
+                    self.assertEqual(build.pid, 710001)
+                    self.assertEqual(build.folder, "/Users/nate/mac clone")
+                    self.assertEqual(build.started_at, now - seconds)
+
+
+
+
+    def test_native_mac_rows_show_the_folder_without_local_memory(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            reading = queue_view.MacBuildReading(now, (queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 45),))
+            with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                text = plain(queue_view.render_view(model, 240))
+            for expected in ("started on the Mac", "mac-clone", "Progress unavailable", "owner not recorded"):
+                self.assertIn(expected, text)
+            row, = [line for line in text.splitlines() if "pid 710001" in line]
+            self.assertIn("mac", row)
+
+    def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            empty_mac_reading(fixture)
+            model = fixture.model()
+            now = model.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
+            for read_at, error in ((now - 90, ""), (now - 30, "Mac unreachable"), (0, "Mac reading missing")):
+                with self.subTest(read_at=read_at, error=error):
+                    reading = queue_view.MacBuildReading(read_at, (build,), error)
+                    with mock.patch.object(queue_view, "read_mac_builds", return_value=reading):
+                        text = plain(queue_view.render_view(model, 240))
+                    self.assertIn("Mac reading is old", text)
+                    self.assertNotIn("pid 710001", text)
+
+
 class CloudQueueViewTests(unittest.TestCase):
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
+        empty_mac_reading(fixture)
         write_memory_config(fixture.root / "build_admission.conf",
             cloud_gate_slots="1", cloud_gate_stale_pushes="3")
         _ = (fixture.root / "cloud_gate.conf").write_text(
@@ -162,6 +305,28 @@ class CloudQueueViewTests(unittest.TestCase):
                     self.assertIn(failure_text, text)
                 else:
                     self.assertNotIn("failed module", text)
+
+    def test_cloud_rows_show_stage_and_location(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        assert isinstance(row.progress, cloud_progress.CloudProgress)
+        for stage, region, zone, detail in (
+            ("tools ready", "", "", "tools ready"),
+            ("tests start", "eu-south-2", "eu-south-2a", "tests start · eu-south-2, zone a"),
+            ("", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
+            ("", "", "eu-south-2a", "zone eu-south-2a"),
+            ("", "eu-south-2", "", "eu-south-2"),
+            ("", "", "", ""),
+        ):
+            with self.subTest(stage=stage, region=region, zone=zone):
+                current = replace(row, progress=replace(row.progress, stage=stage, region=region, zone=zone))
+                self.assertEqual(queue_view.cloud_detail(current), detail)
+                current_model = replace(model, reading=replace(reading, cloud=(current, *reading.cloud[1:])))
+                text = plain(queue_view.render_view(current_model, 240))
+                expected = " · ".join(filter(None, ("running", detail, "7 of 12 modules", "1 failed module")))
+                self.assertIn(expected, text)
 
     def test_cloud_rows_sort_with_local_steps_and_keep_the_local_memory_bars(self) -> None:
         model, fixture = self.cloud_model()
@@ -264,6 +429,7 @@ class QueueViewFixtureTests(QueueFixtureTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        empty_mac_reading(self.fixture)
         _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
 
 
@@ -348,7 +514,7 @@ class QueueViewTests(QueueViewFixtureTests):
             with self.subTest(columns=columns):
                 lines = queue_view.render_view(model, columns)
                 rows = waiting_rows(lines)
-                self.assertIn("nateroids nextest", rows[0])
+                self.assertIn("cables nextest" if columns >= 100 else "cables nexte…", rows[0])
                 for marker in ("pid ",):
                     self.assertEqual(terminal_width(rows[0][:rows[0].index(marker)]),
                                      terminal_width(rows[1][:rows[1].index(marker)]))
@@ -492,41 +658,42 @@ class QueueViewTests(QueueViewFixtureTests):
                        facts=head_facts.read_head_facts(reply.reading))
 
     def test_running_waiting_and_held_rows_show_run_pids_at_every_width(self) -> None:
-        with AdmissionFixture() as fixture:
-            owner = fixture.fixture_owner(7000001, "100")
-            child = fixture.fixture_owner(7000002, "200")
-            run = wire.RunIdentity(owner.pid, owner.start_time)
-            _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
-                f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
-            request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child)))
-            grant = only_admitted(fixture.server.handle_request(request))
-            waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
-                run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
-            _ = fixture.fixture_owner(7000004, "400")
-            _ = fixture.server.handle_request(waiter)
-            for held in (False, True):
-                if held:
-                    _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
-                model = self.service_model(fixture)
-                for columns in (60, 80, 100, 140):
-                    with self.subTest(held=held, columns=columns):
-                        lines = queue_view.render_view(model, columns)
-                        running, = [plain([line]) for line in lines
-                                    if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
-                        queued, = waiting_rows(lines)
-                        self.assertIn("pid 7000001", running)
-                        self.assertIn("pid 7000004", queued)
-                        self.assertNotIn("pid 7000002", running)
-                        self.assertNotIn("pid 7000003", queued)
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                        card = queue_card.render_selection(model, "1", columns)
-                        self.assertIn("pid 7000004", plain(card))
-                        self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
-                if held:
-                    self.assertFalse(fixture.server.reservations)
-                    room = model.reading.explanation.room
-                    assert isinstance(room, admission_records.MemoryRoom)
-                    self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
+        for folder in ("", "builds.slice/builds-detached.slice/verify.scope"):
+            with self.subTest(scope=folder), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(7000001, "100")
+                child = fixture.fixture_owner(7000002, "200")
+                run = wire.RunIdentity(owner.pid, owner.start_time)
+                _ = (fixture.proc.path / str(child.pid) / "environ").write_bytes(
+                    f"BUILDLOG_RUN={owner.pid}:{owner.start_time}\0".encode())
+                request = replace(fixture.request(owner=child, run=run), sidecar=str(fixture.scope(child, folder=folder)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                waiter = fixture.request(owner=fixture.fixture_owner(7000003, "300"),
+                    run=wire.RunIdentity(7000004, "400"), need=60 * admission_records.GIB)
+                _ = fixture.fixture_owner(7000004, "400")
+                _ = fixture.server.handle_request(waiter)
+                for held in (False, True):
+                    if held:
+                        _ = fixture.server.handle_request(wire.ReleaseRequest("held", grant.reservation, 0))
+                    model = self.service_model(fixture)
+                    for columns in (60, 80, 100, 140):
+                        with self.subTest(held=held, columns=columns):
+                            lines = queue_view.render_view(model, columns)
+                            running, = [plain([line]) for line in lines
+                                        if plain([line]).startswith("run") and "pid 7000001" in plain([line])]
+                            queued, = waiting_rows(lines)
+                            self.assertIn("pid 7000001", running)
+                            self.assertIn("pid 7000004", queued)
+                            self.assertNotIn("pid 7000002", running)
+                            self.assertNotIn("pid 7000003", queued)
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+                            card = queue_card.render_selection(model, "1", columns)
+                            self.assertIn("pid 7000004", plain(card))
+                            self.assertTrue(all(terminal_width(plain([line])) <= columns for line in card))
+                    if held:
+                        self.assertFalse(fixture.server.reservations)
+                        room = model.reading.explanation.room
+                        assert isinstance(room, admission_records.MemoryRoom)
+                        self.assertGreater(sum(hold.memory.held for hold in room.runs), 0)
 
     def test_service_without_a_recorded_process_shows_pid_absence(self) -> None:
         model = self.fixture.model()
@@ -643,13 +810,13 @@ class QueueViewTests(QueueViewFixtureTests):
                     for hidden in ("idle", "2880", "2 days", "Runner.Listener"):
                         self.assertNotIn(hidden, row)
 
-    def test_running_ci_names_its_keep_aside_in_the_view_and_card(self) -> None:
+    def test_running_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
             model = self.ci_service_model(fixture, active=True)
             for source, lines in (("view", queue_view.render_view(model, 400)),
                                   ("card", queue_card.render_card(model, [], 400))):
                 with self.subTest(source=source):
-                    self.assertIn("CI keep-aside 7.0 GiB", plain(lines))
+                    self.assertNotIn("CI keep-aside", plain(lines))
 
     def test_idle_ci_has_no_keep_aside_in_the_view_or_card(self) -> None:
         with AdmissionFixture() as fixture:
@@ -740,6 +907,27 @@ class QueueViewTests(QueueViewFixtureTests):
             assert isinstance(activity.run, LiveBuildRun)
             self.assertEqual((activity.run.pid, activity.run.start_time), (owner.pid, owner.start_time))
             self.assertNotIn("Still running after their build ended", plain(queue_view.render_view(model, 140)))
+
+    def test_a_detached_supervisor_does_not_make_a_python_scope_a_live_build(self) -> None:
+        with AdmissionFixture() as fixture:
+            supervisor = fixture.fixture_owner(700001, "100")
+            child = fixture.fixture_owner(700002, "200")
+            write_process(fixture.proc.path, child.pid, admission_records.GIB, parent=supervisor.pid, start=child.start_time)
+            parent = fixture.proc.path / str(supervisor.pid)
+            _ = (parent / "cmdline").write_bytes(b"python3\0detached_runs.py\0supervise\0private.json\0")
+            process = fixture.proc.path / str(child.pid)
+            _ = (process / "cmdline").write_bytes(b"python3\0-m\0unittest\0")
+            scope = Path(fixture.scope(child, folder="builds.slice/python.scope").read_text())
+            _ = fixture.run_pass()
+            model = self.service_model(fixture)
+            step, = [step for step in model.reading.view.running
+                if isinstance(step.measured, admission_records.UnownedSliceMemory) and step.measured.cgroup == str(scope)]
+            assert isinstance(step.measured, admission_records.UnownedSliceMemory)
+            activity = step.measured.activity
+            assert isinstance(activity, ScopeProcesses)
+            self.assertIsInstance(activity.run, NoLiveBuildRun)
+            self.assertEqual(queue_view.running_builds(model), [])
+            self.assertEqual(queue_view.leftover_processes(model.reading.view.running), [(step, step.measured, activity)])
 
     def test_ended_processes_use_session_labels_and_exclude_the_ci_slice(self) -> None:
         model = self.fixture.model()
@@ -836,8 +1024,10 @@ class QueueViewTests(QueueViewFixtureTests):
                 self.assertEqual(len(running), 3)
                 for index, row in enumerate(running):
                     unit = "queue-…" if columns == 60 else "queue-unit"
-                    self.assertEqual(row[:header.index("step")].split(), ["run", "builds", unit])
-                    self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+                    self.assertEqual(row[:header.index("step")].split(),
+                                     ["run", "buil…" if columns == 60 else "builds", unit])
+                    self.assertEqual(row[header.index("step"):header.index("min")].strip(),
+                        cut_tail("queue-unit merge gate", header.index("min") - header.index("step") - 1))
                     self.assertEqual(row[header.index("min"):].split()[0], str(index + 1))
                     self.assertIn("5.0", row)
                     if columns >= 100:
@@ -1180,15 +1370,15 @@ class QueueViewTests(QueueViewFixtureTests):
 
     def test_live_bump_marks_every_unit_row_without_moving_columns(self) -> None:
         model = self.fixture.model()
-        for unit in ("cables", "widget"):
-            priority: admission_records.QueuePriority = {"unit": unit, "why": "test", "set_at": NOW, "set_by": "actor",
-                                            "transition": admission_records.SettledPriority()}
+        for units in (("cables",), ("widget",), ("cables", "widget")):
+            priority = admission_records.QueuePriority(tuple(
+                admission_records.PriorityEntry(unit=unit, why="test", set_at=NOW, set_by="actor") for unit in units))
             bumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=priority)))
             unbumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=admission_records.NoQueuePriority())))
             for columns in (40, 60, 80, 100, 140):
-                with self.subTest(unit=unit, columns=columns):
+                with self.subTest(units=units, columns=columns):
                     baseline = queue_view.render_view(unbumped, columns, you=ASKING_SESSION, selector="widget")
                     with mock.patch.object(head_facts, "queue_moves", side_effect=AssertionError("bump history read")), \
                          mock.patch.object(gate, "read_queue_priority", side_effect=AssertionError("live priority read")):
@@ -1200,7 +1390,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     steps = [row.step for row in queue_view.running_builds(model)] + list(model.reading.view.waiting)
                     self.assertEqual(len(rows), len(steps))
                     for row, before, step in zip(rows, previous, steps):
-                        expected = model.labels[step.session_id].unit == unit
+                        expected = model.labels[step.session_id].unit in units
                         self.assertEqual(sum(span.text == "●" for span in row), int(expected))
                         # The step, minutes, bars and selection mark retain their positions.
                         unit_end = 5 if expected else 4
@@ -1210,7 +1400,7 @@ class QueueViewTests(QueueViewFixtureTests):
                     data = json_form(lines, columns, NOW)
                     self.assertEqual(sum(part["text"] == "●" and part.get("tone") == "warning"
                                          for row in data["lines"] for part in row),
-                                     sum(model.labels[step.session_id].unit == unit for step in steps))
+                                     sum(model.labels[step.session_id].unit in units for step in steps))
 
     def test_no_live_bump_keeps_the_recorded_board_bytes(self) -> None:
         model = self.fixture.cap_model()
@@ -1404,7 +1594,7 @@ class CapViewTests(QueueViewFixtureTests):
         bar = queue_view.cap_bar(room, 60, colour=True)
         self.assertEqual(plain([bar[:9]]), "█" * 9)
         self.assertEqual([span.tone for span in bar],
-            ["suggestion"] * 9 + ["warning"] * 12 + ["success"] * 5 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
+            ["suggestion"] * 9 + ["warning"] * 5 + ["success"] * 12 + ["error"] + ["warning"] * 2 + ["inactive"] * 31)
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)
@@ -1480,11 +1670,12 @@ class CapViewTests(QueueViewFixtureTests):
 
     def test_size_bars_show_uncut_needs_with_nearest_eighth_and_zero(self) -> None:
         model = self.fixture.cap_model()
-        for need, expected in ((6.8, "██████▊"), (0, ""), (25, "█" * 25)):
-            with self.subTest(need=need):
+        for columns, need, expected in ((100, 6.8, "██████▊"), (100, 0, ""), (100, 25, "█" * 23),
+                                        (120, 6.8, "██████▊"), (120, 0, ""), (120, 25, "█" * 25)):
+            with self.subTest(columns=columns, need=need):
                 step = replace(model.reading.view.waiting[1], need=int(need * admission_records.GIB))
                 changed = with_waiting(model, [model.reading.view.waiting[0], step])
-                lines = queue_view.render_view(changed, 100, colour=True)
+                lines = queue_view.render_view(changed, columns, colour=True)
                 row = next(line for line in lines if plain([line]).lstrip().startswith("2 "))
                 self.assertEqual("".join(span.text for span in row if span.tone == "warning"), "●" + expected)
                 self.assertTrue(any(f"{need:.1f}" in span.text and span.tone == "inactive" for span in row))
@@ -1501,13 +1692,17 @@ class CapViewTests(QueueViewFixtureTests):
         model = replace(with_waiting(model, [first, second]), labels=labels)
         for columns in (80, 100, 140):
             with self.subTest(columns=columns):
-                rows = waiting_rows(queue_view.render_view(model, columns))
+                lines = queue_view.render_view(model, columns)
+                rows = waiting_rows(lines)
                 self.assertIn("metrics-viewer", rows[0])
                 self.assertNotIn("performance-metrics-viewer", rows[0])
                 self.assertIn("tool-based-ui", rows[1])
                 self.assertEqual(rows[1].split()[2], "—")
                 self.assertNotIn("other-session", rows[1])
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual(rows[0][start:end].strip(), cut_tail("metrics-viewer nextest", end - start - 1))
+                self.assertEqual(rows[1][start:end].strip(), "nextest")
 
     def test_showrunner_prefix_is_removed_from_running_and_queued_units(self) -> None:
         model = self.fixture.cap_model()
@@ -1542,7 +1737,7 @@ class CapViewTests(QueueViewFixtureTests):
         header, = [line for line in plain(lines).splitlines() if line.lstrip().startswith("# ")]
         row, = waiting_rows(lines)
         self.assertEqual(row[:header.index("step")].split()[1:], ["sdlc", "devtools"])
-        self.assertEqual(row[header.index("step"):header.index("min")].strip(), read_step_names().shown("merge-gate"))
+        self.assertEqual(row[header.index("step"):header.index("min")].strip(), "devtools merge gate")
 
 
 
@@ -1569,7 +1764,9 @@ class CapViewTests(QueueViewFixtureTests):
                 rows = waiting_rows(narrow)
                 self.assertEqual(len(rows), 2)
                 self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in narrow))
-                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+                header, = [line for line in plain(narrow).splitlines() if line.lstrip().startswith("# ")]
+                start, end = header.index("step"), header.index("min")
+                self.assertEqual([row[start:end].strip() for row in rows], ["cables nexte…", "cables nexte…"])
 
 
 if __name__ == "__main__":

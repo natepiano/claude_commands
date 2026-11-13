@@ -2,7 +2,17 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines. Each production has one workspace. Each standalone session has a workspace with its tab name. A unit uses its fixed parent row's production workspace. No launcher starts a separate herdr session. `start_server` and `restore_server` refuse other session names. Open `agents` with `herdr session attach agents` (`hsa agents`). Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine. Workers use interactive Claude or Codex panes under their staff parent. Crash recovery also restores interactive Codex conversations into tabs in `agents`. tmux remains only in old records, which produce manual restart instructions. The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py` and `scripts/agents/`. See [herdr-trial.md](herdr-trial.md) for the trial results.
+Every showrunner, unit director, and standalone Claude session uses a tab in the shared herdr session, `agents`, on both machines.
+Each production has one workspace.
+Each producer uses its own tab in `PRODUCER_WORKSPACE`, normally `producers`, for either family.
+Other standalone sessions use a workspace with their tab name.
+A unit uses its fixed parent row's production workspace.
+No launcher starts a separate herdr session.
+`start_server` and `restore_server` refuse other session names.
+Open `agents` with `herdr session attach agents` (`hsa agents`).
+Use `herdr_sessions.py attach-remote <host> <tab>` for a tab on the other machine.
+Workers use interactive Claude or Codex panes under their staff parent.
+The implementation uses `scripts/herdr/`, `scripts/production/`, `scripts/message/roster.py`, and `scripts/agents/`.
 
 ## How it works
 
@@ -150,7 +160,17 @@ Every Claude launch writes trust before starting Claude. The target account does
 
 The CLI takes `read|type|keys|where` and either `unit <showrunner name> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
-These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
+These consumers use this path:
+
+1. Effort changes through `unit_effort.py`, showrunner promotion, and relays.
+2. The stall watch and `unit_status.sh`, each with 400 joined lines.
+3. Shutdown screen checks through `restart_support._screen`, with 60 lines, and the Remote Control fixer.
+
+`restart_support._screen` checks the registry session identity at the unit's pid before resolving its pane.
+A mismatch returns `ScreenUnreadable("session registry identity changed")`.
+`remote_control.py` finds the newly registered pid's pane through `record_place`.
+It confirms process identity and idle state.
+It then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
 ### Worker questions
 
@@ -284,40 +304,34 @@ The command waits for the showrunner's registration before it attaches the child
 
 ### Shutdown, restart and crash recovery
 
-[shutdown-and-restart.md](shutdown-and-restart.md) covers records, `ResumeParts`, holds and the restart pass. The herdr parts:
+The [shutdown design](shutdown-and-restart.md) defines shared stop, resume, move, and restart.
+`agents stop --all` saves live local staff row IDs before stopping their processes.
+The selection includes producers from both families.
+`agents restart` resumes missing rows from that list through `restart.start_row`.
+Start reads the current conversation and folder from staff.
+It uses `herdr.row_workspace` for the destination.
+Producers use `PRODUCER_WORKSPACE`; units use their parent showrunner's workspace.
+Other sessions use their own name or the shared session name.
+Worker rows use `worker.restore` and the shared worker launch policy.
+An idle worker remains closed until assignment.
+A live session stays unchanged.
+A failed start retains the row on the restart list.
+Restart sends no work prompt.
 
-- **Hosts.** `inventory._host` checks `TMUX_PANE` first (non-empty means `UnknownHost`). A unit with session labels with a live Claude is `UnitHost{production, unit, doc, session_name, session_host: "herdr", plan}`. A placed pid is `HerdrHost{herdr_session, pane_id, presentation}`, where `presentation` is `"attached window"` when `attached_clients` finds one and `"detached"` otherwise (a record without it reads as detached). Everything else is a window or terminal host. On Darwin, inventory reads environments through `herdr.darwin_process_environment`. The desktop snapshot collector is deleted.
-- **Stop.** After the Claude exits, `stop._stop_unit_session` closes the unit's place. In the shared session it closes only the tab of the pane that carries the unit's marks (`unit_lookup.labeled_session`, then `Herdr.close_tab_of`). The tab counts as closed only when `pane list` no longer shows that pane. A unit recorded in another herdr session gets `herdr.stop_session(<session_name>)`, and that session counts as stopped only when `live_sessions()` no longer lists it. Otherwise, or when herdr cannot be read, the record keeps `unit session left running{host: "herdr", session_name, cause}`.
-- **Restart destinations.** Every restart lands as a tab in the one shared session, `shared_session()` (`agents`); no restart opens a herdr session of its own. `_herdr_launch(parts: ResumeParts, destination: RecordedHerdrPane(name, pane_id) | SharedHerdrTab(name), session, *, dry_run, session_kind) -> HerdrLaunch`.
-  - Units restart only through `add_unit.py ... --host-session <session_name>` (`_unit_argv`), never `_herdr_launch`.
-  - A `HerdrHost` recorded in the shared session restarts through `RecordedHerdrPane`; one recorded in any other session restarts into `SharedHerdrTab` and leaves its recorded session (`_leave_recorded_session`). The leave runs after the launch. A leave that fails (`HerdrFailure`, `OSError` or `SubprocessError`) prints `<name> restart issue: herdr session <recorded> left open: <error>` and the launch stands; the old session stays for the user to close.
-  - A legacy tmux host restarts into `SharedHerdrTab`, with no window step.
-  - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
-- **`_herdr_launch` steps.**
-  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account uses the home from `pane_launch.config_home`.
-  2. Write Claude folder trust in the target account before starting Claude. A failed write prints one anomaly and prevents the start.
-  3. Call `restore_server(name, 90_000, session_kind=...)`.
-  4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
-  5. Refuse a live agent in the recorded pane. A recorded pane left at its shell is closed; one running a command is left open, with a printed line, because the session resumes in a new tab.
-  6. Record the scheduled prompt. Open a tab in the workspace named by the showrunner staff row. A unit uses its showrunner parent's `name`. Other sessions use a workspace with their session name. Start Claude with `OpeningPrompt(parts.opening_prompt)`. On `AgentExited`, close that tab with `close_agent`. Keep the shared server running.
-  7. An adopted or window-started server gets its restored workspace focused. After a successful focus, a window-started server also gets `close_startup_workspaces`. A failed focus or close prints `<name> restart issue: ...` and the restore stands.
-  8. `StartFreshConversation` prints `<name>: no conversation to resume; started a new one`.
+Producers use their current `[producers]` model and effort through the shared launch code.
+Codex producers select the workers account; Claude producers select the showrunners account.
+An explicit target account overrides that selection.
+The [producer admission contract](shutdown-and-restart.md#producer-launch-and-admission) defines first start and interrupted admission recovery.
+The [upkeep service](herdr-restore.md#restore-services) restores admitted producers after server loss and reboot.
+It excludes paused and exited producers.
 
-  `SessionTaken` becomes `HerdrDestinationTaken`, and `MacDesktopUnavailable` passes through.
-- **Windows after launch.** A `WindowServerCreated` restore needs nothing more. An `"attached window"` host gets a window only when `attached_clients` is `NoClientAttached`. Unreadable clients, or a `"detached"` host, print `herdr session attach <name>`. A failed window open appends to the record's `restart_issues` and leaves the agent running. Mac windows open `Ghostty.app` with `-e herdr session attach <name>`, spaced `WINDOW_DELAY_SECONDS` (1.2 s) apart.
-- **Detached starts on the Mac.** `detached.start_detached(argv, *, ready, within, output: DiscardOutput | AppendLog, environment: InheritEnvironment | ExplicitEnvironment) -> pid` starts the child in its own session with stdin closed. It returns only once `ready()` passes while the child lives, and leaves a thread to reap it. Failure raises `DetachedChildExited(pid)` or `DetachedStartFailure`, and a child that never became ready has its process group stopped (SIGTERM, then SIGKILL after 0.5 s). The conductor and the fixer start this way, with the caller's environment plus `DETACHED_STARTUP_SIGNAL=1` (`ExplicitEnvironment`). Each is ready when its log holds `shutdown conductor started` or `Remote Control fixer started`, within 15 s. They print that line only when `DETACHED_STARTUP_SIGNAL=1` is in their environment, and they pop it at once. Their start errors end `; log: <path>`, with logs under `shutdown_state_root()/logs`. Linux uses systemd.
-
-### Legacy tmux records
-
-Old shutdown host records still parse. Their compatibility parsing remains; recovery snapshots and their readers are deleted.
-
-- `session_types._parse_host`:
-  - A unit host whose `session_host` is absent or `"tmux"`, or whose kind is `legacy tmux unit`, becomes `LegacyTmuxUnitHost{kind: "legacy tmux unit", production, unit, doc, session_name}`. The old key `tmux_session` is read.
-  - A `tmux` or `legacy tmux` host becomes `LegacyTmuxHost{kind: "legacy tmux", session_name}`.
-  - Any `session_host` other than `tmux` or `herdr` raises `InvalidInventory`. `UnitHost.session_host` is `Literal["herdr"]`.
-- `record.py`: the old left-running kinds parse as `LegacyTmuxSessionLeftRunning{kind, at, session_name, cause}`. `legacy_tmux_leftovers(record)` returns every one, whatever its cause.
-- `restart.py`: tmux is gone, so a legacy host restarts as a tab in the shared session like a desktop host (see Restart destinations). Only a record with legacy tmux leftovers (`legacy_tmux_leftovers`) is `ManualRestartRequired(legacy_resume_command(record))`, which is `tmux kill-session -t =<name>` per leftover, `&&` the resume shell from `_resume_command`. Such a record is never archived (`clear_running_on_target` refuses first) and never retried as cleanup. `status` and restart show it as a manual restart. It counts in `MachineRestartResult.manual_sessions`, so restart reports `partial` and exits 1.
-- Other `tmux` text that stays on purpose: `sessions.SessionRecord.tmux`, the `/exit` guard in `pre-tool-use-showrunner-move-guard.py`, the old log line form in `waiting.py`, and user quotes in commands and `herdr-trial.md`.
+A restore adopts an answering shared server.
+On Linux, it starts a missing server through `systemd-run`.
+On the Mac, a desktop session starts the server directly.
+A non-desktop caller opens an attach window to start the server with desktop access.
+A launch focuses a workspace only when it creates the window.
+It then closes untouched startup workspaces.
+An existing server retains focus and startup workspaces.
 
 ### Test doubles
 
@@ -362,7 +376,7 @@ The block removes the temporary home when the tests end:
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
-- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. Successful worker prompt delivery returns the launcher before the transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
+- Prompt input requires an agent status of `working`, `idle`, or `done` and an empty visible composer. An absent `interactive_ready` permits input. A boolean value controls input. A non-boolean value prints one readiness anomaly and prevents input. No Remote Control turn is required. A Codex worker prompt delivery returns the launcher only after its transcript records the prompt, within `WORKER_SETTLE_SECONDS`; without that proof the launcher returns 8. A Claude delivery returns before its transcript must contain the prompt. A matching transcript prompt prevents replay. A matching final transcript reply proves completion. With a matching transcript prompt, the hook can use its own DONE reply before the final transcript record appears. A live detached run still holds completion. A failed delivery command returns an error. An unreadable transcript prevents a retry. Both `idle` and `done` permit retyping after the settle time.
 - Each composer read uses `pane read --source visible --format ansi` and removes faint text. SGR 2 starts faint text. SGR 22 or 0 ends faint text. The parser skips colour arguments for SGR 38, 48, and 58. A faint hint can appear in an empty composer.
 
 The turn hook closes a completed pane at once after DONE.
@@ -402,7 +416,9 @@ Every pane keeps its shell when its agent ends.
 - Native session ids select staff rows for launch and restore names.
   The Stop hook keeps member titles consistent with their rows.
   A unit name mismatch prints `/agents rename` and never changes staff.
-- Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
+- Staff restart uses `restart.start_row` and the shared pane launch path.
+  Producers use their current conversation and configured model settings.
+  Workers use `worker.restore`.
 - Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
 - Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.
 - Restart reads `attached_clients` before opening any window, and records a failed window in `restart_issues` without undoing the launch.
@@ -497,7 +513,10 @@ Every pane keeps its shell when its agent ends.
 
 ## Why
 
-- **One herdr session, one tab per Claude session (user, 2026-10-26).** One attach shows every session, with one workspace per production. `attach <tab>` and `attach-remote` focus the named tab first, so an attach still opens the session the user names. A tab has its session's name, so `list` and attach lines need no lookup table. A stop closes one tab and changes nothing else in the session.
+- **Shared session and named tabs.** One attach shows each production workspace and the configured producer workspace.
+  `attach <tab>` and `attach-remote` focus the named tab first.
+  A tab uses its session's name.
+  A process stop retains its tab and shell.
 - **Native pane workers report through hooks.** Assignment returns after submission. The hook completes the pass and resumes the director with one message.
 - **Launches write trust.** The shared writer grants the exact repository key before Claude starts. A failed write prints one anomaly and prevents the start.
 - **Unique tab names.** A tab name is a session name, so two sessions must never share one. A taken `--name` refuses, and a generated name moves to the next suffix. Every launcher adopts the one shared server, so only the tab name must be unique.

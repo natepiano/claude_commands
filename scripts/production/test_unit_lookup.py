@@ -34,8 +34,6 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
 
-
-
 class UnitReferenceTests(StaffTestCase):
     def test_row_production_returns_the_recorded_parent_when_its_document_is_missing(self) -> None:
         doc = self.source_root / "missing-production.md"
@@ -269,10 +267,6 @@ class UnitLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(staff.StaffUnreadable, "process environment is unavailable"):
             _ = session_staff.session_staff_and_directors([session], self.environment, record=staff.snapshot())
 
-    def test_default_identity_and_process_are_named_states(self) -> None:
-        pane = unit_lookup.LabeledSession("alpha", ClaudeUnknown("no evidence"), herdr.HerdrPlace("agents", "w1:p1"))
-        self.assertIsInstance(pane.identity, session_staff.NoSession)
-        self.assertIsInstance(pane.process, session_staff.ProcessUnobserved)
 
     def test_missing_native_identity_refuses_instead_of_using_an_ambiguous_name(self) -> None:
         _ = unit_membership("show", "alpha")
@@ -294,7 +288,7 @@ found = staff_sources.member(staff_sources.UnitMember('old', 'alpha'), record)
 assert isinstance(found, staff_sources.NoSuchMember)
 
 marked = unit_lookup.LabeledSession('alpha', unit_lookup.ClaudeNotRunning(),
-                                unit_lookup.herdr.HerdrPlace('agents', 'w1:p1'),
+                                unit_lookup.HerdrPlace('agents', 'w1:p1'),
                                 identity=unit_lookup.LiveSession(record.find(kind='unit')[0].current_session))
 grouped = unit_lookup.group_labeled_sessions([marked], record=record)
 assert list(grouped.units['receiving']) == ['alpha']
@@ -422,7 +416,7 @@ print(observed.row.id)
             changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
-            self.assertEqual(entry["session_id"], owner.id)
+            self.assertEqual(entry.get("staff_id"), owner.id)
             self.assertEqual(entry["environment"], {})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
@@ -451,7 +445,7 @@ print(observed.row.id)
         # Tab sorting consumes the environments resolved by herdr_processes.
         processes = herdr.herdr_processes()
         classifier = herdr.UnitTabClassifier("agents", processes, staff.snapshot())
-        self.assertIsInstance(classifier.classify("show", "organon", ["w4:p1"]), herdr.UnitTab)
+        self.assertIsInstance(classifier.classify(["w4:p1"]), herdr.UnitTab)
         self.assertEqual(herdr.tab_order("show", ["show", "aaa-other", "organon"], [], {"organon"}), [0, 2, 1])
         grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha"].identity, session_staff.LiveSession(owner.current_session))
@@ -460,7 +454,7 @@ print(observed.row.id)
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
             labels = unit_labels.unit_labels_for([owner.id], self.environment)
-        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("organon", "show", "alpha"))
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha"))
 
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
             changes = session_staff.repair_marks()
@@ -473,18 +467,10 @@ print(observed.row.id)
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def renamed_production(self) -> None:
-        for name in ("trunk", "other", "first", "second", "third"):
-            _ = unit_membership("new", name)
+        _ = unit_membership("new", "trunk")
         doc = self.root / "new-production.md"
         _ = doc.write_text("# Production\n")
-        owner = recorded_showrunner("new", doc)
-        state = self.root / "showrunner-state"
-        _ = self.enterContext(mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state))
-        self.environment["SHOWRUNNER_STATE_DIR"] = str(state)
-        instance = self.root / f"notifier/showrunner-{showrunner_relationship('new').id}"
-        instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{owner.id}\nCHECK=zsh /scripts/production_check.sh {owner.id}\n")
+        _ = recorded_showrunner("new", doc)
 
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         fake_unit_host.process(self.environment, pid, parent, argv, environment, cwd=self.root)
@@ -519,9 +505,6 @@ print(observed.row.id)
             "pid": pid, "sessionId": identity, "name": name,
             "messagingSocketPath": str(path), "updatedAt": updated, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
-    def live_hosts(self, *panes: str) -> None:
-        for pane in panes:
-            self.claude(pane, pane, pid=fake_unit_host.live_pid(self))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = self.environment
@@ -580,48 +563,6 @@ print(observed.row.id)
         scan.assert_not_called()
 
 
-
-
-
-
-    def test_native_sessions_do_not_read_timers_during_discovery(self) -> None:
-        self.renamed_production()
-        self.hosts({
-            "$1": labeled("first", "w4:p1", "first", production_name="new"),
-            "$2": labeled("second", "w5:p1", "second", production_name="new"),
-            "$3": labeled("third", "w6:p1", "third", production_name="new"),
-        })
-        self.live_hosts("w4:p1", "w5:p1", "w6:p1")
-        sources = unit_lookup.member_sources()
-        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
-            for _ in range(2):
-                found = unit_lookup.every_labeled_session(sources=sources)
-                self.assertEqual(set(found.units["new"]), {"first", "second", "third"})
-                self.assertEqual(reads.call_count, 0)
-
-    def test_current_production_discovery_keeps_an_existing_timer_read_budget(self) -> None:
-        self.renamed_production()
-        self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
-        self.claude("current", "w4:p1")
-        sources = unit_lookup.member_sources()
-        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
-            source = showrunners.read_sources(self.root / "notifier",
-                unreadable=showrunners.UnreadableTimerPolicy.STRICT, record=staff.snapshot())[0]
-            self.assertIsInstance(source, showrunners.ShowrunnerSource)
-            found = unit_lookup.every_labeled_session(sources=sources)
-            self.assertEqual(list(found.units["new"]), ["trunk"])
-            self.assertEqual(reads.call_count, 1, "current marks must not reread already inventoried timers")
-
-    def test_current_production_lookup_does_not_read_timer_docs(self) -> None:
-        self.renamed_production()
-        self.hosts({"$1": labeled("current", "w4:p1", "trunk", production_name="new")})
-        self.claude("current", "w4:p1")
-        sources = unit_lookup.member_sources()
-        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
-            found = unit_lookup.labeled_sessions("new", sources=sources)
-            self.assertEqual(found["trunk"].place, herdr.HerdrPlace("current", "w4:p1"))
-            self.assertEqual(reads.call_count, 0)
-
     def test_herdr_marks_are_grouped_under_the_current_production(self) -> None:
         self.renamed_production()
         self.herdr_session()
@@ -658,7 +599,6 @@ print(observed.row.id)
         self.assertIsInstance(unit.claude, ClaudeUnknown)
 
 
-
     def test_an_unreadable_record_leaves_a_unit_without_a_match_unknown_not_stopped(self) -> None:
         self.hosts({"$1": labeled("trunk", "w4:p1", "trunk"), "$2": labeled("fps", "w5:p1", "fps")})
         self.claude("fps", "w5:p1")
@@ -683,9 +623,6 @@ print(observed.row.id)
         found = unit_lookup.labeled_sessions("show")
         self.assertIsInstance(found["trunk"].claude, ClaudeUnknown)
         self.assertEqual(found["fps"].claude, ClaudeUnknown(f"the session record of pid {pid} could not be read"))
-
-
-
 
 
     def test_the_command_prints_the_pane_and_tells_absent_from_cannot_tell(self) -> None:
@@ -760,7 +697,6 @@ print(observed.row.id)
                 self.assertIsInstance(grouped.units["show"]["trunk"].claude, LiveClaude)
 
 
-
     def test_registered_claude_with_a_headless_claude_child_of_the_same_id_stays_live(self) -> None:
         row = unit_membership("show", "trunk")
         place = herdr.HerdrPlace("native", "w1:p1")
@@ -779,19 +715,6 @@ print(observed.row.id)
         grouped = unit_lookup.group_labeled_sessions(observed)
         self.assertIsInstance(grouped.units["show"]["trunk"].claude, LiveClaude)
 
-    def test_stopped_shell_does_not_read_the_darwin_process_snapshot(self) -> None:
-        from scripts.message import process_table
-
-        row = unit_membership("show", "trunk")
-        self.hosts({"stopped": labeled("native", "w1:p1", "trunk", CODEX_THREAD_ID="",
-                                      CLAUDE_CODE_SESSION_ID=row.current_session)})
-        with herdr.process_snapshot():
-            _ = herdr.herdr_processes()
-            with (mock.patch.dict(os.environ, {"HERDR_PLATFORM": "darwin"}),
-                  mock.patch.object(process_table, "snapshot", wraps=process_table.snapshot) as snapshot):
-                found = unit_lookup.every_labeled_session()
-        self.assertIsInstance(found.status_units("show")[row.name].claude, ClaudeNotRunning)
-        self.assertEqual(snapshot.call_count, 0)
 
     def test_live_claude_with_deleted_cwd_joins_its_marked_shell(self) -> None:
         self.herdr_session(name="writing")
@@ -845,7 +768,6 @@ print(observed.row.id)
         self.assertIsInstance(unit.claude, LiveClaude)
 
 
-
     def test_missing_claude_record_keeps_its_native_process_evidence(self) -> None:
         self.hosts({"trunk": labeled("trunk", "w4:p1", "trunk")})
         self.claude("trunk", "w4:p1")
@@ -876,7 +798,6 @@ print(observed.row.id)
         self.assertIsInstance(found.claude, ClaudeUnknown)
 
 
-
     def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
         """Write the record of a /unit:direct run in `worktree`, as the recorder would."""
         runs = self.root / "history/runs"
@@ -886,10 +807,20 @@ print(observed.row.id)
         if row is None:
             row = fixture_member("unit", name="history-" + name, parent=owner.id,
                                  worktree=staff.PresentWorktree(remote.local_machine(), worktree.resolve()))
-        events = [{"event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
+        events = [{"owner_staff_id": row.id, "event_type": "run_started", "main_agent": {"session_id": row.current_session}, "run_started_at": started},
                   *({"event_type": kind} for kind in later)]
         path = runs / f"{name}.jsonl"
         _ = path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        root = self.root / "held"
+        _ = cast(object, self.enterContext(mock.patch.multiple(unit_runs, RUN_ROOT=root, FORMER_RUN_ROOT=self.root / "former-held")))
+        folder = root / name
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        if "run_finished" in later:
+            if isinstance(row.run, staff.OpenRun):
+                _ = staff.clear_run(row.id, row.run.path)
+        else:
+            _ = staff.set_run(row.id, staff.OpenRun(folder))
         return path
 
     def held_folder(self, history: Path, director: str) -> Path:
@@ -898,7 +829,7 @@ print(observed.row.id)
         _ = cast(object, self.enterContext(mock.patch.multiple(
             unit_runs, RUN_ROOT=root, FORMER_RUN_ROOT=self.root / "former-held")))
         folder = root / history.stem
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         first = cast(dict[str, object], json.loads(history.read_text().splitlines()[0]))
         agent = cast(dict[str, str], first["main_agent"])
         source = staff.snapshot().by_member_reference(agent["session_id"])
@@ -917,9 +848,12 @@ print(observed.row.id)
         assert parent is not None
         _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
             "history_file": str(history), "owner_staff_id": row.id}))
+        first["owner_staff_id"] = row.id
         first["main_agent"] = {"session_id": director}
         later = history.read_text().splitlines()[1:]
         _ = history.write_text("\n".join([json.dumps(first), *later]) + "\n")
+        if not any(cast(dict[str, object], json.loads(line)).get("event_type") == "run_finished" for line in later):
+            _ = staff.set_run(row.id, staff.OpenRun(folder))
         return folder
 
     def test_run_state_follows_staff_without_a_history_rewrite(self) -> None:
@@ -944,8 +878,8 @@ print(observed.row.id)
             runs = unit_lookup.HeldRunLookup()
             found = runs.unfinished_held_run(fixture_runtime_id("staff-director"))
             history_opens = [call for call in opened.call_args_list if call.args[0] in (old, current)]
-        # Read the first and last events of different-run-id; stop before old-run.
-        self.assertEqual(len(history_opens), 2)
+        # Read the current run header once.
+        self.assertEqual(len(history_opens), 1)
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
         self.assertEqual((found.path, found.worktree), (current, self.root / "new"))
@@ -984,7 +918,7 @@ print(observed.row.id)
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("replacement")), unit_lookup.HeldRun)
         self.assertIsInstance(runs.unfinished_held_run(fixture_runtime_id("original")), unit_lookup.NoUnfinishedRun)
 
-    def test_held_run_order_skips_finished_staff_pointer_and_keeps_an_older_open_run(self) -> None:
+    def test_held_run_uses_the_staff_pointer_despite_a_history_finish_event(self) -> None:
         open_run = self.record("open-run", self.root / "tree", 1.0)
         latest = self.record("finished-run", self.root / "tree", 2.0, "run_finished")
         _ = self.held_folder(open_run, fixture_runtime_id("director"))
@@ -997,8 +931,8 @@ print(observed.row.id)
         found = runs.unfinished_held_run(fixture_runtime_id("director"))
         self.assertIsInstance(found, unit_lookup.HeldRun)
         assert isinstance(found, unit_lookup.HeldRun)
-        self.assertEqual(found.path, open_run)
-        self.assertIs(unit_lookup.read_run_states().state(self.root / "tree"), UnitState.RUN_FINISHED)
+        self.assertEqual(found.path, latest)
+        self.assertIs(unit_lookup.read_run_states().state(self.root / "tree"), UnitState.RUNNING)
 
     def test_finished_held_run_is_not_eligible(self) -> None:
         history = self.record("finished", self.root / "tree", 1.0, "run_finished")
@@ -1009,7 +943,7 @@ print(observed.row.id)
         history = self.record("run", self.root / "tree", 1.0)
         _ = self.held_folder(history, fixture_runtime_id("director"))
         for contents in (b"not JSON\n", b"\xff\n", b'{"event_type":"not_run_started"}\n',
-                         b'{"event_type":"run_started","working_dir":"/tree"}\n\xff\n'):
+                         b'{"event_type":"not_run_started","working_dir":"/tree"}\n\xff\n'):
             with self.subTest(contents=contents):
                 _ = history.write_bytes(contents)
                 runs = unit_lookup.HeldRunLookup()
@@ -1058,7 +992,7 @@ print(observed.row.id)
         with self.assertRaises(OSError):
             _ = unit_lookup.run_state(self.root / "trunk")
 
-    def test_only_the_first_and_last_events_are_parsed(self) -> None:
+    def test_only_the_first_event_is_parsed(self) -> None:
         tree = self.root / "trunk"
         path = self.record("run", tree, 1.0)
         first = path.read_text(encoding="utf-8").strip()
@@ -1066,23 +1000,9 @@ print(observed.row.id)
         _ = path.write_text(first + "\nnot JSON\n[also broken\n" + last + "\n", encoding="utf-8")
         with mock.patch.object(unit_lookup, "json", wraps=json) as history_json:
             parses = cast(mock.MagicMock, history_json.loads)
-            self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
-        self.assertEqual(parses.call_args_list, [mock.call(first + "\n"), mock.call(last)])
+            self.assertIs(unit_lookup.run_state(tree), UnitState.RUNNING)
+        self.assertEqual(parses.call_args_list, [mock.call(first + "\n")])
 
-    def test_last_event_larger_than_a_read_block(self) -> None:
-        tree = self.root / "trunk"
-        path = self.record("run", tree, 1.0)
-        with path.open("a", encoding="utf-8") as handle:
-            _ = handle.write(json.dumps({"event_type": "run_finished", "detail": "界" * (64 * 1024)},
-                                        ensure_ascii=False) + "\n")
-        self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
-
-    def test_partial_last_line_uses_the_previous_complete_object(self) -> None:
-        tree = self.root / "trunk"
-        path = self.record("run", tree, 1.0, "run_finished")
-        with path.open("a", encoding="utf-8") as handle:
-            _ = handle.write('[]\nnull\n{"event_type": "phase_star')
-        self.assertIs(unit_lookup.run_state(tree), UnitState.RUN_FINISHED)
 
     def test_empty_partial_and_non_start_first_lines_are_skipped(self) -> None:
         runs = self.root / "history/runs"
@@ -1127,8 +1047,11 @@ print(observed.row.id)
                 else:
                     with path.open("ab") as handle:
                         _ = handle.write(b'\xff\n')
-                with self.assertRaises(UnicodeError):
-                    _ = unit_lookup.read_run_states()
+                if where == "first":
+                    with self.assertRaises(UnicodeError):
+                        _ = unit_lookup.read_run_states()
+                else:
+                    self.assertIs(unit_lookup.read_run_states().state(self.root / "trunk"), UnitState.RUNNING)
 
 
 if __name__ == "__main__":

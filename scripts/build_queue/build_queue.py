@@ -19,7 +19,6 @@ import time
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
 from scripts.build_queue.queue_lines import json_form
-from scripts.build_queue.queue_evidence import step_labels
 from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
 from scripts.build_queue.queue_lines import Span
 from scripts.buildlog.mac_idle_alert import alert_line, state_dir
@@ -71,7 +70,8 @@ def bump(selector: str, actor: str) -> int:
         print(f"build queue: no waiting step matches {selector}")
         return 3
     selected_place = matches[0]
-    unit = step_labels(reading.view.waiting[selected_place - 1], labels).unit
+    step = reading.view.waiting[selected_place - 1]
+    unit = memory_admit.queue_unit(step.unit, step.session_id, labels)
     if unit == unit_labels.UnitLabels("").unit or not unit:
         print(f"build queue: waiting step #{selected_place} has no unit")
         return 3
@@ -81,9 +81,13 @@ def bump(selector: str, actor: str) -> int:
         return 3
     reading = memory_admit.queue_read()
     first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
-                  if step_labels(step, labels).unit == unit), NoWaitingStep())
+                  if memory_admit.queue_unit(step.unit, step.session_id, labels) == unit), NoWaitingStep())
     detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
-    print(f"queue priority set for {unit} (step #{selected_place}): {detail}")
+    priority = reading.explanation.priority
+    units = ([entry["unit"] for entry in priority.entries]
+             if isinstance(priority, admission_records.QueuePriority) else [])
+    place = f"; priority #{units.index(unit) + 1}" if unit in units else ""
+    print(f"queue priority set for {unit} (step #{selected_place}): {detail}{place}")
     return 0
 
 
@@ -109,14 +113,18 @@ def main() -> int:
             actor = admission_records.queue_command_actor()
             if sys.argv[1] == "bump" and len(sys.argv) == 3:
                 return bump(sys.argv[2], actor)
-            elif sys.argv[1] == "clear" and len(sys.argv) == 2:
-                result = admission_client.priority_clear(actor)
+            elif sys.argv[1] == "clear" and len(sys.argv) in (2, 3):
+                result = (admission_client.priority_clear(actor, sys.argv[2]) if len(sys.argv) == 3
+                          else admission_client.priority_clear(actor))
             elif sys.argv[1] == "admit-head" and len(sys.argv) > 2:
                 result = admission_client.admit_head(" ".join(sys.argv[2:]), actor)
             else:
-                print("build queue: use bump <position|session|folder>, clear, or admit-head <why>", file=sys.stderr)
+                print("build queue: use bump <position|session|folder>, clear [unit], or admit-head <why>", file=sys.stderr)
                 return 3
             if isinstance(result, admission_protocol.Refused):
+                if command == "clear" and len(sys.argv) == 3:
+                    print(f"build queue: {result.reason}")
+                    return 3
                 print(f"build queue: {result.reason}", file=sys.stderr)
                 return 2
             if command == "clear":

@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 from scripts.production import staff
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import transcripts, unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
@@ -41,17 +41,6 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # section inside one. A real phase heading always names a title after an
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
-DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
-PHASE_REFERENCE_PATTERN = re.compile(
-    r"\b(?i:Phase)[ \t]+(?P<single>\d+[a-z]?(?!\w|[-:./]\w))"
-    + r"|\b(?i:Phases)[ \t]+(?P<list>\d+[a-z]?(?!\w|[-:./]\w)"
-    + r"(?:[ \t]*(?:,[ \t]*(?:(?i:and)[ \t]+)?|(?i:and)[ \t]+|&[ \t]*)"
-    + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
-)
-UNIT_PHASE_PREFIX = re.compile(
-    r"(?:^|[;,&][ \t]*|\b(?i:and)[ \t]+)(?P<quote>`|'|\"|\*\*)?(?P<unit>(?!(?i:and)(?![\w-]))[\w-]+)"
-    + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
-)
 
 
 class PlanPhase(TypedDict):
@@ -60,8 +49,6 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
-    # The phases its `**Depends on:**` line names; None when the line is absent.
-    depends_on: list[str] | None
 
 
 class EtaBand(NamedTuple):
@@ -98,18 +85,13 @@ def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None =
     return resolver.member_by_folder(remote.local_machine(), plan_path.expanduser().resolve().parent)
 
 
-def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> tuple[list[PlanPhase], list[str]]:
+def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
     text = plan_path.read_text(encoding="utf-8")
-    try:
-        member = plan_member(plan_path, resolver=resolver)
-    except (OSError, ValueError) as error:
-        print(f"plan_history: {plan_path}: {error}", file=sys.stderr)
-        member = session_staff.NoSuchMember(session_staff.FolderMember(remote.local_machine(), plan_path.parent))
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
     headings = list(PHASE_HEADING_PATTERN.finditer(text))
-    for position, match in enumerate(headings):
+    for match in headings:
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -130,38 +112,19 @@ def plan_phase_details(plan_path: Path, *, resolver: session_staff.RowResolver |
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
-        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
-        body = text[match.end() : end]
-        depends_match = DEPENDS_ON_PATTERN.search(body)
-        depends_on: list[str] | None = None
-        if depends_match is not None:
-            depends_on = []
-            dependency_text = depends_match.group("list")
-            for reference in PHASE_REFERENCE_PATTERN.finditer(dependency_text):
-                # A unit name qualifies only the phase span that follows it.
-                qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
-                if qualifier is not None and (
-                    isinstance(member, session_staff.NoSuchMember) or qualifier.group("unit") != member.row.name
-                ):
-                    continue
-                phase_ids = reference.group("single") or reference.group("list")
-                for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
-                    if dependency.lower() != "and" and dependency not in depends_on:
-                        depends_on.append(dependency)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
-                depends_on=depends_on,
             )
         )
     return phases, duplicates
 
 
-def plan_phases(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> list[PlanPhase]:
+def plan_phases(plan_path: Path) -> list[PlanPhase]:
     """Return the plan's unique phase headings in document order."""
-    phases, _ = plan_phase_details(plan_path, resolver=resolver)
+    phases, _ = plan_phase_details(plan_path)
     return phases
 
 
@@ -187,9 +150,26 @@ def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _director_family(row: staff.StaffRow) -> str:
+    """Read the current director's native transcript evidence."""
+    from scripts.message import sessions
+    from scripts.whoami import agent_accounts
+
+    homes = set(agent_accounts.codex_homes(Path.home() / ".codex"))
+    if isinstance(row.home, staff.SessionHome):
+        homes.add(row.home.path)
+    if configured := os.environ.get("CODEX_HOME"):
+        homes.add(Path(configured).expanduser())
+    for home in homes:
+        for folder in ("sessions", "archived_sessions"):
+            if transcripts.transcript_paths(home / folder, f"**/*{row.current_session}.jsonl"):
+                return "codex"
+    return "claude" if sessions.transcript_locations(row.current_session) else "unknown"
+
+
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
-    """Resolve the director's current folder without changing its stored record."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
+    """Resolve current state through staff and preserve recorded events."""
+    if fields.get("event_type"):
         return fields
     row = unit_runs.run_owner(fields, record)
     if isinstance(row, unit_runs.RunOwnerUnrecorded):
@@ -204,7 +184,7 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
             del fields[key]
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
-        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
+        if not fields.get("event_type"):
             branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
                                     capture_output=True, text=True, check=False)
             fields["branch"] = branch.stdout.strip()
@@ -212,6 +192,26 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
                 commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
                                         capture_output=True, text=True, check=False)
                 fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
+    if not fields.get("event_type"):
+        main = fields.get("main_agent")
+        identity = dict(cast(dict[str, object], main)) if isinstance(main, dict) else {}
+        identity.update(session_id=row.current_session, family=_director_family(row))
+        fields["main_agent"] = identity
+        passes = fields.get("pass")
+        if isinstance(passes, dict):
+            for value in cast(dict[str, object], passes).values():
+                if not isinstance(value, dict):
+                    continue
+                passed = cast(dict[str, object], value)
+                worker = record.by_id(staff.StaffId(_text(passed.get("worker_id"))))
+                if worker is None or worker.kind != "worker" or worker.parent != staff.ReportsTo(row.id):
+                    continue
+                passed["worker_name"] = worker.name
+                called = passed.get("called_agent")
+                agent = dict(cast(dict[str, object], called)) if isinstance(called, dict) else {}
+                backend = record.backends.get(worker.id)
+                agent.update(session_id=worker.current_session, family=backend.family if backend is not None else "unknown")
+                passed["called_agent"] = agent
     return fields
 
 
@@ -225,13 +225,13 @@ def plan_runs(plan_path: Path, *,
         return []
     starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
     if record is None:
-        record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+        record = (staff.snapshot() if any(event.get(unit_runs.OWNER_FIELD) or event.get("main_agent") or event.get("owner_session") for _, event in starts)
                   else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
     for path, event in starts:
-        event = staff_directory(event, record)
-        working_dir = event.get("working_dir")
-        plan_doc = event.get("plan_doc")
+        current = staff_directory({key: value for key, value in event.items() if key != "event_type"}, record)
+        working_dir = current.get("working_dir")
+        plan_doc = current.get("plan_doc")
         if not isinstance(working_dir, str) or not isinstance(plan_doc, str):
             continue
         if not working_dir or not plan_doc:

@@ -147,6 +147,9 @@ def _perform(part: Part) -> int:
         with stop_resume.detached_moves():
             for line in refusal_watch.run(recover_units=False, refresh_usage=refresh_refusal_usage):
                 print(line)
+        from scripts.herdr import turn_end
+        for line in turn_end.report_quota_refusals():
+            print(line)
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):

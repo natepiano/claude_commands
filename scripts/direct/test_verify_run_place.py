@@ -31,6 +31,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
         direct.mkdir(parents=True)
+        (direct / "file_lock.sh").symlink_to(VERIFY.with_name("file_lock.sh"))
         (direct / "step_record.py").symlink_to(VERIFY.with_name("step_record.py"))
         for directory in ("agents", "build_targets", "build_hold"):
             (scripts / directory).symlink_to(VERIFY.parent.parent / directory, target_is_directory=True)
@@ -38,6 +39,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         library.mkdir()
         (library / "py").symlink_to(sys.executable)
         (library / "package_root.py").symlink_to(VERIFY.parent.parent / "lib/package_root.py")
+        (library / "conf_record.sh").symlink_to(VERIFY.parent.parent / "lib/conf_record.sh")
         (library / "build_folders.py").symlink_to(VERIFY.parent.parent / "lib/build_folders.py")
         lint = scripts / "lint"
         lint.mkdir()

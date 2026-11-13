@@ -15,8 +15,8 @@ from unittest import mock
 
 import sys
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state, mac_test
-from scripts.build_hold.build_hold import NoOwningSession, OwningSession
 from scripts.lib import process_start as identity
 from scripts.build_queue import placement, admission_protocol as wire
 from scripts.build_queue.test_placement import (

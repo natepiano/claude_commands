@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.lib import names
 from scripts.lib.test_names import NAMES_TOML
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, review, read_production
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -429,51 +429,61 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(line, "relay: to the showrunner of kid, for requesting role (display name unavailable)")
 
     def test_answer_waits_for_the_lists_lock(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
-                                        "asked_by": self.fixture_staff_id("alpha")})
-        lock = self.outstanding().with_suffix(".lock")
-        holder = subprocess.Popen([sys.executable, "-c", (
-            "import fcntl, sys\n"
-            f"handle = open({str(lock)!r}, 'a')\n"
-            "fcntl.flock(handle, fcntl.LOCK_EX)\n"
-            "print('held', flush=True)\n"
-            "sys.stdin.read(1)\n")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        stdin = cast(io.TextIOWrapper, holder.stdin)
-        stdout = cast(io.TextIOWrapper, holder.stdout)
+        for unrelated in (False, True):
+            with self.subTest(unrelated=unrelated):
+                self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
+                                                "asked_by": self.fixture_staff_id("alpha")})
+                records = Path(self.env["HERDR_PANE_RECORD_DIR"])
+                publication_lock = records / ".publication.lock"
+                if unrelated:
+                    records.mkdir(parents=True, exist_ok=True)
+                    _ = (records / "agents.json").write_text("{}")
+                lock = self.outstanding().with_suffix(".lock")
+                holder = subprocess.Popen([sys.executable, "-c", (
+                    "import fcntl, sys\n"
+                    f"handle = open({str(lock)!r}, 'a')\n"
+                    "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+                    "print('held', flush=True)\n"
+                    "sys.stdin.read(1)\n")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                stdin = cast(io.TextIOWrapper, holder.stdin)
+                stdout = cast(io.TextIOWrapper, holder.stdout)
 
-        def cleanup() -> None:
-            stdin.close()
-            _ = holder.wait(timeout=TEST_HANG_GUARD_SECS)
-            stdout.close()
+                self.addCleanup(stdout.close)
+                self.addCleanup(holder.wait, timeout=TEST_HANG_GUARD_SECS)
+                self.addCleanup(stdin.close)
+                self.assertEqual(stdout.readline().strip(), "held")
+                real_flock = fcntl.flock
+                contended: list[Path] = []
+                passed: list[Path] = []
 
-        self.addCleanup(cleanup)
-        self.assertEqual(stdout.readline().strip(), "held")
-        real_flock = fcntl.flock
-        contended: list[Path] = []
+                def acquire(handle: io.TextIOWrapper | int, operation: int) -> None:
+                    identity = os.fstat(handle if isinstance(handle, int) else handle.fileno())
+                    if operation == fcntl.LOCK_EX and os.path.samestat(identity, lock.stat()):
+                        if unrelated:
+                            self.assertIn(publication_lock, passed)
+                        # Prove that the other process holds the selected lock.
+                        with self.assertRaises(BlockingIOError):
+                            real_flock(handle, operation | fcntl.LOCK_NB)
+                        contended.append(lock)
+                        _ = stdin.write("x")
+                        stdin.flush()
+                    real_flock(handle, operation)
+                    if (operation == fcntl.LOCK_EX and publication_lock.exists()
+                            and os.path.samestat(identity, publication_lock.stat())):
+                        passed.append(publication_lock)
 
-        def acquire(handle: io.TextIOWrapper, operation: int) -> None:
-            if operation == fcntl.LOCK_EX:
-                # Prove the other process owns this exact lock at acquisition.
-                # Releasing via stdin is the event that lets answer proceed.
-                with self.assertRaises(BlockingIOError):
-                    real_flock(handle, operation | fcntl.LOCK_NB)
-                contended.append(Path(handle.name))
-                _ = stdin.write("x")
-                stdin.flush()
-            real_flock(handle, operation)
-
-        with mock.patch.object(fcntl, "flock", acquire):
-            answered = self.run_command("answer", "--item", "retry?")
-        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
-        self.assertEqual(contended, [lock], "answer must acquire the held list lock before changing it")
+                with mock.patch.object(fcntl, "flock", acquire):
+                    answered = self.run_command("answer", "--item", "retry?")
+                self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+                self.assertEqual(contended, [lock], "answer must acquire the held list lock before changing it")
 
     def test_the_reader_refuses_an_asker_without_a_question(self) -> None:
         self.timer("example")
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout",
                                         "question": "Keep this layout?", "asked_by": "alpha"})
         _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": self.fixture_staff_id("alpha")}]))
-        with self.assertRaisesRegex(dailies_render.InputError, "question required"):
-            _ = dailies_render.read_outstanding(self.outstanding())
+        with self.assertRaisesRegex(registration.InputError, "question required"):
+            _ = registration.read_open_items(self.outstanding())
 
 
 if __name__ == "__main__":

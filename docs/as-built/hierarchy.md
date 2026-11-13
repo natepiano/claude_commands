@@ -11,11 +11,17 @@ The hierarchy connects the user's product choices to work in separate repository
 | Role | Responsibility | Contract |
 | --- | --- | --- |
 | User, the executive producer | Decides product direction, scope changes, and irreversible actions. | [Decision criteria](../decision_criteria.md) |
-| Producer | Divides approved work into productions and unit plans. | `commands/producer/greenlight.md`, `commands/producer/to_production.md` |
+| Producer | Runs its own named job through shared producer management. | `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md` |
 | Showrunner | Coordinates units, resolves dependencies, integrates checkpoints, and presents user decisions. | `commands/showrunner/produce.md` |
 | Unit director | Defines assignments, dispatches workers, checks results, and prepares checkpoints. | `commands/unit/direct.md` |
 | Worker | Changes or inspects its assigned files through a native Claude or Codex conversation. | [Worker lifecycle](long-lived-workers.md) |
 | Held designer or reviewer | Serves one design through a fixed staff identity and an explicit binding. | `scripts/astra/design_roles.py` |
+
+Morty, brain, and dwight have staff kind `producer` and no parent.
+They remain individual operators; their shared kind defines management.
+Dwight's role is strategist.
+`commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
+The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 
 Top-level showrunners are peers. A child showrunner retains its own production, units, and integration branch.
 Its staff parent identifies the receiving showrunner. The user can speak directly to either showrunner.
@@ -82,7 +88,8 @@ A shared read through `worker_lifecycle.locked_state` creates no missing state f
 `HookCompletion` records completed actions so an interrupted handler can continue.
 An already finished hook event changes no dispatch.
 A missing final transcript record does not erase a matching DONE reply supported by the dispatch prompt.
-A live detached command prevents completion. A pending command result or friend reply keeps the assignment active.
+A live detached command prevents completion.
+A pending command result keeps the assignment active.
 
 Normal DONE closure retains the staff row and native conversation.
 The next assignment resumes that conversation in a new pane.
@@ -116,7 +123,7 @@ Results return to the worker or its current holder. Callers do not poll.
 | User question | `scripts/production/update_registration.py` records the question and its asker. |
 | Changes for user review | `scripts/production/change_review.py` supplies the shared scoped queue. |
 | Phone message | `send.py --to user` uses the notification review and delivery path. |
-| Requested production report | `dailies_input.py` and `dailies_render.py` assemble current production evidence. |
+| Unit status | `/showrunner:units` shows phases, ETAs, worker runs, and queued work through `scripts/production/unit_phases.py`. |
 
 A bare worker name resolves within the sender's own unit.
 A match only in another unit refuses delivery and lists the available full paths.

@@ -385,7 +385,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
         _ = index.update()
         with closing(index.read_only()) as connection:
-            self.assertEqual(report.mac_section(connection, local_day(STAMP)) + ["Mac copies: none started.", ""], mac)
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
             nextest_runs = cast(int, connection.execute(
                 "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
                 + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
@@ -420,8 +421,9 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         self.assertEqual(
             self.section_lines(text, "### Mac"),
-            ["### Mac", "", "No steps recorded on the Mac.", "", "Mac copies: none started.", ""],
+            ["### Mac", "", "No steps recorded on the Mac.", ""],
         )
+        self.assertEqual(self.section_lines(text, "### AWS")[-2:], ["Mac copies: none started.", ""])
         self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
@@ -1731,7 +1733,13 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         lines = text.splitlines()
         mac = self.section_lines(text, "### Mac")
-        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### Mac copies")
+        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### AWS")
+        aws = self.section_lines(text, "### AWS")
+        self.assertEqual(aws.count('No spend days.'), 1)
+        self.assertNotIn('| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Storage | Other | Gate runs | Source |', aws)
+        self.assertNotIn('AWS: up ', '\n'.join(aws))
+        self.assertFalse(any(line.startswith('**') for line in aws))
+        self.assertEqual(lines[lines.index("### AWS") + len(aws)], "### Mac copies")
         section = self.section_lines(text, "### Mac copies")
         self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"
                          + " | Mac time on copies that did not win |")
@@ -3029,6 +3037,17 @@ class ReportTests(unittest.TestCase):
         disk.write_snapshot(expanded)
         self.assertEqual(report.disk_section(), old_lines)
         self.assertIn("| /tmp | 1.0 GiB |", old_lines)
+        for capacity_at in (base["measured_at"], "2026-10-04T16:24:00+00:00"):
+            with self.subTest(capacity_measured_at=capacity_at):
+                disk.write_snapshot({**expanded, "capacity_measured_at": capacity_at})
+                with mock.patch.object(sync, "sync_time", side_effect=[base["measured_at"], capacity_at]):
+                    lines = report.disk_section()
+                if capacity_at == base["measured_at"]:
+                    expected = f"Measured by the buildlog disk job at {base['measured_at']}"
+                else:
+                    expected = (f"Folder sizes measured by the buildlog disk job at {base['measured_at']}; "
+                                f"free and used space at {capacity_at}")
+                self.assertIn(f"{expected}: allocated blocks, each hard-linked file once.", lines)
 
     def test_no_disk_section_without_snapshot(self) -> None:
         with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=None):

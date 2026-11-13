@@ -13,13 +13,13 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member
-from scripts.agents import pane_record, restart_support, shutdown, stop_resume, remote
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member, fixture_session
+from scripts.agents import restart_support, shutdown, stop_resume, remote
 from scripts.agents.stop_resume import stop as stop_session
 from scripts.agents.stop_results import ClaudeStartState, StopResult
 
@@ -30,6 +30,7 @@ class PauseExitTests(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.child, self.stop_workers, self.stop_director, self.start, self.send
+        fixture_session(self.unit.current_session, staff.ClaudeBackend())
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=str(self.owner.current_session)))
         _ = self.enterContext(mock.patch.object(stop_resume, "_pane_environment", return_value=([], {})))
         def tab(session: str) -> herdr.TabSession | stop_resume.SessionNotFound:
@@ -51,7 +52,8 @@ class PauseExitTests(StaffTestCase):
 
     @cached_property
     def unit(self) -> staff.StaffRow:
-        return fixture_member("unit", name="TEST-unit", parent=self.owner.id)
+        return fixture_member("unit", name="TEST-unit", parent=self.owner.id,
+                              worktree=staff.PresentWorktree(remote.local_machine(), self.root))
 
     @cached_property
     def child(self) -> staff.StaffRow:
@@ -159,7 +161,7 @@ class PauseExitTests(StaffTestCase):
         self.save_exit()
         exited = self.current()
         tab = herdr.TabSession("w1:p1", self.unit.name, "w1", str(self.unit.current_session))
-        entry: pane_record.PaneLaunch = {
+        entry: pane_launch.CurrentLaunch = {
             "kind": "claude", "pane_id": "w1:p1", "session_id": str(self.unit.id),
             "config_dir": str(self.root / ".claude2"), "cwd": str(self.root),
             "name": self.unit.name, "model": "sonnet", "remote_control": False,
@@ -362,7 +364,7 @@ class PauseExitTests(StaffTestCase):
             self.assertNotIn("STAFF_OPERATION_FD", environment)
             self.assertNotIn("exited", self.current().to_json())
             raise SystemExit
-        entry: pane_record.PaneLaunch = {
+        entry: pane_launch.CurrentLaunch = {
             "kind": "claude", "pane_id": "w1:p1", "session_id": str(self.unit.id),
             "config_dir": str(self.root / ".claude2"), "cwd": str(self.root),
             "name": self.unit.name, "model": "sonnet", "remote_control": False,
@@ -375,7 +377,7 @@ class PauseExitTests(StaffTestCase):
     def test_a_failed_exec_preserves_the_exit_record(self) -> None:
         self.save_exit()
         tab = herdr.TabSession("w1:p1", self.unit.name, "w1", str(self.unit.current_session))
-        entry: pane_record.PaneLaunch = {
+        entry: pane_launch.CurrentLaunch = {
             "kind": "claude", "pane_id": "w1:p1", "session_id": str(self.unit.id),
             "config_dir": str(self.root / ".claude2"), "cwd": str(self.root),
             "name": self.unit.name, "model": "sonnet", "remote_control": False,

@@ -45,7 +45,7 @@ case "${1:-}" in
   *) echo "push_direct.sh: unknown argument: $1" >&2; exit 64 ;;
 esac
 
-if [ "$FOLLOW_PUBLISHED" = false ]; then
+publish_branch() {
   if [ -n "${CI_VALIDATED_BASE:-}" ]; then
     git fetch --no-tags origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
     REMOTE_TIP="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
@@ -76,12 +76,35 @@ if [ "$FOLLOW_PUBLISHED" = false ]; then
       exit "$PUSH_STATUS"
     fi
   fi
+  if [ "$PUSHED" = true ]; then
+    printf '%s pushed\n' "$SHA"
+  else
+    printf '%s contained\n' "$SHA"
+  fi
+}
+
+if [ "$FOLLOW_PUBLISHED" = false ]; then
+  export -f publish_branch
+  export SHA BRANCH PUSHED
+  publish_status=0
+  if [ "$BRANCH" = main ]; then
+    publication_output="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \
+      --checkout "$PWD" -- bash -euo pipefail -c publish_branch)" || publish_status=$?
+  else
+    publication_output="$(bash -euo pipefail -c publish_branch)" || publish_status=$?
+  fi
+  if [ "$publish_status" -ne 0 ]; then
+    [ -z "$publication_output" ] || printf '%s\n' "$publication_output"
+    exit "$publish_status"
+  fi
+  receipt="${publication_output##*$'\n'}"
+  if [[ "$publication_output" == *$'\n'* ]]; then
+    printf '%s\n' "${publication_output%$'\n'*}"
+  fi
+  read -r SHA publication_state <<< "$receipt"
+  if [ "$publication_state" = pushed ]; then PUSHED=true; else PUSHED=false; fi
   if [ "$PUBLISH_ONLY" = true ]; then
-    if [ "$PUSHED" = true ]; then
-      printf '%s pushed\n' "$SHA"
-    else
-      printf '%s contained\n' "$SHA"
-    fi
+    printf '%s\n' "$receipt"
     exit 0
   fi
 fi

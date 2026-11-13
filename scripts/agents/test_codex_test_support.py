@@ -26,7 +26,8 @@ class FixtureModelDefaultsTests(unittest.TestCase):
             with patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
                 resolve = MagicMock(return_value=("gpt-test", "high"))
                 defaults = FixtureModelDefaults(resolve)
-                configuration = models_registry.launch_configuration({})
+                configuration = models_registry.launch_configuration({
+                    **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""})
                 args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
                 self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
                 self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
@@ -40,7 +41,8 @@ class FixtureModelDefaultsTests(unittest.TestCase):
     def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
         resolve = MagicMock(return_value=("gpt-test", "high"))
         defaults = FixtureModelDefaults(resolve)
-        configuration = models_registry.launch_configuration({})
+        configuration = models_registry.launch_configuration({
+            **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""})
         args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
         self.assertEqual(defaults(args, configuration), ("gpt-test", "high"))
         with patch.dict(os.environ, {"MODELS_CONFIG_FILE": "/tmp/custom-codex-registry"}):

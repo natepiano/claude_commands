@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import json
 from collections.abc import Iterator
+from contextlib import chdir
 import os
 import shlex
 import subprocess
@@ -21,10 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
+from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude
+from scripts.lib import git_exclude, models_registry
+from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -457,10 +460,17 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
 def director_agent(request: UnitLaunch) -> DirectorAgent:
     """Resolve the unit director in this script's checkout before any writes."""
     resolver = Path(__file__).resolve().parents[1] / "agents" / "models_config.sh"
+    try:
+        with chdir(request.production.checkout):
+            configuration = models_registry.launch_configuration(
+                os.environ, registry=models_registry.registry_path(os.environ))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"ERROR: {error}") from error
     result = subprocess.run(
-        ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
+        ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+         + 'agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
          "_", str(resolver)], cwd=request.production.checkout,
-        text=True, capture_output=True, check=False)
+        input=models_registry.configuration_shell(configuration), text=True, capture_output=True, check=False)
     if result.returncode != 0:
         error = next((line for line in result.stderr.splitlines() if line.startswith("ERROR:")),
                      result.stderr.splitlines()[0] if result.stderr else "ERROR: cannot resolve production.director.")
@@ -910,7 +920,7 @@ def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted
         return "; run the same command again"
     try:
         herdr.close_agent(found.unit.place.session, found.unit.place.pane)
-    except herdr.HerdrFailure as error:
+    except herdr_types.HerdrFailure as error:
         return f"; its session {found.unit.place.session} could not be closed: {error}"
     return "; its session is closed: run the same command again"
 
@@ -1053,7 +1063,7 @@ class TranscriptEntry(TypedDict, total=False):
 
 def transcript_lines_from_end(path: Path) -> Iterator[str]:
     """Read newest entries first without loading the whole conversation."""
-    with path.open("rb") as stream:
+    with open_transcript(path) as stream:
         offset = stream.seek(0, os.SEEK_END)
         pending = b""
         while offset:
@@ -1071,7 +1081,7 @@ def transcript_lines_from_end(path: Path) -> Iterator[str]:
 def transcript_model(session_id: str) -> str:
     """The newest real assistant model in the newest transcript for this session."""
     try:
-        matches = list((Path.home() / ".claude/projects").rglob(f"{session_id}.jsonl"))
+        matches = transcript_paths(Path.home() / ".claude/projects", f"**/{session_id}.jsonl")
         if not matches:
             return ""
         path = max(matches, key=lambda path: path.stat().st_mtime)
@@ -1391,7 +1401,7 @@ def _main(argv: list[str]) -> int:
                 place = stopped_tab.unit.place
                 try:
                     herdr.close_agent(place.session, place.pane)
-                except herdr.HerdrFailure as error:
+                except herdr_types.HerdrFailure as error:
                     raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
@@ -1430,7 +1440,7 @@ def _main(argv: list[str]) -> int:
     except (Refusal, unit_config.ConfigRefused, git_exclude.ExcludeRefused) as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
-    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr_types.HerdrFailure) as error:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1

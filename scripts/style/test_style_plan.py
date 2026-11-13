@@ -331,6 +331,17 @@ class StylePlanTests(StylePlanFixture):
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         held = ledger.hold(rule, self.sources[0], 1, "Split this module", "restructure", "before", "after", blob, "outside")
+        approved_findings: list[style_ledger.HeldFinding] = []
+        issues: list[Path] = []
+        for line, name in ((4, "approved"), (5, "other-approved")):
+            issue = self.root / f"{name}.md"
+            _ = issue.write_text('---\nstatus: open\ntags: [proposal, style]\n'
+                                 + f'unit: {unit_staff_id("modules")}\nplan: approved\nstyle_rule: {rule}\n'
+                                 + f'style_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+            finding = ledger.hold(rule, self.sources[0], line, name, "restructure", "before", "after", blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            approved_findings.append(finding)
+            issues.append(issue)
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
         _ = ledger.decline_findings((waived.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
@@ -347,12 +358,32 @@ class StylePlanTests(StylePlanFixture):
         heading = "Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."
         self.assertIn(heading, text)
         held_section, _, waived_section = text.partition(heading)
+        for finding in approved_findings:
+            self.assertIn(f"{finding.finding_id} · {rule} · {finding.path}:{finding.line} · {finding.text}", held_section)
+            self.assertEqual(text.count(finding.finding_id), 1)
         self.assertNotIn(waived.finding_id, held_section)
         self.assertIn(waived.finding_id, waived_section)
         self.assertNotIn(other.finding_id, text)
         self.assertIn(f"{waived.finding_id} · {rule} · {self.sources[0]}:2 · Already waived", text)
         self.assertNotIn(outside.finding_id, text)
         self.assertIn("Judge these 2 files of `crates/alpha`", text)
+
+        ledger.ticket_drop(ledger.ticket_open(ticket_owner_id("modules"))[0]["id"])
+        ledger.ticket_add("7001", ticket_owner_id("modules"), "proposal", "modules", "crates/alpha",
+                          [self.sources[0]], [rule], proposal=str(issues[0]), proposals=(issues[1],),
+                          finding_ids=tuple(finding.finding_id for finding in approved_findings))
+        ledger.ticket_assign("7001", "demo-style-modules")
+        style_plan.write_phase(ledger, ledger.ticket_get("7001"), plan, self.plan_header())
+        for kind, work_order, build_line in (
+            ("structure", text, ""),
+            ("proposal", plan.read_text(), f"Also build the approved findings selected from: `{issues[1]}`"),
+        ):
+            with self.subTest(kind=kind):
+                if build_line:
+                    self.assertIn(build_line, work_order)
+                    self.assertNotIn("Already-held findings:", work_order)
+                else:
+                    self.assertNotIn("Also build", work_order)
 
     def test_structure_resume_keeps_waived_findings_after_the_pinned_rule_leaves_the_catalog(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: manifest\n")
@@ -498,6 +529,7 @@ class StylePlanTests(StylePlanFixture):
         self.write("crates/beta/Cargo.toml", '[package]\nname = "cargo-handler"\nversion = "0.1.0"\n')
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** cargo-handler\n\n## Phases"))
         result = self.run_next()
         self.assertEqual(result[0], 0, result)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One holder file per session; decide when builds are quiet and may resume."""
+"""Keep one hold per staff member and decide when builds may resume."""
 
 from __future__ import annotations
 try:
@@ -25,15 +25,15 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
 from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
 
-from scripts.buildlog import store
 from scripts.message import session_send
 
 
@@ -48,16 +48,6 @@ RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your bui
                   "their memory gate orders them. No answer is needed.")
 
 DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
-
-
-@dataclass(frozen=True)
-class OwningSession:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class NoOwningSession:
-    pass
 
 
 class ReleaseEntry(TypedDict):
@@ -97,6 +87,8 @@ class BroadcastReleaseNotice(TypedDict):
 class ReleaseIntent(TypedDict):
     holder_key: str
     holder_name: str
+    holder_purpose: NotRequired[str]
+    cycle_holders: NotRequired[dict[str, dict[str, str]]]
     holder_since: str
     holder_directory: str
     released_at: str
@@ -265,25 +257,8 @@ def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
-def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
-    from scripts.message.sessions import live_sessions
-
-    def unblock(holder: str) -> MacHoldResult:
-        arguments = ["unblock", "--holder", holder]
-        return run_mac_hold(arguments, target)
-
-    result = unblock(identity.name)
-    prefix = "blocked by "
-    line = result.stdout.rstrip("\n")
-    if result.status != 1 or not line.startswith(prefix):
-        return result
-    holder = line[len(prefix):]
-    no_former_names: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions()
-                   if record["sessionId"] == identity.key), no_former_names)
-    if holder != identity.name and holder in (identity.name, given, *former):
-        return unblock(holder)
-    return result
+def release_mac_hold(identity: HolderIdentity, target: str = "mac") -> MacHoldResult:
+    return run_mac_hold(["unblock", "--holder", identity.key], target)
 
 
 def print_mac_hold_result(result: MacHoldResult) -> int:
@@ -294,12 +269,12 @@ def print_mac_hold_result(result: MacHoldResult) -> int:
 
 @dataclass(frozen=True)
 class Holder:
-    # The holder's name now when it is a live Claude session, else the name the hold was taken under.
+    # The current staff name, or the text given for a holder outside staff.
     name: str
     since: datetime
     purpose: str
     release: ReleaseEta
-    # The hold file's name: the holder's Claude session id, or its name when it is no Claude session.
+    # The fixed staff ID, or the text given for a holder outside staff.
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
 
@@ -357,8 +332,23 @@ class Busy:
     reasons: tuple[str, ...]
 
 
-def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession | NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
+@dataclass(frozen=True)
+class RunOwner:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoRunNamed:
+    pass
+
+
+@dataclass(frozen=True)
+class RunNotInStaff:
+    run: Path
+
+
+def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | NoRunNamed | RunNotInStaff:
+    """Find the staff session that owns the named run."""
     run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
            or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
     if run:
@@ -370,9 +360,18 @@ def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession
             rows = ()
         for row in rows:
             if isinstance(row.run, staff.OpenRun) and str(row.run.path) == run and row.current_session:
-                return OwningSession(row.current_session)
+                return RunOwner(row.current_session)
+        return RunNotInStaff(Path(run))
+    return NoRunNamed()
+
+
+def owning_session(environment: Mapping[str, str] = os.environ) -> session_owner.OwningSession | session_owner.NoOwningSession:
+    """Find the session that owns this run before using the shell's session id."""
+    resolution = run_resolution(environment)
+    if isinstance(resolution, RunOwner):
+        return session_owner.OwningSession(resolution.session_id)
     session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
-    return OwningSession(session_id) if session_id else NoOwningSession()
+    return session_owner.OwningSession(session_id) if session_id else session_owner.NoOwningSession()
 
 
 def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
@@ -389,6 +388,16 @@ def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
 class ProcessIdentity:
     pid: int
     start_time: str
+
+
+@dataclass(frozen=True)
+class LiveClaims:
+    identities: frozenset[ProcessIdentity]
+
+
+@dataclass(frozen=True)
+class ClaimsUnreadable:
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -420,7 +429,7 @@ FULL_BUILD_AUDIT = FullBuildAudit()
 SYSTEM_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
-BuildClass = Literal["holder", "admitted", "other_session", "no_session"]
+BuildClass = Literal["holder", "admitted", "claimed", "other_session", "no_session"]
 AUDIT_COMMANDS = frozenset({"cargo-tile-real", "cargo", "cargo-nextest", "rustc", "rustdoc"})
 CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 
@@ -428,7 +437,7 @@ CARGO_COMMANDS = AUDIT_COMMANDS - {"rustc", "rustdoc"}
 @dataclass(frozen=True)
 class AuditedBuild:
     process: AuditProcess
-    owner: OwningSession | NoOwningSession
+    owner: session_owner.OwningSession | session_owner.NoOwningSession
     classification: BuildClass
     children: tuple[ProcessIdentity, ...]
 
@@ -501,6 +510,7 @@ def read_audit_processes(
         if isinstance(selection, FullBuildAudit):
             try:
                 in_build_scope = any("/builds.slice/" in line
+                                     and "/builds.slice/builds-detached.slice/" not in line
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass
@@ -532,45 +542,39 @@ def audit_command(process: AuditProcess) -> str:
     return executable if executable in AUDIT_COMMANDS | {"claude", "codex"} else process.command
 
 
-def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> OwningSession | NoOwningSession:
+def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> session_owner.OwningSession | session_owner.NoOwningSession:
     for item in (process, *ancestors):
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
         if session_id:
-            return OwningSession(session_id)
+            return session_owner.OwningSession(session_id)
         owner = owning_session(item.environment)
-        if isinstance(owner, OwningSession):
+        if isinstance(owner, session_owner.OwningSession):
             return owner
         if item.environment.get("CODEX_THREAD_ID"):
-            return OwningSession(item.environment["CODEX_THREAD_ID"])
+            return session_owner.OwningSession(item.environment["CODEX_THREAD_ID"])
     for parent in ancestors:
         if audit_command(parent) in {"claude", "codex"}:
             owner = owning_session(parent.environment)
-            if isinstance(owner, OwningSession):
+            if isinstance(owner, session_owner.OwningSession):
                 return owner
-            return OwningSession(parent.environment.get("CODEX_THREAD_ID")
+            return session_owner.OwningSession(parent.environment.get("CODEX_THREAD_ID")
                                  or f"{audit_command(parent)}:{parent.identity.pid}:{parent.identity.start_time}")
-    return NoOwningSession()
+    return session_owner.NoOwningSession()
 
 
-def admitted_processes() -> frozenset[ProcessIdentity]:
-    """Read durable grants, which precede replies and the next decision pass."""
-    from scripts.build_queue import admission_service
-
-    try:
-        state = admission_service.read_state(store.root() / "admission")
-    except (OSError, ValueError) as error:
-        raise OSError(f"admission state unavailable: {error}") from error
-    return frozenset(ProcessIdentity(record.owner.pid, record.owner.start_time)
-                     for record in state.reservations.values())
-
-
-def owner_is_sole_holder(owner: OwningSession | NoOwningSession, holders: Sequence[Holder]) -> bool:
-    return (isinstance(owner, OwningSession) and bool(holders)
-            and all(holder.key == holder_path(Path(), owner.session_id).name for holder in holders))
+def owner_is_sole_holder(owner: session_owner.OwningSession | session_owner.NoOwningSession, holders: Sequence[Holder]) -> bool:
+    return (isinstance(owner, session_owner.OwningSession) and bool(holders)
+            and all(holder.key == holder_path(Path(), holder_of(owner.session_id).key).name for holder in holders))
 
 
 class HoldEnforcer(Protocol):
+    def admitted_processes(self) -> frozenset[ProcessIdentity]: ...
+    def claimed_processes(self, proc_root: Path = PROC_ROOT) -> LiveClaims | ClaimsUnreadable: ...
+    def holds_claim(self, process: AuditProcess, processes: Mapping[int, AuditProcess],
+                    claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
+    def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
+    def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
     def report(self, proc_root: Path, directory: Path) -> list[str]: ...
@@ -584,7 +588,11 @@ def hold_enforcer() -> HoldEnforcer:
 
 def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBuild, ...]:
     processes = read_audit_processes(proc_root)
-    admitted = admitted_processes()
+    admitted = hold_enforcer().admitted_processes()
+    claims = hold_enforcer().claimed_processes(proc_root) if holders else LiveClaims(frozenset())
+    if isinstance(claims, ClaimsUnreadable):
+        print(f"claims unreadable: {claims.reason}", file=sys.stderr)
+    claimed: frozenset[ProcessIdentity] = claims.identities if isinstance(claims, LiveClaims) else frozenset()
     builds: list[AuditedBuild] = []
     children: dict[int, list[ProcessIdentity]] = {}
     roots: list[AuditProcess] = []
@@ -604,11 +612,13 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder]) -> tuple[AuditedBui
             continue
         owner = audit_owner(process, ancestors)
         classification: BuildClass
-        if owner_is_sole_holder(owner, holders):
+        if hold_enforcer().holds_claim(process, processes, claimed):
+            classification = "claimed"
+        elif owner_is_sole_holder(owner, holders):
             classification = "holder"
         elif process.in_build_scope or any(item.identity in admitted for item in (process, *ancestors)):
             classification = "admitted"
-        elif isinstance(owner, OwningSession):
+        elif isinstance(owner, session_owner.OwningSession):
             classification = "other_session"
         else:
             classification = "no_session"
@@ -625,9 +635,10 @@ def audit_lines(builds: Sequence[AuditedBuild], *, beginning: bool = False) -> l
     for build in builds:
         if build.classification == "no_session":
             continue
-        owner = build.owner.session_id if isinstance(build.owner, OwningSession) else ""
+        owner = build.owner.session_id if isinstance(build.owner, session_owner.OwningSession) else ""
         command = shlex.join(build.process.argv) or build.process.command
-        lines.append(f"  {build.classification}: {owner}, pid {build.process.identity.pid}: {command}"
+        reason = "holds a live Mac or AWS claim" if build.classification == "claimed" else build.classification
+        lines.append(f"  {reason}: {owner}, pid {build.process.identity.pid}: {command}"
                      + (f" ({len(build.children)} build children)" if build.children else ""))
     if len(lines) == 1:
         lines.append("  No session-owned builds are running.")
@@ -642,7 +653,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
         holders = state.holders if isinstance(state, ActiveHolders) else ()
     builds = audit_builds(proc_root, holders)
     for build in builds:
-        if build.classification in {"holder", "admitted"}:
+        if build.classification in {"holder", "admitted", "claimed"}:
             continue
         for holder in holders:
             hold_enforcer().record_build(build, holder, proc_root, "audit")
@@ -675,39 +686,48 @@ def holder_path(directory: Path, name: str) -> Path:
 
 
 def holder_of(given: str | None) -> HolderIdentity:
-    """The key a holder's hold is kept under, and the holder's name now.
+    """Resolve a fixed staff key and its current display name."""
+    from scripts.production import staff
 
-    The key is the Claude session id of the session `given` means, or of the caller when no name is
-    given, so a rename between hold and release loses nothing. A holder that is no live Claude
-    session keeps `given` as its key.
-    """
-    from scripts.message.sessions import addressed, live_sessions
-
-    records = live_sessions()
+    try:
+        membership = staff.snapshot()
+    except staff.StaffAbsent:
+        membership = staff.StaffSnapshot(())
     if given is None:
         own = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        session = next((record for record in records if own and record["sessionId"] == own), None)
-        if session is None:
-            raise ValueError("give --holder: this is not a live Claude session")
-        return HolderIdentity(session["sessionId"], session["name"])
-    session = addressed(given, records)
-    return HolderIdentity(given, given) if session is None else HolderIdentity(session["sessionId"], session["name"])
+        member = membership.by_current_session(own) if own else None
+        if member is None:
+            raise ValueError("give --holder: this caller has no staff row")
+        return HolderIdentity(member.id, member.name)
+    from scripts.message.sessions import staff_recipient
+
+    member = membership.by_member_reference(given)
+    resolved = member if member is not None else staff_recipient(given, membership)
+    return HolderIdentity(resolved.id, resolved.name) if isinstance(resolved, staff.StaffRow) else HolderIdentity(given, given)
+
+
+def holder_address(key: str) -> str:
+    """Use a staff ID directly; preserve native session addresses for other keys."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return key if member is not None else f"session:{key}"
+
+
+def holder_session(key: str) -> str:
+    """Use a staff holder's current session; keep a native session key as it is."""
+    from scripts.production import staff
+
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    return member.current_session if member is not None else key
 
 
 def held_key(directory: Path, given: str | None) -> str:
-    """The key of the hold `given`, or the caller, has. A hold taken under a name before holds were
-    kept by session id is found by the name given, the session's name now, and each name it once had."""
-    from scripts.message.sessions import live_sessions
-
+    """Find only the resolved holder's fixed key."""
     identity = holder_of(given)
-    key, name = identity.key, identity.name
-    none: list[str] = []
-    former = next((record["formerNames"] for record in live_sessions() if record["sessionId"] == key), none)
-    candidates: list[str] = [key, given or name, name, *former]
-    found = next((one for one in candidates if holder_path(directory, one).is_file()), None)
-    if found is None:
-        raise ValueError(f"{given or name} held nothing")
-    return found
+    if not holder_path(directory, identity.key).is_file():
+        raise ValueError(f"{given or identity.name} held nothing")
+    return identity.key
 
 
 def aware_instant(value: str) -> datetime:
@@ -719,7 +739,7 @@ def aware_instant(value: str) -> datetime:
 
 def read_holder(path: Path) -> Holder:
     """Even an unreadable or malformed regular file remains an active hold."""
-    from scripts.message.sessions import live_sessions
+    from scripts.production import staff
 
     fallback = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     try:
@@ -738,7 +758,8 @@ def read_holder(path: Path) -> Holder:
             release = fields.get("release_eta")
             if isinstance(name, str) and isinstance(since, str) and isinstance(purpose, str) and isinstance(release, str):
                 eta: ReleaseEta = UnknownReleaseEta() if release == "unknown" else KnownReleaseEta(aware_instant(release))
-                now = next((record["name"] for record in live_sessions() if record["sessionId"] == path.name), name)
+                member = staff.initial_snapshot().by_id(staff.StaffId(path.name))
+                now = member.name if member is not None else name
                 keep: list[ProcessIdentity] = []
                 values = fields.get("keep", [])
                 if isinstance(values, list):
@@ -801,6 +822,28 @@ def natedev_holds(directory: Path) -> NatedevHolds:
     if isinstance(holders, NoHolders):
         return NatedevHolds(())
     return NatedevHolds(holders.holders)
+
+
+def caller_processes(proc_root: Path, pid: int) -> frozenset[ProcessIdentity]:
+    """Read the caller and its live ancestors without scanning other processes."""
+    lineage: set[ProcessIdentity] = set()
+    seen: set[int] = set()
+    child_start = float("inf")
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            start = fields[19]
+            if fields[0] == "Z" or int(start) > child_start:
+                break
+            identity = ProcessIdentity(pid, start)
+            if process_start_time(pid, proc_root) != start:
+                break
+            lineage.add(identity)
+            pid, child_start = int(fields[1]), int(start)
+        except (OSError, ValueError, IndexError):
+            break
+    return frozenset(lineage)
 
 
 def release_eta_text(release: ReleaseEta) -> str:
@@ -940,7 +983,11 @@ def release_hold(directory: Path, holder: Holder) -> str:
 
 
 def release_directory() -> Path:
-    return Path(os.environ.get("BUILD_HOLD_RELEASE_DIR", str(Path.home() / ".local/state/build-hold-release")))
+    explicit = os.environ.get("BUILD_HOLD_RELEASE_DIR")
+    if explicit is not None:
+        return Path(explicit)
+    holders = holder_directory().absolute()
+    return holders.with_name(holders.name + "-release")
 
 
 @contextmanager
@@ -1225,10 +1272,8 @@ def release_records_for_change() -> ReleaseRecordsForChange:
 
 def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
     """Resolve a stopped or completed release without accepting an unrelated holder."""
-    from scripts.message.sessions import live_sessions
-
     with release_lock():
-        # A receipt for a former name must never shadow a live session-id hold.
+        # A completed release must never hide a current hold.
         if given is None and resume:
             if has_holder_file(directory):
                 return NoReleaseIntent()
@@ -1247,12 +1292,8 @@ def recorded_release_holder(directory: Path, given: str | None, *, resume: bool)
             if given is None and resume:
                 return HolderIdentity(intent["holder_key"], intent["holder_name"])
             identity = holder_of(given)
-            no_former_names: list[str] = []
-            former = next((record["formerNames"] for record in live_sessions()
-                           if record["sessionId"] == identity.key), no_former_names)
-            candidates = (identity.key, identity.name, given or identity.name, *former)
-            if any(holder_path(directory, candidate).name == intent["holder_key"] for candidate in candidates):
-                return HolderIdentity(intent["holder_key"], intent["holder_name"])
+            if holder_path(directory, identity.key).name == intent["holder_key"]:
+                return identity
         if recovered.set_aside and not has_holder_file(directory):
             for record in recovered.records:
                 if record.state == "pending" and record.intent["holder_directory"] == str(directory.resolve()):
@@ -1284,6 +1325,9 @@ def finish_release_intent(intent: ReleaseIntent) -> str:
 def finish_recorded_notices(record: RecordedRelease) -> str:
     intent = record.intent
     directory = Path(intent["holder_directory"])
+    released_hold = {"name": intent["holder_name"], "purpose": intent.get("holder_purpose", ""),
+                     "since": intent["holder_since"], "released_at": intent["released_at"]}
+    released_holds = intent.get("cycle_holders", {intent["holder_key"]: released_hold})
     try:
         pending = release_notices(intent)
     except ReleaseNoticeReadError as error:
@@ -1296,12 +1340,12 @@ def finish_recorded_notices(record: RecordedRelease) -> str:
         notices = intent["notices"]
         assert notices["kind"] == "cycle"
         save_cycle({"id": notices["cycle_id"], "opened_at": intent["holder_since"],
-                    "holders": {intent["holder_key"]: {"since": intent["holder_since"], "released_at": intent["released_at"]}},
+                    "holders": released_holds,
                     "recipients": dict(notices["recipients"]), "entries": [], "release_started_at": intent["released_at"]})
         pending = release_notices(intent)
     if not isinstance(pending, CycleNoticesToSend):
         # The pending record is the broadcast entry. Keep it until the send returns.
-        send_release_broadcast()
+        send_release_broadcast(release_notice(released_holds))
         result = " No hold cycle: broadcast this release to every session."
     else:
         cycle = pending.cycle
@@ -1353,7 +1397,8 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
                 cycle["release_started_at"] = ""
                 for entry in cycle["entries"]:
                     entry["delivery"] = "NotAttempted"
-            cycle["holders"][identity.key] = {"since": now.isoformat(), "released_at": ""}
+            cycle["holders"][identity.key] = {"name": identity.name, "purpose": purpose,
+                                              "since": now.isoformat(), "released_at": ""}
             save_cycle(cycle)
         return notice
 
@@ -1417,9 +1462,22 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
     return RecipientLookupFailed(reason)
 
 
-def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
+def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
+    """Name each released hold in the user's time zone."""
+    descriptions: list[str] = []
+    zone = user_zone()
+    for key, holder in holders.items():
+        name = holder.get("name", key)
+        purpose = holder.get("purpose", "")
+        work = f" for {purpose}" if purpose else ""
+        started = aware_instant(holder["since"]).astimezone(zone).strftime("%H:%M:%S %Z")
+        descriptions.append(f"{name} hold{work}, from {started}")
+    return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
+
+
+def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
+    notice = f"{notice} Session {entry['session_id']}."
     try:
         result = subprocess.run(session_send.send_argv("--to", f"uds:{socket}", "--text", notice), capture_output=True, text=True)
     except OSError as error:
@@ -1431,9 +1489,9 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
     return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
-def send_release_broadcast() -> None:
+def send_release_broadcast(notice: str) -> None:
     script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
-    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+    result = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), str(script), "--from", "build-hold", "--all", notice],
                             capture_output=True, text=True)
     if result.returncode:
         raise OSError(f"release broadcast: {failure_detail(result)}")
@@ -1487,7 +1545,7 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         if isinstance(recipient, RecipientGone):
             entry["delivery"] = "RecipientGone"
         elif isinstance(recipient, RecipientLive):
-            result = send_release(entry, recipient.socket)
+            result = send_release(entry, recipient.socket, release_notice(cycle["holders"]))
             if isinstance(result, ReleaseDelivered):
                 entry["delivery"] = "Delivered"
             elif isinstance(result, ReleaseQueued):
@@ -1529,9 +1587,11 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             notices: CycleReleaseNotices | BroadcastReleaseNotice = {"kind": "broadcast"}
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
-            intent = {"holder_key": holder.key, "holder_name": holder.name,
+            intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}
+            if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                intent["cycle_holders"] = {key: dict(fields) for key, fields in cycle["holders"].items()}
             save_release_intent(intent)
         result = release_hold(directory, holder)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1656,6 +1716,8 @@ def main(arguments: list[str]) -> int:
     _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
     _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
     _ = hold.add_argument("--keep", type=int, action="append", default=[])
+    _ = hold.add_argument("--drain", action="store_true",
+                          help="stop waiting gate runs and wait for working runs; INT keeps the hold")
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
@@ -1684,6 +1746,8 @@ def main(arguments: list[str]) -> int:
                 target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
                 refused: list[str] = []
                 if action == "hold":
+                    if cast(bool, options.drain):
+                        refused.append("--drain")
                     if cast(list[int], options.keep):
                         refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
@@ -1697,11 +1761,10 @@ def main(arguments: list[str]) -> int:
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
                 if action == "hold":
-                    command = ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]
+                    command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
                     result = run_mac_hold(command, target_name)
                 else:
-                    given = cast(str | None, options.holder) or identity.name
-                    result = release_mac_hold(identity, given, target_name)
+                    result = release_mac_hold(identity, target_name)
                 return print_mac_hold_result(result)
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
@@ -1713,10 +1776,14 @@ def main(arguments: list[str]) -> int:
                 if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
                 keep.append(ProcessIdentity(pid, start))
+            if cast(bool, options.drain):
+                keep.extend(hold_enforcer().working_drain_identities(proc_root))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
                              datetime.now(timezone.utc), keep))
             hold_enforcer().start()
             print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
+            if cast(bool, options.drain):
+                return hold_enforcer().drain(read_holder(holder_path(holder_directory(), identity.key)), proc_root)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):

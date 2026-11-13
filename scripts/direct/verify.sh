@@ -554,6 +554,8 @@ fi
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
         [[ "${VERIFY_HELPER_STARTED:-0}" == 0 ]] || return 0
+        # shellcheck source=/dev/null
+        source "$VERIFY_START_DIR/file_lock.sh" || return 2
         VERIFY_HELPER_STARTED=1
         local script="$VERIFY_START_DIR/verify_helper.py" input output
         [[ -f "$script" ]] || return 0
@@ -591,7 +593,7 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if flock -x 72 2>/dev/null && (
+        if lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             env -0
             printf '\0%s\0' "$input"
@@ -633,6 +635,9 @@ hash_stream() {
     printf '%s\n' "${hash%% *}"
 }
 
+# shellcheck source=/dev/null
+source "${BASH_SOURCE[0]%/*}/../lib/conf_record.sh"
+
 lint_code_key() {
     local file hash
     hash="$(
@@ -642,6 +647,7 @@ lint_code_key() {
                 "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
                 if [[ -f "$file" ]]; then
                     printf 'present\0'
+                    case "$file" in *.conf) stem="${file##*/}"; conf_record "${stem%.conf}" ;; esac
                     cat -- "$file" || exit 1
                 else
                     printf 'absent\0'
@@ -1560,9 +1566,10 @@ elif kind == "hold":
     holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
                                         build_hold.owning_session(), directory)
     if isinstance(holder, build_hold.Holder):
+        session = build_hold.holder_session(holder.key)
         try:
-            UUID(holder.key)
-            owner = holder.key
+            UUID(session)
+            owner = session
         except ValueError:
             owner_flag, owner = "--holder-unit", text(holder.name)
 elif kind in ("mac", "target"):
@@ -1654,7 +1661,8 @@ phase_wait_start() {
     if [[ -n "$holder" ]]; then
         while IFS= read -r flag; do holder_args+=("$flag"); done <<< "$holder"
     fi
-    if [[ -s "$file" ]]; then
+    if [[ -f "$file" ]]; then
+        [[ -s "$file" ]] || return 0
         previous=$(< "$holder_file")
         if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
         read -r id < "$file"
@@ -1674,9 +1682,14 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})" && [[ -n "$id" ]]; then
-        printf '%s' "$holder" > "$holder_file"
-        printf '%s\n' "$id" > "$file"
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
+        if [[ -n "$id" ]]; then
+            printf '%s' "$holder" > "$holder_file"
+            printf '%s\n' "$id" > "$file"
+        else
+            : > "$file"
+            printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+        fi
     else
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
     fi
@@ -1684,7 +1697,10 @@ phase_wait_start() {
 phase_wait_finish() {
     if [[ "$1" == token ]]; then PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""; fi
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
-    [[ -s "$file" ]] || return 0
+    if [[ ! -s "$file" ]]; then
+        rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
+        return 0
+    fi
     read -r id < "$file"
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"

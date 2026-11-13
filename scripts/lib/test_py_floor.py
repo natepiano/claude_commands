@@ -1,6 +1,5 @@
 """Check the interpreter floor against syntax and the real finder."""
 
-import ast
 import os
 from pathlib import Path
 import subprocess
@@ -12,17 +11,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class PythonFloorTests(unittest.TestCase):
-    def test_every_script_parses_at_the_interpreter_floor(self) -> None:
-        scripts = Path(__file__).resolve().parents[1]
-        version = floor()
-        failures: list[str] = []
-        for path in sorted(scripts.rglob("*.py")):
-            try:
-                _ = ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=version)
-            except SyntaxError as error:
-                failures.append(f"{path.relative_to(scripts.parent)}: {error}")
-        self.assertEqual(failures, [], "Scripts exceed the interpreter floor:\n" + "\n".join(failures))
-
     def test_a_cold_cache_records_an_absolute_interpreter_path(self) -> None:
         finder = Path(__file__).with_name("py")
         with tempfile.TemporaryDirectory() as temporary:

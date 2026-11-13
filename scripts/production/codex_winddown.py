@@ -2,7 +2,7 @@
 """Wind Codex agents down on every showrunner, and count the ones still running.
 
 A running Codex agent is one native pane process or one plain
-`codex exec`. It belongs to the nearest ancestor that is a named Claude session.
+`codex exec`. Its nearest staff-owned Claude ancestor identifies its owner.
 """
 from __future__ import annotations
 try:
@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -33,10 +34,10 @@ from zoneinfo import ZoneInfo
 from scripts.production import broadcast
 from scripts.message import process_table
 from scripts.production import session_staff, showrunners, staff
-from scripts.message import send_budget
+from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
-from scripts.production.live_units import live_unit_names
-from scripts.message.sessions import SessionRecord, live_sessions
+from scripts.production.live_units import live_unit_ids as live_unit_ids
+from scripts.message.sessions import live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
 STATE = Path(os.environ.get("CODEX_WINDDOWN_STATE") or Path.home() / ".local/state/codex-winddown")
@@ -46,7 +47,8 @@ INSTANCE = "codex-count-"
 EVERY_MINUTES = 2
 NO_SESSION = "no session"
 UNMEASURED: Final = "unmeasured"
-USAGE = ("usage: codex_winddown.py status | count <showrunner session> | eta <unit session> <minutes|unmeasured>"
+NO_DISPLAY_NAMES: Mapping[str, str] = MappingProxyType({})
+USAGE = ("usage: codex_winddown.py status | count <showrunner staff id> | eta <unit staff id> <minutes|unmeasured>"
          + " | (start | triage | clear) --from <your session>")
 
 
@@ -156,10 +158,13 @@ def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int,
 
 
 def current_counts() -> Counter[str]:
-    names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
-    counts = agent_counts(process_table.snapshot(), names)
+    table = process_table.snapshot()
+    counts = agent_counts(table, {})
     try:
         record = staff.snapshot()
+        owners = {session["pid"]: str(owner.id) for session in live_sessions()
+                  if (owner := record.by_current_session(session["sessionId"])) is not None}
+        counts = agent_counts(table, owners)
         for row in record.find(kind="worker"):
             if record.parent_of(row) is None:
                 print(f"codex wind-down: {row.name}: no staff member for parent {row.parent}", file=sys.stderr)
@@ -177,7 +182,7 @@ def current_counts() -> Counter[str]:
                 elif (isinstance(worker, worker_panes.OpenWorker)
                       and worker.status.value in ("working", "running", "starting")
                       and isinstance(record.backends.get(worker.row.id), staff.CodexBackend)):
-                    counts[parent.name] += 1
+                    counts[parent.id] += 1
     except (staff.StaffUnreadable, OSError, ValueError) as error:
         print(f"codex wind-down: {error}", file=sys.stderr)
     return counts
@@ -274,9 +279,11 @@ def projected(unit: str, held: Mapping[str, Projection], now: float) -> str:
             return f"likely finishes in {minutes} minute{'' if minutes == 1 else 's'}"
 
 
-def render(heading: str, rows: Mapping[str, int], held: Mapping[str, Projection], now: float) -> str:
-    lines = [f"{name} - {rows[name]}" + (f" - {projected(name, held, now)}" if rows[name] else "")
-             for name in sorted(rows, key=str.casefold)]
+def render(heading: str, rows: Mapping[str, int], held: Mapping[str, Projection], now: float,
+           names: Mapping[str, str] = NO_DISPLAY_NAMES) -> str:
+    lines = [f"{names.get(identity, identity)} - {rows[identity]}"
+             + (f" - {projected(identity, held, now)}" if rows[identity] else "")
+             for identity in sorted(rows, key=lambda identity: names.get(identity, identity).casefold())]
     return "\n".join([heading, "", "```", *lines, "```"])
 
 
@@ -298,9 +305,17 @@ def needs_asking(unit: str, held: Mapping[str, Projection], now: float) -> bool:
             return True
 
 
+def _notice(showrunner: str, unit: str, template: str, agents: int = 0) -> bool:
+    """Keep the staff recipient fixed until send.py resolves its current session."""
+    owner = staff.snapshot().by_id(staff.StaffId(showrunner))
+    if owner is None:
+        raise ValueError(f"{showrunner}: no showrunner staff row")
+    return not broadcast.send(unit, owner.name, template.format(showrunner=owner.name, agents=agents,
+                              script=Path(__file__).resolve(), unit=shlex.quote(unit)))
+
+
 def ask(showrunner: str, unit: str, agents: int) -> bool:
-    return not broadcast.send(unit, showrunner, ASK.format(showrunner=showrunner, agents=agents,
-                                                           script=Path(__file__).resolve(), unit=shlex.quote(unit)))
+    return _notice(showrunner, unit, ASK, agents)
 
 
 def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: float) -> dict[str, Projection]:
@@ -326,7 +341,7 @@ def refresh(showrunner: str, units: list[str], rows: Mapping[str, int], now: flo
             notice = saved.get(unit)
             if (isinstance(notice, ZeroNoticeOwed)
                     and notice == observed_notice
-                    and not broadcast.send(unit, showrunner, AT_ZERO.format(showrunner=showrunner))):
+                    and _notice(showrunner, unit, AT_ZERO)):
                 if isinstance(notice.resumed_projection, ProjectionNotRequested):
                     del saved[unit]
                 else:
@@ -435,19 +450,25 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
 
 def count(session: str) -> int:
     try:
-        runner = {runner["session"]: runner for runner in
-                  showrunners.require_complete(showrunners.registered_showrunners())}[session]
-    except (OSError, ValueError, KeyError) as error:
+        record = staff.snapshot()
+        owner = record.by_id(staff.StaffId(session))
+        if owner is None or owner.kind != "showrunner":
+            raise ValueError(f"{session}: no showrunner staff row")
+        runner = next(runner for runner in showrunners.require_complete(
+            showrunners.registered_showrunners(membership=record))
+            if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and runner["doc"] == str(owner.doc.path))
+    except (OSError, ValueError, KeyError, StopIteration) as error:
         print(error, file=sys.stderr)
         return 1
-    units = live_unit_names(runner)
+    units = live_unit_ids(runner)
     with quiet_notice_state() as state:
         counts = current_counts()
         observation = _observe_quiet_count(counts.total(), state)
     rows = listed(session, units, counts)
     held = refresh(session, units, rows, time.time())
     announce_quiet(observation)
-    print(render(f"Codex agents, {clock(runner['zone'])}", rows, held, time.time()))
+    print(render(f"Codex agents, {clock(runner['zone'])}", rows, held, time.time(),
+                 {row.id: row.name for row in record.rows}))
     return 0
 
 
@@ -455,6 +476,9 @@ def record_eta(unit: str, answer: str) -> int:
     if answer != UNMEASURED and not (answer.isascii() and answer.isdigit()):
         print(USAGE, file=sys.stderr)
         return 2
+    owner = staff.snapshot().by_id(staff.StaffId(unit))
+    if owner is None:
+        raise ValueError(f"{unit}: no staff row")
     with projections() as held:
         answer_projection = (
             CompletionUnmeasured()
@@ -462,7 +486,7 @@ def record_eta(unit: str, answer: str) -> int:
             else CompletionExpectedAt(time.time() + 60 * int(answer))
         )
         _record_projection(held, unit, answer_projection)
-    print(f"{unit}: recorded")
+    print(f"{owner.name}: recorded")
     return 0
 
 
@@ -474,11 +498,17 @@ def status() -> int:
     counts = current_counts()
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
     discovered = showrunners.registered_showrunners()
+    record = staff.snapshot()
     for runner in discovered:
-        rows.update(listed(runner["session"] or runner["name"], live_unit_names(runner), counts))
-    counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
+        owner = send.staff_named(runner["name"], record)
+        units = live_unit_ids(runner)
+        if isinstance(owner, staff.StaffRow):
+            rows.update(listed(str(owner.id), units, counts))
+    counting = ", ".join(row.name if (row := record.by_id(staff.StaffId(name.removeprefix(INSTANCE)))) is not None
+                         else name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
-    print(render("Codex agents on this machine", rows, read_projections(), time.time()))
+    print(render("Codex agents on this machine", rows, read_projections(), time.time(),
+                 {row.id: row.name for row in record.rows}))
     _ = showrunners.require_complete(discovered)
     return 0
 
@@ -500,13 +530,12 @@ def announce(sender: str, showrunner: str, unit: str) -> bool:
     return delivered and not discovered.lookup_failures
 
 
-def start_count(record: SessionRecord) -> bool:
-    prompt = STATE / f"{instance_name(record['name'])}.txt"
-    _ = prompt.write_text(TICK.format(minutes=EVERY_MINUTES, script=Path(__file__).resolve(),
-                                      session=shlex.quote(record["name"])) + "\n", encoding="utf-8")
-    done = subprocess.run(["zsh", str(NOTIFIER), "new", instance_name(record["name"]), "--every",
-                           str(EVERY_MINUTES), "--to", f"session:{record['sessionId']}", "--prompt-file",
-                           str(prompt), "--from", "codex-winddown"], capture_output=True, text=True, check=False)
+def start_count(owner: staff.StaffRow) -> bool:
+    text = TICK.format(minutes=EVERY_MINUTES, script=Path(__file__).resolve(),
+                       session=shlex.quote(str(owner.id)))
+    done = subprocess.run(["zsh", str(NOTIFIER), "new", instance_name(str(owner.id)), "--every",
+                           str(EVERY_MINUTES), "--to", f"session:{owner.id}", "--command",
+                           text, "--from", "codex-winddown"], capture_output=True, text=True, check=False)
     return done.returncode == 0
 
 
@@ -516,16 +545,16 @@ def start(sender: str) -> int:
     with quiet_notice_state() as state:
         _ = _cancel_quiet_notice(state)
     every = announce(sender, WIND_DOWN, UNIT_WIND_DOWN)
-    live: dict[str, SessionRecord] = {}
-    for record in live_sessions():
-        if record["name"]:
-            _ = live.setdefault(record["name"], record)
-    discovered = showrunners.registered_showrunners()
-    for runner in discovered:
-        if runner["session"] in live:
-            counting = start_count(live[runner["session"]])
+    record = staff.snapshot()
+    live = {session["sessionId"] for session in live_sessions()}
+    discovered = showrunners.registered_showrunners(membership=record)
+    for owner in record.find(kind="showrunner"):
+        if owner.current_session in live and any(
+                isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and runner["doc"] == str(owner.doc.path)
+                for runner in discovered):
+            counting = start_count(owner)
             every = every and counting
-            print(f"{runner['session']}: "
+            print(f"{owner.name}: "
                   + (f"counting every {EVERY_MINUTES} minutes" if counting else "count NOT started"))
     _ = showrunners.require_complete(discovered)
     return 0 if every else 1

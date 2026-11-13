@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import unittest
+from scripts.accounts import accounts
 from scripts.direct import assign_claude_test_support as support
 from scripts.direct.assign_claude_test_support import DIRECT_DIR as DIRECT_DIR
+from scripts.lib.test_models_registry import claude_catalog_environment
 from typing import cast
 import json
+import os
 import subprocess
 import sys
+from unittest.mock import patch
 
 
 class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
@@ -94,6 +98,27 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         for line, expected in zip(register, ("role=impl", "role=impl")):
             self.assertIn(expected, line)
 
+        with self.subTest(model="catalog target"):
+            session = self.start_phase("catalog-records")
+            environment = self.launch_environment(session)
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(accounts.setup("claude2"), [])
+                _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+                    "oauthAccount": {"emailAddress": "worker@example.invalid"}}))
+            expected_model = "claude-opus-assign-fixture"
+            environment.update(claude_catalog_environment(self.root / ".claude2", {"opus": expected_model}))
+            result = self.run_assignment(self.assign_command(session), environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = cast(list[str], json.loads((self.root / "launch_args.json").read_text()))
+            self.assertEqual(arguments[arguments.index("--model") + 1], expected_model)
+            self.assertIn("agent=" + expected_model, (session / "impl_agent_impl").read_text())
+            started, = self.launch_records(session, "pass_started")
+            self.assertEqual(cast(dict[str, object], started["called_agent"])["model"], expected_model)
+            self.assertIn("claude/" + expected_model + ":high", (session / "board.log").read_text())
+            self.assertIn("claude/" + expected_model + ":high", (session / "heartbeat.log").read_text())
+            worker = cast(dict[str, object], json.loads((session / "impl_worker_impl.json").read_text()))
+            self.assertEqual(worker["model"], expected_model)
+
     def test_failed_follow_up_abandons_round_and_posts_blocked(self) -> None:
         session_dir, first = self.first_worker_launch(repair=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -170,7 +195,9 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)[name]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)[name]["status"], "completed")
-        self.assertEqual(self.open_passes(session_dir)[name]["worker_name"], name)
+        passed = self.open_passes(session_dir)[name]
+        self.assertEqual(passed["worker_id"], self.recorded_worker(session_dir).id)
+        self.assertNotIn("worker_name", passed)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
         self.assertEqual((self.root / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (self.root / "delivered_message.txt").read_text(encoding="utf-8")

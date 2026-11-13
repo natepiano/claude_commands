@@ -44,7 +44,8 @@ from unittest.mock import patch
 from scripts.message import send, repeat_guard as g, roster
 from scripts.message import send_result
 from scripts.production import staff
-staff.snapshot=lambda: staff.StaffSnapshot(())
+staff.snapshot=lambda: staff.StaffSnapshot((staff.StaffRow(
+    staff.StaffId('owner'), 'producer', 'owner', staff.StaffRoot(), current_session=staff.StaffId('owner')),))
 role,mode,root,sink=sys.argv[1:]
 if role=='supervise':
     limits=g.configuration()

@@ -9,13 +9,15 @@ from scripts.lib import test_hang_guard
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import json
 import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 from unittest.mock import patch
 
 # Initialize dependencies before invoke_cli swaps HOME. The recorder currently
@@ -24,25 +26,22 @@ from scripts.direct import progress_history
 from scripts.lib import models_registry, user_zone
 from scripts.lib.test_models_registry import write_registry
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production import staff
+from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
 
 def record_wait_workers(root: Path, session: Path, environment: dict[str, str],
                         workers: Mapping[str, str]) -> None:
     """Publish private staff references before the recorder attributes a wait."""
-    import json
     with isolated_staff_file(root / "staff.json", environment):
         owner = fixture_member("showrunner", name="wait-owner")
         parent = fixture_member("unit", name="wait", parent=owner.id,
                                 runtime_id=fixture_runtime_id("fixture-director"),
                                 worktree=staff.PresentWorktree("natedev", root))
-        roster = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
+        entries = {name: {"staff_id": fixture_worker(name, parent.id, runtime_id=fixture_runtime_id(identity)).id}
                   for name, identity in workers.items()}
     session.mkdir(parents=True, exist_ok=True)
-    # The recorder still reads historical aliases from this roster.
-    _ = (session / "mesh_roster.json").write_text(json.dumps(roster))
-    for name, entry in roster.items():
+    for name, entry in entries.items():
         _ = (session / f"impl_worker_{name}.json").write_text(json.dumps({"slot": name, **entry}))
 
 
@@ -151,10 +150,11 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     for name in ("py", "process_group.py"):
         _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
+    _ = (root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"worker@example.invalid"}}')
+    for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("assign.sh", "assign.py", "assign_claude.py", "claude_worker.py", "assign_gate.py", "workers.py", "end_session.sh", "remove_run_scratch.py", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
-                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
+                 "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh", "file_lock.sh"):
         _ = shutil.copy2(source / "direct" / name, direct / name)
     return direct, agents, lib
 
@@ -179,7 +179,8 @@ def launcher_environment(root: Path) -> dict[str, str]:
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     seed_interpreter_cache(root / "cache")
-    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+    for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_REMOTE_MEMORY_DIR"):
         _ = environment.pop(name, None)
     return environment
 
@@ -202,6 +203,13 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     home = Path(environment["HOME"])
 
     def main() -> int:
+        if arguments and arguments[0] == "start-pass" and "--worker-name" in arguments and "--worker-id" not in arguments:
+            session = Path(arguments[arguments.index("--session-dir") + 1])
+            name = arguments[arguments.index("--worker-name") + 1]
+            state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+            matches = [row for row in session_staff.run_workers(state, staff.local_snapshot()) if row.name == name]
+            if len(matches) == 1:
+                sys.argv.extend(("--worker-id", matches[0].id))
         progress_history.main()
         return 0
 

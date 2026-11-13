@@ -98,6 +98,11 @@ class QueueEvidenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        mac_cache = self.root / "mac-builds.json"
+        _ = mac_cache.write_text(json.dumps({"read_at": NOW, "builds": [], "error": ""}))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=mac_cache))
+        _ = self.enterContext(mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.read_mac_builds()))
+        _ = self.enterContext(mock.patch.object(queue_view, "mac_activity_refresh_seconds", return_value=30))
         config = self.root / "build_admission.conf"
         write_memory_config(config)
         self.directory = self.root / "buildlog/admission"
@@ -421,8 +426,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_order_rule_shows_the_queue_priority_from_its_snapshot(self) -> None:
         from dataclasses import replace
         reading = gate.queue_read()
-        priority: records.QueuePriority = {"unit": "resources", "why": "work", "set_at": NOW,
-            "set_by": "showrunner", "transition": records.SettledPriority()}
+        priority: records.QueuePriority = records.QueuePriority(({'unit': "resources", 'why': "work", 'set_at': NOW, 'set_by': "showrunner"},), records.SettledPriority())
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         facts = head_facts.read_head_facts(reading)
         model = queue_view.QueueModel(reading, {}, facts, head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),
@@ -478,24 +482,22 @@ class QueueEvidenceTests(unittest.TestCase):
         self.assertNotIn("large-peak", final)
         self.assertIn("keep-aside drops 0.0 GiB; free memory rises 9.0 GiB", final)
 
-    def test_release_advice_retains_the_running_ci_keep_aside(self) -> None:
+    def test_release_advice_keeps_ci_use_without_a_margin(self) -> None:
         self.reset_running(available=15, need=11)
         _ = self.running(800, "ending", "clippy", 8, 3, 3600)
         _ = self.running(801, "remaining", "clippy", 1, 1, 3600)
         inputs = gate.queue_read().explanation.decided_from
         ending = next(index for index, step in enumerate(inputs.running) if step.session_id == "id-ending")
         config = records.read_memory_config()
-        for job, expected in ((IdleService(), gate.HeadAdmitsAfterEnd),
-                              (RunningServiceJob(NOW - 120), gate.HeadStillHeld)):
+        for job in (IdleService(), RunningServiceJob(NOW - 120)):
             with self.subTest(job=job):
                 ci = ci_step(4 * GIB, job)
                 captured = replace(inputs, running=(*inputs.running, ci))
                 explanation = gate.queue_read_from(captured, config.policy).explanation
                 outcome = gate.head_after_steps_end(explanation, (ending,))
-                self.assertIsInstance(outcome, expected)
-                assert isinstance(outcome, (gate.HeadAdmitsAfterEnd, gate.HeadStillHeld))
-                expected_room = 8 * GIB if isinstance(job, RunningServiceJob) else 15 * GIB
-                self.assertEqual(outcome.decision.room.room, expected_room)
+                self.assertIsInstance(outcome, gate.HeadAdmitsAfterEnd)
+                assert isinstance(outcome, gate.HeadAdmitsAfterEnd)
+                self.assertEqual(outcome.decision.room.room, 15 * GIB)
 
     def test_release_ties_choose_least_charge_then_running_table_order(self) -> None:
         self.reset_running(available=4, need=14)
@@ -585,7 +587,7 @@ class QueueEvidenceTests(unittest.TestCase):
         )
         for name, step, admitted, need, used, kept in expected:
             row, = [line for line in rows if f"{name}-session," in line]
-            self.assertIn(f"hana / {name} / {name}-session, hana {step}: admitted {admitted}", row)
+            self.assertIn(f"hana / {name} / {name}-session, {name} {step}: admitted {admitted}", row)
             self.assertIn(f"need {need} GiB; anonymous use {used} GiB; held slot 0.0 GiB; kept aside {kept} GiB", row)
         compiler, = [line for line in rows if "sccache.service" in line]
         self.assertIn("sccache.service: idle; 0.4 GiB RAM; 0.0 GiB swapped", compiler)

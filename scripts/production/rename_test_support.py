@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import shutil
@@ -19,9 +20,10 @@ from types import SimpleNamespace
 
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
+from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import fake_herdr
-from scripts.herdr import herdr
+from scripts.herdr import herdr, pane_launch
 from scripts.agents import pane_record, remote
 from scripts.direct import progress_history
 from scripts.message import sessions
@@ -40,6 +42,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
+NATIVE_PANE_CLIENT = herdr.Herdr
+NATIVE_PROCESS_ENVIRONMENT = herdr.process_environment
 
 
 class RenameDisplays:
@@ -132,6 +136,12 @@ class FolderMoveBackend:
         fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
                                self.environment(self.pid), cwd=self.cwd)
 
+    def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
+        """Use the shared scan with this fixture's process replies."""
+        client = NATIVE_PANE_CLIENT(self.session)
+        with mock.patch.object(client, "result", side_effect=self.result):
+            return client.scan_row_panes(record, panes)
+
     def pane_row(self, pane: str) -> herdr.PaneIdentity | herdr.NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), herdr.NoPane(pane))
 
@@ -156,10 +166,15 @@ class FolderMoveBackend:
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         entry = pane_record.read(self.session)[pane]
-        self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
+        self.fixture.assertIn(pane_launch.reference_id(entry), (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
+        if arguments == ("pane", "process-info", "--pane", "w1:p2"):
+            return {"process_info": {"shell_pid": self.shell_pid,
+                "foreground_process_group_id": self.shell_pid,
+                "foreground_processes": [{"pid": self.shell_pid, "argv": ["zsh"]}]}}
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
         argv = ([self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]) if self.live else ["zsh"]
         foreground: list[dict[str, object]] = [{"pid": self.pid if self.live else self.shell_pid, "argv": argv, "cwd": str(self.cwd)}]
@@ -208,6 +223,8 @@ class FolderMoveBackend:
         raise AssertionError(f"a folder resume must keep its pane: {pane}")
 
     def environment(self, pid: int) -> dict[str, str]:
+        if pid != self.pid:
+            return NATIVE_PROCESS_ENVIRONMENT(pid)
         self.fixture.assertEqual(pid, self.pid)
         return ({"CLAUDE_CONFIG_DIR": str(self.config)} if self.kind == "claude" else
                 {"CODEX_HOME": str(self.config), "CODEX_THREAD_ID": self.fixture.owner.current_session})
@@ -232,7 +249,7 @@ class FolderMoveFixture(StaffTestCase):
         self.checkout = self.root / "checkout"
         self.old_folder = self.root / "worktrees/source-folder"
         self.new_folder = self.root / "elsewhere/destination-folder"
-        self.run_dir = self.root / "sessions/move-run"
+        self.run_dir = self.root / "unit/move-run"
         self.history = self.root / "history/runs/move-run.jsonl"
         self.records = self.root / "pane-records"
         self.checkout.mkdir()
@@ -240,7 +257,8 @@ class FolderMoveFixture(StaffTestCase):
         self.history.parent.mkdir(parents=True)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "UNIT_HISTORY_DIR": str(self.history.parent.parent),
-            "UNIT_RUN_ROOT": str(self.root / "sessions"),
+            "UNIT_RUN_ROOT": str(self.run_dir.parent),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
             "PROGRESS_SESSION_ROOTS": str(self.run_dir.parent),
             "HERDR_PANE_RECORD_DIR": str(self.records),
             "HERDR_BIN": "/nonexistent/herdr",
@@ -250,6 +268,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.records))
         _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -270,13 +289,14 @@ class FolderMoveFixture(StaffTestCase):
         sibling = pane_record.launch("w1:p2", fixture_runtime_id("folder-move-neighbour"),
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
-        fields: dict[str, object] = {
+        fields: dict[str, object] = {"owner_staff_id": self.owner.id,
             "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
             "branch": "unit-branch", "plan_doc": "plan.md",
-            "history_file": str(self.history), "status": "active", "production": "production", "unit": "kept-name",
+            "history_file": str(self.history), "production": "production", "unit": "kept-name",
         }
         write_text_atomic(self.history, json.dumps({**fields, "event_type": "run_started", "run_started_at": 1}) + "\n")
         write_text_atomic(self.run_dir / STATE_FILENAME, json.dumps(fields) + "\n")
+        _ = staff.set_run(self.owner.id, staff.OpenRun(self.run_dir))
 
     def folder_git(self, checkout: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(checkout), *arguments],

@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
+from datetime import datetime
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
@@ -89,11 +90,15 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.git("commit", "-q", "-m", "fixture")
         _ = self.git("worktree", "add", "-q", "-b", self.child_branch, str(self.child_tree))
         self.plan = self.child_tree / self.plan_relative
+        self.child_doc = self.child_tree / "child.md"
         _ = self.git("init", "--bare", "-q", str(self.root / "origin.git"))
         _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
         _ = self.worker
+        from scripts.production.staff_test_support import fixture_session
+        fixture_session(self.child.current_session, staff.ClaudeBackend())
         self.events = []
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state")})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state"),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "__ETC_ZSHENV_SOURCED": "1"})))
         _ = self.enterContext(mock.patch.object(showrunners, "own_name", return_value=self.parent_name))
         _ = self.enterContext(mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()))
         self.observed = self.enterContext(mock.patch.object(unit_lookup, "observed_session_labels", side_effect=self.session_labels))
@@ -113,7 +118,7 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     @staticmethod
     def document(checkout: Path, branch: str = "main") -> str:
-        return f"# Production\n\n- **Merge branch:** {branch}\n- **Showrunner checkout:** {checkout}\n- **Log:** log.md\n"
+        return f"# Production\n\n> **Status: PRODUCTION — running.**\n\n- **Merge branch:** {branch}\n- **Showrunner checkout:** {checkout}\n- **Log:** log.md\n"
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.checkout), *args], capture_output=True, text=True, check=True).stdout.strip()
@@ -128,9 +133,9 @@ class DemoteShowrunnerTests(StaffTestCase):
         row = fixture_member("unit", name=name, parent=self.child.id,
                              worktree=staff.PresentWorktree(remote.local_machine(), tree))
         _ = unit_config.write(tree, unit_config.UnitConfig(unit_config.PlanFile(Path("old.md")), unit_config.AppPort(9000), ()))
-        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session, unit_config.Branch(branch)))
+        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session))
         _ = self.git("worktree", "remove", "--force", str(tree))
-        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree), expected=row.worktree)
+        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree, staff.ParkedBranch(branch)), expected=row.worktree)
 
     def question_staff(self) -> update_registration.QuestionStaff:
         return update_registration.QuestionStaff.for_record(staff.snapshot(), session_staff.MemberSources(()))
@@ -142,8 +147,10 @@ class DemoteShowrunnerTests(StaffTestCase):
         return 0
 
     def timer_action(self, args: list[str]) -> str:
-        self.assertEqual(args, ["stop", f"showrunner-{self.child.id}"])
-        self.events.append("timer")
+        self.assertIn(args, (["stop", f"showrunner-{self.child.id}"],
+                             ["remove", f"showrunner-{self.child.id}"]))
+        if args[0] == "stop":
+            self.events.append("timer")
         return ""
 
     def stop_child(self, name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude) -> bool:
@@ -185,6 +192,147 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertFalse(self.journal().exists())
 
+    def cleanup_files(self) -> tuple[Path, ...]:
+        state = self.root / "state"
+        files = (state / "counts" / self.child.id,
+                 state / "outstanding" / f"{self.child.id}.json",
+                 state / "outstanding" / f"{self.child.id}.history.jsonl",
+                 state / self.child.id / "history.txt",
+                 state / "counts" / self.parent.id)
+        for path in files:
+            write_text_atomic(path, "retained fixture content\n")
+        write_text_atomic(files[1], "[]\n")
+        update_registration.write_open_entries(read_production(self.child), [
+            {"since": "2026-11-09T10:01", "text": "Keep this reminder"}], self.question_staff())
+        return files
+
+    def fixture_notifier(self, args: list[str]) -> str:
+        result = subprocess.run(["zsh", str(Path(__file__).parents[1] / "message/notifier.sh"), *args],
+                                capture_output=True, text=True, check=True)
+        return result.stdout
+
+    def test_completed_demotion_removes_only_its_schedule_and_ends_the_old_document(self) -> None:
+        files = self.cleanup_files()
+        self.timer.side_effect = self.fixture_notifier
+        for row in (self.child, self.parent):
+            _ = self.fixture_notifier(["new", f"showrunner-{row.id}", "--every", "15",
+                                      "--to", f"session:{row.current_session}", "--command", "fixture"])
+        other_doc = self.checkout / "other-production.md"
+        write_text_atomic(other_doc, self.document(self.checkout))
+        other = self.root / "notifier" / f"showrunner-{self.parent.id}"
+        unchanged = {path: path.read_bytes() for path in (*files[1:], other_doc, *other.iterdir())}
+        before = int(self.git("-C", str(self.child_tree), "rev-list", "--count", "HEAD"))
+        code, _, errors = self.run_command()
+        self.assertEqual(code, 0, errors)
+        self.assertFalse((self.root / "notifier" / f"showrunner-{self.child.id}").exists())
+        for path in files[:1]:
+            self.assertFalse(path.exists(), str(path))
+        for path, content in unchanged.items():
+            self.assertEqual(path.read_bytes(), content)
+        text = self.child_doc.read_text()
+        stamp = datetime.now(read_production(self.parent).zone).date().isoformat()
+        self.assertIn(f"> **Status: ended {stamp}.**", text)
+        self.assertIn(f"The user demoted this production to the one unit {self.child_name} under {self.parent_name}.", text)
+        self.assertIn(f"That unit's plan is `{self.plan_relative}`.", text)
+        self.assertIn("This doc is a record and no session reads it as live state.", text)
+        self.assertEqual(int(self.git("-C", str(self.child_tree), "rev-list", "--count", "HEAD")), before + 1)
+        self.assertEqual(self.git("-C", str(self.child_tree), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "child.md")
+        self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), self.child_branch)
+
+    def test_pending_demotion_keeps_its_registration_and_restore_leaves_it_stopped(self) -> None:
+        files = self.cleanup_files()
+        self.timer.side_effect = self.fixture_notifier
+        _ = self.fixture_notifier(["new", f"showrunner-{self.child.id}", "--every", "15",
+                                  "--to", f"session:{self.child.current_session}", "--command", "fixture"])
+        write_text_atomic(self.child_doc, self.child_doc.read_text() + "- **Updates:** every 15 minutes\n")
+        _ = self.git("-C", str(self.child_tree), "add", "--", "child.md")
+        _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "schedule fixture updates")
+        self.start.side_effect = None
+        self.start.return_value = 2
+        self.assertEqual(self.run_command()[0], 1)
+        instance = self.root / "notifier" / f"showrunner-{self.child.id}"
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
+        self.assertTrue(all(path.exists() for path in files))
+        self.assertNotIn("> **Status: ended", self.child_doc.read_text())
+        with (mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(self.child.current_session)),
+              mock.patch.object(herdr, "shared_session", return_value="fixture"),
+              mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
+            self.assertEqual(demote.restore(self.journal()), 0)
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
+        self.start.side_effect = self.start_unit
+        self.assertEqual(self.run_command()[0], 0)
+        self.assertFalse(instance.exists())
+
+    def test_failed_document_commit_keeps_the_notifier_available_for_restore(self) -> None:
+        files = self.cleanup_files()
+        self.timer.side_effect = self.fixture_notifier
+        _ = self.fixture_notifier(["new", f"showrunner-{self.child.id}", "--every", "15",
+                                  "--to", f"session:{self.child.current_session}", "--command", "fixture"])
+        write_text_atomic(self.child_doc, self.child_doc.read_text() + "- **Updates:** every 15 minutes\n")
+        _ = self.git("-C", str(self.child_tree), "add", "--", "child.md")
+        _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "schedule fixture updates")
+        commit_paths = add_unit.commit_paths
+        def fail_document(production: Production, paths: list[Path], message: str) -> bool:
+            if production.owner.id == self.child.id:
+                raise OSError("fixture commit failed")
+            return commit_paths(production, paths, message)
+        with mock.patch.object(add_unit, "commit_paths", side_effect=fail_document):
+            self.assertEqual(self.run_command()[0], 1)
+        self.assertEqual(json.loads(self.journal().read_text())["step"], demote.Step.PLACED)
+        instance = self.root / "notifier" / f"showrunner-{self.child.id}"
+        self.assertTrue(instance.is_dir())
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
+        self.assertTrue(all(path.exists() for path in files))
+        with (mock.patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(self.child.current_session)),
+              mock.patch.object(herdr, "shared_session", return_value="fixture"),
+              mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
+            self.assertEqual(demote.restore(self.journal()), 0)
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
+        self.assertEqual(staff.by_id(self.child.id), self.child)
+        self.assertTrue(all(path.exists() for path in files))
+
+    def test_cleanup_retries_after_placement_and_changes_nothing_when_repeated(self) -> None:
+        files = self.cleanup_files()
+        self.timer.side_effect = self.fixture_notifier
+        _ = self.fixture_notifier(["new", f"showrunner-{self.child.id}", "--every", "15",
+                                  "--to", f"session:{self.child.current_session}", "--command", "fixture"])
+        commit_paths = add_unit.commit_paths
+        failed_commit = False
+        def commit_document(production: Production, paths: list[Path], message: str) -> bool:
+            nonlocal failed_commit
+            if production.owner.id == self.child.id and not failed_commit:
+                failed_commit = True
+                raise OSError("fixture commit failed")
+            return commit_paths(production, paths, message)
+        with mock.patch.object(add_unit, "commit_paths", side_effect=commit_document):
+            # Fail after placement, before the final document commit.
+            notifier = self.fixture_notifier
+            def fail_remove(args: list[str]) -> str:
+                if args[0] == "remove":
+                    raise update_registration.RegistrationFailure("notifier", "fixture remove failed")
+                return notifier(args)
+            self.timer.side_effect = fail_remove
+            self.assertEqual(self.run_command()[0], 1)
+            self.assertEqual(json.loads(self.journal().read_text())["step"], demote.Step.PLACED)
+            self.assertTrue((self.root / "notifier" / f"showrunner-{self.child.id}").is_dir())
+            self.assertTrue(all(path.exists() for path in files))
+            self.assertEqual(self.run_command()[0], 1)
+            self.assertEqual(json.loads(self.journal().read_text())["step"], demote.Step.PLACED)
+            self.assertIn("> **Status: ended", self.child_doc.read_text())
+            self.timer.side_effect = notifier
+            self.assertEqual(self.run_command()[0], 0)
+            self.assertEqual(self.git("-C", str(self.child_tree), "status", "--porcelain", "--", "child.md"), "")
+            head = self.git("-C", str(self.child_tree), "rev-parse", "HEAD")
+            document = self.child_doc.read_bytes()
+            row = staff.by_id(self.child.id)
+            assert row is not None
+            demote.finish_demotion(row, self.child_doc, read_production(self.parent), self.plan)
+            self.assertEqual(self.git("-C", str(self.child_tree), "rev-parse", "HEAD"), head)
+            self.assertEqual(self.child_doc.read_bytes(), document)
+        self.start.assert_called_once()
+        self.place.assert_called_once()
+        self.assertTrue(all(path.exists() for path in files[1:]))
+
     def test_name_only_uses_the_child_plan_and_keeps_explicit_values(self) -> None:
         original_doc = self.child_doc
         for source in ("configuration", "production document"):
@@ -223,6 +371,8 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
 
     def test_name_only_without_a_plan_reports_one_refusal_line(self) -> None:
+        self.child_doc = self.checkout / "child.md"
+        _ = staff.set_doc(self.child.id, staff.LiveDoc(remote.local_machine(), self.child_doc))
         with redirect_stderr(io.StringIO()) as errors:
             code = demote.main([self.child_name, "--check"])
         self.assertEqual(code, 2)
@@ -240,6 +390,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 _ = self.git("-C", str(self.child_tree), "switch", "-c", "without-plan")
                 _ = self.git("-C", str(self.child_tree), "rm", "--", str(self.plan_relative))
                 _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "remove the plan from the current branch")
+                write_text_atomic(self.plan, "# Plan kept only in the checkout\n")
             for plan in (self.plan, self.plan_relative):
                 with self.subTest(current_has_plan=current_has_plan, plan=plan):
                     self.assertEqual(self.run_command("--check", "--plan", str(plan))[0], 0)
@@ -258,6 +409,13 @@ class DemoteShowrunnerTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         self.assertEqual(self.run_command()[0], 2)
         self.assert_no_actions(before)
+        for plan in (self.plan, self.child_tree / "untracked-plan.md"):
+            with self.subTest(plan=plan):
+                write_text_atomic(plan, "changed plan\n")
+                code, _, errors = self.run_command("--check", "--plan", str(plan))
+                self.assertEqual(code, 2, errors)
+                self.assertIn("has uncommitted work; it checkpoints first", errors)
+                self.assert_no_actions(before)
 
     def test_refuses_a_child_with_an_open_run(self) -> None:
         _ = staff.set_run(self.child.id, staff.OpenRun(self.root / "child-run"))
@@ -278,35 +436,71 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(self.run_command()[0], 2)
         self.assert_no_actions(before)
 
-    def test_refuses_an_uncommitted_plan(self) -> None:
+    def test_accepts_existing_plans_without_a_merge_branch_commit(self) -> None:
         before = self.staff_file.read_bytes()
         original = self.plan.read_text()
         untracked = self.child_tree / "untracked-plan.md"
         branch_only = self.child_tree / "temporary-plan.md"
+        ignored = self.child_tree / "ignored-plan.md"
+        exclude = Path(self.git("rev-parse", "--git-path", "info/exclude"))
+        if not exclude.is_absolute():
+            exclude = self.checkout / exclude
+        write_text_atomic(exclude, exclude.read_text() + "\nignored-plan.md\n")
+        missing = self.child_tree / "missing-plan.md"
         _ = self.git("-C", str(self.child_tree), "switch", "-c", "temporary-plan-branch")
         write_text_atomic(branch_only, "# Temporary plan\n")
         _ = self.git("-C", str(self.child_tree), "add", "--", branch_only.name)
         _ = self.git("-C", str(self.child_tree), "commit", "-q", "-m", "commit the temporary plan")
         for plan in (self.plan, untracked, self.checkout / self.plan_relative,
-                     self.child_tree / ".." / "parent" / self.plan_relative, branch_only):
+                     self.child_tree / ".." / "parent" / self.plan_relative, branch_only, ignored, missing):
             with self.subTest(plan=plan):
-                if plan in (self.plan, untracked):
+                if plan in (self.plan, untracked, ignored):
                     write_text_atomic(plan, "changed\n")
                 try:
-                    for flags in ((), ("--check",)):
+                    accepted = plan in (self.plan, untracked, ignored)
+                    for flags in (("--check",),) if accepted else ((), ("--check",)):
                         with self.subTest(flags=flags):
                             code, _, errors = self.run_command(*flags, "--plan", str(plan))
-                            self.assertEqual(code, 2)
-                            if plan == branch_only:
-                                self.assertIn(f"plan {branch_only.name} is missing on {self.child_branch}", errors)
-                            elif plan not in (self.plan, untracked):
+                            self.assertEqual(code, 0 if accepted else 2, errors)
+                            if accepted:
+                                self.assertEqual(errors, "")
+                            elif plan == branch_only:
+                                self.assertEqual(errors,
+                                    f"demote_showrunner: plan {branch_only.name} is committed only on temporary-plan-branch; "
+                                    + f"commit it on {self.child_branch} or keep it untracked\n")
+                            elif plan == missing:
+                                self.assertEqual(errors,
+                                    f"demote_showrunner: plan {missing.name} is missing in {self.child_tree}\n")
+                            else:
                                 self.assertIn("plan must be inside the child checkout", errors)
                             self.assert_no_actions(before)
                 finally:
                     if plan == self.plan:
                         write_text_atomic(self.plan, original)
-                    elif plan == untracked:
-                        untracked.unlink()
+                    elif plan in (untracked, ignored):
+                        plan.unlink()
+
+        self.plan = untracked
+        self.plan_relative = untracked.relative_to(self.child_tree)
+        content = "# Untracked plan kept across the branch switch\n"
+        write_text_atomic(untracked, content)
+
+        def launch_with_plan(args: list[str]) -> int:
+            self.assertTrue(untracked.is_file())
+            self.assertEqual(untracked.read_text(), content)
+            self.assertEqual(args[args.index("--plan") + 1], str(self.plan_relative))
+            return self.start_unit(args)
+
+        self.start.side_effect = launch_with_plan
+        with self.subTest(plan=untracked, full_demote=True):
+            code, _, errors = self.run_command()
+            self.assertEqual(code, 0, errors)
+            self.start.assert_called_once()
+            self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), self.child_branch)
+            self.assertTrue(untracked.is_file())
+            self.assertEqual(untracked.read_text(), content)
+            self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"])
+            self.assertFalse(self.journal().exists())
 
     def test_refuses_live_units_and_accepts_retired_units(self) -> None:
         rows = [fixture_member("unit", name=name, parent=self.child.id) for name in ("alpha", "beta")]
@@ -367,7 +561,11 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assert_no_actions(before)
 
     def test_absent_update_timer_counts_as_stopped(self) -> None:
-        self.timer.side_effect = update_registration.RegistrationFailure("notifier", "fixture missing timer")
+        def absent_timer(args: list[str]) -> str:
+            if args[0] == "stop":
+                raise update_registration.RegistrationFailure("notifier", "fixture missing timer")
+            return ""
+        self.timer.side_effect = absent_timer
         with mock.patch.object(update_registration, "instance", return_value=update_registration.InstanceAbsent()) as instance:
             self.assertEqual(self.run_command()[0], 0)
         instance.assert_called_once_with(f"showrunner-{self.child.id}")
@@ -440,6 +638,24 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertEqual(self.run_command()[0], 2)
                 self.assertEqual(self.events, ["detach", "timer", "stop", "start", "place"] * count)
 
+    def test_placed_or_cleaned_journal_resumes_an_unchanged_unit_without_another_launch(self) -> None:
+        with mock.patch.object(demote, "save", wraps=demote.save) as save:
+            self.assertEqual(self.run_command()[0], 0)
+        fields = cast(dict[str, object], save.call_args.args[1])
+        before = self.staff_file.read_bytes(), list(self.events), self.git("-C", str(self.child_tree), "rev-parse", "HEAD")
+        for step in (demote.Step.PLACED, demote.Step.CLEANED):
+            with self.subTest(step=step):
+                demote.save(self.journal(), fields, step)
+                with mock.patch.object(demote, "checked", wraps=demote.checked) as checked:
+                    self.assertEqual(self.run_command()[0], 0)
+                checked.assert_not_called()
+                self.assertEqual((self.staff_file.read_bytes(), self.events,
+                                  self.git("-C", str(self.child_tree), "rev-parse", "HEAD")), before)
+                self.assertFalse(self.journal().exists())
+        self.start.assert_called_once()
+        self.place.assert_called_once()
+        self.assertEqual(self.account.call_count, 1)
+
     def test_moves_open_questions_once_and_preserves_reminders(self) -> None:
         child = read_production(self.child)
         parent = read_production(self.parent)
@@ -465,7 +681,9 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(cast(dict[str, object], json.loads(self.journal().read_text()))["step"], demote.Step.QUESTIONS_MOVED)
         self.assertEqual(self.run_command()[0], 0)
         self.detach.assert_called_once()
-        self.timer.assert_called_once()
+        self.assertEqual(self.timer.call_args_list, [
+            mock.call(["stop", f"showrunner-{self.child.id}"]),
+            mock.call(["remove", f"showrunner-{self.child.id}"])])
         self.assertEqual(self.stop.call_count, 2)
         self.start.assert_called_once()
 
@@ -525,7 +743,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 stop.assert_called_once_with(self.child.current_session)
                 self.assertEqual(staff.by_id(self.child.id), self.child)
                 args = start.call_args.args
-                self.assertEqual(args[:4], ("fixture", self.child_name, "child-session", str(self.child_tree)))
+                self.assertEqual(args[:4], ("fixture", self.child_name, self.child_name, str(self.child_tree)))
                 self.assertEqual(cast(dict[str, str], args[4])["CLAUDE_CONFIG_DIR"], str(self.root / "showrunner-account"))
                 self.assertIn(self.child.current_session, cast(list[str], args[6]))
                 if isinstance(outcome, herdr.AgentNotStarted):

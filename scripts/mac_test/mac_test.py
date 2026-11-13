@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.mac_test.claim_state import (
@@ -89,7 +90,6 @@ from scripts.build_targets.target_config import ConfigError
 from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as idle_config
 
 if TYPE_CHECKING:
-    from scripts.build_hold import build_hold
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
     from scripts.mac_test import offload
@@ -388,6 +388,17 @@ def lock_if_available(path: Path) -> Generator[bool, None, None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def holder_name(key: str) -> str:
+    """Show the current staff name when the fixed holder key resolves."""
+    from scripts.production import staff
+
+    try:
+        member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    except staff.StaffUnreadable:
+        return key
+    return member.name if member is not None else key
+
+
 def decoded_delivery(session: object, holder: str, path: Path) -> MessageDelivery:
     if session is None:
         return HolderQueue(holder)
@@ -518,7 +529,7 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
 
 
 def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
-    print(f"blocked by {block.holder}: {block.reason}")
+    print(f"blocked by {holder_name(block.holder)}: {block.reason}")
     return ClaimFinished(10)
 
 
@@ -738,6 +749,12 @@ def message_timeout_s() -> float:
 
 
 def delivery_target(delivery: MessageDelivery) -> str:
+    from scripts.production import staff
+
+    key = delivery.name if isinstance(delivery, HolderQueue) else delivery.holder
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    if member is not None:
+        return member.id
     if isinstance(delivery, HolderQueue):
         return delivery.name
     sessions_script = message_script("MAC_TEST_SESSIONS", "sessions.py")
@@ -1128,7 +1145,7 @@ def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
 def expiry_text(block: PendingMacBlock | ActiveMacBlock, skipped: str, target: str) -> str:
     label = "the Mac" if target == "mac" else target
     text = (
-        f"Message from mac-test: {label} block by {block.holder} ({block.reason}) "
+        f"Message from mac-test: {label} block by {holder_name(block.holder)} ({block.reason}) "
         + f"reached its time limit at {block_time(block.expires)} and lifted by itself."
     )
     if ci_needs_restore(block.ci):
@@ -1167,7 +1184,7 @@ def expire_block(
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
             text = (
-                f"Message from mac-test: {label} block by {block.holder} is past "
+                f"Message from mac-test: {label} block by {holder_name(block.holder)} is past "
                 + f"its time limit but still in place: CI's {label} switch could not be "
                 + f"turned back on ({restored.line}). Run github-warmup, then unblock."
             )
@@ -1704,19 +1721,17 @@ def requested_delivery(holder: str) -> MessageDelivery:
     owner = build_hold.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
-        if isinstance(owner, build_hold.OwningSession)
+        if isinstance(owner, OwningSession)
         else HolderQueue(holder)
     )
 
 
 def block_belongs_to(
     block: PendingMacBlock | ActiveMacBlock,
-    owner: build_hold.OwningSession | build_hold.NoOwningSession,
+    owner: OwningSession | NoOwningSession,
 ) -> bool:
-    from scripts.build_hold import build_hold
-
     return (
-        isinstance(owner, build_hold.OwningSession)
+        isinstance(owner, OwningSession)
         and isinstance(block.delivery, RecordedSession)
         and block.delivery.name == owner.session_id
     )
@@ -1779,8 +1794,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
                assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
-    from scripts.build_hold import build_hold
-
     try:
         claims = live_claims(paths)
     except ClaimStateUnreadable as error:
@@ -1873,7 +1886,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
         bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
-    if isinstance(owner, build_hold.OwningSession):
+    if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
     if isinstance(scope, RepositoryScope):
         claimed["repo_name"] = scope.name
@@ -2162,18 +2175,18 @@ def block_state_line(
     host = "the Mac" if target == "mac" else target
     if isinstance(block, ActiveMacBlock):
         return (
-            f"{'Mac' if target == 'mac' else target} blocked for {block.holder}: nothing is running there, "
+            f"{'Mac' if target == 'mac' else target} blocked for {holder_name(block.holder)}: nothing is running there, "
             + "it is free now."
         )
     waiting = block.waiting_on
     if isinstance(waiting, WaitingOnLocalRun):
         return (
-            f"Block pending for {block.holder}: {waiting.what} is running on {host}. "
+            f"Block pending for {holder_name(block.holder)}: {waiting.what} is running on {host}. "
             + "Nothing new starts there, and you get a message when it ends."
         )
     if isinstance(waiting, WaitingOnCiJob):
         return (
-            f"Block pending for {block.holder}: a CI run may still use the Mac. "
+            f"Block pending for {holder_name(block.holder)}: a CI run may still use the Mac. "
             + "Nothing new starts there, and you get a message when CI no longer "
             + "needs the Mac."
         )
@@ -2183,7 +2196,7 @@ def block_state_line(
         else "unknown error"
     )
     return (
-        f"Block pending for {block.holder}: CI could not be checked ({line}). "
+        f"Block pending for {holder_name(block.holder)}: CI could not be checked ({line}). "
         + "Nothing new starts there, and you get a message once CI's Mac job is "
         + "known to be idle."
     )
@@ -2209,7 +2222,7 @@ def command_block(
                 not isinstance(existing, NoMacBlock)
                 and existing.holder != args.holder
             ):
-                print(f"already blocked by {existing.holder}")
+                print(f"already blocked by {holder_name(existing.holder)}")
                 return 1
             now = utc_now()
             expires = now + timedelta(hours=duration.hours)
@@ -2299,7 +2312,7 @@ def command_unblock(
             print("no block")
             return 0
         if block.holder != args.holder:
-            print(f"blocked by {block.holder}")
+            print(f"blocked by {holder_name(block.holder)}")
             return 1
         if not config.ci_repo:
             block = replace_ci(block, "not_configured")
@@ -2405,20 +2418,20 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             print_switch_without_block(config)
         elif isinstance(block, PendingMacBlock):
             print(
-                f"block pending for {block.holder} "
+                f"block pending for {holder_name(block.holder)} "
                 + f"({pending_wait_text(block.waiting_on)}), "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
             print_switch_with_block(block, switch_problem)
         else:
             print(
-                f"blocked by {block.holder} since {block_time(block.since)}, "
+                f"blocked by {holder_name(block.holder)} since {block_time(block.since)}, "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
             if isinstance(block.free_message, FreeMessageOwed):
                 print(
                     f'The "{"Mac" if paths.target == "mac" else paths.target} is free" message '
-                    + f'has not reached {block.holder} yet.'
+                    + f'has not reached {holder_name(block.holder)} yet.'
                 )
             print_switch_with_block(block, switch_problem)
         if isinstance(lift_failure, ExpiredBlockLiftFailed):
@@ -2441,7 +2454,7 @@ def command_target_status(paths: StatePaths) -> int:
         print(f"state unreadable: {error}")
         return 12
     if not isinstance(block, NoMacBlock):
-        print(f"blocked by {block.holder} since {block_time(block.since)}: {block.reason}")
+        print(f"blocked by {holder_name(block.holder)} since {block_time(block.since)}: {block.reason}")
     for claim in claims:
         print(f"running: {claim.record['what']} ({claim.record['worktree']})")
     if isinstance(block, NoMacBlock) and not claims:
@@ -2538,9 +2551,7 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("watch-claim")
 
     def parsed_session(value: str) -> SubmittingSession:
-        from scripts.build_hold import build_hold
-
-        return build_hold.OwningSession(value) if value else build_hold.NoOwningSession()
+        return OwningSession(value) if value else NoOwningSession()
 
     for command in (claim, wait_claim, free):
         _ = command.add_argument("--session", type=parsed_session, default=claim_state.CALLING_SESSION)
@@ -2590,9 +2601,7 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     return command_status(paths, config)
 
 
-
-
-RELEASE_STATES = ('stopping', 'stopped', 'terminated')
+RELEASE_STATES = ("stopping", "stopped", "terminated")
 
 
 @dataclass(frozen=True)

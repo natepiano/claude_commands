@@ -245,6 +245,7 @@ def consume_stopped_build(call_id: str, consumed: Path) -> bool:
                 continue
             row = cast(dict[str, object], value)
             if (row.get("kind") != "hold_build" or row.get("action") != "stopped"
+                    or row.get("stop_status", "stopped") != "stopped"
                     or row.get("call_id") != call_id or row.get("boot_id") != boot_id):
                 continue
             pid, start = row.get("pid"), row.get("proc_start")

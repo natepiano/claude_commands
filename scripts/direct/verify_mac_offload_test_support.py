@@ -361,6 +361,88 @@ raise SystemExit(0)
 '''
 
 
+def install_fixed_cargo(path: Path) -> None:
+    """Install shell replies for an unchanged Python Cargo stub."""
+    python_source = f"#!{sys.executable}\n" + CARGO_STUB
+    if path.read_text(encoding="utf-8") != python_source:
+        return
+    fallback = path.with_name(path.name + "-python")
+    _ = fallback.write_text(python_source, encoding="utf-8")
+    fallback.chmod(0o755)
+    script = r'''#!/bin/sh
+python_reply() {
+    exec PYTHON FALLBACK "$@"
+}
+if [ "$#" = 2 ]; then
+    case "$1:$2" in
+        mend:--version|clippy:--version) printf 'cargo fixture 1.0\n'; exit 0 ;;
+    esac
+fi
+if [ "$#" = 3 ] && [ "$1:$2:$3" = '+nightly:fmt:--version' ]; then
+    printf 'cargo fixture 1.0\n'
+    exit 0
+fi
+if [ "${1:-}:${2:-}" = nextest:run ] && [ "${TEST_CARGO_HOLD:-}" = 1 ]; then
+    python_reply "$@"
+fi
+token_exists=0
+token_holder=''
+if [ -e "$TEST_TOKEN_RECORD" ]; then
+    token_exists=1
+    read -r token_holder < "$TEST_TOKEN_RECORD" || true
+fi
+coordinator=${BUILDLOG_HOLD_PID-}
+original_locale=${LC_ALL-}
+locale_was_set=${LC_ALL+x}
+LC_ALL=C
+for argument in "$@" "$token_holder" "$coordinator"; do
+    case "$argument" in
+        *[!\ -~]*)
+            if [ "$locale_was_set" = x ]; then LC_ALL=$original_locale; else unset LC_ALL; fi
+            python_reply "$@"
+            ;;
+    esac
+done
+json_quote() {
+    argument=$1
+    quoted=''
+    while [ -n "$argument" ]; do
+        remaining=${argument#?}
+        character=${argument%"$remaining"}
+        case "$character" in
+            '"'|'\') quoted=$quoted\\$character ;;
+            *) quoted=$quoted$character ;;
+        esac
+        argument=$remaining
+    done
+}
+arguments=''
+separator=''
+for argument do
+    json_quote "$argument"
+    arguments=$arguments$separator\"$quoted\"
+    separator=', '
+done
+json_quote "$token_holder"
+token_json=$quoted
+json_quote "$coordinator"
+coordinator_json=$quoted
+token_held=false
+if [ "$token_exists" = 1 ] && [ "$token_holder" = "$coordinator" ]; then token_held=true; fi
+printf '{"args": [%s], "token_holder": "%s", "coordinator": "%s", "token_held": %s}\n' \
+    "$arguments" "$token_json" "$coordinator_json" "$token_held" >> "$TEST_CARGO_EVENTS" || exit 1
+if [ "${1:-}" = metadata ]; then
+    printf '%s\n' "$TEST_METADATA"
+    exit 0
+fi
+if [ "${1:-}:${2:-}" = nextest:run ]; then exit "${TEST_LOCAL_STATUS:-0}"; fi
+exit 0
+'''
+    _ = path.write_text(script.replace("PYTHON FALLBACK", f"{shlex.quote(sys.executable)} {shlex.quote(str(fallback))}"),
+                        encoding="utf-8")
+    path.chmod(0o755)
+
+
 GIT_STUB = r'''#!/bin/bash
 has() { local word; for word in "$@"; do [[ "$word" == "$wanted" ]] && return 0; done; return 1; }
 wanted=check-ignore
@@ -1147,6 +1229,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
     def call_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         """Call the real result and retry functions with private tools and records."""
+        install_fixed_cargo(self.bin_directory / "cargo")
         direct = self.root / "direct-functions"
         direct.mkdir(exist_ok=True)
         library = self.root / "lib"
@@ -1257,6 +1340,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.Popen[str]:
         self.placement_policy = {**self.environment, **(extra or {})}
+
+        install_fixed_cargo(self.bin_directory / "cargo")
         return subprocess.Popen(
             ["bash", str(self.verify_script), *arguments],
             cwd=self.root,
@@ -1402,9 +1487,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
-        survivors = reap(self.child_marker())
-        if survivors:
+        remaining = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
+        if remaining:
+            survivors = reap(self.child_marker())
+            for pid in remaining:
+                _ = survivors.setdefault(pid, "exited before reap")
             commands = "\n".join(f"{pid}: {command}" for pid, command in sorted(survivors.items()))
             self.fail(f"processes outlived the test:\n{commands}")
 

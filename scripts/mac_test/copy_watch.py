@@ -23,6 +23,7 @@ import re
 import select
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from types import FrameType
@@ -32,7 +33,7 @@ from typing import Literal
 from scripts.lib import process_group
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state, offload
-from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
 from scripts.direct import step_record
 from scripts.build_queue import placement, admission_protocol as wire
@@ -600,8 +601,11 @@ class Watch:
             stop_copy(self.copy)
         if isinstance(self.placement, QueuedCopyPlacement):
             submitted = self.placement.request
-            _ = admission_client.cancel_placement(wire.CancelPlacement(
-                admission_client.request_id(), submitted.episode, submitted.owner, "copy watcher ended"))
+            try:
+                _ = admission_client.cancel_placement(wire.CancelPlacement(
+                    admission_client.request_id(), submitted.episode, submitted.owner, "copy watcher ended"))
+            except wire.AdmissionUnavailable as error:
+                print(f"copy_watch: cannot cancel placement: {error}", file=sys.stderr)
 
 
 def wait_for_stop(wakeup: Wakeup) -> WatchReport:

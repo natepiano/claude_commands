@@ -64,7 +64,7 @@ class RunOwnerUnrecorded:
 
 
 def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
-    """Resolve a fixed owner first; older runs can still name their director."""
+    """Resolve the run owner through its fixed staff reference."""
     from scripts.production import staff
 
     reference = fields.get(OWNER_FIELD)
@@ -73,11 +73,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
         if row is None or row.kind not in ("unit", "showrunner"):
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
-    identity = fields.get("main_agent")
-    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
-    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
-    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
+    return RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -93,6 +89,12 @@ def environ(name: str) -> str:
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
     """The folders that hold run folders, the new name first."""
     return (Path(override),) if override else (RUN_ROOT, FORMER_RUN_ROOT)
+
+
+def is_unit_run(folder: Path) -> bool:
+    """Test whether the folder is under a unit run root."""
+    folder = folder.resolve()
+    return any(folder.is_relative_to(root.resolve()) for root in run_roots())
 
 
 def run_temp_path(run: Path) -> Path:
@@ -112,6 +114,14 @@ class RunStaffAtUse(Enum):
     LOCAL = "read the local staff record"
 
 
+@dataclass(frozen=True)
+class LauncherRunDirectories:
+    """Share worker resolution and parent scans within one display."""
+
+    by_worker: dict[staff.StaffId, tuple[Path, ...]]
+    by_session: dict[str, list[str]]
+
+
 
 
 def open_run(session_id: str, *,
@@ -122,6 +132,29 @@ def open_run(session_id: str, *,
     row = (staff.local_by_current_session(session_id) if isinstance(record, RunStaffAtUse)
            else record.by_current_session(session_id))
     return row.run.path if row is not None and isinstance(row.run, staff.OpenRun) else None
+
+
+def run_is_open(folder: Path, *, record: staff.StaffSnapshot | None = None) -> bool:
+    """Read a unit's staff pointer or a helper's unfinished state."""
+    from scripts.production import staff
+
+    folder = folder.resolve()
+    try:
+        raw = cast(object, json.loads((folder / STATE_FILE).read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    fields = cast(dict[str, object], raw)
+    if not is_unit_run(folder):
+        return "status" not in fields
+    record = staff.local_snapshot() if record is None else record
+    reference = fields.get(OWNER_FIELD)
+    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+             next((row for row in record.rows if isinstance(row.run, staff.OpenRun)
+                   and row.run.path.resolve() == folder), None))
+    return (isinstance(owner, staff.StaffRow) and isinstance(owner.run, staff.OpenRun)
+            and owner.run.path.resolve() == folder)
 
 
 def history_root() -> Path:
@@ -221,10 +254,15 @@ def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffA
 
 
 def held_by_session(root_override: str | Path | None = None, *,
-                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL,
+                    additional_roots: Sequence[Path] = ()) -> dict[str, list[str]]:
     """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
-    for folder in run_folders(root_override):
+    folders: dict[Path, Path] = {}
+    for root in (root_override, *additional_roots):
+        for folder in run_folders(root):
+            _ = folders.setdefault(folder.resolve(), folder)
+    for folder in folders.values():
         if (folder / STATE_FILE).is_file():
             found.setdefault(director(folder, record=record), []).append(str(folder))
     return found

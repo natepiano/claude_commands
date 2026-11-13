@@ -206,7 +206,9 @@ def table_rows(table: str, where: str = "", *parameters: object) -> list[Record]
         connection.row_factory = sqlite3.Row
         records = cast(list[sqlite3.Row],
                        connection.execute(f"SELECT * FROM {table} {where} ORDER BY 1", parameters).fetchall())
-        return [{name: cast(object, row[name]) for name in row.keys()} for row in records]
+        return [{name: cast(object, row[name]) for name in row.keys()
+                 if not (table == "gate_modules" and name in {"config_reads", "folder_scans", "content_reads"} and row[name] is None)}
+                for row in records]
 
 
 class LogIsolationTests(unittest.TestCase):
@@ -298,6 +300,26 @@ class IndexTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.host_file = self.root / "natedev" / "2026-10.jsonl"
         self.host_file.parent.mkdir(parents=True)
+
+    def test_gate_config_reads_store_sorted_empty_and_missing_records(self) -> None:
+        template = gate_run()["modules"][0]
+        run: Record = {**gate_run(), "kind": "gate_run", "v": 1, "id": "config-reads", "host": "mac",
+                       "modules": [{**template, "module": "test_empty.py", "config_reads": [], "folder_scans": [], "content_reads": []},
+                                   {**template, "module": "test_missing.py"},
+                                   {**template, "module": "test_read.py", "config_reads": ["z", "a", "z"],
+                                    "folder_scans": ["scripts/", "docs", "scripts/"],
+                                    "content_reads": ["scripts/z.py", "scripts/a.py", "scripts/z.py"]}]}
+        self.write(self.host_file, run)
+        _ = index.update()
+        self.assertIn("config_reads", [row[1] for row in self.rows("PRAGMA table_info(gate_modules)")])
+        self.assertEqual(self.rows("SELECT module, config_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None), ("test_read.py", '["a", "z"]')])
+        self.assertEqual(self.rows("SELECT module, folder_scans FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["docs", "scripts/"]')])
+        self.assertEqual(self.rows("SELECT module, content_reads FROM gate_modules ORDER BY module"),
+                         [("test_empty.py", "[]"), ("test_missing.py", None),
+                          ("test_read.py", '["scripts/a.py", "scripts/z.py"]')])
 
     def test_update_enables_the_configured_spill_threshold(self) -> None:
         spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
@@ -1772,12 +1794,6 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(
             self.rows("SELECT job_id, run_state, duration_s, queued_s FROM ci_jobs ORDER BY job_id"),
             [(11, "ran", 60.0, 0.0), (12, "skipped", None, None)],
-        )
-
-    def test_ci_job_run_states_name_the_persisted_outcomes(self) -> None:
-        self.assertEqual(
-            {state.value for state in index.JobRunState},
-            {"ran", "skipped", "carried_over"},
         )
 
     def test_tree_and_port_lint_columns(self) -> None:

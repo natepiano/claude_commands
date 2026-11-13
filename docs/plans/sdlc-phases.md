@@ -524,3 +524,42 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Gotchas:** `repair` and `committed` take no shared lock, so a checkpoint during a repair of the same phase can lose its pending-release record. The cargo-berth side of the shared release belongs to tile.
 
 **Ruled out:** a repair/checkpoint lock in this phase (a new guard; a next item).
+
+### Phase 22 — Checkpoint notices carry no Parallel line  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint notices carry no `Parallel:` line. `merge_checkpoint.py` takes no `--parallel` argument and has no `check_parallel`.
+- `phase_table.py` has no `parallel` subcommand, no `"parallel"` JSON key and no `CouldStart`, `NothingToStart`, `DependenciesUnknown` or `ParallelCheck` types.
+- `plan_history.plan_phases(plan_path)` reads no `**Depends on:**` line; each `PlanPhase` has `id`, `title` and `done`. `plan_member` stays for `phase_table.py` and `progress_history.py`.
+- `dailies_input.py` prints no `parallel check:` line.
+- The docs keep the `**Depends on:**` rule and the rule that a director starts independent phases itself, with no report line.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — checkpoint merge request checks, without the Parallel line
+- `scripts/direct/phase_table.py` — phase table build and render
+- `scripts/direct/plan_history.py` — plan phase reader
+- `scripts/production/dailies_input.py`, `scripts/production/unit_phases.py` — callers without the parallel data
+- `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
+
+**Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
+
+**Files:**
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows

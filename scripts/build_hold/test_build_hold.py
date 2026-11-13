@@ -23,6 +23,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
 from scripts.production import staff
@@ -37,6 +38,7 @@ from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.lib import test_hang_guard
+from scripts.production.cli_fixture import process_boundary
 
 
 class ImportTests(unittest.TestCase):
@@ -80,7 +82,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "stale-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_board_directory_takes_priority_over_session_directory(self) -> None:
         other_run = self.scratch / "other-run"
@@ -90,7 +92,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "UNIT_SESSION_DIR": str(other_run),
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("board-owner")))
+            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("board-owner")))
 
     def test_a_staff_run_under_either_run_folder_name_owns_the_run(self) -> None:
         for name in ("unit", "delegate"):
@@ -98,7 +100,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             run = self.scratch / name / "run"
             self.owner(identity, run)
             with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(identity))
+                self.assertEqual(build_hold.owning_session(), OwningSession(identity))
 
     def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
         self.owner(fixture_runtime_id("run-owner"), self.unit_run)
@@ -109,7 +111,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                         os.environ["UNIT_RUN_DIR"] = ""
                     else:
                         _ = os.environ.pop("UNIT_RUN_DIR", None)
-                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(fixture_runtime_id("run-owner")))
+                    self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_no_matching_staff_run_falls_back_to_shell_session(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
@@ -117,24 +119,37 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "shell-session",
         }):
-            self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+            self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
+
+    def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
+        identity = fixture_runtime_id("run-owner")
+        self.owner(identity, self.unit_run)
+        missing = self.scratch / "missing-run"
+        cases: tuple[tuple[dict[str, str], build_hold.RunOwner | build_hold.NoRunNamed | build_hold.RunNotInStaff], ...] = (
+            ({"UNIT_RUN_DIR": str(self.unit_run)}, build_hold.RunOwner(identity)),
+            ({}, build_hold.NoRunNamed()),
+            ({"UNIT_RUN_DIR": str(missing)}, build_hold.RunNotInStaff(missing)),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(build_hold.run_resolution(environment), expected)
 
     def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
             with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
-                self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("shell-session"))
+                self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
 
     def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+            self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
-        self.assertEqual(build_hold.owning_session(), build_hold.NoOwningSession())
+        self.assertEqual(build_hold.owning_session(), NoOwningSession())
 
     def test_owner_results_are_frozen(self) -> None:
-        for owner in (build_hold.OwningSession(fixture_runtime_id("run-owner")), build_hold.NoOwningSession()):
+        for owner in (OwningSession(fixture_runtime_id("run-owner")), NoOwningSession()):
             with self.subTest(owner=type(owner).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(owner, "session_id", "changed")
@@ -512,22 +527,24 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             "tmux": "",
         }
         _ = (directory / "renamed-session.json").write_text(json.dumps(record))
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId("renamed-session"))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def test_mac_release_after_session_rename_releases_own_block_and_keeps_others(self) -> None:
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "renamed-session"}):
-            for given in ([], ["--holder", "first-name"], ["--holder", "current-name"]):
+            for given in ([], ["--holder", "session:renamed-session"], ["--holder", "current-name"]):
                 with self.subTest(given=given):
                     self.session("first-name")
                     status, _, errors, calls = self.run_with_mac_stand_in(
                         ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks", "--target", "mac"]])
+                    self.assertEqual(calls, [["block", "--holder", "fixed", "--for", "renderer checks", "--target", "mac"]])
                     self.session("current-name", "first-name", "middle-name")
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"],
-                                             ["unblock", "--holder", "first-name", "--target", "mac"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
                     self.assertEqual(output, "Mac stand-in result\n")
                     self.assertEqual(errors, "Mac stand-in detail\n")
                     self.assertFalse((self.scratch / "stand-in-block-holder").exists())
@@ -539,7 +556,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
                     self.assertEqual(output, "blocked by someone-else\n")
                     self.assertEqual(errors, "")
                     self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
@@ -569,7 +586,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     [*arguments, "--target", "missing", "--holder", "alice"])
                 self.assertEqual(status, 2)
                 self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev, aws"])
+                                 ["unknown target missing; configured targets: mac, natedev"])
                 self.assertEqual(calls, [])
                 self.assert_no_natedev_record()
 
@@ -635,9 +652,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
             with self.subTest(by_id=by_id):
                 result = self.run_cli(folder, "release", "--holder", session_id if by_id else name)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse((folder / session_id).exists())
+                self.assertFalse((folder / ("fixed-" + session_id)).exists())
             # A failing subcase must not leave a hold in the next subcase's fixture.
-            (folder / session_id).unlink(missing_ok=True)
+            (folder / ("fixed-" + session_id)).unlink(missing_ok=True)
 
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"hold", "status", "audit"} else []
@@ -676,6 +693,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
         _ = (self.scratch / "sessions" / f"{session_id}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
+        member = staff.StaffRow(staff.StaffId("fixed-" + session_id), "unit", name, staff.StaffRoot(),
+                                current_session=staff.StaffId(session_id))
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
 
     def hold(self, folder: Path, given: str | None) -> str:
         identity = build_hold.holder_of(given)
@@ -692,40 +712,45 @@ class CommandTests(PrivateReleaseBroadcastTest):
         _ = build_hold.release_cycle(folder, build_hold.held_key(folder, "new-name"))
         rows = recorded_hold_events(self.scratch / "buildlog", 2)
         self.assertEqual([(row["event"], row["hold_key"], row["holder"]) for row in rows],
-                         [("began", "id-1", "old-name"), ("ended", "id-1", "new-name")])
+                         [("began", "fixed-id-1", "old-name"), ("ended", "fixed-id-1", "new-name")])
 
     def test_a_hold_is_kept_by_session_id_so_a_rename_between_hold_and_release_loses_nothing(self) -> None:
         folder = self.scratch / "holders"
         self.session("id-1", "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
             self.assertIn("natedev is held for one test.", self.hold(folder, None))
-        self.assertEqual([path.name for path in folder.iterdir()], ["id-1"])
+        self.assertEqual([path.name for path in folder.iterdir()], ["fixed-id-1"])
         self.session("id-1", "new-name", "old-name")
         holders = build_hold.read_holders(folder)
         assert isinstance(holders, build_hold.ActiveHolders)
-        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "id-1")])
-        # The name it had when it took the hold still finds it, and so does no name at all.
+        self.assertEqual([(holder.name, holder.key) for holder in holders.holders], [("new-name", "fixed-id-1")])
+        # The native ID resolves the fixed member after the staff rename.
         with self.assertRaisesRegex(ValueError, "someone-else held nothing"):
             _ = build_hold.held_key(folder, "someone-else")
-        self.assertEqual(build_hold.held_key(folder, "old-name"), "id-1")
-        self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
+        self.assertEqual(build_hold.held_key(folder, "session:id-1"), "fixed-id-1")
+        self.assertEqual(build_hold.held_key(folder, "new-name"), "fixed-id-1")
+        with self.assertRaisesRegex(ValueError, "old-name held nothing"):
+            _ = build_hold.held_key(folder, "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
-            self.assertEqual(build_hold.held_key(folder, None), "id-1")
-        self.assertEqual(build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "id-1"))), "released, builds may resume.")
+            self.assertEqual(build_hold.held_key(folder, None), "fixed-id-1")
+        self.assertEqual(build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "fixed-id-1"))), "released, builds may resume.")
 
     def test_a_hold_taken_under_a_name_before_is_released_by_the_session_that_had_the_name(self) -> None:
         folder = self.scratch / "holders"
-        # No live session is called this yet, so the hold is kept under the name, as every hold once was.
+        # A holder outside staff keeps its explicit key.
         _ = self.hold(folder, "old-name")
         self.assertEqual([path.name for path in folder.iterdir()], ["old-name"])
         self.session("id-1", "new-name", "old-name")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
-            self.assertEqual(build_hold.held_key(folder, None), "old-name")
-        self.assertEqual(build_hold.held_key(folder, "new-name"), "old-name")
+            with self.assertRaisesRegex(ValueError, "new-name held nothing"):
+                _ = build_hold.held_key(folder, None)
+        with self.assertRaisesRegex(ValueError, "new-name held nothing"):
+            _ = build_hold.held_key(folder, "new-name")
+        self.assertEqual(build_hold.held_key(folder, "old-name"), "old-name")
         # With no name and no session, there is no holder to look up.
         refused = self.run_cli(folder, "hold", "--for", "one test")
         self.assertEqual(refused.returncode, 1)
-        self.assertIn("give --holder: this is not a live Claude session", refused.stderr)
+        self.assertIn("give --holder: this caller has no staff row", refused.stderr)
 
     def test_last_release_sets_aside_each_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
@@ -920,6 +945,21 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
 
     def test_idle_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
+        for variables, expected in (
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds")}, self.scratch / "custom-holds-release"),
+            ({"BUILD_HOLD_DIR": str(self.scratch / "custom-holds"),
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": ".",
+              "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "custom-release")}, self.scratch / "custom-release"),
+            ({"BUILD_HOLD_DIR": "."}, Path.cwd().with_name(Path.cwd().name + "-release")),
+            ({}, self.scratch / ".local/state/build-hold-release"),
+        ):
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in {"BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR"}}
+            environment.update(variables)
+            with self.subTest(variables=variables), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(build_hold.release_directory(), expected)
+                self.assertFalse(expected.exists())
         release = self.scratch / "release"
         self.assertFalse(release.exists())
         for arguments in (
@@ -933,21 +973,25 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            path = folder / "slot-one"
-            fields = cast(dict[str, object], json.loads(path.read_text()))
-            self.assertEqual(fields["holder"], "slot one")
-            self.assertEqual(fields["for"], "the focused test")
-            self.assertEqual(fields["release_eta"], "unknown")
-            self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
-            status = self.run_cli(folder, "status")
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("slot one", status.stdout)
-            self.assertIn("the focused test", status.stdout)
-            self.assertIn("unknown", status.stdout)
+        for options in ((), ("--drain",)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as scratch, \
+                 mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())):
+                folder = Path(scratch)
+                result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test", *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                path = folder / "slot-one"
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(fields["holder"], "slot one")
+                self.assertEqual(fields["for"], "the focused test")
+                self.assertEqual(fields["release_eta"], "unknown")
+                self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
+                if options:
+                    self.assertEqual(result.stdout.splitlines()[-1], "drained")
+                status = self.run_cli(folder, "status")
+                self.assertEqual(status.returncode, 0, status.stderr)
+                self.assertIn("slot one", status.stdout)
+                self.assertIn("the focused test", status.stdout)
+                self.assertIn("unknown", status.stdout)
 
     def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -1177,10 +1221,63 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
             with self.subTest(code=code):
                 result = subprocess.CompletedProcess([], code, "", "recipient refused")
                 with mock.patch.object(subprocess, "run", return_value=result):
-                    self.assertEqual(build_hold.send_release(entry, "/test/socket"), expected)
+                    self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE), expected)
         with mock.patch.object(subprocess, "run", side_effect=OSError("send unavailable")):
-            self.assertEqual(build_hold.send_release(entry, "/test/socket"),
+            self.assertEqual(build_hold.send_release(entry, "/test/socket", build_hold.RELEASE_NOTICE),
                              build_hold.ReleaseSendFailed("send unavailable"))
+
+        for record in ("current-cycle", "old-cycle", "multiple-holders", "recovered-cycle", "broadcast", "same-minute"):
+            with self.subTest(record=record), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "TZ": "UTC"}):
+                texts: list[str] = []
+                starts = ((33, 0, "frame capture", "07:33:00"), (56, 0, "animation capture", "07:56:00"))
+                if record == "same-minute":
+                    starts = ((33, 0, "frame capture", "07:33:00"),
+                              (33, 20, "frame capture", "07:33:20"), (33, 40, "frame capture", "07:33:40"))
+                for minute, second, purpose, shown in starts:
+                    started = datetime(2026, 11, 11, 12, minute, second, tzinfo=timezone.utc)
+                    folder = self.scratch / "holders"
+                    _ = build_hold.start_hold(folder, build_hold.HolderIdentity("fps", "fps"), purpose,
+                                              build_hold.NoReleaseEta(), started)
+                    build_hold.record_recipients([("waiting session", "session-a")])
+                    cycle = build_hold.read_cycle()
+                    assert cycle is not None
+                    if record == "old-cycle":
+                        for holder in cycle["holders"].values():
+                            _ = holder.pop("purpose", None)
+                        build_hold.save_cycle(cycle)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("resources", "resources"),
+                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1))
+                        _ = build_hold.release_cycle(folder, "fps")
+                    key = "resources" if record in ("multiple-holders", "recovered-cycle") else "fps"
+                    if record == "broadcast":
+                        (build_hold.release_directory() / "current").unlink()
+                    if record == "recovered-cycle":
+                        release = build_hold.release_hold
+
+                        def interrupt(directory: Path, holder: build_hold.Holder) -> str:
+                            _ = release(directory, holder)
+                            raise OSError("stopped after unlink")
+
+                        with mock.patch.object(build_hold, "release_hold", side_effect=interrupt), \
+                             self.assertRaisesRegex(OSError, "stopped after unlink"):
+                            _ = build_hold.release_cycle(folder, key)
+                        _ = (build_hold.release_directory() / cycle["id"] / "cycle.json").write_text("broken")
+                    with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+                         mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as send:
+                        _ = build_hold.release_cycle(folder, key)
+                    send.assert_called_once()
+                    arguments = cast(list[str], send.call_args.args[0])
+                    notice = arguments[arguments.index("--all" if record == "broadcast" else "--text") + 1]
+                    texts.append(notice)
+                    if record == "old-cycle":
+                        self.assertIn(f"fps hold, from {shown} EST", notice)
+                    else:
+                        self.assertIn(f"fps hold for {purpose}, from {shown} EST", notice)
+                    if record in ("multiple-holders", "recovered-cycle"):
+                        self.assertIn(f"resources hold for render checks, from 07:{minute + 1}:00 EST", notice)
+                self.assertNotEqual(texts[0], texts[1])
+                self.assertEqual(len(set(texts)), len(texts))
 
 
     def test_empty_or_unavailable_socket_lookup_has_named_results(self) -> None:
@@ -1316,6 +1413,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
         self.assertEqual([(row["event"], row["hold_key"]) for row in self.events()],
                          [("began", "alice")])
 
+    @process_boundary
     def test_recorder_starts_after_release_lock_closes_and_finished_children_are_reaped(self) -> None:
         launched: list[subprocess.Popen[bytes]] = []
         real_popen = subprocess.Popen
@@ -1386,6 +1484,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                             for row in records))
         self.assertFalse((folder / "unsafe-name").exists())
 
+    @process_boundary
     def test_partial_and_final_release_write_end_events_only_after_file_removal(self) -> None:
         folder = self.begin()
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other work",
@@ -1414,6 +1513,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                 time.tzset()
         self.assertIn("holder since 12:00 EDT, for render checks - release eta: 13:00 EDT", output.getvalue())
 
+    @process_boundary
     def test_event_write_failure_keeps_the_hold_notice_and_file(self) -> None:
         with mock.patch.object(subprocess, "Popen", side_effect=OSError("cannot start recorder")):
             folder = self.begin()
@@ -1825,7 +1925,9 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("second waiter", "two")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            holder = "first" if entry["session_id"] == "one" else "second"
+            self.assertIn(f"{holder} hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["two", "one"]:
                 raise OSError("stopped while sending the earlier release")
@@ -1887,6 +1989,26 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
                     self.assertEqual(repeated.returncode, 0, repeated.stderr)
                     self.assertEqual(repeated.stdout.splitlines(), ["hold is already released."])
                     send.assert_not_called()
+
+        member = staff.StaffRow(staff.StaffId("fixed-release-holder"), "producer", "before-rename", staff.StaffRoot(),
+                                current_session=staff.StaffId("release-conversation"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            folder = self.scratch / "holders"
+            _ = build_hold.start_hold(folder, build_hold.holder_of(member.name), "rename recovery",
+                                      build_hold.NoReleaseEta(), self.now)
+            build_hold.record_recipients([("waiting", "rename-recipient")])
+            self.assertEqual(self.stop_release_after_unlink(member.name).returncode, 1)
+            intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
+            assert not isinstance(intent, build_hold.NoReleaseIntent)
+            self.assertEqual(intent["holder_key"], member.id)
+        member = staff.StaffRow(member.id, "producer", "after-rename", member.parent, current_session=member.current_session)
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
+            resumed = invoke_hold(["release", "--holder", member.name], dict(os.environ))
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual([call.args[0]["session_id"] for call in send.call_args_list], ["rename-recipient"])
+            self.assertTrue((build_hold.release_directory() / "receipts" / member.id / "completed-release.json").is_file())
 
     def test_finished_release_reruns_leave_files_and_notices_unchanged(self) -> None:
         self.begin()
@@ -1956,7 +2078,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         build_hold.record_recipients([("first", "one"), ("second", "two"), ("third", "three")])
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             sent.append(entry["session_id"])
             if sent == ["one", "two"]:
                 raise OSError("stopped after sending second notice")
@@ -2017,7 +2140,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             events.append("started" if cycle["release_started_at"] else "released")
             save(cycle)
 
-        def send(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(_entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             self.assertIn("started", events)
             events.append("notice")
@@ -2067,7 +2191,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             self.assertIn("wait for release", build_hold.register_wait(session, session))
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders/holder").exists())
             sent.append(entry["session_id"])
             # Neither session acknowledges or reports that its turn ended.
@@ -2091,7 +2216,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         _ = build_hold.register_wait("two")
         sent: list[str] = []
 
-        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        def send(entry: build_hold.ReleaseEntry, _socket: str, notice: str) -> build_hold.ReleaseDelivered:
+            self.assertIn("holder hold for tests,", notice)
             self.assertFalse((self.scratch / "holders" / "holder").exists())
             self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
             sent.append(entry["session_id"])
@@ -2148,8 +2274,11 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("new-holder", self.cycle()["holders"])
 
     def test_notice_says_builds_can_start_and_needs_no_answer(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
-            _ = build_hold.send_release(build_hold.new_entry("one", "recipient"), "/test")
+        self.begin()
+        build_hold.record_recipients([("recipient", "one")])
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            _ = build_hold.release_cycle(self.scratch / "holders", "holder")
         arguments = cast(list[str], run.call_args.args[0])
         notice = arguments[arguments.index("--text") + 1]
         self.assertIn("Start your builds", notice)
@@ -2161,10 +2290,13 @@ class BuildAuditTests(IsolatedBuildHoldTest):
     proc: Path = Path()
     holders: Path = Path()
     log: Path = Path()
+    claimed: frozenset[build_hold.ProcessIdentity] = frozenset()
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.claimed = frozenset()
+        _ = self.enterContext(mock.patch.object(hold_enforcer, "claimed_processes", side_effect=self.read_claims))
         self.proc = self.scratch / "proc"
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
@@ -2173,6 +2305,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         self.holders.mkdir()
         _ = write_holder(self.holders, "holder", "2026-10-28T12:00:00+00:00", "app test")
         self.log = self.scratch / "buildlog"
+
+    def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
+        self.assertEqual(proc_root, self.proc)
+        return build_hold.LiveClaims(self.claimed)
 
     def process(self, pid: int, command: str, *, parent: int = 1, start: int = 0,
                 environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:
@@ -2211,14 +2347,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
     def enforce_builds(self) -> tuple[list[tuple[int, int]], tuple[hold_enforcer.BuildDecision, ...]]:
         table = hold_enforcer.read_processes(self.proc, os.getuid(), self.scratch / "cgroup")
         holders = build_hold.natedev_holds(self.holders).in_force
-        decisions = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+        decisions = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
         signals: list[tuple[int, int]] = []
         stopper = hold_enforcer.StopBuildsAndTests(
             self.proc, signal_process=lambda pid, signum: signals.append((pid, signum)),
         )
         for decision in decisions:
             if isinstance(decision, hold_enforcer.WouldStopBuild):
-                stopper.stop(decision, table, holders, 999)
+                stopper.stop(decision, table, holders, 999, self.claimed)
         return signals, decisions
 
     def assert_gate_job_stopped(self) -> None:
@@ -2284,7 +2420,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                                       build_hold.audit_ancestors(table[20], table)], [10])
                     self.assertNotIn("BUILDLOG_CALL_ID", table[20].environment)
                     holders = build_hold.natedev_holds(self.holders).in_force
-                    before = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    before = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
                     self.assertEqual([decision.process.identity.pid for decision in before], [10, 20])
                     for decision in before:
                         self.assertIsInstance(decision, hold_enforcer.WouldStopBuild)
@@ -2295,7 +2431,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                         (build_hold.ProcessIdentity(kept_pid, str(kept_pid * 10)),),
                     )
                     holders = build_hold.natedev_holds(self.holders).in_force
-                    kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999)
+                    kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
                     self.assertEqual([decision.process.identity.pid for decision in kept], [10, 20])
                     for decision in kept:
                         self.assertIsInstance(decision, hold_enforcer.KeptBuild)
@@ -2306,10 +2442,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                     )
                     for decision in before:
                         if isinstance(decision, hold_enforcer.WouldStopBuild):
-                            stopper.stop(decision, table, holders, 999)
+                            stopper.stop(decision, table, holders, 999, self.claimed)
                     for pid in (10, 20):
                         stopper.terminating[table[pid].identity] = 0
-                    stopper.kill_survivors(table, holders, 999)
+                    stopper.kill_survivors(table, holders, 999, self.claimed)
                     self.assertEqual(signals, [])
                     self.assertEqual(stopper.terminating, {})
                     self.assertEqual(self.rows(), [])
@@ -2330,6 +2466,16 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                          [(10, "holder"), (21, "admitted"), (30, "other_session"), (40, "no_session")])
         self.assertEqual([item.pid for item in builds[1].children], [22, 23, 24])
 
+        _ = self.process(35, "python3", parent=30, argv=("python3", "offload.py", "check"))
+        self.claimed = frozenset({build_hold.ProcessIdentity(35, "350")})
+        builds = self.builds()
+        claimed = next(item for item in builds if item.process.identity.pid == 30)
+        self.assertEqual(claimed.classification, "claimed")
+        self.assertIn("holds a live Mac or AWS claim: other, pid 30", "\n".join(build_hold.audit_lines(builds)))
+        self.claimed = frozenset()
+        ended = next(item for item in self.builds() if item.process.identity.pid == 30)
+        self.assertEqual(ended.classification, "other_session")
+
     def test_nearest_agent_ancestor_with_unreadable_environment(self) -> None:
         _ = self.process(10, "claude", environment={"CLAUDE_CODE_SESSION_ID": "farther"})
         _ = self.process(20, "codex", parent=10, environment={"CODEX_THREAD_ID": "nearer"})
@@ -2338,14 +2484,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         (directory / "environ").unlink()
         (directory / "environ").mkdir()
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("nearer"))
+        self.assertEqual(build.owner, OwningSession("nearer"))
         self.assertEqual(build.classification, "other_session")
 
     def test_claude_ancestor_without_session_id_has_process_identity(self) -> None:
         _ = self.process(10, "claude")
         _ = self.process(20, "cargo", parent=10)
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("claude:10:100"))
+        self.assertEqual(build.owner, OwningSession("claude:10:100"))
 
     def test_worker_run_maps_to_owning_session_without_changing_environment(self) -> None:
         with isolated_staff_file(self.scratch / "staff.json", {}):
@@ -2355,14 +2501,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = write_holder(self.holders, owner.current_session, "2026-10-28T12:00:00+00:00", "app test")
         _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession(owner.current_session))
+        self.assertEqual(build.owner, OwningSession(owner.current_session))
         self.assertEqual(build.classification, "holder")
         self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
 
     def test_session_environment_precedes_worker_mapping(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "direct", "UNIT_RUN_DIR": "/unit/run"})
         build, = self.builds()
-        self.assertEqual(build.owner, build_hold.OwningSession("direct"))
+        self.assertEqual(build.owner, OwningSession("direct"))
 
     def test_second_holder_means_caller_does_not_hold_only_its_own(self) -> None:
         _ = write_holder(self.holders, "second", "2026-10-28T12:00:00+00:00", "app test")
@@ -2378,7 +2524,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
             _ = self.process(20, "cargo", parent=10, start=200)
             build, = self.builds()
         self.assertEqual(build.classification, "no_session")
-        self.assertEqual(build.owner, build_hold.NoOwningSession())
+        self.assertEqual(build.owner, NoOwningSession())
 
     def test_durable_grant_is_admitted_before_the_next_service_pass(self) -> None:
         fixture = self.admission_fixture
@@ -2436,12 +2582,15 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def test_build_scope_marks_admission_without_memory_reservation(self) -> None:
         directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
-        _ = (directory / "cgroup").write_text("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "admitted")
-        _ = (directory / "cgroup").write_text("0::/user.slice/not-builds.slice/run-123.scope\n")
-        build, = self.builds()
-        self.assertEqual(build.classification, "other_session")
+        for cgroup, classification in (
+            ("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n", "admitted"),
+            ("0::/user.slice/not-builds.slice/run-123.scope\n", "other_session"),
+            ("0::/user.slice/user-1000.slice/builds.slice/builds-detached.slice/run-123.scope\n", "other_session"),
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = (directory / "cgroup").write_text(cgroup)
+                build, = self.builds()
+                self.assertEqual(build.classification, classification)
 
     def test_two_passes_record_once_per_build_per_hold_and_new_pid_lifetime(self) -> None:
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
@@ -2525,6 +2674,37 @@ with mock.patch("sys.exit", side_effect=exit_code):
                 self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)
             self.assertIn("Build audit unavailable:", output.getvalue())
             self.assertTrue((self.holders / "holder").is_file())
+
+        _ = self.process(60, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "reader-owner"})
+        for reading in ("unreadable", "claim after table"):
+            with self.subTest(claim_read=reading):
+                events: list[str] = []
+                read_table = build_hold.read_audit_processes
+
+                def table_before_claims(proc_root: Path) -> dict[int, build_hold.AuditProcess]:
+                    table = read_table(proc_root)
+                    events.append("table")
+                    return table
+
+                def read_after_table(proc_root: Path) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
+                    self.assertEqual(proc_root, self.proc)
+                    events.append("claims")
+                    self.assertEqual(events, ["table", "claims"])
+                    if reading == "unreadable":
+                        return build_hold.ClaimsUnreadable("private claims are damaged")
+                    return build_hold.LiveClaims(frozenset({build_hold.ProcessIdentity(60, "600")}))
+
+                errors = io.StringIO()
+                with mock.patch.object(build_hold, "read_audit_processes", side_effect=table_before_claims), \
+                     mock.patch.object(hold_enforcer, "claimed_processes", side_effect=read_after_table), \
+                     redirect_stderr(errors):
+                    builds = self.builds()
+                build, = builds
+                self.assertEqual(build.process.identity.pid, 60)
+                self.assertEqual(build.classification, "other_session" if reading == "unreadable" else "claimed")
+                self.assertIn("pid 60", "\n".join(build_hold.audit_lines(builds)))
+                self.assertEqual(errors.getvalue().splitlines(),
+                                 ["claims unreadable: private claims are damaged"] if reading == "unreadable" else [])
 
 
 if __name__ == "__main__":

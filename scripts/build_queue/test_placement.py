@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 from typing import TextIO, cast, override
 
-from scripts.build_hold.build_hold import NoOwningSession, OwningSession
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope

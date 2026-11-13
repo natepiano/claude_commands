@@ -25,7 +25,6 @@ from scripts.buildlog.moments import COLD_BUILD_MIN_CRATES
 from scripts.buildlog import store
 from scripts.buildlog import record
 from scripts.buildlog import sync, rust_release, aws_report
-from scripts.mac_test import mac_test
 from scripts.buildlog.mac_outcome import (
     DECLINE_REASONS,
     CacheReuse,
@@ -53,7 +52,7 @@ from scripts.buildlog.mac_outcome import (
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.aws_target import config as aws_config, ledger, measurement
-from scripts.build_targets.target_config import SshTarget, is_aws_target, read_targets
+from scripts.build_targets.target_config import ssh_target_state_directory
 
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
@@ -2272,13 +2271,20 @@ def disk_section() -> list[str]:
         rows.append([free_label, gib(snapshot["free"])])
     rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
                 for reason in snapshot.get("output_unavailable", []))
-    measured = sync.sync_time(snapshot["measured_at"], datetime.now())
+    now = datetime.now()
+    measured = sync.sync_time(snapshot["measured_at"], now)
+    capacity_measured_at = snapshot.get("capacity_measured_at", snapshot["measured_at"])
+    if capacity_measured_at != snapshot["measured_at"]:
+        capacity = sync.sync_time(capacity_measured_at, now)
+        measurement = f"Folder sizes measured by the buildlog disk job at {measured}; free and used space at {capacity}"
+    else:
+        measurement = f"Measured by the buildlog disk job at {measured}"
     return [
         f"### Disk: {snapshot['host']}",
         "",
         *table(["Where", "Size"], rows),
         "",
-        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        f"{measurement}: allocated blocks, each hard-linked file once.",
         "",
     ]
 
@@ -2311,77 +2317,67 @@ def peer_sync_lines() -> list[str]:
 
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
-    configured = tuple(item for item in read_targets() if isinstance(item, SshTarget) and is_aws_target(item))
-    return [line for target in configured for line in aws_target_section(connection, day, target, len(configured) > 1)]
-
-
-def aws_target_section(connection: sqlite3.Connection, day: str, configured: SshTarget, multiple: bool) -> list[str]:
-    target = configured.name
-    directory = mac_test.state_paths(target).directory
+    settings = conf.path('aws_target')
+    directory = ssh_target_state_directory('aws')
     instant = int(time.time())
     spends: tuple[ledger.DailySpend, ...] = ()
     daily_limit = Decimal(0)
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
-        snapshot = measurement.read_measurement(configured.settings, directory, instant, inputs=inputs)
-        usage = measurement.daily_usage(configured.settings, directory, day, instant, inputs=inputs)
+        snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
+        usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
         if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
             spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
             daily_limit = inputs.settings.daily_limit_usd
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
-    saving = aws_report.estimate_wait_saved(connection, day, target, bounds=day_range(day))
-    lines = [f'### AWS: {target}' if multiple else '### AWS', '']
-    dollars = uptime = 'unavailable'
-    ratio = 'cost per saved hour unavailable'
-    if isinstance(usage, measurement.DailyUsage):
-        dollars = f'{usage.usd:.2f}'
-        uptime = f'{usage.uptime_s / 3600:.2f}'
-    saved = 'queue wait saved unavailable'
-    if isinstance(saving.queue_saved_s, Decimal):
-        hours = saving.queue_saved_s / Decimal(3600)
-        saved = f'about {hours:.2f} h of queue wait saved'
-        ratio = 'unavailable per saved hour'
-        if isinstance(usage, measurement.DailyUsage) and hours > 0:
-            ratio = f'${usage.usd / hours:.2f} per saved hour'
-    lines.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
-    if isinstance(saving.run_saved_s, Decimal):
-        lines.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
-    else:
-        lines.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
-    if isinstance(snapshot, measurement.MeasurementUnavailable):
-        lines.append(f'AWS measurement unavailable: {snapshot.reason}.')
-    else:
-        for reading in snapshot.charge_reads:
-            if ledger.is_billed_day(reading) and reading.period_end <= instant:
-                lines.extend(aws_report.bill_lines(reading, directory))
-        today = datetime.fromtimestamp(instant, UTC).date().isoformat()
-        current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
-        for spend in spends:
-            if spend.source == 'AWS bill' or (current_report and spend.day == today):
-                lines.extend(aws_report.spend_lines(spend, daily_limit, today=spend.day == today))
-        if isinstance(snapshot.go_live_at, int):
-            boundary = store.utc_iso(snapshot.go_live_at)
-            periods: list[list[object]] = []
-            for relation in ('<', '>='):
-                rows = fetch(connection, "SELECT sum(coalesce(mem_wait_s,0)) FROM steps WHERE "
-                             + natedev_step_predicate() + f' AND started_at {relation} ?'
-                             + " GROUP BY date(started_at,'localtime') ORDER BY date(started_at,'localtime')", boundary)
-                periods.append([row[0] for row in rows])
-            before, after = periods
-            lines.append('Natedev daily summed queue wait before go-live: '
-                         + (', '.join(seconds(value) for value in before) if before else 'unavailable')
-                         + '; after go-live: ' + (', '.join(seconds(value) for value in after) if after else 'unavailable')
-                         + '; unmatched for load.')
+    saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
+    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+    last_estimate_day = today if current_report else day
+    newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
+    shown = sorted((spend for spend in spends if spend.source == 'AWS bill'
+                    or newest_bill_day < spend.day <= last_estimate_day),
+                   key=lambda spend: spend.day, reverse=True)
+    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, daily_limit, today)]
+    notes: list[str] = []
+    if saving.steps > 0:
+        dollars = uptime = 'unavailable'
+        ratio = 'cost per saved hour unavailable'
+        if isinstance(usage, measurement.DailyUsage):
+            dollars = f'{usage.usd:.2f}'
+            uptime = f'{usage.uptime_s / 3600:.2f}'
+        saved = 'queue wait saved unavailable'
+        if isinstance(saving.queue_saved_s, Decimal):
+            hours = saving.queue_saved_s / Decimal(3600)
+            saved = f'about {hours:.2f} h of queue wait saved'
+            ratio = 'unavailable per saved hour'
+            if isinstance(usage, measurement.DailyUsage) and hours > 0:
+                ratio = f'${usage.usd / hours:.2f} per saved hour'
+        notes.append(f'AWS: up {uptime} h, {saving.steps} steps, {saved} for ${dollars} ({ratio}, estimated).')
+        if isinstance(saving.run_saved_s, Decimal):
+            notes.append(f'Estimated run time saved: {saving.run_saved_s / Decimal(3600):.2f} h. Negative differences remain included.')
         else:
-            lines.append('Natedev daily queue wait before and after go-live: unavailable; unmatched for load.')
-    status = sync.read_status(target)
-    if isinstance(status, sync.SyncStatus) and isinstance(status.last_good, sync.LastSynced):
-        lines.append(f'AWS report data synchronized at {sync.sync_time(status.last_good.at, datetime.fromtimestamp(instant))}.')
+            notes.append('Estimated run time saved: unavailable; matching command comparisons are missing.')
+    if isinstance(snapshot, measurement.MeasurementUnavailable):
+        notes.append(f'AWS measurement unavailable: {snapshot.reason}.')
     else:
-        lines.append('AWS report data never synchronized; run buildlog sync.')
-    return [*lines, '']
+        fees = sum((spend.query_usd for spend in shown), Decimal(0))
+        bill_read = ''
+        if snapshot.charge_reads:
+            at = max(reading.at for reading in snapshot.charge_reads)
+            bill_read = datetime.fromtimestamp(at, user_zone()).strftime('Bill read %Y-%m-%d %H:%M %Z. ')
+        notes.append(f'{bill_read}Ledger query fees for these days: ${fees:.2f}.')
+    notes.append('Spot compute can include the older Spot builder.')
+    try:
+        days = conf.read(settings).whole('gate_type_window_days')
+        comparison = aws_report.gate_type_report(directory, day, days)
+        lines.extend(comparison.tables)
+        notes.append(comparison.source)
+    except (OSError, ValueError, ArithmeticError, KeyError) as error:
+        notes.append(f'Gate type comparison unavailable: {error}.')
+    return [*lines, *(f'- {note}' for note in notes), '']
 
 
 def lead_block(

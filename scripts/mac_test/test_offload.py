@@ -428,6 +428,11 @@ class OffloadSettingsTests(unittest.TestCase):
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
             self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / ".local/state/build-targets/aws")
             self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "build-targets")}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "build-targets/aws")
+                self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": "~/private-targets", "HOME": str(self.root)}):
+                self.assertEqual(offload.ssh_target_state_directory("aws"), self.root / "private-targets/aws")
 
     def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
         for target in (".", "..", "../aws", "/tmp/aws", "aws/other"):
@@ -637,7 +642,7 @@ class OffloadSettingsTests(unittest.TestCase):
         from scripts.build_queue import admission_protocol as wire, placement
         from scripts.build_queue.admission_test_support import AdmissionFixture
         from scripts.build_queue import admission_records as records
-        from scripts.build_hold.build_hold import NoOwningSession
+        from scripts.build_hold.owning_session import NoOwningSession
 
         _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
         fixture = self.enterContext(AdmissionFixture(root=self.root))
@@ -863,6 +868,12 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  template="mac_test")
         self.config["offload"] = "off"
         self.sync_config()
+        linux_settings = self.root / "linux.conf"
+        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
+            + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")
+        self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
         request_placement = admission_client.request_placement
 
         def submit(request: wire.PlacementRequest
@@ -872,10 +883,29 @@ class OffloadCommandTests(OffloadCommandFixture):
                              [placement.ExplicitProviderSettings(alternate.resolve())])
             return request_placement(request)
 
-        for settings in (alternate, alternate.relative_to(self.root)):
-            with self.subTest(settings=settings), mock.patch.object(admission_client, "request_placement", side_effect=submit):
+        for target, settings in (("", alternate), ("", alternate.relative_to(self.root)),
+                                 ("mac", alternate), ("mac", Path(alternate.name)),
+                                 ("builder", alternate)):
+            with self.subTest(target=target, settings=settings), mock.patch.object(admission_client, "request_placement", side_effect=submit):
                 self.clear_events()
-                result = self.command(settings=settings, direct_placement=True)
+                options = ("--target", target) if target else ()
+                if target == "builder":
+                    with (
+                        mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                        mock.patch.object(offload, "trusted_linux_source", return_value=True),
+                        mock.patch.object(offload, "recorded_linux_version_mismatch", return_value=""),
+                        mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
+                        mock.patch.object(offload, "expected_linux_parity", return_value={}),
+                        mock.patch.object(offload, "copy_tracked_scripts", return_value=False) as scripts_copy,
+                    ):
+                        result = self.command(settings=settings, runner_options=options, separate_stderr=True)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(str(alternate.resolve()), result.stderr)
+                    self.assertIn(str(linux_settings.resolve()), result.stderr)
+                    self.assertEqual(self.events_for("rsync"), [])
+                    scripts_copy.assert_not_called()
+                    continue
+                result = self.command(settings=settings, runner_options=options, direct_placement=True)
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assert_wire("passed", "")
                 ssh = self.events_for("ssh")

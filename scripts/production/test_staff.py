@@ -26,10 +26,11 @@ from scripts.production import staff
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
-from scripts.lib import unit_runs
-from scripts.message import sessions
+from scripts.lib import transcripts, unit_runs
+from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.transcript_test_support import compressed_copy
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -148,7 +149,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
 
         _, parent, member = self.tree()
         with mock.patch.object(pane_launch, "staff_admitted", wraps=pane_launch.staff_admitted) as publication:
-            _ = staff.ensure("agent", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
+            _ = staff.ensure("producer", name="TEST-no-pane-read", runtime_id=fixture_runtime_id("TEST-no-pane-read"))
             _ = staff.ensure_worker(staff.native_id(fixture_runtime_id("TEST-no-worker-pane-read")), "TEST-new", parent.id)
             _ = staff.update_current_session(member.current_session, staff.native_id(fixture_runtime_id("TEST-next-native")))
         publication.assert_not_called()
@@ -191,6 +192,50 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         self.assertEqual(staff.backend(worker), staff.ClaudeBackend())
         registry.unlink()
         self.assertIsInstance(staff.backend(worker), staff.BackendUnavailable)
+
+    def test_codex_backend_requires_the_recorded_home_to_hold_the_transcript(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        shared = Path.home() / ".codex" / "sessions"
+        shared.mkdir(parents=True)
+        numbered = Path.home() / ".codex1"
+        numbered.mkdir()
+        (numbered / "sessions").symlink_to(shared, target_is_directory=True)
+        absent = Path.home() / ".codex2"
+        absent.mkdir()
+        sibling = Path.home() / ".codex3"
+        sibling.mkdir()
+        (sibling / "sessions").symlink_to(shared, target_is_directory=True)
+        expected_backends: dict[staff.StaffId, staff.CodexBackend] = {}
+        for label, home, expected in (
+            ("recorded", staff.SessionHome(numbered), staff.CodexBackend(numbered)),
+            ("shared", staff.SessionHome(sibling), staff.CodexBackend(sibling)),
+            ("unknown", staff.HomeUnknown(), staff.BACKEND_UNAVAILABLE),
+            ("absent", staff.SessionHome(absent), staff.BACKEND_UNAVAILABLE),
+        ):
+            with self.subTest(home=label):
+                native = staff.native_id(fixture_runtime_id(label))
+                row = staff.ensure_worker(native, label, unit.id)
+                transcript = shared / f"{native}.jsonl"
+                transcript.touch()
+                if isinstance(home, staff.SessionHome):
+                    row = staff.set_home(row.id, home)
+                if isinstance(expected, staff.CodexBackend):
+                    expected_backends[row.id] = expected
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(shared.parent)}):
+                    for compressed in (False, True):
+                        with self.subTest(compressed=compressed):
+                            if compressed:
+                                _ = compressed_copy(transcript)
+                            with mock.patch.object(transcripts, "transcript_paths", wraps=transcripts.transcript_paths) as listed:
+                                self.assertEqual(staff.backend(row), expected)
+                                backends = staff.local_snapshot().backends
+                                self.assertEqual(backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
+                            self.assertEqual(dict(backends), expected_backends)
+                            self.assertEqual(
+                                [cast(Path, call.args[0]).resolve() for call in listed.call_args_list].count(shared),
+                                2,
+                            )
 
     def test_agent_environment_removes_launch_and_editor_configuration(self) -> None:
         environment = {"MODELS_LAUNCH_CONFIGURATION": "launch-generation",
@@ -259,22 +304,22 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         self.assertEqual(staff.by_id(holder.id), holder)
 
 
-    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+    def test_guarded_cli_adds_a_producer_without_a_parent_and_reads_its_locations(self) -> None:
         identity = fixture_runtime_id("morty-agent")
         for field, state in (("worktree", "present"), ("doc", "live")):
             with self.subTest(field=field):
                 self.staff_file.unlink(missing_ok=True)
-                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                result = self.cli("ensure", "producer", "--name", "morty", "--runtime-id", identity,
                                   "--" + field, "natedev", str(self.root / "morty"), state, "--json")
                 payload = cast(object, json.loads(result.stdout))
                 row = staff.StaffRow.from_json(payload)
                 self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
-                                 (identity, identity, "agent", "morty", staff.StaffRoot()))
+                                 (identity, identity, "producer", "morty", staff.StaffRoot()))
                 self.assertEqual(staff.snapshot().rows, (row,))
                 self.assertEqual(staff.by_path("morty"), row)
-                shown = self.cli("show", "--kind", "agent")
+                shown = self.cli("show", "--kind", "producer")
                 self.assertIn("morty", shown.stdout)
-                self.assertIn("agent", shown.stdout)
+                self.assertIn("producer", shown.stdout)
                 self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
 
     def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
@@ -361,7 +406,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         _, _, worker = self.tree()
         _ = self.session_record(worker.id, worker.name)
         before = self.staff_file.read_bytes()
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
             with self.assertRaisesRegex(staff.StaffRefused, worker.id):
                 _ = staff.retire(worker.id)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -872,14 +917,14 @@ class StaffTests(StaffCommandTestCase):
             pane_launch.write(path, launch)
             self.assertEqual(staff.snapshot().by_id(owner.id), replace(owner,
                 home=staff.SessionHome(Path.home() / ".claude")))
-            self.assertEqual(pane_launch.read_strict(path)["w1:p1"]["session_id"], owner.id)
+            self.assertEqual(pane_launch.read_strict(path)["w1:p1"].get("staff_id"), owner.id)
         self.assertTrue((module_root / "staff.json").is_file())
         self.assertEqual((folder_bytes(inherited_staff), folder_bytes(inherited_launches)), before)
 
     def test_stopped_test_owner_removal_is_unchanged_on_a_second_run(self) -> None:
         row = fixture_member("showrunner", name="fixture",
             doc=staff.LiveDoc("natedev", self.root / "merge-gate-fixture/production.md"))
-        with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
             self.assertEqual(staff._remove_test_fixture(row.id), staff.FixtureRemoved(row))  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(staff.snapshot().by_id(row.id))
             before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
@@ -967,7 +1012,7 @@ class StaffTests(StaffCommandTestCase):
                 _ = staff.set_doc(fixture.id, staff.LiveDoc("natedev", Path("/srv/staff-guard/production.md")))
             self.assertEqual(primary_file.read_bytes(), before)
 
-            with mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
                 self.assertEqual(staff._remove_test_fixture(fixture.id), staff.FixtureRemoved(fixture))  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(staff.snapshot().rows, (changed,))
 
@@ -1181,7 +1226,7 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(record.by_path("unfilled/removed"), units[2])
         self.assertCountEqual(record.find(), [*runners, *units])
 
-    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_agents(self) -> None:
+    def test_local_and_remote_retire_keep_owners_and_remove_selected_workers_and_producers(self) -> None:
         runner, unit, worker = self.tree()
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
@@ -1189,7 +1234,7 @@ class StaffTests(StaffCommandTestCase):
                     self.assert_refused(lambda: staff.retire(row.id))
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                agent = fixture_member("agent", name="test-agent-" + machine)
+                agent = fixture_member("producer", name="test-agent-" + machine)
                 self.assertEqual(staff.retire(agent.id), agent)
                 self.assertIsNone(staff.by_id(agent.id))
         self.assertEqual(staff.retire(worker.id), worker)
@@ -1247,7 +1292,8 @@ class StaffTests(StaffCommandTestCase):
 
     def test_staff_writes_keep_unknown_row_location_and_pause_fields(self) -> None:
         runner, unit, worker = self.tree()
-        for row, other, key, state in ((unit, runner, "worktree", "present"),
+        for row, other, key, state in ((unit, runner, "worktree", "parked"),
+                                       (unit, runner, "worktree", "present"),
                                        (unit, runner, "worktree", "removed"),
                                        (runner, unit, "doc", "live"),
                                        (runner, unit, "doc", "wrapped")):
@@ -1257,6 +1303,8 @@ class StaffTests(StaffCommandTestCase):
                                "future_location": ["retained", {"revision": 2}]},
                          "paused": {"since": "2026-11-06T16:54:00-05:00", "by": "owner", "why": "review",
                                     "future_pause": {"enabled": True}}}
+                if state == "parked":
+                    value[key] = {**cast(dict[str, object], value[key]), "state": "removed", "branch": "feature/parked"}
                 _ = self.write_document({"schema": 2, "rows": [value, other.to_json(), worker.to_json()]})
                 current = staff.snapshot().by_id(row.id)
                 assert current is not None
@@ -1264,6 +1312,9 @@ class StaffTests(StaffCommandTestCase):
                 location = current.worktree if key == "worktree" else current.doc
                 assert isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc))
                 self.assertEqual(location.unknown_fields, {"future_location": ["retained", {"revision": 2}]})
+                if state == "parked":
+                    assert isinstance(location, staff.RemovedWorktree)
+                    self.assertEqual(location.branch, staff.ParkedBranch("feature/parked"))
                 assert isinstance(current.paused, staff.Paused)
                 self.assertEqual(current.paused.unknown_fields, {"future_pause": {"enabled": True}})
                 _ = staff.rename(other.id, "other-" + state)

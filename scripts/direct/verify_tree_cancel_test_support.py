@@ -171,7 +171,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "PACKAGE_ROOT": str(self.workspace), "TEST_METADATA": json.dumps(metadata),
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
-            "UNIT_TEAM_ROLE": "test", "CLAUDE_PYTHON": sys.executable,
+            "UNIT_TEAM_ROLE": "test",
             "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })
@@ -234,9 +234,15 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             supervisor = """
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
+
+def deliver_result(path: Path) -> int:
+    return detached_runs.main(["deliver", str(path)])
+
 with (patch.object(detached_runs, "deliver", return_value="private fixture"),
+      patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver_result),
       patch.object(detached_runs.staff, "local_snapshot", return_value=detached_runs.staff.StaffSnapshot(()))):
     raise SystemExit(detached_runs.main(["supervise", sys.argv[1]]))
 """

@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
-Kind = Literal["showrunner", "unit", "worker", "agent"]
-_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "agent")
+Kind = Literal["showrunner", "unit", "worker", "producer"]
+_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
 WorkerRole = Literal["impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 WORKER_ROLES: tuple[WorkerRole, ...] = ("impl", "test", "review", "fix", "astra-designer", "astra-reviewer")
 
@@ -134,7 +134,7 @@ def runtime_id(pid: int | None = None) -> str:
     """Read the exact Claude registry pid, or the caller's Codex runtime identity."""
     import subprocess
     from scripts.agents import worker_lifecycle
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
 
     if pid is None and (thread := os.environ.get("CODEX_THREAD_ID", "")):
         try:
@@ -221,9 +221,26 @@ class PresentWorktree:
 
 
 @dataclass(frozen=True)
+class ParkedBranch:
+    """The branch retained when a unit removes its worktree."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value or any(character.isspace() for character in self.value):
+            raise StaffRefused(f"invalid parked branch: {self.value!r}")
+
+
+@dataclass(frozen=True)
+class BranchUnrecorded:
+    """The removed location has no retained branch."""
+
+
+@dataclass(frozen=True)
 class RemovedWorktree:
     machine: str
     path: Path
+    branch: ParkedBranch | BranchUnrecorded = field(default_factory=BranchUnrecorded)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
@@ -358,6 +375,9 @@ class StaffRow:
         if not isinstance(self.worktree, WorktreeUnfilled):
             value["worktree"] = {**self.worktree.unknown_fields, "machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
+        if isinstance(self.worktree, RemovedWorktree) and isinstance(self.worktree.branch, ParkedBranch):
+            location = cast(dict[str, object], value["worktree"])
+            location["branch"] = self.worktree.branch.value
         if not isinstance(self.doc, DocUnfilled):
             value["doc"] = {**self.doc.unknown_fields, "machine": self.doc.machine, "path": str(self.doc.path),
                             "state": "live" if isinstance(self.doc, LiveDoc) else "wrapped"}
@@ -418,7 +438,7 @@ def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktre
     for key in ("worktree", "doc"):
         if key not in fields:
             continue
-        if kind not in ("agent", "unit" if key == "worktree" else "showrunner"):
+        if kind not in ("producer", "unit" if key == "worktree" else "showrunner"):
             raise StaffUnreadable(f"{kind} cannot hold {key}")
         raw = fields[key]
         if not isinstance(raw, dict):
@@ -430,10 +450,20 @@ def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktre
         machine, path, state = (location.get(item) for item in ("machine", "path", "state"))
         if not isinstance(machine, str) or not isinstance(path, str):
             raise StaffUnreadable(f"invalid {key} location")
-        unknown_fields = _unknown_fields(location, required)
+        known = required | {"branch"} if key == "worktree" and state == "removed" else required
+        unknown_fields = _unknown_fields(location, known)
         try:
             if key == "worktree" and state in ("present", "removed"):
-                worktree = PresentWorktree(machine, Path(path), unknown_fields=unknown_fields) if state == "present" else RemovedWorktree(machine, Path(path), unknown_fields=unknown_fields)
+                if state == "present":
+                    worktree = PresentWorktree(machine, Path(path), unknown_fields=unknown_fields)
+                else:
+                    branch: ParkedBranch | BranchUnrecorded = BranchUnrecorded()
+                    if "branch" in location:
+                        raw_branch = location["branch"]
+                        if not isinstance(raw_branch, str):
+                            raise StaffUnreadable("worktree.branch must be a string")
+                        branch = ParkedBranch(raw_branch)
+                    worktree = RemovedWorktree(machine, Path(path), branch, unknown_fields=unknown_fields)
             elif key == "doc" and state in ("live", "wrapped"):
                 doc = LiveDoc(machine, Path(path), unknown_fields=unknown_fields) if state == "live" else WrappedDoc(machine, Path(path), unknown_fields=unknown_fields)
             else:
@@ -738,12 +768,6 @@ def _file() -> Path:
     return Path(_file_override() or _default_file()).expanduser()
 
 
-def folder_move_path(unit: StaffId) -> Path:
-    """Keep move progress beside the selected staff record."""
-    _ = native_id(unit)
-    return _file().parent / "folder_moves" / f"{unit}.json"
-
-
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     from scripts.agents import remote
@@ -901,7 +925,7 @@ def operation() -> AbstractContextManager[None]:
 
 
 def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
-    return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
+    return () if kind == "producer" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
 def validate_name(kind: Kind, name: str) -> None:
@@ -930,9 +954,9 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.current_session in sessions:
             raise StaffRefused(f"duplicate current session: {row.current_session}")
         sessions.add(row.current_session)
-        if row.kind not in ("unit", "agent") and not isinstance(row.worktree, WorktreeUnfilled):
+        if row.kind not in ("unit", "producer") and not isinstance(row.worktree, WorktreeUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold worktree")
-        if row.kind not in ("showrunner", "agent") and not isinstance(row.doc, DocUnfilled):
+        if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold doc")
         if isinstance(row.worktree, PresentWorktree):
             location = (row.worktree.machine, row.worktree.path)
@@ -948,7 +972,7 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         names.add(key)
     for row in rows:
         if isinstance(row.parent, StaffRoot):
-            if row.kind not in ("showrunner", "agent"):
+            if row.kind not in ("showrunner", "producer"):
                 raise StaffRefused(f"{row.kind} {row.name} requires a parent")
         elif row.parent.id not in unknown:
             parent = indexed.get(row.parent.id)
@@ -1043,8 +1067,9 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
-    """Find worker sessions with one scan of each home."""
-    from scripts.message import sessions
+    """Find worker sessions with one scan of each real session folder."""
+    from scripts.lib.transcripts import transcript_paths, uncompressed_path
+    from scripts.message import session_records as sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
     observe_home = cast(Callable[[], object], accounts.observe_workers_home)
@@ -1053,21 +1078,32 @@ def _found_backends(rows: Sequence[StaffRow],
     if os.environ.get("CODEX_HOME"):
         homes.insert(0, Path(os.environ["CODEX_HOME"]))
     wanted = {row.current_session: row.id for row in rows if row.kind == "worker"}
+    recorded_homes = {row.id: row.home.path for row in rows if isinstance(row.home, SessionHome)}
+    codex_sessions: set[StaffId] = set()
     found: dict[StaffId, ClaudeBackend | CodexBackend] = {}
+    ids_by_folder: dict[Path, list[StaffId]] = {}
     for home in dict.fromkeys(homes):
         try:
             for folder in ("sessions", "archived_sessions"):
-                for path in (home / folder).rglob("*.jsonl"):
-                    identity = wanted.get(StaffId(path.stem[-36:]))
+                real_folder = (home / folder).resolve()
+                if real_folder not in ids_by_folder:
+                    ids_by_folder[real_folder] = [
+                        StaffId(uncompressed_path(path).stem[-36:])
+                        for path in transcript_paths(real_folder)
+                    ]
+                for session_id in ids_by_folder[real_folder]:
+                    identity = wanted.get(session_id)
                     if identity is not None:
-                        _ = found.setdefault(identity, CodexBackend(home))
+                        codex_sessions.add(identity)
+                        if recorded_homes.get(identity) == home:
+                            found[identity] = CodexBackend(home)
         except OSError as error:
             print(f"anomaly: {home}: {error}", file=sys.stderr)
     if running is None:
         running = (frozenset(record["sessionId"] for record in sessions.running_sessions())
-                   if any(identity not in found for identity in wanted.values()) else frozenset())
+                   if any(identity not in codex_sessions for identity in wanted.values()) else frozenset())
     for current, identity in wanted.items():
-        if identity not in found and (current in running or bool(sessions.transcript_locations(current))):
+        if identity not in codex_sessions and (current in running or bool(sessions.transcript_locations(current))):
             found[identity] = ClaudeBackend()
     return found
 
@@ -1100,7 +1136,7 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
     timeout = _wait_seconds("REMOTE_SECONDS")
-    command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout))}", OWNER_MACHINE,
+    command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
     try:
@@ -1179,7 +1215,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
     if not all(parts) or len(parts) > len(_KINDS):
         return None
     # A root kind starts its own path.
-    roots = [row for row in rows if row.kind in ("showrunner", "agent") and row.name == parts[0]]
+    roots = [row for row in rows if row.kind in ("showrunner", "producer") and row.name == parts[0]]
     row = roots[0] if len(roots) == 1 else None
     for name in parts[1:]:
         if row is None:
@@ -1293,9 +1329,7 @@ mv -f "$temporary" "$directory/staff.json"
             previous_handler = signal.signal(signal.SIGTERM, stop)
             try:
                 with subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                     remote.other_machine(), command],
+                    ["ssh", "-o", "BatchMode=yes", remote.other_machine(), command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 ) as process:
                     try:
@@ -1372,9 +1406,9 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "") -> StaffRow:
-    if kind not in ("unit", "agent") and not isinstance(worktree, WorktreeUnfilled):
+    if kind not in ("unit", "producer") and not isinstance(worktree, WorktreeUnfilled):
         raise StaffRefused(f"{kind} cannot hold worktree")
-    if kind not in ("showrunner", "agent") and not isinstance(doc, DocUnfilled):
+    if kind not in ("showrunner", "producer") and not isinstance(doc, DocUnfilled):
         raise StaffRefused(f"{kind} cannot hold doc")
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
@@ -1620,9 +1654,10 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
         renamed = _transaction(edit)
     if renamed.kind == "worker":
         herdr = import_module("scripts.herdr.herdr")
+        herdr_types = import_module("scripts.herdr.herdr_types")
         client = cast(Callable[[str], object], herdr.Herdr)
         shared_session = cast(Callable[[], str], herdr.shared_session)
-        display_failure = cast(type[Exception], herdr.HerdrFailure)
+        display_failure = cast(type[Exception], herdr_types.HerdrFailure)
 
         try:
             retitle = cast(Callable[[str], bool], getattr(client(shared_session()), "retitle_row"))
@@ -1700,13 +1735,17 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
         previous = (["--expected-state", "unfilled"] if isinstance(expected, WorktreeUnfilled) else
                     ["--expected-state", "present" if isinstance(expected, PresentWorktree) else "removed",
                      "--expected-machine", expected.machine, "--expected-path", str(expected.path)])
+        branch = (["--branch", worktree.branch.value]
+                  if isinstance(worktree, RemovedWorktree) and isinstance(worktree.branch, ParkedBranch) else [])
+        if isinstance(expected, RemovedWorktree) and isinstance(expected.branch, ParkedBranch):
+            previous.extend(("--expected-branch", expected.branch.value))
         return _remote_row(["set-worktree", unit, "--machine", worktree.machine, "--path", str(worktree.path),
-                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed", *previous])
+                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed", *branch, *previous])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, unit)
-        if row.kind not in ("unit", "agent"):
-            raise StaffRefused("set-worktree requires a unit or agent")
+        if row.kind not in ("unit", "producer"):
+            raise StaffRefused("set-worktree requires a unit or producer")
         if row.worktree == worktree:
             return row
         if row.worktree != expected:
@@ -1726,8 +1765,8 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, showrunner)
-        if row.kind not in ("showrunner", "agent"):
-            raise StaffRefused("set-doc requires a showrunner or agent")
+        if row.kind not in ("showrunner", "producer"):
+            raise StaffRefused("set-doc requires a showrunner or producer")
         changed = replace(row, doc=_keep_location_fields(doc, row.doc))
         rows[rows.index(row)] = changed
         return changed
@@ -1741,7 +1780,7 @@ def require_stopped(identity: StaffId) -> None:
     target = record.by_id(identity)
     if target is None:
         return
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
     observed = sessions.session_liveness(target.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
         raise StaffRefused(f"{identity}: native session is live (pid {observed.pid}); stop it before removing its row")
@@ -1789,7 +1828,7 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
         if not children:
             break
         selected.update(children)
-    from scripts.message import sessions
+    from scripts.message import session_records as sessions
 
     for candidate in selected.values():
         locations = _location_paths(candidate)
@@ -1814,8 +1853,8 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if row.kind not in ("worker", "agent"):
-        raise StaffRefused("retire requires a worker or agent; retain units and showrunners with their location state")
+    if row.kind not in ("worker", "producer"):
+        raise StaffRefused("retire requires a worker or producer; retain units and showrunners with their location state")
     rows.remove(row)
     return row
 
@@ -1829,6 +1868,7 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
             print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
             return False
         changed = replace(row, worktree=_keep_location_fields(
+            row.worktree if isinstance(row.worktree, RemovedWorktree) else
             RemovedWorktree(row.worktree.machine, row.worktree.path), row.worktree))
     elif row.kind == "showrunner":
         if any(child.kind == "unit" and child.parent == ReportsTo(row.id)
@@ -1912,7 +1952,7 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 row = _required(rows, entry.match)
                 if row.kind != entry.kind:
                     raise StaffRefused(f"seed member has the wrong kind: {row.id}")
-            elif entry.kind in ("showrunner", "agent"):
+            elif entry.kind in ("showrunner", "producer"):
                 row = next((row for row in rows if row.kind == entry.kind and row.name == entry.name), None)
                 if row is None:
                     row = _ensure_row(rows, entry.kind, entry.name, StaffRoot(), runtime_id=entry.runtime_id)
@@ -1965,7 +2005,7 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     for row in rows:
         chain: list[str] = [row.name]
         member = row
-        while (member.kind not in ("showrunner", "agent") and isinstance(member.parent, ReportsTo)
+        while (member.kind not in ("showrunner", "producer") and isinstance(member.parent, ReportsTo)
                and member.parent.id in indexed):
             member = indexed[member.parent.id]
             chain.append(member.name)
@@ -2001,6 +2041,8 @@ class _Arguments:
     expected_state: str = ""
     expected_machine: str = ""
     expected_path: str = ""
+    branch: str = ""
+    expected_branch: str = ""
     worktree: list[str] | None = None
     doc: list[str] | None = None
 
@@ -2089,6 +2131,8 @@ def _parser() -> argparse.ArgumentParser:
             _ = location_parser.add_argument("--expected-state", required=True, choices=("unfilled", "present", "removed"))
             _ = location_parser.add_argument("--expected-machine", default="")
             _ = location_parser.add_argument("--expected-path", default="")
+            _ = location_parser.add_argument("--branch", default="")
+            _ = location_parser.add_argument("--expected-branch", default="")
         location_parsers.append(location_parser)
     for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
@@ -2103,7 +2147,7 @@ def _print_row(row: StaffRow, path: str) -> None:
     print(f"{row.id:<12}  {row.kind:<10}  {path}")
 
 
-def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
     if arguments.verb == "set-worker-role":
         return set_worker_role(StaffId(arguments.target), KnownWorkerRole(cast(WorkerRole, arguments.value)))
     if arguments.verb in ("set-run", "clear-run"):
@@ -2125,11 +2169,13 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
     if arguments.verb == "set-worktree":
         worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
-                    else RemovedWorktree(arguments.machine, Path(arguments.path)))
+                    else RemovedWorktree(arguments.machine, Path(arguments.path),
+                                         ParkedBranch(arguments.branch) if arguments.branch else BranchUnrecorded()))
         expected = (WorktreeUnfilled() if arguments.expected_state == "unfilled" else
                     PresentWorktree(arguments.expected_machine, Path(arguments.expected_path))
                     if arguments.expected_state == "present" else
-                    RemovedWorktree(arguments.expected_machine, Path(arguments.expected_path)))
+                    RemovedWorktree(arguments.expected_machine, Path(arguments.expected_path),
+                                    ParkedBranch(arguments.expected_branch) if arguments.expected_branch else BranchUnrecorded()))
         return set_worktree(StaffId(arguments.target), worktree, expected=expected)
     if arguments.verb == "set-doc":
         doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
@@ -2165,7 +2211,7 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "move":
         return move(StaffId(arguments.target), _parent(arguments.parent))
     if arguments.verb == "apply-seed":
-        return apply_seed(SeedInput.from_json(_decode(sys.stdin.read())))
+        return apply_seed(SeedInput.from_json(_decode(seed_text)))
     if arguments.row_write and is_owner():
         require_stopped(StaffId(arguments.target))
         return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target)))
@@ -2228,8 +2274,9 @@ def _main(arguments: _Arguments) -> int:
     if arguments.row_write and not (arguments.verb in ("retire", "ensure-worker", "update-current-session") or
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
+    seed_text = sys.stdin.read() if arguments.verb == "apply-seed" else ""
     with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run") else nullcontext():
-        result = _mutate(arguments)
+        result = _mutate(arguments, seed_text)
     if isinstance(result, tuple):
         print(json.dumps(result))
         return 0

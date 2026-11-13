@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.agents import stop_resume
-from scripts.lib import main_publish
+from scripts.lib import main_publish, main_push_lock
 from scripts.herdr import worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -118,10 +118,7 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 
 def unit_branch(row: staff.StaffRow, resolver: session_staff.RowResolver) -> session_staff.Branch | session_staff.BranchUnreadable | session_staff.LocationUnfilled | session_staff.RetiredFactsUnavailable:
-    """Read the parked branch first, then use the staff location."""
-    parked = unit_config.read_parked(row.id, cleanup=False)
-    if isinstance(parked, unit_config.UnitConfig) and isinstance(parked.retired, unit_config.RetiredSession):
-        return session_staff.Branch(parked.retired.branch.value)
+    """Read the branch from staff or the current Git worktree."""
     return resolver.unit_branch(row)
 
 
@@ -345,30 +342,31 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     tip = checked(production.checkout, "promote", "rev-parse", "HEAD")
     if not verdict_checked:
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
-    _ = checked(production.checkout, "main", "fetch", "origin", "main")
-    if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
-        raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
-    report("main", "ok", f"origin/main is behind {tip}")
-    promotion = production_doc.promotion_from_doc(lines)
-    if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
-        remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
-        if remote != tip:
-            _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
-            report("promote", "ok", f"main pushed to {tip}")
-        else:
-            report("promote", "ok", f"already at {tip}")
-    else:
-        for destination in promotion.checkouts:
-            result = promote_local_checkout(destination, production.merge_branch, tip)
-            if isinstance(result, PromotionNotPushed):
-                raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
-            if isinstance(result, PromotionAlreadyAtTip):
-                detail = f"{destination}: already at {tip}"
-            elif isinstance(result, PromotionOriginPushed):
-                detail = f"{destination}: pushed {tip}"
+    with main_push_lock.main_push_lock(production.checkout):
+        _ = checked(production.checkout, "main", "fetch", "origin", "main")
+        if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
+            raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
+        report("main", "ok", f"origin/main is behind {tip}")
+        promotion = production_doc.promotion_from_doc(lines)
+        if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
+            remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
+            if remote != tip:
+                _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
+                report("promote", "ok", f"main pushed to {tip}")
             else:
-                detail = f"{destination}: advanced to {tip}"
-            report("promote", "ok", detail)
+                report("promote", "ok", f"already at {tip}")
+        else:
+            for destination in promotion.checkouts:
+                result = promote_local_checkout(destination, production.merge_branch, tip)
+                if isinstance(result, PromotionNotPushed):
+                    raise LifecycleStop("promote", "held", f"{destination} has main commits outside the merge branch")
+                if isinstance(result, PromotionAlreadyAtTip):
+                    detail = f"{destination}: already at {tip}"
+                elif isinstance(result, PromotionOriginPushed):
+                    detail = f"{destination}: pushed {tip}"
+                else:
+                    detail = f"{destination}: advanced to {tip}"
+                report("promote", "ok", detail)
     if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
         outcome = pull_mac_checkout(promotion.mac.path, source)
@@ -478,30 +476,34 @@ def capture_release(production_name: str, *, record: staff.StaffSnapshot | None 
     if (parent is not None and not isinstance(parent, str)) or not isinstance(children, list) or not isinstance(told, list):
         raise ValueError(f"{path}: invalid release capture")
     if not all(isinstance(item, str) for item in [*cast(list[object], children), *cast(list[object], told)]):
-        raise ValueError(f"{path}: release production names must be strings")
-    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(parent) if isinstance(parent, str) else showrunner_tree.Root(),
-                                   tuple(cast(list[str], children)), tuple(cast(list[str], told)))
+        raise ValueError(f"{path}: release staff ids must be strings")
+    return showrunner_tree.WrapRelease(showrunner_tree.ReportedTo(staff.StaffId(parent)) if isinstance(parent, str) else showrunner_tree.Root(),
+                                      tuple(staff.StaffId(item) for item in cast(list[str], children)),
+                                      tuple(staff.StaffId(item) for item in cast(list[str], told)))
 
 
 def release_edges(production_name: str, *, record: staff.StaffSnapshot | None = None) -> None:
     """Send captured wrap notices and save each completed delivery."""
     released = capture_release(production_name, record=record)
-    notices: dict[str, str] = {}
-    if isinstance(released.former_parent, showrunner_tree.ReportedTo):
-        notices[released.former_parent.parent] = f"{production_name} wrapped; its recorded parent is retained for history."
-    for child in released.former_children:
-        notices[child] = f"{production_name} wrapped; {child} keeps its recorded parent for history."
+    recipients = (*((released.former_parent.parent,) if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ()),
+                  *released.former_children)
     messages: list[str] = []
-    for target, text in notices.items():
+    for target in recipients:
         if target not in released.told:
-            told = showrunners.tell_others({target: text}, f"showrunner-tree:{production_name if isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent else target}")
+            name = staff.snapshot().rows_by_id[target].name
+            parent = isinstance(released.former_parent, showrunner_tree.ReportedTo) and target == released.former_parent.parent
+            text = (f"{production_name} wrapped; its recorded parent is retained for history." if parent else
+                    f"{production_name} wrapped; {name} keeps its recorded parent for history.")
+            told = showrunners.tell_others({name: text}, f"showrunner-tree:{production_name if parent else name}")
             if told.failed:
                 raise LifecycleStop("tree", "failed", "; ".join(told.lines))
             released = replace(released, told=(*released.told, target))
             save_release(production_name, released, record=record)
             messages.extend(told.lines)
-    above = f"retained parent {released.former_parent.parent}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
-    below = f"retained children {', '.join(released.former_children)}" if released.former_children else ""
+    current = staff.snapshot()
+    names = {target: current.rows_by_id[target].name for target in recipients}
+    above = f"retained parent {names[released.former_parent.parent]}" if isinstance(released.former_parent, showrunner_tree.ReportedTo) else ""
+    below = f"retained children {', '.join(names[child] for child in released.former_children)}" if released.former_children else ""
     report("tree", "ok", "; ".join(part for part in (above, below, *messages) if part) or "no parent and no child showrunners")
 
 
@@ -532,9 +534,9 @@ def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tup
             raise LifecycleStop("retire", "held", f"{unit.name}: the staff row has no director session for retirement")
         else:
             retirement = unit_config.RetiredSession(datetime.now(production.zone).date().isoformat(),
-                                                   unit.member.current_session, unit_config.Branch(unit.branch))
+                                                   unit.member.current_session)
         if unit.worktree.exists():
-            if isinstance(location, staff.RemovedWorktree):
+            if isinstance(location, staff.RemovedWorktree) and not isinstance(location.branch, staff.ParkedBranch):
                 raise LifecycleStop("retire", "held", f"{unit.name}: removed worktree path is occupied")
             require_untracked_ignored(unit.worktree, ".unit.toml")
             actual = checked(unit.worktree, "retire", "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -627,12 +629,12 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             held = True
             continue
         _ = unit_config.park(unit.member.id, unit.worktree, item.retirement)
+        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree, staff.ParkedBranch(unit.branch)),
+                               expected=unit.member.worktree)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             report("retire", "ok", f"removed {unit.name} worktree")
-        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
-                               expected=unit.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
                 raise LifecycleStop("retire", "held", f"{unit.branch} has work absent from {production.merge_branch}")

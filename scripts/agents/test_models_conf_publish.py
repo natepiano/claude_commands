@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Literal, final, override
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import models_registry, atomic_file  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 AGENTS = Path(__file__).resolve().parent
 REPO = AGENTS.parents[1]
@@ -82,7 +84,7 @@ class RegistryFixture(unittest.TestCase):
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
-        self.environment = {**os.environ, "HOME": str(self.home),
+        self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
                             "MODELS_CONFIG_FILE": str(self.registry),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
@@ -158,15 +160,17 @@ class SharedRegistryTests(RegistryFixture):
         hook.mkdir()
         _ = (hook / "sitecustomize.py").write_text('''import os
 from pathlib import Path
-read_text = Path.read_text
+from scripts.lib import conf_reads
+read_text = conf_reads.read_text
 def read_then_edit(path, *arguments, **keywords):
     text = read_text(path, *arguments, **keywords)
+    path = Path(path)
     if str(path) == os.environ["MODELS_CONFIG_FILE"] and "note=original" in text:
         peer = path.with_suffix(".peer")
         peer.write_text(text.replace("note=original", "note=intermediate"))
         peer.replace(path)
     return text
-Path.read_text = read_then_edit
+conf_reads.read_text = read_then_edit
 ''')
         self.environment["PYTHONPATH"] = str(hook) + os.pathsep + self.environment["PYTHONPATH"]
         operations = ("agents_set_row direct.impl gpt-b:max",
@@ -369,6 +373,14 @@ class RegistryPublishingTests(RegistryFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_published(before)
         self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")
+
+        with self.subTest(holder="another process"):
+            program = ("from scripts.lib import models_registry; "
+                       "p=models_registry.registry_path(); before=p.read_text(); "
+                       "models_registry.store_registry(p,before,before.replace('review=gpt-a:high','review=gpt-b:max'),'row edit')")
+            _ = publish_after_contender(self, self.checkout, self.remote, [sys.executable, "-c", program],
+                                    self.environment, cwd=self.checkout)
+            self.assert_published(before, expected="review=gpt-b:max")
 
     def test_identical_edit_publishes_after_interruption_following_the_atomic_write(self) -> None:
         before = self.dirty_state()

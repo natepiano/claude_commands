@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable, Generator, Mapping
@@ -34,6 +35,7 @@ from scripts.copies import copies
 from scripts.message import send_result, send_budget, session_send
 from scripts.production import showrunners
 from scripts.style import style_ledger
+from scripts.style import rules as rule_catalog
 from scripts.style import style_config
 from scripts.style import style_plan
 from scripts.style.unit_files import changed_files
@@ -45,7 +47,6 @@ SEND_SECONDS = 10
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
 VERIFY = SCRIPTS / "direct/verify.sh"
-LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
 LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
@@ -105,6 +106,8 @@ def sync_productions(repo: Path) -> tuple[ConfiguredStyleProduction, ...]:
         if not style_config.has_style_units(lines):
             continue
         config = style_config.read_config(row.doc.path)
+        if isinstance(config.route, style_config.ParentUnitRoute) and not config.assignments:
+            continue
         productions.append(ConfiguredStyleProduction(row.name, config))
     return tuple(productions)
 
@@ -488,17 +491,11 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
             rewritten = rewritten or (snapshot / "target").resolve() != retained_target
             records = lint_records(output, snapshot)
-            for record in records:
-                passed = record.passed and not rewritten
-                diagnostic_file = directory / f"{record.tool}.json"
-                _ = diagnostic_file.write_text(json.dumps(dict(record.diagnostics), sort_keys=True))
-                recorded = subprocess.run([
-                    str(PYTHON), str(LEDGER), "lint-record", "--repo", str(repo), "--tip", tip,
-                    "--tool", record.tool, "--passed", str(int(passed)),
-                    "--diagnostics", str(diagnostic_file),
-                ], capture_output=True, text=True, check=False)
-                if recorded.returncode:
-                    raise Refusal(recorded.stderr.strip() or f"lint-record exited {recorded.returncode}")
+            if records:
+                with style_ledger.open_ledger(repo) as ledger:
+                    for record in records:
+                        passed = record.passed and not rewritten
+                        ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))
             if rewritten:
                 print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
             return int(returncode != 0 or rewritten
@@ -726,7 +723,8 @@ def main(argv: list[str] | None = None) -> int:
     except LintStopped as stopped:
         print(f"style_sync: {stopped}", file=sys.stderr)
         return 128 + stopped.signum
-    except (copies.CopyError, Refusal, style_ledger.LedgerError, scratch.ScratchError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (copies.CopyError, Refusal, style_ledger.LedgerError, rule_catalog.RuleValidationError,
+            scratch.ScratchError, OSError, sqlite3.Error, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

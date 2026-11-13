@@ -99,11 +99,20 @@ agents_exec_main() {
             ( models_agent_environment; "${command[@]}" < "$prompt_file" > "$log_file" 2>&1 )
             ;;
         claude)
-            source "$script_dir/claude_account.sh"
-            if [[ "$task" == direct.simplify ]]; then
-                claude_launch_environment || return 1
+            if [[ -n "${AGENT_EXEC_CLAUDE_MODEL:-}" ]]; then
+                AGENT_MODEL="$AGENT_EXEC_CLAUDE_MODEL"
+                unset AGENT_EXEC_CLAUDE_MODEL
             else
-                claude_launch_environment workers || return 1
+                source "$script_dir/claude_account.sh"
+                if [[ "$task" == direct.simplify ]]; then
+                    claude_launch_environment || return 1
+                else
+                    claude_launch_environment workers || return 1
+                fi
+                local resolved_model
+                if resolved_model="$(_agents_model_slug claude "$AGENT_MODEL")"; then
+                    AGENT_MODEL="$resolved_model"
+                fi
             fi
             [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             family_args_line="$(agents_claude_args)"

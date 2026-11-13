@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Archive the phase notes of retired units, for every production that has an update timer.
 
-The agent-notes job on natedev runs this on its configured interval, in its own process
-(`scripts/maintenance/agent_notes_job.py`); until 2026-10-13 a dailies did it,
-so a production that never built one kept its retired units' notes (user, 2026-10-13: "Yes do
-the part C"). It runs under nix's plain python3, so it uses the standard library alone.
+The agent-notes job runs this script on its configured interval in a separate process.
+It uses the standard library alone.
 """
 from __future__ import annotations
 try:

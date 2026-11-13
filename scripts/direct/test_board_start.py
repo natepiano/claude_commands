@@ -27,7 +27,8 @@ class BoardStartTests(unittest.TestCase):
             for folder in (direct, library, tools):
                 folder.mkdir(parents=True)
             _ = shutil.copy2(SCRIPTS / "direct" / "board.sh", direct / "board.sh")
-            for name in ("conf.sh", "py"):
+            _ = shutil.copy2(SCRIPTS / "direct" / "file_lock.sh", direct / "file_lock.sh")
+            for name in ("conf.sh", "conf_record.sh", "py"):
                 _ = shutil.copy2(SCRIPTS / "lib" / name, library / name)
             commands = ["bash", "date", "mkdir", "uname"]
             if start != "path":

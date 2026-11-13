@@ -11,6 +11,7 @@ from typing import override
 from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.herdr import herdr_types
 from scripts.production import staff, unit_config, unit_command
 from scripts.agents import remote
 from scripts.herdr import herdr
@@ -30,7 +31,7 @@ class CommandHerdr:
 
     def panes(self) -> list[dict[str, str]]:
         if self.pane_error:
-            raise herdr.HerdrFailure(self.pane_error)
+            raise herdr_types.HerdrFailure(self.pane_error)
         return self.pane_records
 
     def agents(self) -> list[dict[str, str]]:
@@ -119,14 +120,13 @@ class UnitCommandTests(StaffTestCase):
         return fields
 
     def parked_unit(self) -> tuple[staff.StaffRow, Path]:
-        removed = replace(self.unit, worktree=staff.RemovedWorktree("natedev", self.root / "gone"))
+        removed = replace(self.unit, worktree=staff.RemovedWorktree("natedev", self.root / "gone", staff.ParkedBranch("parked/member")))
         parked = unit_config.parked_path(removed.id)
         parked.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(parked, (
             'plan = "docs/plans/retained.md"\nresponsibilities = ["member"]\n'
             '[retired]\ndate = "2026-11-01"\n'
-            f'session = "{removed.current_session}"\nfolder = "{self.root / "original"}"\n'
-            'branch = "parked/member"\n'))
+            f'session = "{removed.current_session}"\n'))
         return removed, parked
 
     def test_unknown_id_reports_one_line_and_fails(self) -> None:

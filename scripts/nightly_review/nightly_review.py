@@ -27,6 +27,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from scripts.lib.transcripts import open_transcript, transcript_paths
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 # The account reader and the production scripts sit one directory over.
@@ -100,10 +101,10 @@ def record_time(text: str) -> datetime:
 
 def recent_replies(path: Path, since: datetime) -> bool:
     """A recent file write alone does not make an old reply part of tonight."""
-    with path.open(encoding="utf-8") as stream:
+    with open_transcript(path) as stream:
         for line in stream:
             try:
-                data = json_record(line)
+                data = json_record(line.decode("utf-8"))
                 record = DatedTranscriptRecord(type=record_text(data, "type"), timestamp=record_text(data, "timestamp"))
                 if record["type"] == "assistant" and record_time(record["timestamp"]) >= since:
                     return True
@@ -150,7 +151,9 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             config = record.get("config_dir", "")
             pid = record.get("pid", 0)
             if recorded:
-                candidates = [Path(recorded)]
+                recorded_path = Path(recorded)
+                candidates = ([recorded_path] if recorded_path.exists() else
+                              [recorded_path.with_suffix(recorded_path.suffix + ".zst")])
             else:
                 setting = (account.ConfiguredClaudeFolder(Path(config)) if config else
                            account.process_account_directory(account.process_config_dir(pid)) if pid > 0 else
@@ -159,10 +162,10 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
                     print(f"messages: account directory unavailable for {session}", file=sys.stderr)
                     continue
                 directory = setting.path
-                candidates = list((directory / "projects").glob(f"*/{session}.jsonl"))
+                candidates = transcript_paths(directory / "projects", f"*/{session}.jsonl")
             for candidate in candidates:
                 if candidate.is_file() and recent_replies(candidate, since):
-                    found.add(candidate)
+                    found.add(candidate.resolve())
         except (OSError, ValueError, TypeError) as error:
             print(f"messages: {path}: {error}", file=sys.stderr)
     return sorted(found)

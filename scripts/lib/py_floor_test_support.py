@@ -35,3 +35,9 @@ def seed_interpreter_cache(cache_home: Path, interpreter: Path | str = sys.execu
     cache = cache_home / "claude" / cache_file_name()
     cache.parent.mkdir(parents=True, exist_ok=True)
     _ = cache.write_text(str(interpreter) + "\n", encoding="utf-8")
+
+
+def interpreter_cache_environment(cache_home: Path) -> dict[str, str]:
+    """Select a private cache with the fixture interpreter."""
+    seed_interpreter_cache(cache_home)
+    return {"XDG_CACHE_HOME": str(cache_home)}

@@ -38,7 +38,7 @@ class CodexQueueDrainTests(StaffTestCase):
             "CONF_DIR": str(HOOK.parents[2] / "config"),
         })))
         _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "state/message"))
-        member = staff.StaffRow(staff.StaffId(THREAD), "agent", "Agent", staff.StaffRoot(),
+        member = staff.StaffRow(staff.StaffId(THREAD), "producer", "Agent", staff.StaffRoot(),
                                current_session=staff.StaffId(THREAD))
         _ = self.write_document({"schema": 2, "rows": [member.to_json()]})
 

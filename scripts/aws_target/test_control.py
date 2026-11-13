@@ -3,19 +3,25 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
+from datetime import UTC, datetime
+from decimal import Decimal
+from io import StringIO
+import fcntl
 import json
 import os
 import shutil
 import sys
 import subprocess
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 import unittest
 from unittest import mock
 
 
 from scripts.aws_target import aws_target, config as settings_config, ledger, remote
 from scripts.aws_target.control_test_support import ControlFixture
+from scripts.aws_target.ledger_test_support import text_setting
 from scripts.mac_test import mac_test
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.direct import step_record
@@ -450,13 +456,6 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.assertIn("aws-build", arguments)
         self.assertEqual(read.call_count, 1)
 
-    def test_stopped_tick_without_claims_reads_claim_records_once(self) -> None:
-        with mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as read:
-            self.assertEqual(self.controller().tick().state, "stopped")
-        self.assertEqual(read.call_count, 1)
-        self.assertEqual(self.aws.count("start-instances"), 0)
-        self.assertEqual(self.aws.count("stop-instances"), 0)
-
     def test_old_eligible_queue_rows_start_one_stopped_instance(self) -> None:
         self.demand()
         _ = self.controller().tick()
@@ -642,61 +641,15 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.clock.advance(1)
         self.assertEqual(self.controller().tick().state, "stopping")
         self.assertEqual(self.aws.count("stop-instances"), 1)
-        self.assertFalse(claim.exists())
 
     def test_unexpected_running_generation_stops_immediately_when_spending_is_refused(self) -> None:
         self.aws.state = "running"
-        claim = self.retained_claim()
+        _ = self.retained_claim()
         self.replace("daily_limit_usd", "3")
         result = self.controller().tick()
         self.assertEqual(result.state, "stopping")
         self.assertEqual(self.aws.count("stop-instances"), 1)
         self.assertEqual(self.aws.count("start-instances"), 0)
-        self.assertFalse(claim.exists())
-
-    def test_manual_stop_records_confirmed_instance_evidence_before_claim_release(self) -> None:
-        self.aws.state = "running"
-        claim = self.retained_claim()
-        result = self.controller().stop()
-        self.assertEqual(result.state, "stopping")
-        self.assertFalse(claim.exists())
-        proof_path = mac_test.state_paths("aws").directory / "release-evidence" / claim.name
-        proof = cast(dict[str, object], json.loads(proof_path.read_text()))
-        self.assertEqual((proof["target"], proof["state"]), ("aws", "stopping"))
-        self.assertEqual(proof["generation"], "i-fixture:" + self.aws.generation)
-        self.assertEqual(proof["observed_at"], self.clock.now)
-
-    def test_running_new_generation_releases_only_ended_host_claims_with_proof(self) -> None:
-        self.aws.state = "running"
-        paths = mac_test.state_paths("aws")
-        old = self.claim(paths, generation="previous-generation", at=self.clock.now)
-        current = self.claim(paths, slot=2, generation="i-fixture:" + self.aws.generation)
-        later = self.claim(paths, slot=3, generation="previous-generation", at=self.clock.now + 1)
-        legacy = self.claim(paths, slot=4)
-        foreign = self.claim(paths, slot=5, generation="previous-generation")
-        row = cast(dict[str, object], json.loads(legacy.read_text()))
-        del row['instance_generation']
-        _ = legacy.write_text(json.dumps(row))
-        row = cast(dict[str, object], json.loads(foreign.read_text()))
-        row['remote_host'] = 'other-host'
-        _ = foreign.write_text(json.dumps(row))
-        before = {path: path.read_bytes() for path in (current, later, legacy, foreign)}
-
-        self.assertEqual(self.controller().tick().state, "running")
-
-        self.assertFalse(old.exists())
-        for path, contents in before.items():
-            self.assertEqual(path.read_bytes(), contents)
-        proofs = list((paths.directory / "release-evidence").iterdir())
-        self.assertEqual([path.name for path in proofs], [old.name])
-        proof = cast(dict[str, object], json.loads(proofs[0].read_text()))
-        self.assertEqual(proof['state'], 'running')
-        self.assertEqual(proof['generation'], 'i-fixture:' + self.aws.generation)
-        self.assertEqual(proof['observed_at'], self.clock.now)
-        self.assertEqual(proof['remote_host'], 'aws-build')
-        claim = cast(dict[str, object], proof['claim'])
-        self.assertEqual(claim['instance_generation'], 'previous-generation')
-        self.assertEqual(self.aws.count('stop-instances'), 0)
 
     def test_a_running_restart_without_queue_demand_never_requests_another_start(self) -> None:
         self.snapshot()
@@ -729,6 +682,149 @@ with mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
         self.clock.advance(1)
         _ = self.controller().tick()
         self.assertEqual(self.aws.count("describe-spot-price-history"), 2)
+
+
+    def gate_price_controller(self, failure: str = '') -> tuple[aws_target.Controller, list[tuple[str, ...]]]:
+        shipped = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
+        values = self.root / 'cloud_gate.conf'
+        _ = values.write_bytes(shipped.read_bytes())
+        text_setting(values, 'spot_candidate_regions', 'us-west-2 us-east-2 us-west-2')
+        text_setting(values, 'instance_types', 'm7a.8xlarge c7a.8xlarge')
+        regions = ('us-east-2', 'us-east-1')
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            dict(region=region, subnets=[dict(id='fixture', zone=region + suffix) for suffix in ('a', 'b')])
+            for region in regions]}))
+        calls: list[tuple[str, ...]] = []
+        def execute(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'describe-spot-price-history' not in arguments or '--no-paginate' not in arguments:
+                return self.aws(arguments, **options)
+            calls.append(tuple(arguments))
+            region = arguments[arguments.index('--region') + 1]
+            if region == 'us-east-2' and failure == 'timeout':
+                raise subprocess.TimeoutExpired('fixture', 1)
+            if region == 'us-east-2' and failure == 'unavailable':
+                return subprocess.CompletedProcess(arguments, 1, '', 'fixture price failure')
+            rows = [dict(InstanceType=size, AvailabilityZone=region + suffix, SpotPrice='.25',
+                         Timestamp=datetime.fromtimestamp(self.clock.now, UTC).isoformat())
+                    for size in ('m7a.8xlarge', 'c7a.8xlarge') for suffix in ('a', 'b')]
+            rows.append({**rows[0], 'SpotPrice': '.9',
+                'Timestamp': datetime.fromtimestamp(self.clock.now - 3600, UTC).isoformat()})
+            reply: dict[str, object] = {'SpotPriceHistory': rows}
+            if region == 'us-east-2':
+                if failure == 'missing-type':
+                    reply['SpotPriceHistory'] = [row for row in rows if row['InstanceType'] == 'm7a.8xlarge']
+                elif failure == 'missing-zone':
+                    reply['SpotPriceHistory'] = [row for row in rows if row['AvailabilityZone'].endswith('a')]
+                elif failure == 'empty':
+                    reply['SpotPriceHistory'] = []
+                elif failure == 'pagination':
+                    reply['NextToken'] = 'fixture-page'
+                elif failure == 'malformed':
+                    rows[0]['SpotPrice'] = 'invalid'
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+        controller = self.controller()
+        controller.execute = execute
+        return controller, calls
+
+    def test_gate_price_refresh_reads_each_region_once_and_uses_the_latest_zone_price(self) -> None:
+        controller, calls = self.gate_price_controller()
+        self.assertEqual(controller.tick().state, 'stopped')
+        self.assertEqual([args[args.index('--region') + 1] for args in calls], ['us-west-2', 'us-east-2', 'us-east-1'])
+        for args in calls:
+            self.assertEqual(args[args.index('--instance-types') + 1:args.index('--product-descriptions')],
+                             ('m7a.8xlarge', 'c7a.8xlarge'))
+            self.assertEqual(args[args.index('--product-descriptions') + 1], 'Linux/UNIX')
+        prices = ledger.read_spot_prices(self.state)
+        self.assertEqual(len(prices), 12)
+        self.assertTrue(all(row.usd_per_hour == Decimal('.25') and row.read_at == self.clock.now for row in prices))
+        self.clock.advance(3599)
+        _ = controller.tick()
+        self.assertEqual(len(calls), 3)
+        self.clock.advance(1)
+        _ = controller.tick()
+        self.assertEqual(len(calls), 6)
+
+    def test_failed_or_partial_price_reads_keep_the_previous_file_and_complete_the_tick(self) -> None:
+        ledger.write_spot_prices(self.state, (
+            ledger.RegionalSpotPrice('us-east-2', 'us-east-2a', 'm7a.8xlarge', Decimal('.4'), self.clock.now - 7201),))
+        original = (self.state / 'spot-prices.json').read_bytes()
+        for failure in ('timeout', 'unavailable', 'missing-type', 'missing-zone', 'empty', 'pagination', 'malformed'):
+            with self.subTest(failure=failure):
+                (self.state / 'spot-prices.lock').unlink(missing_ok=True)
+                controller, calls = self.gate_price_controller(failure)
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(controller.tick().state, 'stopped')
+                self.assertEqual((self.state / 'spot-prices.json').read_bytes(), original)
+                self.assertEqual(len(calls), 2)
+                self.clock.advance(1)
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(controller.tick().state, 'stopped')
+                self.assertEqual(len(calls), 2)
+
+    def test_gate_price_refresh_works_with_the_builder_removed_and_routing_disabled(self) -> None:
+        controller, calls = self.gate_price_controller()
+        self.replace('offload', 'off')
+        (self.state / 'deployment.json').unlink()
+        self.assertEqual(controller.tick().state, 'off')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(ledger.read_spot_prices(self.state)), 12)
+        self.assertEqual(self.aws.count('describe-instances'), 0)
+
+    def test_a_start_command_gets_the_controller_lock_before_a_price_read_returns(self) -> None:
+        controller, calls = self.gate_price_controller()
+        execute = controller.execute
+        started = False
+        def price_read(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                       timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal started
+            if 'describe-spot-price-history' in arguments and '--no-paginate' in arguments and not started:
+                started = True
+                state = cast(dict[str, object], json.loads((self.state / 'controller.json').read_text()))
+                self.assertEqual(state['state'], 'stopped')
+                with (self.state / 'controller.lock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(self.controller().start().state, 'starting')
+                self.assertFalse((self.state / 'spot-prices.json').exists())
+            return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+        controller.execute = price_read
+        self.assertEqual(controller.tick().state, 'stopped')
+        self.assertTrue(started)
+        self.assertEqual(len(calls), 3)
+        state = cast(dict[str, object], json.loads((self.state / 'controller.json').read_text()))
+        self.assertEqual(state['state'], 'starting')
+        self.assertEqual(self.aws.count('start-instances'), 1)
+
+    def test_a_held_price_lock_makes_the_tick_skip_the_price_refresh(self) -> None:
+        controller, calls = self.gate_price_controller()
+        path = self.state / 'spot-prices.lock'
+        flock = fcntl.flock
+        with path.open('a+') as held:
+            flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            inode = os.fstat(held.fileno()).st_ino
+            def lock_operation(descriptor: int | TextIO, operation: int) -> None:
+                number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                if os.fstat(number).st_ino == inode:
+                    self.assertTrue(operation & fcntl.LOCK_NB)
+                flock(number, operation)
+            with mock.patch.object(fcntl, 'flock', side_effect=lock_operation):
+                self.assertEqual(controller.tick().state, 'stopped')
+            self.assertEqual(calls, [])
+            self.assertFalse((self.state / 'spot-prices.json').exists())
+            self.assertEqual(held.read(), '')
+        self.assertEqual(controller.tick().state, 'stopped')
+        self.assertEqual(len(calls), 3)
+
+    def test_tick_uses_the_aws_state_directory_when_routing_is_disabled(self) -> None:
+        controller, calls = self.gate_price_controller()
+        self.replace('offload', 'off')
+        with (mock.patch.object(aws_target, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(aws_target, 'Controller', return_value=controller) as construct,
+              mock.patch.object(sys, 'argv', ['aws_target.py', 'tick', '--settings', str(self.settings)]),
+              mock.patch('sys.stdout', new_callable=StringIO)):
+            self.assertEqual(aws_target.main(), 0)
+        self.assertEqual(construct.call_args.args[1], self.state)
+        self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

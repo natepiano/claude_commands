@@ -7,7 +7,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-import json
 import math
 from time import monotonic
 import os
@@ -44,9 +43,9 @@ RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/prod
 
 
 class Showrunner(TypedDict):
-    """One showrunner, read from its update timer each time. Nothing here is stored in the config."""
+    """A staff showrunner with its timer and current session data."""
 
-    # The session's name now, looked up by its Claude session id. Empty while it is not running.
+    # The current staff name. Empty while the session is not running.
     session: str
     # Where a message reaches it now. Empty while it is not running.
     socket: str
@@ -147,11 +146,16 @@ def timer_for(row: staff.StaffRow, snapshot: staff.StaffSnapshot) -> TimerRegist
     return NoTimer(f"{row.name}: no timer for staff {row.id}")
 
 
+def showrunner_rows(record: staff.StaffSnapshot) -> list[staff.StaffRow]:
+    """Return the staff rows that own showrunner timers."""
+    return record.find(kind="showrunner")
+
+
 def owner_for(reference: str, record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
     """Resolve a staff id or production label through the staff file."""
     record = record if record is not None else staff.snapshot()
-    found = next((row for row in record.rows if row.kind == "showrunner"
-                and (row.id == reference or row.name == reference)), None)
+    found = next((row for row in showrunner_rows(record)
+                  if row.id == reference or row.name == reference), None)
     if found is None:
         raise ValueError(f"{reference}: no showrunner staff row")
     return found
@@ -165,8 +169,9 @@ def timer_name(reference: str, record: staff.StaffSnapshot | None = None) -> str
 def owner_for_timer(instance: Path, record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
     """Read the owner identified by the timer folder's staff id."""
     record = record if record is not None else staff.snapshot()
-    owner = record.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
-    if owner is None or owner.kind != "showrunner":
+    owner = next((row for row in showrunner_rows(record)
+                  if row.id == instance.name.removeprefix("showrunner-")), None)
+    if owner is None:
         raise ValueError(f"{instance}: no showrunner staff row")
     return owner
 
@@ -217,26 +222,13 @@ def _fields(path: Path, *, dependencies: Callable[[Path], None] | None = None) -
 
 
 def session_name(session_id: str) -> str:
-    """The live Claude session's name, or empty when it has none or is not running."""
+    """Return the staff name for the current native session."""
     return _session_name(session_id)
 
 
 def _session_name(session_id: str) -> str:
-    for path in sessions_directory().glob("*.json"):
-        try:
-            pid = int(path.stem)
-            try:
-                os.kill(pid, 0)
-            except PermissionError:
-                # Another user's process is still a live one.
-                pass
-            data = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-            name = data.get("name")
-            if data.get("sessionId") == session_id and isinstance(name, str) and name:
-                return name
-        except (OSError, ValueError, TypeError):
-            continue
-    raise ValueError(f"session {session_id} has no live named process")
+    owner = staff.snapshot().by_current_session(session_id)
+    return owner.name if owner is not None else ""
 
 
 def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None,
@@ -278,9 +270,11 @@ def read_sources(state_dir: Path | None = None, *,
                  record: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP,
                  on_failure: Callable[[ShowrunnerLookupFailure], None] = _report_source_failure,
                  ) -> list[ShowrunnerSource]:
-    """Read each timer/doc once, applying the caller's policy to unreadable timers."""
+    """Read each staff showrunner's timer and document with the specified error policy."""
     found: list[ShowrunnerSource] = []
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+    record = staff.initial_snapshot() if isinstance(record, DiscoverMembership) else record
+    for owner in sorted(showrunner_rows(record), key=lambda row: row.id):
+        instance = (state_dir or NOTIFIER_STATE_DIR) / f"showrunner-{owner.id}"
         if not instance.is_dir():
             continue
         try:
@@ -307,19 +301,20 @@ def _registered(timer: TimerRegistration, *,
                 membership: staff.StaffSnapshot | None = None) -> Showrunner:
     membership = membership if membership is not None else staff.initial_snapshot()
     owner = membership.by_id(staff.StaffId(timer.target[8:]))
-    current = owner.current_session if owner is not None else timer.target[8:]
+    if owner is None:
+        raise ValueError(f"{timer.target}: no showrunner staff row")
+    current = owner.current_session
     target = "session:" + current
     if isinstance(known_sessions, DiscoverSessions):
         socket = (socket_for(target, deadline=deadline) if math.isfinite(deadline)
                   else socket_for(target)) or ""
-        name = _session_name(current) if socket else ""
+        name = owner.name if socket else ""
     else:
         record = known_sessions.get(current)
         live = record is not None and messaging_socket_exists(record)
         socket = record["messagingSocketPath"] if record is not None and live else ""
-        name = record["name"] if record is not None and live else ""
-    doc = (str(owner.doc.path) if owner is not None
-           and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else "")
+        name = owner.name if live else ""
+    doc = str(owner.doc.path) if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else ""
     return Showrunner(session=name, socket=socket or "", name=timer.name, zone=timer.zone, doc=doc)
 
 
@@ -329,20 +324,19 @@ def registered_showrunners(
     deadline: float = math.inf,
     membership: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP,
 ) -> ShowrunnerDiscovery:
-    """Read registered timers and resolve their current sessions through staff."""
+    """Read staff showrunners' timers and resolve their current sessions."""
     found: list[Showrunner] = []
     failures: list[ShowrunnerLookupFailure] = []
     membership = staff.initial_snapshot() if isinstance(membership, DiscoverMembership) else membership
     timers: list[TimerRegistration] = []
-    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+    for owner in sorted(showrunner_rows(membership), key=lambda row: row.id):
+        instance = (state_dir or NOTIFIER_STATE_DIR) / f"showrunner-{owner.id}"
         if not instance.is_dir():
             continue
-        owner = membership.by_id(staff.StaffId(instance.name.removeprefix("showrunner-")))
         try:
             timers.append(_registration(instance, membership))
         except (KeyError, ValueError, UnicodeError) as error:
-            name = owner.name if owner is not None else instance.name.removeprefix("showrunner-")
-            _report_source_failure(ShowrunnerLookupFailure(name, str(error)))
+            _report_source_failure(ShowrunnerLookupFailure(owner.name, str(error)))
     timers.sort(key=lambda timer: timer.name)
     for index, timer in enumerate(timers):
         try:
@@ -374,8 +368,7 @@ def session_state_dir(staff_id: str) -> Path:
 
 
 # The showrunner state a scratchpad held before session_state_dir.
-SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
-                 "dailies_state.json")
+SESSION_STATE = ("unit_status", "showrunner_state.json", "waiting_state")
 
 
 def copy_session_state(staff_id: str, scratch: Path) -> list[str]:
@@ -484,11 +477,15 @@ def named(showrunner: str) -> Showrunner:
 
 
 def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
-    """Map each production name to its document when its update timer is complete."""
+    """Map staff showrunner names to documents when their timers are complete."""
     found: dict[str, Path] = {}
-    for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
+    record = staff.initial_snapshot()
+    for owner in showrunner_rows(record):
+        instance = (state_dir or NOTIFIER_STATE_DIR) / f"showrunner-{owner.id}"
+        if not instance.is_dir():
+            continue
         try:
-            timer = _source(instance).timer
+            timer = _source(instance, record=record).timer
         except (OSError, KeyError, ValueError, UnicodeError):
             continue
         found[timer.name] = timer.doc

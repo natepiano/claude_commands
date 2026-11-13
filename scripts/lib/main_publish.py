@@ -12,6 +12,7 @@ import subprocess
 import sys
 from typing import cast
 
+from scripts.lib import main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -121,34 +122,35 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
     branch = git(checkout, "branch", "--show-current").stdout.strip()
     if branch != "main":
         raise Refusal(f"{checkout} is on {branch or 'no branch'}, not main")
-    fetched = git(checkout, "fetch", "-q", "origin", "main", time_limit=fetch_limit)
-    if fetched.returncode:
-        raise Refusal(f"git fetch origin main: {first_line(fetched)}")
-    listed = git(checkout, "log", "--format=%h %s", "origin/main..main")
-    if listed.returncode:
-        raise Refusal(f"cannot inspect unpublished commits: {first_line(listed)}")
-    commits = listed.stdout.splitlines()
-    for commit_line in commits:
-        if not commit_line.partition(" ")[2].startswith(PUBLICATION_PREFIXES):
-            raise Refusal(f"main holds other commit {commit_line} that origin does not have; main is unchanged")
-    merged = git(checkout, "merge", "-q", "--ff-only", "origin/main")
-    if not merged.returncode:
-        return
-    if not commits:
-        raise Refusal(f"{checkout} main does not take origin/main as a fast-forward: {first_line(merged)}")
-    rebased = git(checkout, "rebase", "--no-autostash", "--no-update-refs", "--empty=drop", "origin/main")
-    if not rebased.returncode:
-        return
-    conflicted = git(checkout, "diff", "--name-only", "--diff-filter=U")
-    if conflicted.stdout:
-        stopped = git(checkout, "show", "-s", "--format=%h %s", "REBASE_HEAD")
-        cause = f"rebase conflict in {stopped.stdout.strip()}: {', '.join(conflicted.stdout.splitlines())}"
-    else:
-        cause = f"rebase refused: {first_line(rebased)}"
-    aborted = git(checkout, "rebase", "--abort")
-    if aborted.returncode and conflicted.stdout:
-        raise Refusal(f"{cause}; cannot restore main: {first_line(aborted)}")
-    raise Refusal(" ".join(cause.split()))
+    with main_push_lock.main_push_lock(checkout):
+        fetched = git(checkout, "fetch", "-q", "origin", "main", time_limit=fetch_limit)
+        if fetched.returncode:
+            raise Refusal(f"git fetch origin main: {first_line(fetched)}")
+        listed = git(checkout, "log", "--format=%h %s", "origin/main..main")
+        if listed.returncode:
+            raise Refusal(f"cannot inspect unpublished commits: {first_line(listed)}")
+        commits = listed.stdout.splitlines()
+        for commit_line in commits:
+            if not commit_line.partition(" ")[2].startswith(PUBLICATION_PREFIXES):
+                raise Refusal(f"main holds other commit {commit_line} that origin does not have; main is unchanged")
+        merged = git(checkout, "merge", "-q", "--ff-only", "origin/main")
+        if not merged.returncode:
+            return
+        if not commits:
+            raise Refusal(f"{checkout} main does not take origin/main as a fast-forward: {first_line(merged)}")
+        rebased = git(checkout, "rebase", "--no-autostash", "--no-update-refs", "--empty=drop", "origin/main")
+        if not rebased.returncode:
+            return
+        conflicted = git(checkout, "diff", "--name-only", "--diff-filter=U")
+        if conflicted.stdout:
+            stopped = git(checkout, "show", "-s", "--format=%h %s", "REBASE_HEAD")
+            cause = f"rebase conflict in {stopped.stdout.strip()}: {', '.join(conflicted.stdout.splitlines())}"
+        else:
+            cause = f"rebase refused: {first_line(rebased)}"
+        aborted = git(checkout, "rebase", "--abort")
+        if aborted.returncode and conflicted.stdout:
+            raise Refusal(f"{cause}; cannot restore main: {first_line(aborted)}")
+        raise Refusal(" ".join(cause.split()))
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
@@ -171,25 +173,26 @@ def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | Miss
 
 def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> tuple[bool, str]:
     """Push main only when every unpublished commit belongs to a configuration publisher."""
-    listed = git(checkout, "log", "--format=%s", "origin/main..main")
-    if listed.returncode:
-        return False, f"not pushed: {first_line(listed)}"
-    unpushed = listed.stdout.splitlines()
-    if not unpushed:
-        return True, "origin has it"
-    others = [subject for subject in unpushed if not subject.startswith(PUBLICATION_PREFIXES)]
-    if others:
-        return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
-    pushed = git(checkout, "push", "-q", "origin", "main", time_limit=time_limit)
-    if pushed.returncode:
-        return False, f"not pushed: {first_line(pushed)}"
-    return True, "pushed"
+    with main_push_lock.main_push_lock(checkout):
+        listed = git(checkout, "log", "--format=%s", "origin/main..main")
+        if listed.returncode:
+            return False, f"not pushed: {first_line(listed)}"
+        unpushed = listed.stdout.splitlines()
+        if not unpushed:
+            return True, "origin has it"
+        others = [subject for subject in unpushed if not subject.startswith(PUBLICATION_PREFIXES)]
+        if others:
+            return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
+        pushed = git(checkout, "push", "-q", "origin", "main", time_limit=time_limit)
+        if pushed.returncode:
+            return False, f"not pushed: {first_line(pushed)}"
+        return True, "pushed"
 
 
 def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> subprocess.CompletedProcess[str] | str:
     """Run a remote command; a string describes why it could not run."""
-    command = [ssh_program, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote]
+    command = [ssh_program, "-o", "BatchMode=yes", host, remote]
     try:
         return subprocess.run(command, capture_output=True, text=True, timeout=time_limit.seconds, check=False)
     except subprocess.TimeoutExpired as error:

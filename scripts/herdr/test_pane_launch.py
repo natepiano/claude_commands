@@ -1,17 +1,22 @@
-"""Retain the launch contract and remove retired identity at caller boundaries."""
+"""Retain launch options and remove retired identity at caller boundaries."""
 from __future__ import annotations
 
 import unittest
+import json
+from contextvars import Context
 import tempfile
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
-from typing import Literal, override
+from typing import Literal, override, cast
 from unittest.mock import patch
 
 
 from scripts.herdr import pane_launch
 from scripts.production import session_labels, staff
 from scripts.production.staff_test_support import isolated_staff_file
-from scripts.lib import legacy_identity
+from scripts.lib import atomic_file, legacy_identity
+from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.agents import pane_record
 from scripts.herdr import herdr
@@ -53,8 +58,129 @@ class LaunchEnvironmentTests(unittest.TestCase):
         entry = pane_record.launch("pane", "native", "/work", {"SHOWRUNNER_UNIT": "demo"}, ["claude"])
         self.assertEqual(entry["environment"], {})
 
+    def test_producer_publication_replaces_only_its_proved_binding(self) -> None:
+        cases = ("control same pane", "move", "native reference", "different records", "interrupted records", "interrupted then unit write",
+                 "wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process",
+                 "stale publication", "repeated publication", "requested account", "wrong requested account", "separate wrong requested account", "compaction after clear", "staff facts removed")
+        for kind in ("claude", "codex"):
+            for case in cases:
+                with self.subTest(kind=kind, case=case), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    owner = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "TEST-owner", staff.STAFF_ROOT,
+                        current_session=staff.StaffId("native-producer"), home=staff.SessionHome(root / "account"),
+                        worktree=staff.PresentWorktree("fixture", root))
+                    other = replace(owner, id=staff.StaffId("other-producer"), name="TEST-other",
+                                    current_session=staff.StaffId("other-native"))
+                    member = replace(owner, id=staff.StaffId("unit"), kind="unit", current_session=staff.StaffId("unit-native"))
+                    record = staff.StaffSnapshot((owner, other, member))
+                    model = "opus" if kind == "claude" else "gpt-test"
+                    registry = write_registry(root / "models.conf", {"producers": {owner.name: f"{kind}:{model}:high"}})
+                    source = root / "source.json"
+                    destination = root / "destination.json" if case in ("different records", "interrupted records", "interrupted then unit write") else source
+                    observation = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)
+                    observation["written_at"] = "2026-01-01T00:00:00+00:00"
+                    retained = pane_launch.StaffPaneLaunch(pane_id="old", staff_id=owner.id,
+                        model=observation["model"], remote_control=observation["remote_control"],
+                        environment=observation["environment"], flags_read=observation["flags_read"],
+                        ended=False, written_at=observation["written_at"])
+                    if "codex_policy" in observation:
+                        retained["codex_policy"] = observation["codex_policy"]
+                    old: pane_launch.PaneLaunch = retained
+                    if case == "native reference":
+                        old = {**observation, "session_id": owner.current_session}
+                    unrelated: dict[str, pane_launch.PaneLaunch] = {
+                        "other": {**retained, "pane_id": "other", "staff_id": other.id},
+                        "unit": {**retained, "pane_id": "unit", "staff_id": member.id}}
+                    pane_launch.save(source, {"old": old, **unrelated})
+                    target = "old" if case == "control same pane" else "new"
+                    launch = observation.copy()
+                    launch.update(pane_id=target, session_id=owner.current_session, kind=kind,
+                                  pid=456, proc_start="current", written_at="2026-02-01T00:00:00+00:00")
+                    if case == "wrong backend":
+                        launch["kind"] = "codex" if kind == "claude" else "claude"
+                    if case == "wrong folder":
+                        launch["cwd"] = str(root / "wrong")
+                    if case == "unread flags":
+                        launch["flags_read"] = False
+                    if case == "ended":
+                        launch["ended"] = True
+                    observed = herdr.NativeAgentProcess(
+                        herdr.EnvironmentThread("wrong" if case == "wrong identity" else owner.current_session),
+                        "old" if case == "stale process" else "current",
+                        {"HERDR_PANE_ID": target, "HERDR_SESSION": destination.stem,
+                         "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR": str(
+                             root / "destination-account" if case in ("requested account", "compaction after clear") else root / "account")})
+                    request = pane_launch.ProducerLaunchRequest(owner.id, owner.current_session, kind,
+                                                               root, root / "destination-account")
+                    with (patch.object(staff, "initial_snapshot", return_value=record),
+                          patch.object(staff, "local_snapshot", return_value=record),
+                          patch.dict("os.environ", {"MODELS_CONFIG_FILE": str(registry)}),
+                          patch.object(herdr, "native_process", return_value=observed),
+                          pane_launch.producer_launch_request(request) if case in ("requested account", "wrong requested account", "compaction after clear") else nullcontext()):
+                        if case == "separate wrong requested account":
+                            environment = {"HERDR_PRODUCER_LAUNCH_REQUEST" + owner.id.encode().hex(): json.dumps({
+                                "member": request.member, "session": request.session, "kind": request.kind,
+                                "folder": str(request.folder), "home": str(request.home)})}
+                            with patch.dict("os.environ", environment):
+                                with self.assertRaisesRegex(ValueError, "producer publication uses another account"):
+                                    Context().run(pane_launch.write, destination, launch, sources=(source, destination))
+                            self.assertEqual(pane_launch.read_strict(source), {"old": old, **unrelated})
+                            self.assertEqual(pane_launch.read_strict(destination),
+                                             {"old": old, **unrelated} if destination == source else {})
+                            continue
+                        if case in ("wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process", "wrong requested account"):
+                            with self.assertRaises(ValueError):
+                                pane_launch.write(destination, launch, sources=(source, destination))
+                            self.assertEqual(pane_launch.read_strict(source), {"old": old, **unrelated})
+                            self.assertEqual(pane_launch.read_strict(destination),
+                                             {"old": old, **unrelated} if destination == source else {})
+                            continue
+                        if case in ("interrupted records", "interrupted then unit write"):
+                            publish = atomic_file.write_text_atomic
+                            def interrupt(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                                if path == source:
+                                    raise OSError("fixture interrupted publication")
+                                publish(path, text, new_file_mode=new_file_mode)
+                            with patch.object(atomic_file, "write_text_atomic", side_effect=interrupt):
+                                with self.assertRaises(OSError):
+                                    pane_launch.write(destination, launch, sources=(source, destination))
+                            if case == "interrupted then unit write":
+                                update = unrelated["unit"].copy()
+                                update["model"] = "updated-unit-model"
+                                pane_launch.write(source, update)
+                                _ = update.pop("config_dir", None)
+                                unrelated["unit"] = update
+                        else:
+                            pane_launch.write(destination, launch, sources=(source, destination))
+                        if case == "compaction after clear":
+                            owner = replace(owner, current_session=staff.StaffId("cleared-producer"),
+                                            home=staff.SessionHome(request.home))
+                            cleared_record = staff.StaffSnapshot((owner, other, member))
+                            launch.update(session_id=owner.current_session, written_at="2026-03-01T00:00:00+00:00")
+                            cleared_process = replace(observed, identity=herdr.EnvironmentThread(owner.current_session))
+                            with (patch.object(staff, "initial_snapshot", return_value=cleared_record),
+                                  patch.object(staff, "local_snapshot", return_value=cleared_record),
+                                  patch.object(herdr, "native_process", return_value=cleared_process)):
+                                Context().run(pane_launch.write, destination, launch, sources=(source, destination))
+                        committed = pane_launch.read_strict(destination)[target]
+                        if case == "staff facts removed":
+                            self.assertEqual(set(committed) & {"session_id", "name", "cwd", "kind", "config_dir"}, set())
+                        if case == "compaction after clear":
+                            self.assertEqual(committed["written_at"], launch["written_at"])
+                        if case == "stale publication":
+                            stale = launch.copy()
+                            stale.update(pane_id="old", written_at=old["written_at"])
+                            pane_launch.write(source, stale, sources=(source, destination))
+                        if case == "repeated publication":
+                            before = destination.read_bytes()
+                            pane_launch.write(destination, launch, sources=(source, destination))
+                            self.assertEqual(destination.read_bytes(), before)
+                    combined = {pane: entry for path in {source, destination} for pane, entry in pane_launch.read_strict(path).items()}
+                    self.assertEqual(combined, {**unrelated, target: committed})
+                    self.assertEqual(cast(pane_launch.StaffPaneLaunch, committed)["staff_id"], owner.id)
+
     def test_readout_keeps_a_staffed_pane_with_an_unknown_home(self) -> None:
-        row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "agent", "TEST-unknown-home", staff.STAFF_ROOT,
+        row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "producer", "TEST-unknown-home", staff.STAFF_ROOT,
                              current_session=staff.StaffId("TEST-unknown-home"))
         entry = pane_launch.launch("TEST-pane", row.id, "/work", {}, ["claude"])
         _ = entry.pop("config_dir", None)

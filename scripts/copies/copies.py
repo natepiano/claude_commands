@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, conf, copy_record, file_lock, scratch
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_index, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -229,7 +229,7 @@ def staged_tree(source: Path) -> str:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():
-            _ = shutil.copyfile(index, private)
+            git_index.private_copy(index, private)
         result = subprocess.run(["git", "-C", str(source), "write-tree"],
                                 env={**os.environ, "GIT_INDEX_FILE": str(private)},
                                 capture_output=True, timeout=load_config().git_timeout_seconds)
@@ -473,9 +473,9 @@ def origin_url(source: Path) -> str | None:
 
 def main_checkout(source: Path) -> Path:
     """Read the main checkout, including repositories with separate Git metadata."""
-    common, current = git(source, "rev-parse", "--path-format=absolute",
-                          "--git-common-dir", "--git-dir").decode().splitlines()
-    if common == current and git(source, "rev-parse", "--is-bare-repository").strip() == b"false":
+    common, current, bare = git(source, "rev-parse", "--path-format=absolute",
+                                "--git-common-dir", "--git-dir", "--is-bare-repository").decode().splitlines()
+    if common == current and bare == "false":
         return Path(git(source, "rev-parse", "--show-toplevel").decode().strip())
     first = git(source, "worktree", "list", "--porcelain").decode().splitlines()[0]
     checkout = Path(first.removeprefix("worktree "))
@@ -1069,18 +1069,38 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
             COMMAND_LOCKS.reset(token)
 
 
-def end_workspaces(task: str, paths: list[Path]) -> None:
-    """End native copies for the sweep and remove adopted workers through guarded cleanup."""
+@dataclass(frozen=True)
+class HeldCrateRunLock:
+    """The caller holds this run lock through workspace removal."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class AcquireCrateRunLock:
+    """The removal guard must acquire the linked run lock."""
+
+
+CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
+ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+
+
+def end_workspaces(task: str, paths: list[Path], *,
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
+    """End workspace records and remove copies linked to terminal crates."""
     holds = scratch.holds()
     changed = False
-    for hold in holds.values():
-        if hold["task"] == task:
+    selected = {str(path.resolve()) for path in paths}
+    for path, hold in holds.items():
+        if path in selected and hold["task"] == task:
             hold["ended"] = time.time()
             changed = True
     if changed:
         scratch.write_holds(holds)
     for tree in paths:
-        if copy_record.copy_folder(tree) != tree.resolve():
+        record = scratch.task_of(tree)
+        if (copy_record.copy_folder(tree) != tree.resolve()
+                and not (isinstance(record, copy_record.Registered) and "crate_run" in record.fields)):
             if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
                     or scratch.end_copy(tree, task, time.time())):
                 hold = scratch.holds().get(str(tree.resolve()))
@@ -1088,15 +1108,33 @@ def end_workspaces(task: str, paths: list[Path]) -> None:
                     _ = scratch.release(tree)
             continue
         if not tree.exists():
+            if isinstance(record, copy_record.Registered) and record.task == task:
+                with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, scratch.removal_lock(tree) as idle:
+                    if not idle:
+                        raise CopyError(f"{tree}: workspace is busy during task completion")
+                    validate()
+                    scratch.remove_with_cargo_output(tree, scratch.remove)
+                    scratch.removal_mark(tree).unlink(missing_ok=True)
+            hold = scratch.holds().get(str(tree.resolve()))
+            if hold is not None and hold["task"] == task:
+                _ = scratch.release(tree)
             continue
-        with claim_tree(tree, create=False) as state:
+        if not isinstance(record, copy_record.Registered) or record.task != task:
+            raise CopyError(f"{tree}: workspace task differs")
+        with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, claim_tree(tree, create=False) as state:
             if state is not ClaimState.ACQUIRED:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(record, copy_record.Registered) or record.task != task:
+            def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+                if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise CopyError(f"{tree}: workspace task differs")
-                return {**record.fields, "ended": time.time(), "ended_task": task}
-            _ = scratch.update_record(tree, ended)
+                return {**current.fields, "ended": time.time(), "ended_task": task}
+            validate()
+            if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
+                _ = scratch.update_record(tree, ended)
+            if "crate_run" not in record.fields:
+                continue
+            scratch.remove_marked(tree, scratch.remove)
+        _ = scratch.release(tree)
 
 
 @contextmanager
@@ -1135,9 +1173,10 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
-                    if saved is not None and saved.blob == current.blob:
+                    if saved is not None and saved.blob == current.blob and path not in path_files:
                         file = tree / path
                         os.utime(file, ns=(file.lstat().st_atime_ns, saved.mtime_ns), follow_symlinks=False)
             try:
@@ -1157,6 +1196,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def manifest_path_files(tree: Path) -> set[str]:
+    """Find tracked files that name Cargo's manifest path variable."""
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(tree), "grep", "--no-color", "-l", "-z", "-F", "--",
+                                 "CARGO_MANIFEST_DIR"], capture_output=True, timeout=timeout,
+                                pass_fds=COMMAND_LOCKS.get())
+    except subprocess.TimeoutExpired as error:
+        raise CopyError(f"git grep in {tree}: timed out after {timeout:g} seconds") from error
+    if result.returncode not in (0, 1):
+        raise CopyError(f"git grep in {tree}: {result.stderr.decode(errors='replace').strip()}")
+    return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
 
 
 def tracked_file_times(tree: Path) -> dict[str, TrackedFileTime]:
@@ -1289,8 +1342,9 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
 
 
 @contextmanager
-def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Generator[Callable[[], None]]:
-    """Lock the linked run before the copy, then read its state under both locks."""
+def workspace_removal_guard(tree: Path, record: copy_record.Registered, *,
+                            run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> Generator[Callable[[], None]]:
+    """Use the caller's run lock or acquire it before the copy lock."""
     if "crate_run" not in record.fields:
         yield lambda: None
         return
@@ -1314,7 +1368,7 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 raise ValueError("manifest authority differs or crate records are missing")
             stages: list[str] = []
             matched = False
-            terminal = True
+            terminal = False
             for package, item in cast(dict[str, object], crates).items():
                 if not isinstance(item, dict):
                     raise ValueError("invalid crate record")
@@ -1322,19 +1376,24 @@ def workspace_removal_guard(tree: Path, record: copy_record.Registered) -> Gener
                 checkout, stage = fields.get("checkout"), fields.get("stage")
                 if not isinstance(checkout, str) or not isinstance(stage, str):
                     raise ValueError("crate checkout or stage is missing")
-                matched |= Path(checkout).resolve() == tree.resolve()
+                if Path(checkout).resolve() == tree.resolve():
+                    matched = True
+                    terminal = stage in ("integrated", "abandoned")
                 stages.append(f"{package}={stage}")
-                terminal &= stage in ("integrated", "abandoned")
             if not matched:
                 raise ValueError("manifest does not own this copy")
             stage_summary = ", ".join(stages)
             if not terminal:
-                raise CopyError(f"{tree}: crate run {path} is not terminal; stages: {stage_summary}")
+                raise CopyError(f"{tree}: crate run {path}: owning crate is not terminal; stages: {stage_summary}")
         except (OSError, UnicodeError, ValueError) as error:
             raise CopyError(f"{tree}: repair crate run {path}: {error}") from error
 
+    lock_path = path.parent / "run.lock"
+    if isinstance(run_lock, HeldCrateRunLock) and run_lock.path == lock_path:
+        yield validate
+        return
     try:
-        with file_lock.exclusive(path.parent / "run.lock", wait=False) as state:
+        with file_lock.exclusive(lock_path, wait=False) as state:
             if state is file_lock.LockResult.BUSY:
                 pid = file_lock.lock_holder(str(path.parent / "run.lock"))
                 busy = BusyCopy(tree, KnownHolder(pid) if pid is not None else None)
@@ -2003,6 +2062,42 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def publish_files(tree: Path, paths: Sequence[str], command_exit: int) -> None:
+    """Copy requested build files into one scratch folder with a deadline."""
+    if not paths:
+        return
+    try:
+        sources: list[Path] = []
+        for path in paths:
+            source = tree / path
+            if source.exists():
+                sources.append(source)
+            else:
+                print(f"copies: publish: {path} not built", file=sys.stderr)
+        if not sources:
+            return
+        commit = commit_at(tree, "HEAD")
+        repository = repository_name(tree)
+        with ExitStack() as cleanup:
+            publication = scratch.new(word="gate-binary", throwaway=True)
+            record = cast(copy_record.Registered, scratch.task_of(publication))
+            _ = cleanup.callback(scratch.end, record.task)
+            for source in sources:
+                destination = publication / source.name
+                temporary = publication / f".{source.name}.tmp"
+                _ = shutil.copy2(source, temporary)
+                _ = temporary.replace(destination)
+            write_text_atomic(publication / "manifest.json", json.dumps({
+                "repository": repository, "commit": commit, "command_exit": command_exit,
+                "files": [source.name for source in sources],
+            }) + "\n")
+            _ = cleanup.pop_all()
+        for source in sources:
+            print(f"published: {publication / source.name} {commit}")
+    except (CopyError, OSError, scratch.ScratchError) as error:
+        print(f"copies: publish: {error}", file=sys.stderr)
+
+
 def receive_metadata(tree: Path, args: CopyArguments) -> None:
     """Finish pending removal and publish all metadata before deleting its authority."""
     authority = floor_claims.removal_authority_path(tree)
@@ -2056,6 +2151,7 @@ class CopyArguments(argparse.Namespace):
     commit: str = ""
     apply_uncommitted: str | None = None
     merge: str | None = None
+    publish: list[str] = []
     command: list[str] = []
     source: str = ""
     task: str = ""
@@ -2103,6 +2199,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = run.add_argument("--commit", required=True)
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
+    _ = run.add_argument("--publish", action="append", default=[], metavar="PATH",
+                         help="copy a built relative path into a scratch folder")
     _ = run.add_argument("command", nargs=argparse.REMAINDER)
     _ = commands.add_parser("list", help="list standing trees and their busy state")
     try:
@@ -2150,7 +2248,9 @@ def main(argv: list[str] | None = None) -> int:
             with standing(caller_owner(), args.repo or "", policy, merge=merge) as tree:
                 result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
                                         cwd=tree, pass_fds=COMMAND_LOCKS.get())
-                return result.returncode if result.returncode >= 0 else 128 - result.returncode
+                command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
+                publish_files(tree, args.publish, command_exit)
+                return command_exit
         if args.action == "list":
             list_trees()
         else:

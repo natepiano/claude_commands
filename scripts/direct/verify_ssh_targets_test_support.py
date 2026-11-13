@@ -17,7 +17,7 @@ from typing import Callable, TypedDict, cast, override
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 
 from scripts.aws_target import ledger
@@ -388,6 +388,7 @@ source() {
             "wanted=ls-files", 'wanted=remote\nif has "$@"; then printf "https://example.com/team/hana.git\\n"; exit 0; fi\nwanted=ls-files'))
         _ = (self.root / ".git/config").write_text('[remote "origin"]\nurl=https://example.com/team/hana.git\n')
         self.configure("mac,natedev,aws")
+        install_fixed_cargo(self.bin_directory / "cargo")
 
     @override
     def setUp(self) -> None:

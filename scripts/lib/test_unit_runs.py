@@ -36,19 +36,52 @@ class UnitRunsTest(StaffTestCase):
         self.assertIsNone(unit_runs.open_run(owner.current_session))
         self.assertEqual(unit_runs.open_run(owner.current_session, record=record), path)
 
-    def test_showrunner_run_resolves_both_session_and_fixed_owner_records(self) -> None:
+        path.mkdir()
+        with patch.object(unit_runs, "RUN_ROOT", self.root):
+            stale = replace(record, rows=tuple(replace(row, run=staff.NoRun()) for row in record.rows))
+            self.write_json(path / unit_runs.STATE_FILE, {unit_runs.OWNER_FIELD: owner.id})
+            with patch.object(staff, "local_snapshot", return_value=stale):
+                self.assertFalse(unit_runs.run_is_open(path))
+                self.assertTrue(unit_runs.run_is_open(path, record=record))
+            for fields, pointer, expected in (
+                ({unit_runs.OWNER_FIELD: owner.id}, staff.OpenRun(path), True),
+                ({"main_agent": {"session_id": "unrelated-saved-session"}}, staff.OpenRun(path), True),
+                ({"main_agent": {"session_id": owner.current_session}}, staff.NoRun(), False),
+                ({unit_runs.OWNER_FIELD: owner.id, "status": "active"}, staff.NoRun(), False),
+                ({unit_runs.OWNER_FIELD: owner.id, "status": "completed"}, staff.OpenRun(path), True),
+            ):
+                with self.subTest(fields=fields, pointer=pointer):
+                    self.write_json(path / unit_runs.STATE_FILE, fields)
+                    if isinstance(pointer, staff.OpenRun):
+                        _ = staff.set_run(owner.id, pointer)
+                    else:
+                        _ = staff.clear_run(owner.id, path)
+                    self.assertEqual(unit_runs.run_is_open(path), expected)
+
+    def test_showrunner_run_uses_only_fixed_owner_records(self) -> None:
         owner = fixture_member("showrunner", name="production-owner")
         run = self.root / "production-run"
         run.mkdir()
         record = staff.snapshot()
         states = (
-            {"main_agent": {"session_id": owner.current_session}},
-            {unit_runs.OWNER_FIELD: owner.id},
+            ({"main_agent": {"session_id": owner.current_session}}, ""),
+            ({unit_runs.OWNER_FIELD: owner.id}, owner.current_session),
         )
-        for state in states:
+        for state, expected in states:
             with self.subTest(state=state):
                 self.write_json(run / unit_runs.STATE_FILE, state)
-                self.assertEqual(unit_runs.director(run, record=record), owner.current_session)
+                self.assertEqual(unit_runs.director(run, record=record), expected)
+
+        from scripts.astra import design_roles
+
+        for root in (unit_runs.ASTRA_RUN_ROOT, design_roles.state_root(), self.root / "other-helpers"):
+            helper = root / "helper"
+            helper.mkdir(parents=True, exist_ok=True)
+            for fields, expected in (({}, True), ({unit_runs.OWNER_FIELD: owner.id}, True),
+                                     ({"status": "completed", "finished_at": 1}, False)):
+                with self.subTest(helper=helper, fields=fields):
+                    self.write_json(helper / unit_runs.STATE_FILE, fields)
+                    self.assertEqual(unit_runs.run_is_open(helper), expected)
 
     def test_anomaly_prints_once_across_both_import_names(self) -> None:
         repository = Path(__file__).resolve().parents[2]

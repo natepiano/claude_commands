@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
+from scripts.build_hold.owning_session import OwningSession
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 from scripts.build_targets import build_targets, targets
@@ -177,11 +178,10 @@ class ConfigurationTests(IsolatedTargetTest):
                 target = target_config.SshTarget(name, platform, self.root / filename)
                 self.assertEqual(target_config.is_aws_target(target), expected)
 
-    def test_shipped_config_reads_mac_then_natedev_then_aws(self) -> None:
+    def test_shipped_config_reads_mac_then_natedev(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
             targets.LocalTarget("natedev", "linux"),
-            targets.SshTarget("aws", "linux", SHIPPED_CONFIG.with_name("aws_target.conf")),
         ))
 
     def test_order_follows_targets_key(self) -> None:
@@ -613,7 +613,7 @@ class ReservationTests(IsolatedTargetTest):
         identity_file = self.root / "reservation.identity"
         args.reservation_file, args.claim_identity_file = str(reservation), str(identity_file)
         paths = mac_test.StatePaths(self.mac_state)
-        session = build_hold.OwningSession("cleanup-session")
+        session = OwningSession("cleanup-session")
         write_atomic = atomic_file.write_text_atomic
 
         def process_start(pid: int) -> process_identity.ProcessStart:

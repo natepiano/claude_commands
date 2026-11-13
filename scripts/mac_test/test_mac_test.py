@@ -24,6 +24,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 
 from unittest import mock
@@ -397,6 +398,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
+        self.environment.update(interpreter_cache_environment(self.root / "cache"))
         self.children = []
         child_lifetime = self.root / "child-lifetime"
         child_lifetime.mkdir()
@@ -733,6 +735,9 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         return cast(str, values["variable"])
 
     def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "\n".join((
+            "targets=mac,natedev,aws", "kind.aws=ssh", "platform.aws=linux", "settings.aws=aws_target.conf",
+        )))
         settings = self.root / "aws_target.conf"
         values = conf.read(settings).values()
         self.assertTrue(all(key not in values for key in (
@@ -1624,6 +1629,30 @@ for arguments in (
                             for row in rows))
         _ = self.command("unblock", "--holder", "alice")
         self.assertEqual(len(self.hold_events(2)), 2)
+
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            member = fixture_member("producer", name="before-rename")
+            result = self.command("block", "--holder", member.id, "--for", "staff hold")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.block_state()["holder"], member.id)
+            member = staff.rename(member.id, "after-rename")
+            status = self.command("status")
+            self.assertIn("blocked by after-rename since ", status.stdout)
+            self.assertNotIn(member.id, status.stdout)
+            self.assertEqual(mac_test.delivery_target(mac_test.HolderQueue(member.id)), member.id)
+            self.assertEqual(mac_test.delivery_target(mac_test.RecordedSession("old-conversation", member.id)), member.id)
+            staff_path = self.root / "staff.json"
+            saved_staff = staff_path.read_bytes()
+            try:
+                _ = staff_path.write_text("{broken")
+                status = self.command("status")
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertIn(f"blocked by {member.id} since ", status.stdout)
+            finally:
+                _ = staff_path.write_bytes(saved_staff)
+            result = self.command("unblock", "--holder", member.id)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((self.state_directory / "block.json").exists())
 
     def test_pending_block_records_begin_before_it_becomes_active(self) -> None:
         result = self.command("claim", "--pid", str(os.getpid()), "--what", "local tests", "--worktree", str(self.root))

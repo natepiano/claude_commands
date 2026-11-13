@@ -14,7 +14,6 @@ import itertools
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import time
@@ -31,17 +30,14 @@ from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle  # noqa: E402
-from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import session_staff, staff, unit_config  # noqa: E402
-from scripts.agents import remote  # noqa: E402
-from scripts.usage import agents_log  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -255,6 +251,8 @@ def _contract_file(path: Path) -> ContractFileHash | ContractFileUnavailable:
 
 def _contract_revision() -> ContractRevision:
     """Read the deployed main checkout afresh at each phase boundary."""
+    from scripts.direct.tag_inventory import contract_table_paths
+
     root = Path.home() / ".claude"
     head: ContractMainHead | ContractHeadUnavailable
     try:
@@ -295,6 +293,7 @@ def _config_digest() -> str:
         text = (models_registry.launch_configuration(os.environ).text
                 if os.environ.get(models_registry.OPERATION_ENVIRONMENT[0]) else models_registry.registry_text())
         registry = text.encode("utf-8")
+        conf_reads.record(_config_path().stem)
         contents = registry + _config_path().read_bytes()
     except (OSError, ValueError, UnicodeError):
         return ""
@@ -449,29 +448,19 @@ def _state_path(session_dir: Path) -> Path:
     return session_dir / plan_history.STATE_FILENAME
 
 
-def _stored_fields(fields: dict[str, object], *, unit_owned: bool = False) -> dict[str, object]:
-    """Omit folder copies from state, events, and nested wait attribution."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status") and fields["status"] != "active":
-        return dict(fields)
-    if not unit_owned and (fields.get(unit_runs.OWNER_FIELD) or fields.get("main_agent") or fields.get("owner_session")):
-        unit_owned = isinstance(unit_runs.run_owner(fields, staff.initial_snapshot()), staff.StaffRow)
-    result: dict[str, object] = {}
+def _stored_fields(fields: dict[str, object]) -> dict[str, object]:
+    """Keep plan paths relative to the recorded folder."""
+    stored = dict(fields)
     directory = _string(fields.get("working_dir"))
-    for key, value in fields.items():
-        if unit_owned and key in ("working_dir", "worktree"):
-            continue
-        if key in ("plan_doc", "project_plan_doc") and isinstance(value, str) and directory and value.startswith(directory + "/"):
-            value = str(Path(value).relative_to(directory))
-        if isinstance(value, dict):
-            value = _stored_fields(cast(dict[str, object], value), unit_owned=unit_owned)
-        elif isinstance(value, list):
-            value = [_stored_fields(cast(dict[str, object], item), unit_owned=unit_owned) if isinstance(item, dict) else item
-                     for item in cast(list[object], value)]
-        result[key] = value
-    return result
+    for key in ("plan_doc", "project_plan_doc"):
+        value = fields.get(key)
+        if directory and isinstance(value, str) and value.startswith(directory + "/"):
+            stored[key] = str(Path(value).relative_to(directory))
+    return stored
 
 
-def _read_state(session_dir: Path) -> dict[str, object]:
+def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
+                resolve_staff: bool = True) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
         state = _json_object(path.read_text(encoding="utf-8"))
@@ -479,16 +468,23 @@ def _read_state(session_dir: Path) -> dict[str, object]:
         raise SystemExit(f"Unable to read progress state {path}: {error}") from error
     if state is None:
         raise SystemExit(f"Invalid progress state: {path}")
-    if not state.get("main_agent") and not state.get("owner_session"):
-        state["owner_session"] = unit_runs.director(session_dir)
-    return plan_history.staff_directory(state, staff.initial_snapshot())
+    if not resolve_staff:
+        return state
+    return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record)
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     stored = _stored_fields(state)
-    if state.get(unit_runs.OWNER_FIELD) and state.get("status") == "active":
-        for key in ("production", "unit", "branch"):
+    if state.get(unit_runs.OWNER_FIELD):
+        for key in ("production", "unit", "branch", "working_dir", "worktree", "owner_session", "director_session"):
             _ = stored.pop(key, None)
+        stored["main_agent"] = {key: value for key, value in (_object_dict(state.get("main_agent")) or {}).items()
+                                if key not in ("family", "session_id")}
+    stored["pass"] = {slot: {**{key: value for key, value in passed.items()
+                               if key != "worker_name" or not passed.get("worker_id")}, **({
+        "called_agent": {key: value for key, value in (_object_dict(passed.get("called_agent")) or {}).items()
+                         if key not in ("family", "session_id")}
+    } if passed.get("worker_id") else {})} for slot, passed in _pass_slots(state).items()}
     write_text_atomic(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
@@ -501,32 +497,9 @@ SESSION_ROOTS = tuple(
 )
 
 
-def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
-    if fields.get("status") != "active" or fields.get("working_dir") not in (str(old), str(new)):
-        return False
-    fields["branch"] = new_branch
-    fields.update(_stored_fields(fields))
-    del fields["working_dir"]
-    if "worktree" in fields:
-        del fields["worktree"]
-    return True
-
-
-def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[Path]:
-    """Remove active state folder copies. Keep recorded history unchanged."""
-    moved: list[Path] = []
-    for root in SESSION_ROOTS:
-        for path in root.glob(f"*/{plan_history.STATE_FILENAME}"):
-            try:
-                state = _json_object(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError):
-                continue
-            if state is not None and state.get("history_file") == str(history_file) and _moved_fields(
-                state, old, new, new_branch
-            ):
-                _write_state(path.parent, state)
-                moved.append(path)
-    return moved
+def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
+    """Staff supplies the current folder; historical records remain unchanged."""
+    return []
 
 
 def _refresh_phase_table(session_dir: Path) -> None:
@@ -692,20 +665,11 @@ def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
 
 
 def _refresh_main_identity(session_dir: Path, state: dict[str, object]) -> None:
-    """Re-read the unit director's model and effort whenever a window opens.
+    """Refresh model and effort from the director's current transcript.
 
-    `start-run` detects the unit director once, and its model or effort can
-    change part way through a run. Windows are also opened from inside workers:
-    a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but detects
-    as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
-    of its own. So a refresh replaces `main_agent` only when the detected
-    session is the run's director (`unit_runs.director`), else the stored
-    identity's session; with neither known, any detection is taken. The
-    director is read from the run folder, not from `main_agent`, because runs
-    started before this check carry a worker's thread there, and the director's
-    next window repairs it. Detection that comes back unknown leaves
-    `main_agent` alone too: a window that cannot answer must not erase the
-    answer already recorded.
+    Staff supplies the director for a staffed run.
+    An unstaffed helper keeps its recorded session.
+    Unknown detection preserves the recorded settings.
     """
     detected = _detect_main_identity(
         argparse.Namespace(
@@ -717,8 +681,9 @@ def _refresh_main_identity(session_dir: Path, state: dict[str, object]) -> None:
     )
     if detected["model"] == "unknown":
         return
-    stored = _object_dict(state.get("main_agent")) or {}
-    owner = unit_runs.director(session_dir) or _string(stored.get("session_id"))
+    owner = unit_runs.director(session_dir)
+    if not owner and not state.get(unit_runs.OWNER_FIELD):
+        owner = _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
     if owner and detected["session_id"] != owner:
         return
     state["main_agent"] = detected
@@ -912,7 +877,10 @@ def _historical_project_timing(
         event = plan_history.run_started_event(history_path)
         if event is None:
             continue
-        event = plan_history.staff_directory(event, record)
+        if not _string(event.get("working_dir")):
+            owner = unit_runs.run_owner(event, record)
+            if isinstance(owner, staff.StaffRow) and not isinstance(owner.worktree, staff.WorktreeUnfilled):
+                event = {**event, "working_dir": str(owner.worktree.path)}
         if (
             _string(event.get("working_dir")) != str(working_dir)
             or _string(event.get("branch")) != branch
@@ -1060,18 +1028,29 @@ class ActiveDispatchUnavailable:
     reason: str
 
 
+def _worker_launcher(command: list[str], name: str) -> list[str]:
+    """Resolve saved target arguments through the current worker name."""
+    result = list(command)
+    for index, part in enumerate(command):
+        if part in ("--to", "--new-worker") and index + 1 < len(command):
+            result[index:index + 2] = ["--to", name]
+        elif part.startswith(("--to=", "--new-worker=")):
+            result[index] = "--to=" + name
+    return result
+
+
 def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoActiveDispatch | ActiveDispatchUnavailable:
     """Read the active pass through the worker's fixed staff id."""
     try:
-        row = staff.snapshot().by_id(worker_id)
-        if row is None:
+        record = staff.snapshot()
+        row = record.by_id(worker_id)
+        if row is None or row.kind != "worker":
             return ActiveDispatchUnavailable(f"worker {worker_id}: staff row is unavailable")
         state = worker_lifecycle.read_json_object(_state_path(run))
-        roster = session_staff.read_worker_roster(run / "mesh_roster.json")
-        names = {row.name, *(name for name, entry in roster.items()
-                           if (_object_dict(entry) or {}).get("staff_id") == worker_id)}
-        matches = [item for slot, item in _open_passes(state).items()
-                   if item.get("worker_name", slot) in names]
+        owner = unit_runs.run_owner(state, record)
+        if not isinstance(owner, staff.StaffRow) or row.parent != staff.ReportsTo(owner.id):
+            return NoActiveDispatch()
+        matches = [item for item in _open_passes(state).values() if item.get("worker_id") == worker_id]
         if not matches:
             return NoActiveDispatch()
         if len(matches) != 1:
@@ -1081,7 +1060,7 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         if not instance or not isinstance(command, list) or not command or any(
                 not isinstance(part, str) for part in cast(list[object], command)):
             return ActiveDispatchUnavailable(f"worker {worker_id}: active pass identity or launcher command is unavailable")
-        return ActiveDispatch(instance, tuple(cast(list[str], command)))
+        return ActiveDispatch(instance, tuple(_worker_launcher(cast(list[str], command), row.name)))
     except FileNotFoundError:
         return NoActiveDispatch()
     except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable) as error:
@@ -1122,7 +1101,6 @@ class DispatchReads:
     record: staff.StaffSnapshot
     states: dict[Path, dict[str, object]]
     events: dict[Path, list[dict[str, object]]]
-    roles: agents_log.RoleLog
 
 
 class ReadDispatches(Enum):
@@ -1142,8 +1120,7 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
             states[path] = _json_object(path.read_text(encoding="utf-8")) or {}
         except (OSError, UnicodeError):
             continue
-    token = _dispatch_reads.set(DispatchReads(record, states, {},
-        agents_log.assignments(agents_log.state_dir() / "agents.jsonl")))
+    token = _dispatch_reads.set(DispatchReads(record, states, {}))
     try:
         yield
     finally:
@@ -1152,6 +1129,8 @@ def dispatch_reads(record: staff.StaffSnapshot, runs: Iterable[Path]) -> Generat
 
 def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchRecorded:
     """Read the newest open or finished dispatch across the staff parent's runs."""
+    from scripts.direct import phase_reservation
+
     reads = _dispatch_reads.get()
     if isinstance(reads, ReadDispatches):
         try:
@@ -1186,19 +1165,16 @@ def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchReco
                 for event in reads.events[path] if event.get("event_type") == "pass_finished")]
         records.extend((path.parent, record) for record in passes
                        if _string(record.get("status")) in {"active", "refused", "completed", "error", "canceled", "interrupted"}
-                       and (record.get("worker_id") == worker_id if record.get("worker_id")
-                            else record.get("worker_name") == worker.name))
-    task = agents_log.role_at(reads.roles, worker.current_session, datetime.now(UTC))
+                       and record.get("worker_id") == worker_id)
     run, latest = max(records, key=lambda item: _number(item[1].get("finished_at"), _number(item[1].get("started_at"))),
                       default=(Path(), dict[str, object]()))
-    role = _string(latest.get("kind")) or (task.role if isinstance(task, agents_log.Assignment) else "")
+    role = _string(latest.get("kind"))
     if not role:
         return NoDispatchRecorded()
     phases = {_string((_object_dict(item[1].get("phase")) or {}).get("id")).strip() for item in records}
     missing = DispatchDetailNotRecorded.UNRECORDED
     phase = next(iter(phases)) if len(phases) == 1 and "" not in phases else missing
-    lens = _string(latest.get("lens")) or (
-        task.lens if isinstance(task, agents_log.Assignment) and task.role == "review" and role == "review" else "")
+    lens = _string(latest.get("lens"))
     paths = _string(latest.get("paths")) or (
         str(phase_reservation.phase_directory(run, phase) / phase_reservation.FILES_FILE)
         if isinstance(phase, str) and role != "review" else missing)
@@ -1467,7 +1443,7 @@ def _close_active_activity(
 def _start_activity(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    if _string(state.get("status")) != "active":
+    if not unit_runs.run_is_open(session_dir):
         raise SystemExit("Cannot start an activity: the run is finished")
     if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
@@ -1500,6 +1476,35 @@ def _finish_activity(args: argparse.Namespace) -> None:
     )
 
 
+def _claim_run_pointer(owner: staff.StaffRow, session_dir: Path) -> None:
+    """Publish the pointer for a unit run folder."""
+    if unit_runs.is_unit_run(session_dir):
+        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+
+
+def _assign_unit_plan(member: staff.StaffRow | unit_runs.RunOwnerUnrecorded | None, working_dir: Path, plan_doc: str) -> None:
+    """Name the plan in a unit's `.unit.toml`; other owners have no unit config."""
+    if isinstance(member, staff.StaffRow) and member.kind == "unit":
+        unit_config.set_plan(working_dir, plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir))
+
+
+def _record_plan(session_dir: Path, state: dict[str, object], plan_doc: str) -> dict[str, object]:
+    """Point a reused run at the plan its start-run names; the same plan changes nothing."""
+    working_dir = Path(_string(state.get("working_dir"))).resolve()
+    recorded = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+    wanted = plan_history.resolve_plan_path(working_dir, plan_doc)
+    if recorded and plan_history.resolve_plan_path(working_dir, recorded) == wanted:
+        return state
+    _assign_unit_plan(unit_runs.run_owner(state, staff.initial_snapshot()), working_dir, plan_doc)
+    timing = _explicit_plan_timing(working_dir, plan_doc, plan_history.now_epoch())
+    state["plan_doc"] = plan_doc
+    state["project_started_at"] = timing["started_at"]
+    state["project_start_source"] = timing["source"]
+    state["project_plan_doc"] = timing["plan_doc"]
+    _write_state(session_dir, state)
+    return state
+
+
 def _start_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     existing = _state_path(session_dir)
@@ -1509,6 +1514,8 @@ def _start_run(args: argparse.Namespace) -> None:
             _read_state(session_dir),
             plan_history.now_epoch(),
         )
+        if plan_doc := _arg_string(args, "plan_doc"):
+            state = _record_plan(session_dir, state, plan_doc)
         print(_string(state.get("history_file"), str(existing)))
         return
 
@@ -1521,7 +1528,9 @@ def _start_run(args: argparse.Namespace) -> None:
             "Unable to detect the unit director's model and effort; pass explicit --main-* values"
         )
     record = staff.initial_snapshot()
-    current = plan_history.staff_directory({"main_agent": main_agent}, record)
+    owner = record.owner_of(main_agent["session_id"])
+    owner = owner if owner is not None and owner.kind in ("unit", "showrunner") else None
+    current = plan_history.staff_directory({unit_runs.OWNER_FIELD: owner.id} if owner is not None else {}, record)
     working_dir_value = _string(current.get("working_dir")) or working_dir_value
     working_dir = Path(working_dir_value).expanduser().resolve()
     now = plan_history.now_epoch()
@@ -1531,10 +1540,8 @@ def _start_run(args: argparse.Namespace) -> None:
         short_hash = _git_value(working_dir, "rev-parse", "--short", "HEAD")
         branch = f"detached@{short_hash or 'unknown'}"
     plan_doc = _arg_string(args, "plan_doc")
-    member = record.by_member_reference(main_agent["session_id"])
-    if plan_doc and member is not None and member.kind == "unit":
-        plan = plan_history.resolve_plan_path(working_dir, plan_doc).relative_to(working_dir)
-        unit_config.set_plan(working_dir, plan)
+    if plan_doc:
+        _assign_unit_plan(record.by_member_reference(main_agent["session_id"]), working_dir, plan_doc)
     project_timing = _resolve_project_timing(working_dir, branch, plan_doc, now)
     history_file = plan_history.history_root() / "runs" / f"{run_id}.jsonl"
     state: dict[str, object] = {
@@ -1560,12 +1567,10 @@ def _start_run(args: argparse.Namespace) -> None:
         "last_percent": None,
         "percent_started_at": None,
         "pending_calibration": None,
-        "status": "active",
     }
-    owner = unit_runs.run_owner(state, record)
-    if isinstance(owner, staff.StaffRow):
+    if owner is not None and owner.kind in ("unit", "showrunner"):
         state[unit_runs.OWNER_FIELD] = owner.id
-        _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+        _claim_run_pointer(owner, session_dir)
     _write_state(session_dir, state)
     _append_event(state, _event(state, "run_started", now))
     print(history_file)
@@ -1602,8 +1607,11 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 
 
 def _start_phase(args: argparse.Namespace) -> None:
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    record = staff.initial_snapshot()
+    state = _read_state(session_dir, record=record)
     now = plan_history.now_epoch()
     phase_id = _arg_string(args, "phase_id", "ad hoc")
     phase_dir = phase_reservation.phase_directory(session_dir, phase_id)
@@ -1638,22 +1646,19 @@ def _start_phase(args: argparse.Namespace) -> None:
         _ = phase_reservation.restore(phase_dir, phase_id)
     except phase_reservation.StateRefused as refused:
         raise SystemExit(str(refused)) from refused
-    if _string(state.get("status")) != "active" and "finished_at" in state:
-        director = unit_runs.director(session_dir) or _string(
-            (_object_dict(state.get("main_agent")) or {}).get("session_id"))
-        if director:
-            row = staff.by_current_session(director)
-            if row is not None:
-                _ = staff.set_run(row.id, staff.OpenRun(session_dir))
+    if not unit_runs.run_is_open(session_dir, record=record) or "status" in state:
         previous_status = _string(state.get("status"))
-        state["status"] = "active"
+        _ = state.pop("status", None)
         _ = state.pop("finished_at", None)
         reopened = _event(state, "reopened", now)
         reopened.update({"previous_status": previous_status, "cause": "start-phase", "phase_id": phase_id})
         _append_event(state, reopened)
         _write_state(session_dir, state)
+        row = unit_runs.run_owner(state, record)
+        if isinstance(row, staff.StaffRow):
+            _claim_run_pointer(row, session_dir)
     _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
+    state = _read_state(session_dir, record=record)
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         _park_current(state, active)
@@ -1830,7 +1835,11 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     if active is None or _pass_phase_instance(active) != _string(phase.get("instance_id")):
         return NoMatchedDispatch()
     saved_command = active.get("launcher_command")
-    same_launcher = bool(launcher_command) and saved_command == launcher_command
+    current_command: object = (_worker_launcher(cast(list[str], saved_command), _string(active.get("worker_name")))
+                       if isinstance(saved_command, list) and active.get("worker_id") and active.get("worker_name")
+                       else cast(object, saved_command))
+    same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
+        active.get("status") in ("active", "refused") and launcher_command == current_command))
     if launcher_command and saved_command and not same_launcher:
         return NoMatchedDispatch()
     if not all(active.get(key, "") == value for key, value in fields.items()
@@ -1842,19 +1851,37 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     return MatchedDispatch(_string(active.get("worker_name")), _string(active.get("instance_id")))
 
 
+def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> str:
+    """Name the slot whose pass this launcher command started, or the given slot."""
+    if not _state_path(session_dir).is_file():
+        return slot
+    return _launch_slot(_pass_slots(_read_state(session_dir)), slot, launcher_command)
+
+
+def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_command: list[str]) -> str:
+    return next((name for name, passed in passes.items()
+                 if launcher_command and (passed.get("launcher_command") == launcher_command or (
+                     passed.get("status") in ("active", "refused")
+                     and passed.get("worker_id") and passed.get("worker_name")
+                     and isinstance(saved := passed.get("launcher_command"), list)
+                     and _worker_launcher(cast(list[str], saved), _string(passed.get("worker_name"))) == launcher_command))), slot)
+
+
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
     state = _read_state(session_dir)
+    passes = _pass_slots(state)
+    slot = _launch_slot(passes, slot, launcher_command)
     recorded_phase = _open_phase_named(state, phase)
     if recorded_phase is None:
-        recorded_phase = _object_dict(_pass_slots(state).get(slot, {}).get("phase"))
+        recorded_phase = _object_dict(passes.get(slot, {}).get("phase"))
         if recorded_phase is None or _string(recorded_phase.get("id")) != phase:
             return NoMatchedDispatch()
     return _dispatch_match(
-        _pass_slots(state).get(slot), recorded_phase,
+        passes.get(slot), recorded_phase,
         {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
         launcher_command, dispatch_owned=True,
     )
@@ -1873,7 +1900,21 @@ def _start_pass(args: argparse.Namespace) -> None:
         session_id="",
     )
     team_slot = _optional_arg(args, "team_slot") if hasattr(args, "team_slot") else _team_slot()
-    state = _read_state(session_dir)
+    membership = staff.initial_snapshot()
+    state = _read_state(session_dir, record=membership)
+    worker = membership.by_id(staff.StaffId(_optional_arg(args, "worker_id")))
+    inferred_owner = False
+    if not _optional_arg(args, "worker_id") and (name := _optional_arg(args, "worker_name")):
+        from scripts.production import worker_admission
+        owner = unit_runs.run_owner(state, membership)
+        if isinstance(owner, staff.StaffRow):
+            worker = worker_admission.find_worker(membership, owner.id, name)
+    if worker is not None and worker.kind == "worker" and isinstance(worker.parent, staff.ReportsTo):
+        args.worker_id = worker.id
+        args.worker_name = worker.name
+        if not state.get(unit_runs.OWNER_FIELD):
+            state[unit_runs.OWNER_FIELD] = worker.parent.id
+            inferred_owner = True
     # A phase running beside the current one names itself, so its pass is not stamped with
     # the current phase's.
     phase, launch_check = _checked_launch(args, state, session_dir)
@@ -1883,7 +1924,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "kind": pass_kind,
         "fix_pass": fix_pass,
         "called_task": _arg_string(args, "called_task"),
-        "worker_name": _optional_arg(args, "worker_name"),
+        "worker_id": _optional_arg(args, "worker_id"),
         "prompt_file": _optional_arg(args, "prompt_file"),
         "dispatch_kind": _optional_arg(args, "dispatch_kind"),
         "lens": _optional_arg(args, "lens"),
@@ -1893,7 +1934,7 @@ def _start_pass(args: argparse.Namespace) -> None:
                             dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
                             allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
     if active is not None and isinstance(match, MatchedDispatch):
-        changed = active.get("launcher_pid") != launcher_pid
+        changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
@@ -1902,9 +1943,12 @@ def _start_pass(args: argparse.Namespace) -> None:
             _write_state(session_dir, state)
         return
     now = plan_history.now_epoch()
+    owner_id = state.get(unit_runs.OWNER_FIELD)
     # A different dispatch replaces only this slot's pass.
     _ = _close_slot_pass(session_dir, state, team_slot, "interrupted", now)
-    state = _read_state(session_dir)
+    state = _read_state(session_dir, record=membership)
+    if owner_id:
+        state[unit_runs.OWNER_FIELD] = owner_id
     _refresh_main_identity(session_dir, state)
     current_pass: dict[str, object] = {
         **dispatch_fields,
@@ -2145,15 +2189,24 @@ def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> 
     _update_dispatch(session_dir, instance_id, "hook_notice", notice)
 
 
+def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:
+    """Record a reported quota refusal so the timer reports it once."""
+    _update_dispatch(session_dir, instance_id, "quota_refusal", refusal_id)
+
+
 def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
         return
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        state = _read_state(session_dir)
+        record = staff.initial_snapshot()
+        state = _read_state(session_dir, record=record)
+        owner = unit_runs.run_owner(state, record)
+        workers = record.find(kind="worker", parent=owner.id) if isinstance(owner, staff.StaffRow) else ()
+        worker = next((row for row in workers if row.name == worker_name), None)
         for passed in _open_passes(state).values():
-            if passed.get("worker_name") == worker_name and passed.get("status") != "refused":
+            if worker is not None and passed.get("worker_id") == worker.id and passed.get("status") != "refused":
                 passed["status"] = "refused"
                 _write_state(session_dir, state)
                 _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
@@ -2229,6 +2282,8 @@ def _arm_review(args: argparse.Namespace) -> None:
     only earns the reviewer a row in the stage table while the writer it
     overlaps is still going.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _arg_string(args, "phase_id")
@@ -2343,8 +2398,16 @@ def load_events(event_types: Collection[str] = (), *,
 def events_for_worktrees(worktrees: tuple[Path, ...], event_types: frozenset[str]) -> list[dict[str, object]]:
     """Read selected records once for the units' current staff worktrees."""
     directories = {str(worktree.resolve()) for worktree in worktrees}
-    return sorted((event for event in load_events(event_types)[0] if event.get("working_dir") in directories),
-                  key=lambda event: _number(event.get("timestamp_epoch")))
+    events = load_events(event_types)[0]
+    record = staff.initial_snapshot() if any(not event.get("working_dir") for event in events) else None
+    selected: list[dict[str, object]] = []
+    for event in events:
+        if not event.get("working_dir") and record is not None:
+            current = plan_history.staff_directory({key: value for key, value in event.items() if key != "event_type"}, record)
+            event = {**event, **{key: current[key] for key in ("working_dir", "worktree") if key in current}}
+        if event.get("working_dir") in directories:
+            selected.append(event)
+    return sorted(selected, key=lambda event: _number(event.get("timestamp_epoch")))
 
 
 def _agent_fields(event: dict[str, object], key: str) -> tuple[str, str]:
@@ -2457,6 +2520,8 @@ def _round_metric(value: float) -> float:
 
 
 def _sample_metrics(samples: list[CalibrationSample], current_hold: int) -> dict[str, object]:
+    import statistics
+
     if not samples:
         return {
             "sample_count": 0,
@@ -4191,24 +4256,23 @@ def _current_worker_cells(
 
 
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
-    """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
+    """Show accepted settings for the current staff workers and keep historical windows intact."""
     try:
-        roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
-    except worker_lifecycle.WorkerStateUnreadable:
+        membership = staff.local_snapshot()
+        workers = {row.id for row in session_staff.run_workers(_read_state(session_dir, record=membership), membership)}
+    except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
         return [{**window, "worker": "unavailable"} for window in windows]
-    slots: dict[str, str] = {}
+    models: dict[str, str] = {}
     for path in session_dir.glob("impl_worker_*.json"):
         try:
-            identity = _json_object(path.read_text(encoding="utf-8")) or {}
-        except OSError:
+            identity = worker_lifecycle.read_worker_state(path)
+        except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable):
             continue
-        slots[_string(identity.get("name"))] = _string(identity.get("slot"))
-    models: dict[str, str] = {}
-    for name, value in roster.items():
-        record = _object_dict(value) or {}
-        settings = worker_lifecycle.recorded_turn_settings(record)
-        if settings.model:
-            slot = slots.get(name) or _string(record.get("slot")) or name
+        if identity.get("staff_id") not in workers:
+            continue
+        settings = worker_lifecycle.recorded_turn_settings(identity)
+        slot = _string(identity.get("slot"))
+        if settings.model and slot:
             models[slot] = _agent_display(settings.model, settings.effort)
     result: list[StageWindow] = []
     for window in windows:
@@ -5530,18 +5594,8 @@ def resolve_production_unit(state: Mapping[str, object], *, resolver: session_st
     try:
         resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
         record = resolver.record
-        identity = _string(state.get("director_session")) or _string(state.get("owner_session"))
-        main_agent = state.get("main_agent")
-        if not identity and isinstance(main_agent, dict):
-            identity = _string(cast(dict[str, object], main_agent).get("session_id"))
         owner = unit_runs.run_owner(state, record)
-        row = owner if isinstance(owner, staff.StaffRow) else (record.by_current_session(identity) if identity else None)
-        if row is None:
-            current = plan_history.staff_directory(dict(state), record)
-            folder = _string(current.get("working_dir"))
-            if folder:
-                member = resolver.member_by_folder(remote.local_machine(), Path(folder).expanduser().resolve())
-                row = member.row if isinstance(member, session_staff.MemberFound) else None
+        row = owner if isinstance(owner, staff.StaffRow) else None
         if row is None or row.kind != "unit":
             plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
             working_dir = _string(state.get("working_dir"))
@@ -5643,14 +5697,7 @@ def _phase_plan_names(state: Mapping[str, object]) -> tuple[
 
 
 def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
-    production = _recorded_phase_metadata(state.get("production"), "run names no production")
-    unit = _recorded_phase_metadata(state.get("unit"), "run names no unit")
-    if isinstance(production, PhaseMetadataNotRecorded) or isinstance(unit, PhaseMetadataNotRecorded):
-        plan_production, plan_unit = _phase_plan_names(state)
-        if isinstance(production, PhaseMetadataNotRecorded):
-            production = plan_production
-        if isinstance(unit, PhaseMetadataNotRecorded):
-            unit = plan_unit
+    production, unit = _phase_plan_names(state)
     return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
@@ -5659,32 +5706,29 @@ def _phase_identity(state: dict[str, object], phase: dict[str, object]) -> dict[
             "phase_instance_id": _string(phase.get("instance_id"))}
 
 
-def resolve_worker_pass(session_dir: Path, state: dict[str, object],
-                        thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
-    """Use the thread's full roster name, never a server's inherited slot."""
+def resolve_worker_pass(state: dict[str, object], thread_id: str) -> ResolvedWorkerPass | UnresolvedWaitAttribution:
+    """Select the current staff worker and its recorded dispatch reference."""
     phases = [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
-    candidates: list[dict[str, object]] = []
-    for record in _open_passes(state).values():
-        candidates.append({"run_id": _string(state.get("run_id")),
-                           "phase_instance_id": _pass_phase_instance(record),
-                           "phase_id": _string((_object_dict(record.get("phase")) or {}).get("id")),
-                           "pass_instance_id": _string(record.get("instance_id")),
-                           "worker_name": _string(record.get("worker_name")),
-                           "team_slot": _string(record.get("team_slot"))})
+    candidates: list[dict[str, object]] = [{"run_id": _string(state.get("run_id")),
+                   "phase_instance_id": _pass_phase_instance(passed),
+                   "phase_id": _string((_object_dict(passed.get("phase")) or {}).get("id")),
+                   "pass_instance_id": _string(passed.get("instance_id")),
+                   "worker_id": _string(passed.get("worker_id")),
+                   "team_slot": _string(passed.get("team_slot"))}
+                  for passed in _open_passes(state).values()]
     if not candidates:
         candidates = [_phase_identity(state, phase) for phase in phases if phase.get("status") == "active"]
     try:
-        roster = session_staff.read_worker_roster(session_dir / "mesh_roster.json")
+        membership = staff.local_snapshot()
+        worker = next((row for row in session_staff.run_workers(state, membership)
+                       if thread_id and row.current_session == thread_id), None)
     except (OSError, ValueError) as error:
-        return UnresolvedWaitAttribution(f"worker roster unavailable: {error}", tuple(candidates))
-    membership = staff.local_snapshot()
-    names = [name for name, value in roster.items()
-             if thread_id and session_staff.worker_session(_object_dict(value) or {}, membership) == thread_id]
-    if len(names) != 1:
-        return UnresolvedWaitAttribution(f"worker thread has {len(names)} roster matches", tuple(candidates))
-    matching = [candidate for candidate in candidates if candidate.get("worker_name") == names[0]]
+        return UnresolvedWaitAttribution(f"worker staff unavailable: {error}", tuple(candidates))
+    if worker is None:
+        return UnresolvedWaitAttribution("worker thread has no matching staff membership", tuple(candidates))
+    matching = [candidate for candidate in candidates if candidate.get("worker_id") == worker.id]
     if len(matching) != 1:
-        return UnresolvedWaitAttribution(f"worker {names[0]} has {len(matching)} active pass matches",
+        return UnresolvedWaitAttribution(f"worker {worker.name} has {len(matching)} active pass matches",
                                          tuple(matching or candidates))
     candidate = matching[0]
     no_phase: dict[str, object] = {}
@@ -5692,7 +5736,7 @@ def resolve_worker_pass(session_dir: Path, state: dict[str, object],
                   and phase.get("status") == "active"), no_phase)
     if not phase or not candidate["pass_instance_id"]:
         return UnresolvedWaitAttribution("worker pass has no active phase or pass id", (candidate,))
-    return ResolvedWorkerPass(phase, _string(candidate["pass_instance_id"]), names[0],
+    return ResolvedWorkerPass(phase, _string(candidate["pass_instance_id"]), worker.name,
                               _string(candidate["team_slot"]))
 
 
@@ -5704,7 +5748,7 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
     instance_id = _optional_arg(args, "phase_instance_id")
     phase_id = _optional_arg(args, "phase_id")
     if hasattr(args, "worker_thread_id"):
-        return resolve_worker_pass(_session_dir(args), state, _optional_arg(args, "worker_thread_id"))
+        return resolve_worker_pass(state, _optional_arg(args, "worker_thread_id"))
     if hasattr(args, "director") and cast(bool, args.director):
         phases = [phase for phase in [*_parked_phases(state), _object_dict(state.get("phase")) or {}]
                   if phase.get("status") == "active"]
@@ -5738,7 +5782,7 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
     if _optional_arg(args, "missing_reason") and not hasattr(args, "phase_id"):
         return WaitPhaseNotRecorded("missing wait has no phase selector")
     phase = _open_phase_named(state, phase_id) if hasattr(args, "phase_id") else _object_dict(state.get("phase"))
-    if phase is not None and phase.get("status") == "active" and state.get("status") == "active":
+    if phase is not None and phase.get("status") == "active" and unit_runs.run_is_open(_session_dir(args)):
         return WaitPhaseResolved(phase)
     return WaitPhaseNotRecorded(f"phase {phase_id or '(current)'} is not open")
 
@@ -5747,10 +5791,22 @@ def _start_wait(args: argparse.Namespace) -> None:
     if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
         return
     state = _read_state(_session_dir(args))
-    print(_record_wait(state, args))
+    result = _record_wait(state, args)
+    if isinstance(result, StartedWait):
+        print(result.wait_id)
 
 
-def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
+@dataclass(frozen=True)
+class StartedWait:
+    wait_id: str
+
+
+@dataclass(frozen=True)
+class WaitNotRecorded:
+    wait_id: str
+
+
+def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedWait | WaitNotRecorded:
     holder = _holder_from_args(args, _arg_string(args, "kind"))
     resolution = _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
@@ -5797,7 +5853,7 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                      requested_phase_id=_optional_arg(args, "phase_id"),
                      requested_phase_instance_id=_optional_arg(args, "phase_instance_id"))
     _append_event(state, event)
-    return wait_id
+    return WaitNotRecorded(wait_id) if missing_reason else StartedWait(wait_id)
 
 
 def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, unclosed: bool) -> None:
@@ -5905,7 +5961,8 @@ def _record_external_wait(args: argparse.Namespace) -> None:
     owner = (_arg_string(args, "owner_session") or os.environ.get("CLAUDE_CODE_SESSION_ID")
              or os.environ.get("CODEX_THREAD_ID", ""))
     if not owner and isinstance(attribution, ResolvedCheckpointPhase):
-        owner = _string((_object_dict(attribution.identity.get("main_agent")) or {}).get("session_id"))
+        member = unit_runs.run_owner(attribution.identity, staff.initial_snapshot())
+        owner = member.current_session if isinstance(member, staff.StaffRow) else ""
     event: dict[str, object] = {"schema_version": SCHEMA_VERSION, "event_id": str(uuid.uuid4()),
         "event_type": "wait_started", "wait_id": str(uuid.uuid4()), "timestamp_epoch": now,
         "timestamp": _iso_time(now), "wait_started_at": _iso_time(now), "wait_started_epoch": now,
@@ -5987,20 +6044,22 @@ def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | No
     if identity.startswith(("uds:/", "codex:")):
         return NamedSupplier(identity)
     if identity.startswith("worker:"):
-        run_id, separator, name = identity.partition(":")[2].partition("/")
-        if not separator or run_id in ("", ".", "..") or "/" in name:
+        run_id, separator, reference = identity.partition(":")[2].partition("/")
+        if not separator or run_id in ("", ".", "..") or "/" in reference:
             return NoNamedSupplier("worker alias has no run and worker identity")
-        threads: set[str] = set()
-        membership = staff.local_snapshot()
+        membership = resolver.record if resolver is not None else staff.local_snapshot()
+        worker = membership.by_id(staff.StaffId(reference))
+        if worker is None or worker.kind != "worker" or not isinstance(worker.parent, staff.ReportsTo):
+            return NoNamedSupplier("worker alias has no current staff worker")
         for root in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT")):
             try:
-                roster = session_staff.read_worker_roster(root / run_id / "mesh_roster.json")
-                thread = session_staff.worker_session(_object_dict(roster.get(name)) or {}, membership)
-                if thread:
-                    threads.add(thread)
+                fields = worker_lifecycle.read_json_object(root / run_id / unit_runs.STATE_FILE)
+                owner = unit_runs.run_owner(fields, membership)
+                if isinstance(owner, staff.StaffRow) and worker.parent == staff.ReportsTo(owner.id):
+                    return NamedSupplier("codex:" + worker.current_session)
             except (OSError, ValueError):
                 continue
-        return NamedSupplier("codex:" + next(iter(threads))) if len(threads) == 1 else NoNamedSupplier("worker alias has no unique roster thread")
+        return NoNamedSupplier("worker alias has no matching staff parent")
     from scripts.message import sessions
 
     records = sessions.live_sessions()
@@ -6219,11 +6278,11 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             declaration = str(uuid.uuid4())
         marker = {**identity, "declaration_id": declaration}
         write_text_atomic(marker_path, json.dumps(marker) + "\n")
-        args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
+        args = argparse.Namespace(session_dir=str(session_dir), missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields,
                                   declaration_id=declaration)
-        wait_id = _record_wait(state, args)
-        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": wait_id}) + "\n")
+        result = _record_wait(state, args)
+        write_text_atomic(marker_path, json.dumps({**marker, "wait_id": result.wait_id}) + "\n")
     return True
 
 
@@ -6281,7 +6340,7 @@ def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
                    "merge_commit": merge_commit, "source_checkpoint": source_checkpoint,
                    "target_branch": target_branch, "merged_at": _iso_time(merged_at),
                    "timestamp_epoch": merged_at}
-        _ = handle.write(json.dumps(_stored_fields(record), sort_keys=True) + "\n")
+        _ = handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
         if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
             os.fsync(handle.fileno())
@@ -6354,7 +6413,7 @@ def _read_waits(args: argparse.Namespace) -> None:
     session = _arg_string(args, "session_dir")
     ignored = 0
     if session:
-        events = _run_events(_read_state(_session_dir(args)))
+        events = _run_events(_read_state(_session_dir(args), resolve_staff=False))
         run_ids = {event.get("run_id") for event in events}
         events.extend(wait for wait in _external_wait_events() if wait.get("run_id") in run_ids or any(
             candidate.get("run_id") in run_ids for candidate in
@@ -6493,6 +6552,8 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     workers. When the current phase closes, the most recently started older open
     phase becomes current again.
     """
+    from scripts.direct import phase_reservation
+
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase_id = _optional_arg(args, "phase_id")
@@ -6562,15 +6623,17 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> None:
     _refresh_phase_table(session_dir)
 
 
-def _clear_run_pointer(session_dir: Path) -> None:
-    for row in staff.initial_snapshot().rows:
-        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == session_dir.resolve():
+def _clear_run_pointer(session_dir: Path, *, record: staff.StaffSnapshot) -> None:
+    folder = session_dir.resolve()
+    for row in record.rows:
+        if isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == folder:
             _ = staff.clear_run(row.id, session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    record = staff.initial_snapshot()
+    state = _read_state(session_dir, record=record)
     now = plan_history.now_epoch()
     run_status = _arg_string(args, "status")
     # Every open phase, newest first: closing the current one makes the next
@@ -6578,12 +6641,16 @@ def _finish_run(args: argparse.Namespace) -> None:
     while recorder_state.open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
         _finish_phase(finish_args)
-        state = _read_state(session_dir)
-    if _string(state.get("status")) != "active":
-        _clear_run_pointer(session_dir)
+        state = _read_state(session_dir, record=record)
+    if not unit_runs.run_is_open(session_dir, record=record):
+        _clear_run_pointer(session_dir, record=record)
+        return
+    # A repeated finish clears a restored pointer without recording the outcome again.
+    if worker_lifecycle.finished_run_status(str(session_dir)):
+        _clear_run_pointer(session_dir, record=record)
         return
     _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
+    state = _read_state(session_dir, record=record)
     event = _event(state, "run_finished", now)
     event["status"] = run_status
     event["run_elapsed_seconds"] = max(
@@ -6598,7 +6665,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
-    _clear_run_pointer(session_dir)
+    _clear_run_pointer(session_dir, record=record)
     _refresh_phase_table(session_dir)
 
 

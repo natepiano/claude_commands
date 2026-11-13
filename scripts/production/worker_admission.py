@@ -12,13 +12,19 @@ from importlib import import_module
 import json
 import re
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
+from scripts.herdr import pane_launch
 from scripts.lib import unit_runs
+from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from scripts.production import staff, session_staff
 from scripts.agents.stop_results import ReleaseSource, SourceReleased
+
+
+UNKNOWN_LAUNCH_HOME = staff.HomeUnknown()
 
 
 class AdmissionRefused(ValueError):
@@ -162,7 +168,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
 
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
-    return next((row for row in record.find(kind="worker", parent=owner) if row.name == name), None)
+    return next((row for row in record.find(kind="worker", parent=owner) if name in (row.name, row.id)), None)
 
 
 def admit(name: str, run: Path, *, reference: str = "") -> WorkerStartAllowed:
@@ -195,7 +201,7 @@ def member(run: Path, name: str, record: staff.StaffSnapshot | None = None) -> s
 def codex_transcript_source(thread_id: str, home: Path) -> Path:
     """Find the newest transcript for the named Codex thread and account."""
     paths = [path for folder in ("sessions", "archived_sessions")
-             for path in (home / folder).rglob(f"*{thread_id}.jsonl")]
+             for path in transcript_paths(home / folder, f"**/*{thread_id}.jsonl")]
     if not paths:
         raise ValueError("no source transcript found")
     return max(paths, key=lambda path: path.stat().st_mtime)
@@ -211,6 +217,13 @@ def transcript_source(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.
     return max(paths, key=lambda path: path.stat().st_mtime)
 
 
+def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
+    """Accept a final DONE line with at most one period after the dispatch id."""
+    lines = reply.rstrip().splitlines()
+    marker = f"DONE {dispatch_id}"
+    return bool(lines and lines[-1] in (marker, marker + "."))
+
+
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""
@@ -218,6 +231,8 @@ def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
     if not isinstance(raw, dict):
         return ""
     message = cast(dict[str, object], raw)
+    if fields.get("type") == "response_item" and message.get("type") == "agent_message":
+        return ""
     role = message.get("role", fields.get("type"))
     if message.get("type") in ("user_message", "agent_message"):
         role = "user" if message["type"] == "user_message" else "assistant"
@@ -245,16 +260,32 @@ class TornTranscriptRecord:
     """A transcript line is not complete JSON."""
 
 
-def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornTranscriptRecord]:
-    with source.open(encoding="utf-8") as transcript:
-        for line in transcript:
+class TranscriptRecordBoundary(Enum):
+    ALL_RECORDS = "include the final record without a newline"
+    COMPLETE_LINES = "read only records that end with a newline"
+
+
+def transcript_records(source: Path, *, offset: int = 0,
+                       boundary: TranscriptRecordBoundary = TranscriptRecordBoundary.ALL_RECORDS
+                       ) -> Generator[dict[str, object] | TornTranscriptRecord]:
+    """Read transcript records from the supplied byte boundary."""
+    with open_transcript(source) as stream:
+        _ = stream.seek(offset)
+        for line in stream:
+            if boundary is TranscriptRecordBoundary.COMPLETE_LINES and not line.endswith(b"\n"):
+                break
             try:
                 fields = cast(object, json.loads(line))
             except json.JSONDecodeError:
                 yield TornTranscriptRecord()
                 continue
             if isinstance(fields, dict):
-                yield transcript_entry(cast(dict[str, object], fields), changed)
+                yield cast(dict[str, object], fields)
+
+
+def transcript_entries(source: Path, changed: set[str]) -> Generator[str | TornTranscriptRecord]:
+    for fields in transcript_records(source):
+        yield fields if isinstance(fields, TornTranscriptRecord) else transcript_entry(fields, changed)
 
 
 def conversation_entries(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend,
@@ -289,6 +320,7 @@ def extract_transcript(row: staff.StaffRow, run: Path, backend: staff.ClaudeBack
                 messages.append(entry)
         if not messages:
             raise ValueError("source transcript has no assignments or final replies")
+        source = uncompressed_path(source)
         run.mkdir(parents=True, exist_ok=True)
         extract = handoff_path(run, row)
         from scripts.lib.atomic_file import write_text_atomic
@@ -368,9 +400,10 @@ def record_dispatch(allowed: WorkerStartAllowed, request: str, state: SwitchStat
 
 
 def publish_created(allowed: WorkerStartAllowed, identity: str,
-                    cleanup: Callable[[str], CleanupOutcome]) -> PublishedWorker:
+                    cleanup: Callable[[str], CleanupOutcome], *,
+                    launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
     with _cleanup_on_failure(cleanup, identity):
-        return publish(allowed, identity)
+        return publish(allowed, identity, launch_home=launch_home)
 
 
 @contextmanager
@@ -406,7 +439,8 @@ def worker_operation(allowed: WorkerStartAllowed) -> Generator[None]:
 def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                   start: Callable[[FamilyHandoff], str],
                   dispatch: Callable[[PublishedWorker], SwitchState] | DispatchOwner,
-                  cleanup: Callable[[str], CleanupOutcome], request: str = "") -> PublishedWorker:
+                  cleanup: Callable[[str], CleanupOutcome], request: str = "",
+                  launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
     """Hold the row through publication and dispatch acceptance, then release it."""
     with worker_operation(allowed):
         handoff: FamilyHandoff = NoFamilyHandoff()
@@ -431,7 +465,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
             extract = handoff_path(allowed.run, row)
             try:
                 with extract.open(encoding="utf-8") as saved:
-                    source = Path(saved.readline().removeprefix(HANDOFF_SOURCE_PREFIX).strip())
+                    source = uncompressed_path(Path(saved.readline().removeprefix(HANDOFF_SOURCE_PREFIX).strip()))
                 handoff = TranscriptHandoff(extract, source)
             except OSError as error:
                 print(f"anomaly: {row.name}: transcript extract: {error}".replace("\n", " "), file=sys.stderr)
@@ -448,7 +482,7 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
                 record_dispatch(allowed, request, SwitchState.CREATION_INTENT_RECORDED)
             with _cleanup_on_failure(cleanup):
                 identity = start(handoff)
-            row = publish_created(allowed, identity, cleanup).row
+            row = publish_created(allowed, identity, cleanup, launch_home=launch_home).row
         published = PublishedWorker(row, handoff)
         if not isinstance(dispatch, DispatchOwner):
             state = dispatch(published)
@@ -457,8 +491,9 @@ def switch_worker(allowed: WorkerStartAllowed, family: str, *,
         return published
 
 
-def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
-    """Publish the session before dispatch."""
+def publish(allowed: WorkerStartAllowed, runtime_id: str, *,
+            launch_home: staff.SessionHome | staff.HomeUnknown = UNKNOWN_LAUNCH_HOME) -> PublishedWorker:
+    """Publish the session and its supplied launch home before dispatch."""
     try:
         identity = staff.native_id(runtime_id)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -466,6 +501,9 @@ def publish(allowed: WorkerStartAllowed, runtime_id: str) -> PublishedWorker:
                 row = staff.update_current_session(allowed.slot.row.current_session, identity)
             else:
                 row = staff.ensure_worker(identity, allowed.name, allowed.parent)
+            if isinstance(launch_home, staff.SessionHome):
+                row = staff.set_home(row.id, launch_home)
+            row = pane_launch.staff_admitted(row)
         return PublishedWorker(row)
     except worker_lifecycle.OperationDeadlineExpired:
         raise

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -72,7 +72,7 @@ PY
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}},
-            "HOME": str(self.root),
+            "HOME": str(self.root), **interpreter_cache_environment(self.root / "cache"),
             "PATH": tool_path,
             "TMPDIR": str(self.root),
             "XDG_RUNTIME_DIR": str(self.root),
@@ -195,8 +195,7 @@ class VerifyRoutingTests(unittest.TestCase):
         self.cycle_file = release / CYCLE_ID / "cycle.json"
         self.reset_cycle()
         self.fixture.environment.update({
-            "HOME": str(root),
-            "CLAUDE_PYTHON": sys.executable,
+            "HOME": str(root), **interpreter_cache_environment(root / "cache"),
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),

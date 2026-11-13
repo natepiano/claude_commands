@@ -15,8 +15,7 @@ it changes, and say so in one line.
 
 1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py bump <position|session|folder>` for a waiting step of the bumped unit. It gives that unit the queue priority until step 5 clears it; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
-   one line: the bumped unit's merge goes first, and a build hold may come. Do
-   not wait for the next update tick.
+   one line: the bumped unit's merge goes first, and a build hold may come.
 2. **Checkpoint now.** Tell the owning unit director: "Bump: checkpoint and
    push this work now. Run lint and the tests directly related to the change
    only, not the full suite. The full suite runs on the pushed tip after the
@@ -24,8 +23,8 @@ it changes, and say so in one line.
    normal checkpoint notice, with the line `bump: lint and related tests only`.
 3. **First in the merge queue.** Take the bumped notice before every other
    notice that waits.
-   - When the production has a merge unit (hana: `merge-gate`), tell it in one
-     line to merge this checkpoint next, before its queue.
+   - When the production has a merge unit, read its identity from staff.
+     Tell the production's merge unit to merge this checkpoint next under `commands/unit/merge.md`, before its queue.
    - Otherwise run <MergeCheckpoint/> (`/showrunner:produce`) with `--bump`
      for it yourself now.
 
@@ -33,6 +32,7 @@ it changes, and say so in one line.
    <CIPoint/> on the pushed sha, or the build the production's rules name. If
    natedev's free memory is too short for it, first take `/build:hold
    bump: demo build of <unit>`, and release it when the build ends.
+   A merge unit dispatches the demo build through a worker under `commands/unit/merge.md`.
 4. **Full suite after.** `--bump` starts the checkpoint gate on the pushed
    tip in the background, in a detached clone. Red goes to the owning unit
    and the showrunner with the failed step, tip and log; green goes to the

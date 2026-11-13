@@ -16,6 +16,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.aws_target import admin_secrets, box, deploy
+from scripts.lib import conf
 
 
 VALUES = admin_secrets.AdminCredentials('test-admin-id', 'test-admin-secret', 'test-client-id', 'test-client-secret')
@@ -54,6 +55,23 @@ class AdminSecretTests(unittest.TestCase):
         self.path.parent.mkdir(mode=0o700)
         _ = self.path.write_bytes(admin_secrets.crypt(json.dumps(asdict(VALUES)).encode(), 'test-passphrase', encrypt=True))
         self.path.chmod(0o600)
+
+    def test_credentials_file_uses_configuration_without_an_environment_override(self) -> None:
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text('credential_file=~/private-scaler\n')
+        with mock.patch.dict(os.environ, {'CONF_DIR': str(self.root), 'HOME': str(self.root)}):
+            _ = os.environ.pop('AWS_SHARED_CREDENTIALS_FILE', None)
+            expected = Path(conf.read(path).text('credential_file')).expanduser()
+            self.assertEqual(admin_secrets.credentials_file(), expected)
+            self.assertTrue(expected.is_relative_to(self.root))
+            os.environ['AWS_SHARED_CREDENTIALS_FILE'] = ''
+            self.assertEqual(admin_secrets.credentials_file(), expected)
+
+    def test_credentials_file_environment_override_wins_without_reading_configuration(self) -> None:
+        value = '~/override-scaler'
+        with (mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': value, 'HOME': str(self.root)}),
+              mock.patch.object(conf, 'read_or_repository', side_effect=AssertionError('The override must win'))):
+            self.assertEqual(admin_secrets.credentials_file(), Path(value).expanduser())
 
     def test_symmetric_round_trip_uses_the_supplied_passphrase_without_agent_cache(self) -> None:
         self.save()

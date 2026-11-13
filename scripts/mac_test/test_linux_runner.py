@@ -20,6 +20,7 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
 from scripts.mac_test import claim_state, linux_runner, mac_test, offload, test_target_slots
@@ -192,6 +193,7 @@ class LinuxShellTests(unittest.TestCase):
         if real_rm is None:
             self.fail("The fixture needs the rm executable")
         self.environment = {
+            **interpreter_cache_environment(self.root / "cache"),
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
