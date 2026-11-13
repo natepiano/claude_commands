@@ -542,23 +542,21 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(opening, herdr.OpeningPrompt):
             transcript = herdr.SessionTranscript(selected_home, str(row.current_session))
             opening = replace(opening, transcript=transcript)
+            since = datetime.now(timezone.utc)
+            if kind == "claude":
+                opening = opening.prepare_for_launch(since)
             if row.kind in ("unit", "showrunner") and isinstance(resume_checks, DirectorResumeChecks):
-                since = datetime.now(timezone.utc)
-                reader = (herdr.TranscriptCursor(transcript, since) if kind == "claude" else
+                reader = (cast(herdr.TranscriptCursor, opening.cursor) if kind == "claude" else
                           CodexResumeTranscript(transcript, since))
-                reader.skip_existing_turns()
+                if isinstance(reader, CodexResumeTranscript):
+                    reader.skip_existing_turns()
                 check = DirectorResumeCheck(row.name, opening.text, reader)
                 if isinstance(reader, herdr.TranscriptCursor):
                     cursor = reader
                     before_prompt = opening.before_prompt
 
                     def native_transcript(actual: herdr.SessionTranscript) -> object:
-                        if actual != cursor.transcript:
-                            cursor.transcript = actual
-                            cursor.offsets.clear()
-                            cursor.sizes.clear()
-                            cursor.turns.clear()
-                            cursor.skip_existing_turns()
+                        cursor.bind_transcript(actual)
                         return before_prompt(actual)
 
                     opening = replace(opening, before_prompt=native_transcript)

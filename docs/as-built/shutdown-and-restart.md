@@ -471,6 +471,11 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
+The opening prompt and the Claude resume check share a cursor positioned before launch.
+The cursor skips complete historical records without parsing their JSON.
+Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
+If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.
+The cursor retains observed turns, so prompt submission does not remove evidence from the resume check.
 The reader leaves a final record without a newline unread until the writer completes it.
 The launch boundary follows the last complete newline.
 A malformed Codex record with a newline makes the transcript unreadable.
