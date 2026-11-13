@@ -3471,71 +3471,16 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Each setUp in `scripts/direct/test_assign_claude_follow.py` and `test_assign_claude_records.py` turns on the existing `run_assignment` adapter. Nine cases keep real processes for startup hooks, child observations, recorder failures and status order. Both fixtures set `MODELS_CONFIG_TIER_ONLY=1`, so in-process calls start no catalog sync. All 18 tests and 136 assertions stay. aws pairs, 3 rounds: records 31.52 → 25.96 CPU s (5.56 s saved), peak 167.0 → 173.2 MiB; follow 32.16 → 30.92 CPU s (0.96 s saved), peak 220.2 → 225.1 MiB. sdlc approved the diff; move the repeated setUp into the shared launcher fixture when a third module adopts it. Checkpoint `a5bce07e7`.
 
-### Phase 222 — The merge gate installs no signal handlers  · status: todo
+### Phase 222 — The merge gate installs no signal handlers  · status: done
 **Depends on:** Phase 219
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/merge_gate.py` installs no signal handler, and an interrupted gate leaves nothing behind that the next gate start does not clean up.
+- `scripts/production/merge_gate.py` and `scripts/test_times/module_run.py` install no signal handlers. The old `defer_signals` windows use the `pthread_sigmask` context; `rollback_signals` and its `gate_box.py` caller are gone. Each gate writes one run record (pid and start identity, process groups, tmp roots, FIFO CPU tokens, rollback intent) by atomic rename; a clean end removes it. The next gate start recovers a dead gate's record: it sends SIGTERM then SIGKILL to its groups (SIGKILL also when the leader has ended), restores tokens, removes folders and rolls back under the checkout lock after a HEAD check. Failed recovery keeps the record. Module children get SIGKILL parent death; `module_run.py` keeps the SIGKILL status without a signal reset. Signal tests assert exact statuses (SIGINT 1, else `-signal`). Also touches queue (builds ruling): `queue_place.py` `defer_cleanup_signals` reads the previous mask first and blocks inside the `try`; one row in `test_queue_place.py`. 17 modules, 323 pass. Checkpoint `b17e9b84e`.
 
-**Decision:** the user's rule, via builds, 2026-11-12: no signal handlers. builds accepted this plan with two changes: no test that checks `signal.getsignal` after import; `scripts/build_queue/queue_place.py` is not ours (queue removes its call in its own phase). sdlc devtools deletes `build_folders.defer_signals` when both callers are gone.
-
-**Spec:**
-1. Remove each `build_folders.defer_signals()` call in `merge_gate.py` (:361, :377, :710, :1427, :1464). For each window, name what it protects. Use the existing `defer_cleanup_signals` mask (`pthread_sigmask`, no handler) only where a window must not split; otherwise use no guard.
-2. Remove `rollback_signals` and `interrupted` (:518–527). Find what the rollback undoes. Move that undo to the next gate start (step 4).
-3. Children die with the gate without a handler: set `PR_SET_PDEATHSIG` to `SIGKILL` in each module child through the existing `SUITE_BOOTSTRAP` path. Keep `start_new_session` and the existing group stop.
-4. Each gate writes one run record (pid, start time, job group ids, tmp folders, rollback state) with an atomic write through rename, and deletes it at a clean end. At start, the gate reads each record whose pid is dead (check pid and start time), stops those groups, deletes those folders, applies the rollback, then deletes the record. Use an existing record folder and atomic-write helper if one exists.
-5. Tests: start a real child gate on a small fixture, send it SIGTERM, then SIGINT in a second case. Then start a second gate and prove it stops the leftover groups, deletes the folders and applies the rollback. No other guard tests.
-6. Keep every existing test and assertion. Run the merge-gate modules and basedpyright on each changed file.
-
-7. Architect after Phase 219 (folded while the worker ran):
-   - Remove the `merge_gate.rollback_signals()` caller at `scripts/aws_target/gate_box.py:349` and its fake at `test_gate_box.py:153`. Replace the retired-handler exception expectations at `test_merge_gate_suites_resources.py:194,219,256`; keep their token, status and CPU assertions.
-   - `PDEATHSIG` does not reach the test process that `scripts/test_times/module_run.py:595` forks, and SIGKILL skips the cleanup at `:613`. Own the whole descendant set without a handler (for example the module's cgroup scope). Handle parent death before the bootstrap sets `PDEATHSIG`. Cover a descendant that starts a new session.
-   - Record CPU token ownership durably (token read at `merge_gate.py:391`, returned at `:418`), and restore it at the next start. Prove FIFO capacity survives recovery.
-   - Record rollback intent before `git merge` and disarm it before the push at `merge_gate.py:1803`. At recovery, stop owned command groups (`command():534`), take the checkout lock and check the expected HEAD before a reset. Keep the record when recovery fails.
-   - Windows: drop the wakeup-fd plumbing at `:361` if it needs a handler; keep the `try_acquire` mask at `:377`; mask `wait4` with its result save at `:710`; mask start plus ownership publication at `:1427`; mask bounded cleanup at `:1464`.
-
-**Files:**
-- `scripts/production/merge_gate.py`, `merge_gate_test_support.py` and the `scripts/production/test_merge_gate*.py` modules
-- `scripts/aws_target/gate_box.py`, `test_gate_box.py`
-- `scripts/test_times/module_run.py`, `test_module_run.py`
-
-**Workers:** 1 writer; every change is in the gate's run path.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 219: keep the same-vCPU history selection, the no-history states, and reaping finished jobs before the time-limit deadline.
-
-**Acceptance gate:**
-- `grep -n "signal.signal\|defer_signals" scripts/production/merge_gate.py` finds only the child `SIG_DFL` reset in `SUITE_BOOTSTRAP`.
-- The SIGTERM and SIGINT cases pass, and the next start cleans up; all merge-gate modules pass; basedpyright clean.
-
-### Phase 223 — Simplify lens tests call the daily command in process  · status: todo
+### Phase 223 — Simplify lens tests call the daily command in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the content cases in `scripts/direct/test_simplify_lens.py` call `simplify_daily.main()` in process, and aws pairs show a CPU gain.
-
-**Decision:** architect review after Phase 219 (order row 1). Owner go: asked of sdlc, 2026-11-12; no code before the go. Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on the module.
-2. `launch():125` runs the whole assignment command, and `assign.py:813` forwards to `simplify_daily.main():121`. Call `simplify_daily.main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) for the content cases.
-3. Keep one full dispatch entry, real Git operations, reviewer children and the failure injection at `:286`.
-4. Keep every test and assertion. Change no shared support file; if the adapter cannot serve a case, report the case and stop.
-5. Run the module, its importers and basedpyright on each changed file.
-
-**Files:**
-- `scripts/direct/test_simplify_lens.py`
-
-**Workers:** 1 writer; one test file.
-- impl: the test file.
-
-**Constraints from prior phases:**
-- Phase 214: in-process launch reads carry the tier-only guard (`MODELS_CONFIG_TIER_ONLY=1`), so no catalog sync starts.
-
-**Acceptance gate:**
-- Python starts fall; all tests and assertions remain; importers pass; basedpyright clean.
-- aws pairs show a gain; sdlc sees the diff before land.
-
+- `scripts/direct/test_simplify_lens.py` calls `simplify_daily.main` in process through `invoke_cli`. `assign_gate.called_by_assign` refuses an in-process reviewer (unittest is the ancestor), and the guard stays. `simplify_daily.py` names its launcher path in one constant, `AGENT_EXEC`; the in-process cases bind it to a private launcher with an admission stub (the `review_launcher_test_support.py:184` pattern). The full `assign.sh` case and the status-write failure case keep the real guard. All 15 tests and 80 assertions stay; assignment starts 18 → 2. aws pairs, 3 rounds: 19.23 → 9.67 CPU s (9.56 s saved), peak 143.7 → 148.1 MiB. sdlc approved the diff. Checkpoint `8ee605e7f`.
