@@ -49,6 +49,13 @@ class LocalFallback:
     reason: str
 
 
+@dataclass
+class CloudAttempt:
+    directory: Path
+    mode: gate.SuiteMode
+    identifier: str = ''
+
+
 @dataclass(frozen=True)
 class CloudCompleted:
     run: gate.GateRun
@@ -80,6 +87,12 @@ def read(path: Path) -> dict[str, object]:
 
 def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
+
+
+def append_launch(directory: Path, row: dict[str, object]) -> None:
+    """Append one event with the existing launch record lock and format."""
+    with store.locked_append(directory / 'cloud-gate-launches.jsonl') as handle:
+        store.append_locked(handle, row)
 
 
 def capacity_error(reason: str) -> bool:
@@ -431,8 +444,7 @@ class GateWorker:
             row['gate_s'] = gate_s
         else:
             row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
-        with store.locked_append(self.book.directory / 'cloud-gate-launches.jsonl') as handle:
-            store.append_locked(handle, row)
+        append_launch(self.book.directory, row)
         if result == 'refused':
             print(f'Cloud gate refused: {size} in {zone}: {error_code}', flush=True)
 
@@ -856,17 +868,29 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
+    # Record the final fallback here so worker replies and service errors produce one row.
+    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode)
     try:
-        return run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected, service=service)
+        outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                            selected=selected, service=service, attempt=attempt)
     except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
-        return LocalFallback(str(error))
+        outcome = LocalFallback(str(error))
+    if isinstance(outcome, LocalFallback):
+        try:
+            append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
+                'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
+                'availability_zone': '', 'error_code': launch_error_code(outcome.reason), 'reason': outcome.reason})
+        except OSError as error:
+            detail = ' '.join(str(error).split())
+            print('Cloud gate fallback row was not written: ' + detail, file=sys.stderr, flush=True)
+    return outcome
 
 
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
-              service: Callable[[Sequence[str]], int],
+              service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    directory = target_config.ssh_target_state_directory('aws')
+    directory = attempt.directory
     deployment_path = directory / 'gate-deployment.json'
     if not deployment_path.exists():
         return LocalFallback('image or stack is absent')
@@ -893,6 +917,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             for row in book.read_snapshot().gate_reservations)
         if ended or (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             folder = root / uuid4().hex
+        attempt.identifier = folder.name
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
         command = service_command('scripts.aws_target.cloud_gate',

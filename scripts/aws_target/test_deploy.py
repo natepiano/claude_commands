@@ -1607,14 +1607,18 @@ sys.exit(7)
 
     def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output')
+        folder = self.root / 'trial-alias'
+        folder.symlink_to(self.root, target_is_directory=True)
         with mock.patch.object(gpu_size_trial, 'start_service', return_value=0) as service:
             with self.assertRaisesRegex(deploy.DeploymentRefused, '--approve-resources'):
                 _ = subject.gpu_size_trial(self.root / 'trial')
             service.assert_not_called()
             with mock.patch.object(subject, '_check_credentials') as credentials:
-                self.assertTrue(subject.gpu_size_trial(self.root / 'trial', approve_resources=True))
+                self.assertTrue(subject.gpu_size_trial(folder, approve_resources=True))
             credentials.assert_called_once_with()
         service.assert_called_once()
+        assert service.call_args is not None
+        self.assertEqual(service.call_args.args[0], folder)
 
     def test_gpu_trial_cli_routes_the_approved_run(self) -> None:
         folder = self.root / 'trial'

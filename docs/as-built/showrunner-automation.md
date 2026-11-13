@@ -255,7 +255,9 @@ Each local Promote checkout must exist before the command pushes.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
      A shrink allows only the plan doc and `<plan stem>-next.md`.
-     An as-built commit allows only Markdown paths and must change or delete the plan.
+     An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
+     The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
+     It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
@@ -307,6 +309,8 @@ Each local Promote checkout must exist before the command pushes.
   A merge message can carry only invisible lines.
   The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
+  A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
+  Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
   The merge gates retain their staff reads before publication.
 
@@ -321,7 +325,8 @@ Each local Promote checkout must exist before the command pushes.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
-  The count and row writer use this same selection.
+  The count includes only selected commits with review lines that parse.
+  The row writer uses the same selection and reads its visible lines.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
@@ -423,6 +428,11 @@ The caller's working directory stays unchanged.
 
 ### Production open, promote and wrap: `production_lifecycle.py`
 
+`add_showrunner.finish_publication` completes an unknown staff home through `set_home(..., only_unknown=True)`.
+The staff transaction preserves a home that another writer records first.
+The admitted receipt keeps staff references and removes its `session_id`, `doc`, and `config_dir` copies.
+The [launch receipt contract](build-followups-fn-length-hook.md#production-launch-and-wrap-records) defines pending creation claims and retry behavior.
+
 `production_lifecycle.py load|open|promote-main|wrap --production <showrunner name> [--no-ci] …`. `--no-ci` makes the CI, smoke-launch and Mac-run steps print `<step>: ok — skipped: no CI` and is refused together with a verdict flag.
 
 - `load [--resume] [--scratch <dir>]`: checks the checkout. With `--scratch`, it prints `state-dir: ok — <dir>` after the copy above. On resume or for a running doc, it reads the current state file through `update_registration.judgment_state`. It prints the `next` items, or `no next list`, and each unit's last code merge and session. A refused state file prints one `anomaly:` line; load continues.
@@ -498,6 +508,9 @@ Registration retains a stopped timer for discovery and session ownership.
 Timer folders and targets retain the showrunner's fixed staff ID.
 Discovery uses the staff row's current session and current name.
 Registry names do not affect registration or discovery.
+Scheduled timer configurations store no sender name.
+`delivery --owner <staff id>` derives the sender and prompt from one current staff snapshot.
+The [notifier contract](session-notifier.md#delivery) defines framing and delivery failure behavior.
 The herdr session list classifies showrunner panes through native session identity and the owning staff ID.
 Quota notices retain staff IDs for named recipients.
 Current staff names resolve at notice creation; former names do not resolve.
@@ -614,6 +627,14 @@ The [staff identity contract](staff-accessors.md#staff-identity-and-backends) de
 Saved progress state uses the fixed staff reference instead of a copied session name.
 
 - **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+
+  `unit_status.sh` recognizes peers by their staff name, fixed staff id, and current session id.
+  A replaced session therefore keeps its peer-wait classification.
+  Registry display names do not select these peers.
+
+`/showrunner:promote_unit` selects an existing member through its staff row.
+It joins the row's `current_session` to native pane or process evidence.
+An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
   Each table prints one row per production staff unit.

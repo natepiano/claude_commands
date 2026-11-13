@@ -350,8 +350,43 @@ A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
 Preparation uses a private Cargo cache.
 It never copies the user's Rust or Cargo directories.
 It checks toolchain wrappers for home paths and tests Cargo with an empty `HOME`.
+Preparation builds all features and discovers shared libraries in the Cargo target directory.
+A nextest archive profile inherits `ci` and includes each shared library through `archive.include`.
+The archive retains the workspace's existing archive includes.
+Nextest lists the extracted tests before preparation builds the NixOS closure.
+An archive validation error includes nextest's diagnostic, which names a missing shared library.
+Each measurement run creates its extraction directory before passing it to nextest through `--extract-to`.
+Nextest 0.9.143 returns setup exit 96 when that directory does not exist.
+A failed preparation copies up to 200 final lines of each failed `nextest.log` into `prepare.log`.
+The reader seeks backward in 64 KiB chunks and reads at most 1 MiB per log.
+It retains diagnostics when a run has no valid status record.
+It then keeps only `prepare.log` and removes the other files and GC root links.
+Host trial folders must be canonical direct children of `~/.local/state/gpu-size-trial`.
+The commands refuse nested paths, outside paths, and paths through directory links before deletion.
+A new preparation removes earlier trial folders under `~/.local/state/gpu-size-trial` when no live run holds their locks.
+It refuses to create another folder while a live run holds an earlier folder.
+Preparation, its worker, the service launcher, and the online worker hold folder locks.
+The locks remain outside the trial folders.
+A successful preparation keeps only these inputs and records:
 
-The service selects the first candidate region with an applied G and VT Spot quota of at least 32.
+1. `hana-tests.tar.zst`, `closure.export`, and `source.tar`.
+2. `cargo-home/`, `runtime.env`, `gpu-trial.nix`, and `gpu_trial_wrapper.py`.
+3. `closure.json`, `request.json`, `manifest.json`, and `inventory.json`.
+4. `machines/` with baseline reports, samples, and logs, plus `prepare.log`.
+
+After the archive and closure exist, preparation replaces the build tree with the source tar's clean contents.
+It removes that source copy and the temporary Nix profile links after baseline measurement.
+Each measurement removes its extraction directory, source copy, and Cargo target directory when the run ends, including failures.
+Reports, samples, and logs remain.
+The measured inputs imply an estimated peak near 32 GiB during preparation and about 12 GiB after preparation.
+Local measurement needs about 19 GiB because only one extracted archive remains at a time.
+These estimates cover the trial folder; Nix store use is separate.
+
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+It uses the existing type-size vCPU calculation and refuses a type whose vCPU count is unknown.
+If no region fits, the refusal reports the required vCPUs and each region's applied value.
+The quota request size remains separate from this selection rule.
 It checks regional offerings and current Spot prices.
 It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
@@ -368,11 +403,17 @@ The USD6 check includes completed costs and full open reservations under the acc
 The daily and monthly limits still apply.
 A restart retains the trial ID, limit, region, and type order.
 A saved budget stop ends the trial.
+After an online run ends, the worker saves its result or error before removing the archive, closure export, source tar, and Cargo cache.
+It removes the temporary upload payload after upload, including an upload failure.
+Metadata, results, and logs remain for comparison.
+A restart uses saved hashes and uploaded inputs when upload completed.
+A failure before upload requires a new preparation.
 
 The service confirms termination before another launch.
 The guest stops five minutes before the lifetime ends.
 The expiry tag triggers two minutes before the lifetime ends.
 `ExecStopPost` cleans known boxes and uncertain launches.
+It saves an error and removes the large inputs if an interrupted worker leaves no final result.
 The service uses no new signal handler.
 
 `gpu_size_trial_root_gib=100` is an estimated disk requirement.

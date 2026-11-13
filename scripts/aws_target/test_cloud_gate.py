@@ -238,37 +238,40 @@ class CloudGateTests(CostFixture):
 
     def test_live_price_timeout_keeps_hourly_rows_and_bounds_the_whole_read(self) -> None:
         worker, variants = self.live_price_fixture()
+        hourly = (self.state / 'spot-prices.json').read_bytes()
         release = threading.Event()
         stopped = threading.Event()
         path = self.root / 'cloud_gate.conf'
         _ = path.write_text(re.sub(r'(?m)^spot_price_live_read_timeout_s=.*$',
                                   'spot_price_live_read_timeout_s=.1', path.read_text()))
+        timeouts: list[float] = []
         def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
             if 'describe-spot-price-history' in arguments and 'us-east-2' in arguments:
-                self.assertLessEqual(float(str(options['timeout'])), .1)
+                timeouts.append(float(str(options['timeout'])))
                 try:
-                    _ = release.wait(2)
+                    _ = release.wait(TEST_HANG_GUARD_SECS)
                     raise subprocess.TimeoutExpired('fixture price read', .1)
                 finally:
                     stopped.set()
             return self.fake(arguments, **options)
         worker.api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
         try:
-            begin = time.monotonic()
             reads = worker.live_spot_prices(variants)
-            elapsed = time.monotonic() - begin
-            self.assertLess(elapsed, .5)
-            self.assertGreaterEqual(elapsed, .08)
+            self.assertFalse(stopped.is_set())
             east = next(row for row in reads if row.region == 'us-east-2')
             self.assertFalse(east.used)
-            self.assertGreaterEqual(east.seconds, .08)
+            self.assertEqual(east.prices, ())
             prices = [price for reading in reads for price in reading.prices]
             ranked = worker.rank_variants(variants, 'merge-gate', prices)
             self.assertEqual(ranked[0].region, 'eu-south-2')
             self.assertEqual(ranked[4].region, 'us-east-2')
+            self.assertEqual((self.state / 'spot-prices.json').read_bytes(), hourly)
         finally:
             release.set()
-            self.assertTrue(stopped.wait(2))
+            self.assertTrue(stopped.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(len(timeouts), 1)
+        self.assertGreater(timeouts[0], 0)
+        self.assertLessEqual(timeouts[0], .1)
 
     def test_all_live_price_failures_keep_the_hourly_order(self) -> None:
         worker, variants = self.live_price_fixture()
@@ -2018,6 +2021,7 @@ class CloudRouteTests(CostFixture):
                     return 0
 
                 destination = self.root / f'record-{dirty}-{later_edit}-{changed_head}.jsonl'
+                before = len(self.fallback_rows())
                 with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The session must not call AWS')),
                       mock.patch.object(store, 'host_file', return_value=destination),
                       mock.patch.dict(os.environ, {'MERGE_GATE_PASSED_DIR': str(self.root / 'passed')}),
@@ -2027,7 +2031,11 @@ class CloudRouteTests(CostFixture):
                 if changed_head:
                     self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
                     self.assertFalse(destination.exists())
+                    rows = self.fallback_rows()
+                    self.assertEqual(len(rows), before + 1)
+                    self.assertEqual(rows[-1]['reason'], 'The checkout changed during the cloud attempt')
                     continue
+                self.assertEqual(len(self.fallback_rows()), before)
                 self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
                 self.assertIn('cloud log', output.getvalue())
                 self.assertEqual(commands[0][0], 'systemd-run')
@@ -2052,6 +2060,93 @@ class CloudRouteTests(CostFixture):
                                  module_time_limit_s=1800, service=service)
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         service.assert_not_called()
+
+    def test_fallback_row_write_error_keeps_the_original_fallback(self) -> None:
+        service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
+        with (mock.patch.object(cloud_gate, 'append_launch',
+                                side_effect=PermissionError('fixture row write denied')) as append,
+              redirect_stderr(StringIO()) as errors):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+        self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
+        self.assertEqual(errors.getvalue(), 'Cloud gate fallback row was not written: fixture row write denied\n')
+        append.assert_called_once()
+        service.assert_not_called()
+        self.assertFalse((self.state / 'cloud-gate-launches.jsonl').exists())
+
+    def fallback_rows(self) -> list[dict[str, object]]:
+        return [row for row in ledger.CostLedger(self.state).launches() if row['result'] == 'fallback']
+
+    def test_early_fallback_records_without_an_attempt(self) -> None:
+        for missing in ('deployment', 'image', 'template'):
+            with self.subTest(missing=missing):
+                deployment: dict[str, object] = {'image': 'fixture-image', 'template': 'fixture-template'}
+                if missing != 'deployment':
+                    _ = deployment.pop(missing)
+                    cloud_gate.save(self.state / 'gate-deployment.json', dict(deployment))
+                before = len(self.fallback_rows())
+                service = mock.Mock(side_effect=AssertionError('No service may start'))
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                    module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+                self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual((rows[-1]['attempt'], rows[-1]['reason'], rows[-1]['mode']),
+                                 ('', 'image or stack is absent', gate.SuiteMode.TARGETED_TEST.value))
+                self.assertIsInstance(rows[-1]['time'], (int, float))
+                service.assert_not_called()
+
+    def test_admission_and_preparation_errors_record_the_created_attempt(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        for phase, error in (('cloud_reservation', GateRefused('fixture admission refusal')),
+                             ('prepare', GateRefused('The checkout changed after the test selection')),
+                             ('prepare', OSError('fixture source read error'))):
+            with (self.subTest(phase=phase, reason=str(error)),
+                  mock.patch.object(cloud_gate, phase, side_effect=error)):
+                before = len(self.fallback_rows())
+                service = mock.Mock(side_effect=AssertionError('No service may start'))
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                    module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+                self.assertEqual(outcome, cloud_gate.LocalFallback(str(error)))
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual(rows[-1]['reason'], str(error))
+                attempt = ledger.text(rows[-1], 'attempt')
+                self.assertTrue(attempt)
+                self.assertTrue((root / attempt).is_dir())
+                self.assertFalse((root / attempt / 'request.json').exists())
+                self.assertTrue(self.admission.callers_released())
+                service.assert_not_called()
+
+    def test_service_fallback_paths_record_one_final_reason(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            ({}, 'The scaler service has no final result'),
+            ({'status': 'fallback', 'reason': 'Spot capacity is unavailable in every configured region'},
+             'Spot capacity is unavailable in every configured region'),
+            ({'status': 'fallback', 'reason': 'fixture permission refusal'}, 'fixture permission refusal'),
+            ({'status': 'pending', 'reason': 'fixture pending cleanup'}, 'fixture pending cleanup'),
+            ({'status': 'complete', 'result': {}}, 'The result differs from the current attempt'),
+        )
+        for reply, reason in cases:
+            with self.subTest(reply=reply):
+                attempts: list[str] = []
+                def service(command: Sequence[str]) -> int:
+                    folder = Path(command[command.index('--worker') + 1])
+                    attempts.append(folder.name)
+                    (folder / 'outcome.json').unlink(missing_ok=True)
+                    if reply:
+                        cloud_gate.save(folder / 'outcome.json', reply)
+                    return 1
+                before = len(self.fallback_rows())
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+                self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual((rows[-1]['attempt'], rows[-1]['reason']), (attempts[-1], reason))
+                self.assertTrue(self.admission.callers_released())
 
     def test_cloud_admission_uses_route_identity_and_no_local_memory(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
