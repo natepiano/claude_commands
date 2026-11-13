@@ -14,14 +14,6 @@
   - Completion condition: on or after 2026-12-05 the reader and the file are deleted, `sweep.py rebuilds` reads only the journal and the build-log rows, and `test_sweep.py` passes.
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
 
-- [ ] **Measure EASY backfill against the deployed captured-room rule**
-  - Start after deployment of the current rule and seven days within one unchanged policy and configuration span.
-  - Calibrate the deployed model first. Stop comparison if calibration fails.
-  - Bound the cohort at changes to priority, head policy, estimation, memory charges, slots, spacing, safety settings or headroom.
-  - Use the shipped `head_policy` and `admission_walk` for the baseline.
-  - Include head protection, continuation slots, the starts-alone exception and start spacing.
-  - Report additional wait savings and head delay.
-  - Revealed by: Phase 30; baseline corrected against the current admission rule.
 
 - [ ] **Match trims against each step's recorded Cargo output roots**
   - Target: `scripts/lint/sweep.py` (`RebuildStep`, `read_rebuild_evidence`, `_rebuild_causes`), `scripts/buildlog/step_outputs.py`, and their tests.
@@ -80,5 +72,6 @@
   - Revealed by: Phase 79; the builds showrunner placed it in next items on 2026-11-07.
 
 ## Dropped
+- **Measure EASY backfill against the deployed captured-room rule** — dropped by the user 2026-11-13 (via the builds showrunner): "we cannot let small builds start while a large head is blocking because that large build will never run - we already know this from experience." Do not propose backfill again.
 
 - **The floor pass keeps an existing hana `target/external-client`** — dropped by the builds showrunner 2026-11-05: the measured cause (fresh-clone CI points) is already gone, and 1 eviction in 3 days does not pay for 1.3 GB per checkout (Phase 73).
