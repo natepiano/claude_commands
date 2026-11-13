@@ -2609,7 +2609,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Speed:** two more `memory.swap.current` reads on each admission pass; `/proc/meminfo` is already read.
 
-### Phase 120b — The Builds page memory bar shows the desktop guarantee and the agents  · status: todo
+### Phase 120b — The Builds page memory bar shows the desktop guarantee and the agents  · status: done
 
 **Source:** 2026-11-13 ~15:55, the user (via natedev and builds): "we need to reflect these larger tranches in other - show the desktop guarantee and the agents (which is more dynamic) - when i say other i mean the main memory bar at the top of the builds page". builds: split today's "other" into its own segments; read them from the same source as the Phase 120 admission room. Lands right after Phase 120.
 
@@ -2620,9 +2620,9 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Measured:** 2026-11-13 15:55 EST: session.slice `memory.min` reads 2147483648 (2 GiB, nixos dd9e7f6). `memory_feed.py` sets `other` = total − MemAvailable − build use; `memory_live.html` draws it as one grey segment ("Other programs and the system"). The feed reads its room from `explanation.room` (`MemoryRoom`), which carries the Phase 120 swapped-demand term.
 
 **Spec:**
-1. The feed payload adds `desktop_guarantee` (session.slice `memory.min`, read live, never a constant), `agents_ram` (app.slice `memory.current`) and `agents_swap` (the Phase 120 swapped-demand term from `MemoryRoom`). `other` becomes the rest and is never below zero.
-2. Read the session.slice and app.slice values through the cgroup readers in `scripts/lint/memory_admit.py`, so that the bar and admission read one source.
-3. The bar draws three new segments: the desktop guarantee, the agents' RAM, and the agents' swapped demand. The swapped demand is drawn inside the free part of the bar with its own pattern, because admission takes it from the room. Each segment has a tooltip and a legend entry in the page's style, in light and dark themes.
+1. The feed payload adds `desktop_guarantee` (session.slice `memory.min`, read live, never a constant), `agents_ram` (the app-agents.slice working set, the slice the swap table names agents; `memory.current` minus `inactive_file`, read by `slice_working_set`; plain `memory.current` counts page cache that MemAvailable already counts as free) and `agents_swap` (the Phase 120 swapped-demand term from `MemoryRoom`). `other` becomes the rest and is never below zero.
+2. Read the session.slice and app-agents.slice values through the cgroup readers in `scripts/lint/memory_admit.py`, so that the bar and admission read one source.
+3. The bar draws three new segments: the desktop guarantee, the agents' RAM, and the agents' swapped demand. The swapped demand is drawn inside the free part of the bar, between the room and the safety segment, with its own pattern, because admission takes it from the room. Since Phase 120 the room is smaller by this term, so without the segment the bar has a blank gap of that size. Each segment has a tooltip and a legend entry in the page's style, in light and dark themes.
 4. An unavailable reading shows its segment as unavailable, never as zero.
 5. Keep apart from report phase 73's blocks banner edits in `memory_live.html`: change only the bar, its legend and its tooltips.
 
@@ -2643,4 +2643,4 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 2. Lint: `basedpyright` on the changed Python files.
 3. Live proof: before and after shots of the bar on natedev.
 
-**Speed:** two more cgroup file reads for each page refresh.
+**Speed:** four more cgroup file reads for each page refresh (session.slice `memory.min`; app-agents.slice `memory.current`, `memory.stat`, `memory.swap.current`).

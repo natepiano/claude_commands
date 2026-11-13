@@ -128,6 +128,7 @@ class MemoryFeedTests(unittest.TestCase):
             "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
+            "BUILDLOG_USER_CGROUP": str(self.root / "user"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
@@ -1277,6 +1278,33 @@ class MemoryFeedTests(unittest.TestCase):
                 for minutes in (45, 19 * 60, 2 * 24 * 60):
                     self.assertIn(queue_view.leftover_age(minutes), text)
 
+    def test_memory_shares_split_other_and_place_swapped_demand_in_free_memory(self) -> None:
+        gib = admission_records.GIB
+        room = gate.memory_room(admission_records.HostMemory(20 * gib, 64 * gib, 32 * gib, 22 * gib), [],
+                                admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        for case, total, agents, guarantee, expected in (
+            ("both read", 64.0, True, "2147483648", (2.0, 5.0, 2.0, 5.0, 37.0, "")),
+            ("agents fill other", 26.0, True, "2147483648", (2.0, 5.0, 1.0, 5.0, 0.0, "")),
+            ("agents unavailable", 64.0, False, "2147483648", (2.0, None, 2.0, 0.0, 42.0, "agents' memory unavailable")),
+            ("guarantee unavailable", 64.0, True, "max", (None, 5.0, 0.0, 5.0, 39.0, "desktop guarantee unavailable")),
+        ):
+            with self.subTest(case=case):
+                user = self.root / case
+                write_user_slices(user, agents=agents, guarantee=guarantee)
+                with mock.patch.dict(os.environ, {"BUILDLOG_USER_CGROUP": str(user)}):
+                    shares = memory_feed.memory_shares(total, room, 3.0, 0.0, 0.0)
+                desktop, agents_ram, shown_desktop, shown_agents, other, reason = expected
+                self.assertEqual(shares["desktop_guarantee"], desktop)
+                self.assertEqual(shares["agents_ram"], agents_ram)
+                self.assertEqual(shares["shown_desktop"], shown_desktop)
+                self.assertEqual(shares["shown_agents"], shown_agents)
+                self.assertEqual(shares["other"], other)
+                self.assertIn(reason, shares["slices_unavailable"])
+                self.assertEqual(bool(reason), bool(shares["slices_unavailable"]))
+                self.assertEqual(shares["agents_swap"], 10.0)
+                self.assertEqual(shares["shown_agents_swap"], 10.0)
+
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
@@ -1448,11 +1476,25 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
 
 
+def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
+    """Write private session.slice and app-agents.slice readings: 6 GiB agents with 1 GiB inactive cache."""
+    gib = admission_records.GIB
+    (user / "session.slice").mkdir(parents=True, exist_ok=True)
+    _ = (user / "session.slice" / "memory.min").write_text(f"{guarantee}\n")
+    if agents:
+        agents_slice = user / "app.slice" / "app-agents.slice"
+        agents_slice.mkdir(parents=True, exist_ok=True)
+        _ = (agents_slice / "memory.current").write_text(f"{6 * gib}\n")
+        _ = (agents_slice / "memory.stat").write_text(f"anon {5 * gib}\nshmem 0\ninactive_file {gib}\n")
+        _ = (agents_slice / "memory.swap.current").write_text(f"{4 * gib}\n")
+
+
 def write_browser_fixture(folder: Path) -> None:
     """Publish private feed readings for the browser proof."""
     fixture = MemoryFeedTests()
     fixture.setUp()
     _ = cast(object, fixture.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"})))
+    write_user_slices(fixture.root / "user")
     pressure_missing = memory_feed.PressureNotRecorded("Pressure is unreadable: /private/proc/pressure/memory")
     _ = cast(object, fixture.enterContext(mock.patch.object(memory_feed, "read_stalls",
         return_value={"some": pressure_missing, "full": pressure_missing})))
