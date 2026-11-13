@@ -129,7 +129,7 @@ A stub identifies its authoritative file and the moment to read it.
 Compaction recovery reads the core and the contracts whose moments apply.
 Each rule has one authoritative definition.
 
-`/module_review`, `/team_review`, and `/api_review` run their lenses in the invoking session.
+`/module_review` and `/team_review` run their lenses in the invoking session.
 Each writes its lens result before the next lens starts.
 These commands do not start separate one-shot reviewers.
 The phase review workflow retains its own worker path.

@@ -28,7 +28,7 @@ to rediscover after a context compaction lives in the doc.
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** <one line: what this builds>
 
-<!-- Optional; set by the originating review (e.g. /api_review). Preserved verbatim
+<!-- Optional; set by the originating design doc (e.g. /implement_issue). Preserved verbatim
      by /plan:to_phased_plan and /plan:phase_review; consumed by /plan:to_as_built.
      amend = on completion, fold the shipped changes into the named existing
      as-built docs — no new doc; create (or line absent) = distill a new as-built doc. -->

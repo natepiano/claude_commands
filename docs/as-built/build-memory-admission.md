@@ -1682,7 +1682,18 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
-Running rows show a `machine` column after `min` and before `pid`.
+The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+The first column shows `building` or `testing` from the recorded progress counter.
+A row without a counter shows `—`.
+Local builds, merge gates, and cloud rows use their recorded counters.
+Native Mac builds and hana CI currently have no counter.
+The Running table shows hana CI only when a recorded runner has a busy job.
+Idle or unreadable runners have no separate Running row.
+Their memory remains in the taken total, the cap, and the summary tooltip.
+Waiting rows use `#` in the first column for their queue place.
+Both sections use the same column widths.
+The narrow layout adds the `Step` column.
+The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.
