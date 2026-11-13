@@ -383,6 +383,54 @@ class MemoryFeedTests(unittest.TestCase):
                     self.assertNotIn(error, payload)
                 self.assertEqual(sum(row.get("kind") == "mac-unavailable" for row in page["walk"]), 1)
 
+    def mac_clone_units(self, build: queue_view.MacBuild, *, host: str = "mac", count: int = 1,
+                        mirror: bool = False) -> dict[int, unit_labels.UnitLabels]:
+        """Resolve a manual clone against private claims and mirror records."""
+        from scripts.copies import copies
+        from scripts.mac_test import claim_state, floor_claims
+
+        claims: list[claim_state.HeldClaim] = []
+        labels: dict[str, unit_labels.UnitLabels] = {}
+        for index in range(count):
+            session = f"claim-session-{index}"
+            record: claim_state.RemoteJobClaim = {"claim_id": f"claim-{index}", "episode": "episode",
+                "attempt": "attempt", "submitting_session": session, "pid": 900 + index,
+                "proc_start": "start", "what": "hana build", "worktree": "/home/nate/source",
+                "since": "2026-11-12T18:00:00+00:00", "remote_host": host, "repo_name": "hana"}
+            claims.append(claim_state.HeldClaim(claim_state.RepositoryScope("hana"),
+                self.root / f"claim-{index}.json", record))
+            labels[session] = unit_labels.UnitLabels("worker", "hana", "research")
+        leases = ((floor_claims.HeldMirror(floor_claims.MirrorIdentity(host, build.folder),
+                   "claim-session-0"),) if mirror else ())
+        with (mock.patch.object(claim_state, "read_claims", return_value=tuple(claims)),
+              mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            return dict(memory_feed.mac_build_units((build,)))
+
+    def test_mac_manual_clone_unit_requires_one_claim_and_a_known_non_ci_origin(self) -> None:
+        build = queue_view.MacBuild(68214, "/Users/nate/rust/hana_handmade", 200_000,
+            "cargo build -p hana", "hana", origin=queue_view.MacBuildOrigin.NON_CI)
+        cases = (
+            ("manual clone", build, "mac", 1, "research"),
+            ("SSH user", build, "natemccoy@mac", 1, "research"),
+            ("other host", build, "other", 1, "—"),
+            ("CI", replace(build, origin=queue_view.MacBuildOrigin.CI), "mac", 1, "—"),
+            ("old cache", replace(build, origin=queue_view.MacBuildOrigin.UNKNOWN), "mac", 1, "—"),
+            ("duplicate claims", build, "mac", 2, "—"),
+            ("no claim", build, "mac", 0, "—"),
+            ("other session", replace(build, session="another"), "mac", 1, "—"),
+            ("other session in worktree", replace(build, session="another", folder="/home/nate/source"), "mac", 1, "—"),
+            ("other repository", replace(build, repository="cargo-liner"), "mac", 1, "—"),
+        )
+        for name, row, host, count, expected in cases:
+            with self.subTest(name=name):
+                result = self.mac_clone_units(row, host=host, count=count)
+                self.assertEqual(result.get(row.pid, unit_labels.UnitLabels("")).unit, expected)
+
+    def test_mac_mirror_match_keeps_its_unit_with_an_unknown_origin(self) -> None:
+        build = queue_view.MacBuild(100, "/Users/nate/mirror/hana", 200_000, repository="hana")
+        self.assertEqual(self.mac_clone_units(build, host="natemccoy@mac", mirror=True)[100].unit, "research")
+
     def test_configuration_reads_all_keys_from_the_feed_config(self) -> None:
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
