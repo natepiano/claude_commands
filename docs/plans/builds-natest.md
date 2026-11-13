@@ -3575,7 +3575,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The three fixture classes inherit the seed. `test_unit_config.py` (45 tests) and `lib/test_git_exclude.py` (5 tests) did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: `test_unit_config.py` CPU 3.099 to 2.947 s; `test_git_exclude.py` 0.295 to 0.285 s; peak unchanged. natedev module_cost 3.915 to 1.744 s for both. Taplo (158 starts, 1.16 natedev CPU s) is now the top command in `test_unit_config.py`. Checkpoint `63acaa3e0`.
 
-### Phase 235 — The copies tests copy one source seed  · status: todo
+### Phase 235 — The copies tests copy one source seed  · status: done
 **Depends on:** Phase 234
 
 #### Work Order

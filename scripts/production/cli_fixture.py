@@ -163,4 +163,7 @@ class ImmutableGitSeed:
         _ = shutil.copytree(self.checkout, checkout)
         _ = shutil.copytree(self.origin, origin)
         config = checkout / ".git/config"
-        _ = config.write_text(config.read_text().replace(str(self.origin), str(origin)))
+        config_text = config.read_text()
+        if str(self.origin) not in config_text:
+            raise ValueError(f"Cannot replace seed origin {self.origin} with {origin} in {config}")
+        _ = config.write_text(config_text.replace(str(self.origin), str(origin)))

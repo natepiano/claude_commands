@@ -18,7 +18,7 @@ import tempfile
 import time
 from threading import Event
 import unittest
-from typing import TextIO, cast, override
+from typing import ClassVar, TextIO, cast, override
 from unittest import mock
 
 from scripts.copies import copies
@@ -50,6 +50,7 @@ class WaitNotice(io.StringIO):
 
 
 class StandingTests(unittest.TestCase):
+    source_seed: ClassVar[ImmutableGitSeed]
     base: Path = Path()
     source: Path = Path()
     gates: Path = Path()
@@ -59,6 +60,33 @@ class StandingTests(unittest.TestCase):
     published: str = ""
     owner_id: str = ""
     gate_caches: dict[Path, Path] = {}
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="copies-source-seed-"))).resolve()
+        home = root / "home"
+        home.mkdir()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("GIT_") and key != "UNIT_RUN_DIR"}
+        environment.update({
+            "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Gate Tests",
+            "GIT_AUTHOR_EMAIL": "gate-tests@example.invalid", "GIT_COMMITTER_NAME": "Gate Tests",
+            "GIT_COMMITTER_EMAIL": "gate-tests@example.invalid",
+        })
+        with mock.patch.dict(os.environ, environment, clear=True):
+            cls.source_seed = ImmutableGitSeed.create(
+                root, "main", "Gate Tests", "gate-tests@example.invalid",
+                {"Cargo.toml": "[workspace]\n", "tracked.txt": "published\n", "stable.txt": "unchanged\n",
+                 ".gitignore": "target/\nignored.txt\n"},
+            )
+            builder = cls()
+            _ = builder.git(cls.source_seed.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
+            cls.published = builder.git(cls.source_seed.checkout, "rev-parse", "HEAD")
+            _ = (cls.source_seed.checkout / "tracked.txt").write_text("source HEAD\n")
+            _ = builder.git(cls.source_seed.checkout, "commit", "-qam", "unpushed source commit")
+            cls.head = builder.git(cls.source_seed.checkout, "rev-parse", "HEAD")
 
     @override
     def setUp(self) -> None:
@@ -105,18 +133,10 @@ class StandingTests(unittest.TestCase):
         self.owner_id = str(owner.id)
         os.environ["CODEX_THREAD_ID"] = ""
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
-        seed = ImmutableGitSeed.create(
-            self.base, "main", "Gate Tests", "gate-tests@example.invalid",
-            {"Cargo.toml": "[workspace]\n", "tracked.txt": "published\n", "stable.txt": "unchanged\n",
-             ".gitignore": "target/\nignored.txt\n"},
-        )
-        self.source = seed.checkout
-        _ = self.git(seed.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
+        self.source = self.base / "checkout"
+        self.source_seed.copy_to(self.source, self.base / "origin.git")
+        _ = shutil.copyfile(self.source_seed.checkout.parent / "git-config", self.base / "git-config")
         self.gates = Path(self.settings["root"]) / self.source.name
-        self.published = self.git(self.source, "rev-parse", "HEAD")
-        _ = (self.source / "tracked.txt").write_text("source HEAD\n")
-        _ = self.git(self.source, "commit", "-qam", "unpushed source commit")
-        self.head = self.git(self.source, "rev-parse", "HEAD")
 
     def write_config(self, settings: Mapping[str, str]) -> None:
         _ = self.configuration.write_text("[copies]\n" + "".join(f"{key}={value}\n" for key, value in settings.items()))
