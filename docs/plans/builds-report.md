@@ -1373,9 +1373,15 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 
 ### Phase 72 — AWS rows name their owner · status: done
 
-From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png, pid 3184935). Cause, from aws: `cloud_gate.service_command` (scripts/aws_target/cloud_gate.py, about line 1061) starts each gate worker, and `gate_trial.py:476` each paired-trial worker, as a `systemd-run` unit without the caller's session id or unit. The worker's step record has no owner, so `queue_evidence.step_labels` falls back.
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png). A gate worker and a paired-trial worker start as a `systemd-run` unit without the caller's session id or unit.
 
-1. The worker carries the caller's session id, session name and unit into its step record.
-2. A cloud gate row and a paired-trial row name their showrunner and unit, the same as a natedev row.
-3. aws owns cloud_gate.py and gate_trial.py; aws-unit is asked about the change.
-4. Proof: before and after page shots of an AWS row and its tooltip.
+#### As-built
+
+- `cloud_gate.service_command` forwards `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_NAME` and `BUILDLOG_UNIT` with `--setenv`, each only when the caller sets it. An empty value stays empty.
+- The gate worker and the paired-trial worker both use `service_command`, so `gate_trial.py` does not change.
+- The existing `admission_records.waiter_identity` reads the forwarded values. The worker's step record names its session and unit, and the AWS row reads "{unit} {step}" over the showrunner name.
+- The AWS `UnsetEnvironment` list does not change, and no new credential data is read. A hold owned by another session still refuses the worker (exit 10).
+- `memory_page_proof.mjs --cloud-owner` saves before and after shots of an AWS row and its tooltip.
+- aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
