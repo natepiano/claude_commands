@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import ExitStack, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -75,6 +77,52 @@ sys.stdin.read(1)
                     send_process_group(leader.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+        for live_holder in (False, True):
+            with self.subTest(live_holder=live_holder), mock.patch.dict(os.environ, self.environment, clear=True):
+                with ExitStack() as holder:
+                    if live_holder:
+                        _ = holder.enter_context(merge_gate.gate_recovery(self.checkout))
+                    directory = merge_gate.gate_run_directory(self.checkout)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    recovery = merge_gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
+                                                       leader.pid, "ended-owner")
+                    folder = self.root / "abandoned-gate"
+                    folder.mkdir()
+                    self.write(folder / "module-output", "unfinished")
+                    recovery.folders.append(str(folder))
+                    _ = self.git(self.checkout, "merge", "--no-edit", self.checkpoint)
+                    merged = self.git(self.checkout, "rev-parse", "HEAD")
+                    recovery.rollback = self.base
+                    recovery.rollback_head = merged
+                    recovery.rollback_source = self.checkpoint
+                    descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+                    try:
+                        recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1)))
+                        recovery.save()
+                    finally:
+                        os.close(descriptor)
+                    if live_holder:
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            recovery.recover()
+                        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+                        record = cast(dict[str, object], json.loads(recovery.path.read_text()))
+                        self.assertEqual(record["rollback"], self.base)
+                        self.assertEqual(record["groups"], {})
+                        self.assertEqual(record["tokens"], [])
+                        self.assertEqual(record["folders"], [])
+                        self.assertEqual(len(output.getvalue().splitlines()), 1)
+                        self.assertIn("rollback waits for the live gate", output.getvalue())
+                    else:
+                        with merge_gate.gate_recovery(self.unit):
+                            self.assertEqual(self.jobserver_tokens(), b"Q")
+                    self.assertEqual(self.jobserver_tokens(), b"Q")
+                    self.assertFalse(folder.exists())
+                with merge_gate.gate_recovery(self.checkout):
+                    self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+                    self.assertFalse(recovery.path.exists())
+                self.assertEqual(list(directory.glob("*.json")), [])
 
     def test_module_timeout_removes_fixture_and_nested_gate_folders(self) -> None:
         parent = self.root / "nested-temporary"

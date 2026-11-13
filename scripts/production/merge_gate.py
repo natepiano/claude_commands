@@ -759,9 +759,17 @@ class GateRecovery:
                 shutil.rmtree(folder)
             except FileNotFoundError:
                 pass
+        self.folders.clear()
+        self.save()
         if self.rollback:
             repo = Path(self.repo)
-            with scratch.copy_lock(repo):
+            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                    return
+                _ = cleanup.enter_context(scratch.copy_lock(repo))
                 head = checked_git(repo, "rev-parse", "HEAD")
                 if head not in (self.rollback, self.rollback_head):
                     parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
@@ -792,9 +800,16 @@ def recover_gate_runs(repo: Path) -> None:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
         return
-    directory = gate_run_directory(repo)
-    if not directory.exists():
+    root = gate_state_dir() / "active-runs"
+    if not root.exists():
         return
+    for directory in sorted(root.iterdir()):
+        if directory.is_dir():
+            recover_gate_directory(directory)
+
+
+def recover_gate_directory(directory: Path) -> None:
+    """Recover dead owners while holding the directory lock."""
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -824,6 +839,18 @@ def recover_gate_runs(repo: Path) -> None:
 
 
 @contextmanager
+def gate_operation_lock(repo: Path) -> Generator[int]:
+    """Keep one operation lock file for each checkout."""
+    directory = gate_run_directory(repo)
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(directory / "operation.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
 def gate_recovery(repo: Path) -> Generator[GateRecovery]:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
@@ -833,18 +860,19 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
         raise GateRefused("the gate has no readable process start")
-    directory = gate_run_directory(repo)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{os.getpid()}-{hashlib.sha256(identity.start.encode()).hexdigest()[:12]}.json"
-    recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
-    recovery.save()
-    token = ACTIVE_GATE_RECOVERY.set(recovery)
-    try:
-        yield recovery
-    finally:
-        ACTIVE_GATE_RECOVERY.reset(token)
-        if not (recovery.groups or recovery.folders or recovery.tokens or recovery.rollback):
-            path.unlink(missing_ok=True)
+    with gate_operation_lock(repo) as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        directory = gate_run_directory(repo)
+        path = directory / f"{os.getpid()}-{hashlib.sha256(identity.start.encode()).hexdigest()[:12]}.json"
+        recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
+        recovery.save()
+        token = ACTIVE_GATE_RECOVERY.set(recovery)
+        try:
+            yield recovery
+        finally:
+            ACTIVE_GATE_RECOVERY.reset(token)
+            if not (recovery.groups or recovery.folders or recovery.tokens or recovery.rollback):
+                path.unlink(missing_ok=True)
 
 
 @contextmanager
