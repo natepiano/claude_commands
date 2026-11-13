@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import select
 import shutil
@@ -47,6 +48,25 @@ def install_guard_test_budget() -> None:
     paths = [str(folder), *inherited_paths(os.environ.get("PYTHONPATH", ""))]
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(
         os.environ, {"PYTHONPATH": os.pathsep.join(paths)})))
+
+
+def run_guard_in_process() -> None:
+    """Run guard storage in this interpreter when this module does not test the worker process.
+
+    The real worker decode and storage run. Child interpreters keep the process boundary.
+    """
+    _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
+        repeat_guard, "isolated", guard_worker_in_process)))
+
+
+def guard_worker_in_process(command: list[str], request: str, _budget: float) -> repeat_guard.Decision:
+    """Answer as the worker's `__main__` does: a fault admits delivery with one warning."""
+    try:
+        with patch.object(sys, "stdin", io.StringIO(request)):
+            return repeat_guard.worker(command[-1])
+    except Exception as error:
+        repeat_guard.warn(str(error))
+        return repeat_guard.Decision()
 
 
 def install_notice_test_config(home: Path) -> Path:
