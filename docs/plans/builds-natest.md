@@ -3655,7 +3655,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 241 — The CI points tests copy one seed repository  · status: todo
+### Phase 241 — The CI points tests copy one seed repository  · status: done
 **Depends on:** none
 
 #### Work Order
