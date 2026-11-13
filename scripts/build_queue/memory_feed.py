@@ -45,13 +45,13 @@ from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import placement
-from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
+from scripts.build_queue.queue_evidence import service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, step_estimator
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import conf
@@ -294,11 +294,13 @@ class RowProgress(TypedDict):
 
 
 class RowQueueNotes(TypedDict):
-    head_text: NotRequired[str]
+    head: NotRequired[bool]
+    priority: NotRequired[admission_records.PriorityEntry]
     priority_text: NotRequired[str]
 
 
 class RunRow(RowQueueNotes):
+    diagnostic: NotRequired[str]
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
@@ -316,7 +318,9 @@ class RunRow(RowQueueNotes):
     reserved: float
     started_at: float
     queued: bool
-    keep_text: str
+    estimated_need: NotRequired[float]
+    held: NotRequired[float]
+    estimate: NotRequired[admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded]
     group: str
     ci: bool
     parts: list[GroupPart]
@@ -354,6 +358,7 @@ class WaitRow(RowQueueNotes):
     since: float
     reason: str
     fits: bool
+    estimate: admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded
 
 
 class MacBuildRow(RowQueueNotes):
@@ -419,6 +424,7 @@ class PressureNotRecorded:
 class PressureValues(TypedDict):
     some: float | PressureNotRecorded
     full: float | PressureNotRecorded
+    swap: float | PressureNotRecorded
 
 
 class PressureLimits(TypedDict):
@@ -458,16 +464,12 @@ class MemoryPage(TypedDict):
     available: float
     cap: float | admission_records.CapUnavailable
     floor: float
-    cap_text: str
     shortfall: float
     used: float
     reserved: float
     taken: float
     room: float
-    room_source: Literal["free"]
-    limit: str
     other: float
-    shown_reserved: float
     ci_name: str
     ci_ram: float
     shown_safety: float
@@ -479,10 +481,8 @@ class MemoryPage(TypedDict):
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
-    head_text: str
-    priority_text: str
     queued_priority_units: list[str]
-    unmatched_priority_text: str
+    unmatched_priorities: list[admission_records.PriorityEntry]
     mac_idle_alert: str
     cloud_slots_used: int
     cloud_slots: int
@@ -590,11 +590,6 @@ def job_age(started_at: float, now: float) -> str:
     return f"{hours} h {minutes % 60} min" if hours < 48 else f"{hours // 24} days"
 
 
-def ci_amount(value: float) -> str:
-    """Show the shared CI text for an amount in GiB."""
-    return ci_bytes_text(round(value * admission_records.GIB))
-
-
 def build_ci_row(used: float, now: float,
                  cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False) -> RunRow:
     runners: list[CIRunner]
@@ -611,21 +606,12 @@ def build_ci_row(used: float, now: float,
               if busy else "idle")
     if any(runner["state"] == "unreadable" for runner in runners):
         detail = detail + " · runner not readable" if busy else "runner not readable"
-    lines: list[str] = []
-    for runner in runners:
-        if runner["state"] == "unreadable":
-            lines.append(f"{runner['name']} · not readable")
-        elif runner["state"] == "busy":
-            lines.append(f"{runner['name']} · {runner['job']} · {job_age(runner['started_at'], now)} · {ci_amount(runner['used'])}")
-        else:
-            lines.append(f"{runner['name']} · idle · {ci_amount(runner['used'])}")
-    lines.append(f"hana CI uses {ci_amount(used)} now. This use is part of the work inside the cap.")
     idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
     pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
     return {"name": "hana CI", "showrunner": "hana CI", "unit": "hana CI", "state": detail if not busy else "",
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
-            "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
+            "queued": False, "group": "", "ci": True, "parts": [],
             "ci_runners": runners, "admitted": admitted,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
@@ -724,37 +710,27 @@ def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -
             "total": counter.total, "percent": counter.percent, "unit": "modules"}
 
 
-def run_keep_text(hold: admission_records.RunKeepAside, steps: Sequence[admission_records.RunningStep]) -> str:
-    lines = [keep_aside_text(hold)]
-    for step in steps:
-        detail = gate.progress_text(step.measured)
-        if detail:
-            lines.append(f"{step.step}: {detail}")
-    return "\n".join(lines)
+def estimate_source(row: admission_records.Waiter) -> admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded:
+    """Keep the estimate evidence available to the page without formatting it."""
+    if "need_source" not in row:
+        return admission_records.NeedSourceNotRecorded()
+    width = row.get("test_threads")
+    return admission_records.RecordedNeed(row["need_source"], row.get("need_runs", 0), step_estimator.HISTORY_DAYS,
+        row.get("test_scope", "full"), row.get("package", ""), tuple(row.get("filters", [])),
+        width if width is not None else admission_records.WidthNotRecorded(), gate.read_need_basis(row.get("need_basis")))
 
 
-def read_stalls() -> PressureValues:
-    """Read the current ten-second memory stall averages."""
-    path = PROC / "pressure/memory"
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        missing = PressureNotRecorded(f"Pressure is unreadable: {path}")
-        return {"some": missing, "full": missing}
-    values: PressureValues = {"some": PressureNotRecorded(f"Pressure is unreadable: {path}"),
-                              "full": PressureNotRecorded(f"Pressure is unreadable: {path}")}
-    for line in lines:
-        fields = line.split()
-        if not fields or fields[0] not in ("some", "full"):
-            continue
-        name = fields[0]
-        for field in fields[1:]:
-            if field.startswith("avg10="):
-                try:
-                    values[name] = float(field.removeprefix("avg10="))
-                except ValueError:
-                    values[name] = PressureNotRecorded(f"Pressure is unreadable: {path}")
-    return values
+def captured_pressure(pressure: admission_records.Pressure, host: admission_records.HostMemory) -> PressureValues:
+    """Publish the measurements that produced the captured admission decision."""
+    if isinstance(pressure, admission_records.MemoryPressure):
+        return {"full": pressure.full_avg10, "some": pressure.some_avg10, "swap": pressure.swap_used_percent}
+    if isinstance(pressure, admission_records.NoPressureHold) and isinstance(pressure.measurements, admission_records.PressureMeasurements):
+        values = pressure.measurements
+        return {"full": values.full_avg10, "some": values.some_avg10, "swap": values.swap_used_percent}
+    missing = PressureNotRecorded(pressure.reason if isinstance(pressure, admission_records.PressureUnavailable)
+                                  else "Pressure reading not recorded")
+    return {"full": missing, "some": missing,
+            "swap": 100 * (host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0}
 
 
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
@@ -864,7 +840,7 @@ class SwapReadingPass:
 
 
 def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[str, unit_labels.UnitLabels],
-              row_limit: int, names: StepNames) -> SwapReading | SwapUnavailable:
+              row_limit: int, names: StepNames, host: admission_records.HostMemory) -> SwapReading:
     """Account for host swap with disjoint cgroup owners and an explicit difference."""
     owners: dict[Path, tuple[str, str]] = {}
     for step in steps:
@@ -892,14 +868,8 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
     reading = SwapReadingPass(owners)
     for child in reading.children(CGROUP):
         _ = reading.visit(child)
-    path = PROC / "meminfo"
-    try:
-        values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                  for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
-        total = values["SwapTotal"]
-        used = total - values["SwapFree"]
-    except (OSError, ValueError, KeyError, IndexError):
-        return SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path))
+    total = host.swap_total
+    used = total - host.swap_free
     if "agents" in reading.rows:
         reading.rows["agents"]["name"] = SWAP_NAMES["agents"].format(count=reading.agent_count)
     rows = sorted((row for row in reading.rows.values() if row["kind"] == "owner"),
@@ -916,8 +886,8 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
     visible.extend(row for row in reading.rows.values() if row["kind"] == "ungrouped")
     attributed = sum(row["bytes"] for row in visible)
     visible.append(swap_row(SWAP_NAMES["unattributed"], SWAP_NAMES["difference"], used - attributed, "unattributed"))
-    visible.append(swap_row(SWAP_NAMES["total"], SWAP_NAMES["host"].format(path=path), used, "total"))
-    return SwapReading(used, total, visible, len(reading.counters) + 1)
+    visible.append(swap_row(SWAP_NAMES["total"], "Captured admission reading", used, "total"))
+    return SwapReading(used, total, visible, len(reading.counters))
 
 
 def swap_text(rows: Sequence[SwapRow]) -> str:
@@ -932,6 +902,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     names = read_step_names()
     parsed = admission_client.view()
     explanation = parsed.explanation
+    priority_entries = ({entry["step"]: entry for entry in explanation.priority.entries}
+                        if isinstance(explanation.priority, admission_records.QueuePriority) else {})
+    matched_priority_steps: set[admission_records.SelectedPriorityStep] = set()
+
+    def priority_notes(steps: Sequence[admission_records.SelectedPriorityStep], unit: str) -> RowQueueNotes:
+        entries = [priority_entries[step] for step in steps
+                   if step in priority_entries and priority_entries[step]["unit"] == unit]
+        matched_priority_steps.update(entry["step"] for entry in entries)
+        return ({"priority": entries[0], "priority_text": "\n".join(f"queue priority: {entry['unit']} ({entry['why']})" for entry in entries)}
+                if entries else {})
+
     captured = explanation.room
     host = explanation.decided_from.host
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
@@ -963,11 +944,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_ram, ci_name = gib(captured.ci_use), "hana CI"
     by_owner: dict[str, admission_records.RunningStep] = {}
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
+    estimates: dict[str, admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded] = {}
+    priority_steps_by_owner: dict[str, list[admission_records.SelectedPriorityStep]] = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
     for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step
+        estimates[owner] = (estimate_source(reservation["queue_waiter"]) if "queue_waiter" in reservation
+                            else admission_records.NeedSourceNotRecorded())
         steps_by_owner.setdefault(owner, []).append(entry.step)
+        if "queue_waiter" in reservation:
+            priority_steps_by_owner.setdefault(owner, []).append(admission_records.priority_step(reservation["queue_waiter"]))
     run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
@@ -987,7 +974,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
-                     "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
+                     "queued": True, "estimated_need": gib(hold.memory.need), "held": gib(hold.memory.held),
+                     "estimate": estimates.get(hold.memory.owner, admission_records.NeedSourceNotRecorded()),
+                     "group": "", "ci": False, "parts": [],
+                     **priority_notes(priority_steps_by_owner.get(hold.memory.owner, ()), unit)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1005,7 +995,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
-                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
+                "queued": False, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
             walk.append(remote_row)
             continue
@@ -1020,22 +1010,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 detail = activity if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service · " + activity
                 if isinstance(memory, admission_records.UnownedSliceMemory):
                     ci_name = "hana CI"
-                    description = memory.diagnostic
-                else:
-                    description = "Memory the compiler cache holds outside the build queue."
-            else:
-                description = "Memory these processes hold outside the build queue."
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
                            "progress": row_progress((step,)),
-                           "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
+                           "queued": False, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
                                    Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
                                    admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
                 if memory.diagnostic:
-                    row["keep_text"] += "\n" + memory.diagnostic
+                    row["diagnostic"] = memory.diagnostic
+                    row["detail"] += " · " + memory.diagnostic
                 name, detail = row["name"], row["detail"]
             if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
@@ -1049,7 +1035,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
         walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
-                     "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
+                     "queued": False,
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
                      "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", "")}
@@ -1060,10 +1046,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for row in walk:
         _ = row.setdefault("machine", machine)
         _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
+    waiter_identities = {(row["pid"], row["since"]): admission_records.priority_step(row) for _, row in parsed.ordered}
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
         checks[explanation.head.waiter.pid] = explanation.head.room
+    waiter_sources = {row["pid"]: estimate_source(row) for _, row in parsed.ordered}
     for waiter in parsed.view.waiting:
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
@@ -1071,10 +1059,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
+        key = (waiter.pid, waiter.since)
+        steps = (waiter_identities[key],) if key in waiter_identities else ()
         waiters.append({"name": step_text(waiter, names, labels=labels), "showrunner": identity.owner_text, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
-                        "fits": need <= captured.signed_room})
+                        "fits": need <= captured.signed_room,
+                        "estimate": waiter_sources.get(waiter.pid, admission_records.NeedSourceNotRecorded()),
+                        **priority_notes(steps, identity.unit)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_reading = queue_view.read_mac_builds()
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
@@ -1113,7 +1105,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
                     if isinstance(information.update, queue_view.CloudUpdateLate)
-                    and not isinstance(cloud.wait, wire.CloudSlotWait) else ""}
+                    and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
+                **priority_notes((admission_records.SelectedPriorityStep(cloud.owner.pid, cloud.owner.start_time, cloud.since),), identity.unit)}
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text}
             else:
@@ -1121,33 +1114,26 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
-    unmatched_priority_text = ""
-    queued_priority_units: list[str] = []
-    if isinstance(explanation.priority, admission_records.QueuePriority):
-        priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
-                      for entry in explanation.priority.entries}
-        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
-        matched_units: set[str] = set()
-        for work_row in (*work_rows, *waiting_rows):
-            if work_row["unit"] in priorities:
-                work_row["priority_text"] = priorities[work_row["unit"]]
-                matched_units.add(work_row["unit"])
-        unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
+    queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row.get("priority")))
+    unmatched_priorities = (list({(entry["unit"], entry["why"]): entry
+                                 for entry in explanation.priority.entries
+                                 if entry["step"] not in matched_priority_steps}.values())
+                            if isinstance(explanation.priority, admission_records.QueuePriority) else [])
     if waiting_rows:
-        head_pid = waiting_rows[0]["pid"]
-        if isinstance(explanation.head, admission_records.HeadExplanation):
-            head = explanation.head.waiter
-            head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
+        waiting_rows[0]["head"] = True
+    if isinstance(explanation.head, admission_records.HeadExplanation):
+        for waiting_row in waiting_rows:
+            _ = waiting_row.pop("head", None)
+        head = explanation.head.waiter
+        head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
         for waiting_row in waiting_rows:
             if waiting_row["pid"] == head_pid:
-                waiting_row["head_text"] = queue_view.head_text(model)
+                waiting_row["head"] = True
                 break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
-    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
-    if isinstance(swap, SwapUnavailable):
-        raise RuntimeError(swap.reason)
-    pressure_values = read_stalls()
+    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names, host)
+    pressure_values = captured_pressure(pressure, host)
     pressure_label = "none"
     if isinstance(pressure, admission_records.MemoryPressure):
         pressure_label = admission_records.pressure_text(pressure)
@@ -1156,21 +1142,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     return {
         "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
-        "cap": cap, "floor": safety, "cap_text": room_text(captured),
+        "cap": cap, "floor": safety,
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
-        "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
+        "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room),
         "other": max(0.0, total - gib(captured.available) - gib(captured.cap_use)),
         "ci_name": ci_name, "ci_ram": ci_ram,
-        "shown_safety": min(safety, used + gib(captured.available)),
-        "shown_reserved": max(0.0, min(reserved, gib(captured.available) - safety)),
+        "shown_safety": min(safety, gib(captured.available)),
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
         "swap_used": gib(swap.used), "swap_total": gib(swap.total),
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
-        "head_text": queue_view.head_text(model),
-        "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
-        "unmatched_priority_text": unmatched_priority_text,
+        "unmatched_priorities": unmatched_priorities,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},

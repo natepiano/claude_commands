@@ -19,7 +19,7 @@ import time
 from scripts.build_queue import head_facts, admission_client, admission_protocol
 from scripts.build_queue.queue_card import select_waiters
 from scripts.build_queue.queue_lines import json_form
-from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view
+from scripts.build_queue.queue_view import QueueModel, HostLoad, HostLoadUnavailable, UnknownCpuCount, render_view, running_matches_selector
 from scripts.build_queue.queue_lines import Span
 from scripts.buildlog.mac_idle_alert import alert_line, state_dir
 from scripts.build_queue import admission_records
@@ -60,34 +60,61 @@ class NoWaitingStep:
     pass
 
 
-def bump(selector: str, actor: str) -> int:
+@dataclass(frozen=True)
+class DefaultBumpReason:
+    pass
+
+
+@dataclass(frozen=True)
+class SuppliedBumpReason:
+    text: str
+
+
+DEFAULT_BUMP_REASON = DefaultBumpReason()
+
+
+def bump(selector: str, actor: str, why: DefaultBumpReason | SuppliedBumpReason = DEFAULT_BUMP_REASON) -> int:
     reading = memory_admit.queue_read()
-    labels = unit_labels.unit_labels_for([step.session_id for step in reading.view.waiting], os.environ)
+    labels = unit_labels.unit_labels_for([step.session_id for step in (*reading.view.waiting, *reading.view.running)], os.environ)
     model = QueueModel(reading, labels, admission_records.NoWaiter(), head_facts.PaceUnavailable(), user_zone(),
                        HostLoadUnavailable(), admission_records.NoWaiter())
     matches = select_waiters(model, selector)
-    if not matches:
-        print(f"build queue: no waiting step matches {selector}")
-        return 3
-    selected_place = matches[0]
-    step = reading.view.waiting[selected_place - 1]
-    unit = memory_admit.queue_unit(step.unit, step.session_id, labels)
+    if matches:
+        selected_place = matches[0]
+        step = reading.view.waiting[selected_place - 1]
+        selected = next(row for _, row in reading.ordered if row["pid"] == step.pid and row["since"] == step.since)
+        selected_text = f"step #{selected_place}"
+    else:
+        running = next((step for step in reading.view.running if running_matches_selector(step, selector, labels)), None)
+        selected = next((row["queue_waiter"] for row in reading.explanation.reservations
+                         if "queue_waiter" in row and running is not None and row["pid"] == running.pid), None)
+        if selected is None:
+            print(f"build queue: no live step matches {selector}")
+            return 3
+        selected_text = "running step"
+    unit = memory_admit.queue_unit(selected.get("unit", ""), selected.get("session_id", ""), labels)
     if unit == unit_labels.UnitLabels("").unit or not unit:
-        print(f"build queue: waiting step #{selected_place} has no unit")
+        print(f"build queue: {selected_text.replace('step', 'waiting step')} has no unit")
         return 3
-    result = admission_client.priority_set(unit, "the user's bump", actor)
+    identity = admission_records.priority_step(selected)
+    result = admission_client.priority_set(unit, why.text if isinstance(why, SuppliedBumpReason) else admission_records.queue_priority_reason(actor),
+                                          actor, identity, selector=selector)
     if isinstance(result, admission_protocol.Refused):
         print(f"build queue: {result.reason}")
         return 3
-    reading = memory_admit.queue_read()
-    first = next((WaitingPosition(place) for place, step in enumerate(reading.view.waiting, 1)
-                  if memory_admit.queue_unit(step.unit, step.session_id, labels) == unit), NoWaitingStep())
+    try:
+        reading = memory_admit.queue_read()
+    except admission_protocol.AdmissionUnavailable:
+        print(f"queue priority set for {unit} ({selected_text}): the new place is not known now")
+        return 0
+    first = next((WaitingPosition(place) for place, (_, row) in enumerate(reading.ordered, 1)
+                  if admission_records.priority_step(row) == identity), NoWaitingStep())
     detail = f"first step now #{first.place}" if isinstance(first, WaitingPosition) else "no waiting step now"
     priority = reading.explanation.priority
-    units = ([entry["unit"] for entry in priority.entries]
-             if isinstance(priority, admission_records.QueuePriority) else [])
-    place = f"; priority #{units.index(unit) + 1}" if unit in units else ""
-    print(f"queue priority set for {unit} (step #{selected_place}): {detail}{place}")
+    identities = ([entry["step"] for entry in priority.entries]
+                  if isinstance(priority, admission_records.QueuePriority) else [])
+    place = f"; priority #{identities.index(identity) + 1}" if identity in identities else ""
+    print(f"queue priority set for {unit} ({selected_text}): {detail}{place}")
     return 0
 
 
@@ -106,13 +133,20 @@ def main() -> int:
 
     if len(sys.argv) > 1 and sys.argv[1] in ("bump", "clear", "admit-head"):
         command = sys.argv[1]
-        if command == "bump" and (len(sys.argv) != 3 or len(sys.argv[2].split()) != 1):
+        bump_words = sys.argv[2:]
+        reason: DefaultBumpReason | SuppliedBumpReason = DefaultBumpReason()
+        if command == "bump" and "--why" in bump_words:
+            index = bump_words.index("--why")
+            if index + 2 == len(bump_words):
+                reason = SuppliedBumpReason(bump_words[index + 1])
+                bump_words = bump_words[:index]
+        if command == "bump" and (len(bump_words) != 1 or len(bump_words[0].split()) != 1):
             print("build queue: use /build:queue bump <position|session|folder>")
             return 3
         try:
             actor = admission_records.queue_command_actor()
-            if sys.argv[1] == "bump" and len(sys.argv) == 3:
-                return bump(sys.argv[2], actor)
+            if command == "bump":
+                return bump(bump_words[0], actor) if isinstance(reason, DefaultBumpReason) else bump(bump_words[0], actor, reason)
             elif sys.argv[1] == "clear" and len(sys.argv) in (2, 3):
                 result = (admission_client.priority_clear(actor, sys.argv[2]) if len(sys.argv) == 3
                           else admission_client.priority_clear(actor))

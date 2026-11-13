@@ -603,12 +603,15 @@ class ClientTests(unittest.TestCase):
         return transport
 
     def test_priority_commands_from_any_session_send_the_actor(self) -> None:
+        def selected_unit(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
+            return client.priority_set(unit, why, actor, records.SelectedPriorityStep(42, "start", 123))
         for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
                                       ("", "codex-session", "codex-session"), ("", "", "user")):
             for argv in (("priority-set", "unit"), ("priority-clear",), ("admit-head", "urgent")):
                 with self.subTest(actor=actor, argv=argv), \
                      mock.patch.dict(os.environ), \
                      mock.patch.object(client, "_mutation", return_value=wire.Ok()) as mutation, \
+                     mock.patch.object(client, "priority_set_unit", side_effect=selected_unit), \
                      redirect_stdout(io.StringIO()):
                     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
                         _ = os.environ.pop(key, None)
@@ -622,6 +625,32 @@ class ClientTests(unittest.TestCase):
                                    mutation.call_args.args[0])
                     self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest))
                     self.assertEqual(request.actor, actor)
+
+    def test_priority_cli_keeps_the_named_caller_and_an_explicit_reason(self) -> None:
+        from scripts.production import staff
+        member = staff.StaffRow(staff.StaffId("member-id"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-id"))
+        for reason in (None, "  exact reason  "):
+            with self.subTest(reason=reason), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                request = replace(fixture.request(), identity=wire.Identity("worker", "worker", "check", "", "chosen"))
+                _ = fixture.server.handle_request(request)
+                with fixture.serving(), mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))), \
+                     mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session-id"}), redirect_stdout(io.StringIO()):
+                    self.assertEqual(client.main(["priority-set", "chosen", *(["--why", reason] if reason is not None else [])]), 0)
+                priority = fixture.server.priority
+                assert isinstance(priority, records.QueuePriority)
+                self.assertEqual(priority.entries[0]["set_by"], "session-id")
+                self.assertEqual(priority.entries[0]["why"], reason if reason is not None else "impl2's bump")
+                self.assertEqual(priority.entries[0]["step"], records.SelectedPriorityStep(
+                    request.owner.pid, request.owner.start_time, request.since))
+
+    def test_priority_cli_without_a_live_step_names_the_selector_and_does_not_mutate(self) -> None:
+        with AdmissionFixture() as fixture, fixture.serving(), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(client.main(["priority-set", "absent"]), 2)
+            self.assertIn("no live step matches absent", errors.getvalue())
+            self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
 
     def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
         with AdmissionFixture() as fixture:
@@ -998,7 +1027,7 @@ class ClientTests(unittest.TestCase):
             "release": lambda: client.release("stem", 137, records.read_memory_config()),
             "width": lambda: client.width("stem", 3),
             "admit-head": lambda: client.admit_head("urgent", "director"),
-            "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
+            "priority-set": lambda: client.priority_set("unit", "urgent", "director", records.SelectedPriorityStep(42, "start", 123)),
             "priority-clear": lambda: client.priority_clear("director"),
             "priority-clear-unit": lambda: client.priority_clear("director", "demo"),
             "token-wait": lambda: client.token_wait("stem", records.read_memory_config())}
@@ -1823,7 +1852,9 @@ class ClientTests(unittest.TestCase):
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
             lambda: client.release("stem", 137, records.read_memory_config()), lambda: client.width("stem", 3),
-            lambda: client.admit_head("urgent", "director"))
+            lambda: client.admit_head("urgent", "director"),
+            lambda: client.priority_set("unit", "urgent", "director", records.SelectedPriorityStep(42, "start", 123)),
+            lambda: client.priority_clear("director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
                 transport = self.use_transport(fixture, Exchange(b""), Exchange(reply_bytes(wire.Ok())))

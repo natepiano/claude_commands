@@ -318,6 +318,53 @@ class QueueTests(NotificationGuardedTestCase):
                 self.assertEqual(events[-1]["set_by"], actor)
                 self.assertEqual(admission_client.priority_clear(actor), wire.Ok())
 
+    def test_bump_keeps_success_when_the_second_view_is_unavailable(self) -> None:
+        _ = self.fixture.waiter(100, "worker-id", "worker")
+        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="demo")}
+        reading = self.fixture.read()
+        with mock.patch.object(memory_admit, "queue_read", side_effect=[reading, wire.AdmissionUnavailable("no answer")]), \
+             mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
+            self.assertEqual(self.bump_output("1"),
+                (0, "queue priority set for demo (step #1): the new place is not known now\n", ""))
+        mutation.assert_called_once()
+
+    def test_bump_does_not_mutate_after_an_unavailable_first_view(self) -> None:
+        with mock.patch.object(memory_admit, "queue_read", side_effect=wire.AdmissionUnavailable("no socket")), \
+             mock.patch.object(admission_client, "priority_set") as mutation:
+            self.assertEqual(self.bump_output("1")[0], 2)
+        mutation.assert_not_called()
+
+    def test_explicit_bump_reason_stays_exact(self) -> None:
+        _ = self.fixture.waiter(100, "worker-id", "worker")
+        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="demo")}
+        with mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
+            self.assertEqual(self.bump_output("1", "--why", "  urgent: exact  ")[0], 0)
+        self.assertEqual(mutation.call_args.args[1], "  urgent: exact  ")
+
+    def test_bump_reason_states_resolve_default_and_preserve_supplied_text(self) -> None:
+        _ = self.fixture.waiter(100, "worker-id", "worker")
+        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="demo")}
+        cases = ((build_queue.DefaultBumpReason(), "actor's bump"),
+                 (build_queue.SuppliedBumpReason("  exact  "), "  exact  "),
+                 (build_queue.SuppliedBumpReason(""), ""))
+        for reason, expected in cases:
+            with self.subTest(reason=reason), mock.patch.object(
+                    admission_client, "priority_set", return_value=wire.Ok()) as mutation, redirect_stdout(io.StringIO()):
+                self.assertEqual(build_queue.bump("1", "actor", reason), 0)
+            self.assertEqual(mutation.call_args.args[1], expected)
+
+    def test_default_bump_reason_uses_the_staff_name_or_the_actor(self) -> None:
+        member = staff.StaffRow(staff.StaffId("member-id"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-id"))
+        snapshot = staff.StaffSnapshot((member,))
+        for actor in ("member-id", "session-id"):
+            with self.subTest(actor=actor), mock.patch.object(staff, "snapshot", return_value=snapshot):
+                self.assertEqual(records.queue_priority_reason(actor), "impl2's bump")
+        with mock.patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("unavailable")):
+            self.assertEqual(records.queue_priority_reason("codex-id"), "codex-id's bump")
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("a plain shell has no staff actor")):
+            self.assertEqual(records.queue_priority_reason("user"), "user's bump")
+
     def test_clear_one_unit_passes_the_unit_to_the_client(self) -> None:
         with mock.patch.object(records, "queue_command_actor", return_value="actor"), mock.patch.object(
                 admission_client, "priority_clear", return_value=wire.Ok()) as clear, mock.patch(
@@ -381,13 +428,13 @@ class QueueTests(NotificationGuardedTestCase):
         priority = admission.server.priority
         self.assertNotIsInstance(priority, records.NoQueuePriority)
         if not isinstance(priority, records.NoQueuePriority):
-            self.assertEqual((priority.entries[0]["unit"], priority.entries[0]["why"]), ("berth", "the user's bump"))
+            self.assertEqual((priority.entries[0]["unit"], priority.entries[0]["why"]), ("berth", records.queue_priority_reason(records.queue_command_actor())))
 
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
         admission = self.private_mutation_service()
         with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unmatched priority write")):
             status, output, errors = self.bump_output("berth")
-        self.assertEqual((status, output, errors), (3, "build queue: no waiting step matches berth\n", ""))
+        self.assertEqual((status, output, errors), (3, "build queue: no live step matches berth\n", ""))
         self.assertIsInstance(admission.server.priority, records.NoQueuePriority)
 
     def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
@@ -407,7 +454,8 @@ class QueueTests(NotificationGuardedTestCase):
                  mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
                 self.assertEqual(self.bump_output(selector),
                     (0, "queue priority set for actual-unit (step #2): first step now #2\n", ""))
-                mutation.assert_called_once_with("actual-unit", "the user's bump", "actor-id")
+                mutation.assert_called_once_with("actual-unit", "actor-id's bump", "actor-id",
+                    records.SelectedPriorityStep(200, "200", NOW + 200), selector=selector)
 
     def test_bump_row_without_a_unit_refuses_without_writing_priority(self) -> None:
         _ = self.fixture.waiter(100, "head-id", "head")
