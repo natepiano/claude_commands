@@ -10,6 +10,32 @@ The status line's first row shows its current staff assignment and path; its sec
 
 `/whoami` shows Claude accounts used by local live sessions, omitting unused Claude accounts. Before this machine cuts over, its legacy `~/.claude` login is also included. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
+## Preventive login sittings
+
+The weekly reminder asks you to renew Claude logins before their server end dates.
+The first sitting is Tuesday, November 17, 2026, at 10:00 EST.
+Later sittings occur every seven days.
+The reminder selects accounts whose earliest stored end date is within ten days of the sitting.
+It compares the dates on natedev and the Mac.
+When none is within ten days, it selects the account with the earliest end date.
+It sends no sitting reminder when no account has a stored date.
+A missed sitting produces only the latest sitting reminder.
+
+The push lists each selected account and its known end date on each machine.
+For each selected account:
+
+1. Sign out of claude.ai in the browser.
+2. Sign in as that account.
+3. On each named machine, run `/login` in a Claude session on that account.
+
+One sitting renews the account on both machines.
+A token refresh does not extend the server end date.
+An additional safety reminder covers an unreported login within three days of its end date.
+The safety reminder does not repeat for the same machine, account, and end date.
+Both reminders respect notification silence.
+Only natedev sends these reminders.
+It reads peer dates at most once per hour and retains the last good dates when the Mac is unavailable.
+
 ## Trusted worktrees
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust` to trust

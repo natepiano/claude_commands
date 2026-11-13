@@ -18,6 +18,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/role_map.py` | The shared role map, its transport, cache, locks, and change history. |
 | `scripts/accounts/next_moves.py` | Ordered moves, holds, positional edits, and validation. |
 | `scripts/accounts/refusal_watch.py` | Refusal detection, login renewal, queued moves, and automatic group moves. |
+| `scripts/accounts/login_sittings.py` | Weekly and safety reminders from stored Claude login end dates. |
 | `scripts/accounts/refusals.py` | Provider refusals and the freshness of usage readings. |
 | `scripts/accounts/moves.py` | Move outcomes, waits, assignment routing, and replay evidence. |
 | `scripts/accounts/unit_watchdog.py` | Recovery from pane launch records and fresh session liveness. |
@@ -36,6 +37,59 @@ The agent-notes job runs notes, quota alerts, pacing, refusal moves, and unit re
 `config/agent_notes.toml` supplies its schedules and process limits.
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
+
+## Preventive login reminders
+
+The argument-free notes pass calls `login_sittings.run` after `refusal_watch.run`.
+A separate error block preserves the notes output when the reminder fails.
+The Mac usage refresher does not call this reminder.
+The module sends only on `login_sitting_machine`.
+It reads local dates through `accounts.read_status(source=StoredUsageOnly())`.
+It uses the same numbered Claude rows and `login_ends_at` values that stored status exports.
+Removed accounts cannot retain a date through an old usage-store directory link.
+This shared status path inspects account readiness but does not refresh usage.
+The peer command is `accounts.py status --stored --json` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
+An attempt time limits peer reads, including failed reads.
+The last successful peer read time and dates remain available after a failed attempt.
+
+`config/accounts.conf` supplies all reminder settings:
+
+| Key | Current value | Meaning |
+| --- | --- | --- |
+| `login_sitting_machine` | `natedev` | The machine that sends reminders. |
+| `login_sitting_first` | `2026-11-17T10:00:00-05:00` | The first sitting. |
+| `login_sitting_interval_days` | `7` | The interval between sittings. |
+| `login_sitting_window_days` | `10` | The selection window after a sitting. |
+| `login_safety_margin_days` | `3` | The immediate reminder margin. |
+| `login_peer_read_minutes` | `60` | The minimum interval between peer attempts. |
+| `login_peer_read_timeout_seconds` | `30` | The peer command limit. |
+
+Each pass reads these settings through `conf.read`.
+The earliest end on either machine selects the account for a sitting.
+The sitting push includes both known machine dates for that account.
+When no account is within the window, the push selects the account with the earliest end.
+No known dates means no sitting push.
+The latest sitting replaces any missed sittings.
+Safety pushes include only machine, account, and end-date combinations that no accepted push has named.
+An unknown date never enters either list.
+
+The atomic state file is `accounts_home()/.local/state/accounts/login_sittings.json`.
+It holds the latest completed sitting, named login dates, peer dates, and peer read and attempt times.
+Each save removes a named record only when the same machine and account have a different known end date.
+A missing date keeps the named record.
+Cached peer dates remain current evidence until the next successful peer read replaces them.
+The module saves each peer attempt and its result before it reads local dates.
+It contains no credential or login identity.
+`locked_history` holds the lock in `login_sittings/` beside the state file throughout each pass.
+The lock covers state reads, local and peer reads, sends, and saves.
+A busy pass performs no account reads or sends.
+The module records a sitting after an accepted push or an empty selection.
+A failed push leaves its sitting and named dates unrecorded for another attempt.
+The `accounts.login_sitting` catalog entry supplies both push kinds as normal notes.
+The `login-sitting` and `login-safety` keys replace older retained pushes of the same kind.
+Delivery uses `push_texts.user_send_argv` and checks `send_result.send_outcome`.
+It never sets `--through-silence`.
+The push formats dates in the user's zone.
 
 ## Account identity and storage
 
