@@ -1,4 +1,16 @@
 {
+  "accounts.login_sitting": {
+    "safety": {
+      "reviewer": "claude-opus-5-5",
+      "sha256": "37c7f2434717100db2c2fbbefe50f90541565757e8af08c257239b0a837be2be",
+      "time": "2026-11-13T14:34:47.281665-05:00"
+    },
+    "weekly": {
+      "reviewer": "claude-opus-5-5",
+      "sha256": "37c7f2434717100db2c2fbbefe50f90541565757e8af08c257239b0a837be2be",
+      "time": "2026-11-13T14:34:39.189148-05:00"
+    }
+  },
   "alert.blocked": {
     "typical": {
       "objections": [],

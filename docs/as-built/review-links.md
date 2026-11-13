@@ -317,7 +317,13 @@ Builds rows can remain in the natedev list while the builds filter shows them.
 Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
 The page keeps row entries during ordering and does not format the text that `/next` prints.
 The existing urgency order, pin, dependencies, and moved rows determine its order.
-Rows from another list use qualified row IDs and qualified prerequisite IDs.
+Queue keys and prerequisites retain their list-based IDs.
+The Details line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
+The shared staff resolver supplies the prefix used by the showrunner filter.
+Rows without a staff producer use the list's showrunner through the same resolver.
+`verdict` and `answer-question` print the same responsible-showrunner ID.
+Row commands and selected-row links accept that ID and the existing list-based ID.
+An ambiguous displayed ID requires an explicit `--list <path>`.
 Skip for now selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
 A reload restores that place when the row waits, awaits validation, or has an open question.
@@ -458,7 +464,8 @@ An absent proposal returns `skipped: no proposal for <row>` and is not an error.
 Malformed proposals, incompatible states, and SSH failures raise `FeatureLogError`.
 The server makes no separate proposal lookup.
 A Hana list uses a bare review ID, such as `C27`.
-Other lists use their filename's showrunner name, such as `natedev/C27`.
+Other feature-log review IDs retain their filename's showrunner name, such as `natedev/C27`.
+These stored IDs stay valid when the displayed ID names another responsible showrunner.
 A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
 A returning answer calls `drop_review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.

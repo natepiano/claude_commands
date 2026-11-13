@@ -10,6 +10,32 @@ The status line's first row shows its current staff assignment and path; its sec
 
 `/whoami` shows Claude accounts used by local live sessions, omitting unused Claude accounts. Before this machine cuts over, its legacy `~/.claude` login is also included. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
+## Preventive login sittings
+
+The weekly reminder asks you to renew Claude logins before their server end dates.
+The first sitting is Tuesday, November 17, 2026, at 10:00 EST.
+Later sittings occur every seven days.
+The reminder selects accounts whose earliest stored end date is within ten days of the sitting.
+It compares the dates on natedev and the Mac.
+When none is within ten days, it selects the account with the earliest end date.
+It sends no sitting reminder when no account has a stored date.
+A missed sitting produces only the latest sitting reminder.
+
+The push lists each selected account and its known end date on each machine.
+For each selected account:
+
+1. Sign out of claude.ai in the browser.
+2. Sign in as that account.
+3. On each named machine, run `/login` in a Claude session on that account.
+
+One sitting renews the account on both machines.
+A token refresh does not extend the server end date.
+An additional safety reminder covers an unreported login within three days of its end date.
+The safety reminder does not repeat for the same machine, account, and end date.
+Both reminders respect notification silence.
+Only natedev sends these reminders.
+It reads peer dates at most once per hour and retains the last good dates when the Mac is unavailable.
+
 ## Trusted worktrees
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust` to trust
@@ -76,10 +102,8 @@ Each Codex account can stay signed in in its own home. The table's `workers` rol
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live usage request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says "the attempt time is not recorded". It does not promise when another read will run. A good read clears the star and footnote. The default table shows accounts and upcoming moves; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
 `status --json` prints `{"accounts": [...], "upcoming_moves": [...], "problems": [...]}` from the same readings as the table, in the same account order.
-`problems` contains the table's problem lines except shared-home repair lines.
-These repairs cover real entries where shared links belong, clashing entries, folders to merge, and failed shared moves.
-The text board keeps these lines, including with `--detail`.
-All other problem lines remain in JSON.
+JSON `problems` matches the text board's problem lines, including shared-home repair lines.
+JSON removes only the `* ` footnote prefix.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
 Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `login_ends_at`, `credits`, `use_credits` and `read_at`.
@@ -172,7 +196,25 @@ A failed refresh retains its watches and retries on the next tick.
 An unavailable local staff record supplies no group membership.
 
 
-Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. JSON `problems` omits shared-home repair lines and the `* ` footnote prefix. All other problem lines match the text board. A direct folder or sign-in check replaces the empty-row summary for that cause.
+Each problem below the table uses this form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`.
+An MCP server difference uses one line for each account, server, and direction.
+It counts only projects that differ from the same project in `~/.claude`.
+For example:
+
+```text
+claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp
+```
+
+The home scope counts as the project `~`.
+Both files use the same `~/.claude` project as the baseline.
+The final command makes that server match the baseline in every differing project.
+It writes atomically and preserves the file mode.
+It keeps a `.claude.json.mcp-backup-<time>` beside the account file.
+It preserves other servers and account settings.
+The read-only `mcp-projects <account> <server> <off|on>` command shows those paths before a repair.
+JSON `problems` matches the text board's problem lines, including shared-home repairs.
+JSON removes only the `* ` footnote prefix.
+A direct folder or sign-in check replaces the empty-row summary for that cause.
 
 A login with no account note has one line that names the missing note. The line asks for the account's login. Problem lines use account labels and never print a login.
 
@@ -223,7 +265,7 @@ A readable credential entry without a token requires a session or manual login.
 
 Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
 Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
-pruning and the vault commit each run in a separate process.
+pruning, login renewal reminders and the vault commit each run in a separate process.
 Each process has a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
@@ -548,6 +590,7 @@ A worker refusal does not keep the group request open.
 The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
 One detached unit handles all targets without overlapping moves.
 Direct Codex worker moves use the same runner and read the selected role before each worker.
+A Codex worker move skips a target whose note says `use_credits: off` and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
 Claude worker moves use the same run lock and retain the requested Claude label.
 It reads the selected role before each worker and checks it again before it ends.
 A role change causes another pass over workers that need the new account.

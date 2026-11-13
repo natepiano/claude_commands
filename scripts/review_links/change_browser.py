@@ -136,9 +136,8 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             key = item.row["#"] if item.page.review_list == current else item.key
             by_key[key] = item
             if item.waiting:
-                prefix = "" if item.page.review_list == current else item.key.rsplit("/", 1)[0] + "/"
                 entry = change_review.row_entries([item.row])[0]
-                after = prefix + entry.after if entry.after and "/" not in entry.after else entry.after
+                after = change_review.prerequisite_key(entry.after, item.page.review_list, current)
                 entries.append(replace(entry, key=key, item=item.row | {"#": key}, after=after))
         prepared = change_review.ChangeQueue(name, entries)
         changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
@@ -172,11 +171,12 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
+    shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
         return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
-{change_page.change_details(row, change.key)}
+{change_page.change_details(row, shown)}
 <h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
@@ -185,7 +185,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     saved = f'<p>{html.escape(text)}</p>' if text else ""
     return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
-{change_page.change_details(row, change.key)}
+{change_page.change_details(row, shown)}
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''

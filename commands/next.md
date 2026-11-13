@@ -107,9 +107,11 @@ it follows a staff id in its Production cell. A unit id gives that unit's curren
 production, and a showrunner id gives that showrunner's production. A Producer id
 with no staff row is unrouted. Any other row belongs to its list's production.
 Mark: `change_review.py mark-important --row <id>`.
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`. Say
-what changed, how to try it and what the user sees, in plain words. Record the
-user's verdict through `/change_review` → verdict.
+Pass the displayed ID, such as `sdlc/C9`.
+Its prefix names the responsible showrunner from the shared staff resolver.
+The list-based ID remains valid; use `--list <path>` when the displayed ID matches several lists.
+Say what changed, how to try it, and what the user sees.
+Record the verdict through `/change_review` → verdict.
 
 ## proposal
 

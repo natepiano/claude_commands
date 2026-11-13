@@ -15,6 +15,15 @@ def mac_idle_reservation(holder: str, detail: str) -> str:
 
 
 ENTRIES = (
+    PushText("accounts.login_sitting", "accounts", "note", "Claude logins will expire", NoActionNeeded(),
+        "You asked for early login reminders.\nWithout renewal, Claude work stops at these login end dates:\n{accounts}\nFor each account:\n"
+        + "1. Sign out of claude.ai in the browser.\n2. Sign in as that account.\n"
+        + "3. On each named machine, run /login in a Claude session on that account.",
+        (PushExample("weekly", {"accounts": "claude1: Mac Sat 11-28, natedev Fri 12-11\n"
+            + "claude2: Mac Sun 11-29, natedev Sat 12-12\nclaude3: Mac Mon 11-30, natedev Sun 12-13\n"
+            + "claude4: Mac Tue 12-01, natedev Mon 12-14\nclaude5: Mac Wed 12-02, natedev Tue 12-15"}),
+         PushExample("safety", {"accounts": "claude4: Mac Sat 11-28"})),
+        purpose="The weekly sitting or safety margin requires a preventive Claude login.", header=False),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",

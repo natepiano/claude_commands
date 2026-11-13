@@ -39,6 +39,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.agents.test_support import write_machine_config
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker
@@ -551,6 +552,7 @@ class RetireUnitTests(unittest.TestCase):
         atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+        write_machine_config(self.root)
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"

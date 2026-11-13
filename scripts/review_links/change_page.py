@@ -580,7 +580,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         sections.append(f'''<section id="{row_id}">
 {alert}
 <h1>{html.escape(row["Change"])}</h1>
-{change_details(row, row["#"])}
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}</section>''')
     if notice.reason and not notice.row:
@@ -802,7 +802,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
 
 
 def review_message(page: ReviewPage, row: dict[str, str], headline: str, *details: str) -> str:
-    return "\n".join((f"Change review {row['#']}: {headline}", f"List: {page.review_list}",
+    shown = change_review.display_id(row, route_owner(page, row).tab)
+    return "\n".join((f"Change review {shown}: {headline}", f"List: {page.review_list}",
                       f"Production: {unit_lookup.doc_owner(page.production, staff.snapshot()).name}", f"Change: {row['Change']}", *details))
 
 
@@ -1020,15 +1021,17 @@ def main(arguments: list[str]) -> int:
         _ = parser.add_argument("--question", required=True)
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
-        page = ReviewPage(cast(Path, args.list).expanduser(), change_review.production_doc(cast(str, args.production)),
-                          (cast(str, args.row),), "")
         try:
+            target = change_review.resolve_row(cast(str, args.row), production=cast(str, args.production),
+                                               review_list=cast(Path, args.list))
+            shown = change_review.row_display_id(target.path, target.row)
+            page = ReviewPage(target.path, change_review.production_doc(cast(str, args.production)), (target.row,), "")
             changed = DeliveryStatus(review_link.review_root()).answer_question(
                 page, page.rows[0], cast(str, args.question), cast(str, args.text))
         except (OSError, ValueError, change_review.ChangeReviewError, Refusal, subprocess.SubprocessError) as error:
             print(f"change page: {error}", file=sys.stderr)
             return 1
-        print(f"Answered {page.rows[0]}" if changed else f"{page.rows[0]} already has this answer")
+        print(f"Answered {shown}" if changed else f"{shown} already has this answer")
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("rows", nargs="*")
@@ -1047,8 +1050,10 @@ def main(arguments: list[str]) -> int:
         if production is None:
             raise ValueError("pass --production for an older selected-row link")
         doc = change_review.production_doc(production)
-        path = review_list.expanduser() if review_list else change_review.production_list(production)
-        print(publish(doc, path, rows))
+        targets = [change_review.resolve_row(row, production=production, review_list=review_list) for row in rows]
+        if any(target.path.resolve() != targets[0].path.resolve() for target in targets):
+            raise ValueError("selected rows must belong to one review list")
+        print(publish(doc, targets[0].path, [target.row for target in targets]))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1
