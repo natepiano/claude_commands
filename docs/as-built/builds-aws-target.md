@@ -34,15 +34,15 @@ Boxes receive signed URLs and no scaler credential file.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The target registry contains `mac,natedev`.
-The retained `offload=on` value does not register an AWS target.
+The builder configuration and offload route have been removed.
 Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
-The repository retains their implementation for compatibility and removal recovery.
+Only historical cost, ownership, and teardown compatibility remain.
 
 `deploy.py down --approve-destroy` can remove the remaining gate resources without registering the former target.
 Teardown resolves former builder claim and lock paths directly from the AWS state folder.
 It preserves the existing lock and live claim checks.
-The controller no longer releases claims after a box stop or generation change.
-That path no longer writes `release-evidence/`.
+The builder controller and remote agent have been removed.
+Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
@@ -182,7 +182,7 @@ The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
-The controller searches every configured region for an expired reservation without a recorded region.
+Reconciliation searches every configured region for an expired reservation without a recorded region.
 After a valid final result, the controller books the box end at the result receipt time.
 It still requests termination and requires AWS to confirm termination before it books that time.
 A box without a valid final result uses the termination confirmation time.
@@ -230,14 +230,15 @@ Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
-The controller reads gate Spot prices every `price_refresh_seconds=3600`.
-It reads prices after the tick releases `controller.lock`, in the same process.
+`aws_target.py tick` refreshes gate Spot prices.
+`price_refresh_seconds=3600` limits the refresh frequency.
+The command no longer starts or stops a builder.
 It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
 The price lock stores the last refresh attempt time.
 Slow price reads leave start and stop commands free to acquire the controller lock.
 It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
 Each read requests all configured gate `instance_types` for Linux/UNIX.
-The controller keeps the latest price for each zone and type.
+The reader keeps the latest price for each zone and type.
 It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
 Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
 An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
@@ -294,8 +295,7 @@ It preserves the configured order within each list.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
 `deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
-The price stage of `up` shows this quota for each gate region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
+`deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.

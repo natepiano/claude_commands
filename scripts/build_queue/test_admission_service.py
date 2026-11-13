@@ -5478,8 +5478,6 @@ class RunPlaceTests(unittest.TestCase):
 
     def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
         from zoneinfo import ZoneInfo
-        from scripts.aws_target import aws_target
-        from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
 
@@ -5504,18 +5502,6 @@ class RunPlaceTests(unittest.TestCase):
                     if line.lstrip().startswith("1 ") and "project check" in line]
             minute_column = heading.index("min")
             self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
-            settings_path = fixture.root / "aws_target.conf"
-            _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
-                                     + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
-            configuration = conf.read(settings_path)
-            settings = read_control_settings(configuration)
-            controller = aws_target.Controller(settings_path, fixture.root / "aws", fixture.state_dir)
-            eligible_steps = cast(Callable[[ControlSettings, int, conf.ConfigRead], int],
-                                  getattr(controller, "_queued"))
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 0)
-            fixture.clock.advance(300)
-            _ = fixture.server.run_pass()
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
