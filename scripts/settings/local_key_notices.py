@@ -77,10 +77,9 @@ def deliver(root: Path, machine: str) -> None:
     destination = conf.read("settings").text("local_key_notice_to")
     for key in pending:
         identity = hashlib.sha256(json.dumps([machine, key]).encode()).hexdigest()
-        command = [str(root / "scripts/lib/py"), str(session_send.SEND_SCRIPT),
-                   "--to", destination, "--from", "settings", "--key", "settings-local:" + identity,
+        command = session_send.send_argv("--to", destination, "--from", "settings", "--key", "settings-local:" + identity,
                    "--repeat-minutes", str(timedelta.max.days * 1440),
-                   "--text", f"Settings key {key} is local on {machine}."]
+                   "--text", f"Settings key {key} is local on {machine}.", python_interpreter=root / "scripts/lib/py")
         accepted = False
         try:
             sent = subprocess.run(command, input="", text=True, capture_output=True,

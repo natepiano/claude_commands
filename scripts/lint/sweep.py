@@ -3762,7 +3762,6 @@ def send_phone_push(phone: RenderedPush, *,
         from scripts.notify.push_texts import user_send_argv
         from scripts.notify import review
     command = user_send_argv(phone)
-    command[1] = str(session_send.SEND_SCRIPT)
     command.extend(crossing_send_argv(repeat))
     return run_send(command, "phone alert", input=None,
                     timeout=send_budget.user_seconds(review.user_send_seconds()))

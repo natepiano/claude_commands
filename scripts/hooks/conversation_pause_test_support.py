@@ -93,11 +93,11 @@ def asked_read(asked_at: int, replies_ended: int) -> dict[str, object]:
     }
 
 
-def scheduled_wakeup(prompt: str) -> dict[str, object]:
+def scheduled_wakeup(prompt: str, *, task_id: str = "scheduled-1", recurring: bool = True) -> dict[str, object]:
     return {
-        "id": "scheduled-1",
+        "id": task_id,
         "schedule": "0 * * * *",
-        "recurring": True,
+        "recurring": recurring,
         "prompt": prompt,
     }
 
@@ -389,9 +389,8 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         return self.pause_root / "scheduled-prompts" / f"{session_id}.json"
 
     def scheduled_prompts(self, session_id: str = SESSION) -> list[str]:
-        return cast(
-            list[str], json.loads(self.scheduled_prompts_path(session_id).read_text())
-        )
+        entries = cast(list[dict[str, object]], json.loads(self.scheduled_prompts_path(session_id).read_text()))
+        return [cast(str, entry["prompt"]) for entry in entries]
 
     def calls(self, path: Path) -> list[list[str]]:
         if not path.exists():

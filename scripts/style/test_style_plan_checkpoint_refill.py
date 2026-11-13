@@ -201,22 +201,25 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("read")
         old, new = "crates/alpha/src/probe.rs", "crates/alpha/src/frame_log.rs"
         reference = "crates/alpha/src/render.rs"
-        issue = self.file_rename_decision(rule, ((old, "Rename probe.rs to frame_log.rs"),))
+        doc = "docs/rename-notes.md"
+        issue = self.file_rename_decision(rule, ((old, "Rename probe.rs to frame_log.rs"),),
+                                          ((doc, "Use probe for samples.\n"),))
         ledger = self.ledger()
         finding = ledger.proposal_findings(issue)[0]
         ledger.ticket_add("1", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [old], [rule],
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         ledger.ticket_assign("1", "demo-style-names")
         _ = ledger.ticket_base("1")
+        self.widen_for_pipeline("1", doc)
         _ = self.git("mv", old, new, cwd=self.unit)
-        for path in ("crates/alpha/src/lib.rs", reference):
+        for path in ("crates/alpha/src/lib.rs", reference, doc):
             source = self.unit / path
             _ = source.write_text(source.read_text().replace("probe", "frame_log"))
         _ = self.git("add", "--all", cwd=self.unit)
         _ = self.git("commit", "-qm", "Rename waiting for merge", cwd=self.unit)
         checkpoint = self.git("rev-parse", "HEAD", cwd=self.unit)
         ledger.ticket_checkpoint("1", checkpoint)
-        for number, path in enumerate((reference, new), 2):
+        for number, path in enumerate((reference, new, doc), 2):
             with self.subTest(path=path):
                 ticket = f"{number}"
                 ledger.ticket_add(ticket, ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
@@ -225,6 +228,15 @@ class StylePlanTests(StylePlanFixture):
                 self.assertIn("overlap: " + path, output)
                 self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
                 ledger.ticket_drop(ticket)
+        with self.subTest(path=self.sources[2]):
+            ledger.ticket_add("5", ticket_owner_id("names"), "read", "names", "crates/beta", [self.sources[2]], [rule])
+            code, output, error = self.run_next()
+            self.assertEqual((code, error), (0, ""), output)
+            self.assertIn("phase written: 5", output)
+            self.assertNotIn("footprint unknown", output)
+            self.assertEqual(ledger.ticket_get("5")["state"], "assigned")
+            self.assertEqual(ledger.ticket_get("5")["base"], checkpoint)
+            self.assertEqual(self.run_next(), (0, "resume 5\n", ""))
 
     def test_checkpoint_refill_stops_after_the_successor_checkpoints(self) -> None:
         ledger, rule, _ = self.waiting_ticket()
@@ -250,13 +262,21 @@ class StylePlanTests(StylePlanFixture):
     def test_checkpoint_refill_build_inputs_and_rename_paths_block_symmetrically(self) -> None:
         work = style_plan.WaitingCheckpoint("1", self.tip, frozenset({self.sources[0]}),
                                            ("crates/alpha", "crates/beta"))
-        for path in (self.sources[0], "crates/alpha/Cargo.toml", "crates/alpha/build.rs", "Cargo.toml", "Cargo.lock"):
+        for path in (self.sources[0], "crates/alpha/Cargo.toml", "crates/alpha/build.rs", "Cargo.toml", "Cargo.lock",
+                     ".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain"):
             with self.subTest(path=path):
                 self.assertIsInstance(work.check((path,)), style_plan.WaitingForMerge)
                 reverse = style_plan.WaitingCheckpoint("1", self.tip, frozenset({path}), work.crates)
                 self.assertIsInstance(reverse.check((self.sources[0],)), style_plan.WaitingForMerge)
         self.assertIsInstance(work.check((self.sources[1],)), style_plan.NoCheckpointBlock)
         self.assertIsInstance(work.check((self.sources[2],)), style_plan.NoCheckpointBlock)
+        doc = "docs/x/style/y.md"
+        for waiting, selected, blocked in ((doc, doc, True), (doc, self.sources[0], False),
+                                           (self.sources[0], doc, False)):
+            with self.subTest(waiting=waiting, selected=selected):
+                checkpoint = style_plan.WaitingCheckpoint("1", self.tip, frozenset({waiting}), work.crates)
+                expected = style_plan.WaitingForMerge if blocked else style_plan.NoCheckpointBlock
+                self.assertIsInstance(checkpoint.check((selected,)), expected)
         with self.assertRaisesRegex(style_ledger.LedgerError, "unknown crate"):
             _ = work.check(("unknown/file.rs",))
 
