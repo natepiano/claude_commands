@@ -1307,9 +1307,13 @@ From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): r
 
 ### Phase 68 — The build page joins the admin console as Builds · status: done
 
-From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation (Lucide icons): Changes and Builds. sdlc's admin-console unit builds the console. The contract, through builds:
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
 
-1. Add `memory_feed.page_url() -> str`: the body of `page_link` without the print. `page_link` prints it. It raises one of `review_link.SNAPSHOT_ERRORS` when the page is not available.
-2. Rename the page title and heading from "Build memory on natedev" to "Builds" (the user's name). Rename it in `/build:page` too.
-3. The page allows same-origin framing (no `X-Frame-Options DENY`, no `frame-ancestors 'none'`). It draws no site navigation. Links that leave the page use `target=_top`.
-4. Do not edit `config/console.conf`; admin-console adds the builds block. Land before 14:30.
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
