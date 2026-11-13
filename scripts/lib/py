@@ -20,35 +20,98 @@ root="${shim%/*/*/*}"
 NEED_MAJOR=3
 NEED_MINOR=12
 
-isolated=0
+python_options=()
+file_separator=()
+mode=stdin
+target=""
 if [[ "${1:-}" == --isolated ]]; then
-    isolated=1
+    python_options+=(-I)
     shift
 fi
-skip_argument=0
-options=1
-for argument in "$@"; do
-    if [[ "$skip_argument" == 1 ]]; then skip_argument=0; continue; fi
-    if [[ "$options" == 1 ]]; then
-        case "$argument" in
-            -c*|-m*|-) set -- -P "$@"; break ;;
-            -W|-X|--check-hash-based-pycs) skip_argument=1; continue ;;
-            --) options=0; continue ;;
-            -*) continue ;;
-        esac
-    fi
-    script="$argument"
-    [[ "$script" == /* ]] || script="$PWD/$script"
-    folder="${script%/*}"
-    while [[ -n "$folder" ]]; do
-        if [[ -f "$folder/scripts/lib/py" ]]; then root="$folder"; break; fi
-        folder="${folder%/*}"
-    done
-    break
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|-m)
+            mode="${1#-}"
+            if [[ $# -lt 2 ]]; then
+                echo "Argument expected for the $1 option" >&2
+                exit 2
+            fi
+            target="$2"
+            shift 2
+            break ;;
+        -c*|-m*) mode="${1:1:1}"; target="${1:2}"; shift; break ;;
+        -) target=-; shift; break ;;
+        --)
+            file_separator=(--)
+            shift
+            if [[ $# -gt 0 ]]; then mode=file; target="$1"; shift; fi
+            break ;;
+        -W|-X|--check-hash-based-pycs)
+            python_options+=("$1")
+            shift
+            if [[ $# -gt 0 ]]; then python_options+=("$1"); shift; fi ;;
+        -*) python_options+=("$1"); shift ;;
+        *) mode=file; target="$1"; shift; break ;;
+    esac
 done
-export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-if [[ "$isolated" == 1 ]]; then
-    set -- -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); script = sys.argv.pop(1); sys.argv[0] = script; runpy.run_path(script, run_name="__main__")' "$root" "$@"
+# Add the root to this interpreter only. Keep native interpreter options.
+bootstrap='
+def launch():
+    import os, sys
+    root, mode, target = sys.argv[1:4]
+    arguments = sys.argv[4:]
+    import runpy
+    sys.argv = [target if mode in {"file", "m"} else "-c", *arguments]
+    runpy.run_path(os.path.join(root, "scripts/lib/python_startup/sitecustomize.py"), run_name="_shim_python_startup")["select_checkout"](sys.argv)
+    namespace = sys.modules["__main__"].__dict__
+    builtins = namespace["__builtins__"]
+    namespace.clear()
+    namespace.update(__name__="__main__", __package__=None, __spec__=None,
+                     __builtins__=builtins)
+    if mode == "m":
+        import runpy
+        sys.argv = [target, *arguments]
+        runpy._run_module_as_main(target)
+    elif mode == "file":
+        import runpy
+        if not sys.flags.isolated:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(target)))
+        sys.argv = [target, *arguments]
+        namespace.update(runpy.run_path(target, run_name="__main__"))
+    else:
+        sys.argv = ["-c" if mode == "c" else target, *arguments]
+        if mode == "c":
+            exec(compile(target, "<string>", "exec"), namespace)
+        elif sys.stdin.isatty():
+            if not sys.flags.interactive:
+                import code
+                code.interact(local=namespace)
+        else:
+            exec(compile(sys.stdin.read(), "<stdin>", "exec"), namespace)
+launch()
+'
+startup="$root/scripts/lib/python_startup"
+native=1
+for option in "${python_options[@]}"; do
+    case "$option" in
+        --*|-W*|-X*) ;;
+        -*I*|-*E*|-*S*) native=0 ;;
+    esac
+done
+if [[ "$native" == 1 ]]; then
+    export PYTHONPATH="$startup${PYTHONPATH+:$PYTHONPATH}"
+    case "$mode" in
+        c|m) set -- "${python_options[@]}" -P "-$mode" "$target" "$@" ;;
+        file) set -- "${python_options[@]}" "${file_separator[@]}" "$target" "$@" ;;
+        *)
+            if [[ "$target" == - ]]; then
+                set -- "${python_options[@]}" -P - "$@"
+            else
+                set -- "${python_options[@]}" -P "$@"
+            fi ;;
+    esac
+else
+    set -- "${python_options[@]}" -P -c "$bootstrap" "$root" "$mode" "$target" "$@"
 fi
 
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
@@ -69,7 +132,7 @@ fi
 
 new_enough() {
     command -v "$1" >/dev/null 2>&1 || [ -x "$1" ] || return 1
-    "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
+    "$1" -I -c "import sys; sys.exit(0 if sys.version_info >= ($NEED_MAJOR, $NEED_MINOR) else 1)" 2>/dev/null
 }
 
 # Written through a temp file and renamed, so two hooks resolving at once can

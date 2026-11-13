@@ -158,7 +158,7 @@ class CargoLifetimeTests(unittest.TestCase):
         cargo = fixture.root / "fake-cargo"
         _ = cargo.write_text(FAKE_CARGO)
         cargo.chmod(0o755)
-        environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
             "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(fixture.root),
             "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile"}
@@ -305,7 +305,7 @@ class RunnerHomeTests(unittest.TestCase):
             _ = fixture.occupy_host()
             fixture.free(0)
             request = fixture.service_request()
-            environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                            "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1"}
             with fixture.serving():
                 child = subprocess.Popen([sys.executable, "-c", DENIED_HOME_CLIENT],

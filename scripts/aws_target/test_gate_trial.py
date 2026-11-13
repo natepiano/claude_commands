@@ -1,6 +1,9 @@
 """Measure trial lifecycles with a fake AWS command and clock."""
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_startup
+
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
@@ -166,10 +169,7 @@ class GuestTests(unittest.TestCase):
             repo = root / 'repo'
             suite = repo / 'scripts' / 'fixture'
             suite.mkdir(parents=True)
-            shim = repo / 'scripts' / 'lib' / 'py'
-            shim.parent.mkdir()
-            shim.symlink_to(Path(__file__).resolve().parents[1] / 'lib' / 'py')
-            (shim.parent / 'package_root.py').symlink_to(Path(__file__).resolve().parents[1] / 'lib/package_root.py')
+            copy_startup(repo)
             links = {'step': 'size', 'commit': 'fixture-head', 'source': 'https://fixture.invalid/source',
                      'log': 'https://fixture.invalid/log', 'result': 'https://fixture.invalid/result',
                      'module_seconds': 'https://fixture.invalid/module_seconds'}
@@ -312,7 +312,7 @@ class PairedTrialTests(CostFixture):
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
-        for relative in ('scripts/test_times/module_run.py', 'scripts/lib/descendants.py', 'scripts/lib/package_root.py'):
+        for relative in (*STARTUP_FILES, 'scripts/test_times/module_run.py', 'scripts/lib/descendants.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())

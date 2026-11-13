@@ -1,6 +1,8 @@
 """Test process counts and module costs with private test modules."""
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
 from contextlib import ExitStack, redirect_stdout
 import io
 import os
@@ -21,7 +23,7 @@ from scripts.test_times import module_cost, task_cpu
 
 def install_runner(tree: Path) -> None:
     source = Path(module_cost.__file__).resolve().parents[2]
-    for relative in ("scripts/test_times/module_run.py", "scripts/lib/package_root.py", "scripts/lib/descendants.py"):
+    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py"):
         destination = tree / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copyfile(source / relative, destination)
@@ -65,7 +67,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -102,7 +104,7 @@ class ModuleCostTests(unittest.TestCase):
             _ = sockets.enter_context(writer)
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             paused = tree / "paused.py"
             _ = paused.write_text(
@@ -169,7 +171,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -204,7 +206,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -233,7 +235,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -270,7 +272,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"
@@ -312,7 +314,7 @@ class ModuleCostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary)
             self.enterContext(mock.patch.dict(os.environ, {
-                "PYTHONPATH": os.pathsep.join((str(tree), os.environ.get("PYTHONPATH", ""))),
+                "PYTHONPATH": os.pathsep.join((str(tree / "scripts/lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             }))
             install_runner(tree)
             folder = tree / "scripts" / "fixture"

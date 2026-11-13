@@ -198,7 +198,7 @@ class LinuxShellTests(unittest.TestCase):
             "TEST_REAL_RM": real_rm,
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
             "CONF_DIR": str(self.root),
-            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
         }

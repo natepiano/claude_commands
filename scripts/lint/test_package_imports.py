@@ -1,6 +1,8 @@
 """Check package bootstrap insertion, tree scans, and entry execution."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_startup
+
 import os
 from pathlib import Path
 import subprocess
@@ -15,8 +17,9 @@ class PackageImportTests(unittest.TestCase):
     def test_bootstrap_preserves_the_docstring_future_imports_and_nested_entry_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            copy_startup(root)
             bootstrap = root / "scripts/lib/package_root.py"
-            bootstrap.parent.mkdir(parents=True)
+            bootstrap.parent.mkdir(parents=True, exist_ok=True)
             _ = bootstrap.write_bytes((Path(__file__).resolve().parents[1] / "lib/package_root.py").read_bytes())
             source = '''#!/usr/bin/env python3
 """Keep the entry documentation.

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lib.process_group import send_process_group
@@ -142,14 +145,25 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
+    for name in ("process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
                  "codex_models_cache.py", "build_folders.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
     home_lib = root / ".claude/scripts/lib"
     home_lib.mkdir(parents=True, exist_ok=True)
-    for name in ("py", "process_group.py"):
-        _ = shutil.copy2(source / "lib" / name, home_lib / name)
+    _ = shutil.copy2(source / "lib/process_group.py", home_lib / "process_group.py")
+    for checkout in (root, root / ".claude"):
+        for relative in STARTUP_FILES:
+            destination = checkout / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(source.parent / relative, destination)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
+    copy_runtime(root)
+    copy_runtime(root / ".claude")
+    # The launcher fixtures do not contact a Codex catalog.
+    for checkout in (root, root / ".claude"):
+        catalog = checkout / "scripts/agents/sync_codex_catalog.sh"
+        _ = catalog.write_text("#!/bin/sh\nexit 0\n")
+        catalog.chmod(0o755)
     _ = (root / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"worker@example.invalid"}}')
     for name in ("models_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)

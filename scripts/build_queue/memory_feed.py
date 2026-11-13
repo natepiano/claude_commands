@@ -71,7 +71,9 @@ def feed_code_paths() -> tuple[str, ...]:
         _ = importlib.import_module(name)
     source_root = Path(__file__).resolve().parents[2]
     paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
-    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
+    paths.update((*STARTUP_FILES, "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
     for module in tuple(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if isinstance(source, str) and source.endswith(".py"):

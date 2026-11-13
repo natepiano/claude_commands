@@ -28,7 +28,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
         self.environment["TMPDIR"] = str(parent)
         record = self.state / "nested-folders.json"
         module = self.checkout / "scripts" / "hooks" / "test_first.py"
-        self.write(module, f'''import json
+        program = f'''import json
 from pathlib import Path
 import signal
 import sys
@@ -53,7 +53,11 @@ def hold_nested_gate(request):
 
 build_folders.temporary_build_folder = hold_nested_gate
 merge_gate.run_suites(Path.cwd(), full=True)
-''')
+'''
+        helper = self.bin / "nested-gate.py"
+        self.write(helper, program)
+        shim = self.bin.parent / "scripts/lib/py"
+        self.write(module, "import os\n" + f"os.execv({str(shim)!r}, [{str(shim)!r}, {str(helper)!r}])\n")
         result = self.run_gate("--tests-only", "--module-time-limit-s", "10", own_process=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("killed: still running after 10 s, the module time limit", result.stdout)

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from scripts.production.merge_gate import GateRun
 
 from scripts.lib import conf
+from scripts.lib.python_startup import sitecustomize as python_startup
 from scripts.test_times import gate_record
 
 
@@ -335,7 +336,12 @@ try:
         home.mkdir(exist_ok=True)
         (home / 'config').symlink_to(repo / 'config', target_is_directory=True)
         os.chdir(repo)
-        sys.path.insert(0, str(repo))
+        from types import ModuleType
+        startup = ModuleType('_devtools_python_startup')
+        startup.__file__ = __GATE_STARTUP_FILENAME__
+        sys.modules[startup.__name__] = startup
+        exec(__GATE_STARTUP_SOURCE__, startup.__dict__)
+        startup.select_checkout(sys.argv)
         from scripts.production import merge_gate
         os.environ['HERDR_BIN'] = '/nonexistent/herdr'
         timings = {}
@@ -425,9 +431,10 @@ finally:
 '''
 
 
-GUEST = LEGACY_GUEST.replace("links['boot'] =",
+GUEST = (LEGACY_GUEST.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup)))
+    .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)).replace("links['boot'] =",
     "if links.get('production') and gate_request.get('task') == 'paired':\n    exec(" + repr(paired_supervisor())
-    + ")\n    raise SystemExit(0)\nlinks['boot'] =", 1)
+    + ")\n    raise SystemExit(0)\nlinks['boot'] =", 1))
 
 
 def log_upload(links: dict[str, str]) -> str:

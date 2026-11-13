@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
 from scripts.agents import remote
 
 import json
@@ -102,8 +104,10 @@ class NightlyReviewTests(unittest.TestCase):
         _ = shutil.copyfile(nightly_review.__file__, copied)
         library = copied.parents[1] / "lib"
         library.mkdir()
-        for name in ("process_failure.py", "package_root.py", "transcripts.py"):
-            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib" / name, library / name)
+        for relative in (*STARTUP_FILES, "scripts/lib/process_failure.py", "scripts/lib/transcripts.py"):
+            destination = copied.parents[2] / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[2] / relative, destination)
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")

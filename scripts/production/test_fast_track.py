@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime, copy_startup
+
 from collections.abc import Callable
 from datetime import datetime
 import errno
@@ -255,6 +257,8 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/production/merge_gate.py": "raise AssertionError('gate ran')\n",
         }.items():
             self.write(self.checkout, path, content)
+        copy_runtime(self.root, configuration=False)
+        copy_startup(self.checkout)
         (self.checkout / "scripts/lib/py").chmod(0o755)
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fast-track fixture modules")

@@ -72,7 +72,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
                 environment.update(claude_catalog_environment(account, {"opus": first_model}))
                 modules = stopped_worker_module(self.root / "catalog-retry-modules")
                 environment.update({
-                    "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT))),
+                    "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules))),
                     "CLAUDE_WORKER_SEND_SCRIPT": str(self.root / "send"),
                     "STUB_TRANSCRIPT": str(transcript),
                     "STUB_SEND_BEHAVIOR": "queued",
@@ -134,7 +134,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             "Path.read_text = read",
         )))
         environment = self.environment()
-        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        environment["PYTHONPATH"] = os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))
         with patch.object(self, "environment", return_value=environment):
             result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -157,7 +157,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         _ = record_path.write_text(json.dumps({"dispatch_state": "invalid"}))
         modules = stopped_worker_module(self.root / "switch-modules")
         environment = self.environment()
-        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        environment["PYTHONPATH"] = os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))
         with patch.object(self, "environment", return_value=environment):
             result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

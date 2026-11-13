@@ -87,16 +87,16 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
             state = cast(dict[str, object], json.loads(state_path.read_text())) if state_path.exists() else {}
             state["owner_staff_id"] = parent.id
             write_text_atomic(state_path, json.dumps(state))
-            wrapper = fixture.root / "scripts/agents/detached_runs.py"
+            wrapper = fixture.root / "detached-tools/agents/detached_runs.py"
             wrapper.parent.mkdir(parents=True, exist_ok=True)
-            library = fixture.root / "scripts/lib"
+            library = wrapper.parents[1] / "lib"
             library.mkdir(parents=True, exist_ok=True)
             if not (library / "py").exists():
                 (library / "py").symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
             write_text_atomic(wrapper, PRIVATE_DELIVERY)
             environment["TEST_DETACHED_PACKAGE"] = str(Path(__file__).resolve().parents[2])
             os.environ["TEST_DETACHED_PACKAGE"] = environment["TEST_DETACHED_PACKAGE"]
-            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
             os.environ["PYTHONPATH"] = environment["PYTHONPATH"]
             _ = self.enterContext(patch.object(detached_runs, "__file__", str(wrapper)))
             status = detached_runs.main(["start", "--session-dir", str(session), "--to", identity,

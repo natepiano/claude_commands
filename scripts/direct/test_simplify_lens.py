@@ -88,7 +88,7 @@ if sys.argv[0].endswith(("assign.py", "simplify_daily.py")):
                 simplify_daily.write_text_atomic = publish_status
     sys.setprofile(enter)
 ''')
-        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
+        self.env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(startup)))
         self.script(self.bin / "claude", '''import json, os, subprocess, sys, uuid
 from pathlib import Path
 session = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())

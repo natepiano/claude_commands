@@ -399,7 +399,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
-        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parents[1])
+        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parent / "lib/python_startup")
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)

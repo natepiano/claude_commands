@@ -194,6 +194,10 @@ class GateBoxTests(unittest.TestCase):
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
+                library = repo / 'scripts/lib'
+                library.mkdir()
+                _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
+                self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
                     'from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
