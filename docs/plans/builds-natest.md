@@ -3710,7 +3710,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - aws pairs: 49.820 -> 36.245 CPU s (paired median saving 13.592 s); peak 272.6 -> 265.5 MiB. Base round 1 timed out; the changed variant passed all rounds.
 - 108 tests and 617 assertions unchanged; director review (no-worker mode) approves with no findings. Checkpoint 0a13c9aa4.
 
-### Phase 250 — The verify Mac-only tests do less repeated work  · status: todo
+### Phase 250 — The verify Mac-only tests do less repeated work  · status: done
 **Depends on:** none
 
 #### Work Order

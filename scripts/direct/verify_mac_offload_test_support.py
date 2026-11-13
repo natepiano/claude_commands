@@ -897,12 +897,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 for name, value in os.environ.items()
                 if name
                 not in {
-                    "UNIT_RUN_DIR",
-                    "UNIT_SESSION_DIR",
-                    "UNIT_TEAM_ROLE",
                     "CODEX_THREAD_ID",
                     "CODEX_SESSION_ID",
-                    "UNIT_DETACHED_RUN",
                     "BUILDLOG_MAC",
                     "BUILDLOG_MAC_REASON",
                     "BUILDLOG_LOCAL_REASON",
@@ -910,7 +906,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     "BASH_ENV",
                     "ENV",
                 }
-                and not name.startswith("BASH_FUNC_")
+                # Fixture calls must not update the outer run or use its folders.
+                and not name.startswith(("BASH_FUNC_", "UNIT_"))
             },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
