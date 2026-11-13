@@ -2304,56 +2304,15 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 109 — Every hana Linux CI job finds its devShell tools again, and a cargo version call skips the queue  · status: done
 
-**Depends on:** none.
+#### As-built
 
-**Source (2026-11-12, builds showrunner):** "top priority, ahead of other work. Every hana Linux CI job fails since the 11-11 14:30 switch, from your scripts/build_queue/ci_cargo_front.py ... Fix: the child PATH keeps every entry and drops only the front's own folder (and any shim that recurses). Add a test row: a devShell entry before the real cargo stays on the child PATH."
-
-**Source 2 (2026-11-12 18:40, builds showrunner, from queue):** "Both hana CI runners have had a busy job for 1 h 19 min ... Each sits in scripts/build_queue/ci_cargo_front.py ... Find why the front waits without a queue entry. Fold it into 109 if it is the same code path, else the next phase."
-
-#### Work Order
-
-**Goal:** the cargo that the CI admission front starts sees every PATH entry of the job, except the front's own folder and a folder whose `cargo` resolves to the front.
-A cargo call that only prints a version or help text runs at once, without an admission request.
-
-**Measured:**
-1. Every hana Linux CI job fails since the 2026-11-11 14:30 switch with `linker cc not found` and `no such command: deny`, `nextest` or `sweep`.
-2. CI runs `nix develop .#ci -c ...`. The devShell puts its bin folders (`cc`, `cargo-deny`, `cargo-nextest`, `cargo-sweep`, `mold`) before rustup's cargo on PATH.
-3. `cargo_path()` (`scripts/build_queue/ci_cargo_front.py:56-72`) returns `entries[index:]`, the PATH from the first real cargo on. Every devShell folder before that cargo is dropped from the child PATH.
-4. With `--cargo <path>`, the same slice (`entries[entries.index(directory):]`) drops every folder before the explicit cargo's folder.
-5. At 18:40 the hana-linux-2 front (pid 2272243) ran `cargo clippy --version` and had waited since 17:22. The live queue view shows it as the queue head: `hana CI · hana-linux-2 · clippy`, need 6,740,828,160 bytes, held for memory. The hana-linux-1 front (pid 2272585, `cargo install ... cargo-mend`) waits behind it (`BehindHead`).
-6. `building_call()` (`ci_cargo_front.py:46-53`) looks only at the subcommand. `clippy` is in `BUILDING`, so `clippy --version` asks for admission with the estimate of a full clippy build.
-7. Each front sends its request again every 10 minutes (service log, 17:22 to 18:38). The service restarted at 17:42 and 18:27.
-
-**Spec:**
-1. `cargo_path(explicit, front)` returns the child PATH as every entry of `os.get_exec_path()`, in its order, without:
-   - the folder that holds the front (current rule);
-   - each folder whose `cargo` is an executable file that resolves to the front (a shim that would call the front again).
-2. Without `--cargo`, the command is still the first `cargo` on that filtered PATH that does not resolve to the front. Folders before it stay on the child PATH.
-3. With `--cargo <path>`, the command is that path. Its folder goes first on the child PATH; drop its later duplicate. All other kept entries follow in their order.
-4. Keep the `FileNotFoundError` when no cargo is found. Add no flag and no config key.
-5. Update the `cargo_path()` docstring in STE.
-6. `building_call(arguments)` returns `False` when a flag that only prints text comes after the subcommand and before a `--`:
-   - `-V` and `--version` for every subcommand except `install` (`cargo install --version <VERSION>` takes a value);
-   - `-h` and `--help` for every subcommand.
-   An argument after `--` goes to the program and does not change the result (`cargo run -- --help` stays a build).
-
-**Tests** (`scripts/build_queue/test_ci_cargo_front.py`):
-1. A devShell folder with `cc` before the real cargo folder stays on the child PATH, in front of the cargo folder. Use the existing wrapper test (`test_packaged_wrapper_selects_the_next_cargo_and_admits_once`) or a direct `cargo_path()` row.
-2. A folder whose `cargo` is a symlink to the front is not on the child PATH, and the command is the real cargo after it.
-3. With `--cargo <path>`, a folder before that cargo's folder stays on the child PATH, and the explicit folder comes first.
-4. The front's own folder is not on the child PATH (current assertion stays).
-5. `building_call()` rows: `clippy --version`, `build -V`, `test --help` and `nextest -h` are not builds; `install --version 1.2 foo`, `run -- --help`, `test -- --version` and `clippy` are builds. Extend `test_nonbuilding_cargo_passes_through_during_an_admission_outage` with `clippy --version`.
+- `cargo_path(explicit, front)` returns every `os.get_exec_path()` entry in its order. It drops only the folder that holds the front and each folder whose `cargo` is an executable that resolves to the front. The devShell folders (`cc`, `cargo-deny`, `cargo-nextest`, `cargo-sweep`, `mold`) before the real cargo stay on the child PATH.
+- Without `--cargo`, the command is the first `cargo` on that PATH that does not resolve to the front. With `--cargo <path>`, the command is that path; its folder goes first and its later duplicate is dropped.
+- `building_call(arguments)` returns no build when a flag that only prints text comes after the subcommand and before `--`: `-V` or `--version` (not for `install`, where `--version <VERSION>` takes a value), and `-h` or `--help`. Such a call runs at once with no admission request. An argument after `--` does not change the result.
+- Measured before the fix: every hana Linux CI job failed from the 2026-11-11 14:30 switch with `linker cc not found` and `no such command`. On 2026-11-12, `cargo clippy --version` held the queue head for 85 minutes with a 6,740,828,160-byte estimate.
 
 **Files:**
-- `scripts/build_queue/ci_cargo_front.py`
-- `scripts/build_queue/test_ci_cargo_front.py`
+- `scripts/build_queue/ci_cargo_front.py` — `cargo_path()`, `building_call()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the wrapper test with a devShell folder and a recursing shim before the real cargo, with and without `--cargo`; a `building_call()` table; a `clippy --version` row in the outage pass-through test
 
-**Workers:** one implement worker.
-
-**State:** none.
-
-**Verification:**
-1. Test: `scripts.build_queue.test_ci_cargo_front`.
-2. Lint: `basedpyright` on both files, once after the edits.
-
-**Speed:** one more `cargo` stat per PATH entry, once per front start.
+**Gotchas:** the CI runners run the front from a nix store copy. A fix reaches CI only after the nixos input bump and a switch.
