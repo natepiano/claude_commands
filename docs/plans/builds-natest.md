@@ -3611,7 +3611,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Real writers, locks, rejected pushes and publication checks did not change. All 51 test bodies and 214 assertions did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: CPU 32.828 to 31.491 s; peak 104.2 to 104.4 MiB. Git (17.3 natedev CPU s) and `models_registry.py` (6.8 s) stay the top commands. Checkpoint `0a5f1f853`.
 
-### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: todo
+### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: done
 **Depends on:** Phase 234
 
 #### Work Order

@@ -238,6 +238,10 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+        with mock.patch.dict(os.environ, self.env):
+            for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
+                _ = unit_config.write(worktree, unit_config.UnitConfig(
+                    unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
 
     def running(self) -> None:
         # Keep the per-test state and the fixed paths in Git worktree links.
@@ -250,8 +254,6 @@ class LifecycleFixture(unittest.TestCase):
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
             row = fixture_member("unit", name=name, parent=runner.id,
                                worktree=staff.PresentWorktree(remote.local_machine(), worktree))
-            _ = unit_config.write(worktree, unit_config.UnitConfig(
-                unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
             self.staff.pane(f"fixture:{name}", session_id=row.id, environment={
                 "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": name,
             })

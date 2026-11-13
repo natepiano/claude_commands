@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.agents import remote
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
@@ -12,13 +13,21 @@ from typing import ClassVar, override
 import unittest
 from unittest.mock import patch
 
+from scripts.lib import git_exclude
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.staff import StaffId
 
 
+@dataclass(frozen=True)
+class ParkedConfigBaseline:
+    live: bytes
+    parked: bytes
+
+
 class UnitConfigFixture(unittest.TestCase):
     repository_seed: ClassVar[Path]
+    parked_baselines: ClassVar[dict[unit_config.RepositoryTaploConfig | unit_config.DefaultTaploConfig, ParkedConfigBaseline]]
     root: Path = Path()
     home: Path = Path()
     worktree: Path = Path()
@@ -44,6 +53,7 @@ class UnitConfigFixture(unittest.TestCase):
             _ = builder.git("init", "-q", "--initial-branch=main")
             _ = builder.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                             "commit", "-q", "--allow-empty", "-m", "Initial commit")
+        cls.parked_baselines = {}
 
     @override
     def setUp(self) -> None:
@@ -77,8 +87,18 @@ class UnitConfigFixture(unittest.TestCase):
         return unit_config.RetiredSession("2026-10-31", "session-before-retire")
 
     def park_config(self) -> None:
-        _ = unit_config.write(self.worktree, self.config())
-        _ = unit_config.park(self.unit, self.worktree, self.retirement())
+        formatting = unit_config.repository_formatting(self.worktree)
+        if formatting not in self.parked_baselines:
+            _ = unit_config.write(self.worktree, self.config())
+            _ = unit_config.park(self.unit, self.worktree, self.retirement())
+            self.parked_baselines[formatting] = ParkedConfigBaseline(self.source.read_bytes(), self.parked.read_bytes())
+            return
+        baseline = self.parked_baselines[formatting]
+        git_exclude.ensure_excluded(self.worktree, "/.unit.toml")
+        for path, content in ((self.source, baseline.live), (self.parked, baseline.parked)):
+            if not path.exists() or path.read_bytes() != content:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_bytes(content)
 
     def file_versions(self) -> dict[Path, tuple[bytes, int]]:
         return {path: (path.read_bytes(), path.stat().st_mtime_ns)
