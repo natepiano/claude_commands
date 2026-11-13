@@ -1497,7 +1497,7 @@ class RebuildRowTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(Path(directory) / "needs")})))
 
     def settings(self) -> rebuild_row.RebuildSettings:
-        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60, 120)
+        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60, 120, 600)
 
     def answer(self, local: str, mac: str, expected: str = "/nix/store/main-system") -> str:
         def run(command: list[str]) -> str:
@@ -1536,20 +1536,22 @@ class RebuildRowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "statusline.conf"
             text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
-                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\n")
+                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\nrebuild.eval_retry_seconds=301\n")
             _ = path.write_text(text, encoding="utf-8")
             settings = rebuild_row.RebuildSettings.read(path)
-            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41))
-            _ = path.write_text(text.replace("interval=17", "interval=29").replace("eval_timeout=41", "eval_timeout=73"), encoding="utf-8")
+            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))
+            _ = path.write_text(text.replace("interval=17", "interval=29").replace("eval_timeout=41", "eval_timeout=73")
+                                .replace("eval_retry_seconds=301", "eval_retry_seconds=503"), encoding="utf-8")
             self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
             self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
+            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_retry_seconds, 503)
 
     def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
-                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.cache={cache}\n", encoding="utf-8")
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
             running = "/nix/store/old"
 
@@ -1624,7 +1626,7 @@ class RebuildRowTests(unittest.TestCase):
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
-                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=47\nrebuild.cache={cache}\n", encoding="utf-8")
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=47\nrebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
             commit = "a" * 40
             running = "/nix/store/old"
@@ -1658,51 +1660,83 @@ class RebuildRowTests(unittest.TestCase):
                                      ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
                     self.assertEqual(rebuild_row.read(config).row(), "")
 
-    def test_failed_eval_is_retried_for_the_commit_without_a_false_item(self) -> None:
+    def test_failed_eval_waits_for_a_retry_and_a_new_commit_bypasses_the_wait(self) -> None:
         for failure in ("timeout", "error", "empty natedev", "empty mac"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                config = Path(directory) / "statusline.conf"
-                cache = Path(directory) / "cache"
-                _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
-                    + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=59\n"
-                    + f"rebuild.cache={cache}\n", encoding="utf-8")
-                evaluated = 0
+            for changed in (False, True):
+                with self.subTest(failure=failure, changed=changed), tempfile.TemporaryDirectory() as directory:
+                    config = Path(directory) / "statusline.conf"
+                    cache = Path(directory) / "cache"
+                    _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                        + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=59\n"
+                        + f"rebuild.eval_retry_seconds=600\nrebuild.cache={cache}\n", encoding="utf-8")
+                    evaluated = 0
+                    commit = "a" * 40
+                    now = 1000.0
 
-                def run(command: list[str], *, timeout: int = 30) -> str:
-                    nonlocal evaluated
-                    if command[0] == "git":
-                        return "a" * 40
-                    if command[0] != "nix":
-                        return "/nix/store/old"
-                    evaluated += 1
-                    paths = {"natedev": "/nix/store/main", "mac": "/nix/store/main"}
-                    if evaluated == 1:
-                        if failure.startswith("empty"):
-                            paths[failure.removeprefix("empty ")] = ""
-                        else:
-                            effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
-                                      else subprocess.CompletedProcess(command, 1, "", "eval failed"))
-                            with patch.object(subprocess, "run", side_effect=[effect]) as process:
-                                output = rebuild_row.command_output(command, timeout=timeout)
-                            self.assertEqual(process.call_args.kwargs["timeout"], 59)
-                            return output
-                    return json.dumps(paths)
+                    def clock() -> float:
+                        return now
 
-                stale = rebuild_row.ExpectedSystems("a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "", "")
-                _ = cache.write_text("\n0\n" + str(config) + "\n" + stale.details() + "\n", encoding="utf-8")
-                rebuild_row.write(config, run)
-                self.assertEqual(evaluated, 1)
-                answer = rebuild_row.read(config)
-                self.assertIsInstance(answer.expected, rebuild_row.NoExpectedSystems)
-                self.assertEqual(answer.row(), {"empty natedev": "rebuild mac", "empty mac": "rebuild natedev"}.get(failure, ""))
-                lines = cache.read_text(encoding="utf-8").splitlines()
-                self.assertEqual(lines[3:], [])
-                lines[1] = "0"
-                _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                rebuild_row.write(config, run)
-                self.assertEqual(evaluated, 2)
-                self.assertIsInstance(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems)
-                self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev, rebuild mac")
+                    def run(command: list[str], *, timeout: int = 30) -> str:
+                        nonlocal evaluated, now
+                        if command[0] == "git":
+                            return commit
+                        if command[0] != "nix":
+                            return "/nix/store/old"
+                        evaluated += 1
+                        self.assertEqual(timeout, 59)
+                        self.assertIn(f"?rev={commit}", command[-1])
+                        paths = {"natedev": "/nix/store/main", "mac": "/nix/store/main"}
+                        if evaluated == 1:
+                            now += 59
+                            if failure.startswith("empty"):
+                                paths[failure.removeprefix("empty ")] = ""
+                            else:
+                                effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
+                                          else subprocess.CompletedProcess(command, 1, "", "eval failed"))
+                                with patch.object(subprocess, "run", side_effect=[effect]) as process:
+                                    output = rebuild_row.command_output(command, timeout=timeout)
+                                self.assertEqual(process.call_args.kwargs["timeout"], 59)
+                                return output
+                        return json.dumps(paths)
+
+                    stale = rebuild_row.ExpectedSystems(
+                        commit, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "", "")
+                    _ = cache.write_text("\n0\n" + str(config) + "\n" + stale.details() + "\n", encoding="utf-8")
+                    rebuild_row.write(config, run, clock=clock)
+                    self.assertEqual(evaluated, 1)
+                    answer = rebuild_row.read(config, clock=clock)
+                    self.assertIsInstance(answer.expected, rebuild_row.NoExpectedSystems)
+                    self.assertEqual(answer.failure, rebuild_row.EvaluationFailure(commit, stale.source, 1059))
+                    self.assertEqual(answer.row(), {
+                        "empty natedev": "rebuild mac", "empty mac": "rebuild natedev"}.get(failure, ""))
+                    # The cache retains the row, but never stores partial paths for reuse.
+                    details = cast(dict[str, object], json.loads(cache.read_text().splitlines()[3]))
+                    self.assertNotIn("natedev", details)
+                    self.assertNotIn("mac", details)
+                    for elapsed in (60, 120, 539):
+                        now = 1059 + elapsed
+                        commit = "" if elapsed == 120 else "a" * 40
+                        rebuild_row.write(config, run, clock=clock)
+                        delayed = rebuild_row.read(config, clock=clock)
+                        self.assertEqual(evaluated, 1)
+                        self.assertEqual(delayed.row(), answer.row())
+                        self.assertEqual(delayed.failure, answer.failure)
+                    if changed:
+                        commit = "b" * 40
+                        now = 1059 + 599
+                    else:
+                        now = 1059 + 600
+                    rebuild_row.write(config, run, clock=clock)
+                    self.assertEqual(evaluated, 2)
+                    success = rebuild_row.read(config, clock=clock)
+                    self.assertEqual(success.expected, rebuild_row.ExpectedSystems(
+                        commit, stale.source, "/nix/store/main", "/nix/store/main"))
+                    self.assertIsInstance(success.failure, rebuild_row.NoEvaluationFailure)
+                    self.assertNotIn("failed_at", cache.read_text())
+                    self.assertEqual(success.row(), "rebuild natedev, rebuild mac")
+                    now += 60
+                    rebuild_row.write(config, run, clock=clock)
+                    self.assertEqual(evaluated, 2)
 
     def test_open_needs_show_without_an_evaluation_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

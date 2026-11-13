@@ -78,7 +78,11 @@ The refresh compares running systems with `rebuild.ref` in `rebuild.repo`.
 It reuses an evaluation only when both machine paths are valid for the same commit and source.
 A timeout, error, or empty path leaves no reusable evaluation.
 Each valid machine path still supplies its current comparison when the other machine has no path.
-The next refresh evaluates that commit again.
+The cache records the failed commit, evaluation source, and failure time.
+`rebuild.eval_retry_seconds` sets a 600-second wait before another evaluation for that commit and source.
+Refreshes during this wait keep the cached row.
+A new commit or evaluation source bypasses the wait.
+A successful evaluation clears the failure record.
 `rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation time limit to 120 seconds.
 Other commands retain their 30-second limit.
 `rebuild.interval` sets the refresh interval to 60 seconds.
