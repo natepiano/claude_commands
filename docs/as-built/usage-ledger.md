@@ -7,6 +7,8 @@ Each request records token classes, model, effort, and the role held at that tim
 The same store records runs, phases, reviews, findings, checkpoints, compactions, readings, and account-role changes.
 Named SQL queries compare usage across roles, models, and outcomes.
 The assignment log preserves role history independently of temporary run folders.
+Staff supplies each worker's current role through `KnownWorkerRole` and `set_worker_role`.
+Live role readers do not use the agents log as a fallback.
 The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines the staff references in current run records.
 
 ## How it works
@@ -23,7 +25,7 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 - `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`.
   For a full id, it merges history under `agent_id[:8]` when that prefix is a recorded 8-hex id.
   Old worker lines under that prefix still count.
-  A worker reads `interactive` until `scripts/direct/claude_worker.py` records its dispatch role under the full id.
+  Historical attribution reads `interactive` until `scripts/direct/claude_worker.py` records its dispatch role under the full id.
 - CLI: `append`, `register --id --role`, `backfill [--archive] [--live]`, `show [--id]`. A write failure prints one `agents_log: <reason>` stderr line and exits 0.
 
 **Writers.**
@@ -34,13 +36,20 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/direct/claude_worker.py` | Records the dispatch role under the full destination id before delivery. A call without a role records nothing, so the session stays `interactive`. |
 | `scripts/direct/review.sh` | Records each fresh review session as `review` with its lens. |
+| `scripts/astra/astra_roles.py hold` | Records dated `impl` or `review` attribution when the log does not already show that assignment. Staff role changes do not control this write. |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
-The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives in `agents.jsonl`.
+The hook command is `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`.
+`settings.json` registers it under `hooks.SessionStart` and `hooks.SubagentStart`, with no `matcher`.
+`SessionStart` covers startup, resume, clear, and compact events.
+`SubagentStart` supplies the parent's `session_id` and the subagent's `agent_id` before its first request.
+`SessionStart` does not fire for a subagent.
+The log keeps each dated review lens for usage attribution.
+The roster reads the current review lens from dispatch evidence.
 
 `backfill` reads surviving run rosters through one staff snapshot.
 It resolves each entry's current session and worker name through staff.
-A worker name that belongs to `ROLES` supplies an approximate assignment at the roster file's modification time.
+The worker's known staff role supplies an approximate assignment at the roster file's modification time when it belongs to `ROLES`.
 A review assignment can take its lens from a matching review log.
 Active markers also recover director assignments.
 The importer skips ids with exact assignments and never repeats an `(id, role, lens)` tuple.
@@ -137,6 +146,50 @@ It identifies the source event in the history file, including a finding's title 
 - A `review` role with no lens is `lens_state = 'unrecorded'`.
 
 `reattribute` re-resolves every stored turn of the machine on every pass, so a late role-log line corrects earlier turns without adding rows. An `unreadable` role log leaves stored attribution as it was.
+
+### Command use
+
+`/command_use` runs `scripts/usage/command_use.py` on natedev.
+The report lists commands from the running checkout's `commands/**/*.md` tree.
+It lists commands without evidence first, then other commands by oldest last use.
+Rows contain the last use, user count, agent count, and first observed transcript use.
+The heading gives the oldest and newest dated evidence.
+
+The reader scans every local `.claude` and numbered `.claudeN` projects tree, including subagents and `.jsonl.zst` files.
+User entries with automation metadata count as agent uses; unmarked user entries count as user uses.
+Automation metadata includes `isMeta`, `isSidechain`, non-human `origin` or `source`, forwarded intent, and non-interactive entrypoints.
+Assistant `Skill` tool calls also count as agent uses.
+The prompt hook records launcher input in `~/.local/state/notify/auto-silence-events.jsonl` after it consumes the script prompt marker.
+The journal records the session, input hash, time, and source.
+The reader matches each journal entry to the nearest command within the time window, with the same session and input hash.
+If two entries have the same time difference, the reader selects the later entry.
+If metadata already marks the selected entry as an agent use, the journal entry changes no other entry.
+The window accepts transcript times before or after the recorded time because the hook can write its evidence later.
+`command_use_launcher_window_seconds` in `config/context_economy.conf` limits the match window to 30 seconds.
+Matching uses time order rather than transcript read order.
+Each journal entry applies to one submission.
+The report derives launcher attribution without changing the actor recorded in the transcript event.
+Herdr launch records and staff rows do not retain the input text.
+`add_unit` removes its pending opening record after submission.
+Restart and resume prose uses the script envelope; the transcript keeps this marker.
+The hook records prompt sources only for showrunners and unit directors.
+Other sessions, hook failures, and deleted hook records can leave launcher input without evidence.
+Unmarked input without retained evidence counts as user use.
+Only the `skillUsage` key enters the report from each account's `.claude.json`.
+The default home uses `~/.claude.json`; numbered homes use `~/.claudeN/.claude.json`.
+`lastUsedAt` extends the last-use date without inventing user counts, agent counts, or a first-use date.
+
+`command_use_events.sqlite3` keeps durable command events under `~/.cache/context_economy/`.
+`command_use.sqlite3` keeps the parse checkpoints in that folder.
+The checkpoint eviction budget excludes the durable events database.
+Each event uses its transcript entry UUID and command position as its identity.
+Entries without a UUID use the logical transcript path and a hash of the complete entry.
+Reparsing inserts only new identities, so trimming and checkpoint eviction preserve the counts and dates.
+The report reads the event store; the shared cache resumes appended files at the last complete line.
+The same database retains prompt source evidence after its journal disappears.
+The context-economy database remains separate.
+The first event-store read reparses available sources whose checkpoints contain only old aggregates.
+The reader moves event tables from the earlier combined database into the durable database once.
 
 ### The Mac half
 

@@ -83,7 +83,7 @@ class HeldRolePaneFixture:
         _ = case.enterContext(patch.object(design_roles, "_worker_command", side_effect=self.command))
         _ = case.enterContext(patch.object(design_roles, "_assign_command", side_effect=self.assign))
         _ = case.enterContext(patch.object(design_roles, "_recorder_command", side_effect=self.record))
-        design_roles.register_repository("private-repo", {"natedev": str(self.root)})
+        design_roles.register_repository("private-repo", {"natedev": design_roles.ConfiguredCheckout(str(self.root))})
         state_path = self.command_case.run_dir / "progress_history_state.json"
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         state["run_id"] = "held-role-private-run"

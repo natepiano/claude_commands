@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from typing import NamedTuple
 
 from scripts.production import session_staff, showrunners, staff
@@ -38,9 +39,10 @@ class UnitListing(NamedTuple):
 
 
 def read_units(production_name: str, *,
+               record: staff.StaffSnapshot | None = None,
                check: Callable[[int, str], session_staff.ReportProcessIdentity] | None = None) -> UnitListing:
     """Return staff units and every anomaly from this observation."""
-    record = staff.snapshot()
+    record = staff.snapshot() if record is None else record
     sources = unit_lookup.member_sources()
     metadata = unit_lookup.unit_metadata(record, name=production_name)
     for problem in metadata.problems:
@@ -62,7 +64,7 @@ def units_of(production_name: str) -> list[LiveUnit]:
 
 def _with_status(units: list[LiveUnit], rows: tuple[staff.StaffRow, ...], *,
                  record: staff.StaffSnapshot) -> list[LiveUnit]:
-    detached = session_state.running_detached_work(record)
+    detached = session_state.running_detached_work(replace(record, rows=rows))
     members = {row.name: row for row in rows}
     activities = {session["sessionId"]: session_state.LiveActivity(session.get("status", ""))
                   for session in sessions.running_sessions()}

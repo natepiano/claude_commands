@@ -4,9 +4,11 @@ description: Remove a command and its dedicated support.
 
 Find, classify, remove and report a command's full footprint.
 
-**Usage:** `/remove_command <command name>`
+**Usage:** `/remove_command <command name> [--dry-run]`
 
-1. **Inventory.** Read the command name from `$ARGUMENTS`.
+1. **Inventory.** Read the command name and optional `--dry-run` flag from `$ARGUMENTS`.
+   For a real run after a dry run, repeat the inventory; do not reuse the dry-run table.
+   The tree can change.
    Search the repository with `git grep -n -i --untracked` for every spelling.
    Also search the ignored local settings: `.claude/settings*.json` and `templates/settings*.json`.
    Include underscores, hyphens, a slash prefix and words with spaces.
@@ -34,11 +36,18 @@ Find, classify, remove and report a command's full footprint.
    | `permission` | An allow or deny rule in a settings file names the command or its files. | Never edit it. |
 
 3. **Report.** Show the caller a table before any deletion.
+   Put an impact summary above the table for every run. Include:
+
+   - the hit count for each class;
+   - each owner unit with its file count;
+   - the test modules that step 5 would run after a real removal;
+   - numbered steps for permission rules to remove by hand, with each rule's file, line and exact text.
+
    Include the path, line, class, action and owner for each hit.
-   Give the user a numbered step for each permission rule to remove by hand.
-   Include each rule's file, line and exact text.
    If the caller requests a board post, post a summary of at most 900 characters.
    Put the full table in the reply.
+   With `--dry-run`, state in the report that this is a dry run and nothing changed.
+   With `--dry-run`, stop after step 3: delete nothing, edit no file, run no test and send no morty notice.
 
 4. **Remove.** Delete the `dedicated` parts and remove the `embedded` parts.
    Resolve shared dependencies before you delete their config.

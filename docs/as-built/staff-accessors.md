@@ -33,6 +33,11 @@ A move can write the target home before start confirmation.
 The home alone does not prove a successful start.
 `member_account.repair_home` repairs it from a proved live process.
 
+`StaffRow.role` is `KnownWorkerRole(value)` or `WorkerRoleUnknown()`.
+`WorkerRole` accepts `impl`, `test`, `fix`, `review`, `astra-designer`, and `astra-reviewer`.
+Live worker readers use this staff field without a role-history fallback.
+Stored references keep the staff id and resolve current staff facts when used.
+
 ## Producer rows and commands
 
 Each producer runs its own named job.
@@ -121,6 +126,9 @@ The write functions are `ensure`, `ensure_worker`, `move`, `rename`, `retire`, a
 They also include `set_doc`, `set_worktree`, `update_current_session`, `set_hold`, `pause`, `exit`, and `resume`.
 `set_worker_role` writes the last dispatch role.
 `set_home` writes the selected or proved account home.
+`set_home(..., only_unknown=True)` completes only an unknown home.
+Its CLI form uses `--only-unknown`.
+The setter checks the current row inside the staff transaction, so a stale receipt cannot overwrite a recorded home.
 `progress_history.begin_dispatch` writes every dispatch role, including Astra policies.
 The shared pane launch builder uses `set_home`.
 `add_unit.ensure_staff_unit`, worker pane admission, and `staff_sources.ensure_staff_showrunner` complete earlier pane publications.
@@ -143,9 +151,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
-| `scripts/astra/astra_roles.py` | read | local_snapshot |
+| `scripts/astra/astra_roles.py` | write | local_snapshot, set_worker_role |
 | `scripts/astra/design_role_test_support.py` | read | CodexBackend |
-| `scripts/astra/design_roles.py` | read | runtime_id |
+| `scripts/astra/design_roles.py` | read | runtime_id, snapshot, by_id; resolves saved checkout owners through staff |
 | `scripts/bevy_upgrade/bevy_upgrade.py` | read | snapshot |
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
@@ -215,7 +223,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/nightly_review/candidates.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
 | `scripts/nix_env/heal.py` | read | initial_snapshot |
-| `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session |
+| `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session, set_home |
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
@@ -319,7 +327,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-186 accessor rows: 39 write, 146 read, 1 owner.
+191 accessor rows: 40 write, 150 read, 1 owner.
 
 ## Approved copies
 
