@@ -15,7 +15,7 @@ import fcntl
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from collections.abc import Generator
@@ -146,11 +146,16 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole,
         reason = f"{staff_id}: Astra hold has no worker staff row"
         print(f"anomaly: {reason}", file=sys.stderr)
         return HoldWorkerUnavailable(reason)
-    task_role = "review" if role == "reviewer" else "impl"
-    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                              member.current_session, datetime.now(timezone.utc))
-    if not isinstance(task, agents_log.Assignment) or task.role != task_role:
-        agents_log.append(member.current_session, task_role, None, datetime.now(timezone.utc))
+    current_role = staff.KnownWorkerRole("astra-reviewer" if role == "reviewer" else "astra-designer")
+    if member.role != current_role:
+        member = staff.set_worker_role(member.id, current_role)
+        membership = replace(membership, rows=tuple(member if row.id == member.id else row for row in membership.rows))
+    now = datetime.now(timezone.utc)
+    dated_role = "review" if role == "reviewer" else "impl"
+    previous = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                  member.current_session, now)
+    if not isinstance(previous, agents_log.Assignment) or (previous.role, previous.lens) != (dated_role, None):
+        agents_log.append(member.current_session, dated_role, None, now)
     held = HeldRole(role=role, staff_id=member.id, thread_id=member.current_session,
                     manager="", held_at=datetime.now(timezone.utc).isoformat(), lifetime=lifetime)
     record = _role_record(held)
@@ -192,12 +197,12 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
     if not isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend)) or parent is None:
         raise ValueError("Astra hold backend or parent is unavailable")
     role: AstraRole
-    task = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-                              member.current_session, datetime.now(timezone.utc))
     if fields.get("role_id") in ("designer", "reviewer"):
         role = cast(AstraRole, fields["role_id"])
-    elif isinstance(task, agents_log.Assignment) and task.role in ("impl", "review"):
-        role = "reviewer" if task.role == "review" else "designer"
+    elif isinstance(member.role, staff.KnownWorkerRole) and member.role.value in ("impl", "astra-designer"):
+        role = "designer"
+    elif isinstance(member.role, staff.KnownWorkerRole) and member.role.value in ("review", "astra-reviewer"):
+        role = "reviewer"
     else:
         raise ValueError("worker does not hold an Astra role")
     thread_id, manager = member.current_session, parent.current_session
