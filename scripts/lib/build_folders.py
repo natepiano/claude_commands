@@ -483,6 +483,26 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
+@contextmanager
+def collector_lease(path: Path) -> Generator[bool]:
+    """Hold a managed folder's lease lock while a collector judges and removes it.
+
+    Yield False when an owner holds the lease. A folder without a lock file has no lease.
+    """
+    with ExitStack() as stack:
+        try:
+            directory = stack.enter_context(_folder_parent(path, path.parent, create=False))
+            descriptor = _open_lock(path, directory, create=False)
+        except FileNotFoundError:
+            free = True
+        except (OSError, ValueError):
+            free = False
+        else:
+            _ = stack.callback(os.close, descriptor)
+            free = _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
+        yield free
+
+
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
                         dir_fd: int | None = None) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""

@@ -854,14 +854,22 @@ class TempFolderTests(TmpSweepCase):
     def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
         pairs: list[tuple[str, Path, Path]] = []
         parents: list[str] = []
+        requests: list[tuple[str, str]] = []
         for kind, template in build_folders.FOLDER_PREFIXES.items():
             parent = self.tmp.parent / "common-prefixes" / kind
             parent.mkdir(parents=True)
             parents.append(str(parent))
-            prefix = template.format(owner="123")
-            allocated = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                prefix, build_folders.ExplicitBuildParent(parent)))
-            previous = parent / (prefix + "Ab12Cd")
+            requests.append((template.format(owner="123"), str(parent)))
+        # Each run ends when the child exits, so its lease is free when the sweep starts.
+        code = ("import json, sys\nfrom pathlib import Path\nfrom scripts.lib import build_folders\n"
+                "for prefix, parent in json.loads(sys.argv[1]):\n"
+                "    print(build_folders.create_build_folder(build_folders.UniqueBuildFolder(\n"
+                "        prefix, build_folders.ExplicitBuildParent(Path(parent)))))\n")
+        child = subprocess.run([sys.executable, "-c", code, json.dumps(requests)], text=True, capture_output=True,
+                               check=True, cwd=Path(__file__).resolve().parents[2], timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        for kind, (prefix, _), line in zip(build_folders.FOLDER_PREFIXES, requests, child.stdout.splitlines(), strict=True):
+            allocated = Path(line)
+            previous = allocated.parent / (prefix + "Ab12Cd")
             previous.mkdir()
             _ = write(allocated / "Cargo.toml")
             _ = write(previous / "Cargo.toml")

@@ -22,7 +22,7 @@ from unittest import mock
 
 from scripts.copies import copies
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib import cargo_output, copy_record, scratch
+from scripts.lib import build_folders, cargo_output, copy_record, scratch
 from scripts.lint import sweep
 
 from scripts.lib import conf
@@ -707,6 +707,34 @@ print(scratch.target('gate:proof', 'tree', False))
         (path / copy_record.RECORD).unlink()
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
         self.assertFalse(scratch.busy_path(path).exists())
+
+    def test_a_held_lease_is_busy_for_judgment_and_removal(self) -> None:
+        request = build_folders.UniqueBuildFolder("leased-", build_folders.ExplicitBuildParent(self.base))
+        with build_folders.temporary_build_folder(request) as path:
+            for lock in (scratch.removal_lock, scratch.judgment_lock):
+                with self.subTest(lock=lock.__name__), lock(path) as idle:
+                    self.assertFalse(idle)
+            self.assertFalse(scratch.busy_path(path).exists())
+            self.assertEqual(build_folders.build_folder_state(path), "held")
+
+    def test_removal_holds_a_free_lease_until_it_ends(self) -> None:
+        path = self.base / "free-lease"
+        path.mkdir()
+        lease_lock = path.with_name(path.name + ".lock")
+        lease_lock.touch()
+        with scratch.removal_lock(path) as idle:
+            self.assertTrue(idle)
+            with lease_lock.open("a") as allocator, self.assertRaises(BlockingIOError):
+                fcntl.flock(allocator, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        self.assertEqual(build_folders.build_folder_state(path), "free")
+
+    def test_judgment_of_an_unmanaged_folder_creates_no_lease_lock(self) -> None:
+        path = self.base / "unmanaged"
+        path.mkdir()
+        with scratch.judgment_lock(path) as idle:
+            self.assertTrue(idle)
+        self.assertEqual(sorted(entry.name for entry in self.base.iterdir() if entry.name.startswith("unmanaged")),
+                         ["unmanaged"])
 
     def test_removal_claims_an_absent_busy_mark_before_a_late_holder_can_start(self) -> None:
         path = self.copy()

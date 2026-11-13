@@ -431,6 +431,18 @@ class FolderAuditTests(unittest.TestCase):
         for path in (used, held, listening, busy):
             self.assertTrue((path / "checkout" / "target" / "build").exists(), path)
 
+    def test_a_held_lease_keeps_a_clone_that_has_no_busy_mark(self) -> None:
+        clone = self.clone_folder("leased-clone", 3)
+        lock = clone.with_name(clone.name + ".lock")
+        with lock.open("a") as owner:
+            fcntl.flock(owner, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            outcomes = self.judge_clones([clone], mac=True, free_space=0)
+        self.assertEqual(outcomes[clone], scratch.BUSY_REASON)
+        self.assertTrue((clone / "checkout" / "target" / "build").exists())
+        outcomes = self.judge_clones([clone], mac=True, free_space=0)
+        self.assertEqual(outcomes[clone], folder_audit.REMOVED)
+        self.assertFalse(clone.exists())
+
     def test_config_failure_keeps_an_active_hold_and_its_clone(self) -> None:
         clone = self.clone_folder("config-held", 3)
         _ = scratch.hold(clone, "gate:keep-config-held", "keep the clone")

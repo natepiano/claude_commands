@@ -82,7 +82,7 @@ from typing import TypedDict, cast
 from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, inherited_temporary_parent  # noqa: E402
+from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -94,6 +94,7 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY = ".claude-busy"
+BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
 CACHE_TAG = "CACHEDIR.TAG"
@@ -339,16 +340,17 @@ def directory_record_lock(path: Path, *, wait: bool,
 
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
-    """Claim the busy mark even when absent, and hold it through removal."""
-    with busy_locks(path, create=True) as idle:
-        yield idle
+    """Claim the lease lock and the busy mark, even when absent, and hold them through removal.
+    A held lease is busy, and the busy mark is then not created."""
+    with collector_lease(path) as free, busy_locks(path, create=free) as idle:
+        yield free and idle
 
 
 @contextmanager
 def judgment_lock(path: Path) -> Generator[bool]:
-    """Check existing busy marks without creating metadata during a scan or dry run."""
-    with busy_locks(path, create=False) as idle:
-        yield idle
+    """Check the lease lock and existing busy marks without creating metadata during a scan or dry run."""
+    with collector_lease(path) as free, busy_locks(path, create=False) as idle:
+        yield free and idle
 
 
 @contextmanager
@@ -950,7 +952,7 @@ def lifetime(path: Path, now: float | None = None, *,
 ) -> Live | Ended | Unknown:
     with judgment_lock(path) as idle:
         if not idle:
-            return Live("busy: .claude-busy is locked")
+            return Live(BUSY_REASON)
     return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings)
 
 

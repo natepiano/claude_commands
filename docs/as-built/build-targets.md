@@ -469,6 +469,10 @@ Holders create `.claude-busy` and use a shared flock for the whole run. Judges a
 `targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
 Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
 They create the mark when absent and retain it through deletion.
+A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
+`scratch.removal_lock` and `scratch.judgment_lock` first take its lease lock without waiting and hold it through judgment and deletion.
+A held lease is busy, even when no busy mark is held. The collector then creates no busy mark.
+Every collector that uses these locks (scratch end, the folder audit, the tmp sweep, the floor sweep and copy removal) gets this guard.
  A holder checks the present mark and removal evidence before it starts work. Shared holders can run together; a process exit releases its lock. Hana can set the same mark in a target with `flock`, without importing these scripts. `scratch.py hand-over <path> --to <unit> --task <new-task>` replaces owner and the complete task atomically and keeps the path, so child alternates and recovery records retain valid paths. One task-field function clears the old end evidence, run directory, phase id and land target; a phase hand-over supplies `--run-dir` and derives its phase id from the new task, and a landed task can supply `--land-target`.
 
 Scratch end rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
