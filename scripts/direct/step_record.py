@@ -33,6 +33,7 @@ COMMAND_ARGUMENTS: dict[str, tuple[tuple[str, bool, str, tuple[str, ...]], ...]]
         + tuple(("--" + name, False, "", ()) for name in
                 ("package", "reason", "eligible-targets", "mac-targets", "mac-disk-exclusions", "pinned-target")),
     "stopped": (("--call-id", True, "", ()), ("--consumed", True, "", ())),
+    "disk-exclusions": (("--call-id", True, "", ()), ("--targets", True, "", ())),
 }
 
 
@@ -41,7 +42,7 @@ class UseArgumentParser:
 
 
 def parse_light_cli(arguments: list[str]) -> dict[str, str] | UseArgumentParser:
-    if not arguments or arguments[0] not in ("write", "stopped"):
+    if not arguments or arguments[0] not in ("write", "stopped", "disk-exclusions"):
         return UseArgumentParser()
     verb = arguments[0]
     rules = COMMAND_ARGUMENTS[verb]
@@ -90,6 +91,15 @@ def execute_cli(args: dict[str, str]) -> int:
         call_id = args["call_id"]
         if command == "stopped":
             return 0 if consume_stopped_build(call_id, Path(args["consumed"])) else 1
+        elif command == "disk-exclusions":
+            expected = sys.stdin.read()
+            path = record_path(call_id)
+            if path.read_text() != expected:
+                raise ValueError("record missing or changed")
+            row = validated_fields(cast(object, json.loads(expected)), call_id)
+            row["mac_disk_exclusions"] = list(filter(None, args["targets"].split(",")))
+            write_fields(call_id, row)
+            print(path.read_text(), end="")
         else:
             pid, kind, location = int(args["pid"]), args["kind"], args["runs_on"]
             if kind not in KINDS or location not in ("any_target", "natedev_only"):
@@ -300,6 +310,7 @@ def package_name(value: PackageSelection) -> str:
 
 
 def mac_eligible(record: StepRecord) -> bool:
+    """Read fixed Mac permission without using diagnostic disk exclusions."""
     return isinstance(record.runs_on, AnyTarget) and bool(record.runs_on.mac_targets)
 
 

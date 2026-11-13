@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
 import io
 import os
+import re
 from collections import Counter
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -147,6 +149,91 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
             "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+
+    def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
+        baseline = reservation_reading()
+        reading = with_converted_executions(baseline)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            page = memory_feed.reading()
+        remote = [row for row in page["walk"] if "used" in row and "counted" in row and "reserved" in row and row.get("machine") in
+                  ("fixture-mac", "fixture-ssh", "uncertain-mac")]
+        self.assertEqual(len(remote), 3)
+        self.assertEqual({row.get("machine") for row in remote}, {"fixture-mac", "fixture-ssh", "uncertain-mac"})
+        self.assertTrue(all(row["counted"] == 0 and row["reserved"] == 0 for row in remote))
+        self.assertTrue(all(isinstance(row["used"], admission_records.RunUseUnavailable) for row in remote))
+        uncertain, = [row for row in remote if row.get("machine") == "uncertain-mac"]
+        self.assertIsInstance(uncertain["pid"], admission_records.PidNotRecorded)
+        self.assertEqual(uncertain["state"], "uncertain")
+        self.assertEqual(reading.explanation.room, baseline.explanation.room)
+
+    def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
+        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(os, "cpu_count", return_value=4)):
+            page = memory_feed.reading()
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        html = self.expected_page()
+        functions = html[html.index("const TIPS ="):html.index("const tip =")]
+        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
+        escape = html[html.index("function esc("):html.index("let lastRead =")]
+        javascript = functions + constants + render + escape + """
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, {style:{}, classList:{toggle(){}}, innerHTML:""});
+  return elements.get(id);
+};
+function fitLabels() {}
+const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+renderWalk(data);
+process.stdout.write(JSON.stringify({
+  walk:data.walk.map((row,index)=>tipText('row:'+index,data)),
+  waiters:data.waiters.map((row,index)=>tipText('wait:'+index,data)),
+  table:$("walk").innerHTML}));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload), text=True,
+            capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered = cast(dict[str, object], json.loads(result.stdout))
+        tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
+        table = cast(str, rendered["table"])
+        matches = cast(list[tuple[str, str, str]],
+            re.findall(r'<tr[^>]*data-tip="(row|wait):([0-9]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
+        cells = {f"{kind}:{index}": body for kind, index, body in matches}
+        for collection, kind in (("walk", "row"), ("waiters", "wait")):
+            rows = cast(list[dict[str, object]], payload[collection])
+            local_position = 0
+            for index, row in enumerate(rows):
+                if kind == "row" and not (row.get("queued") or row.get("kind") == "cloud"):
+                    continue
+                if kind == "wait" and row.get("kind") != "cloud":
+                    local_position += 1
+                with self.subTest(kind=kind, pid=row["pid"]):
+                    text = "\n".join(tips[collection][index])
+                    cell = cells[f"{kind}:{index}"]
+                    progress = cast(dict[str, object], row.get("progress", {}))
+                    place = (str(progress.get("phase", "—")) if kind == "row" else
+                             "cloud" if row.get("kind") == "cloud" else str(local_position))
+                    self.assertIn(f'<td class="place">{place}</td>', cell)
+                    self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
+                    machine = str(row.get("machine") or "")
+                    self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
+                    if kind == "wait":
+                        self.assertEqual(machine, "")
+                    else:
+                        self.assertTrue(machine)
+                    cpus = row.get("vcpus")
+                    shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
+                    self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
+                    unit = str(row["unit"])
+                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
+                    self.assertIn(str(row["name"]), text)
+                    if row.get("kind") == "cloud":
+                        self.assertIn("No local memory reservation.", text)
+                        self.assertIn(str(row.get("status") or row.get("reason")), text)
+                        if kind == "row":
+                            self.assertIn(f"Machine: {machine}.", text)
 
     def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
         cgroup = self.root / "ci"

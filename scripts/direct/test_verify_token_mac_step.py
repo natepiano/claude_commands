@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import unittest
 
+from scripts.build_queue import admission_client, admission_protocol as wire, placement
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, RUNNER_STUB, VERIFY
@@ -108,13 +110,17 @@ exec bash "$TEST_REAL_BOARD" "$@"
             self.assertTrue((self.runner_state / "mac-stage-claim").exists())
         claims = list((Path(self.environment["MAC_TEST_STATE_DIR"]) / "claims").glob("*.json"))
         self.assertEqual([(path.name, path.read_text()) for path in claims], [])
-        self.assertTrue((self.root / "route-events").exists())
-        self.assertIn('"command": "reserve"', (self.root / "route-events").read_text())
+        events = self.root / "route-events"
+        if after_mac:
+            self.assertTrue(events.exists())
+            self.assertIn('"command": "reserve"', events.read_text())
+        else:
+            self.assertNotIn('"command": "reserve"', events.read_text() if events.exists() else "")
         self.release_peer_token()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
 
-    def test_initial_mac_reservation_ends_before_local_mend_waits_for_the_token(self) -> None:
+    def test_local_mend_fix_waits_for_the_token_without_a_mac_reservation(self) -> None:
         self.assert_local_token_wait_has_no_mac_claim(after_mac=False)
 
     def test_mac_stage_releases_its_claim_before_local_fmt_waits_for_the_token(self) -> None:
@@ -133,7 +139,22 @@ exec bash "$TEST_REAL_BOARD" "$@"
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
         })
-        return self.hold_memory()
+        meminfo = self.hold_memory()
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        controls.set_host("mac", placement.TemporaryExclusion("busy"))
+        reply_filter = admission.server.reply_filter
+
+        def release_provider(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait):
+                for path in Path(self.environment["TMPDIR"]).glob("verify-hold.*/placement-*.json.wait"):
+                    notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
+                    if isinstance(notice.last_reply, wire.Wait):
+                        _ = controls.hosts.pop("mac", None)
+            return reply_filter(reply)
+
+        admission.server.reply_filter = release_provider
+        return meminfo
 
     def test_local_fmt_takes_the_token_after_a_memory_wait_leaves_for_the_mac(self) -> None:
         _ = self.prepare_memory_lint()
@@ -143,7 +164,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("waiting for memory", output + errors)
         self.assertIn("leaving the memory wait", output + errors)
-        self.assertIn("Mac attempt ended (passed); waiting 180 s", output + errors)
+        self.assertNotIn("waiting 180 s", output + errors)
         runners = self.runner_events()
         self.assertEqual(len(runners), 1)
         self.assertFalse(runners[0]["token_held"])
@@ -165,20 +186,20 @@ exec bash "$TEST_REAL_BOARD" "$@"
             mac_test.RecordedSession("assembly-session", "assembly"), mac_test.NO_SHOWRUNNER,
             "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED)
         mac_test.write_block(state / "block.json", block)
-        probe = self.root / "blocked-free-now.py"
-        _ = probe.write_text(
-            "import os, subprocess, sys\nfrom pathlib import Path\n"
-            + "result = subprocess.run([sys.executable, os.environ['TEST_REAL_FREE_NOW'], *sys.argv[1:]], check=False)\n"
-            + "observed = Path(os.environ['TEST_BLOCK_PROBE'])\n"
-            + "pending = observed.with_suffix('.pending')\n"
-            + "pending.write_text(str(result.returncode))\n"
-            + "pending.replace(observed)\n"
-            + "raise SystemExit(result.returncode)\n")
         observed = self.runner_state / "block-probe"
-        process = self.start_verify("lint", "--check", "--no-cache", extra={
-            "VERIFY_MAC_TEST_SCRIPT": str(probe),
-            "TEST_REAL_FREE_NOW": str(Path(mac_test.__file__)), "TEST_BLOCK_PROBE": str(observed),
-        })
+        admission = caller_admission(self, self.root, self.environment)
+        provider = admission.server.host_probe
+
+        def observe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            evidence = provider(key)
+            if key.destination.provider == "mac" and isinstance(evidence, placement.FreshHostEvidence):
+                pending = observed.with_suffix(".pending")
+                _ = pending.write_text(str(int(not isinstance(evidence.eligibility, placement.AllowedHost))))
+                _ = pending.replace(observed)
+            return evidence
+
+        admission.server.host_probe = observe
+        process = self.start_verify("lint", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(observed, (process,))
         self.assertEqual(observed.read_text(), "1")

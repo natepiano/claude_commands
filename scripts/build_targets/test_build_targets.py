@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
@@ -27,7 +28,7 @@ from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold
 from scripts.mac_test import claim_state, mac_test, offload
-from scripts.build_targets import targets
+from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
 from scripts.message import session_send
@@ -68,6 +69,36 @@ def setUpModule() -> None:
 
 
 class FolderInvocationTests(NotificationGuardedTestCase):
+    def test_recovery_probe_children_are_reaped_after_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = target_config.SshTarget("linux", "linux", root / "linux.conf")
+            completed = threading.Event()
+            children: list[int] = []
+            real_spawn = os.posix_spawn
+            real_waitpid = os.waitpid
+
+            def spawn(_program: str, _arguments: list[str], environment: dict[str, str], *,
+                      setsid: bool, file_actions: tuple[tuple[int, int, int], ...]) -> int:
+                pid = real_spawn(sys.executable, [sys.executable, "-c", "pass"], environment,
+                                 setsid=setsid, file_actions=file_actions)
+                children.append(pid)
+                return pid
+
+            def reap(pid: int, options: int) -> tuple[int, int]:
+                result = real_waitpid(pid, options)
+                completed.set()
+                return result
+
+            with mock.patch.object(offload, "state_directory", return_value=root), \
+                 mock.patch.object(os, "posix_spawn", side_effect=spawn), \
+                 mock.patch.object(os, "waitpid", side_effect=reap):
+                build_targets.start_probe_recovery(target, root, "sample", "test")
+                self.assertTrue(completed.wait(5), "the service did not reap its recovery child")
+            self.assertEqual(len(children), 1)
+            with self.assertRaises(ChildProcessError):
+                _ = real_waitpid(children[0], os.WNOHANG)
+
     def test_verify_commands_open_each_config_once(self) -> None:
         code = """import io, json, os, runpy, sys
 from contextlib import redirect_stdout
@@ -1216,21 +1247,26 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             10, "natedev is held by hana for render checks; launch after the release.\n", "",
         ))
         proc = self.root / "proc"
-        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+        for pid, parent in ((10, 1), (20, 10), (30, 1), (40, 1), (50, 1)):
             directory = proc / str(pid)
             directory.mkdir(parents=True)
             fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
             _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW,
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("kept-session", "peer"),
                                   "peer checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(40, "4000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         for pid, session, owns_hold, admitted in (
             (10, "other-session", False, True),
             (20, "other-session", False, True),
             (30, "other-session", False, False),
+            (40, "other-session", False, False),
+            (50, "other-session", False, False),
             (10, "", False, True),
             (30, "owned-session", True, False),
         ):
