@@ -3671,38 +3671,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 243 — The rename tests reuse their restored fixture state  · status: todo
-**Depends on:** Phase 236
+### Phase 243 — The rename tests reuse their restored fixture state  · status: done
+**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** Phase 236 profile; sdlc owner go 2026-11-13 14:45 and 15:05 (start on the Phase 236 checkpoint). `FolderRenameTests.test_rename_finishes_a_pending_folder_move_before_renaming_its_folder_and_branch` (`test_shutdown_cli.py:3437`) costs 16.6 natedev CPU s: it restores the fixture and runs real Git moves for 7 interruption points. `UnitRenameTests` identity tests (`:3121`, `:3174`) cost 9.9 s.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Find what each restore and each interruption point repeats that the subtest does not check. Build that state once and copy it per subtest, as Phase 236 did for the retired and resume states. Keep each of the 7 interruption points and its real Git move, branch rename and staff publication. A copy must hold no path into the seed.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/agents/test_shutdown_cli.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 236: class snapshots at fixed roots; `restore_repository` registers the destination removal before the copy (finding F001).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- Folded into Phase 252; no separate checkpoint. The change binds `RUN_ROOT` and `FORMER_RUN_ROOT` to each rename fixture root in `agents/test_shutdown_cli.py`.
+- natedev module CPU 81.5 -> 37.8 s: the rename fixtures read 422,583 live run JSON files on the host. aws pairs 34.319 -> 34.423 CPU s, peak 224.5 -> 227.1 MiB: the aws host has no live run folders, so no gain.
+- The finding is a test-isolation defect; Phase 252 owns the fix for every module.
 
 ### Phase 244 — The verify wait holder tests start fewer recorder and target helpers  · status: todo
 **Depends on:** none
@@ -3788,38 +3764,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 248 — The verify SSH routing tests do less repeated work  · status: todo
+### Phase 248 — The verify SSH routing tests do less repeated work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_ssh_targets_routing.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** Gate median CPU 48.4 s. sdlc owner go 2026-11-13 15:35, profile first.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD direct/test_verify_ssh_targets_routing.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/direct/test_verify_ssh_targets_routing.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- Profile only; no source change. The fixture already copies a class seed at fixed paths; class setup 0.09 CPU s and all per-test setup 0.29 s: 0.56% of the suite.
+- Module 50.3 natedev CPU s, 4,355 processes: real `verify.sh` routing runs. `build_targets.py` 49 starts 7.8 s, `python3 -c` 40 starts 3.0 s, `verify_helper.py` 17 starts 2.6 s, `build_folders.py` 46 starts 2.5 s, `detached_runs.py` 17 starts 2.0 s.
+- Top test `pinned_target_refusal_keeps_the_reason_and_never_runs_locally` 10.1 s runs four real refusals, about 2.5 CPU s each. Architecture proposal to sdlc: a verify refusal costs about 2.5 CPU s in helper starts.
 
 ### Phase 249 — The bulk run tests do less repeated work  · status: todo
 **Depends on:** none
@@ -3897,7 +3849,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - 96 tests and 589 assertions unchanged; two blind reviews approve with no findings. Checkpoint 536f8eb74.
 
 ### Phase 252 — Tests never reach the real unit run roots  · status: todo
-**Depends on:** Phase 243
+**Depends on:** none
 
 #### Work Order
 
@@ -3932,7 +3884,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Constraints from prior phases:**
 - Phase 232: no signal handlers anywhere.
-- Phase 243: `bind_rename_run_roots` binds `RUN_ROOT` and `FORMER_RUN_ROOT` for three rename classes; this phase replaces it.
+- Phase 243 is folded into this phase. `scripts/agents/test_shutdown_cli.py` holds its uncommitted change (SHA-256 06d351b53e4bb9afa1c3e9ca4590921bd965fcae517433da7154f93243ce9f6c): `bind_rename_run_roots` binds `RUN_ROOT` and `FORMER_RUN_ROOT` for three rename classes. Build on it; replace the helper with the shared one. Evidence: `phases/243/impl4/`. Its aws pairs show no gain (34.319 -> 34.423 CPU s): the aws host has no live run folders. The 81.5 -> 37.8 natedev gain is the host's live run folders. So this phase is a correctness fix.
 - Phases 236, 237, 251: register each cleanup before the step that can leave partial state.
 - sdlc terms: test and test-support files only; every test and assertion stays. A correctness fix needs no aws gain; report the aws pairs for changed modules.
 
