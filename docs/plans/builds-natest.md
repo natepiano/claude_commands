@@ -3492,36 +3492,13 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Audit only; no code change. `run_with_descendant_cleanup()` blocks SIGTERM, SIGINT, SIGHUP and SIGCHLD at `module_run.py:580` by design, so `signalfd` can read them. Its sole caller (`:664`) has no catch, so a `signalfd`, `pidfd_open` or `prctl` error ends the process. The test child restores SIGCHLD and the previous mask at `:607-608` before `main()`; parent loss kills it with SIGKILL. The supervisor restores the mask at `:659` before `sys.exit`; signal termination exits through `:653-658`. No path keeps a process running with the mask blocked. `test_module_run.py` (24), `test_module_cost.py` (10) and `test_merge_gate_suites_signals.py` (12) pass; basedpyright clean.
 
-### Phase 225 — Change review tests prove contention without fresh interpreters  · status: todo
+### Phase 225 — Change review tests prove contention without fresh interpreters  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_change_review.py` costs less CPU in aws pairs, with its list-lock and numbering proofs kept.
-
-**Decision:** sdlc freed the module for speed work (2026-11-12) and gave the go. Base: main `015832dfe` (fix-rounds `f25163b78` rows), merged at `41622ad5b`. Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on the module. Work the slowest cases first.
-2. `test_two_readiness_calls_share_the_list_lock_without_duplicate_rows` (`:1377`): today the parent releases its directory lock at `:1387` (`os.close`) before the children import, so no contention is proven. Add a deterministic contention event: the parent holds the list lock until both children wait on it.
-3. The readiness case (`:1377`, 2 children) and the eight-add case (8 children across two lists; Phase 168 found it at `:1636`, so find its current line) may fork in place of a fresh interpreter. Each child closes inherited parent lock descriptors before contention, keeps its own output capture, environment and intended patches, and does not inherit unrelated parent patches. Keep process-group cleanup.
-4. Content cases that start the CLI only to read its result may call it in process through `invoke_cli` (`scripts/production/cli_fixture.py:84`). Keep one fresh CLI case for each entry point.
-5. Keep every test and assertion. Change no shared support file; if a helper cannot serve a case, report the case and stop.
-6. Run the module, its importers and basedpyright on each changed file.
-
-**Files:**
-- `scripts/production/test_change_review.py`
-
-**Workers:** 1 writer; one test file.
-- impl: the test file.
-
-**Constraints from prior phases:**
-- Phase 168: fork estimates at `8d1005406`: eight adds 1.994 CPU s, readiness 0.501 CPU s (children × (start + entry import); fork and cleanup not subtracted). Entry import 0.22 s.
-- Phase 214: in-process launch reads carry `MODELS_CONFIG_TIER_ONLY=1`, so no catalog sync starts.
-
-**Acceptance gate:**
-- Contention is proven; all tests and assertions remain; importers pass; basedpyright clean.
-- aws pairs show a gain; sdlc sees the diff before land.
+- `scripts/production/test_change_review.py`: the lock readiness case (`:1393`) uses two forked children, not fresh interpreters. The parent keeps the list lock until both children report a failed nonblocking lock attempt. The eight-add numbering case keeps one fresh CLI process (`:1724`) and seven forked processes. Each fork closes inherited lock descriptors and keeps process-group cleanup. All 136 tests and 545 assertions are unchanged.
+- AWS paired trial (3 rounds): CPU 16.32 → 14.38 s; median peak 156.3 → 147.2 MiB. Local 13.73 → 9.50 s. Checkpoint `2cc7b7d02`.
 
 ### Phase 226 — Workers and claims tests share one in-process launch fixture  · status: todo
 **Depends on:** none
