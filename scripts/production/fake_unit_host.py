@@ -128,6 +128,13 @@ def _write_children(root: Path) -> None:
 
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
             session: int | None = None, cwd: Path | None = None) -> None:
+    _write_process(env, pid, parent, argv, marks, started=started, session=session, cwd=cwd)
+    _write_children(Path(env["HERDR_PROC"]))
+
+
+def _write_process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *,
+                   started: str = "1", session: int | None = None, cwd: Path | None = None) -> None:
+    """Write one process; the caller updates the child lists after its last write."""
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
     _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} {pid} {session or pid} 0 {session or pid} " + "0 " * 13 + started)
@@ -137,7 +144,6 @@ def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], 
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
     _ = (directory / "cgroup").write_text("")
-    _write_children(directory.parent)
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
@@ -154,7 +160,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
     sessions: list[dict[str, object]] = []
     for name, panes in by_session.items():
         server = shells[(name, panes[0].pane)] - 1
-        process(env, server, 0, ["herdr", "--session", name, "server"], {})
+        _write_process(env, server, 0, ["herdr", "--session", name, "server"], {})
         herdr_listener(Path(env["HERDR_PROC"]), server, name, env)
         sessions.append({"name": name, "running": True, "default": False,
                          "session_dir": "/fixture", "socket_path": "/fixture/socket"})
@@ -164,7 +170,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             {"pane_id": pane.pane, "label": pane.label or None} for pane in panes]}})}
         for unit in panes:
             shell = shells[(name, unit.pane)]
-            process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
+            _write_process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
                 "code": 0, "stdout": json.dumps({"result": {"process_info": {
                     "shell_pid": shell, "foreground_process_group_id": shell,
@@ -176,6 +182,7 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
                     for ansi in ("", " --format ansi"):
                         responses[f"--session {name} pane read {unit.pane} --source {source} --lines {lines}{ansi}"] = {
                             "code": 0, "stdout": unit.screen}
+    _write_children(Path(env["HERDR_PROC"]))
     responses["--session default session list --json"] = {"code": 0, "stdout": json.dumps({"sessions": sessions})}
     before_close = {command: dict(response) for command, response in responses.items()}
     for unit in units:
@@ -215,12 +222,12 @@ def place_process(env: Mapping[str, str], pid: int, pane: str, *, session: str =
         raise AssertionError(f"expected one hosted pane {session}:{pane}, found {len(matches)}")
     directory, marks = matches[0]
     parent = int((directory / "stat").read_text().split()[3]) if exec_shell else int(directory.name)
-    process(env, pid, parent, ["claude"], marks)
+    _write_process(env, pid, parent, ["claude"], marks)
     pane_foreground(env, marks["HERDR_SESSION"], pane, pid if exec_shell else int(directory.name), pid, "claude")
     if exec_shell:
         # Generic launch fixtures use exec; pane-shell scenarios keep both processes.
         shutil.rmtree(directory)
-        _write_children(directory.parent)
+    _write_children(directory.parent)
 
 
 def calls(env: Mapping[str, str]) -> list[list[str]]:
