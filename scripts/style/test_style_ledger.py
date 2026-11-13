@@ -20,8 +20,10 @@ from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import IO, cast, final
 from unittest import mock
-from scripts.style import rules
+from scripts.style import rules, candidate_generators
 from scripts.style import style_ledger
+from scripts.style.refill_facts import RefillFacts
+from scripts.style.refill_inputs import RefillInputs
 from scripts.style.approved_renames import AppliedInCode
 
 
@@ -136,6 +138,24 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         invalid_tip = self.commit("Invalid source encoding")
         with self.ledger() as ledger, self.assertRaises(UnicodeDecodeError):
             _ = ledger.line_counts(invalid_tip, ("invalid-lines.txt",))
+
+        with self.ledger() as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            facts = RefillFacts(connection, str(self.repo / ".git"), "inventory")
+            inputs = RefillInputs(self.repo, tree, facts)
+            self.assertEqual(inputs.entries, inventory)
+            connection.commit()
+            with mock.patch.object(RefillInputs, "read_trees", side_effect=AssertionError("unchanged subtree")):
+                self.assertEqual(RefillInputs(self.repo, tree, facts).entries, inventory)
+            object_path = self.git("rev-parse", "--git-path", f"objects/{tree[:2]}/{tree[2:]}")
+            tree_file = self.repo / object_path
+            content = tree_file.read_bytes()
+            tree_file.unlink()
+            try:
+                with self.assertRaises(style_ledger.GitReadFailed):
+                    _ = RefillInputs(self.repo, tree, facts)
+            finally:
+                _ = tree_file.write_bytes(content)
+            self.assertEqual(RefillInputs(self.repo, tree, facts).entries, inventory)
 
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")
@@ -355,6 +375,32 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertEqual(upgraded.ticket_base("10"), self.initial_tip)
                     self.assertEqual(len(upgraded.ticket_open(ticket_owner_id("names"))), 2)
         self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
+
+        for route in ("sql", "ledger"):
+            with self.subTest(candidate_migration=route):
+                database = self.root / f"phase-one-{route}.sqlite"
+                with closing(sqlite3.connect(database)) as connection:
+                    for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                        if number <= 40:
+                            _ = connection.executescript(migration)
+                    _ = connection.execute("INSERT INTO refill_objects VALUES ('store','blob',1,'line_count','',7)")
+                    _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+                    _ = connection.execute("INSERT INTO schema_version VALUES (40)")
+                    connection.commit()
+                    if route == "sql":
+                        _ = connection.executescript(style_ledger.MIGRATIONS[41])
+                if route == "ledger":
+                    with style_ledger.Ledger(self.repo, database):
+                        pass
+                with closing(sqlite3.connect(database)) as connection, closing(sqlite3.connect(":memory:")) as fresh:
+                    for _, migration in sorted(style_ledger.MIGRATIONS.items()):
+                        _ = fresh.executescript(migration)
+                    query = "SELECT name,sql FROM sqlite_master WHERE name LIKE 'refill_%' ORDER BY name"
+                    schema_rows = cast(list[tuple[str, str]], connection.execute(query).fetchall())
+                    self.assertEqual(schema_rows, cast(list[tuple[str, str]], fresh.execute(query).fetchall()))
+                    counts = cast(list[tuple[int]], connection.execute(
+                        "SELECT line_count FROM refill_objects WHERE fact_kind='line_count'").fetchall())
+                    self.assertEqual(counts, [(7,)])
 
     def pipeline_tickets(self) -> tuple[style_ledger.Ledger, str, str]:
         rule = self.rule("pipeline")
@@ -2010,6 +2056,16 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
         self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
+
+        self.write("README.md", "Advance the migrated listed view\n")
+        changed_tip = self.commit("Advance listed inputs")
+        with self.ledger() as refreshed:
+            refreshed.set_tip(changed_tip)
+            self.assertEqual({site.path for site in refreshed.listed_sites(listed)}, set(self.sources))
+        with self.ledger() as refreshed, mock.patch.object(
+            candidate_generators, "enumerate_candidates", side_effect=AssertionError("unchanged generator")
+        ):
+            self.assertEqual({site.path for site in refreshed.listed_sites(listed)}, set(self.sources))
 
     def test_rust_files_exposes_the_synced_universe_even_with_only_crate_rules(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")

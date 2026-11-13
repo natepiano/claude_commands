@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -21,9 +22,10 @@ from scripts.astra import astra_roles  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import process_start
+from scripts.lib import process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.stop_injection_test_support import stop_in_child
+from scripts.usage import agents_log
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
 
@@ -45,8 +47,12 @@ class AstraRolesTests(StaffTestCase):
         self.home.mkdir()
         self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root), "CODEX_HOME": str(self.home),
                             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                            "ASTRA_REVIEW_DIR": str(self.root / "astra-runs"),
+                            "SCRATCH_ROOT": str(self.root / "scratch"),
                             "USAGE_STATE_DIR": str(self.root / "usage"),
                             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}
+        _ = self.enterContext(mock.patch.object(unit_runs, "run_roots", return_value=(self.run_folder,)))
+        _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
         runner = fixture_member("showrunner", name="astra")
         self.parent = fixture_member("unit", name="director", parent=runner.id,
@@ -96,10 +102,40 @@ class AstraRolesTests(StaffTestCase):
                 live = astra_roles.live_roles(staff.snapshot())
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
                              [("99340615-2159-5777-b1c8-71572890df55", self.parent.current_session, "idle")])
+            with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as history:
+                parsed = astra_roles._parse_record(  # pyright: ignore[reportPrivateUsage]
+                    record, self.state / "99340615-2159-5777-b1c8-71572890df55.json", staff.snapshot())
+                self.assertEqual(parsed["role"], "designer")
+            self.assertEqual(history.call_count, 0)
             ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))), design.roles[1]))
             design_roles._save(ended)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(astra_roles.live_roles(staff.snapshot()), [])
             self.assertFalse((self.state / "99340615-2159-5777-b1c8-71572890df55.json").exists())
+
+    def test_admitted_worker_records_dated_attribution_without_duplicate_holds(self) -> None:
+        identity = staff.StaffId("5048811c-26db-50f1-bf82-b3c52202e7ff")
+        with mock.patch.dict(os.environ, self.environment):
+            cases: tuple[tuple[astra_roles.AstraRole, staff.WorkerRole, agents_log.Role], ...] = (
+                ("designer", "astra-designer", "impl"), ("reviewer", "astra-reviewer", "review"))
+            for role, current, dated in cases:
+                with self.subTest(role=role):
+                    row = staff.set_worker_role(identity, staff.KnownWorkerRole(current))
+                    previous_roles: tuple[agents_log.Role | None, ...] = (None, "fix", dated)
+                    for previous in previous_roles:
+                        with self.subTest(previous=previous):
+                            history = agents_log.state_dir() / "agents.jsonl"
+                            history.unlink(missing_ok=True)
+                            if previous is not None:
+                                agents_log.append(row.current_session, previous, None, datetime.now(timezone.utc))
+                            with mock.patch.object(agents_log, "append", wraps=agents_log.append) as written:
+                                _ = astra_roles.hold(role, astra_roles.ExecProcess(os.getpid()), identity)
+                                _ = astra_roles.hold(role, astra_roles.ExecProcess(os.getpid()), identity)
+                            self.assertEqual(written.call_count, 0 if previous == dated else 1)
+                            latest = agents_log.role_at(agents_log.assignments(history), row.current_session,
+                                                        datetime.now(timezone.utc))
+                            self.assertIsInstance(latest, agents_log.Assignment)
+                            assert isinstance(latest, agents_log.Assignment)
+                            self.assertEqual((latest.role, latest.lens), (dated, None))
 
     def test_durable_record_refuses_mixed_lifetimes_wrong_role_and_unknown_keys(self) -> None:
         with mock.patch.dict(os.environ, self.environment):
@@ -168,6 +204,24 @@ class AstraRolesTests(StaffTestCase):
         ])
         for role in roles:
             self.assertTrue({"session_dir", "worker", "pid"}.isdisjoint(role))
+        for identity, expected in (("5048811c-26db-50f1-bf82-b3c52202e7ff", "astra-designer"),
+                                   ("2ebb1f2e-e51d-5245-8cbd-8202f40c042e", "astra-reviewer")):
+            with self.subTest(identity=identity):
+                row = staff.by_id(staff.StaffId(identity))
+                assert row is not None
+                self.assertEqual(row.role, staff.KnownWorkerRole(cast(staff.WorkerRole, expected)))
+                with mock.patch.dict(os.environ, self.environment):
+                    agents_log.append(row.current_session, "review" if expected == "astra-designer" else "impl",
+                                      None, datetime.now(timezone.utc))
+                    path = self.state / (identity + ".json")
+                    record = cast(dict[str, object], json.loads(path.read_text()))
+                    parsed = astra_roles._parse_record(record, path, staff.snapshot())  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(parsed["role"], "designer" if expected == "astra-designer" else "reviewer")
+                    membership = staff.snapshot()
+                    unknown = replace(membership, rows=tuple(replace(member, role=staff.WorkerRoleUnknown())
+                        if member.id == row.id else member for member in membership.rows))
+                    with self.assertRaisesRegex(ValueError, "worker does not hold an Astra role"):
+                        _ = astra_roles._parse_record(record, path, unknown)  # pyright: ignore[reportPrivateUsage]
         locks: list[bool] = []
 
         def locked_write(path: Path, text: str) -> None:

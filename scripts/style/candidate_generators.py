@@ -24,7 +24,7 @@ import tomllib
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 from typing import Literal
 from typing import cast
 
@@ -280,7 +280,57 @@ def mask_source(text: str) -> MaskedSource:
 # ---------------------------------------------------------------------------
 
 
-def rust_files(project_root: Path) -> list[Path]:
+class CandidateInputs(Protocol):
+    """Supply source paths and immutable text to the existing generators."""
+
+    def rust_files(self, root: Path) -> list[Path]: ...
+    def text(self, path: Path) -> str: ...
+    def masked(self, path: Path) -> MaskedSource: ...
+    def manifest(self, path: Path) -> dict[str, object]: ...
+    def includes(self, path: Path) -> bool: ...
+    def exists(self, path: Path) -> bool: ...
+    def glob(self, root: Path, pattern: str) -> list[Path]: ...
+    def regex(self, spec: CandidatesSpec, root: Path) -> list[Candidate]: ...
+
+
+class FilesystemCandidateInputs:
+    """Keep filesystem behavior for callers outside refill."""
+
+    def rust_files(self, root: Path) -> list[Path]:
+        return _filesystem_rust_files(root)
+
+    def text(self, path: Path) -> str:
+        return path.read_text()
+
+    def masked(self, path: Path) -> MaskedSource:
+        return mask_source(self.text(path))
+
+    def manifest(self, path: Path) -> dict[str, object]:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+
+    def includes(self, path: Path) -> bool:
+        _ = path
+        return True
+
+    def exists(self, path: Path) -> bool:
+        return path.exists()
+
+    def glob(self, root: Path, pattern: str) -> list[Path]:
+        return sorted(root.glob(pattern))
+
+    def regex(self, spec: CandidatesSpec, root: Path) -> list[Candidate]:
+        return _run_rg(spec, root)
+
+
+FILESYSTEM_INPUTS: CandidateInputs = FilesystemCandidateInputs()
+
+
+def rust_files(project_root: Path, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> list[Path]:
+    return inputs.rust_files(project_root)
+
+
+def _filesystem_rust_files(project_root: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted(project_root.rglob("*.rs")):
         rel = path.relative_to(project_root).as_posix()
@@ -306,9 +356,9 @@ def is_test_file(rel: str) -> bool:
     return rel.endswith("tests.rs") or "/tests/" in "/" + rel
 
 
-def read_masked(path: Path) -> MaskedSource:
+def read_masked(path: Path, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> MaskedSource:
     try:
-        return mask_source(path.read_text())
+        return inputs.masked(path)
     except (OSError, UnicodeDecodeError):
         return MaskedSource(lines=[], strings=[])
 
@@ -522,9 +572,9 @@ def snake_case(name: str) -> str:
     return "_".join(camel_words(name))
 
 
-def display_line(path: Path, line: int) -> str:
+def display_line(path: Path, line: int, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> str:
     try:
-        lines = path.read_text().splitlines()
+        lines = inputs.text(path).splitlines()
     except (OSError, UnicodeDecodeError):
         return ""
     if 1 <= line <= len(lines):
@@ -576,11 +626,11 @@ def _run_rg(spec: CandidatesSpec, project_root: Path) -> list[Candidate]:
     return candidates
 
 
-def gen_regex(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_regex(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     if not spec.pattern:
         raise SystemExit(f"candidates kind=regex in {spec.origin} has no pattern")
     return Enumeration(
-        candidates=tuple(_run_rg(spec, project_root)),
+        candidates=tuple(inputs.regex(spec, project_root)),
         source=f"regex:{spec.pattern}",
     )
 
@@ -590,11 +640,10 @@ def gen_regex(spec: CandidatesSpec, project_root: Path) -> Enumeration:
 # ---------------------------------------------------------------------------
 
 
-def _load_toml(path: Path) -> dict[str, object]:
+def _load_toml(path: Path, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> dict[str, object]:
     empty: dict[str, object] = {}
     try:
-        with path.open("rb") as handle:
-            data: dict[str, object] = tomllib.load(handle)
+        data = inputs.manifest(path)
     except (OSError, tomllib.TOMLDecodeError):
         return empty
     return data
@@ -608,10 +657,10 @@ def _toml_table(data: dict[str, object], key: str) -> dict[str, object]:
     return empty
 
 
-def _dep_line(toml_path: Path, dep_name: str) -> int:
+def _dep_line(toml_path: Path, dep_name: str, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> int:
     dep_re = re.compile(rf'^\s*"?{re.escape(dep_name)}"?\s*=')
     try:
-        lines = toml_path.read_text().splitlines()
+        lines = inputs.text(toml_path).splitlines()
     except OSError:
         return 1
     for idx, line in enumerate(lines):
@@ -620,9 +669,9 @@ def _dep_line(toml_path: Path, dep_name: str) -> int:
     return 1
 
 
-def _member_manifests(project_root: Path) -> list[Path]:
+def member_manifests(project_root: Path, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> list[Path]:
     root_manifest = project_root / "Cargo.toml"
-    data = _load_toml(root_manifest)
+    data = _load_toml(root_manifest, inputs)
     workspace = _toml_table(data, "workspace")
     if not workspace:
         return []
@@ -635,10 +684,10 @@ def _member_manifests(project_root: Path) -> list[Path]:
             if not isinstance(member, str):
                 continue
             if "*" in member:
-                for path in sorted(project_root.glob(member)):
-                    if (path / "Cargo.toml").exists():
+                for path in inputs.glob(project_root, member):
+                    if inputs.exists(path / "Cargo.toml"):
                         manifests.append(path / "Cargo.toml")
-            elif (project_root / member / "Cargo.toml").exists():
+            elif inputs.exists(project_root / member / "Cargo.toml"):
                 manifests.append(project_root / member / "Cargo.toml")
     return manifests
 
@@ -646,11 +695,13 @@ def _member_manifests(project_root: Path) -> list[Path]:
 _DEP_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
-def gen_workspace_deps(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_workspace_deps(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for manifest in _member_manifests(project_root):
-        data = _load_toml(manifest)
+    for manifest in member_manifests(project_root, inputs):
+        if not inputs.includes(manifest):
+            continue
+        data = _load_toml(manifest, inputs)
         rel = manifest.relative_to(project_root).as_posix()
         for section in _DEP_SECTIONS:
             for dep_name, dep_value in _toml_table(data, section).items():
@@ -663,7 +714,7 @@ def gen_workspace_deps(spec: CandidatesSpec, project_root: Path) -> Enumeration:
                     candidates.append(
                         Candidate(
                             file=rel,
-                            line=_dep_line(manifest, dep_name),
+                            line=_dep_line(manifest, dep_name, inputs),
                             text=f"[{section}] {dep_name} pins a version instead of workspace = true",
                         )
                     )
@@ -671,21 +722,21 @@ def gen_workspace_deps(spec: CandidatesSpec, project_root: Path) -> Enumeration:
     return Enumeration(candidates=tuple(candidates), source="toml:member-deps-version-pins")
 
 
-def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
     manifests = [project_root / "Cargo.toml"]
-    manifests += [m for m in _member_manifests(project_root) if m not in manifests]
+    manifests += [m for m in member_manifests(project_root, inputs) if m not in manifests]
     kana_crates: list[Path] = []
     for manifest in manifests:
-        data = _load_toml(manifest)
+        data = _load_toml(manifest, inputs)
         deps = _toml_table(data, "dependencies")
-        if "bevy" in deps and "hana_kana" not in deps:
+        if "bevy" in deps and "hana_kana" not in deps and inputs.includes(manifest):
             rel = manifest.relative_to(project_root).as_posix()
             candidates.append(
                 Candidate(
                     file=rel,
-                    line=_dep_line(manifest, "bevy"),
+                    line=_dep_line(manifest, "bevy", inputs),
                     text="bevy crate without a hana_kana dependency",
                 )
             )
@@ -695,15 +746,15 @@ def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration
         r"^\s*pub\s.*\b(Position|Displacement|Velocity|ToF32|ToI32|ToU32|ToUsize)\b"
     )
     for crate_dir in kana_crates:
-        if not (crate_dir / "src" / "lib.rs").exists():
+        if not inputs.exists(crate_dir / "src" / "lib.rs"):
             continue
-        for path in rust_files(crate_dir / "src"):
+        for path in rust_files(crate_dir / "src", inputs):
             rel = path.relative_to(project_root).as_posix()
-            masked = read_masked(path)
+            masked = read_masked(path, inputs)
             for idx, line in enumerate(masked.lines):
                 if leak_re.match(line) or re.match(r"^\s*pub\s+use\s+.*hana_kana", line):
                     candidates.append(
-                        Candidate(file=rel, line=idx + 1, text=display_line(path, idx + 1))
+                        Candidate(file=rel, line=idx + 1, text=display_line(path, idx + 1, inputs))
                     )
     candidates.sort(key=lambda c: (c.file, c.line))
     return Enumeration(
@@ -730,20 +781,20 @@ _BOILERPLATE_LINTS = {
 }
 
 
-def gen_allows_without_reason(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_allows_without_reason(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     """`#[allow(...)]` attributes (single- or multi-line) with no `reason` field."""
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         masked_text = "\n".join(masked.lines)
         for match in _ALLOW_RE.finditer(masked_text):
             if re.search(r"\breason\s*=", match.group(1)):
                 continue
             attr_line = masked_text.count("\n", 0, match.start()) + 1
             candidates.append(
-                Candidate(file=rel, line=attr_line, text=display_line(path, attr_line))
+                Candidate(file=rel, line=attr_line, text=display_line(path, attr_line, inputs))
             )
     candidates.sort(key=lambda c: (c.file, c.line))
     return Enumeration(candidates=tuple(candidates), source="parse:allow-attrs-without-reason")
@@ -792,12 +843,12 @@ def boilerplate_allows(masked: MaskedSource) -> tuple[BoilerplateAllow, ...]:
     return tuple(result)
 
 
-def gen_test_allow_boilerplate(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_test_allow_boilerplate(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        for allow in boilerplate_allows(read_masked(path)):
+        for allow in boilerplate_allows(read_masked(path, inputs)):
             candidates.extend(
                 Candidate(
                     file=rel,
@@ -828,20 +879,20 @@ def _type_idents(type_text: str) -> list[str]:
     return _TYPE_IDENT_RE.findall(type_text)
 
 
-def _each_struct(project_root: Path) -> list[tuple[str, Path, StructDef]]:
+def _each_struct(project_root: Path, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> list[tuple[str, Path, StructDef]]:
     found: list[tuple[str, Path, StructDef]] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         for struct in scan_structs(masked.lines):
             found.append((rel, path, struct))
     return found
 
 
-def gen_field_affixes(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_field_affixes(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for rel, _path, struct in _each_struct(project_root):
+    for rel, _path, struct in _each_struct(project_root, inputs):
         if len(struct.fields) < 2:
             continue
         by_prefix: dict[str, list[str]] = {}
@@ -869,12 +920,12 @@ def gen_field_affixes(spec: CandidatesSpec, project_root: Path) -> Enumeration:
     return Enumeration(candidates=tuple(candidates), source="parse:struct-fields-shared-affix")
 
 
-def gen_enum_variant_stutter(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_enum_variant_stutter(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         for enum in scan_enums(masked.lines):
             enum_words = set(camel_words(enum.name))
             for variant_name, variant_line in enum.variants:
@@ -891,10 +942,10 @@ def gen_enum_variant_stutter(spec: CandidatesSpec, project_root: Path) -> Enumer
     return Enumeration(candidates=tuple(candidates), source="parse:enum-variant-shares-enum-word")
 
 
-def gen_field_type_stutter(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_field_type_stutter(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for rel, _path, struct in _each_struct(project_root):
+    for rel, _path, struct in _each_struct(project_root, inputs):
         struct_snake = snake_case(struct.name)
         first_word = camel_words(struct.name)[0] if camel_words(struct.name) else ""
         for fld in struct.fields:
@@ -924,13 +975,25 @@ def gen_field_type_stutter(spec: CandidatesSpec, project_root: Path) -> Enumerat
 _TRAIT_RE = re.compile(rf"^\s*{_VIS_RE}(?:unsafe\s+)?trait\s+([A-Z]\w*)")
 
 
-def gen_single_impl_traits(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def trait_declarations(masked: MaskedSource) -> tuple[tuple[str, int], ...]:
+    """Keep the generator's line matcher for declared trait names."""
+    return tuple((match.group(1), index + 1) for index, line in enumerate(masked.lines)
+                 if (match := _TRAIT_RE.match(line)) is not None)
+
+
+def trait_impl_count(name: str, masked: MaskedSource) -> int:
+    """Count the same regular expression over one masked file."""
+    matcher = re.compile(rf"\bimpl\b[^{{;]*?\b{name}\b[^{{;]*?\bfor\b", re.S)
+    return len(matcher.findall("\n".join(masked.lines)))
+
+
+def gen_single_impl_traits(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     decls: list[tuple[str, str, int]] = []  # (trait name, rel file, line)
     masked_texts: list[str] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         masked_texts.append("\n".join(masked.lines))
         for idx, line in enumerate(masked.lines):
             match = _TRAIT_RE.match(line)
@@ -955,12 +1018,12 @@ def gen_single_impl_traits(spec: CandidatesSpec, project_root: Path) -> Enumerat
 _FN_RE = re.compile(r"\bfn\s+(\w+)\s*(?:<[^>]*>)?\s*\(", re.S)
 
 
-def gen_observer_guards(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_observer_guards(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         masked_text = "\n".join(masked.lines)
         for match in _FN_RE.finditer(masked_text):
             params_end = masked_text.find(")", match.end())
@@ -992,14 +1055,14 @@ _ITEM_RE = re.compile(
 )
 
 
-def gen_module_root_items(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_module_root_items(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         if path.name not in ("mod.rs", "lib.rs", "main.rs"):
             continue
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         depth = 0
         items: list[tuple[int, str]] = []
         for idx, line in enumerate(masked.lines):
@@ -1033,10 +1096,10 @@ def gen_module_root_items(spec: CandidatesSpec, project_root: Path) -> Enumerati
 _ANTI_PATTERN_STEMS = {"helpers", "utils", "util", "common", "misc", "types", "model"}
 
 
-def gen_submodule_names(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_submodule_names(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
         stem = path.stem
         parent = path.parent.name
@@ -1100,6 +1163,7 @@ def _numeric_candidates_for_file(
     spans: list[tuple[int, int]],
     inside_spans: bool,
     line_filter: Callable[[str], bool] | None = None,
+    inputs: CandidateInputs = FILESYSTEM_INPUTS,
 ) -> list[Candidate]:
     candidates: list[Candidate] = []
     seen_lines: set[int] = set()
@@ -1118,28 +1182,28 @@ def _numeric_candidates_for_file(
                 continue
             if line_no not in seen_lines:
                 seen_lines.add(line_no)
-                candidates.append(Candidate(file=rel, line=line_no, text=display_line(path, line_no)))
+                candidates.append(Candidate(file=rel, line=line_no, text=display_line(path, line_no, inputs)))
             break
     return candidates
 
 
-def gen_literals(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_literals(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     exempts = tuple(spec.paths_exempt) + ("examples", "benches", "build.rs")
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
         if path_is_exempt(rel, exempts) or is_test_file(rel):
             continue
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         spans = test_spans(masked.lines)
-        candidates += _numeric_candidates_for_file(path, rel, masked, spans, inside_spans=False)
+        candidates += _numeric_candidates_for_file(path, rel, masked, spans, inside_spans=False, inputs=inputs)
         for literal in masked.strings:
             if literal.kind != "string" or len(literal.text) < 2:
                 continue
             if in_spans(literal.line, spans):
                 continue
             line = masked.lines[literal.line - 1] if literal.line - 1 < len(masked.lines) else ""
-            raw_line = display_line(path, literal.line)
+            raw_line = display_line(path, literal.line, inputs)
             if _CONST_LINE_RE.match(line) or line.lstrip().startswith("#"):
                 continue
             prefix = line[: literal.col]
@@ -1158,14 +1222,14 @@ def gen_literals(spec: CandidatesSpec, project_root: Path) -> Enumeration:
 _COMPARISON_LINE_RE = re.compile(r"\bassert|[=!<>]=|matches!")
 
 
-def gen_test_literals(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_test_literals(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     """Hardcoded numerics in test assertions/comparisons — the sites where a
     value derived from a production constant breaks silently when it drifts."""
     _ = spec
     candidates: list[Candidate] = []
-    for path in rust_files(project_root):
+    for path in rust_files(project_root, inputs):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
+        masked = read_masked(path, inputs)
         if is_test_file(rel):
             spans = [(1, len(masked.lines))]
         else:
@@ -1178,6 +1242,7 @@ def gen_test_literals(spec: CandidatesSpec, project_root: Path) -> Enumeration:
             masked,
             spans,
             inside_spans=True,
+            inputs=inputs,
             line_filter=lambda line: _COMPARISON_LINE_RE.search(line) is not None,
         )
     candidates.sort(key=lambda c: (c.file, c.line))
@@ -1192,13 +1257,13 @@ def gen_test_literals(spec: CandidatesSpec, project_root: Path) -> Enumeration:
 # ---------------------------------------------------------------------------
 
 
-def gen_struct_fields(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def gen_struct_fields(spec: CandidatesSpec, project_root: Path, *, inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     if not spec.field_type_pattern:
         raise SystemExit(f"candidates kind=struct_fields in {spec.origin} needs field_type_pattern")
     type_re = re.compile(spec.field_type_pattern)
     wanted = set(spec.structs)
     candidates: list[Candidate] = []
-    for rel, _path, struct in _each_struct(project_root):
+    for rel, _path, struct in _each_struct(project_root, inputs):
         if wanted and struct.name not in wanted:
             continue
         for fld in struct.fields:
@@ -1222,7 +1287,12 @@ def gen_struct_fields(spec: CandidatesSpec, project_root: Path) -> Enumeration:
 # Dispatch
 # ---------------------------------------------------------------------------
 
-GENERATORS: dict[str, Callable[[CandidatesSpec, Path], Enumeration]] = {
+class CandidateGenerator(Protocol):
+    def __call__(self, spec: CandidatesSpec, project_root: Path, *,
+                 inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration: ...
+
+
+GENERATORS: dict[str, CandidateGenerator] = {
     "regex": gen_regex,
     "workspace_deps": gen_workspace_deps,
     "allows_without_reason": gen_allows_without_reason,
@@ -1241,11 +1311,12 @@ GENERATORS: dict[str, Callable[[CandidatesSpec, Path], Enumeration]] = {
 }
 
 
-def enumerate_candidates(spec: CandidatesSpec, project_root: Path) -> Enumeration:
+def enumerate_candidates(spec: CandidatesSpec, project_root: Path, *,
+                         inputs: CandidateInputs = FILESYSTEM_INPUTS) -> Enumeration:
     """Run the generator named by the spec. Unknown kinds are loud config errors."""
     generator = GENERATORS.get(spec.kind)
     if generator is None:
         raise SystemExit(
             f"candidates kind '{spec.kind}' in {spec.origin} has no generator in candidate_generators.py"
         )
-    return generator(spec, project_root)
+    return generator(spec, project_root, inputs=inputs)

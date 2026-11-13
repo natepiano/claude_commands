@@ -55,7 +55,8 @@ from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from scripts.style.candidate_generators import enumerate_candidates
+from scripts.style.refill_inputs import RefillInputs, regex_tool_identity
+from scripts.style.refill_facts import RefillFacts
 from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
@@ -221,6 +222,21 @@ class ListedSite:
     crate: str
     line: int
     text: str
+
+
+@dataclass(frozen=True)
+class ListedSiteObservation:
+    """Candidate inputs already checked by this ledger handle."""
+
+    commit: str
+    catalog: str
+    pins: tuple[tuple[str, str], ...]
+    regex_tool: str
+
+
+@dataclass(frozen=True)
+class UnobservedListedSites:
+    """This ledger handle has not checked candidate inputs."""
 
 
 @dataclass(frozen=True)
@@ -1955,13 +1971,6 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
 
-def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
-    for path, content in blob_contents(repo, tip.blobs):
-        destination = export / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = destination.write_bytes(content)
-
-
 def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
     """The tree entries a cell's fingerprint covers, by path; a crate scope covers its whole directory tree."""
     if scope in (CellInputScope.MODULE, CellInputScope.FILE) and path not in tip.blobs:
@@ -2365,6 +2374,36 @@ MIGRATIONS = {
             PRIMARY KEY(object_store, object_id, reader_version, fact_kind, fact_key)
         );
     """,
+    41: """
+        CREATE TABLE refill_objects_candidates (
+            object_store TEXT NOT NULL, object_id TEXT NOT NULL, reader_version INTEGER NOT NULL,
+            fact_kind TEXT NOT NULL, fact_key TEXT NOT NULL, line_count INTEGER NOT NULL,
+            fact_text TEXT NOT NULL DEFAULT '', entry_mode TEXT NOT NULL DEFAULT '',
+            entry_kind TEXT NOT NULL DEFAULT '', entry_object TEXT NOT NULL DEFAULT '',
+            declaration_name TEXT NOT NULL DEFAULT '', source_line INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(object_store, object_id, reader_version, fact_kind, fact_key)
+        );
+        INSERT INTO refill_objects_candidates(object_store,object_id,reader_version,fact_kind,fact_key,line_count)
+            SELECT object_store,object_id,reader_version,fact_kind,fact_key,line_count
+            FROM refill_objects WHERE fact_kind='line_count';
+        DROP TABLE refill_objects;
+        ALTER TABLE refill_objects_candidates RENAME TO refill_objects;
+        CREATE TABLE IF NOT EXISTS refill_candidates (
+            catalog TEXT NOT NULL, rule TEXT NOT NULL, partition TEXT NOT NULL,
+            input_identity TEXT NOT NULL, generator_version INTEGER NOT NULL, sites TEXT NOT NULL,
+            PRIMARY KEY(catalog, rule, partition)
+        );
+        CREATE TABLE IF NOT EXISTS refill_dependencies (
+            consumer_table TEXT NOT NULL, consumer_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL, source_key TEXT NOT NULL, source_identity TEXT NOT NULL,
+            PRIMARY KEY(consumer_table, consumer_key, source_kind, source_key)
+        );
+        DELETE FROM refill_candidates;
+        DELETE FROM refill_dependencies;
+        CREATE INDEX IF NOT EXISTS refill_dependency_sources ON refill_dependencies(source_kind, source_key);
+        CREATE INDEX IF NOT EXISTS refill_object_declarations
+            ON refill_objects(object_store, reader_version, fact_kind, declaration_name);
+    """,
 }
 
 
@@ -2507,6 +2546,7 @@ class Ledger:
         self._finding_reads: list[HeldFindingReads] = []
         self._refill_changes: int = 0
         self._refill_object_store: str = ""
+        self._listed_site_observation: ListedSiteObservation | UnobservedListedSites = UnobservedListedSites()
         self._refill_available_blobs: set[str] = set()
         self._git_operation_depth: int = 0
         self.database: Path = database
@@ -4846,7 +4886,7 @@ class Ledger:
             transaction = self._connection.in_transaction
             before = self._connection.total_changes
             _ = self._connection.executemany(
-                "INSERT OR IGNORE INTO refill_objects VALUES (?,?,1,'line_count','',?)",
+                "INSERT OR IGNORE INTO refill_objects (object_store,object_id,reader_version,fact_kind,fact_key,line_count) VALUES (?,?,1,'line_count','',?)",
                 ((store, blob, counts[blob]) for blob in unread))
             self._refill_changes += self._connection.total_changes - before
             if not transaction:
@@ -7279,6 +7319,13 @@ class Ledger:
         )
 
     def _refresh_sites(self, tip: RepositoryTip) -> None:
+        before = self._connection.total_changes
+        try:
+            self._refresh_candidate_sites(tip)
+        finally:
+            self._refill_changes += self._connection.total_changes - before
+
+    def _refresh_candidate_sites(self, tip: RepositoryTip) -> None:
         definitions = [
             rule for rule in self._catalog
             if (rule.tier in ("B", "D") and rule.candidates is not None)
@@ -7287,16 +7334,31 @@ class Ledger:
         markers = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT rule,rule_blob FROM listed_rules WHERE tip=?", (tip.commit,),
         ).fetchall())
-        if set(markers) == {(rule.rule_id, rule.blob) for rule in definitions}:
+        if not definitions and not markers:
             return
+        checkout = self._rule_checkouts[-1] if self._rule_checkouts else self.repo
+        catalog = json.dumps((str(checkout.resolve()), str(style_rules.NATE_STYLE_DIR.resolve())))
+        pins = tuple(sorted((rule.rule_id, rule.blob) for rule in definitions))
+        tool = regex_tool_identity() if any(rule.candidates is not None and rule.candidates.kind == "regex"
+                                             for rule in definitions) else ""
+        observation = ListedSiteObservation(tip.commit, catalog, pins, tool)
+        if self._listed_site_observation == observation and set(markers) == set(pins):
+            return
+        if set(markers) == set(pins) and isinstance(self._listed_site_observation, UnobservedListedSites):
+            indexed = cast(tuple[int] | None, self._connection.execute(
+                "SELECT 1 FROM refill_candidates WHERE catalog=? LIMIT 1", (catalog,)).fetchone())
+            if indexed is None:
+                # Keep a legacy successful listed view until its tip or rule inputs change.
+                self._listed_site_observation = observation
+                return
 
-        # Refresh together: pre-filter rules also see non-Rust files named by generators.
+        # Pre-filter rules share the Rust and generator path universe.
         sites: set[ListedSite] = set()
-        with tempfile.TemporaryDirectory(prefix="style-listed-") as scratch:
-            root = Path(scratch)
-            export = root / "export"
-            export.mkdir()
-            _export_blobs(self.repo, tip, export)
+        if not self._refill_object_store:
+            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        facts = RefillFacts(self._connection, self._refill_object_store, catalog)
+        with self._connection:
+            inputs = RefillInputs(self.repo, tip.tree, facts)
             ignored: list[str] = []
             for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
                 if config in tip.blobs:
@@ -7305,7 +7367,7 @@ class Ledger:
                 if definition.candidates is None:
                     continue
                 try:
-                    enumeration = enumerate_candidates(definition.candidates, export)
+                    enumeration = facts.enumerate(definition.rule_id, definition.candidates, inputs)
                 except (SystemExit, re.error) as error:
                     raise LedgerError(f"{definition.rule_id}: {error}") from error
                 for candidate in enumeration.candidates:
@@ -7319,18 +7381,18 @@ class Ledger:
             for definition in definitions:
                 if definition.candidates is not None or definition.pre_filter is None:
                     continue
+                paths = tuple(path for path in sorted(universe)
+                              if not isinstance(definition.reach, MemberReach)
+                              or _under(path, definition.reach.crate_dir.as_posix()))
                 try:
-                    pattern = re.compile(definition.pre_filter)
+                    candidates = facts.pre_filter(definition.rule_id, definition.pre_filter, inputs, paths)
                 except re.error as error:
                     raise LedgerError(f"{definition.rule_id}: invalid pre_filter: {error}") from error
-                for path in sorted(universe):
-                    if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
-                        continue
-                    for line, text in enumerate((export / path).read_text().splitlines(), 1):
-                        if pattern.search(text):
-                            sites.add(ListedSite(definition.rule_id, path, tip.crate(path), line, text))
-        blobs = {rule.rule_id: rule.blob for rule in definitions}
-        with self._connection:
+                for candidate in candidates:
+                    sites.add(ListedSite(definition.rule_id, candidate.file, tip.crate(candidate.file),
+                                         candidate.line, candidate.text))
+            facts.finish()
+            blobs = {rule.rule_id: rule.blob for rule in definitions}
             _ = self._connection.execute("DELETE FROM listed_rules WHERE tip=?", (tip.commit,))
             _ = self._connection.executemany(
                 "INSERT INTO listed_rules(rule,rule_blob,tip) VALUES (?,?,?)",
@@ -7341,6 +7403,7 @@ class Ledger:
                 [(site.rule, blobs[site.rule], tip.commit, site.path, site.line, site.text)
                  for site in sorted(sites, key=lambda site: (site.rule, site.path, site.line, site.text))],
             )
+        self._listed_site_observation = observation
 
     def _listed_sites(self, rule: str, tip: RepositoryTip) -> tuple[ListedSite, ...]:
         rows = cast(list[tuple[str, int, str]], self._connection.execute(
