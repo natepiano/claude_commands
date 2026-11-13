@@ -326,6 +326,44 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC 2026-01-14 through 2026-01-15 (2 days)', output)
         self.assertIn('billed days only; 4 rows omitted with no kind or matching launch.', output)
 
+    def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
+        events: list[dict[str, object]] = [
+            {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'targeted-test', 'result': 'fallback',
+             'reason': 'The checkout changed after the test selection\nfixture traceback'},
+            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'image or stack is absent'},
+            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture old reason'},
+            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture future reason'},
+        ]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        numeric_settings(self.settings, {'gate_type_window_days': '1'})
+        output = self.render()
+        lines = [line for line in output.splitlines() if line.startswith('- Cloud gate uses natedev:')]
+        self.assertEqual(len(lines), 2)
+        at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+        self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
+                         + f'({at}, targeted-test).')
+        self.assertIn('image or stack is absent', lines[1])
+        for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
+            self.assertNotIn(hidden, output)
+
+    def test_gate_fallback_line_handles_missing_and_long_reasons(self) -> None:
+        events: list[dict[str, object]] = [
+            {'time': NOW, 'attempt': '', 'result': 'fallback'},
+            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture ' * 100},
+        ]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        comparison = aws_report.gate_type_report(self.state, DAY, 1)
+        lines = [line for line in comparison.tables if line.startswith('- Cloud gate uses natedev:')]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('Reason unavailable', lines[0])
+        self.assertIn('unknown mode', lines[0])
+        self.assertIn('...', lines[1])
+        self.assertLess(len(lines[1]), len(str(events[1]['reason'])))
+
     def test_gate_type_comparison_shows_unbilled_and_empty_cells_for_one_type(self) -> None:
         launches = [
             {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
