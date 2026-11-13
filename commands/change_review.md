@@ -8,6 +8,9 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 For `/change_review` with no action:
 
+The command prints the Hana console link with Changes selected.
+The console navigation switches between Changes and Builds.
+
 1. Run the page script:
 
    ```sh

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert. Mac pushes and cancellations run on natedev.
 
-  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]
+  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence]
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
@@ -23,10 +23,11 @@ or "Sent by: <sender> · Template: none (free text)" for a legacy kept push. The
 sender is the source; "send.py in hana" shows as "hana". A long body is cut so that last line
 always fits. A push with no sender is refused and nothing is posted.
 
-While the user's silence is on (silence.py), a push below priority 2 is kept,
-not posted: it prints "pushover: kept: silence until ..." and exits 0, and
+While the user's silence is on (silence.py), a push below priority 2 is kept unless it uses --through-silence.
+A kept push prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later. A kept push with the same --key from the same
 --source replaces the older kept one.
+--through-silence preserves review and priority. A normal push does not repeat or need acknowledgement.
 
 New pushes require a registered template before review, credentials, claims, or posting. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
@@ -78,7 +79,7 @@ SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
-USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]"
+USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/pushover.py"'
 
@@ -201,6 +202,7 @@ def log(source: str, priority: str, title: str, message: str, outcome: str, *,
 
 
 class Arguments(TypedDict):
+    silence_policy: silence.SilencePolicy
     reference: push_reference.PushReference
     need: str
     priority: str
@@ -223,6 +225,7 @@ def parse(argv: list[str]) -> Arguments | None:
     question = forwarded_reference = ""
     remote_forward = False
     due = ""
+    silence_policy = silence.SilencePolicy.KEEP_DURING_SILENCE
     source: str | None = None
     action: str | None = None
     no_action = False
@@ -233,6 +236,10 @@ def parse(argv: list[str]) -> Arguments | None:
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
         option = argv[index]
+        if option == "--through-silence":
+            silence_policy = silence.SilencePolicy.SEND_THROUGH_SILENCE
+            index += 1
+            continue
         if option == "--ssh-forwarded-reference":
             if "SSH_CONNECTION" not in os.environ:
                 return None
@@ -318,6 +325,7 @@ def parse(argv: list[str]) -> Arguments | None:
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
     return {
+        "silence_policy": silence_policy,
         "reference": reference,
         "need": need,
         "due": due,
@@ -455,14 +463,15 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             completion: review.ClaimDelivery = review.ClaimCancelled()
         else:
             completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header,
-                                                                             key=key, text_id=arguments["text_id"]))
+                                    key=key, text_id=arguments["text_id"], silence_policy=arguments["silence_policy"]))
         if isinstance(completion, review.ClaimCancelled):
             review.log_review(draft, outcome, detail="claim cancelled before posting", text_id=arguments["text_id"])
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
             return 5
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
     else:
-        code = deliver(version, keys_file, post, detail=detail, header=header, key=key, text_id=arguments["text_id"])
+        code = deliver(version, keys_file, post, detail=detail, header=header, key=key, text_id=arguments["text_id"],
+                       silence_policy=arguments["silence_policy"])
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
@@ -512,7 +521,8 @@ def via_natedev(arguments: Sequence[str], text: str, asker: AskNatedev, *,
 
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "",
-            asker: AskNatedev = ask_natedev) -> int:
+            asker: AskNatedev = ask_natedev,
+            silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
@@ -526,6 +536,8 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     push: silence.KeptPush = {"source": source, "priority": priority, "title": title,
                               "message": message, "detail": detail, "key": key, "text_id": text_id,
                               "due": draft.due, "need": need, "reference": draft.reference}
+    if silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
+        push["silence_policy"] = silence_policy
     if silence.on_mac():
         return via_natedev(["deliver"], json.dumps(push), asker,
                            source=source, priority=priority, title=title, message=message)
@@ -536,7 +548,7 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail = push["detail"]
-    if priority != "2":
+    if priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
         kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))

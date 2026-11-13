@@ -1992,6 +1992,33 @@ class PhaseTableTests(unittest.TestCase):
                 self.assertEqual(second.delta_minutes, 100 / 60)
                 self.assertIsInstance(current, phase_table.OpenPhase)
 
+    def test_plan_keeps_each_open_phase_and_its_latest_explicit_eta(self) -> None:
+        self.write_plan(plan_text(
+            "### Phase 3 — Current delivery · status: todo",
+            "### Phase 8 — Repair delivery · status: todo",
+            "### Phase 10 — Verify delivery · status: todo",
+        ))
+        events = [
+            self.phase_event("eta_stated", "2", "previous", 900, eta_phase_id="3", eta_at=1_500),
+            self.phase_event("phase_started", "3", "three", 1_000, phase_title="Current delivery"),
+            self.phase_event("phase_started", "8", "eight", 1_100, phase_title="Repair delivery"),
+            self.phase_event("eta_stated", "8", "eight", 1_150, eta_phase_id="8", eta_at=1_600),
+            self.phase_event("phase_started", "10", "ten", 1_200, phase_title="Verify delivery"),
+            self.phase_event("eta_stated", "3", "three", 1_250, eta_phase_id="10", eta_at=2_200),
+            self.phase_event("eta_stated", "10", "ten", 1_300, eta_phase_id="8", eta_at=1_900),
+        ]
+        _ = self.write_run("parallel", 800, *events)
+        self.write_state(None)
+        record = self.build(2_000)
+        self.assertEqual([phase.phase for phase in record.phases], ["3", "8", "10"])
+        for phase, expected in zip(record.phases,
+                ([(1_500, 900)], [(1_600, 1_150), (1_900, 1_300)], [(2_200, 1_250)]), strict=True):
+            with self.subTest(phase=phase.phase):
+                self.assertIsInstance(phase, phase_table.OpenPhase)
+                assert isinstance(phase, phase_table.OpenPhase)
+                self.assertEqual([(int(target.timestamp()), int(stated.timestamp()))
+                                  for target, stated in phase.eta_trail], expected)
+
     def test_open_phase_survives_a_title_supplied_by_a_later_progress_event(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Delivery  · status: todo"))
         events = [

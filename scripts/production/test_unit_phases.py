@@ -311,6 +311,7 @@ class UnitPhasesTests(unittest.TestCase):
         assert isinstance(current, phase_table.OpenPhase)
         for title, fix_done, expected in (
                 ("x" * 100, 0, "phase 3 — " + "x" * 100),
+                ("Phase 3 — Every session records itself", 0, "phase 3 — Every session records itself"),
                 ("x" * 56, 2, "phase 3 — " + "x" * 56 + " · fix rounds 2")):
             with self.subTest(title=title, fix_done=fix_done), patch.object(plan_history, "plan_runs", return_value=[]):
                 sample = record._replace(current=replace(current, title=title, fix_done=fix_done))
@@ -516,7 +517,7 @@ class UnitPhasesTests(unittest.TestCase):
             cases.append((record._replace(current=latest), now, ZoneInfo("UTC"), expected))
         latest = replace(promised, eta_trail=[(now + timedelta(minutes=30), now)])
         cases.extend([
-            (record, now, ZoneInfo("UTC"), "no ETA"),
+            (record, now, ZoneInfo("UTC"), "no ETA stated"),
             (record._replace(current=latest, plan_finish=phase_table.PredictedFinish(now + timedelta(minutes=42))),
              now, ZoneInfo("UTC"), "18:30"),
             (record._replace(current=latest), now, ZoneInfo("America/New_York"), "14:30"),
@@ -565,6 +566,9 @@ class UnitPhasesTests(unittest.TestCase):
         checkpoint = replace(checkpoint, eta_trail=[(now + timedelta(minutes=45), now)])
         promised = replace(current, eta_trail=[(now + timedelta(minutes=10), now)])
         plan_finish = phase_table.PredictedFinish(now + timedelta(hours=1))
+        predicted = phase_table.PredictedPhaseTiming(start=now, finish=plan_finish.at)
+        checkpoint = replace(checkpoint, times=predicted)
+        running = running._replace(phases=[running.phases[0], replace(running.phases[1], times=predicted)])
         waiting = typed_record(self.root / "plan.md", "done", "todo")._replace(
             phases=[typed_record(self.root / "plan.md", "done").phases[0], checkpoint], plan_finish=plan_finish)
         history = self.root / "history" / "runs"
@@ -576,25 +580,30 @@ class UnitPhasesTests(unittest.TestCase):
         started: dict[str, object] = {"event_type": "run_started", "owner_staff_id": member.id,
             "working_dir": str(self.root), "plan_doc": "plan.md", "run_id": "promises",
             "run_started_at": now.timestamp() - 600}
-        for sample, outside, target, expected, from_events in (
-                (running._replace(current=promised, plan_finish=plan_finish), True, 20, "18:10", False),
-                (running._replace(plan_finish=plan_finish), True, 20, "no ETA", False),
-                (running, True, 20, "18:10", True),
-                (running, True, 20, "no ETA", True),
-                (waiting, True, 20, "18:20", False),
-                (waiting, True, -5, "17:55 · late 5m", False),
-                (waiting, True, None, "no ETA", False),
-                (waiting, False, None, "18:45", False),
-                (typed_record(self.root / "plan.md", "done"), False, None, "—", False)):
+        for sample, outside, target, expected, from_events, expected_plan in (
+                (running._replace(current=promised, plan_finish=plan_finish), True, 20, "18:10", False, "19:00"),
+                (running._replace(plan_finish=plan_finish), True, 20, "no ETA stated", False, "19:00"),
+                (running, True, 20, "18:10", True, "19:00"),
+                (running, True, 20, "no ETA stated", True, "19:00"),
+                (waiting, True, 20, "18:20", False, "19:00 · phase 2: 18:45"),
+                (waiting, True, -5, "17:55 · late 5m", False, "19:00 · phase 2: 18:45"),
+                (waiting, True, None, "no ETA stated", False, "19:00 · phase 2: 18:45"),
+                (waiting, False, None, "18:45", False, "19:00 · phase 2: 18:45"),
+                (typed_record(self.root / "plan.md", "done"), False, None, "—", False, "—")):
             with self.subTest(current=sample.current, outside=outside, target=target,
                               expected=expected, from_events=from_events):
                 events = [started]
-                if from_events:
+                has_planned = isinstance(sample.current, phase_table.OpenPhase)
+                if has_planned or from_events:
                     events.append({"event_type": "phase_started", "phase_id": "1", "phase_title": "Delivery 1",
                                    "phase_instance_id": "planned", "phase_started_at": now.timestamp() - 550})
-                    if expected == "18:10":
+                    promises = ([(now + timedelta(minutes=10), now - timedelta(seconds=525))]
+                                if from_events and expected == "18:10" else
+                                sample.current.eta_trail if not from_events
+                                and isinstance(sample.current, phase_table.OpenPhase) else [])
+                    for promise, stated in promises:
                         events.append({"event_type": "eta_stated", "eta_phase_id": "1", "phase_instance_id": "planned",
-                                       "timestamp_epoch": now.timestamp() - 525, "eta_at": now.timestamp() + 600})
+                                       "timestamp_epoch": stated.timestamp(), "eta_at": promise.timestamp()})
                 if outside:
                     events.extend([
                         {"event_type": "phase_started", "phase_id": "outside-old", "phase_title": "Old work",
@@ -610,26 +619,77 @@ class UnitPhasesTests(unittest.TestCase):
                             {"event_type": "eta_stated", "eta_phase_id": "outside-new", "phase_instance_id": "new",
                              "timestamp_epoch": now.timestamp() - 200,
                              "eta_at": now.timestamp() + target * 60}])
+                for row in sample.phases:
+                    if isinstance(row, phase_table.TodoPhase):
+                        for promise, stated in row.eta_trail:
+                            events.append({"event_type": "eta_stated", "eta_phase_id": row.phase,
+                                "timestamp_epoch": stated.timestamp(), "eta_at": promise.timestamp()})
                 _ = (history / "promises.jsonl").write_text("\n".join(map(json.dumps, events)) + "\n")
                 if from_events:
                     with patch.object(plan_history, "now_epoch", return_value=now.timestamp()):
                         sample = phase_table.build_plan(running.plan)._replace(plan_finish=plan_finish)
-                    self.assertIsInstance(sample.phases[0], phase_table.TodoPhase)
+                    sample = sample._replace(phases=[sample.phases[0], replace(sample.phases[1], times=predicted)])
+                    self.assertIsInstance(sample.phases[0], phase_table.OpenPhase)
                     assert isinstance(sample.current, phase_table.OpenPhase)
                     self.assertEqual(sample.current.phase, "outside-new")
                 rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, pane_rows={},
                                             now=now.timestamp(), zone=ZoneInfo("UTC"))
                 headers = [cell.strip() for cell in rendered.splitlines()[0].split("|")[1:-1]]
-                cells = [cell.strip() for cell in rendered.splitlines()[2].split("|")[1:-1]]
+                table_rows = [[cell.strip() for cell in line.split("|")[1:-1]]
+                              for line in rendered.split("\n\n")[0].splitlines()[2:]]
+                selected_phase = "1" if has_planned or from_events else "outside-new" if outside else ""
+                cells = (next(row for row in table_rows if row[headers.index("Phase")] == selected_phase)
+                         if selected_phase else table_rows[0])
                 if expected == "—":
                     self.assertNotIn("ETA Next", headers)
                 else:
                     self.assertEqual(cells[headers.index("ETA Next")], expected)
                 if any(not isinstance(row, phase_table.DonePhase) for row in sample.phases):
                     self.assertEqual(headers[4:6], ["ETA Next", "ETA Plan"])
-                    self.assertEqual(cells[headers.index("ETA Plan")], "19:00")
+                    self.assertEqual(table_rows[0][headers.index("ETA Plan")], expected_plan)
                 else:
                     self.assertNotIn("ETA Plan", headers)
+
+        _ = running.plan.write_text("# Plan\n### Phase 1 — Delivery 1 · status: done\n"
+                                   + "### Phase 2 — Delivery 2 · status: todo\n")
+        earlier: list[dict[str, object]] = [
+            {**started, "run_id": "earlier", "run_started_at": now.timestamp() - 1200},
+            {"event_type": "phase_started", "phase_id": "1", "phase_instance_id": "completed",
+             "phase_title": "Delivery 1", "timestamp_epoch": now.timestamp() - 1100},
+            {"event_type": "phase_finished", "phase_id": "1", "phase_instance_id": "completed",
+             "timestamp_epoch": now.timestamp() - 1040, "phase_elapsed_seconds": 60, "status": "completed"},
+            {"event_type": "run_finished", "timestamp_epoch": now.timestamp() - 1000},
+        ]
+        _ = (history / "earlier.jsonl").write_text("\n".join(map(json.dumps, earlier)) + "\n")
+        side_events: list[dict[str, object]] = [
+            {**started, "run_id": "side", "run_started_at": now.timestamp() - 10},
+            {"event_type": "phase_started", "phase_id": "2", "phase_instance_id": "side-phase",
+             "phase_title": "Delivery 2", "timestamp_epoch": now.timestamp() - 9},
+            {"event_type": "eta_stated", "eta_phase_id": "2", "phase_instance_id": "side-phase",
+             "timestamp_epoch": now.timestamp() - 8, "eta_at": now.timestamp() + 18000},
+        ]
+        _ = (history / "side.jsonl").write_text("\n".join(map(json.dumps, side_events)) + "\n")
+        for current_promise, expected_next, expected_plan in (
+                (True, "18:10", "18:10 · phase 2: 18:10"),
+                (False, "—", "18:01")):
+            with self.subTest(current_promise=current_promise, other_run="newer open run"):
+                current_events = [started]
+                if current_promise:
+                    current_events.append({"event_type": "eta_stated", "eta_phase_id": "2",
+                        "timestamp_epoch": now.timestamp() - 100, "eta_at": now.timestamp() + 600})
+                _ = (history / "promises.jsonl").write_text("\n".join(map(json.dumps, current_events)) + "\n")
+                with patch.object(plan_history, "now_epoch", return_value=now.timestamp()):
+                    sample = phase_table.build_plan(running.plan)
+                rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, pane_rows={},
+                                            now=now.timestamp(), zone=ZoneInfo("UTC"))
+                lines = rendered.split("\n\n")[0].splitlines()
+                headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+                cells = dict(zip(headers, (cell.strip() for cell in lines[2].split("|")[1:-1]), strict=True))
+                self.assertEqual(cells.get("ETA Next", "—"), expected_next)
+                self.assertEqual(cells["ETA Plan"], expected_plan)
+                self.assertEqual(cells["Progress"], "🟩⬜")
+                self.assertEqual(cells["Phase"], "1/2")
+                self.assertIn("| promises | between phases", rendered)
 
     def test_workers_show_run_results_before_working_workers_and_count_idle_workers(self) -> None:
         rows: list[dict[str, object]] = [
@@ -645,6 +705,199 @@ class UnitPhasesTests(unittest.TestCase):
         for sample, expected in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(unit_phases.workers_cell(sample, now=1060), expected)
+
+    def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
+        owner = fixture_member("showrunner", name="parallel-owner")
+        member = fixture_member("unit", name="parallel", parent=owner.id,
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        holder = fixture_member("showrunner", name="builder")
+        plan = self.root / "parallel.md"
+        _ = plan.write_text("# Plan\n### Phase 7 — Done delivery · status: done\n"
+                            + "### Phase 8 — Repair delivery · status: todo\n"
+                            + "### Phase 10 — Verify delivery · status: todo\n"
+                            + "### Phase 12 — Later delivery · status: todo\n")
+        now = datetime(2026, 11, 13, 3, tzinfo=UTC).timestamp()
+        history = self.root / "history" / "runs"
+        history.mkdir(parents=True)
+        folder = self.root / "runs" / "parallel"
+        folder.mkdir(parents=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+        _ = staff.set_run(member.id, staff.OpenRun(folder))
+        events: list[dict[str, object]] = [
+            {"event_type": "run_started", "run_id": "parallel", "run_started_at": now - 1_000,
+             "owner_staff_id": member.id, "working_dir": str(self.root), "plan_doc": plan.name},
+            {"event_type": "phase_started", "phase_id": "7", "phase_instance_id": "seven",
+             "phase_title": "Done delivery", "timestamp_epoch": now - 950},
+            {"event_type": "phase_finished", "phase_id": "7", "phase_instance_id": "seven",
+             "timestamp_epoch": now - 900, "phase_elapsed_seconds": 50, "status": "completed"},
+            {"event_type": "phase_started", "phase_id": "10", "phase_instance_id": "ten",
+             "phase_title": "Verify delivery", "timestamp_epoch": now - 800},
+            {"event_type": "phase_started", "phase_id": "8", "phase_instance_id": "eight",
+             "phase_title": "Repair delivery", "timestamp_epoch": now - 700},
+            {"event_type": "eta_stated", "phase_id": "8", "phase_instance_id": "eight",
+             "eta_phase_id": "8", "eta_at": now - 3600, "timestamp_epoch": now - 600},
+            {"event_type": "eta_stated", "phase_id": "10", "phase_instance_id": "ten",
+             "eta_phase_id": "8", "eta_at": now - 300, "timestamp_epoch": now - 500},
+            {"event_type": "pass_started", "phase_id": "8", "phase_instance_id": "eight",
+             "pass_instance_id": "repair-pass", "pass_kind": "fix", "pass_activity": "fix dispatch",
+             "team_slot": "repair", "worker_id": "historic-repair", "pass_started_at": now - 400,
+             "timestamp_epoch": now - 400},
+            {"event_type": "pass_started", "phase_id": "10", "phase_instance_id": "ten",
+             "pass_instance_id": "verify-pass", "pass_kind": "test", "pass_activity": "verify the completed rows",
+             "team_slot": "verifier", "worker_id": "historic-verifier", "pass_started_at": now - 350,
+             "timestamp_epoch": now - 350},
+            {"event_type": "wait_started", "phase_id": "8", "phase_instance_id": "eight",
+             "pass_instance_id": "repair-pass", "wait_id": "worker-wait", "wait_reason": "memory admission",
+             "wait_started_epoch": now - 120, "timestamp_epoch": now - 120,
+             "holder": {"state": "HolderNotNamed", "reason": "producer named no holder"}},
+            {"event_type": "wait_started", "phase_id": "10", "phase_instance_id": "ten",
+             "wait_id": "director-wait", "wait_reason": "build queue", "wait_started_epoch": now - 300,
+             "timestamp_epoch": now - 300, "holder": {"state": "NamedHolder", "resource": "build",
+                 "resource_kind": "slot", "holder": {"state": "SessionHolder", "session_id": holder.current_session}}},
+            {"event_type": "eta_stated", "phase_id": "8", "phase_instance_id": "eight",
+             "eta_phase_id": "12", "eta_at": now + 3_600, "timestamp_epoch": now - 100},
+            {"event_type": "eta_stated", "phase_id": "8", "phase_instance_id": "eight",
+             "eta_phase_id": "12", "eta_at": now + 1_800, "timestamp_epoch": now - 90},
+            {"event_type": "eta_stated", "phase_id": "8", "phase_instance_id": "eight",
+             "eta_phase_id": "7", "eta_at": now + 7_200, "timestamp_epoch": now - 80},
+        ]
+        path = history / "parallel.jsonl"
+        _ = (history / "later-finished.jsonl").write_text("\n".join(map(json.dumps, [
+            {"event_type": "run_started", "run_id": "later-finished", "run_started_at": now - 10,
+             "owner_staff_id": member.id, "working_dir": str(self.root), "plan_doc": ""},
+            {"event_type": "run_finished", "timestamp_epoch": now - 5},
+        ])) + "\n")
+        cases = (
+            (False, False, False, "build queue"),
+            (True, False, False, "build queue"),
+            (False, True, False, "build queue"),
+            (False, True, True, "build queue"),
+            (False, False, False, "blocked: waiting on the showrunner"),
+            (False, False, False, "blocked: waiting for the showrunner"),
+            (False, False, False, "waiting on the showrunner"),
+            (False, False, False, "waiting for the showrunner"),
+        )
+        for reopened, failed_repair, previous_completion, reason in cases:
+            with self.subTest(reopened=reopened, failed_repair=failed_repair,
+                              previous_completion=previous_completion, reason=reason):
+                selected_events = [dict(event) for event in events]
+                if previous_completion:
+                    selected_events[3:3] = [
+                        {"event_type": "phase_started", "phase_id": "8", "phase_instance_id": "previous-eight",
+                         "phase_title": "Repair delivery", "timestamp_epoch": now - 880},
+                        {"event_type": "phase_finished", "phase_id": "8", "phase_instance_id": "previous-eight",
+                         "timestamp_epoch": now - 860, "phase_elapsed_seconds": 20, "status": "completed"},
+                    ]
+                if reopened:
+                    selected_events[3:3] = [
+                        {"event_type": "run_finished", "timestamp_epoch": now - 850},
+                        {"event_type": "reopened", "timestamp_epoch": now - 820},
+                    ]
+                for selected in selected_events:
+                    if selected.get("wait_id") == "director-wait":
+                        selected["wait_reason"] = reason
+                if failed_repair:
+                    selected_events.extend([
+                        {"event_type": "phase_finished", "phase_id": "8", "phase_instance_id": "eight",
+                         "timestamp_epoch": now - 70, "phase_elapsed_seconds": 630, "status": "error"},
+                        {"event_type": "eta_stated", "phase_id": "10", "phase_instance_id": "ten",
+                         "eta_phase_id": "8", "eta_at": now + 2_400, "timestamp_epoch": now - 60},
+                    ])
+                _ = path.write_text("\n".join(map(json.dumps, selected_events)) + "\n")
+                with patch.object(plan_history, "now_epoch", return_value=now):
+                    record = phase_table.build_plan(plan)
+                rendered = unit_phases.table([unit("parallel", live("parallel"))._replace(machine="mac")], {"parallel": record},
+                                            now=now, zone=ZoneInfo("UTC"), pane_rows={})
+                sections = rendered.split("\n\n")
+                rows: list[list[dict[str, str]]] = []
+                for section in (sections[0], sections[-1]):
+                    lines = section.splitlines()
+                    headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+                    rows.append([dict(zip(headers, (cell.strip() for cell in line.split("|")[1:-1]), strict=True))
+                                 for line in lines[2:]])
+                status, work = rows
+                if failed_repair:
+                    self.assertEqual([row["Phase"] for row in status], ["10"])
+                    self.assertIn("phase 8: 03:40", status[0]["ETA Plan"])
+                    self.assertNotIn("phase 7:", status[0]["ETA Plan"])
+                    self.assertIn("phase 12: 03:30", status[0]["ETA Plan"])
+                    self.assertEqual(status[0][unit_phases.worker_heading()], "verifier working")
+                    self.assertIn("test: verify the completed rows", work[0]["Notes"])
+                    self.assertTrue(work[0]["Notes"].endswith("waiting on build queue (held by builder) 5m"))
+                    continue
+                self.assertEqual([row["Unit"] for row in status], ["parallel", "parallel"])
+                self.assertEqual([row["Phase"] for row in status], ["8", "10"])
+                self.assertEqual([row["Status"] for row in status], ["idle", "—"])
+                self.assertEqual([row["Machine"] for row in status], ["mac", "—"])
+                self.assertEqual([row["Progress"] for row in status], ["🟩🟨🟨⬜", "—"])
+                self.assertEqual([row["ETA Next"] for row in status], ["02:55 · late 5m", "no ETA stated"])
+                self.assertIn("phase 12: 03:30", status[0]["ETA Plan"])
+                self.assertNotIn("phase 7:", status[0]["ETA Plan"])
+                self.assertEqual(status[1]["ETA Plan"], "—")
+                self.assertEqual([row[unit_phases.worker_heading()] for row in status],
+                                 ["repair working", "verifier working"])
+                self.assertEqual([row["Unit"] for row in work], ["parallel", "parallel"])
+                self.assertTrue(work[0]["Notes"].startswith("phase 8 — Repair delivery"))
+                self.assertNotIn("fix dispatch", work[0]["Notes"])
+                self.assertTrue(work[0]["Notes"].endswith("waiting on memory admission 2m"))
+                self.assertTrue(work[1]["Notes"].startswith("phase 10 — Verify delivery"))
+                self.assertIn("test: verify the completed rows", work[1]["Notes"])
+                self.assertIn("held by builder", work[1]["Notes"])
+                self.assertNotIn(holder.current_session, work[1]["Notes"])
+                expected_wait = "waiting on build queue" if reason == "build queue" else reason
+                self.assertEqual(work[1]["Notes"],
+                    f"phase 10 — Verify delivery · test: verify the completed rows · {expected_wait} (held by builder) 5m")
+                self.assertEqual([row["Queued"] for row in work], ["plan: phase 12: Later delivery", "—"])
+
+        side_path = history / "later-finished.jsonl"
+        side_events: list[dict[str, object]] = [
+            {"event_type": "run_started", "run_id": "later-finished", "run_started_at": now - 10,
+             "owner_staff_id": member.id, "working_dir": str(self.root), "plan_doc": "astra-review.md"},
+            {"event_type": "phase_started", "phase_id": "review", "phase_instance_id": "side-review",
+             "phase_title": "Side review", "timestamp_epoch": now - 9},
+            {"event_type": "pass_started", "phase_instance_id": "side-review", "pass_instance_id": "side-pass",
+             "team_slot": "side-worker", "worker_id": "side-worker", "timestamp_epoch": now - 8},
+        ]
+        current_events = [events[0], events[3], events[8],
+            {"event_type": "pass_started", "phase_id": "10", "phase_instance_id": "ten",
+             "pass_instance_id": "writer-pass", "team_slot": "writer", "worker_id": "historic-writer",
+             "timestamp_epoch": now - 300}]
+        run_cases = (
+            (False, False, "Verify delivery", "phase 10 — Verify delivery"),
+            (True, False, "Verify delivery", "between phases"),
+            (False, True, "Verify delivery", "phase 10 — Verify delivery"),
+            (False, False, "Phase 10 — Verify delivery", "phase 10 — Verify delivery"),
+            (False, False, "pHaSe 10 - Verify delivery", "phase 10 — Verify delivery"),
+            (False, False, "PHASE 10 – Verify delivery", "phase 10 — Verify delivery"),
+        )
+        for between, side_open, title, expected_notes in run_cases:
+            with self.subTest(between=between, side_open=side_open, title=title):
+                selected_events = [dict(event) for event in current_events]
+                selected_events[1]["phase_title"] = title
+                if between:
+                    selected_events.append({"event_type": "phase_finished", "phase_id": "10",
+                        "phase_instance_id": "ten", "timestamp_epoch": now - 200,
+                        "phase_elapsed_seconds": 600, "status": "completed"})
+                _ = path.write_text("\n".join(map(json.dumps, selected_events)) + "\n")
+                _ = side_path.write_text("\n".join(map(json.dumps, side_events + ([] if side_open else [
+                    {"event_type": "run_finished", "timestamp_epoch": now - 5}]))) + "\n")
+                with patch.object(plan_history, "now_epoch", return_value=now):
+                    record = phase_table.build_plan(plan)
+                rendered = unit_phases.table([unit("parallel", live("parallel"))], {"parallel": record},
+                    now=now, zone=ZoneInfo("UTC"),
+                    pane_rows={member.id: [{"slot": "pane-reader", "state": "working"}]})
+                sections = rendered.split("\n\n")
+                status_lines = sections[0].splitlines()
+                headers = [cell.strip() for cell in status_lines[0].split("|")[1:-1]]
+                status = [dict(zip(headers, (cell.strip() for cell in line.split("|")[1:-1]), strict=True))
+                          for line in status_lines[2:]]
+                self.assertEqual([row["Phase"] for row in status], ["1/4" if between else "10"])
+                self.assertEqual([row[unit_phases.worker_heading()] for row in status],
+                                 ["pane-reader working" if between else "verifier working · writer working"])
+                self.assertIn(f"| parallel | {expected_notes}", sections[-1])
+                self.assertNotIn("Side review", rendered)
+                self.assertNotIn("side-worker", rendered)
+                self.assertNotIn("Phase 10 —", rendered)
 
     def test_table_uses_staff_worker_rows_and_shares_detached_run_observations(self) -> None:
         owner = fixture_member("showrunner", name="workers-owner")
@@ -706,6 +959,8 @@ class UnitPhasesTests(unittest.TestCase):
 
         planned = typed_record(self.root / "plan.md", "running", *(["todo"] * 19))
         planned = planned._replace(plan_finish=phase_table.PredictedFinish(planned.updated + timedelta(hours=1)))
+        planned = planned._replace(phases=[*planned.phases[:-1], replace(planned.phases[-1],
+            times=phase_table.PredictedPhaseTiming(start=planned.updated, finish=planned.updated + timedelta(hours=1)))])
         now = planned.updated.timestamp()
         record["started_at"] = now - 60
         for label_size, other in ((60, False), (20, True)):
@@ -732,7 +987,7 @@ class UnitPhasesTests(unittest.TestCase):
                     if "Status" in headers:
                         self.assertEqual(headers[-2:], ["ETA Plan", unit_phases.worker_heading()])
                 self.assertEqual(values["Progress"], "🟨" + "⬜" * 19)
-                self.assertEqual(values["ETA Next"], "no ETA")
+                self.assertEqual(values["ETA Next"], "no ETA stated")
                 self.assertEqual(values["ETA Plan"], "19:00")
                 self.assertEqual(values["Notes"], "phase 1 — Delivery 1")
                 self.assertEqual(values["Queued"], "plan: phase 2: Delivery 2 +18 more")
@@ -786,7 +1041,7 @@ class UnitPhasesTests(unittest.TestCase):
                 {"event_type": "phase_started", "phase_id": "1", "phase_title": "Done work",
                  "phase_instance_id": f"done-{index}", "phase_started_at": now - 600},
                 {"event_type": "phase_finished", "phase_id": "1", "phase_instance_id": f"done-{index}",
-                 "timestamp_epoch": now - 500, "phase_elapsed_seconds": 100},
+                 "timestamp_epoch": now - 500, "phase_elapsed_seconds": 100, "status": "completed"},
                 {"event_type": "phase_started", "phase_id": "2", "phase_title": "Open work",
                  "phase_instance_id": f"open-{index}", "phase_started_at": now - 400},
                 {"event_type": "eta_stated", "eta_phase_id": "2", "phase_instance_id": f"open-{index}",
@@ -811,7 +1066,7 @@ class UnitPhasesTests(unittest.TestCase):
                 (False, False, False, True, [], "🟩🟨🟨", "phase 2 — Open work",
                  "18:30", "plan: phase 3: New work +1 more"),
                 (True, False, False, False, [], "—", "no phases", "—", "plan: phase 2: Open work +2 more"),
-                (False, False, True, False, [], "🟩🟨", "phase 2 — fix: repair Notes · fix rounds 1 + 1 running",
+                (False, False, True, False, [], "🟩🟨", "phase 2 — Open work · fix: repair Notes · fix rounds 1 + 1 running",
                  "18:30", "plan: phase 3: New work +1 more"),
                 (False, True, False, False, [], "🟩🟨", "phase 2 — Open work", "18:30", "—")):
             with self.subTest(finished=finished, missing=missing, fixing=fixing, other=other, queue_items=queue_items):
@@ -848,10 +1103,10 @@ class UnitPhasesTests(unittest.TestCase):
                     values.update(zip(headers, cells, strict=True))
                 expected = {"Unit": "fallback", "Status": "exited", "Notes": notes}
                 if not finished:
-                    expected.update({"Progress": progress, "Phase": "1/3" if other else "1/2", "ETA Next": eta,
+                    expected.update({"Progress": progress, "Phase": "2", "ETA Next": eta,
                                      "ETA Plan": "18:30"})
                 if other:
-                    expected["Non-Phase Work"] = "outside: —"
+                    self.assertIn("| fallback | phase outside — Other work |", rendered)
                 if queued != "—":
                     expected["Queued"] = queued
                 self.assertEqual(values, expected)
@@ -878,7 +1133,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(unit_phases.table(units, records), "\n".join([
                     f"| Unit | Status |{column} Progress | Phase | ETA Next |",
                     f"| --- | --- |{separator} --- | --- | --- |",
-                    f"| one | idle |{first_machine} 🟨⬜ | 0/2 | no ETA |",
+                    f"| one | idle |{first_machine} 🟨⬜ | 0/2 | no ETA stated |",
                     f"| two | exited |{second_machine} — | — | — |",
                     "",
                     legend,
@@ -1179,15 +1434,15 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines(), [
             "| Unit | Status | Progress | Phase | ETA Next |",
             "| --- | --- | --- | --- | --- |",
-            "| one | exited | 🟨⬜ | 0/2 | no ETA |",
-            "| two | exited | 🟨⬜ | 0/2 | no ETA |",
+            "| one | exited | 🟨⬜ | 1 | no ETA stated |",
+            "| two | exited | 🟨⬜ | 1 | no ETA stated |",
             "",
             "Progress: 🟩 done · 🟨 open · ⬜ not started",
             "",
             "| Unit | Notes | Queued |",
             "| --- | --- | --- |",
-            "| one | phase 1 — impl: write one | plan: phase 2: Later work |",
-            "| two | phase 1 — impl: write two | plan: phase 2: Later work |",
+            "| one | phase 1 — First work · impl: write one | plan: phase 2: Later work |",
+            "| two | phase 1 — First work · impl: write two | plan: phase 2: Later work |",
         ])
 
     def test_without_a_production_the_callers_staff_name_selects_it(self) -> None:

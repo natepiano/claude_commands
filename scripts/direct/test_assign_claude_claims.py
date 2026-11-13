@@ -9,6 +9,8 @@ import sys
 from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
 from scripts.production.cli_fixture import process_boundary
 from scripts.lib import process_start
+from scripts.direct import worker_state
+from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -34,7 +36,9 @@ class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture):
         claim = session / "impl_claim_fixture-impl.json"
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)
-        saved = json.dumps({"pid": os.getpid(), "started": started.start, "worker": "fixture-impl"})
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
+        saved = json.dumps({"pid": os.getpid(), "started": started.start, "worker": "fixture-impl", "scope": scope})
         _ = claim.write_text(saved)
         before = self.open_passes(session)
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
@@ -53,8 +57,10 @@ class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture):
         claim = session / "impl_claim_fixture-impl.json"
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
         _ = claim.write_text(json.dumps({
-            "pid": os.getpid(), "started": started.start + "-previous", "worker": "fixture-impl",
+            "scope": scope, "pid": os.getpid(), "started": started.start + "-previous", "worker": "fixture-impl",
         }))
         _ = (session / "impl_status_fixture-impl").write_text("implementing\n")
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
@@ -74,7 +80,9 @@ class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture):
         claim = session / "impl_claim_fixture-impl.json"
         with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
             _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
-        _ = claim.write_text(json.dumps({"pid": child.pid, "started": "ended-launcher-start", "worker": "fixture-impl"}))
+        worker_state.publish_worker_claim(claim, "fixture-impl")
+        scope = cast(dict[str, object], json.loads(claim.read_text()))["scope"]
+        _ = claim.write_text(json.dumps({"scope": scope, "pid": child.pid, "started": "ended-launcher-start", "worker": "fixture-impl"}))
         result = self.worker_launch(session, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "impl_status_fixture-impl").read_text(), "implemented\n")
