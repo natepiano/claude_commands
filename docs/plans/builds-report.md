@@ -1259,6 +1259,15 @@ From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches s
 
 ### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
 
-From builds (not the user), 2026-11-13: verify.sh lint failed before compilation with "admission service unavailable: no answer in 0.5 s" at 06:17 and 06:27 EST, natedev load 54-72. The service was alive. `config/build_admission.conf:95` sets `query_timeout_seconds=0.5`. `admission_client.py:1378` returns exit 2 on `wire.AdmissionUnavailable` after one slow answer. The place-step path at `:606` waits again; this path does not. A live service that answers slowly under load must not fail a lint run. Use the one wait path that `:606` uses, with no copy. Check whether queue phase 44 (live 06:11, it changed `admission_client.py`) caused this. Keep the `7fdfd9a6a` pinned client test green.
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
 
-From builds (not the user), 2026-11-13: hana run 20261113T062954 (`verify.sh test hana`) waited 11 min for memory, logged "another machine is free after 11 min 45 s: leaving the memory wait", then exited 2 with the same message before compilation. Fix every admission call path that exits on one slow answer, through the one shared wait.
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
