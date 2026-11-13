@@ -202,11 +202,20 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
     return parser.parse_args(argv, namespace=PageArguments())
 
 
+def page_url() -> str:
+    """Return the configured page URL without publishing a reading."""
+    folder = configured_output_folder(conf.read("memory_feed")).resolve()
+    page = folder / "memory_live.html"
+    url = review_link.snapshot_url(review_link.review_root().resolve(), page)
+    if not page.is_file():
+        raise FileNotFoundError(f"Builds page is not available: {page}")
+    return url
+
+
 def page_link() -> int:
     """Print the configured page URL without publishing a reading."""
     try:
-        folder = configured_output_folder(conf.read("memory_feed")).resolve()
-        url = review_link.snapshot_url(review_link.review_root().resolve(), folder / "memory_live.html")
+        url = page_url()
     except review_link.SNAPSHOT_ERRORS as error:
         print(f"Build page link: {error}")
         return 1
