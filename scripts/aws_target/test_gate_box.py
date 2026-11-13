@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import base64
+import inspect
 import json
 import os
 from pathlib import Path
@@ -34,7 +35,7 @@ class GateBoxTests(unittest.TestCase):
         log = (fixture.root / 'box/uploaded-log').read_text()
         lines = [line for line in log.splitlines() if ' stage=' in line]
         self.assertEqual([line.split(' stage=', 1)[1] for line in lines], [
-            'warm-up base', 'warm-up changed', 'round 1 of 3 base', 'round 1 of 3 changed',
+            'source ready', 'warm-up base', 'warm-up changed', 'round 1 of 3 base', 'round 1 of 3 changed',
             'round 2 of 3 changed', 'round 2 of 3 base', 'round 3 of 3 base', 'round 3 of 3 changed', 'finish'])
         for line in lines:
             self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
@@ -59,11 +60,16 @@ class GateBoxTests(unittest.TestCase):
                 fixture = trial_tests.PairedTrialTests()
                 self.addCleanup(fixture.doCleanups)
                 fixture.setUp()
-                guest = gate_box.GUEST.replace('def stage(name):', failure + 'def stage(name):')
-                guest = guest.replace("(root / 'boot.log').open('a')",
+                path = fixture.repo / 'scripts/aws_target/gate_box.py'
+                source = path.read_text().replace('def stage(name):', failure + 'def stage(name):')
+                source = source.replace("(root / 'boot.log').open('a')",
                     f"(FailedStageWrite() if name == {name!r} else (root / 'boot.log').open('a'))")
-                with mock.patch.object(gate_box, 'GUEST', guest):
-                    reply, traces = fixture.guest()
+                _ = path.write_text(source)
+                _ = gate_trial.checked_git(fixture.repo, 'add', '.')
+                _ = gate_trial.checked_git(fixture.repo, 'commit', '-qm', 'Fail the candidate stage writer')
+                fixture.changed = gate_trial.checked_git(fixture.repo, 'rev-parse', 'HEAD')
+                _ = gate_trial.checked_git(fixture.repo, 'push', str(fixture.origin), 'HEAD:refs/heads/stage')
+                reply, traces = fixture.guest()
                 self.assertIn(' stage=' + name + '\n', (fixture.root / 'box/failed-stage-write').read_text())
                 self.assertEqual(len(traces), 8)
                 runs = ledger.rows(reply, 'runs')
@@ -84,10 +90,18 @@ class GateBoxTests(unittest.TestCase):
         self.assertIs(gate_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
-        self.assertIn('merge_gate.SelectedModules', gate_box.GUEST)
+        self.assertNotIn('merge_gate', gate_box.GUEST)
+        self.assertIn('merge_gate.SelectedModules', gate_box.CANDIDATE_GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
         self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
+
+    def test_guest_names_no_merge_gate_signal_function(self) -> None:
+        for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):
+            self.assertNotIn('rollback_signals', code)
+            self.assertNotIn('defer_signals', code)
+            self.assertNotRegex(code, r'\bmerge_gate\.\w*signal\w*')
+            self.assertNotIn('signal.signal', code)
 
     def test_boot_timestamps_use_local_kernel_and_cached_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -97,7 +111,7 @@ class GateBoxTests(unittest.TestCase):
             cloud_init = root / 'instance-data.json'
             stat = root / 'stat'
             _ = stat.write_text('cpu 1 2 3\nbtime 1768438700\n')
-            prefix = gate_box.LEGACY_GUEST.split("links['boot'] =", 1)[0].replace(
+            prefix = gate_box.GUEST.split("links['boot'] =", 1)[0].replace(
                 "'/proc/stat'", repr(str(stat))).replace(
                 "'/etc/ec2-metadata/instance-identity-document'", repr(str(metadata))).replace(
                 "'/run/cloud-init/instance-data.json'", repr(str(cloud_init)))
@@ -125,7 +139,7 @@ class GateBoxTests(unittest.TestCase):
                         self.assertNotIn('instance_running_at', timestamps)
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
-        links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+        links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size',
                  'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
                  'result': 'https://fixture.invalid/artifacts/attempt/result.json',
                  'log': 'https://fixture.invalid/artifacts/attempt/gate.log'}
@@ -151,7 +165,7 @@ class GateBoxTests(unittest.TestCase):
 
     def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
         modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
-        links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+        links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size',
                  'attempt': 'a' * 32, 'commit': 'b' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                  'origin': 'https://example.invalid/team/project.git', 'source': 'https://fixture.invalid/source/' + 'd' * 64 + '.bundle',
                  'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
@@ -182,28 +196,67 @@ class GateBoxTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
+        self.production_boot_stubs(('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'))
+
+    def test_candidate_renamed_suite_runner_uses_its_own_entry_point(self) -> None:
+        self.production_boot_stubs(('',), candidate_change='rename')
+
+    def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
+        self.production_boot_stubs(('',), candidate_change='missing')
+
+    def test_bootstrap_renders_with_mock_process_memory_mib(self) -> None:
+        code = '''from unittest import mock
+from scripts.production import merge_gate
+with mock.patch.object(merge_gate, 'process_memory_mib'):
+    from scripts.aws_target import gate_box
+    compile(gate_box.GUEST, '<bootstrap>', 'exec')
+    assert 'merge_gate' not in gate_box.GUEST
+    assert 'inspect.getsource' not in gate_box.GUEST
+'''
+        reply = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
+
+    def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '') -> None:
         stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
-        for failure in ('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'):
+        for failure in failures:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
                 (root / 'home').mkdir()
-                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'config'):
+                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
+                library = repo / 'scripts/lib'
+                _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
+                self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
+                _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport os\n'
+                    'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
-                    + 'rollback_signals = nullcontext\n'
+                    + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
                     + 'def run_suites(*args, **kwargs):\n'
                     + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
+                    + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
-                    'def encode_run(run): return {"passed": run.passed}\n'
+                    'import json\nfrom pathlib import Path\nfrom typing import cast\n'
+                    + f'GUEST_TRANSFERS = {gate_box.GUEST_TRANSFERS!r}\n'
+                    + f'PAIRED_GUEST = {gate_box.PAIRED_GUEST!r}\n'
+                    + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
+                    + inspect.getsource(gate_box.run_guest)
+                    + '\ndef encode_run(run): return {"passed": run.passed}\n'
                     + 'def completion_record(*args): return {"kind": "gate_run"}\n')
+                if candidate_change == 'rename':
+                    for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
+                        path = repo / relative
+                        _ = path.write_text(path.read_text().replace('run_suites', 'candidate_suites'))
+                elif candidate_change == 'missing':
+                    path = repo / 'scripts/aws_target/gate_box.py'
+                    _ = path.write_text(path.read_text().replace('def run_guest(', 'def old_guest('))
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
@@ -265,7 +318,7 @@ else:
                     _ = command.write_text(stub)
                     command.chmod(0o700)
                 (tools / 'python3').symlink_to(sys.executable)
-                links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
+                links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
                          'source': 'https://fixture.invalid/source/snapshot.bundle',
@@ -285,13 +338,21 @@ else:
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
                            for row in uploads if ledger.text(row, 'destination').endswith(('/result.json', '/boot-error.json'))]
                 self.assertTrue(results, log + reply.stderr)
-                self.assertEqual(results[-1]['verdict'], 'error' if failure else 'pass', log)
+                self.assertEqual(results[-1]['verdict'], 'error' if failure or candidate_change == 'missing' else 'pass', log)
+                if candidate_change == 'missing':
+                    self.assertEqual(results[-1]['error'], 'candidate predates guest entry point')
+                    refusals = [row for row in uploads if row['destination'] == links['boot_error']]
+                    self.assertEqual(len(refusals), 1)
+                    self.assertEqual(json.loads(ledger.text(refusals[0], 'body'))['error'],
+                                     'candidate predates guest entry point')
+                    self.assertNotIn('stage=tests start', log)
                 if failure:
                     self.assertIn('error', results[-1])
                 if failure == 'nix':
                     self.assertIn('stage=boot', ledger.text(uploads[0], 'body'))
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
-                if not failure:
+                if not failure and candidate_change != 'missing':
+                    self.assertEqual((root / 'received-limit').read_text(), '2.5')
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
                     result = results[-1]
                     self.assertGreaterEqual(float(str(result['nix_ready_at'])), int(str(result['user_data_started_at'])))

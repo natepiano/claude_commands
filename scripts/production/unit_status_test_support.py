@@ -1,6 +1,8 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
@@ -114,6 +116,7 @@ class UnitStatusFixture(unittest.TestCase):
         for name in ("sessions",):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
+        copy_runtime(root)
         _ = shutil.copytree(root, cls.fixture_seed)
         shutil.rmtree(root)
 

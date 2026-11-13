@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import fixture_shim_source
+
 from scripts.lint.memory_test_support import write_pressure_reading
 
 from scripts.build_queue.admission_test_support import caller_admission
@@ -201,7 +203,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         for entry in source.iterdir():
             if entry.name != "py":
                 (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-        builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        builder.write_executable(library / "py", fixture_shim_source())
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
@@ -302,7 +304,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
-PY=${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}
+PY=$HOME/.claude/scripts/lib/py
 CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
 STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
@@ -490,6 +492,8 @@ else:
 from pathlib import Path
 with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + chr(10))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
         return starts
@@ -532,14 +536,22 @@ from pathlib import Path
 if os.environ.get("TEST_PYTHON_STARTS"):
     with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "step":
-    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
-        output.write(json.dumps({"start": sys.argv[4], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[9:]}) + chr(10))
-if len(sys.argv) > 2 and sys.argv[1].endswith("/buildlog/record.py") and sys.argv[2] == "call":
-    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
-    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
+        recorder = self.fixture.home / ".claude/scripts/buildlog/record.py"
+        source = recorder.read_text()
+        observation_code = '''
+if sys.argv[1:2] == ["step"]:
+    with Path(os.environ["TEST_STEP_OBSERVATIONS"]).open("a") as output:
+        output.write(json.dumps({"start": sys.argv[3], "mem_wait": os.environ.get("BUILDLOG_MEM_WAIT_S", ""), "arguments": sys.argv[8:]}) + chr(10))
+if sys.argv[1:2] == ["call"]:
+    path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
+    Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
+'''
+        _ = recorder.write_text(source.replace('runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")',
+            observation_code + 'runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")'))
         observation = self.fixture.root / "wait-observation"
         self.fixture.environment.update({"CLAUDE_PYTHON": str(observer), "TEST_REAL_PYTHON": sys.executable, "TEST_WAIT_OBSERVATION": str(observation), "TEST_STEP_OBSERVATIONS": str(self.fixture.root / "step-observations")})
         return observation

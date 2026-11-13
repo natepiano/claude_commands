@@ -24,17 +24,13 @@ from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 
-CHILD_TEST_SETUP = '''import os, runpy, sys
-from importlib.machinery import PathFinder
-
-# Preserve the system setup before applying the test budget.
-folder = os.path.dirname(os.path.abspath(__file__))
-paths = [entry for entry in sys.path if os.path.abspath(entry) != folder]
-original = PathFinder.find_spec('sitecustomize', paths)
-if original is not None and original.origin is not None:
-    runpy.run_path(original.origin, run_name='_system_sitecustomize')
+CHILD_TEST_SETUP = '''import runpy, sys
+startup = runpy.run_path({startup!r}, run_name='_repeat_python_startup')
+startup['select_checkout'](sys.argv)
+startup['next_sitecustomize'](__file__)
 from scripts.message import repeat_guard
 repeat_guard.GUARD_IO_CEILING_SECONDS = {budget}
+startup['finish_startup'](__file__, sys.argv)
 '''
 
 
@@ -44,10 +40,11 @@ def install_guard_test_budget() -> None:
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.object(
         repeat_guard, "GUARD_IO_CEILING_SECONDS", TEST_HANG_GUARD_SECS)))
     folder = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = (folder / "sitecustomize.py").write_text(CHILD_TEST_SETUP.format(budget=TEST_HANG_GUARD_SECS))
-    paths = [str(folder), str(root)]
-    if existing := os.environ.get("PYTHONPATH"):
-        paths.append(existing)
+    _ = (folder / "sitecustomize.py").write_text(CHILD_TEST_SETUP.format(
+        budget=TEST_HANG_GUARD_SECS, startup=str(root / "scripts/lib/python_startup/sitecustomize.py")))
+    from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+    paths = [str(folder), *inherited_paths(os.environ.get("PYTHONPATH", ""))]
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(
         os.environ, {"PYTHONPATH": os.pathsep.join(paths)})))
 

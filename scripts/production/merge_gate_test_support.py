@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
@@ -14,6 +17,7 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,6 +37,7 @@ from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
+from scripts.buildlog import index
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -45,11 +50,11 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 
 
 def install_test_runner(checkout: Path) -> Path:
-    """Install the real runner and its descendant helper in a fixture checkout."""
-    for relative in ("test_times/module_run.py", "lib/descendants.py"):
-        destination = checkout / "scripts" / relative
+    """Install the runner, its bootstrap, and its descendant helper in the copy."""
+    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py", "scripts/lib/conf_reads.py"):
+        destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+        _ = shutil.copyfile(SCRIPT.parents[2] / relative, destination)
     return checkout / "scripts/test_times/module_run.py"
 
 
@@ -158,18 +163,20 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(str(Path.cwd()), os.environ.get("PYTHONPATH", "").split(os.pathsep))
+            self.assertIn(str(Path.cwd()), sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         if (state / "sample-module-memory").exists():
-            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
-                exec(package_root.read(), {"__file__": package_root.name})
-            from scripts.direct.wait_for_test_state import wait_until
+            import subprocess
+            checkout = Path(os.environ["MERGE_GATE_TEST_REPO"])
             (state / (str(os.getpgrp()) + ".memory-ready")).touch()
-            wait_until((state / (str(os.getpgrp()) + ".memory-done")).exists,
-                       state, timeout=TEST_HANG_GUARD_SECS)
+            subprocess.run([str(checkout / "scripts/lib/py"),
+                            str(checkout / "scripts/direct/wait_for_test_state.py"),
+                            str(state / (str(os.getpgrp()) + ".memory-done"))],
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
         death = state / ("signal-" + suite)
         if death.exists():
             if death.read_text() == "once":
@@ -207,7 +214,8 @@ class FixtureTest(unittest.TestCase):
         if (state / "leak-child").exists() and suite == "hooks":
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=(state / "detached-child").exists())
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
@@ -325,6 +333,7 @@ class MergeGateFixture(unittest.TestCase):
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -350,6 +359,7 @@ class MergeGateFixture(unittest.TestCase):
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
+            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -405,7 +415,7 @@ class MergeGateFixture(unittest.TestCase):
         self.checkout = self.root / "merge"
         self.unit = self.root / "unit"
         self.main = self.root / "main"
-        self.bin = self.root / "bin"
+        self.bin = self.root / "tools/bin"
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
@@ -529,8 +539,20 @@ class MergeGateFixture(unittest.TestCase):
 
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
+        copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
+        _ = write_config_fixture(self.root / "config/buildlog.conf")
+        _ = write_config_fixture(self.root / "config/merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        # These tests prove gate behavior without a near deadline from their short jobs.
+        history = Path(self.environment["BUILDLOG_DIR"])
+        history.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
+            index.create_schema(connection)
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES ('fixture-normal', '2000-01-01', 'merge-gate', ?, 0, 0, 'full', 1000000)""",
+                (os.cpu_count() or 1,)).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"

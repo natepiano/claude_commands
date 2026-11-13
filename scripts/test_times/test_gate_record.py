@@ -8,6 +8,7 @@ import gzip
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 from typing import cast, override
@@ -16,7 +17,7 @@ from unittest import mock
 
 
 from scripts.test_times import gate_record
-from scripts.buildlog import record, store
+from scripts.buildlog import index, record, store
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
 from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, module_times
@@ -40,6 +41,43 @@ class GateRecordTests(unittest.TestCase):
             "HOME": str(self.root / "home"),
         }))
         _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5")
+
+    def test_time_limits_use_passing_history_on_the_same_vcpu_count(self) -> None:
+        _ = write_config_fixture(self.config / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        rows = [("a", 8, 0, 0, "full", 10), ("b", 8, 0, 0, "full", 20),
+                ("c", 8, 0, 0, "full", 30), ("d", 8, 1, 0, "full", 1000),
+                ("e", 16, 0, 0, "full", 1000), ("f", 8, 0, 1, "full", 1000),
+                ("g", 8, 0, 0, "affected", 1000), ("h", 8, 0, 0, "reused", 1000)]
+        for identity, vcpus, status, aborted, selection, seconds in rows:
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES (?, ?, 'merge-gate', ?, ?, ?, ?, ?)""",
+                (identity, identity, vcpus, status, aborted, selection, seconds)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(40))
+        self.assertIsInstance(gate_record.history_time_limit(connection, 4, (), 2, False), gate_record.NoGateTimeLimit)
+        for run, suite, module, seconds, status in (
+                ("a", "lib", "test_a.py", 6, 0), ("b", "lib", "test_a.py", 10, 0),
+                ("c", "lib", "test_a.py", 8, 0), ("c", "lib", "test_b.py", 7, 0),
+                ("c", "lib", "nested/test_c.py", 6, 0), ("e", "lib", "test_b.py", 999, 0),
+                ("d", "lib", "test_b.py", 999, 0), ("c", "lib", "test_bad.py", 999, 1)):
+            connection.execute("""INSERT INTO gate_modules (run_id, suite, module, attempt, wall_s, status, restart)
+                                VALUES (?, ?, ?, 1, ?, ?, '')""", (run, suite, module, seconds, status)).close()
+        modules = ["scripts/lib/test_a.py", "scripts/lib/test_b.py", "scripts/lib/nested/test_c.py"]
+        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 2, True), gate_record.GateTimeLimit(21))
+        self.assertEqual(gate_record.history_time_limit(connection, 8, modules, 8, True), gate_record.GateTimeLimit(16))
+        self.assertIsInstance(gate_record.history_time_limit(connection, 8, ["lib/test_bad.py"], 2, True), gate_record.NoGateTimeLimit)
+        for missing in (["lib/test_missing.py"], ["lib/test_missing.py", "lib/test_other.py"]):
+            with self.subTest(missing=missing):
+                self.assertIsInstance(gate_record.history_time_limit(connection, 8, [*modules, *missing], 2, True),
+                                      gate_record.NoGateTimeLimit)
+        _ = write_config_fixture(self.config / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=3")
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
+        self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
 
     def write_json(self, value: object) -> None:
         _ = self.timing_path.write_text(json.dumps(value), encoding="utf-8")

@@ -399,7 +399,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
-        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parents[1])
+        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parent / "lib/python_startup")
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
@@ -464,7 +464,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
               patch.object(assign, "SCRIPTS", direct),
               patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
               patch.object(assign_claude, "SCRIPTS", direct),
-              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py"))):
+              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
+              direct_launcher_helpers()):
             return invoke_cli(module, child_main, arguments, environment, self.working_dir)
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
@@ -627,3 +628,13 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.loads((session_dir / "progress_history_state.json").read_text(encoding="utf-8")),
         )
         return stored["pass"]
+
+
+class InProcessAssignClaudeLauncherFixture(AssignClaudeLauncherFixture):
+    """Run content calls in process after the fixture prepares its child entry."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_TIER_ONLY": "1"})))
+        _ = self.enterContext(patch.object(self, "direct_cli_calls", not process_boundary_for_case(self)))

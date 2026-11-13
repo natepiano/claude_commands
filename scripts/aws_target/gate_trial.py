@@ -34,7 +34,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.lib.process_group import send_process_group
-from scripts.build_queue.queue_place import defer_cleanup_signals
+from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate import SuiteMode
@@ -277,7 +277,7 @@ def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Pat
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path,
         args.paired_cleanup / 'reservation.cgroup', clock=time.time)
-    with defer_cleanup_signals():
+    with cancellation.defer_cleanup_signals():
         return int(not cleanup_trial(args.paired_cleanup, worker))
 
 
@@ -305,7 +305,7 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                 cloud_gate.save(folder / 'outcome.json', outcome)
                 slot.status = int(outcome.get('status') != 'complete')
             finally:
-                with defer_cleanup_signals():
+                with cancellation.defer_cleanup_signals():
                     if not cleanup_trial(folder, worker):
                         slot.status = 1
     except BaseException as error:
@@ -356,7 +356,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         print('paired trial: ' + str(error), file=sys.stderr)
         failed = True
     finally:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             for process, connection in children:
                 if process.is_alive():
                     process.terminate()
@@ -427,7 +427,7 @@ def paired_service(command: Sequence[str], unit: str) -> int:
         return 1
     finally:
         if not completed:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
 
 
@@ -481,7 +481,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
         return 1
     finally:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             if trial_id:
                 delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 

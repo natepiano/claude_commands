@@ -211,7 +211,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertTrue(root.is_dir())
                     if fails:
                         raise RuntimeError("module preparation failed")
-                    return prepare(root, environment)
+                    prepared = prepare(root, {**environment, "HERDR_BIN": "/host/herdr"})
+                    self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
+                    return prepared
 
                 with mock.patch.object(merge_gate, "test_module_environment", side_effect=prepare_module):
                     if fails:

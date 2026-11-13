@@ -2509,10 +2509,11 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                    for value in readings.compilers)
     for value in unowned:
         activity = value.activity
-        if not isinstance(value.job_state, NotServiceSlice):
+        state = records.recorded_service_state(value)
+        if not isinstance(state, NotServiceSlice):
             running.append(RunningStep("", value.owner, "service", value.cgroup, 0, value,
                 pid=value.pid,
-                started_at=value.job_state.started_at if isinstance(value.job_state, RunningServiceJob) else 0.0))
+                started_at=state.started_at if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0))
             continue
         running.append(RunningStep(
             activity.session_id if isinstance(activity, ScopeProcesses) else "",
@@ -2651,9 +2652,11 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             activity = activity_reader.scope(members, child.name)
             row_pid: int | PidNotRecorded = (activity.members[0].pid
                 if isinstance(activity, ScopeProcesses) and activity.members else PidNotRecorded())
-            job_state: ServiceJobState = NotServiceSlice()
+            job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+            current_state: ServiceJobState = NotServiceSlice()
             if required:
                 job_state = IdleService()
+                current_state = IdleService()
                 programs = member_programs(members.intersection(processes), proc)
                 workers = [pid for pid, program in programs.items() if program == "Runner.Worker"]
                 listeners = [pid for pid, program in programs.items() if program == "Runner.Listener"]
@@ -2661,14 +2664,19 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                 if candidates:
                     oldest = min(candidates, key=lambda pid: (int(processes[pid].start), pid))
                     row_pid = oldest
-                    job_state = service_job_state(workers, processes, tree_pids | scoped_pids, waiters,
-                                                  activity_reader.started_at(oldest))
+                    current_state = service_job_state(workers, processes, tree_pids | scoped_pids, waiters,
+                                                      activity_reader.started_at(oldest))
+                    unregistered = [pid for pid in workers
+                        if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
+                    if unregistered:
+                        first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
+                        job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped,
                                                  cgroup=str(child), owner=child.name,
                                                  activity=activity, pid=row_pid,
-                                                 job_state=job_state))
+                                                 job_state=job_state, service_job_state=current_state))
         except (OSError, ValueError) as error:
             if required:
                 result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), cgroup=str(child),

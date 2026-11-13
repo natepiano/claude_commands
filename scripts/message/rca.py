@@ -65,14 +65,14 @@ from scripts.lib import conf
 
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import review  # noqa: E402
-from scripts.message import sessions  # noqa: E402
+from scripts.message import session_send, sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 from scripts.notify import silence  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import staff  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
-SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
+SEND = Path(os.environ.get("RCA_SEND") or session_send.SEND_SCRIPT)
 CALL = "~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py"
 PROJECTS = Path.home() / ".claude" / "projects"
 # The owner when the session has no production, or its showrunner does not run.
@@ -308,7 +308,7 @@ def send(argv: list[str], *, seconds: float | ConfiguredSendBudget = ConfiguredS
     if seconds <= 0:
         return False, "owner delivery budget exhausted; retained for the next pass"
     try:
-        result = subprocess.run([sys.executable, str(SEND), *argv], capture_output=True, text=True,
+        result = subprocess.run(session_send.send_argv(*argv, send_script=SEND), capture_output=True, text=True,
                                 timeout=seconds, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, str(error)

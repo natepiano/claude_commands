@@ -2491,7 +2491,7 @@ class QueueLifecycleTests(unittest.TestCase):
 class CiSliceAdmissionTests(unittest.TestCase):
 
     def test_ci_worker_uses_the_current_reservation_and_waiter_identity(self) -> None:
-        from scripts.build_queue.scope_activity import RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+        from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
 
         for admitted, expected in ((True, RunningServiceJob), (False, WaitingServiceJob)):
             with self.subTest(admitted=admitted), AdmissionFixture() as fixture:
@@ -2512,7 +2512,8 @@ class CiSliceAdmissionTests(unittest.TestCase):
                 ci, = (step.measured for step in view.reading.view.running
                        if isinstance(step.measured, records.UnownedSliceMemory)
                        and step.measured.cgroup == str(fixture.root / "ci.slice"))
-                self.assertIsInstance(ci.job_state, expected)
+                self.assertIsInstance(ci.service_job_state, expected)
+                self.assertIsInstance(ci.job_state, IdleService if admitted else RunningServiceJob)
                 self.assertEqual(len(view.reading.view.waiting), int(not admitted))
                 if admitted:
                     grant = only_admitted(reply)
@@ -2525,7 +2526,8 @@ class CiSliceAdmissionTests(unittest.TestCase):
                 ci, = (step.measured for step in view.reading.view.running
                        if isinstance(step.measured, records.UnownedSliceMemory)
                        and step.measured.cgroup == str(fixture.root / "ci.slice"))
-                self.assertIsInstance(ci.job_state, UnmatchedServiceJob)
+                self.assertIsInstance(ci.service_job_state, UnmatchedServiceJob)
+                self.assertIsInstance(ci.job_state, RunningServiceJob)
 
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
         for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):

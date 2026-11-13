@@ -194,7 +194,7 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
 
 def service_activity_text(memory: admission_records.CompilerServiceMemory | admission_records.UnownedSliceMemory, now: float) -> str:
     """Describe the recorded service state at the pass time."""
-    state = memory.job_state
+    state = admission_records.recorded_service_state(memory)
     if isinstance(state, NotServiceSlice):
         raise ValueError("a build scope has no service state")
     if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)):
@@ -221,7 +221,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
     if isinstance(memory, admission_records.CompilerServiceMemory) or (
-            isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(memory.job_state, NotServiceSlice)):
+            isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)):
         return service_text(memory, explanation.now)
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at

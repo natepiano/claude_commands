@@ -5223,7 +5223,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.environment["TEST_QUEUE_CLIENT"] = str(queue_client)
         self.environment["TEST_CAPTURE_WIDTH"] = str(capture)
         self.environment["TEST_PY"] = str(Path(__file__).resolve().parents[1] / "lib/py")
-        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
 
 
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
@@ -5976,12 +5976,13 @@ class CiSliceMemoryTests(unittest.TestCase):
                 reading, = gate.unowned_slice_memory([row] if admitted else [], gate.process_table(self.proc), self.proc,
                     ci_memory_slice=admission_records.read_memory_config().ci_memory_slice,
                     waiters=[waiter] if waiting else [])
-                self.assertIsInstance(reading.job_state, expected)
+                self.assertIsInstance(reading.service_job_state, expected)
+                self.assertIsInstance(reading.job_state, IdleService if admitted else RunningServiceJob)
                 self.assertEqual(reading.bytes, (2 if admitted else 3) * GIB)
         waiter["start_time"] = "old-owner"
         reading, = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc,
             ci_memory_slice=admission_records.read_memory_config().ci_memory_slice, waiters=[waiter])
-        self.assertIsInstance(reading.job_state, UnmatchedServiceJob)
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
 
     def test_registered_and_unregistered_jobs_each_enter_the_cap_once(self) -> None:
         for shared in (0, 2):
@@ -6056,7 +6057,8 @@ class CiSliceMemoryTests(unittest.TestCase):
         idle = self.queue_with_ci(self.reading()).explanation.room
         self.start_ci_job()
         reading = self.reading()
-        self.assertIsInstance(reading.job_state, UnmatchedServiceJob)
+        self.assertIsInstance(reading.job_state, RunningServiceJob)
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
         active = self.queue_with_ci(reading).explanation.room
         assert isinstance(idle, admission_records.MemoryRoom)
         assert isinstance(active, admission_records.MemoryRoom)

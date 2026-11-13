@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_startup
+
 from dataclasses import dataclass
 import json
 import math
@@ -349,7 +351,7 @@ class Reads(unittest.TestCase):
     def test_reads(self):
         conf.read('alpha').text('value')
         subprocess.run([sys.executable, '-c', "from scripts.lib import conf; conf.read('gamma').text('value')"],
-                       env={{**os.environ, 'PYTHONPATH': {str(repository)!r}}}, check=True)
+                       env={{**os.environ, 'PYTHONPATH': {str(repository / 'scripts/lib/python_startup')!r}}}, check=True)
         subprocess.run(['/bin/bash', '-c', 'source "$1"; conf_value beta value', 'fixture',
                        {str(repository / 'scripts/lib/conf.sh')!r}], check=True, capture_output=True)
 """
@@ -418,7 +420,8 @@ finally:
             runner = root / "scripts/test_times/module_run.py"
             runner.parent.mkdir()
             _ = runner.write_text(RUNNER.read_text())
-            for name in ("conf_reads.py", "package_root.py"):
+            for name in ("conf_reads.py", "package_root.py", "python_startup/sitecustomize.py"):
+                (library / name).parent.mkdir(parents=True, exist_ok=True)
                 _ = (library / name).write_text((RUNNER.parents[1] / "lib" / name).read_text())
             for package in (root / "scripts", library, root / "tests", root / "import_only"):
                 package.mkdir(exist_ok=True)
@@ -432,7 +435,7 @@ finally:
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
-            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(root),
+            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
                            "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
             for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
                 _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
@@ -635,6 +638,11 @@ class FixtureCPU(unittest.TestCase):
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            copy_startup(root)
+            runner = root / "scripts/test_times/module_run.py"
+            runner.parent.mkdir(parents=True, exist_ok=True)
+            _ = runner.write_text(RUNNER.read_text())
+            _ = (root / "scripts/lib/descendants.py").write_text((RUNNER.parents[1] / "lib/descendants.py").read_text())
             folder = root / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
@@ -652,7 +660,7 @@ class FixtureCPU(unittest.TestCase):
             for working_directory in (root, folder, Path("/home")):
                 with self.subTest(case="package name", cwd=working_directory):
                     result = subprocess.run(
-                        [str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(folder), "test_package_name.py"],
+                        [str(root / "scripts/lib/py"), str(runner), str(folder), "test_package_name.py"],
                         cwd=working_directory, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -723,6 +731,75 @@ class FixtureCPU(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "Descendant adoption uses Linux prctl and pidfds")
 class ModuleProcessCleanupTests(unittest.TestCase):
+    def test_gate_parent_death_keeps_the_sigkill_status_without_a_traceback(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog"),
+            "PYTHONPATH": str(root)})
+        _ = environment.pop("TEST_TIMES_OUT", None)
+        _ = (root / "test_parent.py").write_text("""import signal, unittest
+class ParentDeath(unittest.TestCase):
+    def test_wait(self):
+        print('ready', flush=True)
+        signal.pause()
+""", encoding="utf-8")
+        parent = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        processes.track(parent)
+        environment["MERGE_GATE_PARENT_PID"] = str(parent.pid)
+        runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
+            env=environment, cwd=root, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        processes.track(runner)
+        output = runner.stdout
+        assert output is not None
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+        self.assertEqual(cast(str, output.readline()), "ready\n")
+        parent.send_signal(signal.SIGTERM)
+        self.assertEqual(parent.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+        stdout, stderr = runner.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(runner.returncode, -signal.SIGKILL, stdout + stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
+        from scripts.production import merge_gate
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment({**os.environ, "HOME": str(root / "home"),
+            "CONF_DIR": str(root / "config"), "BUILDLOG_DIR": str(root / "buildlog")})
+        source = fr"""import os, signal, subprocess, sys
+reader, writer = os.pipe()
+prefix = 'import os; os.write(' + str(writer) + ', b"R"); os.close(' + str(writer) + '); os.read(0, 1)\n'
+child = subprocess.Popen([sys.executable, '-c', prefix + {merge_gate.SUITE_BOOTSTRAP!r},
+    sys.executable, '-c', 'import signal; signal.pause()'],
+    env={{**os.environ, 'MERGE_GATE_PARENT_PID': str(os.getpid())}},
+    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    pass_fds=(writer,), start_new_session=True)
+os.close(writer)
+os.read(reader, 1)
+os.close(reader)
+print(child.pid, flush=True)
+signal.pause()
+"""
+        parent = subprocess.Popen([sys.executable, "-c", source], env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(parent)
+        output = parent.stdout
+        assert output is not None
+        self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+        child = int(cast(str, output.readline()))
+        descriptor = os.pidfd_open(child)
+        self.addCleanup(os.close, descriptor)
+        parent.send_signal(signal.SIGTERM)
+        stdout, stderr = parent.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(parent.returncode, -signal.SIGTERM, stdout + stderr)
+        self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                        "The module survived a gate that ended before bootstrap setup")
+
     def test_ignored_sigchld_keeps_the_test_process_status_and_inheritance(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (root / "test_signal.py").write_text(

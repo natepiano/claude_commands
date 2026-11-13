@@ -1301,13 +1301,39 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         self.assertEqual(scopes, [("module",)])
 
     def test_a_modules_cell_stays_current_after_a_comment_only_change_at_each_scope(self) -> None:
+        from scripts.style.style_ledger import _only_comments_changed, _rust_code  # pyright: ignore[reportPrivateUsage]
+        source = "mod first {\n//! Inner doc.\nfn value() { work(); }\n}\nmod second {}\n"
+        changes = (
+            ("equal code", source, True),
+            ("comment", "// A note.\n" + source, True),
+            ("moved inner doc", source.replace("//! Inner doc.\n", "").replace("mod second {}", "mod second {\n//! Inner doc.\n}"), False),
+            ("code", source.replace("work()", "other()"), False),
+        )
+        for label, changed, expected in changes:
+            with self.subTest(comparison=label):
+                old_code, new_code = _rust_code(source.encode()), _rust_code(changed.encode())
+                self.assertIsInstance(old_code, style_ledger.RustCode)
+                assert isinstance(old_code, style_ledger.RustCode)
+                self.assertEqual(len(old_code.digest), 32)
+                code = {"old": old_code, "new": new_code}
+                before = {"file.rs": style_ledger.TreeEntry("100644", "blob", "old")}
+                after = {"file.rs": style_ledger.TreeEntry("100644", "blob", "new")}
+                self.assertEqual(_only_comments_changed(before, after, code.__getitem__), expected)
         file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
         for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
             self.comment_only_change(relative)
         self.set_tip(self.commit("Change comments only"))
-        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
-            with self.subTest(rule=rule):
-                self.assertEqual(self.states(rule)[judged], "current")
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with self.ledger() as ledger, mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+            for _ in range(2):
+                for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
+                    with self.subTest(rule=rule):
+                        states = {cell.path: cell.state for cell in ledger.cells(rule=rule)}
+                        self.assertEqual(states[judged], "current")
+            _ = ledger.declaration_reading((), lambda _: False)
+        commits = [cast(tuple[Path, str], call.args)[1] for call in builds.call_args_list]
+        self.assertGreaterEqual(len(commits), 2)
+        self.assertEqual(len(commits), len(set(commits)))
 
     def test_a_names_cell_goes_stale_after_a_comment_only_change(self) -> None:
         _, _, _, names_rule, _ = self.comment_scope_rules()

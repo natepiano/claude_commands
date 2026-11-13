@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import unittest
 from scripts.accounts import accounts
-from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
+from scripts.production.cli_fixture import process_boundary
 from scripts.direct import assign_claude_test_support as support
 from scripts.direct.assign_claude_test_support import DIRECT_DIR as DIRECT_DIR
 from scripts.lib.test_models_registry import claude_catalog_environment
-from typing import cast, override
+from typing import cast
 import json
 import os
 import subprocess
@@ -16,14 +16,7 @@ import sys
 from unittest.mock import patch
 
 
-class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_TIER_ONLY": "1"})))
-        # Keep the fixture entry unchanged for startup hooks and child observations.
-        _ = self.enterContext(patch.object(self, "direct_cli_calls", not process_boundary_for_case(self)))
-
+class AssignClaudeLauncherWorkerTests(support.InProcessAssignClaudeLauncherFixture):
     def test_a_companion_fix_starts_after_the_resolver_lands_its_round(self) -> None:
         session = self.start_phase("landed-companion")
         self.open_repair_round(session)

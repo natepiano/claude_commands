@@ -22,25 +22,13 @@ def start_child_collection() -> None:
     cast(Callable[[], None], module.start_child)()
 
 
-def next_sitecustomize() -> None:
-    """Load the next site customization once, including the Nix Python setup."""
-    from importlib.machinery import PathFinder
-    from importlib.util import module_from_spec
+import runpy
+from pathlib import Path
 
-    own = os.path.realpath(os.path.dirname(__file__))
-    remaining: list[str] = []
-    passed_own = False
-    for entry in sys.path:
-        if os.path.realpath(entry) == own:
-            passed_own = True
-        elif passed_own:
-            remaining.append(entry)
-    spec = PathFinder.find_spec("sitecustomize", remaining)
-    if spec is not None and spec.loader is not None:
-        module = module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-
+helper = Path(__file__).resolve().parents[2] / "lib/python_startup/sitecustomize.py"
+startup = runpy.run_path(str(helper), run_name="_coverage_python_startup")
+startup["select_checkout"](sys.argv)
 if os.environ.get("NATEST_COVERAGE_TEST"):
-    start_child_collection()
-next_sitecustomize()
+    startup["after_startup"](start_child_collection)
+startup["next_sitecustomize"](__file__)
+startup["finish_startup"](__file__, sys.argv)

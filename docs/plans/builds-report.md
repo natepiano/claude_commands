@@ -1196,6 +1196,8 @@ From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~
 
 ### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
 
+**Reverted 2026-11-13, landed again in phase 62.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below holds again, with the job state change in phase 62.
+
 From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
 
 #### As-built
@@ -1211,3 +1213,81 @@ From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C15
 - `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
 - `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
 - `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: done
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, with a test that the client at `7fdfd9a6a` parses the new service snapshot.
+
+#### As-built
+
+- The phase 60 as-built above applies again, with one change: `WaitingServiceJob` and `UnmatchedServiceJob` go only in `UnownedSliceMemory.service_job_state`, beside `ServiceJobStateNotRecorded`.
+- `job_state` keeps `RunningServiceJob`, `IdleService` and `NotServiceSlice`. A waiting or unmatched worker keeps the `job_state` value the code before phase 60 wrote, so older clients see no change.
+- `build_ci_row`, `queue_evidence` and `admission_service` read `service_job_state`. The hana CI row shows in Running only for a worker matched to a reservation.
+- `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
+
+**Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
+
+### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
+
+From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches shrank 151.6 GiB" while free space fell 0.9 GiB. The cache total must count the same folders before and after each sweep.
+
+#### As-built
+
+- Cause: the old `scripts/lint/sweep.py` subtracted two cache totals without matching folder paths. A folder that left the list counted as shrinkage.
+- `cache_folder_growth` compares only folders in both readings (`common_cache_bytes`). A folder in only one reading adds no growth and no shrinkage. A record from before phase 63 gives no growth.
+- `MeasuredCacheFolders` keeps one total per folder and a `SharedCacheInode` only for an inode in two or more folders. `CacheFoldersNotMeasured` marks a reading with no folder sizes.
+- `CacheFolderWalk` holds a map in memory from each inode to the first folder that saw it. A second folder registers both as owners, whatever `st_nlink` says. So a link made or removed during the walk counts once. The map is not saved, and it carries across the protected and CI measurements of one sweep.
+- On 37 real folders the saved snapshot is 3,255 bytes and process peak memory is 203.0 MiB.
+- Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
+
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
+
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
+
+### Phase 65 — The build page titles the waiting section by its order · status: done
+
+From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/scratch/user-shot-queued-title.png`: a hairline after the Next step room row, and a title for the waiting section that names its order.
+
+#### As-built
+
+- The Next step room row keeps its place. A 1px hairline after it matches the one before it.
+- The waiting section has a title in the style of "Running, in start order":
+  - "Queued, in order of submission" with no bump.
+  - "Queued, <unit> first, then in submission order" for one bumped unit.
+  - "Queued, <unit> followed by <unit> and then in submission order" for more than one.
+- `memory_feed.py` sends `queued_priority_units`. It reads the queue's own `QueuePriority.entries` (written by `build_queue.py` bump) and the captured waiting order. It does not sort the queue. It drops absent units and duplicates.
+- Tests in `test_memory_feed.py` and `test_memory_hover.py` cover zero, one and two units, removed priorities, source order and escaped text. `memory_page_proof.mjs` checks 18 title cases at three widths in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 66 — Retire /build:queue · status: todo
+
+From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.

@@ -47,7 +47,7 @@ from scripts.buildlog import store
 from scripts.lib import test_phase
 
 from scripts.build_queue.scope_activity import (
-    LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
+    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
     ScopeActivityReader, ScopeProcesses,
 )
 from scripts.lint.build_shape import build_shape, recorded_build_shape
@@ -526,7 +526,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
         except (OSError, ValueError):
             members[reading.cgroup] = frozenset()
-        if not isinstance(reading.job_state, NotServiceSlice):
+        if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
@@ -1455,7 +1455,8 @@ class AdmissionServer:
         tree_pids = gate.process_tree(roots, dict(evidence.processes))
         result: list[records.UnownedSliceMemory] = []
         for memory in evidence.unowned:
-            required = not isinstance(memory.job_state, NotServiceSlice)
+            state = records.recorded_service_state(memory)
+            required = not isinstance(state, NotServiceSlice)
             if not required and memory.cgroup in owned:
                 continue
             scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))] if required else []
@@ -1470,10 +1471,14 @@ class AdmissionServer:
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
             job = (gate.service_job_state(workers, dict(evidence.processes), tree_pids | scoped_pids,
                     [waiting.row for waiting in self.waiters.values()],
-                    memory.job_state.started_at if isinstance(memory.job_state,
+                    state.started_at if isinstance(state,
                         (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0)
-                   if required else memory.job_state)
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
+                   if required else state)
+            legacy_job = memory.job_state
+            if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
+                               dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
+                legacy_job = IdleService()
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 

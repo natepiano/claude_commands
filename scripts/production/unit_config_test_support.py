@@ -5,9 +5,10 @@ from scripts.agents import remote
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
-from typing import override
+from typing import ClassVar, override
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from scripts.production.staff import StaffId
 
 
 class UnitConfigFixture(unittest.TestCase):
+    repository_seed: ClassVar[Path]
     root: Path = Path()
     home: Path = Path()
     worktree: Path = Path()
@@ -24,6 +26,24 @@ class UnitConfigFixture(unittest.TestCase):
     parked: Path = Path()
     exclude: Path = Path()
     unit: StaffId = StaffId("s123456789ab")
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="unit-config-seed-")))
+        seed_home = seed_root / "home"
+        seed_home.mkdir()
+        cls.repository_seed = seed_root / "repository"
+        cls.repository_seed.mkdir()
+        builder = cls()
+        builder.worktree = cls.repository_seed
+        with patch.dict(os.environ, {
+            "HOME": str(seed_home), "XDG_CONFIG_HOME": str(seed_home / ".config"),
+            "GIT_CONFIG_GLOBAL": str(seed_home / "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1",
+        }):
+            _ = builder.git("init", "-q", "--initial-branch=main")
+            _ = builder.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "commit", "-q", "--allow-empty", "-m", "Initial commit")
 
     @override
     def setUp(self) -> None:
@@ -35,10 +55,7 @@ class UnitConfigFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(self.home / "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1",
         }))
         self.worktree = self.root / "repository"
-        self.worktree.mkdir()
-        _ = self.git("init", "-q", "--initial-branch=main")
-        _ = self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                     "commit", "-q", "--allow-empty", "-m", "Initial commit")
+        _ = shutil.copytree(self.repository_seed, self.worktree)
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
         owner = fixture_member("showrunner", name="configuration")
         row = fixture_member("unit", name="worker", parent=owner.id,
