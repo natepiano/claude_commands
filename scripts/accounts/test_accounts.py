@@ -441,7 +441,7 @@ class AccountsTests(unittest.TestCase):
         table = [line for line in stdout.split("\n\n")[0].splitlines() if line.startswith("|")]
         self.assertEqual(
             [cell.strip() for cell in table[0].strip("|").split("|")],
-            ["Folder", "Label", "Role", "Weekly left", "Weekly resets", "On credits", "Credits left", "Read"],
+            ["Folder", "Label", "Role", "Weekly left", "Weekly resets", "On credits", "Credits left", "Read", "Login ends"],
         )
         self.assertEqual(stdout.splitlines()[0], table[0])
         rows = [tuple(cell.strip() for cell in line.strip("|").split("|")) for line in table[2:]]
@@ -4923,18 +4923,53 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         weekly_cell = later.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
 
         self.assertEqual(self.status_rows(), [
-            ("~/.claude1", "claude1", "", *("—",) * 5),
+            ("~/.claude1", "claude1", "", *("—",) * 6),
             ("~/.claude2", "claude2", "",
-             "71%", weekly_cell, "—", "—", read_cell),
+             "71%", weekly_cell, "—", "—", read_cell, "—"),
             ("~/.claude3", "claude3", "units ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)",
-             "12%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude4", "claude4", "", *("—",) * 5),
+             "12%", weekly_cell, "—", "—", read_cell, "—"),
+            ("~/.claude4", "claude4", "", *("—",) * 6),
         ])
         self.assertRegex(read_cell, r"^\d\d:\d\d P[DS]T$")
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
         self.assertFalse(accounts.account_dir("claude1").exists())
         self.assertTrue(accounts.account_dir("claude2").exists())
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_status_login_end_uses_the_user_zone_and_exports_utc_for_stored_json(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "spare@example.invalid")
+        self.codex_login("workers@example.invalid")
+        now = datetime.now(timezone.utc)
+        end = datetime(2026, 12, 4, 21, 7, tzinfo=timezone.utc)
+        report = self.reading("main@example.invalid", None, agent_accounts.Quota("Weekly", 20, now + timedelta(days=3)))
+        report.login_ends_at = agent_accounts.LoginEndKnown(end)
+        usage_store.save([
+            report,
+            self.reading("spare@example.invalid", None, agent_accounts.Quota("Weekly", 20, now + timedelta(days=3))),
+            agent_accounts.Report("Codex", email="workers@example.invalid",
+                                  quotas=[agent_accounts.Quota("Weekly", 20, now + timedelta(days=3))],
+                                  credit_balance="5", login_ends_at=agent_accounts.LoginEndKnown(end)),
+        ], now)
+        zone = ZoneInfo("America/Los_Angeles")
+        for arguments in ((), ("status", "--stored"), ("status", "--stored", "--json")):
+            with self.subTest(arguments=arguments):
+                code, output, errors = self.run_cli(*arguments)
+                self.assertEqual((code, errors), (0, ""))
+                if "--json" in arguments:
+                    document = cast(accounts.StatusDocument, json.loads(output))
+                    self.assertEqual({row["label"]: row["login_ends_at"] for row in document["accounts"]},
+                                     {"claude2": end.isoformat(), "claude3": None, "~/.codex": None})
+                else:
+                    cells = [[cell.strip() for cell in line.strip("|").split("|")]
+                             for line in output.split("\n\n")[0].splitlines()]
+                    self.assertEqual(cells[0][-1], "Login ends")
+                    self.assertEqual({row[1]: row[-1] for row in cells[2:] if row[1]},
+                                     {"claude2": end.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
+                                      "claude3": "—", "~/.codex": "—"})
+        self.live_reads.assert_not_called()
+        self.codex_reads.assert_not_awaited()
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_hides_five_hour_cells_and_keeps_weekly_and_read(self) -> None:
@@ -4959,7 +4994,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertNotIn(five_reset.astimezone(zone).strftime("%H:%M %Z"), row)
         self.assertEqual(row[3:], (
             "56%", weekly_reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
-            "—", "—", read.astimezone(zone).strftime("%H:%M %Z"),
+            "—", "—", read.astimezone(zone).strftime("%H:%M %Z"), "—",
         ))
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -5039,9 +5074,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)"))
                 self.assertEqual(rows[-2][3:], (
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
-                    *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
+                    *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"), "—",
                 ))
-                self.assertEqual(rows[-1], ("~/.codex1", "codex1", "—", *("—",) * 5))
+                self.assertEqual(rows[-1], ("~/.codex1", "codex1", "—", *("—",) * 6))
         self.codex_reads.assert_not_awaited()
 
     def test_status_reads_codex_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
@@ -5693,7 +5728,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
         self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
-                         ["", "", "showrunners ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)", "", "", "", "", ""])
+                         ["", "", "showrunners ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)", "", "", "", "", "", ""])
 
     def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
         _ = next_moves.add_next_move("units", 1, "claude4")
@@ -5848,7 +5883,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         document = cast(dict[str, object], json.loads(output))
         self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "login_ends_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -6377,7 +6412,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(rows[0][3], "75%")
         self.assertEqual(rows[0][7], failed_read_cell(read))
         # claude3 has no good reading. Its failed attempt still gets a star.
-        self.assertEqual(rows[1][2:], ("", *("unavailable",) * 2, "—", "—", "—*"))
+        self.assertEqual(rows[1][2:], ("", *("unavailable",) * 2, "—", "—", "—*", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
     def test_usage_only_selection_reads_local_accounts_without_repairs_or_sessions(self) -> None:
@@ -6576,7 +6611,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli("status", "--stored")
                 self.assertEqual((code, error), (0, ""))
                 row = next(line for line in output.splitlines() if "| claude2 " in line)
-                self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+                self.assertEqual(row.split("|")[8].strip(), "01-02 05:29 PST*")
                 self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
                                  [f"* claude2: usage unavailable; {reason}"])
                 now = datetime.now(timezone.utc)
@@ -6585,7 +6620,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 code, output, error = self.run_cli("status", "--stored")
                 self.assertEqual((code, error), (0, ""))
                 row = next(line for line in output.splitlines() if "| claude2 " in line)
-                self.assertEqual(row.split("|")[-2].strip(),
+                self.assertEqual(row.split("|")[8].strip(),
                                  now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
                 self.assertFalse(any(line.startswith("* ") for line in output.splitlines()))
         self.live_reads.assert_not_called()
@@ -6663,7 +6698,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| claude2 " in line)
-        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertEqual(row.split("|")[8].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
                          ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
@@ -6686,7 +6721,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--stored")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| claude2 " in line)
-        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertEqual(row.split("|")[8].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
                          ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; the attempt time is not recorded"])
         self.live_reads.assert_not_called()
@@ -6704,7 +6739,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--stored")
         self.assertEqual((code, error), (0, ""))
         rows = [line for line in output.splitlines() if "| claude2 " in line or "| claude3 " in line]
-        self.assertEqual([line.split("|")[-2].strip() for line in rows],
+        self.assertEqual([line.split("|")[8].strip() for line in rows],
             [now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*", "—*"])
         self.assertEqual(len([line for line in output.splitlines() if line.startswith("* ")]), 2)
 
@@ -6721,7 +6756,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
-        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertEqual(row.split("|")[8].strip(), "01-02 05:29 PST*")
         self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1 and try again; the attempt time is not recorded", output)
         self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py setup codex1", row)
 
@@ -9016,7 +9051,7 @@ class PickerTests(unittest.TestCase):
         code, output, error = self.group_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual([cell.strip() for cell in output.splitlines()[0].strip("|").split("|")],
-            ["Folder", "Label", "Role", "Weekly left", "Weekly resets", "On credits", "Credits left", "Read"])
+            ["Folder", "Label", "Role", "Weekly left", "Weekly resets", "On credits", "Credits left", "Read", "Login ends"])
         self.assertFalse(any(line.startswith("units:") for line in output.splitlines()))
         rows = [[cell.strip() for cell in line.strip("|").split("|")]
                 for line in output.splitlines() if line.startswith("| ~/.claude")]
@@ -9443,7 +9478,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
         first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
         single = accounts.render_status_table(self.reading(first_role))
         self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
-        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, starting 0, waiting 0, idle 1, paused 0, exited 0)", "", "", "", "", ""))
+        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, starting 0, waiting 0, idle 1, paused 0, exited 0)", "", "", "", "", "", ""))
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(len(document["accounts"]), 1)
         self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
@@ -9538,15 +9573,15 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_json_signals_and_text_table_show_the_same_zero_worker_counts(self) -> None:
         reading = self.reading(self.row())
         self.assertEqual(accounts.render_status_table(reading), (
-            '| Folder    | Label   | Role                                                                  | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
-            '| --------- | ------- | --------------------------------------------------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
-            '| ~/.codex1 | fixture | workers 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
+            '| Folder    | Label   | Role                                                                  | Weekly left | Weekly resets       | On credits | Credits left | Read      | Login ends |\n'
+            '| --------- | ------- | --------------------------------------------------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- | ---------- |\n'
+            '| ~/.codex1 | fixture | workers 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT | —          |\n'
             '\n'
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
             "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"starting": 0, "waiting": 0, "busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}],
-            "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
+            "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00", "login_ends_at": None,
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {}, "sessions": [],
         })

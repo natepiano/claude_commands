@@ -401,8 +401,8 @@ print(observed.row.id)
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
             labels = unit_labels.unit_labels_for([owner.id, str(worker.current_session)],
                 {**self.environment, "ROSTER_RUN_ROOT": str(run_root)})
-        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha"))
-        self.assertEqual(labels[str(worker.current_session)], unit_labels.UnitLabels("fix", "show", "alpha"))
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha", unit_labels.OwnerRole.UNIT))
+        self.assertEqual(labels[str(worker.current_session)], unit_labels.UnitLabels("fix", "show", "alpha", unit_labels.OwnerRole.UNIT))
 
     def test_repair_creates_the_missing_live_launch_from_staff_and_rerun_writes_nothing(self) -> None:
         from scripts.production import session_staff
@@ -454,7 +454,7 @@ print(observed.row.id)
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
             labels = unit_labels.unit_labels_for([owner.id], self.environment)
-        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha"))
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha", unit_labels.OwnerRole.UNIT))
 
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
             changes = session_staff.repair_marks()
