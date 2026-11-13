@@ -138,7 +138,7 @@ class GateBoxTests(unittest.TestCase):
                         self.assertNotIn('instance_running_at', timestamps)
 
     def test_production_boot_has_absolute_expiry_and_no_type_package(self) -> None:
-        links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+        links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size',
                  'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
                  'result': 'https://fixture.invalid/artifacts/attempt/result.json',
                  'log': 'https://fixture.invalid/artifacts/attempt/gate.log'}
@@ -164,7 +164,7 @@ class GateBoxTests(unittest.TestCase):
 
     def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
         modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
-        links = {'production': 'true', 'expires': '1800000000', 'step': 'size',
+        links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size',
                  'attempt': 'a' * 32, 'commit': 'b' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                  'origin': 'https://example.invalid/team/project.git', 'source': 'https://fixture.invalid/source/' + 'd' * 64 + '.bundle',
                  'guest': 'https://fixture.invalid/requests/attempt.guest.py', 'request': 'https://fixture.invalid/requests/attempt.json',
@@ -224,16 +224,19 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
                 (root / 'home').mkdir()
-                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'config'):
+                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
+                _ = (repo / 'scripts/lib/cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
                     'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
+                    + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
                     + 'def run_suites(*args, **kwargs):\n'
                     + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
+                    + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
                     (ROOT / 'scripts/aws_target/gate_box.py').read_text()
@@ -307,7 +310,7 @@ else:
                     _ = command.write_text(stub)
                     command.chmod(0o700)
                 (tools / 'python3').symlink_to(sys.executable)
-                links = {'production': 'true', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
+                links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': 'merge-gate',
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
                          'source': 'https://fixture.invalid/source/snapshot.bundle',
@@ -341,6 +344,7 @@ else:
                     self.assertIn('stage=boot', ledger.text(uploads[0], 'body'))
                     self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
                 if not failure and candidate_change != 'missing':
+                    self.assertEqual((root / 'received-limit').read_text(), '2.5')
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
                     result = results[-1]
                     self.assertGreaterEqual(float(str(result['nix_ready_at'])), int(str(result['user_data_started_at'])))

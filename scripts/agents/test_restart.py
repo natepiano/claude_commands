@@ -311,7 +311,7 @@ class CodexSnapshotTests(RestartTestCase):
         self.assertEqual(listed.call_args_list.count(call("pane")), 1)
 
     def test_live_rows_scans_codex_once_for_members_and_unassigned_candidates(self) -> None:
-        with (patch.object(herdr, "_proc_root", return_value=self.proc) as scans,
+        with (patch.object(herdr, "proc_root", return_value=self.proc) as scans,
               patch.object(herdr.Herdr, "save_layout") as save,
               redirect_stderr(io.StringIO()) as errors):
             selected = restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents"), save_tabs=False)
@@ -324,12 +324,12 @@ class CodexSnapshotTests(RestartTestCase):
 
     def test_live_members_with_only_claude_rows_does_not_scan_codex(self) -> None:
         rows = self.rows[::2]
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(rows, staff.StaffSnapshot(self.rows)), list(rows))
         scans.assert_not_called()
 
     def test_live_members_shares_one_scan_and_reads_fresh_evidence_each_pass(self) -> None:
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(iter(self.rows), staff.StaffSnapshot(self.rows)), list(self.rows))
             scans.assert_called_once()
             self.codex[998081] = "changed-thread"
@@ -338,7 +338,7 @@ class CodexSnapshotTests(RestartTestCase):
 
     def test_live_members_uses_a_supplied_snapshot_without_a_scan(self) -> None:
         snapshot = herdr.CodexConversations({"codex-a": (998081,)}, ())
-        with patch.object(herdr, "_proc_root", return_value=self.proc) as scans:
+        with patch.object(herdr, "proc_root", return_value=self.proc) as scans:
             self.assertEqual(restart.live_members(self.rows, staff.StaffSnapshot(self.rows), codex=snapshot), list(self.rows[:3]))
         scans.assert_not_called()
 

@@ -131,10 +131,14 @@ class FolderMoveBackend:
     def publish_process_state(self) -> None:
         """Expose the process generation and its resume arguments."""
         environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
-        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
-        fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
-                               self.environment(self.pid), cwd=self.cwd)
+        process = Path(environment["HERDR_PROC"]) / str(self.pid)
+        if self.live:
+            fake_unit_host.process(environment, self.pid, self.shell_pid, arguments,
+                                   self.environment(self.pid), cwd=self.cwd)
+        elif process.exists():
+            shutil.rmtree(process)
+        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
 
     def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
         """Use the shared scan with this fixture's process replies."""
@@ -201,6 +205,7 @@ class FolderMoveBackend:
         words = shlex.split(command[1])
         self.cwd = Path(words[words.index("cd") + 2])
         self.fixture.assertTrue(self.cwd.is_dir())
+        self.publish_process_state()
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
@@ -307,6 +312,22 @@ class FolderMoveFixture(StaffTestCase):
     def folder_backend(self, kind: Literal["claude", "codex"] = "claude", *, live: bool = False) -> FolderMoveBackend:
         backend = FolderMoveBackend(self, kind, live)
         backend.publish_process_state()
+        move = unit_move.main
+
+        def move_from_shell(arguments: Sequence[str] | None = None) -> int:
+            environment = {"HERDR_PROC": str(self.root / "folder-processes")}
+            caller = Path(environment["HERDR_PROC"]) / str(os.getpid())
+            fake_unit_host.process(environment, os.getpid(), backend.shell_pid, [sys.executable], {}, cwd=self.root)
+            try:
+                return move(arguments)
+            finally:
+                shutil.rmtree(caller)
+                row = staff.by_id(self.owner.id)
+                if row is not None and isinstance(row.worktree, staff.PresentWorktree):
+                    backend.cwd = row.worktree.path
+                backend.publish_process_state()
+
+        _ = self.enterContext(mock.patch.object(unit_move, "main", side_effect=move_from_shell))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
             os.environ, {"HERDR_PROC": str(self.root / "folder-processes"), "SHUTDOWN_PROOF_WORKSPACE": "w1"})))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"

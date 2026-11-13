@@ -282,7 +282,7 @@ def processes_inside(worktree: Path) -> list[int]:
         return _darwin_processes_inside(worktree)
     found: list[int] = []
     root = str(worktree)
-    for entry in Path("/proc").iterdir():
+    for entry in herdr.proc_root().iterdir():
         if not entry.name.isdigit():
             continue
         try:

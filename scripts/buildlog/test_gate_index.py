@@ -120,7 +120,7 @@ class GateIndexTests(unittest.TestCase):
         expected_run: Record = {
             **{key: value for key, value in run.items() if key not in {"suites", "modules", "dirty_paths", "dirty_path_count"}},
             **common, "id": "gate-one", "aborted": 1, "dirty": 1,
-            "modules_run": 3, "tests_run": 111,
+            "modules_run": 3, "tests_run": 111, "vcpus": None,
         }
         self.assertEqual(table_rows("gate_runs"), [expected_run])
         child: Record = {**common, "run_id": "gate-one"}

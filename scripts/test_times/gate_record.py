@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import sqlite3
+import statistics
 from pathlib import Path
 import sys
 import time
@@ -74,6 +76,7 @@ class SuiteRun(TypedDict):
 
 
 class GateRun(TypedDict):
+    vcpus: NotRequired[int]
     step: str
     dirty_paths: list[str]
     dirty_path_count: int
@@ -397,3 +400,58 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
         report_not_written(error)
+
+
+@dataclass(frozen=True)
+class GateTimeLimit:
+    """The history supports a deadline for this run."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class NoGateTimeLimit:
+    """No passing history supports a deadline for this run."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReadGateTimeLimit:
+    """Read the local gate index before the run starts."""
+
+
+READ_GATE_TIME_LIMIT: Final = ReadGateTimeLimit()
+
+
+def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequence[str],
+                       jobs: int, targeted: bool) -> GateTimeLimit | NoGateTimeLimit:
+    """Use passing records from the same vCPU count and the configured history size."""
+    factor = conf.read("merge_gate").number("GATE_TIME_LIMIT_FACTOR")
+    count = conf.read("test_times").whole("TOP_RUNS")
+    if not targeted:
+        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+            """SELECT wall_s FROM gate_runs
+               WHERE vcpus = ? AND status = 0 AND aborted = 0
+                 AND selection = 'full' AND step = 'merge-gate' AND wall_s > 0
+               ORDER BY started_at DESC, id DESC LIMIT ?""", (vcpus, count)).fetchall())]
+        if walls:
+            return GateTimeLimit(factor * statistics.median(walls))
+    else:
+        medians: list[float] = []
+        for path in modules:
+            name = path.removeprefix("scripts/")
+            suite, module = name.split("/", 1)
+            walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+                """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+                   WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
+                     AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
+                     AND m.suite = ? AND m.module = ? AND m.wall_s > 0
+                   ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
+                (vcpus, suite, module, count)).fetchall())]
+            if not walls:
+                return NoGateTimeLimit(f"no passing module history for {name} on {vcpus} vCPUs")
+            medians.append(statistics.median(walls))
+        if medians:
+            return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
+    return NoGateTimeLimit(f"no passing {'module' if targeted else 'full gate'} history for {vcpus} vCPUs")

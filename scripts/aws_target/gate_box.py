@@ -252,7 +252,7 @@ cpu_started = None
 try:
     repo = root / 'repo'
     from scripts.production import merge_gate
-    os.environ['HERDR_BIN'] = '/nonexistent/herdr'
+    from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
         get(links['module_seconds'], root / 'module_seconds.json')
@@ -263,13 +263,16 @@ try:
     result['vcpus'] = result['max_running_jobs']
     sample_memory()
     memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-    memory_thread.start()
+    cancellation.start_masked_thread(memory_thread)
     stage('tests start')
     with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         cpu_started = busy_cpu_seconds()
         result['gate_started_at'] = time.time()
         if links.get('production'):
-            gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
+            gate = merge_gate.run_suites(repo, full=gate_request.get('full', False), machine=merge_gate.WholeMachine(timings),
+                                        time_limit=(merge_gate.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
+                                                    if float(links.get('gate_time_limit_s', 0)) > 0 else
+                                                    merge_gate.gate_record.NoGateTimeLimit('no passing history on the controller')),
                                         module_time_limit_s=links['module_time_limit_s'],
                                         selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
                                         mode=merge_gate.SuiteMode(links['mode']))
@@ -599,7 +602,8 @@ def encode_run(run: object) -> dict[str, object]:
     return {'jobs': [encode_job(job) for job in run.jobs],
             'executions': [encode_job(job) for job in run.executions],
             'seconds': run.seconds, 'peak_memory_mib': run.peak_memory_mib,
-            'tests_reused': run.tests_reused, 'selection_certified': run.selection_certified}
+            'tests_reused': run.tests_reused, 'selection_certified': run.selection_certified,
+            'time_limit_report': run.time_limit_report}
 
 
 def decode_run(value: object) -> GateRun:
@@ -645,7 +649,8 @@ def decode_run(value: object) -> GateRun:
             raise ValueError(f'{key}: expected a boolean')
     return GateRun(tuple(job(item) for item in rows(row, 'jobs')), number(row, 'seconds'),
                    number(row, 'peak_memory_mib'), row['tests_reused'] is True,
-                   row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions')))
+                   row['selection_certified'] is True, tuple(job(item) for item in rows(row, 'executions')),
+                   str(row.get('time_limit_report', '')))
 
 
 def execution_records(value: GateRun) -> list[gate_record.Execution]:
@@ -675,7 +680,8 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
             'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
-            'reason': 'cloud gate', 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
+            'reason': 'time limit' if value.time_limit_report else 'cloud gate',
+            'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
             'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': 'cloud-gate', 'step': mode,
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
