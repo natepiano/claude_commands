@@ -3578,37 +3578,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 235 — The copies tests copy one source seed  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `copies/test_copies.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 1; sdlc owner go 2026-11-13 13:38. Cached gate median 30.18 CPU s. `StandingTests.setUp` (`test_copies.py:64`) builds the source repositories in each of 120 tests: `ImmutableGitSeed.create` at `:108` (two inits, config, add, commit, push), then a remote add on the origin, `rev-parse`, an unpushed commit and a second `rev-parse` (about 12 Git commands per test).
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD copies/test_copies.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the per-test source setup is a top cost: build the published and unpushed source state once in `setUpClass`, and keep `published` and `head` as class values. In `setUp`, copy it with `ImmutableGitSeed.copy_to` (`production/cli_fixture.py:161`), which rewrites the origin path in the checkout config. Check every other absolute path the seed holds (the origin's added remote, the fixture Git config from `write_fixture_git_config`). Keep the per-test base, environment, staff rows, gate caches and patches.
-3. Keep the two other `ImmutableGitSeed.create` calls at `:1634` and `:1721` unless the profile shows a clear gain.
-4. If the profile names a larger cost, report it to the director before you change the plan.
-5. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-6. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-7. The director runs the aws pairs.
-
-**Files:**
-- `scripts/copies/test_copies.py`
-- `scripts/production/cli_fixture.py` (only if `ImmutableGitSeed` needs a small shared addition; keep its other callers unchanged)
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 233–234: a class seed copy replaces per-test Git setup; a copy to a new path must hold no absolute path into the seed.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `StandingTests.setUpClass` (`copies/test_copies.py`) stores the published and unpushed source states once. `setUp` copies them with `ImmutableGitSeed.copy_to`, which rewrites the checkout origin URL. `ImmutableGitSeed.create` falls from 122 calls to 3. Each test gets its own Git config file with no path into the seed.
+- `ImmutableGitSeed.copy_to` (`production/cli_fixture.py`) raises `ValueError` when the config does not hold the seed origin text, so an escaped path never leaves a copy that points at the seed. Its 11 caller modules (470 tests) pass. All 120 test bodies and 602 assertion expressions did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 30.596 to 26.526 s; peak 119.8 to 119.2 MiB. Checkpoint `3ff00e6ad`.
 
 ### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: todo
 **Depends on:** Phase 234
