@@ -322,6 +322,13 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, problems, and session input paths.
+The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
+Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
+`Report` distinguishes `LoginEndKnown` from `LoginEndUnknown`.
+The usage reader takes the date from `claudeAiOauth.refreshTokenExpiresAt` in the metadata it already loads.
+Both live paths use this source, so the disk identity shortcut still avoids a Claude process start.
+The usage store and the timer cache preserve the date without storing other credential fields.
+An accepted reading without a date removes the stored date.
 Status classifies shared-home repairs before rendering.
 The text board keeps these repair lines.
 JSON omits these lines from `problems`, so cargo-handler and unit-board panes do not show them.
