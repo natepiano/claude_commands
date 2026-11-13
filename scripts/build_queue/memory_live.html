@@ -182,8 +182,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.room > * { border-bottom: 1px solid var(--line); }
-.queue-title { padding: 16px 0 8px; overflow-wrap: anywhere; }
-.walk-table tr.queue-title > td { padding: 0; }
+.walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
+.queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
@@ -194,7 +194,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table th, .walk-table td { padding: 3px 16px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
-.walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; }
+.walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
@@ -202,9 +202,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
+.walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
 .walk.beside .walk-table tr.room > *, .walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
-.walk.beside .wrow.room::after, .walk.beside .walk-chart .queue-title { width: calc(100% + var(--details)); }
+.walk.beside .wrow.room::after { width: calc(100% + var(--details)); }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before {
   content: ""; position: absolute; top: 0; left: 0; width: calc(100% + var(--details));
   border-top: 1px solid var(--line); pointer-events: none;
@@ -534,7 +535,7 @@ function roomEquation(d) {
 }
 function ago(then, now) {
   const m = Math.max(0, Math.round((now - then) / 60));
-  if (m < 1) return "under 1 min";
+  if (m < 1) return "<1 min";
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
   return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} days`;
@@ -828,15 +829,13 @@ function renderWalk(d) {
     const title = !units.length ? "Queued, in order of submission"
       : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
       : `Queued, ${units.join(" followed by ")} and then in submission order`;
-    rows.push(`<div class="queue-title section-head">${esc(title)}</div>`);
-    tableRows.push(`<tr class="queue-title" aria-hidden="true">${"<td></td>".repeat(8)}</tr>`);
     tableRows.push(`<tr class="queue-head">${columns("#", "Waiting")}</tr>`);
-    rows.push(`<div class="walk-chart-head queue-head" aria-hidden="true"></div>`);
+    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${esc(title)}</span></div>`);
   }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -908,7 +907,7 @@ function fitWalkDetails() {
       context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
       return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
     });
-    if (name === "duration") widths.push(context.measureText("waits 99 h 59 min").width + 16);
+    if (name === "duration") widths.push(context.measureText("99 h 59 min").width + 16);
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
@@ -958,10 +957,6 @@ function fitWalkDetails() {
       ? walk.getBoundingClientRect().right - naturalWidth
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
     walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
-  }
-  const queueTitle = walk.querySelector(".walk-chart .queue-title");
-  if (queueTitle) {
-    table.querySelector("tr.queue-title").style.height = `${queueTitle.getBoundingClientRect().height}px`;
   }
   for (const row of walk.querySelectorAll(".wrow.cloud-work")) {
     const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);

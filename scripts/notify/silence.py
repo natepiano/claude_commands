@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Keep the user's pushes for a while: `silence.py on [--until "YYYY-MM-DD HH:MM" | --for SPAN] | off | status`.
 
-While silence is on, pushover.py keeps each push here instead of posting it. A priority 2
-(blocked) push always goes out: power and UPS alerts are safety. `off` ends silence and posts
+Silence keeps ordinary pushes. Priority 2 pushes and pushes with --through-silence go out at once.
+`off` ends silence and posts
 the kept pushes, oldest first, as they would have gone out, and prints how many. A kept push
 with the same non-empty key from the same source replaces the older kept one, so `off` posts
 only the newest. `on` with no end lasts until `off`; --until (a time in the user's zone,
@@ -44,6 +44,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import NotRequired, Protocol, TypedDict, cast
 
@@ -72,7 +73,13 @@ class SilenceRecord(TypedDict):
     auto: bool
 
 
+class SilencePolicy(str, Enum):
+    KEEP_DURING_SILENCE = "keep_during_silence"
+    SEND_THROUGH_SILENCE = "send_through_silence"
+
+
 class KeptPush(TypedDict):
+    silence_policy: NotRequired[SilencePolicy]
     reference: NotRequired[push_reference.PushReference]
     due: NotRequired[str]
     need: NotRequired[str]
@@ -160,7 +167,7 @@ def parse_push(text: str) -> KeptPush | None:
         return None
     record = cast(dict[str, object], value)
     # A line kept before pushes had a key or a text id reads as key "" and text id "" (free text).
-    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference"}} | {
+    found = {name: record.get(name) for name in KeptPush.__annotations__ if name not in {"due", "need", "reference", "silence_policy"}} | {
         "key": record.get("key", ""), "text_id": record.get("text_id", "")}
     for name in ("due", "need"):
         if name in record:
@@ -172,6 +179,14 @@ def parse_push(text: str) -> KeptPush | None:
     except ValueError:
         return None
     result = cast(KeptPush, cast(object, found))
+    if "silence_policy" in record:
+        policy = record["silence_policy"]
+        if not isinstance(policy, str):
+            return None
+        try:
+            result["silence_policy"] = SilencePolicy(policy)
+        except ValueError:
+            return None
     if "reference" in record:
         result["reference"] = reference
     return result

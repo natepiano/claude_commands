@@ -207,6 +207,13 @@ try {
           for (const width of [1400,900,390]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
+            const timeCells = await evaluate(`({
+              short:ago(latest.read_at-15,latest.read_at),
+              waiting:[...document.querySelectorAll('tr[data-tip^="wait:"] .duration')].map(cell=>cell.textContent)
+            })`);
+            assert.equal(timeCells.short,'<1 min');
+            assert.ok(timeCells.waiting.length>0);
+            assert.ok(timeCells.waiting.every(text=>!text.startsWith('waits ')));
             const proof = await evaluate(`(() => {
               const rect = element => {
                 const r = element.getBoundingClientRect();
@@ -821,6 +828,9 @@ try {
             ['queued_one','Queued, research first, then in submission order'],
             ['queued_two','Queued, research followed by cables and then in submission order'],
           ];
+          readings.queued_long = structuredClone(readings.queued_two);
+          readings.queued_long.queued_priority_units = ['research-with-a-long-unit-name'.repeat(4),'cables'.repeat(8)];
+          cases.push(['queued_long',`Queued, ${readings.queued_long.queued_priority_units.join(' followed by ')} and then in submission order`]);
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const width of [1400,900,390]) {
@@ -831,11 +841,27 @@ try {
                 const state=await evaluate(`(() => {
                   const walk=document.querySelector('#walk');
                   const heading=walk.querySelector('.walk-chart .queue-title');
+                  const header=heading.parentElement;
+                  const columns=walk.querySelector('.walk-table tr.queue-head');
                   const room=walk.querySelector('.wrow.room');
                   const after=getComputedStyle(room,'::after'),before=getComputedStyle(room,'::before');
                   const running=getComputedStyle(document.querySelector('.section-head'));
                   const rows=[...walk.querySelectorAll('.walk-table tr[data-tip]')];
+                  const textBottom=element=>{
+                    const range=document.createRange();range.selectNodeContents(element);
+                    return range.getBoundingClientRect().bottom;
+                  };
                   return {title:heading.textContent,font:getComputedStyle(heading).font,
+                    hover:heading.title,truncated:heading.scrollWidth>heading.clientWidth,
+                    clipped:getComputedStyle(heading).textOverflow==='ellipsis' && getComputedStyle(heading).overflow==='hidden',
+                    withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
+                    headerHeight:header.getBoundingClientRect().height,
+                    headerOffset:header.getBoundingClientRect().top-columns.getBoundingClientRect().top,
+                    bottomOffset:textBottom(heading)-textBottom(columns.querySelector('th')),
+                    nextGap:header.nextElementSibling.getBoundingClientRect().top-header.getBoundingClientRect().bottom,
+                    noEmptyRow:!walk.querySelector('tr.queue-title'),
+                    noOverlap:heading.getBoundingClientRect().right<=columns.getBoundingClientRect().left ||
+                      heading.getBoundingClientRect().bottom<=columns.getBoundingClientRect().top,
                     runningFont:running.font,afterWidth:after.borderTopWidth,beforeWidth:before.borderTopWidth,
                     afterColor:after.borderTopColor,beforeColor:before.borderTopColor,
                     roomTop:room.getBoundingClientRect().top,headingTop:heading.getBoundingClientRect().top,
@@ -847,32 +873,49 @@ try {
                     }),beside:walk.classList.contains('beside')};
                 })()`);
                 assert.equal(state.title,title);
+                assert.equal(state.hover,title);
                 assert.equal(state.font,state.runningFont);
+                assert.equal(state.headerHeight,30);
+                assert.equal(state.nextGap,0);
+                assert.equal(state.noEmptyRow,true);
+                assert.equal(state.withinChart,true);
+                assert.equal(state.noOverlap,true,JSON.stringify({theme,width,name,...state}));
+                if(name==='queued_long') {
+                  assert.equal(state.truncated,true);
+                  assert.equal(state.clipped,true);
+                }
                 assert.equal(state.afterWidth,'1px');
                 assert.equal(state.afterWidth,state.beforeWidth);
                 assert.equal(state.afterColor,state.beforeColor);
                 assert.ok(state.headingTop>=state.roomBottom);
                 assert.equal(state.pageOverflow,false);
-                if(state.beside) assert.equal(state.aligned,true);
+                if(state.beside) {
+                  assert.equal(state.aligned,true);
+                  assert.ok(Math.abs(state.headerOffset)<=1,'The title and columns use different rows.');
+                  assert.ok(Math.abs(state.bottomOffset)<=2,'The title and columns have different text bottoms.');
+                }
                 comparisons.push({theme,width,name,...state});
               }
             }
             await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-            let beforeRoomTop;
+            let beforeRoomTop, beforeWaitTop;
             for (const version of ['before','after']) {
               await navigate(version==='before'?'before.html':'memory_live.html');
               await show(readings.queued_two);
               const state=await evaluate(`(() => {
                 const walk=document.querySelector('#walk');
                 return {roomTop:walk.querySelector('.wrow.room').getBoundingClientRect().top,
+                  waitTop:walk.querySelector('.wrow.wait').getBoundingClientRect().top,
                   title:walk.querySelector('.walk-chart .queue-title')?.textContent || ''};
               })()`);
               if(version==='before') {
                 beforeRoomTop=state.roomTop;
-                assert.equal(state.title,'');
+                beforeWaitTop=state.waitTop;
+                assert.equal(state.title,cases[2][1]);
               } else {
                 assert.ok(Math.abs(state.roomTop-beforeRoomTop)<=1,'The room row moved.');
                 assert.equal(state.title,cases[2][1]);
+                assert.ok(state.waitTop<beforeWaitTop,'The separate title row remains.');
               }
               await capture(`${version}-${theme}-queued`,'#walk');
             }

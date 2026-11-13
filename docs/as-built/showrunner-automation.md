@@ -643,7 +643,8 @@ It joins the row's `current_session` to native pane or process evidence.
 An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
-  Each table prints one row per production staff unit.
+  Each phase table prints one row per open phase of each production staff unit's newest run.
+  A unit without open phases keeps one row; the style table keeps one row per unit.
   Without `--production`, `showrunners.own_name()` selects the production name.
   `read_production(name)` reads the document from that showrunner's staff row.
   A missing owner or document exits 1.
@@ -652,11 +653,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
   It preserves full cells and omits columns whose cells are all `—`.
   A table without rows keeps its columns.
-  The command emits one Markdown row per unit for Claude Code's native wrapping.
+  The command emits one Markdown row per phase for Claude Code's native wrapping.
   The renderer sets column widths from the terminal width and wraps text inside each cell.
   Print the output as Markdown without code fences, `<br>`, or continuation rows.
   Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
-  Renderer trials at 170 columns showed that native wrapping keeps each unit in one visible row.
+  Renderer trials at 170 columns showed that native wrapping keeps each Markdown row together.
   The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
@@ -710,10 +711,18 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
+    Each open phase of the newest recorded run gets one row in both tables.
+    The current staff run pointer takes priority over newer completed ad hoc records for the same owner.
+    The latest `run_finished` or `reopened` event determines whether that run is finished.
+    `unit_phases.run_is_finished` supplies the same rule for phase rows and pending promises.
+    Rows follow the configured plan order, then the start order for phases outside that plan.
+    Every row repeats Unit.
+    Only the first row carries Status, Machine, Progress, ETA Plan, and Queued.
+    Later rows use `—` for those unit-wide cells.
     The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
     The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
-    ETA Plan appears only when at least one row has unfinished plan phases.
+    ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
     The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
@@ -728,37 +737,59 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A blank line separates the work table from the legend or the status table.
     `progress_cell` and `progress_legend` use the same `ProgressState` constants for the squares and labels.
     A table with no Progress bar in any row has no legend; the style table also has no legend.
-    Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
-    Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
+    Phase shows the phase id for an open phase row.
+    Without an open phase, it shows `<done>/<total>` from the plan, or `—` with no phases.
+    Notes starts with `phase <id> — <phase title>`.
+    The open step belongs to that phase instance in the newest run.
+    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
+    Empty text, role-only text, and `<label> dispatch` add nothing.
+    Text equal to the title adds nothing; this comparison ignores case and whitespace.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
+    Each open worker or director wait appends `waiting on <reason> <elapsed>` to Notes.
+    A named holder adds `(held by <holder>)` before the elapsed time.
+    The existing staff snapshot resolves a holder's staff ID or current session ID to its staff name.
+    An unknown holder keeps its recorded name or ID.
+    Reasons that start with `waiting on`, `waiting for`, or either phrase after `blocked:` need no extra wait prefix.
+    `worker_runs.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
+    `PhaseWait` carries the reason, start time, and `NamedWaitHolder` or `UnnamedWaitHolder`.
+    Wait text does not change the session classifier in Status.
     Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    Native Markdown wrapping keeps each unit's text in one row inside its cells.
+    Native Markdown wrapping keeps each phase's text in one row inside its cells.
     Workers uses the same wrapping form when the status table exceeds the terminal width.
     Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
     A finished newest run supplies no fallback.
-    ETA Next uses the open plan phase's latest promise from `eta_trail`, never `schedule_end`.
-    Otherwise, it uses the newest open phase outside the plan, then the next not-started plan phase with a promise.
-    Passed promises add `late <elapsed>`; open work without a promise shows `no ETA`.
+    ETA Next uses that phase instance's latest promise from `eta_trail`, never `schedule_end`.
+    Without open work, it uses the next not-started plan phase with a promise.
+    `eta_phase_id` selects the target even when the event carries another active phase instance.
+    Passed promises add `late <elapsed>`; open work without a promise shows `no ETA stated`.
     With no open work or promised phase, ETA Next shows `—`.
-    ETA Plan shows the predicted plan finish without `ends`; a row without unfinished plan phases shows `—`.
+    ETA Plan shows the predicted plan finish without `ends`.
+    The first row also names the latest promises for unfinished targets without open rows.
+    Those promises use `phase <id>: <time>[ · late <elapsed>]`.
+    The latest `phase_finished` event for each target decides whether that target is done.
+    Only status `completed` marks a target as done.
+    A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
+    That target's promise remains visible.
+    Without an unfinished plan or such a promise, the cell shows `—`.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
-    Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
+    `worker_runs.phase_workers(session, events, instance_id, runs)` reads open passes for that phase from the run records.
+    It shows waiting detached runs, queued results, missing runs, and working workers.
     Its cell keeps the existing 80-character limit.
-    Run workers appear first; idle workers append a count, and closed workers add nothing.
-    Remote units show no worker facts.
+    Run workers appear first; finished passes remove their workers.
+    Rows without an open phase keep the existing pane observation rules.
     The command reads panes once for the displayed units and their workers.
     It shares one lazy process snapshot and reads no CPU totals or log tails.
-    Non-Phase Work uses the unit's newest unfinished run and shows open phases absent from the configured plan.
-    It excludes each open phase whose id matches the phase that Notes names in the same row.
-    It shows `—` when no phase remains.
+    Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
+    Rows without a recorded phase instance keep the existing summary for work outside the plan.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    It excludes every open phase of the newest run, including phases absent from the configured plan.
     It excludes each queue item whose text equals Notes in the same row.
     Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.

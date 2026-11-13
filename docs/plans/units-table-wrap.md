@@ -59,7 +59,7 @@ The showrunner's ruling:
 
 **Ruled out:** command-side wrapping to `units_table_columns` — the renderer sets the column widths, so the command cannot hold them.
 
-### Phase 2 — Each open phase shows its work, its wait and its latest ETA  · status: todo
+### Phase 2 — Each open phase shows its work, its wait and its latest ETA  · status: done
 
 The user, relayed by the cargo-liner showrunner at 22:20 EST on 2026-11-12: "i can't actually tell what any of them are working on - which should be the intent of this command". The sdlc showrunner sent this evidence from the plan-delegate run records:
 
