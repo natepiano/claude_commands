@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -43,12 +44,13 @@ from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue import placement
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -130,6 +132,22 @@ SWAP_OWNER_SLICES = {"app-agents.slice": "agents", "session.slice": "desktop",
                      "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 
 
+class MachineColors(TypedDict):
+    natedev: str
+    mac: str
+    aws: str
+
+
+class ThemeColors(TypedDict):
+    remote_memory: str
+    machines: MachineColors
+
+
+class PageColors(TypedDict):
+    light: ThemeColors
+    dark: ThemeColors
+
+
 @dataclass(frozen=True)
 class FeedConfiguration:
     output_folder: Path
@@ -137,6 +155,7 @@ class FeedConfiguration:
     history_days: int
     swap_rows: int
     report_refresh_seconds: int
+    colors: PageColors
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -148,9 +167,22 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
+
+    def color(key: str) -> str:
+        value = settings.text(key)
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+            raise ValueError(f"{key}: expected six hexadecimal digits")
+        return "#" + value
+
+    def theme(name: str) -> ThemeColors:
+        return {"remote_memory": color(f"remote_memory_{name}"), "machines": {
+            "natedev": color(f"machine_natedev_{name}"), "mac": color(f"machine_mac_{name}"),
+            "aws": color(f"machine_aws_{name}")}}
+
     return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
-                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
+                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
+                             {"light": theme("light"), "dark": theme("dark")})
 
 
 class PageArguments(CodeRootArguments):
@@ -267,6 +299,7 @@ class RowQueueNotes(TypedDict):
 
 
 class RunRow(RowQueueNotes):
+    admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
@@ -418,6 +451,7 @@ class ReportNotRead(Enum):
 
 
 class MemoryPage(TypedDict):
+    colors: PageColors
     ok: bool
     read_at: float
     total: float
@@ -561,7 +595,7 @@ def ci_amount(value: float) -> str:
 
 
 def build_ci_row(used: float, now: float,
-                 cgroup: Path = CI_CGROUP, proc: Path = PROC) -> RunRow:
+                 cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False) -> RunRow:
     runners: list[CIRunner]
     try:
         units = sorted(child for child in cgroup.iterdir()
@@ -591,7 +625,8 @@ def build_ci_row(used: float, now: float,
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
+            "ci_runners": runners, "admitted": admitted,
+            "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
 def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
@@ -905,9 +940,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
         memory = entry.step.measured
-        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(memory.job_state, NotServiceSlice):
+        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
             ci_rows[memory.cgroup] = build_ci_row(gib(memory.bytes), explanation.now,
-                Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
+                Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
     ci_runners = frozenset(runner["name"] for row in ci_rows.values() for runner in row.get("ci_runners", []))
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
@@ -952,15 +988,29 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
     groups: dict[str, list[RunRow]] = {}
+    remote_groups: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
         identity = feed_step_labels(step, labels, ci_runners)
         name, detail = step_text(step, names, labels=labels), identity.unit
         unit, state = detail, ""
+        if isinstance(memory, admission_records.RemoteMemoryUnavailable):
+            key = admission_records.execution_group(step, entry.owner)
+            if key in remote_groups:
+                continue
+            remote_groups.add(key)
+            remote_row: RunRow = {"name": name, "showrunner": identity.showrunner, "unit": unit,
+                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
+                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
+                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
+                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
+                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
+            walk.append(remote_row)
+            continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
-                       or not isinstance(memory.job_state, NotServiceSlice) or bool(memory.diagnostic))
+                       or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
             if service:
                 name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
                 activity = service_activity_text(memory, explanation.now)
@@ -981,7 +1031,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
-                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
+                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                                   admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
@@ -1006,8 +1057,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     machine = host_name()
     vcpus = os.cpu_count()
     for row in walk:
-        row["machine"] = machine
-        row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
+        _ = row.setdefault("machine", machine)
+        _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -1100,6 +1151,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
     return {
+        "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,

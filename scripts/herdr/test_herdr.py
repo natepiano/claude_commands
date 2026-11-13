@@ -5274,7 +5274,7 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(scans.call_count, 2)
-        with patch.object(herdr, "_proc_root", return_value=self.root / "missing") as roots:
+        with patch.object(herdr, "proc_root", return_value=self.root / "missing") as roots:
             with herdr.process_snapshot():
                 self.assertEqual(herdr.herdr_processes(), [])
                 self.assertEqual(herdr.herdr_processes(), [])

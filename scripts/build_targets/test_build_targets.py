@@ -1216,21 +1216,26 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             10, "natedev is held by hana for render checks; launch after the release.\n", "",
         ))
         proc = self.root / "proc"
-        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+        for pid, parent in ((10, 1), (20, 10), (30, 1), (40, 1), (50, 1)):
             directory = proc / str(pid)
             directory.mkdir(parents=True)
             fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
             _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW,
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("kept-session", "peer"),
                                   "peer checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
-                                  keep=(build_hold.ProcessIdentity(10, "1000"),))
+                                  keep=(build_hold.ProcessIdentity(10, "1000"),
+                                        build_hold.ProcessIdentity(40, "4000"),
+                                        build_hold.ProcessIdentity(50, "4999")))
         for pid, session, owns_hold, admitted in (
             (10, "other-session", False, True),
             (20, "other-session", False, True),
             (30, "other-session", False, False),
+            (40, "other-session", False, False),
+            (50, "other-session", False, False),
             (10, "", False, True),
             (30, "owned-session", True, False),
         ):

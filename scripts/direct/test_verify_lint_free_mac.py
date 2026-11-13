@@ -5,8 +5,10 @@ import subprocess
 import unittest
 from pathlib import Path
 from typing import override
+from unittest import mock
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -33,6 +35,17 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
 
     def queued_lint(self) -> subprocess.Popen[str]:
         _ = self.hold_memory()
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        controls.set_host("mac", placement.TemporaryExclusion("busy"))
+        previous = admission.server.reply_filter
+
+        def release_provider(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait):
+                _ = controls.hosts.pop("mac", None)
+            return previous(reply)
+
+        admission.server.reply_filter = release_provider
         process = self.start_verify("lint", "sample")
         self.addCleanup(self.stop_verify, process)
         return process
@@ -86,27 +99,30 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
     def test_busy_mac_keeps_the_lint_in_the_local_memory_queue(self) -> None:
         self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
         process = self.queued_lint()
-        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        self.wait_for_memory_wait(process)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_mend(), [])
         self.release_memory()
         _ = self.finish_lint(process)
-        self.assertEqual(self.mac_verbs(), ["clippy"])
+        self.assertEqual(self.mac_verbs(), [])
+        self.assertEqual(sum(row["args"][:1] == ["clippy"] and "--fix" not in row["args"]
+                             for row in self.cargo_events()), 1)
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
 
     def test_linux_only_workspace_never_leaves_the_local_memory_queue(self) -> None:
         settings = Path(self.environment["MAC_TEST_CONFIG"])
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", template="mac_test")
         memory_hook = self.root / "memory-hook"
-        interpreter = self.root / "observe-memory-python"
-        self.write_executable(interpreter, """#!/bin/bash
-case "$1:$2" in
-    */admission_client.py:admit|*/admission_client.py:launch)
-        printf '%s\n' "$LINT_QUEUE_LEAVE_HOOK" > "$TEST_MEMORY_HOOK" ;;
-esac
-exec "$TEST_REAL_PYTHON" "$@"
-""")
-        self.environment.update({"CLAUDE_PYTHON": str(interpreter), "TEST_MEMORY_HOOK": str(memory_hook)})
+        admission = caller_admission(self, self.root, self.environment)
+        handle_request = admission.server.handle_request
+
+        def observe(request: wire.Request,
+                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = memory_hook.write_text(wire.encode_request(request))
+            return handle_request(request, connection)
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=observe))
         process = self.queued_lint()
         self.wait_for_memory_wait(process)
         self.assertNotIn("free-now", memory_hook.read_text())

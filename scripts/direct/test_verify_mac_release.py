@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -33,26 +32,10 @@ class VerifyMacReleaseTests(VerifyMacOffloadFixture):
 
     def test_blocked_mac_and_held_local_wait_for_local_release(self) -> None:
         cycle = self.routing_fixture()
-        # Exercise the real event waiter. A retry cannot rescue a missed release:
-        # its interval is longer than the process hang guard, and a fixed sleep
-        # is an immediate fixture error instead of a wall-clock assertion.
-        self.environment["BUILD_TARGETS_POLL_S"] = "3600"
-        self.write_executable(self.bin_directory / "sleep", 'raise SystemExit("routing must wake on release, not sleep")\n')
-        self.write_executable(Path(self.environment["VERIFY_LOCAL_RELEASE_WAIT_SCRIPT"]), f'''
-import os
-from pathlib import Path
-import sys
-with open({str(VERIFY.parent.parent / 'lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
-from scripts.direct import local_release_wait
-original_wait = local_release_wait.LocalReleaseEvents.wait
-def observe_wait(self, seconds):
-    (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-sleep").write_text("watching\\n")
-    original_wait(self, seconds)
-local_release_wait.LocalReleaseEvents.wait = observe_wait
-local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
-''')
+        # Observe the placement poll after the first remote refusal.
         process = self.start_routing("blocked")
         self.release_local_hold()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("blocked", errors)

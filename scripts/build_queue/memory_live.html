@@ -11,6 +11,8 @@
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f;
   --used: #2a78d6; --res-a: #427caf; --res-b: #6b91b7; --room: #1baf7a;
   --building: #007e78; --testing: #b00079;
+  --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
+  --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
 }
 @media (prefers-color-scheme: dark) {
@@ -20,6 +22,8 @@
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
     --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
     --building: #27c6b8; --testing: #ca458f;
+    --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+    --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
   }
 }
@@ -29,6 +33,8 @@
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
   --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
   --building: #27c6b8; --testing: #ca458f;
+  --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+  --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
 }
 * { box-sizing: border-box; }
@@ -81,6 +87,12 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 #tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .mac-tip-fields dt { text-align: left; }
 #tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
+#tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
+.seg-remote { background: var(--remote-memory); }
+.machine[data-machine="natedev"] { color: var(--machine-natedev); }
+.machine[data-machine="mac"] { color: var(--machine-mac); }
+.machine[data-machine="aws"] { color: var(--machine-aws); }
 #tip b { display: block; margin-bottom: 2px; }
 .mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); transition: left 0.6s ease; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
@@ -183,6 +195,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
+.walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -391,6 +404,13 @@ function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
   return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
 }
+function doneText(row) {
+  const progress = row.progress;
+  if (!progress || progress.kind !== "RowProgress") return "—";
+  const percent = recorded(progress.percent) ? progress.percent
+    : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
+  return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
+}
 function macTipFields(row, data) {
   const fields = [["Machine", "mac"],
     ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
@@ -405,8 +425,9 @@ function tooltipHtml(key, data) {
   const [kind, index] = key.split(":");
   const row = kind === "row" ? data.walk[+index] : null;
   if (!row || !macRow(row)) return `<b>${esc(head)}</b>${esc(body)}`;
-  return `<b>${esc(head)}</b><span>Mac memory does not count against natedev.</span><dl class="mac-tip-fields">` +
-    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") + `</dl>`;
+  return `<b>${esc(head)}</b><dl class="mac-tip-fields">` +
+    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
+    `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
@@ -462,7 +483,7 @@ function rawTipText(key, d) {
     const r = d.walk[+i];
     if (!r) return ["", ""];
     if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
-      "Mac memory does not count against natedev.\n" + macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n")];
+      macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
     if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: ${r.machine}. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
@@ -559,6 +580,12 @@ function render(d) {
   if (d.error || !d.ok) {
     recordReadFailure("The queue did not answer.");
     return;
+  }
+  for (const [theme, colors] of Object.entries(d.colors)) {
+    document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
+    for (const [machine, color] of Object.entries(colors.machines)) {
+      document.documentElement.style.setProperty(`--machine-${machine}-${theme}`, color);
+    }
   }
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
@@ -773,19 +800,19 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
+  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      `<td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
+      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.ci_runners?.some(runner => runner.state === "busy"))];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
@@ -908,7 +935,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   if (!beside) {
-    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
+    const fixedWidth = ["place", "done", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
       width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
     const padding = ["step", "unit"].reduce((width, name) =>
       width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
@@ -972,11 +999,11 @@ function placeMemoryBars(d) {
     if (macRow(run)) {
       if (run.kind === "mac-build" && recorded(run.used)) {
         const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
-        bars = box(0, useWidth, "seg-used");
+        bars = box(0, useWidth, "seg-remote");
         amounts.push({kind: "used-amount", left: 0, value: run.used});
-        if (run.progress?.kind === "RowProgress") amounts.push({kind: "progress-amount", left: useWidth,
-          text: `${formatPercent(run.progress.percent, run.progress.done === run.progress.total)} done`});
       }
+    } else if (run.kind === "cloud" && recorded(run.used)) {
+      bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
       bars = box(used, ciWidth, "seg-ci", "ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});

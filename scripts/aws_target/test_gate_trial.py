@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, cloud_gate, gate_trial as trial, ledger
+from scripts.aws_target import admin_secrets, cloud_gate, gate_box, gate_trial as trial, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
@@ -145,7 +145,7 @@ class GuestTests(unittest.TestCase):
                 write(900000)
                 result: dict[str, object] = {'memory_peak_bytes': None}
                 namespace: dict[str, object] = {'pathlib': pathlib, 'result': result}
-                code = trial.GUEST[trial.GUEST.index('def sample_memory():'):trial.GUEST.index('memory_stop =')]
+                code = gate_box.CANDIDATE_GUEST[gate_box.CANDIDATE_GUEST.index('def sample_memory():'):gate_box.CANDIDATE_GUEST.index('memory_stop =')]
                 code = code.replace("'/proc/meminfo'", repr(str(meminfo)))
                 exec(compile(code, '<memory sampler>', 'exec'), namespace)
                 waits: list[float] = []
@@ -202,13 +202,14 @@ class GuestTests(unittest.TestCase):
                         uploads[url] = cast(bytes, options['input'])
                 return subprocess.CompletedProcess(arguments, 0, 'version', '')
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
-            code = code.replace("'/proc/stat'", repr(str(root / 'stat')))
+            candidate = gate_box.CANDIDATE_GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/proc/stat'", repr(str(root / 'stat')))
+            (repo / 'scripts/aws_target').mkdir()
+            _ = (repo / 'scripts/aws_target/gate_box.py').write_text('fixture candidate')
             _ = (root / 'stat').write_text('cpu 100 0 100 10000 1000 0 0 0 9999 9999\n')
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
             original_run = merge_gate.run_suites
             def run_suites(repo: Path, *, full: bool, machine: merge_gate.WholeMachine,
                            module_time_limit_s: float) -> merge_gate.GateRun:
-                self.assertEqual(os.environ['HERDR_BIN'], '/nonexistent/herdr')
                 self.assertEqual(machine.module_seconds, timings)
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
@@ -216,6 +217,8 @@ class GuestTests(unittest.TestCase):
             with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
                                                  'GATE_BOX_DIR': str(root), 'box_dir': str(root)}),
                   mock.patch.object(sys, 'path', list(sys.path)),
+                  mock.patch.object(gate_box, 'CANDIDATE_GUEST', candidate),
+                  mock.patch.object(gate_box, '__file__', str(repo / 'scripts/aws_target/gate_box.py')),
                   mock.patch.object(Path, 'home', return_value=root),
                   mock.patch('subprocess.run', side_effect=transport),
                   mock.patch('os.cpu_count', return_value=2),
@@ -263,6 +266,7 @@ class GuestTests(unittest.TestCase):
                 call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
                 self.assertEqual(call['args'], [str(suite), path.name])
                 environment = ledger.mapping(call['env'])
+                self.assertEqual(environment['HERDR_BIN'], '/nonexistent/herdr')
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)
@@ -312,10 +316,18 @@ class PairedTrialTests(CostFixture):
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
-        for relative in ('scripts/test_times/module_run.py', 'scripts/lib/descendants.py', 'scripts/lib/package_root.py'):
+        for relative in ('scripts/test_times/module_run.py', 'scripts/lib/descendants.py',
+                         'scripts/lib/package_root.py', 'scripts/lib/process_group.py',
+                         'scripts/aws_target/gate_box.py', 'scripts/aws_target/__init__.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
+        (self.repo / 'scripts/production').mkdir()
+        _ = (self.repo / 'scripts/production/merge_gate.py').write_text(
+            "def test_module_environment(root, environment):\n"
+            + "    return {**environment, 'TMPDIR': str(root), 'TEST_TIMES_OUT': str(root / 'test-times.json')}\n"
+            + "def process_memory_mib(roots):\n"
+            + "    return {pid: 0.0 for pid in roots}\n")
         (self.repo / 'config').mkdir()
         (self.repo / 'scripts/fixture').mkdir()
         _ = (self.repo / 'scripts/fixture/test_sample.py').write_text('''import json, os, pathlib, unittest
@@ -837,7 +849,7 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         trace = self.root / 'trace.jsonl'
         result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True, timeout=30,
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
-                 'PATH': str(tools) + os.pathsep + os.environ['PATH']})
+                 'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})
         self.assertEqual(result.returncode, 0, result.stderr)
         reply = cloud_gate.read(box / 'uploaded-result')
         traces = [ledger.mapping(cast(object, json.loads(line))) for line in trace.read_text().splitlines()] if trace.exists() else []

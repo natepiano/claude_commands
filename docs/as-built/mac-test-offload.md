@@ -4,31 +4,20 @@
 
 `verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `/build:page` prints the shared build page link. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-`test`, `check`, `doc`, `example`, and lint judgments use the first eligible target from their first step.
-The default target order is Mac, natedev, AWS.
-`step_routing_rule` selects the policy before target admission.
-Tree-writing steps always run on natedev.
-`build` and `final` run on natedev unless a flag pins them.
-Every command accepts `--target <name>`, `--mac "<reason>"`, and `--local "<reason>"`.
-A pin applies to movable steps and waits for that target.
-A pinned final runs both steps on the target and keeps the clean-tree check.
-It saves no pass because a saved pass describes this machine.
-An unpinned final keeps its local compiler identity and saved-pass checks.
-A remote build uses the `build` verb and prints `binary: <target>:<path>`.
-A lint can leave its first mend memory wait for a free Mac.
-`build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
-Its first line is `any_target` or `natedev_only <reason>`.
-Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
-A named test package uses its package rule.
-A workspace test refuses Mac offload when any member is `linux_only`.
-Check, lint, and doc require every workspace member to permit macOS.
-This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
-An unreadable member keeps the step on natedev.
-Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
-Unpinned build keeps `makes natedev artifacts`; unpinned final keeps `full gate runs on natedev`.
-Calls without `--kind` keep the test-target table.
-The live record in `${VERIFY_STEPS_DIR:-~/.local/state/verify-steps}` carries this answer and the call's route state.
-The call guard, hold enforcer, and idle watch read that record.
+Converted verify steps execute only at the destination assigned by the queue.
+The queue preserves configured target order.
+`step_routing_rule` supplies fixed pins, platform constraints, tree-write rules, local artifact rules, and final-step rules.
+Tree-writing steps remain local.
+Unpinned build and final steps retain their local rules.
+A pinned final keeps its clean-tree check and saves no local pass.
+A remote build prints its target and binary path.
+
+`fixed_placement_constraints` retains every configured candidate that a fixed rule permits.
+Disk, busy, spending, reachability, and hold results remain refreshed evidence.
+A saved disk exclusion cannot remove a candidate permanently.
+The same episode can receive a Mac assignment after disk evidence recovers.
+The live step record keeps diagnostic disk evidence.
+Standalone fixed local callers retain their existing local admission path.
 
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
 
@@ -47,8 +36,17 @@ Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-c
 - An `argparse` CLI (`claim`, `release`, `free-now`, `block`, `unblock`, `status`, `watch`, `watch-claim`) over a state directory, `MAC_TEST_STATE_DIR` (default `~/.local/state/mac-test/`). Installed scripts refuse to run with `MAC_TEST_STATE_DIR` set; tests set it for a checkout's scripts. Records are written to a temp name, then `os.replace`. `state_paths()` names the files; `read_block(path) -> NoMacBlock | PendingMacBlock | ActiveMacBlock` decodes `block.json` and raises `ValueError` on a file it cannot decode. Both are importable with no side effects.
 - Four locks: `state.lock` covers `claim`, `release` and each claim watcher read and write, and never waits on `gh`, ssh or a message; `control.lock` covers `block`, `unblock`, `status` and each block watcher pass; `watch.lock` keeps one block watcher (a `systemd-run --user` unit named `mac-test-watch-<pid>`) at a time; `claim_watch.lock` keeps one claim watcher (`mac-test-claim-watch-<pid>`) at a time.
 - **Claim files and scopes.** `claims/<repo>.json` holds one repository's claim; `run.json` holds a claim whose worktree is in no repository. `claim_scope(worktree)` names the repository through `offload.repository_identity` (`sweep.repo_name`, the folder holding the shared repository directory), else `WHOLE_MAC`: `ClaimScope = RepositoryScope(name) | WholeMacScope`, and `claim_path(paths, scope)` maps it to its file. `scopes_overlap` is true when either side is the whole Mac or both name the same repository. `read_claims(paths) -> tuple[HeldClaim(scope, path, record), ...]` reads every file, oldest `since` first; a `claims/<repo>.json` scope comes from its file name, a `run.json` scope from its worktree, so a machine-wide `run.json` from an older install covers the repository its worktree is in, or every repository when that worktree is in none. A file it cannot read raises `ClaimStateUnreadable(path)`, a `StateReadError`. `live_claims` removes each claim whose owner ended and returns the rest.
-- Each claim file is `{pid, proc_start, what, worktree, since}` for `ProcessBoundClaim`, with `remote_host` added for `RemoteJobClaim`, and two optional keys on either: `holder_session` and `idle_since`. `read_run` accepts a record without them. `RunRecord` is their union. A process-bound claim is live only while `/proc/<pid>/stat` field 22 equals `proc_start`; a remote claim stays after that process dies because work may remain on its host. `run_is_kept` identifies those leftovers.
-- `claim --pid PID --what TEXT [--worktree PATH] [--wait SECONDS] [--remote HOST]` claims for the scope of `--worktree` (default the current directory) and exits 0 `claimed`, 10 `blocked by <holder>: <for>`, 11 `busy: <what> since <HH:MM>` for the oldest live claim whose scope overlaps (or `busy: leftovers of ...` for a kept claim), 12 `state unreadable: <path>` (`block.json`, `run.json`, `claims/<repo>.json` or the `claims` folder), and 1 for a pid that is not running. `claim_once` decides one attempt under `state.lock`: takeover, then block, then overlap, then a new file. A remote takeover applies only to a kept claim of the same scope; it replaces that claim's controller pid, keeps its job and host, prints `leftovers: <host>` and exits 13; the runner must check those leftovers before releasing it. `release --pid PID` removes every claim file whose `pid` matches, reading each file alone, so a damaged file of another repository cannot keep this owner's claim. `status` shows a kept claim as `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`; after confirming the remote job ended, that pid permits a hand release. `release --pid` for a claim that is already gone exits 0. `status` prints one `running:` line per live claim, oldest first, and `free` when there is none. `claim` records `holder_session`: `build_hold.owning_session()` (the unit director first, then `CLAUDE_CODE_SESSION_ID`), else nothing; a takeover keeps the stored value. Both `status` lines end `, idle since <HH:MM>` while `idle_since` is set.
+Each claim records `claim_id`, `episode`, `attempt`, `submitting_session`, `pid`, `proc_start`, job details, worktree, and queue time.
+A remote-bound claim also records `remote_host` and its applicable host generation.
+A process-bound claim ends when its checked owner ends.
+A remote-bound claim remains held until provider cleanup confirms departure.
+Adoption preserves exact claim identity under the target lock.
+It can transfer the holder from verify to its offload child.
+A cleanup takeover updates the current holder and session but preserves original job evidence.
+It grants no new execution permission.
+Release compares the exact claim identity.
+A PID alone cannot release another attempt.
+
 - `free-now --settings FILE [--repo-root DIR]` reads local records without a lock or remote command.
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
@@ -91,8 +89,8 @@ It accepts `AnyTarget` records with Mac targets.
 The step must have state `waiting_hold` or `waiting_mac`.
 The check validates the owner PID and process start time.
 It reads admission waiters and excludes permanent local declines.
-A disk exclusion remains `NatedevOnly("disk")`.
-The watch counts that reason in `waiting_hold`, `waiting_mac`, and `on_natedev`.
+Saved disk evidence remains diagnostic.
+The queue refreshes disk eligibility without changing the submitted candidate set.
 It displays `Mac disk exclusion` and names sufficient Mac disk space as the clearing condition.
 Other `natedev_only` reasons do not count.
 
@@ -395,19 +393,19 @@ It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac
 
 ### The Mac copy — `scripts/mac_test/copy_watch.py`
 
-After any temporary Mac result at the start of a `verify.sh test` call, the call can run on natedev with `MAC_LEAVE_SETTINGS` set. Once its nextest step has started cargo (past the memory and hold waits) and nextest has not yet printed `Starting N tests`, the call may get a **copy**: the same test run on the Mac at once, the first result winning.
+A speculative copy remains separate from its local parent attempt.
+The parent retains its actual local memory reservation while it compiles.
+The watcher submits source facts, parent identity, call start time, and candidate lifetime to the queue.
+The queue selects the newest eligible copy by call start time, then call identity.
+The watcher requests placement instead of selecting free capacity.
+It starts only the assigned attempt.
+The offload adapter claims, adopts, and consumes that attempt through the normal provider path.
 
-- **mac_test.py.** A claim record may carry `"copy": true` (`claim --copy`). `free-now` (no flag) treats a scope held only by a live copy claim as free; `free-now --copy` counts copy claims as busy. A non-copy `claim` that finds only live copy claims (`ClaimHeldByCopy`) SIGTERMs each copy's pid outside `state.lock` (only when `proc_start` still matches), then retries every 0.1 s until it claims or `MAC_TEST_COPY_YIELD_S` (default 60) passes, then prints the usual `busy:` line and exits 11. A copy claimant never preempts, a non-copy claim never gives way, and a kept copy claim (its process gone, leftovers unchecked) holds like any kept claim. `status` prints `running: copy of <what> …`.
-- **offload.py `run --copy`.** Only nextest accepts `--copy` and `--filter-run`. Other verbs use no copy watch, test skip expression or no-tests exit-4 rule; their exit 4 is a failed step. Claims with `--copy` and prints `mac_test: running a copy on the Mac while natedev compiles (host <host>); tree copied in N s`; the run, result file and cleanup are unchanged, and SIGTERM still exits 143 after its cleanup.
-- **copy_watch.py.** Started in the background by `run_local_test` beside each natedev nextest step (only when `MAC_LEAVE_SETTINGS` is set and both `offload.py` and `copy_watch.py` exist; `VERIFY_MAC_COPY_WATCH` overrides the path). It reads `pgid=`/`log=` from the file `run()` writes to `$VERIFY_STEP_INFO_FILE` after each fork (a new pgid resets what it has read), strips ANSI and watches for the first cargo status line and the nextest `Starting` line. While still compiling it keeps `$MAC_TEST_STATE_DIR/copy_candidates/<repo>/<call_id>.json` (`pid`, `proc_start`, `call_started`, `call_id`; records of dead pids are deleted by any reader). Every `BUILD_TARGETS_POLL_S` (default 15) seconds it asks `free_now(copy=True)` in process, and only the newest live candidate (latest `call_started`, then call id) starts `offload.py run --copy`. A repository the Mac cannot name is never a candidate. It sleeps on a signal wakeup pipe, so TERM, HUP, INT (unless ignored) and a copy's exit are answered at once. Both watch loops check the original parent pid at least once per second and stop when verify.sh is gone, including after SIGKILL.
-- **Outcomes.** A copy failure or pass wins: the watcher checks that the step's group leader still runs (not reaped, not a zombie, same start time, still its own group), creates `<info>.stopped`, SIGTERMs the group and writes `copy=won`, `mac=`, `reason=`, `seconds=`, `runner_status=`, `stopped_natedev=1`, then exits. If the leader is gone, natedev finished first: `natedev_won`. A runner exit 143 the watcher did not cause means a new test took the Mac: `gave_way`. `declined` with `no_tests`, `off`, `repo` or `linux_only` ends copies; any other decline, `lost`, or an unusable result lets the call become a candidate again. verify's TERM or loss of the verify parent stops a running copy (TERM, 60 s, then kill) as `natedev_won`; a copy that ended before the TERM keeps its outcome, except a win, which stopped nothing and is `natedev_won`. The result file always carries `copy=`, `copy_s=` (seconds copies held the Mac), `copy_count=` and `natedev_s_at_end=` (seconds since the step's first cargo line when the result was decided), all empty when no copy started.
-- **verify.sh.** `run()` writes the info file and, after a failed attempt with `.stopped` present, returns at once (no memory-kill retry). `VERIFY_CALL_STARTED` is `EPOCHREALTIME` at call start. After `run_nextest` returns, `stop_copy_watch` TERMs and waits for the watcher and folds its result into `BUILDLOG_MAC_COPY` (last outcome), `BUILDLOG_MAC_COPY_COUNT` and `BUILDLOG_MAC_COPY_S` (summed over leave-hook passes) and `BUILDLOG_MAC_COPY_NATEDEV_S`, passed by `note_event`. Only `copy=won` with `stopped_natedev=1` and a nonzero step status acts: `finish_copy_win` sets the `BUILDLOG_MAC*` words and `BUILDLOG_TARGET=mac`, and ends as `try_mac_test` does (failure: removes the run log and exits with its status; pass: the run log, holding both machines' output, becomes the `host=mac` pass record, `passed_full` or `passed_filter`, exit 0). A `won` that did not stop natedev is recorded as `natedev_won`. `verify_cleanup` calls `stop_copy_watch` first, so an interrupt (after `verify_interrupted` stops the step group) also stops the copy.
-
-`start_copy_watch` passes the launching shell's `BASHPID` as required `--parent-pid`.
-The Bash fallback uses an executed child shell's `PPID`.
-`$$` would identify the outer shell inside a subshell.
-`Wakeup.stop_requested` stops when `os.getppid()` differs from the supplied parent, including on its first check.
-A missing parent argument exits 2 and writes no result.
+The watcher preserves first-result handling, loser stopping, logs, fetch behavior, and source locks.
+An uncertain loser retains its exact provider claim until departure is confirmed.
+A retained cleanup claim cannot yield overlapping capacity.
+Changed source content receives receiver write time through `copies.remote_rsync` and `RSYNC_RECEIVER_WRITE_TIME_FLAGS`.
+Unchanged content retains its earlier time.
 
 ### Build log and report — `scripts/buildlog/`
 
@@ -613,32 +611,59 @@ Task removal can delete the sibling lease and record lock while the outside leas
 The sibling lease path stays unchanged, so a live lease from the old code still blocks removal.
 
 A disk decline remains retryable through the local queue leave hook.
-The step record retains `NatedevOnly("disk")` for idle-alert evidence.
+The step record retains disk diagnostics for idle-alert evidence.
 Permanent exclusions stop remote retries.
 Every claim and command still checks AWS spending rules.
 
 ### Queue claim handoff
 
-The memory wait leave hook uses `mac_test.py claim-wait` under `state.lock`.
-A successful claim creates `MAC_WAIT_CLAIM_FILE`.
-`offload.py run --claim-owner-pid` adopts that claim through `claim --from-pid` and `adopt_wait_claim`.
-A refused claim keeps the local queue place.
-`release_wait_claim` releases unused claims after an attempt and during cleanup.
-An unlocked `free-now` read cannot replace this claim handoff.
-`build_targets.command_reserve()` reads `free_now` before it tries `state.lock`.
-A block or an active backoff returns without waiting for that lock.
-`owns_wait_claim()` reads ownership without a lock before `free_now`.
-Unreadable state means the caller does not own the claim.
-A published reservation retains success during backoff.
-Without a published reservation, an owned wait claim still passes the policy check.
-The policy check refuses backoff without waiting for `state.lock`.
-A block refuses a plain owned claim.
-A retained remote cleanup claim keeps success under a block.
-A published reservation checks ownership before it returns success.
+Converted callers request placement before they claim a provider scope.
+`place-step --once` writes an `Assignment` or `LocalPlacementGranted` file.
+A wait retains the episode, original queue time, run place, and priority.
+Token readiness reports remain separate from fixed placement constraints.
+The token renewal wrapper remains active during waits.
+A remote selection releases the unused local token and continuation claim.
 
-`blocking_claim_block` applies the shared block rule to claim reuse and transfer.
-A plain reservation cannot override a later block from another session.
-Each new step releases the previous step's reservation before local waits.
+The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
+Linux repository scopes carry the selected slot.
+Distinct known Mac repository scopes can coexist.
+A whole-Mac scope overlaps every repository scope.
+A definite refusal reports `ClaimFailure` before the queue decides another attempt.
+An uncertain response requires inspection of the same exact identity.
+It cannot start another claim or choose another destination.
+
+`wait_claim_identity` identifies the current claim owner.
+Adoption preserves the claim identity and updates the local holder under the target lock.
+`submitting_session` identifies that current holder's session.
+`holder_session` preserves the original job evidence.
+Strict session equality prevents an unrelated session from adopting the claim.
+`ClaimHolderIdentity` names the offload child.
+`SubmittingOwner` remains the verify coordinator.
+The service checks both lifetimes and their process-tree relationship.
+
+The adapter consumes permission after adoption and before remote execution.
+Only `FirstAuthorization` permits one execution.
+Repeated consumption returns status across request IDs and service restarts.
+A lost first response authorizes zero executions for that attempt.
+A status response cannot recover authorization.
+
+The adapter resolves pending claim and start children before it reports a settled dispatch path.
+Provider cleanup retains the exact claim until departure is confirmed.
+Owner death, SSH exit, timeout, and an empty scan cannot bypass that barrier.
+Cleanup takeover grants no launch authority.
+The service reconstructs uncertain execution rows from provider records and background observations.
+It invokes no destructive cleanup.
+The provider remains the physical release authority.
+
+A completed command remains terminal under the caller policy.
+A settled prelaunch refusal can produce a new attempt with the original queue position.
+Busy, blocked, and disk outcomes use normal polling.
+Other temporary Mac outcomes delay that target for 180 seconds.
+Permanent declines remove only that target from further retries.
+
+The views show each execution's host.
+Unavailable process identity remains uncertain.
+Unknown remote memory remains unknown and creates no local memory charge.
 
 ## Mirror refusal times
 

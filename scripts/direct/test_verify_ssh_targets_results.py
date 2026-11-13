@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import json
-from typing import override
 
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
 class VerifySshResultsTests(VerifySshTargetsFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.control_admission_clock()
+    def only_attempt(self) -> dict[str, object]:
+        attempts = self.attempts()
+        self.assertEqual(len(attempts), 1,
+                         json.dumps({"attempts": attempts, "events": self.ssh_events()})
+                         + repr(self.admission.server.assignments))
+        return attempts[0]
 
     def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
         self.configure("linux,spare,natedev")
-        result = self.verify("test", "sample", "--no-cache", extra={
-            "TEST_SSH_MODES": '{"linux":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+        with self.spare_after_linux_refusal():
+            result = self.verify("test", "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": '{"linux":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        first, second = self.ssh_events()
+        events = self.ssh_events()
+        self.assertEqual(len(events), 2, json.dumps(events) + repr(self.admission.server.assignments))
+        first, second = events
         self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
         self.assertEqual(first["result_type"], "BusyMacDecline")
         self.assertEqual(first["holder"], "LostRunLeftovers")
@@ -36,7 +40,7 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.configure("linux,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"linux":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("no_tests", "confirmed", "confirmed"))
         self.assertEqual(len(self.local_runs()), 1)
@@ -50,20 +54,19 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.assertEqual(len(self.local_runs()), 1)
         self.assertTrue(self.ssh_events(), result.stdout + result.stderr)
         self.assertTrue(self.attempts(), json.dumps(self.ssh_events()) + result.stdout + result.stderr)
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
                          ("linux", 1, "lost", 100.25))
         self.assertEqual(attempt["repo_identity"], "https://example.com/team/hana")
         self.assertEqual(self.routing_record()["target"], "natedev")
         self.assertEqual(first.read_text().strip(), "100.25")
 
-
     def test_confirmed_linux_failure_never_repeats_the_test_locally(self) -> None:
         self.configure("linux,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"linux":"failed"}'})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
-        attempt, = self.attempts()
+        attempt = self.only_attempt()
         self.assertEqual(self.ssh_events()[0]["result_type"], "FailedOnTarget")
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("failed", "confirmed", "confirmed"))

@@ -11,6 +11,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class VerifyTokenWaitTests(VerifyTokenWaitFixture):
@@ -46,7 +47,8 @@ capture.write_text(json.dumps(rows))
         shell = self.root / "observe.sh"
         _ = shell.write_text('''set -T
 observe_admission() {
-    if [[ "${FUNCNAME[1]:-}" == buildlog_wait_for_memory && "$BASH_COMMAND" == 'with_token_renewal buildlog_wait_for_memory_only "$@"' ]]; then
+    if [[ "${FUNCNAME[1]:-}" == placement_once && "$BASH_COMMAND" == 'PLACEMENT_CLIENT_ACTIVE=1' \
+          && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_TOKEN_OBSERVATIONS" ]]; then
         python3 "$TEST_TOKEN_OBSERVER" admission || exit 95
     fi
 }
@@ -94,6 +96,11 @@ trap observe_admission DEBUG
         runner = self.root / "mac-runner.py"
         _ = targets.write_text(routes.TARGETS)
         _ = runner.write_text(routes.RUNNER)
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
+        _ = write_config_fixture(self.root / "mac-settings", f"offload=on\nlinux_only.{self.root.name}=\n",
+                                 template="mac_test")
         self.environment.update({
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
