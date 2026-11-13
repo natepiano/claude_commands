@@ -643,7 +643,7 @@ It joins the row's `current_session` to native pane or process evidence.
 An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
-  Each phase table prints one row per open phase of each production staff unit's newest run.
+  Each phase table prints one row per open phase of each production staff unit's selected run.
   A unit without open phases keeps one row; the style table keeps one row per unit.
   Without `--production`, `showrunners.own_name()` selects the production name.
   `read_production(name)` reads the document from that showrunner's staff row.
@@ -711,8 +711,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
-    Each open phase of the newest recorded run gets one row in both tables.
-    The current staff run pointer takes priority over newer completed ad hoc records for the same owner.
+    Each open phase of the selected run gets one row in both tables.
+    The staff current run selects the run when present; otherwise, the newest run supplies the rows.
+    Notes, ETA cells, and Workers use that same selected run.
+    Other open runs of the unit supply no rows, Notes, or workers.
     The latest `run_finished` or `reopened` event determines whether that run is finished.
     `unit_phases.run_is_finished` supplies the same rule for phase rows and pending promises.
     Rows follow the configured plan order, then the start order for phases outside that plan.
@@ -740,7 +742,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Phase shows the phase id for an open phase row.
     Without an open phase, it shows `<done>/<total>` from the plan, or `—` with no phases.
     Notes starts with `phase <id> — <phase title>`.
-    The open step belongs to that phase instance in the newest run.
+    A matching phase label at the start of the title appears once, regardless of case or dash.
+    The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
     Empty text, role-only text, and `<label> dispatch` add nothing.
     Text equal to the title adds nothing; this comparison ignores case and whitespace.
@@ -763,13 +766,14 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
-    A finished newest run supplies no fallback.
+    A finished selected run supplies no fallback.
     ETA Next uses that phase instance's latest promise from `eta_trail`, never `schedule_end`.
     Without open work, it uses the next not-started plan phase with a promise.
     `eta_phase_id` selects the target even when the event carries another active phase instance.
     Passed promises add `late <elapsed>`; open work without a promise shows `no ETA stated`.
     With no open work or promised phase, ETA Next shows `—`.
     ETA Plan shows the predicted plan finish without `ends`.
+    Duration predictions still use the plan's recorded history.
     The first row also names the latest promises for unfinished targets without open rows.
     Those promises use `phase <id>: <time>[ · late <elapsed>]`.
     The latest `phase_finished` event for each target decides whether that target is done.
@@ -789,12 +793,12 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
-    It excludes every open phase of the newest run, including phases absent from the configured plan.
+    It excludes every open phase of the selected run, including phases absent from the configured plan.
     It excludes each queue item whose text equals Notes in the same row.
     Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
     Each displayed item or title keeps its full text and count suffix.
-    A configured plan with phases takes priority over the newest run's plan.
+    A configured plan with phases takes priority over the selected run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
