@@ -3685,3 +3685,39 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The same test count and assertions; the module passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: todo
+**Depends on:** Phase 234
+
+#### Work Order
+
+**Goal:** The unit config fixture callers start fewer Taplo processes and use less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** architect 29 trial queue row 5; sdlc owner go 2026-11-13 13:38 (sdlc owns configuration behavior). `unit_config._formatted` (`scripts/production/unit_config.py:387`) starts Taplo for each config write. `test_unit_config.py` starts Taplo 158 times (1.16 natedev CPU s). The lifecycle fixture writes two configs in each of 56 `running()` calls.
+
+**Spec:**
+1. Profile first, each module under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_unit_config.py production/test_production_lifecycle.py --tests 10 --commands 10`. Name the Taplo starts that fixture setup makes, apart from the starts that tests under test make.
+2. Remove only fixture-setup Taplo starts. Write formatted baseline bytes once per class, or copy them with the class seed or snapshot, so setup writes no config through Taplo again. Keep real Taplo in every format, refusal and publication test.
+3. Change test support files only. Do not change `unit_config.py` or any production code.
+4. If the profile shows that fixture setup makes few Taplo starts, report it to the director and stop before you change code.
+5. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+6. Run each changed module and each caller of a changed support file three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+7. The director runs the aws pairs.
+
+**Files:**
+- `scripts/production/unit_config_test_support.py`
+- `scripts/production/production_lifecycle_test_support.py`
+
+**Workers:** 1 writer; shared fixture support.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 233: the lifecycle fixture copies a running snapshot per test from `running_snapshot`.
+- Phase 234: `UnitConfigFixture` copies a class seed repository per test.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test counts and assertions; each changed module passes three times.
+- `module_cost.py` CPU and Taplo starts before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
