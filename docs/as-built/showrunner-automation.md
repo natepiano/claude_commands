@@ -695,8 +695,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
-    `scripts/message/morty_identity.py` supplies the shared match against `MORTY_NATIVE_ID` from `config/send.conf`.
-    A match produces no anomaly.
+    `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
+    `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
@@ -871,8 +871,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
   Unit names also accept the form from `copies.unit_owner`.
-  Morty uses its staff row when present.
-  Without that row, `send.py` matches Morty's configured `MORTY_NATIVE_ID` against native transport addresses.
+  Morty uses its staff row. Without that row, `send.py` refuses the name `morty` as it refuses each name without a row.
   Postmaster replies use explicit session addresses.
   `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.
 
