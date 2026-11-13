@@ -8,6 +8,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import termios
@@ -143,6 +144,27 @@ def refuse_plain_admin(settings: Path) -> None:
         raise SecretsRefused('plain administrator credentials remain; run deploy.py secrets in a terminal')
 
 
+def redact(message: str, secrets: Sequence[str] = ()) -> str:
+    """Remove known credentials and AWS identifiers from diagnostic text."""
+    # Keep appended reports when an earlier pass already removed the credential value.
+    message = re.sub(r'(?i)(\b(?:(?:aws[ _-]*)?(?:secret[ _-]*(?:access[ _-]*)?key|'
+                     + r'(?:session|security)[ _-]*token|access[ _-]*key[ _-]*id)|'
+                     + r'x[ _-]*amz[ _-]*(?:security[ _-]*token|credential|signature)|'
+                     + r'authorization|signature|credential)\b[\'\"]?\s*[:=])'
+                     + r'(?!\s*\[redacted\](?=$|[\s,;}]))(\s*)[\s\S]*',
+                     r'\1\2[redacted]', message)
+    for value in secrets:
+        message = message.replace(value, '[redacted]')
+
+    def hide(match: re.Match[str]) -> str:
+        # Preserve line breaks so callers can select an error line without request dumps.
+        return '[redacted]' + ''.join(re.findall(r'\r\n|[\r\n]', match[0]))
+
+    return re.sub(r'\barn:\s*[^\s\'"<>]+(?:[ \t]*[\r\n]+[ \t]*[^\s\'"<>]+)*|'
+                  + r'\b[0-9](?:\s*[0-9]){11}\b|\b(?:AKIA|ASIA)(?:\s*[A-Z0-9]){16}\b|'
+                  + r'\b(?:i|subnet|ami|vol|snap)-[0-9a-f]+\b', hide, message)
+
+
 class AdminSecretSession:
     """Decrypt once and share credentials across this deployment's stages."""
 
@@ -184,10 +206,8 @@ class AdminSecretSession:
         return environment
 
     def redact(self, message: str) -> str:
-        if isinstance(self.credentials, AdminCredentials):
-            for value in self.credentials.secret_values():
-                message = message.replace(value, '[redacted]')
-        return message
+        secrets = self.credentials.secret_values() if isinstance(self.credentials, AdminCredentials) else ()
+        return redact(message, secrets)
 
     def executor(self, execute: AdminExecutor) -> AdminExecutor:
         def authorized(arguments: Sequence[str], *, capture_output: bool, text: bool,

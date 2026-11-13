@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -30,12 +31,14 @@ from uuid import uuid4
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf, user_zone
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
+CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
 
 
 UP_STAGE_LABELS = {
@@ -93,10 +96,10 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
     )
 
 
-def quota_date(value: object) -> str:
-    """Format AWS timestamps in the user's zone."""
+def quota_timestamp(value: object) -> float:
+    """Convert AWS timestamps to seconds for request ordering."""
     if value is None:
-        return '-'
+        return float('-inf')
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         moment = datetime.fromtimestamp(value, UTC)
     elif isinstance(value, str):
@@ -105,13 +108,19 @@ def quota_date(value: object) -> str:
             moment = moment.replace(tzinfo=UTC)
     else:
         raise ValueError('The quota request date is invalid')
-    return moment.astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
+    return moment.timestamp()
+
+
+def quota_date(value: object) -> str:
+    """Format AWS timestamps in the user's zone."""
+    if value is None:
+        return '-'
+    return datetime.fromtimestamp(quota_timestamp(value), UTC).astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
 def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
     """Request one regional quota unless its value is sufficient or a request is open."""
     region = api.region
-    closed = {'APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'}
     try:
         quota = spot_quota(api, code)
         if quota >= desired:
@@ -119,7 +128,7 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
             return True
         history = api.call('list-requested-service-quota-change-history-by-quota',
             '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in closed]
+        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in CLOSED_QUOTA_REQUEST_STATUSES]
         if opened:
             for row in opened:
                 status = ledger.text(row, 'Status')
@@ -1069,37 +1078,71 @@ class Deployment:
 
     def quota_status(self) -> bool:
         """Report applied quotas and request history without changing AWS or local state."""
+        from scripts.aws_target import gpu_size_trial
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
         regional: dict[str, list[tuple[str, str]]] = {}
         for regions, code, _desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
                 regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
         _ = self.admin.get()
-        print('region | quota | asked vCPUs | applied vCPUs | status | case id | updated')
         success = True
+        ready: list[str] = []
+        opened: list[str] = []
+        unknown: list[str] = []
+        unknown_quota: list[str] = []
         for region, quotas in regional.items():
-            with step('quota-status', 'reading quotas in ' + region, self.settings_path):
-                target = api.in_region(region)
-                for code, name in quotas:
-                    try:
-                        applied = f'{spot_quota(target, code).normalize():f}'
-                        history = target.call('list-requested-service-quota-change-history-by-quota',
-                            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                        for request in ledger.rows(history, 'RequestedQuotas') or [{}]:
-                            asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}' if request else '-'
-                            status = ledger.text(request, 'Status') if request else 'none'
-                            case = str(request.get('CaseId') or '-')
-                            date = quota_date(request.get('LastUpdated') or request.get('Created'))
-                            print(' | '.join((region, name, asked, applied, status, case, date)))
-                    except (admin_secrets.SecretsRefused, DeploymentRefused):
-                        raise
-                    except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                        match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
-                        reason = match[1] if match else type(error).__name__
-                        print(f'{region}: {name} quota status failed: {reason}')
-                        success = False
-        print('quota-status: done at ' + quota_date(self.clock()), flush=True)
+            print(region, flush=True)
+            target = api.in_region(region)
+            for code, name in quotas:
+                applied: Decimal | None = None
+                try:
+                    applied = spot_quota(target, code)
+                    print(f'  {name}: {applied.normalize():f} vCPUs applied', flush=True)
+                    if code == 'L-3819A6DF' and applied >= needed:
+                        ready.append(region)
+                    history = target.call('list-requested-service-quota-change-history-by-quota',
+                        '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+                    requests = sorted(ledger.rows(history, 'RequestedQuotas'),
+                        key=lambda row: quota_timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
+                    rows: list[list[str]] = []
+                    for request in requests:
+                        asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}'
+                        status = ledger.text(request, 'Status')
+                        case = str(request.get('CaseId') or '-')
+                        date = quota_date(request.get('LastUpdated') or request.get('Created'))
+                        rows.append([asked, status, case, date])
+                        if status not in CLOSED_QUOTA_REQUEST_STATUSES:
+                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
+                    if rows:
+                        for line in aligned_table(('Asked vCPUs', 'Status', 'Case ID', 'Updated'), rows,
+                                                  right=frozenset((0,))):
+                            print('    ' + line)
+                    else:
+                        print('    No requests.')
+                except (admin_secrets.SecretsRefused, DeploymentRefused):
+                    raise
+                except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                    reason = match[1] if match else type(error).__name__
+                    if applied is None:
+                        print(f'  {name}: applied quota unknown')
+                        if code == 'L-3819A6DF':
+                            unknown_quota.append(region)
+                    print('    Quota status failed: ' + reason)
+                    unknown.append(region + ' ' + name)
+                    success = False
+            print()
+        fits = ', '.join(ready)
+        if unknown_quota:
+            fits += (', ' if fits else '') + 'unknown for ' + ', '.join(unknown_quota)
+        elif not fits:
+            fits = 'no region has enough applied quota'
+        requests_text = 'unknown' if unknown else ', '.join(opened) or 'none'
+        incomplete = '; request history unavailable: ' + ', '.join(unknown) if unknown else ''
+        print(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+              + 'open requests: ' + requests_text + incomplete, flush=True)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:

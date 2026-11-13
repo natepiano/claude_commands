@@ -30,7 +30,10 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
     label: account.label, roles: account.roles.map(role =>
       account.selected_roles?.includes(role) ? `${role} ✓` : role),
-    roleCounts: account.roles.map((_, index) => reading(account.role_counts?.[index])),
+    roleCounts: account.roles.map((_, index) => {
+      const count = account.role_counts?.[index];
+      return reading(count == null ? count : { ...count, starting: count.starting ?? 0, waiting: count.waiting ?? 0 });
+    }),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
@@ -61,7 +64,7 @@ function dateText(value: AccountReading<string>, zone: string, now: number): str
   return days === 0 ? clock : `${new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short' }).format(date)} ${clock}`;
 }
 
-type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'idle' | 'paused' | 'exited' | 'total' | 'left' | 'resets' | 'credits' | 'enabled';
+type AccountColumn = 'dot' | 'label' | 'roles' | CountColumn | 'left' | 'resets' | 'credits' | 'enabled';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -73,7 +76,7 @@ interface TableColumn {
   width: number;
 }
 
-const COUNT_COLUMNS = ['busy', 'idle', 'paused', 'exited', 'total'] as const;
+const COUNT_COLUMNS = ['busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total'] as const;
 type CountColumn = typeof COUNT_COLUMNS[number];
 
 function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColumn, string> {
@@ -84,7 +87,8 @@ function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColum
 }
 
 function countSpans(counts: Record<CountColumn, string>): Record<CountColumn, BoardLine> {
-  return { busy: [span(counts.busy)], idle: [span(counts.idle)], paused: [span(counts.paused)],
+  return { busy: [span(counts.busy)], starting: [span(counts.starting)], waiting: [span(counts.waiting)],
+    idle: [span(counts.idle)], paused: [span(counts.paused)],
     exited: [span(counts.exited)], total: [span(counts.total)] };
 }
 
@@ -94,6 +98,7 @@ function totalRow(accounts: AccountDisplay[]): AccountRow {
   const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
   const cells = countCells(reading<RoleSessionCounts>({
     busy: sum(counts.map(count => count.busy)),
+    starting: sum(counts.map(count => count.starting)), waiting: sum(counts.map(count => count.waiting)),
     idle: sum(counts.map(count => count.idle)), paused: sum(counts.map(count => count.paused)),
     exited: sum(counts.map(count => count.exited)), total: sum(counts.map(count => count.total)),
   }));
@@ -210,8 +215,8 @@ function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
   if (tableWidth(columns) <= width) {
     return [tableLine(columns, header), ...accounts.map(row => tableLine(columns, row.cells))];
   }
-  const first = columns.slice(0, 9);
-  const second = columns.slice(9);
+  const first = columns.slice(0, 4 + COUNT_COLUMNS.length);
+  const second = columns.slice(4 + COUNT_COLUMNS.length);
   if (tableWidth(first) <= width && tableWidth(second, 2) <= width) {
     return [tableLine(first, header), tableLine(second, header, 2),
       ...accounts.flatMap(row => [tableLine(first, row.cells),
