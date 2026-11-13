@@ -231,7 +231,9 @@ class PlacementTests(unittest.TestCase):
                     places = dict(fixture.server.run_places)
                     if prioritize_movable:
                         self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
-                            "movable-first", "movable", "the user", "fixture-director")), [wire.Ok()])
+                            "movable-first", "movable", "the user", "fixture-director",
+                            records.SelectedPriorityStep(movable.owner.pid, movable.owner.start_time, movable.since))),
+                            [wire.Ok()])
                     view, = fixture.connect(wire.ViewRequest()).replies()
                     assert isinstance(view, wire.ViewReply)
                     expected = ([movable.owner.pid, fixed.owner.pid] if prioritize_movable

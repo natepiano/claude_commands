@@ -17,6 +17,7 @@ import socket
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from typing import Literal, cast
 from unittest import mock
@@ -27,7 +28,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
 from scripts.build_queue import admission_code, admission_records as records
-from scripts.build_queue import placement
+from scripts.build_queue import placement, queue_snapshot
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
 
@@ -75,6 +76,33 @@ class ProtocolTests(unittest.TestCase):
             self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
             self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
 
+
+    def test_clear_pressure_measurements_survive_the_codec_and_reader(self) -> None:
+        for measurements in (records.PressureMeasurements(1.25, 2.5, 62.9), records.PressureMeasurementsNotRecorded()):
+            with self.subTest(measurements=measurements):
+                pressure = records.NoPressureHold(measurements)
+                encoded = codec.snapshot_value(pressure)
+                self.assertEqual(codec.parse_snapshot_value(encoded, records.Pressure), pressure)
+                reading = gate.queue_read_from(
+                    records.QueueInputs([], (), (), records.HostMemory(30 * GIB, 60 * GIB), pressure,
+                        records.ReadyToStart(), records.NoHeadAdmissionOverride(), NOW), admission_policy_fixture())
+                raw = codec.snapshot_value(reading)
+                decoded = codec.parse_snapshot_value(raw, records.QueueRead)
+                self.assertEqual(decoded, reading)
+                with tempfile.TemporaryDirectory() as folder:
+                    directory = Path(folder)
+                    queue_snapshot.write_queue_snapshot(directory, reading.explanation.decided_from, admission_policy_fixture())
+                    saved = queue_snapshot.read_queue_snapshot(directory)
+                    assert isinstance(saved, queue_snapshot.QueueSnapshot)
+                    self.assertEqual(saved.inputs.pressure, pressure)
+                    path = directory / "queue.json"
+                    old = cast(dict[str, dict[str, dict[str, object]]], json.loads(path.read_text()))
+                    del old["inputs"]["pressure"]["measurements"]
+                    _ = path.write_text(json.dumps(old))
+                    self.assertIsInstance(queue_snapshot.read_queue_snapshot(directory), queue_snapshot.NoQueueSnapshot)
+
+        with self.assertRaises(ValueError):
+            _ = codec.parse_snapshot_value({"kind": "NoPressureHold"}, records.Pressure)
 
     def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
         for operation in ("import", "release reply"):
@@ -427,7 +455,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
                 wire.AdmitHeadRequest("head", "urgent", "actor"),
-                wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
+                wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor", records.SelectedPriorityStep(42, "start", 123)),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
                 for call in (test_phase.CallRecord("a-call"), test_phase.NoCallRecord()):

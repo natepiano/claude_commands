@@ -1351,9 +1351,9 @@ class QueueViewTests(QueueViewFixtureTests):
             labels = {first.identity.session_id: UnitLabels("first", "builds", "other-unit"),
                       later.identity.session_id: UnitLabels("gate", "builds", "wrong-unit")}
             with mock.patch.object(gate, "priority_labels", return_value=labels):
-                refused, = fixture.completed_queue_change(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user"))
+                refused, = fixture.completed_queue_change(wire.PrioritySetRequest("wrong-bump", "wrong-unit", "urgent", "user", admission_records.SelectedPriorityStep(later.owner.pid, later.owner.start_time, later.since)))
                 self.assertIsInstance(refused, wire.Refused)
-                replies = fixture.completed_queue_change(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user"))
+                replies = fixture.completed_queue_change(wire.PrioritySetRequest("bump-unit", "queue-unit", "urgent", "user", admission_records.SelectedPriorityStep(later.owner.pid, later.owner.start_time, later.since)))
                 self.assertEqual(replies, [wire.Ok()])
                 model = self.service_model(fixture)
                 self.assertEqual([step.pid for step in model.reading.view.waiting], [later.owner.pid, first.owner.pid])
@@ -1669,7 +1669,7 @@ class QueueViewTests(QueueViewFixtureTests):
         model = self.fixture.model()
         for units in (("cables",), ("widget",), ("cables", "widget")):
             priority = admission_records.QueuePriority(tuple(
-                admission_records.PriorityEntry(unit=unit, why="test", set_at=NOW, set_by="actor") for unit in units))
+                admission_records.PriorityEntry(unit=unit, why="test", set_at=NOW, set_by="actor", step=admission_records.SelectedPriorityStep(1, "1", 0)) for unit in units))
             bumped = replace(model, reading=replace(model.reading,
                 explanation=replace(model.reading.explanation, priority=priority)))
             unbumped = replace(model, reading=replace(model.reading,

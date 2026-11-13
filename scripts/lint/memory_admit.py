@@ -315,7 +315,7 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
         value = cast(object, json.loads(path.read_text()))
         if not isinstance(value, dict):
             raise ValueError("priority is not an object")
-        row = records.upgrade_queue_priority(cast(dict[str, object], value))
+        row = cast(dict[str, object], value)
         return cast(QueuePriority, codec.parse_snapshot_value(row, QueuePriority))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
@@ -423,13 +423,9 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 
 def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, RankedWaiter]], QueuePriority | NoQueuePriority]:
-    ranked: list[tuple[Path, RankedWaiter]] = []
-    for path, row in rows:
-        unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
-        position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
-        order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
-        ranked.append((path, rank_waiter(row, order)))
+    entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
+    orders = {entry["step"]: PriorityUnit(entry["unit"], position) for position, entry in enumerate(entries)}
+    ranked = [(path, rank_waiter(row, orders.get(records.priority_step(row), NormalOrder()))) for path, row in rows]
     return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
 
 
@@ -1223,7 +1219,7 @@ def pressure_from_readings(full: float, some: float, swap: float, policy: Admiss
     """Use one pressure predicate for live admission and replay estimates."""
     if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
         return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NoPressureHold(records.PressureMeasurements(full, some, swap))
 
 
 def admission_dir(root: Path) -> Path:

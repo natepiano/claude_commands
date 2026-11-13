@@ -311,8 +311,11 @@ class QueueFixture(ExitStack):
         self.moves = [self.move(1, NOW - 372, 27), self.move(2, NOW - 372, 27),
             bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
                       actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
-        self.write_json(self.directory / "queue_priority.json", {"unit": "cables", "why": "captured priority",
-            "set_at": NOW - 12, "set_by": "user", "transition": codec.snapshot_value(admission_records.SettledPriority())})
+        entries = [{"unit": "cables", "why": "captured priority", "set_at": NOW - 12, "set_by": "user",
+                    "step": codec.snapshot_value(admission_records.priority_step(gate.read_waiter(path)))}
+                   for path in (self.paths[4], *self.paths[:2])]
+        self.write_json(self.directory / "queue_priority.json", {"kind": "QueuePriority", "entries": entries,
+            "transition": codec.snapshot_value(admission_records.SettledPriority())})
         write_bumps(NOW, self.moves)
         self.write_pace([NOW - 3600 + index * 80 for index in range(44)])
 
