@@ -530,6 +530,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           snapshot: staff.StaffSnapshot | None = None,
           pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
           runs_reader: worker_runs.WorkerRuns | None = None) -> str:
+    """Render both phase tables with continuation rows at the configured floor."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
     if now is None:
         now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()

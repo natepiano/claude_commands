@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 from scripts.lib import conf
+from scripts.production import claude_table_layout
 from scripts.lib.terminal_cells import terminal_width
 
 NONE = "—"
@@ -21,13 +22,15 @@ class CutOrder(Enum):
 
 
 def wrapped(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
-    """Keep full cells for native Markdown wrapping and omit columns with only NONE cells.
-
-    The renderer wraps each cell inside one table row at the terminal width.
-    A table without rows keeps every column.
-    """
+    """Remove empty columns and split cells at the configured terminal floor."""
     kept = [index for index in range(len(headers)) if not rows or any(row[index] != NONE for row in rows)]
-    return tuple(headers[index] for index in kept), [tuple(row[index] for index in kept) for row in rows]
+    titles = tuple(headers[index] for index in kept)
+    table_rows = [tuple(row[index] for index in kept) for row in rows]
+    settings = conf.read_or_repository("production")
+    render_width = settings.whole("units_table_floor_columns") - claude_table_layout.REPLY_INDENT
+    return titles, claude_table_layout.continued(titles, table_rows, render_width,
+                                               settings.whole("units_table_cell_lines"),
+                                               settings.whole("units_table_break_columns"))
 
 
 def fitted(headers: Sequence[str], rows: Sequence[Sequence[str]], *,

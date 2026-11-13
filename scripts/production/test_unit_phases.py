@@ -24,11 +24,11 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import display_cells, live_units, unit_queue
+from scripts.production import claude_table_layout, display_cells, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.agents.detached_runs import RunRecord
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lib import names as display_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.message import sessions
@@ -320,7 +320,7 @@ class UnitPhasesTests(unittest.TestCase):
     def test_non_phase_work_and_queued_items_share_the_units_row(self) -> None:
         config = self.root / "table-conf/production.conf"
         configured = config.read_text()
-        _ = config.write_text(configured.replace("units_table_columns=170", "units_table_columns=1000"))
+        _ = config.write_text(configured.replace("units_table_floor_columns=120", "units_table_floor_columns=1000"))
         owner = fixture_member("showrunner", name="table-owner")
         member = fixture_member("unit", name="messaging", parent=owner.id,
                                 worktree=staff.PresentWorktree(remote.local_machine(), self.root))
@@ -429,17 +429,26 @@ class UnitPhasesTests(unittest.TestCase):
         wide_records: dict[str, object] = {"messaging": typed_record(self.root / "plan.md", *(["todo"] * 20))}
         fitted = unit_phases.table([selected], wide_records)
         for section in (fitted.split("\n\n")[0], fitted.split("\n\n")[-1]):
-            headings = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
-            values = [cell.strip() for cell in section.splitlines()[2].split("|")[1:-1]]
+            lines = section.splitlines()
+            headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
+            rows = [tuple(cell.strip() for cell in line.split("|")[1:-1]) for line in lines[2:]]
+            values = dict(zip(headings, rows[0], strict=True))
+            settings = conf.read_or_repository("production")
+            width = settings.whole("units_table_floor_columns") - claude_table_layout.REPLY_INDENT
+            layout = claude_table_layout.fit(headings, rows, width)
+            self.assertTrue(layout.keeps_table(headings, rows, width, settings.whole("units_table_cell_lines")))
             if "Progress" in headings:
-                self.assertEqual(values[headings.index("Progress")], "⬜" * 20)
+                self.assertEqual(values["Progress"], "⬜" * 20)
+                self.assertEqual(layout.line_count(values["Progress"], headings.index("Progress")), 1)
             else:
-                self.assertEqual(values[headings.index("Notes")], "not started")
-                self.assertEqual(values[headings.index("Queued")],
-                                 long_text + " +1 more · plan: phase 1: Delivery 1 +19 more")
-                self.assertEqual(values[headings.index("Non-Phase Work")],
-                                 "outside-c: Verification: check " + "x" * 150 + " +2 more")
-        _ = config.write_text(configured.replace("units_table_columns=170", "units_table_columns=1000"))
+                self.assertEqual(values["Notes"], "not started")
+                for title, expected in (
+                        ("Queued", long_text + " +1 more · plan: phase 1: Delivery 1 +19 more"),
+                        ("Non-Phase Work", "outside-c: Verification: check " + "x" * 150 + " +2 more")):
+                    column = headings.index(title)
+                    restored = " ".join(row[column] for row in rows if row[column])
+                    self.assertEqual(restored.replace(" ", ""), expected.replace(" ", ""))
+        _ = config.write_text(configured.replace("units_table_floor_columns=120", "units_table_floor_columns=1000"))
         path = unit_queue.state_path(member.id)
         _ = path.write_text("not json")
         errors = io.StringIO()
@@ -457,14 +466,19 @@ class UnitPhasesTests(unittest.TestCase):
         for columns, queued in ((89, "Q" * 60), (90, "Q" * 60), (89, "Review next"),
                                 (170, "Review 界面 before delivery " + "é" * 180)):
             with self.subTest(columns=columns, queued=queued):
-                _ = config.write_text(configured.replace("units_table_columns=170", f"units_table_columns={columns}"))
+                _ = config.write_text(configured.replace("units_table_floor_columns=120", f"units_table_floor_columns={columns}"))
                 _ = path.write_text(json.dumps([queued]))
                 work = unit_phases.table([selected], records).split("\n\n")[-1]
-                self.assertEqual(work.splitlines(), [
-                    "| Unit | Notes | Queued |",
-                    "| --- | --- | --- |",
-                    f"| messaging | phase 1 — {'N' * 50} | {queued} |",
-                ])
+                lines = work.splitlines()
+                headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
+                rows = [tuple(cell.strip() for cell in line.split("|")[1:-1]) for line in lines[2:]]
+                self.assertEqual(headings, ("Unit", "Notes", "Queued"))
+                self.assertTrue(all(row[0] == "messaging" for row in rows))
+                for column, original in ((1, "phase 1 — " + "N" * 50), (2, queued)):
+                    restored = " ".join(row[column] for row in rows if row[column])
+                    self.assertEqual(restored.replace(" ", ""), original.replace(" ", ""))
+                fitted = claude_table_layout.fit(headings, rows, columns)
+                self.assertTrue(fitted.keeps_table(headings, rows, columns, 4))
 
     def test_a_unit_with_no_open_phase_shows_no_task(self) -> None:
         with patch.object(plan_history, "plan_runs") as runs:
@@ -982,8 +996,10 @@ class UnitPhasesTests(unittest.TestCase):
                 values: dict[str, str] = {}
                 for section in (rendered.split("\n\n")[0], rendered.split("\n\n")[-1]):
                     headers = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
-                    cells = [cell.strip() for cell in section.splitlines()[2].split("|")[1:-1]]
-                    values.update(zip(headers, cells, strict=True))
+                    rows = [tuple(cell.strip() for cell in line.split("|")[1:-1])
+                            for line in section.splitlines()[2:]]
+                    values.update((header, " ".join(row[column] for row in rows if row[column]))
+                                  for column, header in enumerate(headers))
                     if "Status" in headers:
                         self.assertEqual(headers[-2:], ["ETA Plan", unit_phases.worker_heading()])
                 self.assertEqual(values["Progress"], "🟨" + "⬜" * 19)
@@ -993,7 +1009,8 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(values["Queued"], "plan: phase 2: Delivery 2 +18 more")
                 expected_worker = ("reader waiting on run: Check " + "x" * 50 + "…" if label_size == 60
                                    else "reader waiting on run: Check " + "x" * 20 + " 1m")
-                self.assertEqual(values[unit_phases.worker_heading()], expected_worker)
+                self.assertEqual(values[unit_phases.worker_heading()].replace(" ", ""),
+                                 expected_worker.replace(" ", ""))
                 self.assertEqual(headers, ["Unit", "Notes",
                     *(("Non-Phase Work",) if other else ()), "Queued"])
                 if other:
