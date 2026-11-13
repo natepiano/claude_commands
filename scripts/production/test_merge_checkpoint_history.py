@@ -167,6 +167,33 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(self.as_built_commit("src/alpha.rs"), "--as-built", review=False)
         self.assertNotEqual(result.process.returncode, 0)
         self.assertIn("an as-built commit carries only docs", result.process.stdout)
+
+        _ = self.git("reset", "--hard", "production", cwd=self.unit)
+        _ = self.git("push", "--force", "origin", "alpha-branch", cwd=self.unit)
+        self.assertEqual(self.git("ls-tree", "--name-only", "production", "--", "docs/plans/staff-copies.md"), "")
+        for path, accepted in (("docs/as-built/staff-copies.md", True), ("docs/outside.md", False)):
+            with self.subTest(plan="absent", path=path):
+                sha = self.checkpoint(path, "closing documentation\n", subject="docs(staff-copies): as-built")
+                result = self.run_checkpoint(sha, "--as-built", review=False)
+                if accepted:
+                    self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                    self.assertIn("scope: ok — 1 changed paths", result.process.stdout)
+                else:
+                    self.assertNotEqual(result.process.returncode, 0)
+                    self.assertIn("scope: held", result.process.stdout)
+                    self.assertIn("allows only docs/as-built/*.md", result.process.stdout)
+                    self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
+
+        with self.subTest(plan="added on unit branch", path="docs/notes.md"):
+            _ = self.git("reset", "--hard", "production", cwd=self.unit)
+            _ = self.git("push", "--force", "origin", "alpha-branch", cwd=self.unit)
+            self.write(self.unit, "docs/plans/staff-copies.md", "completed plan\n")
+            _ = self.git("add", "docs/plans/staff-copies.md", cwd=self.unit)
+            sha = self.checkpoint("docs/notes.md", "closing notes\n", subject="docs(staff-copies): as-built")
+            result = self.run_checkpoint(sha, "--as-built", review=False)
+            self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+            self.assertIn("scope: ok — 2 changed paths", result.process.stdout)
+
     def test_reruns_report_their_own_code_and_shrink_merge_hashes(self) -> None:
         code = self.checkpoint()
         first = self.run_checkpoint(code)
