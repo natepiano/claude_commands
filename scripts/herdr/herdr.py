@@ -2892,12 +2892,12 @@ class Herdr:
             arguments.extend(["--format", "ansi"])
         return self.run(*arguments, deadline=deadline)
 
-    def send_keys(self, pane: str, *keys: str, target: str) -> None:
+    def send_keys(self, pane: str, *keys: str, target: str, expected_text: str = "") -> None:
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
         row = self.pane_row(pane)
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
-                            pane_info=row, client=self):
+                            pane_info=row, client=self, text=expected_text):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         self._send_keys(pane, *keys)
 
