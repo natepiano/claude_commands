@@ -1,7 +1,7 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file, build_folders, cancellation
+from scripts.lib import atomic_file, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
@@ -1120,8 +1120,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         pass
         with QueuePlaceFixture() as fixture:
             before = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
-            with mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")), \
-                    mock.patch.object(build_folders, "defer_signals", side_effect=AssertionError("deferred folder signals")):
+            with mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
                 with queue.queue_place("rust-analyzer", fixture.root):
                     pass
             self.assertEqual({number: signal.getsignal(number) for number in before}, before)
@@ -1167,8 +1166,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                         pause(place.program.process)
                                     place.on_started = on_started
                                 with mock.patch.object(subprocess, "Popen", side_effect=start), \
-                                        mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")), \
-                                        mock.patch.object(build_folders, "defer_signals", side_effect=AssertionError("deferred start signals")):
+                                        mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
                                     _ = place.popen([sys.executable, "-c", TERM_RESISTANT_CHILD], stdout=subprocess.PIPE)
                         except KeyboardInterrupt:
                             status = 128 + signal.SIGINT

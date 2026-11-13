@@ -43,6 +43,7 @@ Phase notes store the unit's fixed staff id in `unit:`.
 
 ```python
 build_plan(plan_path: Path) -> PhaseRecord      # raises NoPlan
+with_run_promises(record: PhaseRecord, events: list[dict[str, object]]) -> PhaseRecord
 build(session_dir: Path) -> PhaseRecord         # raises NoState, NoPlan
 render(record: PhaseRecord, zone: ZoneInfo) -> str
 show(session_dir: Path, zone: ZoneInfo, json_output: bool = False) -> str
@@ -128,7 +129,10 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 
 JSON writes the finish time for `FinishedAt` and `PredictedFinish`, and `null` for `UnknownFinish`.
 Markdown writes the recorded time, the predicted time with `, predicted`, or `—`, respectively.
-The Units table reads `build_plan` records for progress and ETA facts.
+The Units table reads `build_plan` records for progress facts.
+For ETA facts it applies `with_run_promises` with the selected run's events.
+That call rebuilds each row's `eta_trail` and the `plan_finish` from that run's promises only.
+Duration predictions (`PredictedPhaseTiming`) keep the plan's history across all runs.
 
 `current.repair_rounds_since_first_stated_eta` is the `FirstStatedEtaTarget`'s count when a first stated target exists, else `null`, and is present even when `current.eta` is `null`. The Markdown shows no count.
 

@@ -37,8 +37,10 @@ For units outside the `Style units` table in a production without `Kind: style`,
 Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
 Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
 Both tables use the same unit order.
-Each open phase of a unit's newest run gets one row in each table.
-The current staff run pointer selects the unit run before newer completed ad hoc records.
+Each open phase of the selected run gets one row in each table.
+The staff current run selects the run when present; otherwise, the newest run supplies the rows.
+Notes, ETA cells, and Workers use that same selected run.
+Other open runs of the unit supply no rows, Notes, or workers.
 Rows follow the configured plan order, then the start order for phases outside that plan.
 Each row repeats the Unit name.
 Only the first row shows Status, Machine, Progress, ETA Plan, and Queued.
@@ -60,9 +62,10 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
 2. **Phase** shows the phase id for an open phase row.
    Without an open phase, it shows `<done>/<total>` from Progress, or `—` with no phases.
    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
-   A finished newest run supplies no fallback.
+   A finished selected run supplies no fallback.
 3. **Notes** starts with `phase <id> — <phase title>` for the open phase.
-   The phase instance in the newest run supplies the open step.
+   A matching phase label at the start of the title appears once, regardless of case or dash.
+   The phase instance in the selected run supplies the open step.
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
@@ -82,6 +85,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    Open work without a promise shows `no ETA stated`; no open work or promised phase gives `—`.
    Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
 5. **ETA Plan** shows the predicted plan finish in the same time form, without `ends`.
+   Duration predictions still use the plan's recorded history.
    It never precedes the latest promise of any open or not-started plan phase.
    The first row also names promises for unfinished targets without open rows, as `phase <id>: <time>[ · late <elapsed>]`.
    The latest `phase_finished` event for each target decides whether that target is done.
@@ -102,8 +106,8 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    The queue count includes only remaining items.
    With no remaining queue item, it shows the plan part or `—`.
    Plan work includes every phase that is neither done nor open.
-   Every open phase of the newest run stays outside Queued, including phases absent from the configured plan.
-   It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
+   Every open phase of the selected run stays outside Queued, including phases absent from the configured plan.
+   It uses the configured plan when that plan has phases; otherwise, it uses the selected run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
 Workers first limits each cell to 80 characters.
