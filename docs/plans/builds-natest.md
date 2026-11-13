@@ -3839,18 +3839,9 @@ Checkpoint 215299cb2. Changed `production_lifecycle_test_support.py` and added `
 **Depends on:** none
 **Owner:** builds gave the go 2026-11-13.
 
-#### Work Order
+#### As-built
 
-**Goal:** `message/test_repeat_guard.py` uses less CPU in aws pairs; every behavior check stays.
+Checkpoint 298f77624. Changed `scripts/message/test_repeat_guard.py` (`NOTICE_FIXTURE`); no test is removed or folded.
 
-**Spec:**
-- Profile: 16.0 local CPU s. The notice fixture starts a supervisor, a drain and an attempt process for each run; each imported send and staff (0.38 CPU s).
-- The supervisor role runs only `repeat_guard.notice_job`, so it imports only `repeat_guard` (0.05 CPU s) and exits.
-- The drain and attempt roles keep their imports and patches.
-- Test file only.
-
-**Files:** `scripts/message/test_repeat_guard.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:** the module passes; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
+- The supervise role runs only `repeat_guard.notice_job`, imports only `repeat_guard` and exits. The drain and attempt roles keep their imports and patches.
+- AWS pair (c7a.8xlarge, 3 rounds): median 14.54 → 12.03 CPU s. Most of the rest is the drain and attempt processes, which import `send` and `staff`.
