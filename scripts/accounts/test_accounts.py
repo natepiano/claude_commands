@@ -45,6 +45,7 @@ from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.agents import stop_resume
 from scripts.agents import remote, stop_results
+from scripts.agents.test_support import write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
@@ -307,6 +308,7 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         counts_cache = session_counts_cache()
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -8441,6 +8443,7 @@ class PickerTests(unittest.TestCase):
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         (self.home / "notes").mkdir()
         _ = installed_program(self.home, "claude")
         _ = installed_program(self.home, "codex")
@@ -9599,6 +9602,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             "AGENT_NOTES_DIR": str(self.home / "notes"),
             "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",
         }, clear=True)))
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         cache = session_counts_cache()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(json.dumps({"machine": remote.other_machine(),
