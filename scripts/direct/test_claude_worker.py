@@ -245,7 +245,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     modules = stopped_worker_module(self.root / "source-stop-modules")
                     environment.update(CODEX_HOME=str(backend.codex_home),
                         FIXTURE_STOPPED=str(self.root / "source-stopped.json"),
-                        PYTHONPATH=os.pathsep.join((str(modules), str(CHECKOUT))))
+                        PYTHONPATH=os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules))))
                 result = self.launch(**environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 sent = cast(dict[str, object], json.loads(self.fixture.sent.read_text()))
@@ -298,7 +298,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 environment = {**self.fixture.environment, "FIXTURE_GATE": str(address),
                     "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
                     "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
-                    "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT)))}
+                    "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))}
                 with subprocess.Popen(command, cwd=self.fixture.work, text=True, env=environment,
                         start_new_session=True,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) as launcher:
@@ -392,7 +392,7 @@ if len(sys.argv) > 1 and sys.argv[0] == "-c":
 ''')
         environment = models_registry.launch_configuration(os.environ).environment(
             models_registry.edit_base(os.environ).environment(self.fixture.environment))
-        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(fake_modules), str(CHECKOUT))),
+        result = self.launch(**{**environment, "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(fake_modules))),
                                "FIXTURE_REGISTRY_READS": str(reads), "CLAUDE_CODE_CHILD_SESSION": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = cast(list[str], self.backend_calls()[0]["arguments"])

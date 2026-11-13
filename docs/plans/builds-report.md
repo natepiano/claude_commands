@@ -1288,6 +1288,32 @@ From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/sc
 
 **Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
 
+### Phase 67 — The Queued title shares the waiting header row · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers".
+
+#### As-built
+
+- The phase 65 title sits on the waiting header row, bottom-aligned with the column headers. It keeps its `.section-head` font.
+- The empty title row and its height code are gone. The Next step room row and its hairline do not move.
+- A long title ends in an ellipsis before the header columns and shows its full text on hover. The stacked phone layout does not change.
+- `test_memory_hover.py` checks that the header row follows the room row. `memory_page_proof.mjs` checks bottom alignment and no overlap at 1400, 900 and 390 px in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
 ### Phase 66 — Retire /build:queue · status: todo
 
 From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
+
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.

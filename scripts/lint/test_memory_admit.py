@@ -5227,7 +5227,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.environment["TEST_QUEUE_CLIENT"] = str(queue_client)
         self.environment["TEST_CAPTURE_WIDTH"] = str(capture)
         self.environment["TEST_PY"] = str(Path(__file__).resolve().parents[1] / "lib/py")
-        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
 
 
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:

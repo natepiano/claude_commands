@@ -288,7 +288,7 @@ class FailedProbeTests(OffloadCommandFixture):
             '    if [[ " $* " != *" --files-from="* ]]; then\n'
             + f'        {shlex.quote(sys.executable)} {shlex.quote(str(receiver))} "${{@: -2:1}}" "${{!#}}" || exit $?\n'
             + '    fi\n    exit "$rsync_status"')
-        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
         self.environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
         source = source.replace('exit "$probe_status"',
             'printf "end %s\\n" "$EPOCHREALTIME" >> "$root/probe-timing"\nexit "$probe_status"')

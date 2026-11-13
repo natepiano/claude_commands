@@ -2,11 +2,11 @@
 
 Status: implementation plan. Phase bf1 is in progress at a devtools worker.
 The user approved D1–D9 on 2026-11-12 at 12:45 EST.
-This plan has eight phases and an estimate of **60 worker hours**.
+This plan has nine phases and an estimate of **64 worker hours**.
 
 ## Cut
 
-1. Remove the separate measurement feature and phase. Resources supplies a read-only sizing note before slot activation.
+1. Remove the separate measurement feature and phase. The user approved the slot values on 2026-11-12.
 2. Remove the fixture lease API and four separate fixture migration phases. Tests call the maker through one small private-config helper.
 3. Merge queue attribution into slots. Merge gate migrations and assign other callers to their existing owners.
 4. Remove mandatory human-link trees, extra lease states, persistent deletion records, and a separate rescue manifest format.
@@ -82,20 +82,24 @@ This plan has eight phases and an estimate of **60 worker hours**.
 ## Configuration and user decisions
 
 The builds queue unit owns `config/build_folders.conf`.
-Resources supplies a read-only note with concurrent demand and complete slot sizes for each machine and repository.
-The note covers production repositories and test repository demand.
-It adds no measurement code, telemetry, or test service.
+The user approved the slot values on 2026-11-12 (relayed by builds). Count x complete size limit:
 
-| Config key | Meaning | User go |
-| --- | --- | --- |
-| `slots.<machine>.<repository>.count` | Fixed slot count | **USER GO REQUIRED**, except `slots.mac.hana.count=2` |
-| `slots.<machine>.<repository>.max_bytes` | Complete slot size limit | **USER GO REQUIRED** for every machine and repository |
-| `roots.slots.<machine>` | Stable slot parent | Retain a suitable existing root; user go is not required by D1–D9 |
-| Existing `roots.*`, `names.*`, `patterns.*`, `prefixes.*` | Roots, explicit names, and compatibility | Retain existing settings where applicable; no new capacity approval follows from these keys |
+| Machine | Repository | Slots | Size limit |
+| --- | --- | ---: | ---: |
+| natedev | hana | 4 | 40 GiB |
+| natedev | hana merge gate | 1 | 120 GiB |
+| natedev | cargo-liner | 6 | 15 GiB |
+| natedev | claude | 16 | 2 GiB |
+| natedev | tool-based-ui | 2 | 25 GiB |
+| natedev | every other repository | 1 | 20 GiB |
+| Mac | hana | 2 | 40 GiB |
+| Mac | cargo-liner | 2 | 15 GiB |
+| AWS | none (per-run boxes keep no cache) | 0 | - |
 
-Do not treat old Mac target budgets or AWS slot counts as approval for these keys.
+The values live in `config/build_folders.conf` as `slots.<machine>.<repository>.count` and `slots.<machine>.<repository>.max_bytes`.
+They change only through /tune and apply at the next slot take, with no deploy.
+`roots.slots.<machine>` keeps a suitable existing root. Existing `roots.*`, `names.*`, `patterns.*` and `prefixes.*` settings stay.
 Missing required capacity values stop admission with a named config error.
-Phase 3 can implement slots before approval, but production activation requires the approved values.
 Tests use explicit private values under the same schema; they do not set production limits.
 The private-config helper supplies test roots and values, not another allocation API or fixture registry.
 Do not add per-module production fixture keys or a parent lease that blocks its child fixture slots.
@@ -114,13 +118,14 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | --- | --- | --- | ---: | --- |
 | bf1 | Maker and process lock; in progress | devtools; queue reviews B files | 6 | None |
 | 2 | Rescue and legacy collector protection | queue; resources and devtools own collector edits | 8 | bf1 |
-| 3 | Slots, limits, affinity, and queue fields | queue; resources supplies sizing note | 10 | 2; user go before activation |
+| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values approved 2026-11-12 |
 | 4 | Gate caches become slots | queue and aws | 8 | 3 |
 | 5 | Other repository callers | verify, style, and devtools | 8 | 4 |
 | 6 | One-offs and review folders | devtools; builds owners edit B files | 6 | 5 |
 | 7 | Remaining fixtures and source enforcement | devtools; builds owners edit their fixtures | 8 | 6 |
 | 8 | Stall watch and alarm-only sweep | resources and devtools | 6 | 7 |
-| **Total** | | | **60** | |
+| 9 | Test run folders; runs beside Phase 2 | devtools | 4 | bf1 |
+| **Total** | | | **64** | |
 
 Run the phases in this order.
 Migrate adjacent fixtures with their callers during Phases 4–6.
@@ -161,6 +166,7 @@ All builds-owned adjacent tests carry the same B owner as their implementation.
 | 7 | **B:** `scripts/direct/recorder_fixture.py`, `scripts/build_queue/queue_fixture.py`; all remaining builds fixtures | verify or queue; other builds fixtures retain their runtime owner |
 | 7 | `scripts/direct/assign_launcher_test_support.py`, `scripts/berth/tests/check_installed_hooks.py`; **B:** `scripts/style/test_style_ledger_tickets.py` | devtools; style owns the B file |
 | 7 | Remaining Python, shell, and JavaScript fixtures under `scripts`; maker instructions under `commands` | devtools; builds fixtures retain their runtime owner |
+| 9 | `scripts/production/targeted_test.py`, the shared test bootstrap under `scripts/lib`, and their tests | devtools |
 | 8 | `scripts/production/stall_watch.py`, `scripts/production/test_stall_watch.py`; **B:** `scripts/build_targets/working_set.py` as a process identity reference | devtools; resources owns the B reference |
 
 ## Phase bf1 — Maker and process lock
@@ -180,6 +186,17 @@ All builds-owned adjacent tests carry the same B owner as their implementation.
 6. Record showrunner, unit, work, purpose, pid, and start time beside the lock.
 7. Return held or free from a query function without checking session liveness.
 8. Keep every current caller working without moving callers in this phase.
+
+The owner of a folder owns its whole subtree.
+Parent removal removes every nested folder and record, whether held or free.
+A process must release a nested folder before its parent context ends.
+Keeping a nested folder after the parent context ends is a caller error.
+Each nested context removes its own folder, lease, and lock when it ends first.
+
+An asynchronous exception, such as `KeyboardInterrupt`, between cleanup bytecodes can leave the lock held until the process exits.
+The kernel then releases the lock.
+The folder becomes free recorded residue for Phase 9 cleanup.
+The maker adds no signal handler or signal mask to close these bytecode windows.
 
 **Acceptance gate:** Add tests for mutual exclusion, child inheritance, release after process death, and explicit names.
 Show that these tests fail before the change.
@@ -214,7 +231,7 @@ Run maker, scratch, temporary sweep, and folder audit tests before Phase 3 activ
 ## Phase 3 — Slots, limits, affinity, and queue fields
 
 **Goal:** Implement D2–D4 through the maker and existing queue page.
-**Owner units:** queue implements slots and queue fields; resources supplies the read-only sizing note and capacity wiring.
+**Owner units:** queue implements slots and queue fields; resources wires capacity.
 **Estimate:** 10 worker hours.
 **Depends on:** Phase 2; user go before production activation.
 **Files:** Maker/config files and the Phase 3 queue/target inventory row with adjacent tests.
@@ -225,7 +242,7 @@ Run maker, scratch, temporary sweep, and folder audit tests before Phase 3 activ
 4. Use existing admission behavior when the pool is full.
 5. Check complete slot size and remove an over-limit target once before a cold build.
 6. Publish showrunner, unit, purpose, and machine beside each occupied slot on the existing queue page.
-7. Record approved count and size values after resources supplies the sizing note.
+7. Write the approved count and size values (see Configuration and decisions) into config/build_folders.conf.
 8. Provide one small private-config helper for tests that call the maker directly.
 
 **Acceptance gate:** Test full pools, affinity, source reset, target retention, and one cold rebuild after target removal.
@@ -317,10 +334,10 @@ Update `scripts/hooks/pre-tool-use-scratch-guard.py`, `test_scratch_guard.py`, `
 8. Keep comments, imports, annotations, and inert examples separate from executable makers.
 9. Remove allocation adapters that bypass the maker; permit no per-file allocation allowlist.
 
-**Dispatches:** 381 test modules use `TemporaryDirectory` or `mkdtemp` today.
-Split the migration into one dispatch for each owner unit and each scripts folder.
+**Scope (builds, 2026-11-12):** The source test fails on bare `mkdtemp`, `git clone` and `git worktree add` outside the maker.
+`TemporaryDirectory` as a context manager and pytest tmp fixtures stay, because they delete themselves.
+**Dispatches:** Split the migration into one dispatch for each owner unit and each scripts folder.
 Each dispatch names its files and runs its own modules as its gate.
-Use one mechanical rewrite for file-only fixtures, then fix the repository fixtures by hand.
 Run the source test last, after every dispatch lands.
 
 **Acceptance gate:** Run the source test, existing command guard tests, and affected fixture modules.
@@ -358,6 +375,28 @@ Require low-disk checks to retain every fixture folder.
 Verify that explicit maker cleanup can still rescue and remove an unlocked one-off.
 Run stall watch, process group, sweep, folder audit, and source enforcement tests.
 Run the existing complete gate after the final migration.
+
+## Phase 9 — Test run folders
+
+**Goal:** Give each test run outside the merge gate its own TMPDIR, so a killed run leaves no folder behind.
+**Owner unit:** devtools.
+**Estimate:** 4 worker hours.
+**Depends on:** bf1 only; this phase runs beside Phase 2.
+**Files:** The Phase 9 inventory row and adjacent tests.
+
+Killed test runs leave `TemporaryDirectory` folders, for example `sender-guard-*` (`scripts/message/session_send_test_support.py:39`), `review-link-test-*` (`scripts/review_links/test_review_link.py:116`) and `tmp*` (`scripts/lint/test_tmp_sweep.py`).
+The tests are correct: Python runs no cleanup on SIGTERM.
+The merge gate already gives each run its own TMPDIR (`scripts/production/merge_gate.py:1204`).
+
+1. Make one per-run folder through the maker in `targeted_test.py` and in direct unittest runs through the shared bootstrap.
+2. Set TMPDIR to that folder for the run and its children. The run holds the folder's lease lock.
+3. Remove the folder when the run exits.
+4. Remove a killed run's folder when its lease lock is free. Add no signal handler (user rule).
+5. Do not change the tests that make temporary folders.
+
+**Acceptance gate:** Kill a run with SIGTERM and with SIGKILL; require its folder to be removed once its lock is free.
+Require a live run's folder to stay.
+Run the targeted test and bootstrap tests.
 
 ## Shared completion gate
 

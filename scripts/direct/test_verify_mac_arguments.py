@@ -114,7 +114,7 @@ destination = offload.ResultFile(Path(sys.argv[sys.argv.index("--result") + 1]))
 raise SystemExit(offload.write_result(result, destination))
 ''')
         result = self.verify("test", "sample", "--no-cache", extra={
-            "VERIFY_MAC_RUNNER": str(runner), "PYTHONPATH": str(VERIFY.parents[2]),
+            "VERIFY_MAC_RUNNER": str(runner), "PYTHONPATH": str(VERIFY.parents[1] / "lib/python_startup"),
         })
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(

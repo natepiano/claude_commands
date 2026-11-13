@@ -59,13 +59,19 @@ def fake_cargo_output_roots(
             )
             # Python children enter the same boundary mock before loading their scripts.
             _ = (startup / "sitecustomize.py").write_text(
-                "from pathlib import Path\n"
+                "import runpy, sys\n"
+                + f"_startup = runpy.run_path({str(Path(__file__).with_name('python_startup') / 'sitecustomize.py')!r}, run_name='_cargo_python_startup')\n"
+                + "_startup['select_checkout'](sys.argv)\n"
+                + "_startup['next_sitecustomize'](__file__)\n"
+                + "from pathlib import Path\n"
                 + "from scripts.lib.cargo_output_test_support import fake_cargo_output_roots, CargoOutputRoots\n"
                 + f"_cargo_output_fixture = fake_cargo_output_roots({arguments})\n"
                 + "_cargo_output_fixture.__enter__()\n"
+                + "_startup['finish_startup'](__file__, sys.argv)\n"
             )
-            python_path = os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[2]),
-                                                       str(startup), os.environ.get("PYTHONPATH", ""))))
+            from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+            python_path = os.pathsep.join((str(startup), *inherited_paths(os.environ.get("PYTHONPATH", ""))))
             previous = os.environ.get("PYTHONPATH")
             os.environ["PYTHONPATH"] = python_path
             _ = stack.callback(restore_environment, "PYTHONPATH", previous)

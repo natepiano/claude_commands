@@ -1451,7 +1451,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
                        "SCRATCH_ROOT": str(self.tmp / "scratch"), "TMPDIR": str(self.tmp),
-                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup")}
         for cargo in (False, True):
             if cargo:
                 _ = write(source / "Cargo.toml", "[workspace]\n")

@@ -223,7 +223,7 @@ class CollectorFixture(unittest.TestCase):
             self.assertTrue((self.root / "bin/ssh").is_file(), "Mac tests require the fake SSH executable")
             environment["USAGE_TEST_SSH_CONFIG"] = str(configuration)
             environment["PYTHONPATH"] = os.pathsep.join(
-                (str(REPOSITORY), environment.get("PYTHONPATH", ""))
+                (str(REPOSITORY / "scripts/lib/python_startup"), environment.get("PYTHONPATH", ""))
             )
         return command, environment
 

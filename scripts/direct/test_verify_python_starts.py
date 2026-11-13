@@ -42,8 +42,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
         self.assertEqual(counts["step_context.py"], 0, rows)
-        # The live helper serves synchronous calls, so they start no interpreter.
-        self.assertLessEqual(len(rows), 7, counts)
+        # The live helper serves context and folder calls without new interpreters.
+        self.assertEqual(counts["build_folders.py"], 0, rows)
+        self.assertEqual(len(rows), 7, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

@@ -323,6 +323,28 @@ A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
 
+Restart waits within `START_SECONDS` for an exiting agent in its retained pane.
+It reuses that pane when fresh reads prove a shell with no native agent.
+After that budget, restart opens the replacement tab.
+The existing resume-check loop closes the old shell through the restore path when its agent exits.
+The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
+A caller without shared resume checks runs the same cleanup loop before `start_row` returns.
+Failed destination cleanup uses the destination session.
+Source cleanup uses the source session and its original terminal.
+If the old agent outlives that check, one anomaly names the pane, which stays for retire.
+A pane with a live agent, another native owner, or a changed terminal stays open.
+The source record stays until closure, absence, or another native owner is proved.
+Producer publication also keeps a prior binding while its pane remains open.
+It removes a prior binding when a read proves absence or another native owner.
+Consumers select a proved native pane before retained bindings.
+When no native pane exists, consumers select the newest retained publication and keep the older records.
+
+Retirement stops the unit and its workers before it closes their panes.
+It closes each owned retained shell across tabs, even when the director pane is absent.
+It keeps foreign panes and live agents.
+herdr removes a tab when its last pane closes.
+Retirement cannot find an idle shell whose launch record was lost before this fix.
+
 Producers use their current `[producers]` model and effort through the shared launch code.
 Codex producers select the workers account; Claude producers select the showrunners account.
 An explicit target account overrides that selection.

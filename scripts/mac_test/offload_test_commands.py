@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 
 JSON_SHELL = r'''
 json_string() {
@@ -169,6 +171,7 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
         printf '%s\n' "$run_status_line"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
         python3 - "$claim_file" <<'SETTLE_FENCE'
+''' + python_tool_source(r'''
 import json
 from pathlib import Path
 import subprocess
@@ -179,6 +182,7 @@ claim = json.loads(path.read_text())
 identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
 command = offload.start_fence_command(identity, "mac", settle=True, scope_key=path.stem)
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
+''') + r'''
 SETTLE_FENCE
     fi
     exit "$run_ssh_status"

@@ -124,7 +124,7 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
         return subprocess.run(
             command, capture_output=True, text=True, check=False,
             env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
-                 "PYTHONPATH": str(INVOKE.resolve().parents[2])},
+                 "PYTHONPATH": str(INVOKE.resolve().parents[1] / "lib/python_startup")},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 

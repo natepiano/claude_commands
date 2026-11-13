@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
+
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
 import select
 import shlex
-import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -419,10 +419,7 @@ class OffloadCommandFixture(unittest.TestCase):
         return ["--assignment-file", str(assignment_file)]
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(
-            f"#!{sys.executable}\n" + source, encoding="utf-8"
-        )
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def sync_config(self) -> None:
         ready = self.config_path.with_suffix(".ready")
@@ -621,22 +618,11 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        scripts_directory = self.root / "claim-runner" / "scripts"
-        runner_directory = scripts_directory / "mac_test"
-        runner_directory.mkdir(parents=True)
-        runner = runner_directory / "offload.py"
-        _ = shutil.copyfile(SCRIPT, runner)
-        _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
+        checkout = self.root / "claim-runner"
+        copy_runtime(checkout)
+        runner_directory = checkout / "scripts/mac_test"
         self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
-        (scripts_directory / "lib").symlink_to(SCRIPT.parent.parent / "lib", target_is_directory=True)
-        (scripts_directory / "lint").symlink_to(
-            SCRIPT.parent.parent / "lint", target_is_directory=True
-        )
-        (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
-        (scripts_directory / "buildlog").symlink_to(
-            SCRIPT.parent.parent / "buildlog", target_is_directory=True
-        )
-        return runner
+        return runner_directory / "offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

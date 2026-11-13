@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state
+from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
@@ -363,7 +364,7 @@ raise SystemExit(0)
 
 def install_fixed_cargo(path: Path) -> None:
     """Install shell replies for an unchanged Python Cargo stub."""
-    python_source = f"#!{sys.executable}\n" + CARGO_STUB
+    python_source = python_tool_source(CARGO_STUB)
     if path.read_text(encoding="utf-8") != python_source:
         return
     fallback = path.with_name(path.name + "-python")
@@ -1059,6 +1060,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         log = scripts / "buildlog"
         log.mkdir()
         self.write_executable(log / "record.py", RECORD_WRAPPER)
+        copy_runtime(claude, configuration=False)
         self.bin_directory.mkdir()
         self.runner_state.mkdir()
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
@@ -1210,9 +1212,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # Private tools may start as links; replacing one must never edit its target.
         if path.is_symlink():
             path.unlink()
-        _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
-                            encoding="utf-8")
-        path.chmod(0o755)
+        if source.startswith("#!") and "python" not in source.splitlines()[0]:
+            _ = path.write_text(source, encoding="utf-8")
+            path.chmod(0o755)
+        else:
+            write_python_tool(path, source)
 
     def assigned_remote(self, target: str, verb: str, kind: str = "test") -> Path:
         """Request a real assignment for a private runner boundary."""
@@ -1266,7 +1270,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         script = direct / "verify.sh"
         setup = r'''
 set -euo pipefail
-PY=$TEST_REAL_PYTHON
+PY=$TEST_REAL_DIRECT/../lib/py
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
