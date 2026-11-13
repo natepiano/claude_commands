@@ -590,6 +590,7 @@ A worker refusal does not keep the group request open.
 The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
 One detached unit handles all targets without overlapping moves.
 Direct Codex worker moves use the same runner and read the selected role before each worker.
+A Codex worker move skips a target whose note says `use_credits: off` and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
 Claude worker moves use the same run lock and retain the requested Claude label.
 It reads the selected role before each worker and checks it again before it ends.
 A role change causes another pass over workers that need the new account.

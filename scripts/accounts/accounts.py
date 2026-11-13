@@ -3104,6 +3104,34 @@ def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWork
     return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
 
 
+@dataclass(frozen=True)
+class TargetCanWork:
+    """The target account can take workers."""
+
+
+@dataclass(frozen=True)
+class CreditsOffTarget:
+    """The target has use_credits off and no included usage left."""
+
+    reason: str
+
+
+def _codex_target_credit_block(label: str, now: datetime) -> TargetCanWork | CreditsOffTarget:
+    """A worker move never sends work to an account that may not spend credits and has no included usage."""
+    if not isinstance(agent_accounts.codex_credits_setting(label), agent_accounts.CreditsOff):
+        return TargetCanWork()
+    try:
+        login = _codex_home_login(_codex_account_home(label))
+    except AccountsError:
+        return TargetCanWork()
+    reading = refusals.stored_reading("codex", login, now) if login else NoReading()
+    if not isinstance(reading, (FreshReading, StaleReading)) or not isinstance(reading.weekly, ReadingWindow):
+        return TargetCanWork()
+    if _codex_reading_can_work(FreshReading(reading.weekly, reading.five_hour, "0"), now, agent_accounts.CreditsOff()):
+        return TargetCanWork()
+    return CreditsOffTarget(f"{label}: use_credits is off and its included usage is gone; the worker stays")
+
+
 @settings_report_scope()
 def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                       why: str) -> GroupMoveStarted | GroupMoveStartFailed:
@@ -3124,7 +3152,9 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 target = _resolve_worker_move_target(destination)
                 if attempted.get(row.id) == target:
                     continue
-                results[row.id] = _move_worker_row(pane_moves, row, record, target, why)
+                block = _codex_target_credit_block(target, datetime.now(timezone.utc)) if family == "codex" else TargetCanWork()
+                results[row.id] = (SessionMoveRefused(row.id, block.reason) if isinstance(block, CreditsOffTarget)
+                                   else _move_worker_row(pane_moves, row, record, target, why))
                 attempted[row.id] = target
             with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
                 target = _resolve_worker_move_target(destination)
@@ -3134,7 +3164,8 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 if isinstance(destination, FollowWorkersRole):
                     pending = _read_pending_worker_moves()
                     if isinstance(pending, PendingWorkerMoves):
-                        _complete_worker_move_requests(pending.requests, target)
+                        _complete_worker_move_requests(pending.requests, target,
+                                                       _codex_target_credit_block(target, datetime.now(timezone.utc)))
                         _workers_move_file().unlink()
                 break
     outcomes = tuple(results.values())
@@ -3467,7 +3498,8 @@ def _queue_worker_moves(
     atomic_file.write_text_atomic(_workers_move_file(), json.dumps(document) + "\n", new_file_mode=0o600)
 
 
-def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> None:
+def _complete_worker_move_requests(requests: tuple[str, ...], target: str,
+                                   block: TargetCanWork | CreditsOffTarget) -> None:
     pending = _pending_workers_requests()
     home = str(_codex_account_home(target) if _label_is(target, "codex") else claude_account_dir(target))
     for identity in requests:
@@ -3476,7 +3508,9 @@ def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> No
             continue
         common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool=request["tool"],
                                   subject="workers", move_id=identity)
-        if request["to"] == target:
+        if isinstance(block, CreditsOffTarget):
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=block.reason))
+        elif request["to"] == target:
             moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=home))
         else:
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=f"superseded by {target}"))

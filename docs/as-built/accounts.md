@@ -222,6 +222,7 @@ One `accounts-workers-move` unit serves every target.
 The runner reads the role before each worker and repeats after a changed final role.
 A run lock serializes worker moves, including the fallback without systemd.
 Direct Codex worker moves use this runner and read the selected role before each worker.
+A Codex worker move skips a target whose note says `use_credits: off` and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
 Both direct preview and execution refuse a Codex target that differs from the workers role.
 The refusal says `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
 The swap preview shares the worker preview helper and can show a new target without changing the role.
