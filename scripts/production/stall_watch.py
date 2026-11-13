@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock
+from enum import Enum
 from pathlib import Path
 from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
@@ -45,7 +46,6 @@ from scripts.production import showrunners, staff, session_staff
 from scripts.production import unit_lookup
 from scripts.production.session_pane import HerdrFailure, agent_status, read_place
 from scripts.whoami import account, usage_store
-from scripts.whoami.agent_accounts import UsageReadOutcome
 
 from scripts.hooks import context_usage  # noqa: E402
 from scripts.notify import push_texts  # noqa: E402
@@ -124,6 +124,7 @@ class Stretch(TypedDict):
     tell_sent: bool
     reported_status: str
     login_since: NotRequired[float]
+    login_pid: NotRequired[int]
 
 
 class PaneInspection(NamedTuple):
@@ -227,6 +228,12 @@ class TranscriptEntry(TypedDict, total=False):
     type: str
     timestamp: str
     message: TranscriptMessage
+    isApiErrorMessage: bool
+
+
+class SessionLoginLifetime(TypedDict):
+    sessionId: str
+    startedAt: int
 
 
 class PendingTool(NamedTuple):
@@ -396,21 +403,61 @@ def latest_transcript_activity(session_id: str) -> float:
     return latest
 
 
-def login_restored(pid: int, session_id: str) -> bool:
-    """A successful usage read after the session's last activity proves login recovery."""
+class LoginVerdict(Enum):
+    """The current login evidence can establish a limit, clear it, or remain unknown."""
+
+    LIMITED = "limited"
+    CLEAR = "clear"
+    UNKNOWN = "unknown"
+
+
+def login_limited(pid: int, session_id: str, pattern: re.Pattern[str]) -> LoginVerdict:
+    """Use the current process's latest assistant error, independent of pane scrollback."""
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
+            return LoginVerdict.CLEAR
+        for line in lines_from_end(transcript):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            text = "\n".join(block.get("text", "") for block in blocks_of(entry) if block.get("type") == "text")
+            if not entry.get("isApiErrorMessage") or not pattern.search(text):
+                return LoginVerdict.CLEAR
+            try:
+                failed_at = datetime.fromisoformat(entry.get("timestamp", "")).timestamp()
+            except (ValueError, KeyError, OverflowError):
+                return LoginVerdict.LIMITED
+            break
+        else:
+            return LoginVerdict.CLEAR
+    except OSError:
+        return LoginVerdict.UNKNOWN
+    try:
+        record = cast(SessionLoginLifetime, json.loads((sessions.sessions_dir() / f"{pid}.json").read_text()))
+        if record["sessionId"] == session_id and record["startedAt"] / 1000 > failed_at:
+            return LoginVerdict.CLEAR
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     try:
         folder = account.process_config_dir(pid)
         if not isinstance(folder, account.ConfiguredClaudeFolder):
-            return False
+            return LoginVerdict.LIMITED
         stored = usage_store.load()
         login = stored.directory_logins[usage_store.directory_key("Claude", str(folder.path))]
         usage = stored[login]
-        if usage_store.latest_read_outcome(usage) != UsageReadOutcome.OK or "weekly" not in usage:
-            return False
+        if "weekly" not in usage:
+            return LoginVerdict.LIMITED
         read_at = datetime.fromisoformat(usage["weekly"]["at"])
-        return read_at.tzinfo is not None and read_at.timestamp() > latest_transcript_activity(session_id)
+        return (LoginVerdict.CLEAR if read_at.tzinfo is not None and read_at.timestamp() > failed_at
+                else LoginVerdict.LIMITED)
     except (OSError, ValueError, KeyError, TypeError, OverflowError):
-        return False
+        return LoginVerdict.LIMITED
 
 
 def context_near_compaction(session_id: str) -> bool:
@@ -1421,18 +1468,20 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             pane_hash = hashlib.sha256(pane.encode()).hexdigest()
             stretch = read_stretch(path, pane_hash, now)
             turns = list(TURN_END.finditer(pane))
-            latest_pane = pane[turns[-1].end():] if turns else pane
             try:
-                login_limit = re.search(watch_config(status_defaults=True)["login_limit_pattern"].strip(),
-                                        latest_pane, re.IGNORECASE)
+                login_limit = login_limited(pid, session_id, re.compile(
+                    watch_config(status_defaults=True)["login_limit_pattern"].strip(), re.IGNORECASE))
             except (OSError, UnicodeError, KeyError, ValueError, re.error) as error:
                 print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
                 continue
-            if login_limit and not login_restored(pid, session_id):
+            if login_limit is LoginVerdict.UNKNOWN:
+                continue
+            if login_limit is LoginVerdict.LIMITED:
                 report.decision = "login limit"
-                if "login_since" not in stretch:
+                if "login_since" not in stretch or stretch.get("login_pid", pid) != pid:
                     stretch = Stretch(pane_hash=pane_hash, since=now, bump_sent=False, tell_sent=False,
                                       reported_status="", login_since=now)
+                stretch["login_pid"] = pid
                 stretch["since"] = now
                 save_stretch(path, stretch)
                 if not stretch["tell_sent"]:
