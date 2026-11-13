@@ -224,6 +224,8 @@ def _folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
 
 
 _locks: dict[int, Path] = {}
+# A folder's lock file, lease record, or unfinished lease record.
+_METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 
 def _open_lock(path: Path, directory: int, *, create: bool) -> int:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -513,13 +515,16 @@ def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
     """Hold a managed folder's lease lock while a collector judges and removes it.
 
     Yield False when an owner holds the lease. A folder without a lock file has no lease.
-    With children, also hold every lease below the folder; a held one, or an unreadable
+    A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
     folder, is busy.
     """
+    metadata = _METADATA.fullmatch(path.name)
+    folder = path.with_name(metadata[1]) if metadata else path
     with ExitStack() as stack:
         try:
-            directory = stack.enter_context(_folder_parent(path, path.parent, create=False))
-            free = _hold_free_lease(path, directory, stack) and (not children or _hold_child_leases(path, stack))
+            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
+            free = (_hold_free_lease(folder, directory, stack)
+                    and (metadata is not None or not children or _hold_child_leases(folder, stack)))
         except FileNotFoundError:
             free = True
         except (OSError, ValueError):
@@ -565,7 +570,7 @@ def sweep_temporary_build_folders(parent: Path) -> None:
         with _folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
             for entry in os.listdir(directory):
-                match = re.fullmatch(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)", entry)
+                match = _METADATA.fullmatch(entry)
                 if match is not None:
                     names.add(match[1])
             for name in sorted(names):

@@ -213,6 +213,7 @@ Do not add slots, rescue refs, or size limits during bf1.
 `scratch.removal_lock` and `scratch.judgment_lock` take it first and hold it through judgment and deletion; a held lease is busy.
 The folder audit, the tmp sweep, scratch end, the floor sweep and copy removal get the guard through these locks.
 **Held child leases (bf2p):** `removal_lock` also holds every lease lock below the folder through deletion; a held one keeps the parent.
+**Lease records (bf9r):** a lock file or lease record is judged by its folder's lease; a live owner's records are busy.
 `tmp_sweep.py` still reports the old busy reason; resources can use `scratch.BUSY_REASON`.
 **Estimate:** 8 worker hours.
 **Depends on:** bf1.
