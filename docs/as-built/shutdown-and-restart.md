@@ -353,10 +353,11 @@ Each child has one result:
 |---|---|---|
 | `Resumable` | The child's turn was live | The unchanged command from `resume_worker_command` |
 | `Idle` | The child's readable turn was not live | `idle` and `nothing to run now` |
-| `Unavailable` | The run, worker record, or last assignment is unavailable | One `anomaly:` line with the child and reason |
+| `Unavailable` | The run, worker record, or known staff role is unavailable | One `anomaly:` line with the child and reason |
 
 The reader selects staff members under the moved parent.
 It reads each member's backend and current native session.
+The member's `KnownWorkerRole` supplies the child's role without a history fallback.
 A Claude child uses its `impl_worker_<slot>.json` record and the matching status file.
 The status reader searches the run root and `phases/*`; it does not search `tmp/**`.
 A readable status other than `implementing`, including `capacity_exhausted`, gives `Idle`.

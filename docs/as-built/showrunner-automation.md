@@ -423,6 +423,11 @@ The caller's working directory stays unchanged.
 
 ### Production open, promote and wrap: `production_lifecycle.py`
 
+`add_showrunner.finish_publication` completes an unknown staff home through `set_home(..., only_unknown=True)`.
+The staff transaction preserves a home that another writer records first.
+The admitted receipt keeps staff references and removes its `session_id`, `doc`, and `config_dir` copies.
+The [launch receipt contract](build-followups-fn-length-hook.md#production-launch-and-wrap-records) defines pending creation claims and retry behavior.
+
 `production_lifecycle.py load|open|promote-main|wrap --production <showrunner name> [--no-ci] …`. `--no-ci` makes the CI, smoke-launch and Mac-run steps print `<step>: ok — skipped: no CI` and is refused together with a verdict flag.
 
 - `load [--resume] [--scratch <dir>]`: checks the checkout. With `--scratch`, it prints `state-dir: ok — <dir>` after the copy above. On resume or for a running doc, it reads the current state file through `update_registration.judgment_state`. It prints the `next` items, or `no next list`, and each unit's last code merge and session. A refused state file prints one `anomaly:` line; load continues.
@@ -498,6 +503,9 @@ Registration retains a stopped timer for discovery and session ownership.
 Timer folders and targets retain the showrunner's fixed staff ID.
 Discovery uses the staff row's current session and current name.
 Registry names do not affect registration or discovery.
+Scheduled timer configurations store no sender name.
+`delivery --owner <staff id>` derives the sender and prompt from one current staff snapshot.
+The [notifier contract](session-notifier.md#delivery) defines framing and delivery failure behavior.
 The herdr session list classifies showrunner panes through native session identity and the owning staff ID.
 Quota notices retain staff IDs for named recipients.
 Current staff names resolve at notice creation; former names do not resolve.
@@ -614,6 +622,14 @@ The [staff identity contract](staff-accessors.md#staff-identity-and-backends) de
 Saved progress state uses the fixed staff reference instead of a copied session name.
 
 - **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+
+  `unit_status.sh` recognizes peers by their staff name, fixed staff id, and current session id.
+  A replaced session therefore keeps its peer-wait classification.
+  Registry display names do not select these peers.
+
+`/showrunner:promote_unit` selects an existing member through its staff row.
+It joins the row's `current_session` to native pane or process evidence.
+An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
   The command prints one row per production staff unit.
