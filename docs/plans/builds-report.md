@@ -1182,29 +1182,14 @@ From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved del
 
 ### Phase 59 — The disk walk measures ~/.local/state · status: done
 
-From builds (not the user), 2026-11-12: "a gap for buildlog-disk and disk_floor. The aws GPU size trial wrote 49 GiB under ~/.local/state/gpu-size-trial in 90 min, and neither saw it, because ~/.local/state is outside the measured folders. Measure the large writers under ~/.local/state too, so the floor alert names them."
+From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~/.local/state/gpu-size-trial` in 90 min, and neither the disk walk nor the floor alert saw it; measure the large writers under `~/.local/state` too.
 
-Cause: `scripts/buildlog/disk.py` `FOLDERS` lists only `~/rust`, `/tmp` and the two CI runners. The floor alert and the build report read their folder rows from that walk. Measured 2026-11-12 20:25 EST: `~/.local/state` holds 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+#### As-built
 
-#### Work Order
-
-**Goal:** The disk walk measures `~/.local/state`, so a large writer there appears in the walk rows, the growth totals and the floor alert.
-
-**Spec:**
-- `scripts/buildlog/disk.py`: add `("~/.local/state", "~/.local/state")` to `FOLDERS`. The existing depth rule (levels 0 to 3) and the cargo target exclusion apply unchanged.
-- No change to `sweep.py`: `read_disk_measurement` and the alert already read every walk row and total.
-- `scripts/buildlog/test_disk.py`: add one row that proves a large folder under a `~/.local/state` root appears in `outside_build_caches` with its growth, and in `outside_build_cache_totals`.
-- Do not run the real walk.
+- `disk.FOLDERS` includes `~/.local/state`. Its walk rows (levels 0 to 3, cargo targets excluded) and growth total reach `read_disk_measurement` and the floor alert with no other change.
+- Measured 2026-11-12 20:25 EST: `~/.local/state` held 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+- The checkpoint also carries the package import block for `scripts/aws_target/gpu_size_trial.py`, which bootstrap added after the builds merge.
 
 **Files:**
-- `scripts/buildlog/disk.py`
-- `scripts/buildlog/test_disk.py`
-
-**Workers:** `1 writer`
-- writer: all files.
-
-**State:** none.
-
-**Acceptance gate:**
-- `scripts.buildlog.test_disk` passes, with the new row.
-- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
+- `scripts/buildlog/disk.py` — `FOLDERS`.
+- `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
