@@ -3890,21 +3890,8 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 251 — The crate run setup removes a partial seed copy  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a failed seed copy in `style/test_crate_run.py` leaves no partial root for the next test.
-
-**Decision:** sdlc go 2026-11-13 15:35: correctness fix; no speed gain needed.
-
-**Spec:**
-1. In `setUp` (`test_crate_run.py:200-201`), register `shutil.rmtree(self.root, ignore_errors=True)` before `shutil.copytree`.
-2. Keep every test and assertion. Run the module once and basedpyright on the file.
-
-**Files:**
-- `scripts/style/test_crate_run.py`
-
-**Workers:** 1 writer.
-- impl: all files.
-
-**Acceptance gate:**
-- The module passes; a probe with a failed copy shows no partial root before the next test.
+- `setUp` in `style/test_crate_run.py` registers `shutil.rmtree(self.root, ignore_errors=True)` before `copytree`; a failed copy leaves no partial root.
+- Correctness fix with no aws trial. Probes inject a failure before and after root creation; each gives one setup error, and the next test passes.
+- 96 tests and 589 assertions unchanged; two blind reviews approve with no findings. Checkpoint 536f8eb74.
