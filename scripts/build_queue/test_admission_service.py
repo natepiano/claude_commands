@@ -2490,6 +2490,43 @@ class QueueLifecycleTests(unittest.TestCase):
 
 class CiSliceAdmissionTests(unittest.TestCase):
 
+    def test_ci_worker_uses_the_current_reservation_and_waiter_identity(self) -> None:
+        from scripts.build_queue.scope_activity import RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+
+        for admitted, expected in ((True, RunningServiceJob), (False, WaitingServiceJob)):
+            with self.subTest(admitted=admitted), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(700001, "100")
+                write_process(fixture.proc.path, 700010)
+                _ = (fixture.proc.path / "700010/comm").write_text("Runner.Worker\n")
+                write_process(fixture.proc.path, owner.pid, parent=700010, start=owner.start_time)
+                _ = (fixture.root / "ci.slice/cgroup.procs").write_text(f"700010\n{owner.pid}\n")
+                if not admitted:
+                    _ = only_admitted(fixture.server.handle_request(
+                        fixture.request(owner=fixture.fixture_owner(700020, "200"), need=GIB)))
+                request = fixture.request(owner=owner, need=GIB if admitted else 100 * GIB)
+                reply = fixture.server.handle_request(request)
+                self.assertEqual(any(isinstance(item, wire.Admitted) for item in reply), admitted)
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.job_state, expected)
+                self.assertEqual(len(view.reading.view.waiting), int(not admitted))
+                if admitted:
+                    grant = only_admitted(reply)
+                    fixture.release(grant)
+                else:
+                    fixture.server.waiters.clear()
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.job_state, UnmatchedServiceJob)
+
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
         for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):
             with self.subTest(shared=shared), AdmissionFixture() as fixture:
@@ -5478,8 +5515,6 @@ class RunPlaceTests(unittest.TestCase):
 
     def test_display_age_and_aws_wait_threshold_use_child_arrival_not_run_order(self) -> None:
         from zoneinfo import ZoneInfo
-        from scripts.aws_target import aws_target
-        from scripts.aws_target.config import ControlSettings, read_control_settings
         from scripts.build_queue import head_facts
         from scripts.build_queue.queue_lines import plain
 
@@ -5504,18 +5539,6 @@ class RunPlaceTests(unittest.TestCase):
                     if line.lstrip().startswith("1 ") and "project check" in line]
             minute_column = heading.index("min")
             self.assertEqual(row[minute_column:minute_column + 3].strip(), "0", rendered)
-            settings_path = fixture.root / "aws_target.conf"
-            _ = write_config_fixture(settings_path, "offload=on\nkinds=check\nstart_after_wait_s=300\n"
-                                     + "region=us-east-1\ninstance_id=i-fixture\ncredentials_profile=fixture\n")
-            configuration = conf.read(settings_path)
-            settings = read_control_settings(configuration)
-            controller = aws_target.Controller(settings_path, fixture.root / "aws", fixture.state_dir)
-            eligible_steps = cast(Callable[[ControlSettings, int, conf.ConfigRead], int],
-                                  getattr(controller, "_queued"))
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 0)
-            fixture.clock.advance(300)
-            _ = fixture.server.run_pass()
-            self.assertEqual(eligible_steps(settings, int(fixture.clock.now()), configuration), 1)
 
 
 class AdmissionConfigurationTests(unittest.TestCase):

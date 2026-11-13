@@ -313,7 +313,8 @@ The installed account file supplies these settings:
 The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
 These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
 They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
-`spot_quota_request_vcpus=128` requests capacity for four gates with 32 vCPUs each through `deploy.py quota-request`.
+`spot_quota_request_vcpus=136` requests capacity through `deploy.py quota-request`.
+This covers four 32-vCPU gates and one 8-vCPU Hana box.
 The gate records its own bid and allowance in each reservation.
 `attempt_allowance_usd` reserves non-compute costs before launch.
 Admission includes every open reservation's allowance when bills exist.
@@ -583,6 +584,13 @@ Rsync replaces complete files and preserves this host's append files.
 | `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
+| `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+
+Configuration values use six hexadecimal digits without `#`.
+The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.

@@ -72,7 +72,7 @@ class MeasurementFixture(CostFixture):
             "BUILDLOG_PEER": "", "USER_ZONE": "UTC", "TZ": "UTC",
         })))
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac,aws\nkind.natedev=local\nplatform.natedev=linux\n"
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
             + "sync.hosts.natedev=natedev\nsync.hosts.mac=Mac,mac\nsync.hosts.aws=aws-build\n")

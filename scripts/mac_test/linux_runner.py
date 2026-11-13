@@ -12,7 +12,6 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from importlib import import_module
 import fcntl
 import hashlib
 import json
@@ -22,12 +21,9 @@ import re
 from pathlib import Path
 import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
-import time
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
-from types import FrameType
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 import uuid
 
 from scripts.mac_test.abandoned_sessions import removal_script
@@ -37,15 +33,11 @@ if TYPE_CHECKING:
     from scripts.lib import build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from scripts.aws_target import ledger
-    from scripts.build_targets.target_config import SshTarget, is_aws_target
 else:
     from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
-    from scripts.build_targets.target_config import SshTarget, is_aws_target
-
 
 
 PROC_ROOT = Path('/proc')
@@ -511,105 +503,13 @@ def probe_command_script(mirror: str, values: dict[str, str], repository: str) -
                        '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
 
 
-class AwsExecutionEvidence(Protocol):
-    """Read generation-bound AWS evidence only for an AWS execution."""
-
-    def current_generation(self, directory: Path, boot_id: str) -> str: ...
-    def interruption_generation(self, directory: Path, *, target: str, generation: str) -> str: ...
-    def execution_permission(self, directory: Path, target: str, *, now: int,
-                             boot_id: str) -> ledger.AdmissionPermission: ...
-
-
-def aws_execution_evidence() -> AwsExecutionEvidence:
-    return cast(AwsExecutionEvidence, cast(object, import_module('scripts.aws_target.remote')))
-
-
-@dataclass(frozen=True)
-class AwsExecutionContext:
-    target: str
-    directory: Path
-
-
-@dataclass(frozen=True)
-class IndependentLinuxExecution:
-    """This Linux target does not use AWS spending permission."""
-
-
-def aws_execution_context(values: dict[str, str]) -> AwsExecutionContext | IndependentLinuxExecution:
-    target = SshTarget(values.get('selected_target', ''), 'linux', Path(values.get('selected_settings', '')))
-    if not is_aws_target(target):
-        return IndependentLinuxExecution()
-    return AwsExecutionContext(target.name, Path.home() / values['remote_state_directory'])
-
-
-def interruption_generation(values: dict[str, str]) -> str:
-    try:
-        context = aws_execution_context(values)
-        if isinstance(context, IndependentLinuxExecution):
-            return ''
-        remote = aws_execution_evidence()
-        generation = remote.current_generation(context.directory, boot_identity())
-        return remote.interruption_generation(context.directory, target=context.target, generation=generation)
-    except (OSError, ValueError, KeyError, TypeError):
-        return ''
-
-
-def permission_refused(values: dict[str, str]) -> bool:
-    try:
-        context = aws_execution_context(values)
-        if isinstance(context, IndependentLinuxExecution):
-            return False
-        from scripts.aws_target import ledger
-        remote = aws_execution_evidence()
-        permission = remote.execution_permission(context.directory, context.target, now=int(time.time()),
-                                                 boot_id=boot_identity())
-        if isinstance(permission, ledger.PermissionAllowed):
-            return False
-        reason = permission.reason
-    except (OSError, ValueError, KeyError) as error:
-        reason = str(error)
-    print(f'aws_permission=refused reason={reason}', flush=True)
-    return True
-
-
-@contextmanager
-def interruption_signals(values: dict[str, str]) -> Generator[None, None, None]:
-    if isinstance(aws_execution_context(values), IndependentLinuxExecution):
-        yield
-        return
-
-    def interrupted(signum: int, _frame: FrameType | None) -> None:
-        if not interruption_generation(values):
-            raise SystemExit(128 + signum)
-
-    previous = signal.signal(signal.SIGTERM, interrupted)
-    try:
-        yield
-    finally:
-        _ = signal.signal(signal.SIGTERM, previous)
-        if generation := interruption_generation(values):
-            print(f'aws_interrupted={generation}', flush=True)
-
-
-@contextmanager
-def interruptible_slot(mirror: Path, values: dict[str, str]) -> Generator[None, None, None]:
-    with interruption_signals(values), slot_run(
-        mirror, require_boot_identity=isinstance(aws_execution_context(values), AwsExecutionContext)
-    ):
-        yield
-
-
 def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
     """Read parity inside the same cached environment as the work."""
-    if permission_refused(values):
-        return 75
     try:
-        with interruptible_slot(mirror, values):
+        with slot_run(mirror):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
                                   positive_setting(values, 'shell_timeout_s'))
-            if permission_refused(values):
-                return 75
             command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
                        + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
@@ -624,10 +524,8 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
         test_environment: tuple[tuple[str, str], ...] = (),
         clear_environment: str = '') -> int:
-    if permission_refused(values):
-        return 75
     try:
-        with interruptible_slot(mirror, values):
+        with slot_run(mirror):
             return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
@@ -744,8 +642,6 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     selector = policy_setting(values, 'devshell', repository)
     shell = prepare_shell(mirror, Path.home() / values['shell_cache'], selector,
                           positive_setting(values, 'shell_timeout_s'))
-    if permission_refused(values):
-        return 75
     build_budget = positive_setting(values, 'build_budget_gib')
     budget = float(policy_setting(values, 'target_budget_gib', repository))
     if not math.isfinite(budget) or not 0 < budget <= build_budget:
