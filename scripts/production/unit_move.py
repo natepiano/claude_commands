@@ -90,7 +90,7 @@ def checkout_folders(folder: Path) -> git_files.Checkout:
     """Read the checkout's Git folders from its files, with no Git start."""
     try:
         return git_files.locate(folder)
-    except git_files.NotACheckout as error:
+    except git_files.GitFilesError as error:
         raise RenameRefused(str(error)) from error
 
 
@@ -98,7 +98,7 @@ def checked_out_branch(folder: Path) -> str:
     """Read the checked-out branch from Git's files; "" for a detached HEAD."""
     try:
         return git_files.current_branch(folder)
-    except git_files.NotACheckout as error:
+    except git_files.GitFilesError as error:
         raise RenameRefused(str(error)) from error
 
 

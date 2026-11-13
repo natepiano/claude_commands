@@ -826,7 +826,7 @@ def retirement_branch(folder: Path) -> str:
     """The checked-out branch from Git's files; "" when HEAD is detached or the folder is no checkout."""
     try:
         return git_files.current_branch(folder)
-    except git_files.NotACheckout:
+    except git_files.GitFilesError:
         return ""
 
 def retirement_failure(result: subprocess.CompletedProcess[str]) -> str:
@@ -1314,7 +1314,7 @@ def unit_local_command() -> int:
                     try:
                         common = git_files.locate(location.path).common_dir
                         branch = git_files.current_branch(location.path)
-                    except git_files.NotACheckout as error:
+                    except git_files.GitFilesError as error:
                         raise ValueError("cannot read the worktree Git identity") from error
                     if not branch:
                         raise ValueError("cannot read the worktree Git identity")
@@ -1659,7 +1659,7 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
 def recovery_resume_record(production: Production, name: str) -> Path:
     try:
         return git_files.locate(production.checkout).git_dir / "resume-units" / name
-    except git_files.NotACheckout as error:
+    except git_files.GitFilesError as error:
         raise RecoveryRefused(f"cannot find the resume record: {error}") from error
 
 def recovery_git(unit: RetiredUnitRecovery, *arguments: str) -> str:

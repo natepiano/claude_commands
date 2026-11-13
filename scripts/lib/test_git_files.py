@@ -82,6 +82,19 @@ class GitFilesTests(unittest.TestCase):
         worktree = self.root / "lost"
         _ = git(self.main, "worktree", "add", "-q", "-b", "side", str(worktree))
         _ = (worktree / ".git").write_text("gitdir: /nonexistent/worktrees/lost\n", encoding="utf-8")
-        with self.assertRaises(git_files.NotACheckout):
+        with self.assertRaises(git_files.UnreadableGitFiles) as raised:
             _ = git_files.locate(worktree)
+        self.assertEqual(raised.exception.path, worktree / ".git")
+
+    def test_at_reads_only_the_given_folder(self) -> None:
+        (self.main / "sub").mkdir()
+        self.assertEqual(git_files.at(self.main), git_files.locate(self.main / "sub"))
+        with self.assertRaises(git_files.NotACheckout):
+            _ = git_files.at(self.main / "sub")
+
+    def test_head_names_the_branch_or_the_detached_commit(self) -> None:
+        checkout = git_files.at(self.main)
+        self.assertEqual(git_files.head(checkout), git_files.OnBranch("trunk"))
+        _ = git(self.main, "switch", "-q", "--detach")
+        self.assertEqual(git_files.head(checkout), git_files.DetachedHead(git(self.main, "rev-parse", "HEAD")))
 

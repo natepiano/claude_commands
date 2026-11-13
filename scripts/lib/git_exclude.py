@@ -32,7 +32,7 @@ def require_untracked(checkout: Path, path: str) -> None:
 def _exclude_path(checkout: Path) -> Path:
     try:
         return git_files.locate(checkout).common_dir / "info" / "exclude"
-    except git_files.NotACheckout as error:
+    except git_files.GitFilesError as error:
         raise ExcludeRefused(f"{checkout}: cannot find git exclude file: {error}") from error
 
 
