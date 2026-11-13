@@ -1216,11 +1216,18 @@ From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C15
 
 ### Phase 61 — Older admission clients parse a newer service snapshot · status: done
 
-From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, older admission clients refused the snapshot with "invalid snapshot variant" and stopped. Affected: a hana lint step in `hana_catalyst-research`, trunk run `20261113T011836-3473767-16a1`, and hana CI Clippy, Rendering Diagnostic and Linux Compile at 02:03 (runners pinned at claude-commands `7fdfd9a6a`). Fix at the source:
-- The service keeps the wire shape that older pinned clients parse. New information goes in a new optional field that an older client ignores.
-- The client accepts unknown variants in fields it does not use.
-- A test proves that a client at an older schema parses the new service snapshot.
-From queue (not the user), 2026-11-13: go. Keep the old wire shape and add one new optional field per record; add no value to an existing enum on the wire. The client ignores unknown values only in fields it does not use; a used field still refuses with the named error. The old-codec test reads the codec at `7fdfd9a6a` with `git show`. Keep the diff small and to `snapshot_codec.py`, `admission_client.py` and `admission_records.py` plus tests.
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
 
 ### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: todo
 
