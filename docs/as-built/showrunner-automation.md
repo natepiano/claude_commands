@@ -307,6 +307,8 @@ Each local Promote checkout must exist before the command pushes.
   A merge message can carry only invisible lines.
   The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
+  A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
+  Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
   The merge gates retain their staff reads before publication.
 
@@ -321,7 +323,8 @@ Each local Promote checkout must exist before the command pushes.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
-  The count and row writer use this same selection.
+  The count includes only selected commits with review lines that parse.
+  The row writer uses the same selection and reads its visible lines.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
