@@ -27,7 +27,7 @@ from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses)
 
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
@@ -2583,9 +2583,23 @@ def owned_scope_roots(scopes: Iterable[Path], parent: Path) -> set[Path]:
     return {scope for scope in inside if inside.isdisjoint(scope.parents)}
 
 
+def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdentity],
+                      reserved_pids: set[int], waiters: Sequence[Waiter], started_at: float = 0.0) -> ServiceJobState:
+    """Match worker process trees to admitted and waiting step identities."""
+    trees = [process_tree({pid: processes[pid].start}, processes) for pid in workers if pid in processes]
+    if not trees:
+        return IdleService()
+    if any(tree.intersection(reserved_pids) for tree in trees):
+        return RunningServiceJob(started_at)
+    waiting_pids = process_tree({row["pid"]: row["start_time"] for row in waiters}, processes)
+    if any(tree.intersection(waiting_pids) for tree in trees):
+        return WaitingServiceJob(started_at)
+    return UnmatchedServiceJob(started_at)
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "") -> tuple[UnownedSliceMemory, ...]:
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -2637,7 +2651,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             activity = activity_reader.scope(members, child.name)
             row_pid: int | PidNotRecorded = (activity.members[0].pid
                 if isinstance(activity, ScopeProcesses) and activity.members else PidNotRecorded())
-            job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+            job_state: ServiceJobState = NotServiceSlice()
             if required:
                 job_state = IdleService()
                 programs = member_programs(members.intersection(processes), proc)
@@ -2647,12 +2661,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                 if candidates:
                     oldest = min(candidates, key=lambda pid: (int(processes[pid].start), pid))
                     row_pid = oldest
-                    if workers:
-                        unregistered = [pid for pid in workers
-                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
-                        if unregistered:
-                            first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
-                            job_state = RunningServiceJob(activity_reader.started_at(first))
+                    job_state = service_job_state(workers, processes, tree_pids | scoped_pids, waiters,
+                                                  activity_reader.started_at(oldest))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped,

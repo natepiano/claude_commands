@@ -1193,3 +1193,67 @@ From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~
 **Files:**
 - `scripts/buildlog/disk.py` — `FOLDERS`.
 - `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
+
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+
+From builds (not the user), 2026-11-12 23:00 EST, relaying two user items. The page code is queue's; this unit edits it for this work and asks queue for page details. One phase, landed alone, with a Change-Review line for each item.
+
+Item 1, from the user (via the showrunner) on C1507: "the memory bar in the row should be a different color if it doesn't consume natedev memory - right now it looks like the color of natedev memory consumption. the "mac memory does not count against natedev" note should be underneath everything else and ideally would not word wrap. the % done should be a column on the right hand side - right after stage - and should be filled in for every run time that provides a % (or the numbers with which to calculate them) - after that the % can come out from underneath the mac row. also in the column showing machines (aws natedev mac) the text of these should get their own color so it's easy to habituate to which machine is running something just by seeing the color - this is for the table on the right - the machine column". Colors and the machine color map come from config, not code.
+
+Item 2, from the user (via the showrunner): "also hana ci still shows as a row when ci isn't running - i asked that this stop happening". The earlier asks are Phase 44e (never built) and Phase 44af (`54c9f3403`, "hana CI only while a CI job runs"). Evidence at 23:05 EST: Runner.Worker pid 1142071 ran `scripts/ci/doctests.sh` → `ci_cargo_front.py`, which waited for admission; cargo had not started, and `admission_client explain` listed no CI step as ordered. `build_ci_row` counts a runner with a job as busy, so a CI job that only waits shows as a Running row.
+
+User screenshots:
+- `/tmp/claude/scratch/user-shot-c1507-a.png`: the Mac `hana nextest` tooltip; the note sits under the title and wraps; the bar is the natedev blue; "99.3% done" sits under the bar.
+- `/tmp/claude/scratch/user-shot-c1507-b.png`: the Running table; the Machine text is one color.
+- `/tmp/claude/scratch/user-shot-hanaci-row.png`: a `hana CI` row with a 0.1 GiB bar and Stage `—`.
+
+#### Work Order
+
+**Goal:** On the build memory page, memory that does not count against natedev has its own bar color, each machine name has its own color, the Running table has a done column after Stage, the Mac note is last in its tooltip on one line, and a hana CI row shows in Running only while CI work uses natedev memory.
+
+**Spec:**
+- `config/memory_feed.conf` (new keys, no user go needed) and `config/README.md`:
+  - A light and a dark bar color for memory that does not count against natedev (Mac and AWS rows).
+  - A light and a dark text color for each machine name: `natedev`, `mac`, `aws`.
+  - Choose colors that differ from the natedev used blue, from each other, and from the building, testing, floor and cap colors. Check contrast on both page themes.
+- `scripts/build_queue/memory_feed.py`: put the configured colors in `memory.json`. Keep one place that reads them.
+- `scripts/build_queue/memory_live.html`:
+  - A row whose memory does not count against natedev draws its used bar in the remote color.
+  - The Machine column text uses the machine's color.
+  - Add a done column right after Stage. Fill it for every row whose progress gives a percent or the counts to compute one; otherwise show `—`. Remove the "N% done" text under the bar.
+  - The tooltip note "Mac memory does not count against natedev." moves below every other tooltip line and does not wrap.
+- hana CI row. From queue (not the user), 2026-11-12: "Use a matched running reservation, not a cargo descendant. … The proof is process identity, no label … A Runner.Worker is matched when process_tree({worker: start}, processes) intersects tree_pids | scoped_pids; that is the test at 2650-2651. Today the unmatched worker becomes RunningServiceJob, which is why a waiting job shows as running. … apply the same intersection to the waiter records' pid and start_time: matched to a waiter = waiting, matched to a reservation = running, matched to neither = service job without a queue step. … Keep the CI total as it is: amount and duplicate_use do not depend on job_state."
+  - `scripts/lint/memory_admit.py` (near lines 2640-2661): classify each `Runner.Worker` by process identity against reservation rows and waiter records. Add a waiting job state in `scripts/build_queue/scope_activity.py` beside `RunningServiceJob`. A worker matched to neither keeps a distinct state.
+  - From impl2 (not the user), 2026-11-13: `admission_records.py` (near 431) holds the closed `job_state` union, and `admission_service.py` (near 1469-1473) overwrites the captured state and marks unregistered workers as running. Both carry the waiting and unmatched states and classify through the shared helper with the captured worker trees, reservations and waiters.
+  - `scripts/build_queue/queue_evidence.py` recognizes every service state and shows a waiting or unmatched job with the stored worker age (impl2, 2026-11-13).
+  - The `hana CI` row shows in Running only for a worker matched to a running reservation. A waiting worker's step stays in the Waiting table through the existing waiter rows (`memory_feed.py` near 930-940). A worker matched to neither shows no Running row.
+  - CI amounts, `duplicate_use`, the taken total and the cap do not change.
+- Tests: rows in `test_memory_feed.py` and `test_memory_hover.py` for the remote bar color, the machine colors from config, the done column for each progress kind, the note position, and the hana CI row for a busy runner that waits (Waiting, not Running) and one with admitted work (Running).
+- Proof: `memory_page_proof.mjs` screenshots of the same elements as the three user shots, before and after, in both themes. Save them under the phase trial folder.
+
+**Files:**
+- `config/memory_feed.conf`
+- `config/README.md`
+- `scripts/build_queue/scope_activity.py`
+- `scripts/build_queue/admission_records.py`
+- `scripts/build_queue/admission_service.py`
+- `scripts/build_queue/test_admission_service.py`
+- `scripts/build_queue/queue_evidence.py`
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/memory_live.html`
+- `scripts/build_queue/test_memory_feed.py`
+- `scripts/build_queue/test_memory_hover.py`
+- `scripts/build_queue/memory_page_proof.mjs`
+
+**Workers:** `1 writer`
+- writer: all files.
+
+**State:** none.
+
+**Acceptance gate:**
+- `scripts.build_queue.test_memory_feed`, `scripts.build_queue.test_memory_hover` and `scripts.lint.test_memory_admit` pass, with the new rows.
+- Every module that reads `job_state` still passes: `scripts.build_queue.test_queue_view` and `scripts.build_queue.test_queue_evidence`.
+- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
+- The before and after screenshots show each user item changed.

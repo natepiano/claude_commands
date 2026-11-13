@@ -128,10 +128,10 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(queue_view, "refresh_mac_builds"))
 
     def configure(self, *, seconds: float = 0.125) -> None:
-        _ = self.configuration.write_text(
-            f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n" +
-            "# whole: 1..90\nhistory_days=7\n# whole: 1..50\nswap_rows=6\n# whole: 30..3600\nreport_refresh_seconds=300\n" +
-            "# whole: 1..\nmac_activity_refresh_seconds=30\n")
+        source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
+        text = source.read_text().replace("output_folder=~/.local/share/review-links/h7uj5c", f"output_folder={self.output}")
+        text = text.replace("interval_seconds=3", f"interval_seconds={seconds}").replace("# range: 1..60", "# range: 5e-324..")
+        _ = self.configuration.write_text(text)
 
     def expected_page(self, seconds: float = 0.125) -> str:
         return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
@@ -158,6 +158,41 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(page["ci_ram"], 0.125)
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
                 self.assertEqual(page["taken"], 0.125)
+                self.assertEqual(row.get("admitted"), busy)
+
+    def test_the_feed_publishes_configured_colors_for_both_themes(self) -> None:
+        original = self.configuration.read_text()
+        keys = ("remote_memory", "machine_natedev", "machine_mac", "machine_aws")
+        for theme in ("light", "dark"):
+            for index, key in enumerate(keys):
+                value = f"{index + 1:06x}"
+                text = "\n".join(f"{key}_{theme}={value}" if line.startswith(f"{key}_{theme}=") else line
+                                 for line in original.splitlines())
+                with self.subTest(theme=theme, key=key):
+                    _ = self.configuration.write_text(text)
+                    configuration = memory_feed.read_configuration()
+                    with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                        page = memory_feed.reading(configuration)
+                    palette = page["colors"]["light"] if theme == "light" else page["colors"]["dark"]
+                    actual = palette["remote_memory"] if key == "remote_memory" else palette["machines"].get(key.removeprefix("machine_"))
+                    self.assertEqual(actual, "#" + value)
+
+    def test_waiting_and_unmatched_ci_jobs_do_not_claim_admission(self) -> None:
+        from scripts.build_queue.scope_activity import WaitingServiceJob, UnmatchedServiceJob
+
+        for state in (WaitingServiceJob(199_000), UnmatchedServiceJob(199_000), RunningServiceJob(199_000)):
+            with self.subTest(state=state):
+                step = admission_records.RunningStep("", "hana-ci.slice", "service", "/ci", 0,
+                    admission_records.UnownedSliceMemory(admission_records.GIB // 8, owner="hana-ci.slice",
+                        job_state=state, pid=701), pid=701)
+                reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                ci, = [row for row in page["walk"] if row.get("ci")]
+                self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
+                self.assertIn("start spacing", page["waiters"][0]["reason"])
+                self.assertEqual(page["taken"], 0.125)
+                self.assertEqual(page["ci_ram"], 0.125)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
@@ -339,12 +374,13 @@ class MemoryFeedTests(unittest.TestCase):
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors))
 
     def test_configuration_expands_the_output_folder(self) -> None:
-        _ = self.configuration.write_text("output_folder=~/page\n# range: 5e-324..\ninterval_seconds=7\n# whole: 1..90\nhistory_days=7\n# whole: 1..50\nswap_rows=6\n# whole: 30..3600\nreport_refresh_seconds=300\n")
+        original = self.configuration.read_text()
+        _ = self.configuration.write_text(original.replace(f"output_folder={self.output}", "output_folder=~/page"))
         self.assertEqual(memory_feed.read_configuration().output_folder, Path.home() / "page")
-        _ = self.configuration.write_text("output_folder=$FEED_TEST_ROOT/page\n# range: 5e-324..\ninterval_seconds=7\n# whole: 1..90\nhistory_days=7\n# whole: 1..50\nswap_rows=6\n# whole: 30..3600\nreport_refresh_seconds=300\n")
+        _ = self.configuration.write_text(original.replace(f"output_folder={self.output}", "output_folder=$FEED_TEST_ROOT/page"))
         with mock.patch.dict(os.environ, {"FEED_TEST_ROOT": str(self.root)}):
             self.assertEqual(memory_feed.read_configuration().output_folder, self.output)
 
