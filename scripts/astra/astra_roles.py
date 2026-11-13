@@ -11,16 +11,20 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import json
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import process_start
+from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 from scripts.herdr import worker_panes
@@ -31,12 +35,10 @@ RoleState = Literal["busy", "idle", "unknown"]
 
 
 class RoleRecord(TypedDict):
-    """The on-disk ownership record; null fields belong to the other launch mode."""
+    """A staff reference and the evidence for one role lifetime."""
 
     staff_id: str
     held_at: str
-    session_dir: str | None
-    worker: str | None
     pid: int | None
     pid_start: NotRequired[str]
     design_id: NotRequired[str]
@@ -97,6 +99,19 @@ def state_root() -> Path:
     return Path(os.environ.get("ASTRA_ROLES_STATE") or "~/.local/state/astra/roles").expanduser()
 
 
+@contextmanager
+def role_lock() -> Generator[None]:
+    """Serialize hold writes, removals, and state migration."""
+    root = state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / "lock").open("a", encoding="utf-8") as handle:
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_UN)
+
+
 def _record_path(staff_id: str) -> Path:
     if not staff_id or staff_id in (".", "..") or "/" in staff_id or "\\" in staff_id:
         raise ValueError("a staff id must be a file name")
@@ -141,14 +156,15 @@ def hold(role: AstraRole, lifetime: ExecProcess | HeldDesignRole,
     record = _role_record(held)
     path = _record_path(member.id)
     held = _parse_record(record, path, membership)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(record))
+    with role_lock():
+        write_text_atomic(path, json.dumps(record))
     return held
 
 
 def release(staff_id: str) -> None:
     """Remove a hold, including one whose thread has already stopped."""
-    _record_path(staff_id).unlink(missing_ok=True)
+    with role_lock():
+        _record_path(staff_id).unlink(missing_ok=True)
 
 
 def _record_text(record: dict[str, object], key: str) -> str:
@@ -160,7 +176,7 @@ def _record_text(record: dict[str, object], key: str) -> str:
 
 def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership: staff.StaffSnapshot) -> HeldRole:
     fields = cast(dict[str, object], record)
-    expected = {"staff_id", "held_at", "session_dir", "worker", "pid"}
+    expected = {"staff_id", "held_at", "pid"}
     if "pid_start" in fields:
         expected.add("pid_start")
     if "design_id" in fields:
@@ -194,13 +210,13 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path, membership
 
 
 def _role_lifetime(fields: dict[str, object], role: AstraRole) -> ExecProcess | HeldDesignRole:
-    session_dir, worker, pid = fields["session_dir"], fields["worker"], fields["pid"]
+    pid = fields["pid"]
     lifetime: ExecProcess | HeldDesignRole
     if "design_id" in fields:
-        if session_dir is not None or worker is not None or pid is not None or fields["role_id"] != role:
+        if pid is not None or fields["role_id"] != role:
             raise ValueError("invalid durable role lifetime")
         lifetime = HeldDesignRole(_record_text(fields, "design_id"), _record_text(fields, "role_id"))
-    elif session_dir is None and worker is None and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+    elif isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
         saved_start = fields.get("pid_start")
         lifetime = ExecProcess(pid, process_start.Started(saved_start) if isinstance(saved_start, str) and saved_start
                                else process_start.Unreadable("legacy hold has no process start; release it explicitly"))
@@ -212,8 +228,6 @@ def _role_lifetime(fields: dict[str, object], role: AstraRole) -> ExecProcess | 
 def _role_record(role: HeldRole) -> RoleRecord:
     lifetime = role["lifetime"]
     record = RoleRecord(staff_id=role["staff_id"], held_at=role["held_at"],
-                      session_dir=None,
-                      worker=None,
                       pid=lifetime.pid if isinstance(lifetime, ExecProcess) else None)
     if isinstance(lifetime, HeldDesignRole):
         record.update(design_id=lifetime.design_id, role_id=lifetime.role_id)
@@ -231,6 +245,12 @@ class AllHeldRoles(Enum):
 def live_roles(membership: staff.StaffSnapshot, *,
                selection: frozenset[staff.StaffId] | AllHeldRoles = AllHeldRoles.ALL) -> list[LiveRole]:
     """Return readable live holds with current state; remove holds known to have ended."""
+    with role_lock():
+        return _live_roles(membership, selection=selection)
+
+
+def _live_roles(membership: staff.StaffSnapshot, *,
+                selection: frozenset[staff.StaffId] | AllHeldRoles) -> list[LiveRole]:
     roles: list[LiveRole] = []
     parents = [row for row in membership.rows if row.kind in ("unit", "showrunner")]
     observations: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {}

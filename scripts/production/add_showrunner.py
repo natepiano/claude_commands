@@ -99,12 +99,16 @@ NEW_SHOWRUNNER_LAUNCH = NewShowrunnerLaunch()
 
 
 def finish_publication(receipt: completion_receipt.OwnedReceipt) -> completion_receipt.OwnedReceipt:
-    """Save the observed home before removing the creation claim."""
-    if "config_dir" not in receipt.fields:
+    """Complete an unknown staff home, then remove the admitted launch copies."""
+    owner = receipt.owner
+    config_dir = receipt.fields.get("config_dir")
+    if isinstance(owner.home, staff.HomeUnknown) and config_dir is not None:
+        if not isinstance(config_dir, str) or not config_dir or not Path(config_dir).is_absolute():
+            raise Refusal("showrunner receipt has no launch home")
+        owner = staff.set_home(owner.id, staff.SessionHome(Path(config_dir)), only_unknown=True)
+    fields = {key: value for key, value in receipt.fields.items() if key not in ("session_id", "doc", "config_dir")}
+    if fields == receipt.fields:
         return receipt
-    home = staff.SessionHome(Path(cast(str, receipt.fields["config_dir"])))
-    owner = staff.set_home(receipt.owner.id, home)
-    fields = {key: value for key, value in receipt.fields.items() if key not in ("doc", "config_dir")}
     path = showrunners.SHOWRUNNER_STATE_DIR / owner.id / "add_showrunner.json"
     completion_receipt.write_receipt(path, owner.id, fields)
     return completion_receipt.OwnedReceipt(owner, fields)
