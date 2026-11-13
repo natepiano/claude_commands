@@ -1,6 +1,8 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import json
 import io
 import os
@@ -42,14 +44,14 @@ class NativeHookEntryTests(unittest.TestCase):
                 payload = json.dumps(value)
                 receiver = Path(folder) / "receive.py"
                 receipt = Path(folder) / "receipt.json"
-                atomic_file.write_text_atomic(receiver, "\n".join((
+                atomic_file.write_text_atomic(receiver, python_tool_source("\n".join((
                     "from dataclasses import asdict",
                     "import json, sys",
                     "from pathlib import Path",
                     "from scripts.herdr import turn_end",
                     "from scripts.lib.atomic_file import write_text_atomic",
                     "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
-                    "raise SystemExit(turn_end.main(sys.argv[2:]))", "")))
+                    "raise SystemExit(turn_end.main(sys.argv[2:]))", ""))))
                 children: list[subprocess.Popen[bytes]] = []
 
                 def receive(arguments: list[str], *, start_new_session: bool, stdin: int,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import io
 import builtins
 import fcntl
@@ -43,7 +45,7 @@ from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import relay_session_name
 from scripts.message.relay_test_support import write_relay_record
-from scripts.lib import conf, names, process_start
+from scripts.lib import conf, names, process_start, models_registry
 from scripts.production import staff
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
@@ -119,6 +121,44 @@ def write_send_config(path: Path, values: str) -> int:
     return path.write_text(timings + "\n" + values)
 
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_imports_only_its_temporary_checkout(self) -> None:
+        repository = Path(send.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            selected, other, home = (base / name for name in ("selected", "other", "home"))
+            home.mkdir()
+            record = base / "relay-import.json"
+            observer = ("\nimport scripts\n"
+                        + "with open(os.environ['RELAY_IMPORT_RECORD'], 'w') as output:\n"
+                        + "    json.dump([__file__, list(scripts.__path__), os.environ.get('PYTHONPATH', '')], output)\n")
+            for checkout in (selected, other):
+                _ = shutil.copytree(repository / "scripts", checkout / "scripts",
+                                    ignore=shutil.ignore_patterns("__pycache__"))
+                identity = checkout / "scripts/message/relay_identity.py"
+                _ = identity.write_text(identity.read_text() + observer)
+            _ = (other / "scripts/__init__.py").write_text("")
+            fake = base / "fake-claude"
+            message = send.Message("uds:/fixture", "copy-sender", "Copy", "body", None)
+            payload = stream(INIT, call(send.agent_text(message, via_relay=True)), answer(OK))
+            _ = fake.write_text(f"#!{sys.executable}\nprint({payload!r}, end='')\n")
+            fake.chmod(0o755)
+            with (mock.patch.dict(os.environ, {
+                    "HOME": str(home), "PYTHONPATH": str(other), "RELAY_IMPORT_RECORD": str(record),
+                    "XDG_CACHE_HOME": str(base / "cache"),
+                  }),
+                  mock.patch.object(send, "__file__", str(selected / "scripts/message/send.py")),
+                  mock.patch.object(send, "STATE", base / "state"),
+                  mock.patch.object(send, "claude_binary", return_value=str(fake)),
+                  mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+                  mock.patch.object(models_registry, "claude_model", return_value="fixture")):
+                result = send.relay(message, TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.outcome, "sent", result.detail)
+            filename, paths, inherited = cast(tuple[str, list[str], str], json.loads(record.read_text()))
+            self.assertEqual(Path(filename), selected / "scripts/message/relay_identity.py")
+            self.assertEqual(paths, [str(selected / "scripts")])
+            self.assertNotIn(str(other), inherited.split(os.pathsep))
+            self.assertNotIn(str(selected), inherited.split(os.pathsep))
+
     def test_relay_reads_its_cleanup_budget_before_starting_the_process(self) -> None:
         class TimedOutRelay:
             returncode: int = 0
@@ -5808,9 +5848,8 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "oauthAccount": {"emailAddress": "sender@example.invalid"}}))
         executable = self.root / ".local/bin/claude"
         executable.parent.mkdir(parents=True)
-        _ = executable.write_text(
-            f"#!{sys.executable}\n"
-            + "import json, socket, sys\n"
+        _ = executable.write_text(python_tool_source(
+            "import json, socket, sys\n"
             + "from scripts.message.test_send import INIT, OK, answer, call, stream\n"
             + "prompt = sys.stdin.read()\n"
             + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
@@ -5818,7 +5857,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             + "with socket.socket(socket.AF_UNIX) as connection:\n"
             + "    connection.connect(target.removeprefix('uds:'))\n"
             + "    connection.sendall(text.encode())\n"
-            + "print(stream(INIT, call(text), answer(OK)), end='')\n")
+            + "print(stream(INIT, call(text), answer(OK)), end='')\n"))
         executable.chmod(0o755)
         question, response = "Can you confirm the survey?", "The survey is confirmed."
         with ShortUnixSocket() as sender, self.daemon(self.homes[1]):

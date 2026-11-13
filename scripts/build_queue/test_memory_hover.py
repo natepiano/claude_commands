@@ -20,6 +20,53 @@ GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_time_cells_use_short_times_without_a_wait_prefix(self) -> None:
+        for elapsed, expected in ((0, "<1 min"), (29, "<1 min"), (30, "1 min"),
+                                  (60, "1 min"), (2580, "43 min"), (3600, "1 h 0 min")):
+            with self.subTest(elapsed=elapsed):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200_000,
+                    "walk": [{"name": "running", "queued": True, "started_at": 200_000 - elapsed,
+                              "used": 1, "reserved": 0, "counted": 1}],
+                    "waiters": [{"name": "queued", "since": 200_000 - elapsed, "detail": "fixture",
+                                 "pid": 200, "need": 1, "reason": "free memory"}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                self.assertEqual(root.findtext(".//tr[@data-tip='row:0']/td[@class='duration']"), expected)
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='duration']"), expected)
+                tips = self.page_expression("[tipText('row:0', data), tipText('wait:0', data)]", data)
+                self.assertIn(f"Started {expected} ago.", str(tips))
+                self.assertIn(f"Waiting for {expected}.", str(tips))
+
+    def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
+        for units, expected in (([], "Queued, in order of submission"),
+                                (["research"], "Queued, research first, then in submission order"),
+                                (["research", "cables"], "Queued, research followed by cables and then in submission order"),
+                                (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
+            with self.subTest(units=units):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
+                    "walk": [{"name": "running", "queued": True}],
+                    "waiters": [{"name": "first", "since": 100, "detail": "research", "pid": 200}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                chart = root.find("./div[@class='walk-chart']")
+                assert chart is not None
+                header = chart.find("./div[@class='walk-chart-head queue-head']")
+                assert header is not None
+                title = header.find("./span[@class='queue-title section-head']")
+                assert title is not None
+                self.assertEqual(title.text, expected)
+                self.assertEqual(title.get("title"), expected)
+                room = chart.find("./div[@class='wrow room']")
+                assert room is not None
+                children = list(chart)
+                self.assertEqual(children.index(room) + 1, children.index(header))
+                self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:0")
+                table_rows = root.findall(".//tbody/tr")
+                self.assertEqual([row.get("class") for row in table_rows],
+                                 ["", "room", "queue-head", "wait wait-first"])
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='place']"), "1")
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/th[@class='step']/span"), "first")
+
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
         for phase, unit, done, total, percent, expected in (
             ("building", "units", 7, 10, 70, "70.0%"),

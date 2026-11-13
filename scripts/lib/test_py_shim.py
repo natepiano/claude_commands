@@ -82,16 +82,20 @@ class PythonShimTests(unittest.TestCase):
         self.assertEqual(Path(result.stdout.strip()).resolve(), ROOT / "scripts/lib/unit_runs.py")
 
     def test_file_script_keeps_its_folder_first(self) -> None:
+        inherited = self.environment["PYTHONPATH"]
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(ROOT), inherited, str(ROOT)))
         script = self.folder / "program/probe.py"
         script.parent.mkdir()
-        _ = script.write_text("import os, sys; print(sys.path[0]); print(os.environ['PYTHONPATH'])")
+        _ = script.write_text(
+            "import subprocess, sys\nprint(sys.path[0], flush=True)\n"
+            + "subprocess.run([sys.executable, '-c', \"import os; print(os.environ['PYTHONPATH'])\"], check=True)\n")
         result = subprocess.run(
             [str(SHIM), "-B", str(script)], cwd=self.folder, env=self.environment,
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(),
-                         [str(script.parent), f"{ROOT}{os.pathsep}{self.environment['PYTHONPATH']}"])
+                         [str(script.parent), inherited])
 
 
 if __name__ == "__main__":

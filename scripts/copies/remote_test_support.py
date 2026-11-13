@@ -123,7 +123,7 @@ os.execve('/bin/bash', ['bash', '-c', sys.argv[-1]], environment)
     with mock.patch.dict(os.environ, {
         **config_environment(root), **copies_environment(root),
         "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-        "PYTHONPATH": str(repository), "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(root / "cache"),
+        "PYTHONPATH": str(repository / "scripts/lib/python_startup"), "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(root / "cache"),
         "MAC_TEST_STATE_DIR": str(root / "local-claims"),
         "REMOTE_CLAIM_STATE": str(root / "remote-claims"),
     }):

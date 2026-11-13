@@ -15,9 +15,9 @@ state the hooks and `--analysis` report read), so this never diverges from the
 text report.
 
 Usage (uv auto-installs Pillow from the inline metadata above):
-    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py
-    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --sort recency
-    PYTHONPATH="$HOME/.claude" uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --scale linear --out /tmp/x.png
+    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py
+    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --sort recency
+    uv run ~/.claude/scripts/banned_word_analysis/banned-word-gradient.py --scale linear --out /tmp/x.png
 
 Prints the output PNG path on success.
 """

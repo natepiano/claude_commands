@@ -15,7 +15,7 @@ class RustGenerationRerunTests(ScriptRepositoryTestCase):
         _ = self.write(self.home / ".claude/templates/settings_local.json", "{}\n")
         self.environment["TEST_REMOTE"] = str(self.remote)
         self.environment["TEST_CARGO_CALLS"] = str(self.root / "cargo-calls")
-        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
         for command in ("cargo-generate", "cargo-mend", "taplo"):
             _ = self.stub(command, "pass\n")
         _ = self.stub("cargo", '''import os, sys

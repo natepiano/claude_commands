@@ -671,6 +671,13 @@ def command_supervise(args: argparse.Namespace) -> int:
             record["pid"] = os.getpid()
             record = _write_record(record_path, record)
     environment = dict(os.environ)
+    from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+    paths = inherited_paths(environment.get("PYTHONPATH", ""))
+    if paths:
+        environment["PYTHONPATH"] = os.pathsep.join(paths)
+    else:
+        _ = environment.pop("PYTHONPATH", None)
     environment.update({
         "UNIT_DETACHED_RUN": "1",
         "UNIT_RUN_DIR": record["session_dir"],

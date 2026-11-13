@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import base64
+import inspect
 import json
 import os
 from pathlib import Path
@@ -229,7 +230,10 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
-                _ = (repo / 'scripts/lib/cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
+                library = repo / 'scripts/lib'
+                _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
+                self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
+                _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
                     'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
@@ -239,7 +243,11 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
-                    (ROOT / 'scripts/aws_target/gate_box.py').read_text()
+                    'import json\nfrom pathlib import Path\nfrom typing import cast\n'
+                    + f'GUEST_TRANSFERS = {gate_box.GUEST_TRANSFERS!r}\n'
+                    + f'PAIRED_GUEST = {gate_box.PAIRED_GUEST!r}\n'
+                    + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
+                    + inspect.getsource(gate_box.run_guest)
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
                     + 'def completion_record(*args): return {"kind": "gate_run"}\n')
                 if candidate_change == 'rename':

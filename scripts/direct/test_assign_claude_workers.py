@@ -28,7 +28,7 @@ class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture, Clau
         _ = reference.write_text(json.dumps({"staff_id": old.id, "slot": "impl", "model": "gpt-6"}))
         modules = stopped_worker_module(self.root / "switch-modules")
         environment = self.environment()
-        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        environment["PYTHONPATH"] = os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))
         with patch.object(self, "environment", return_value=environment):
             result = self.claude_launch(run, "sonnet:low")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
