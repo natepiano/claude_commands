@@ -395,7 +395,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         for process in (self.watcher, self.step):
             if process is not None and process.poll() is None:
                 if os.getpgid(process.pid) == process.pid:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    send_process_group(process.pid, signal.SIGKILL)
                 else:
                     process.kill()
                 _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
@@ -650,7 +650,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                 self.wait_until((self.root / "runner-ready").exists, "the copy to run")
                 values = self.finish_watcher(terminate=True)
                 self.assertEqual(values["copy"], "natedev_won")
-                os.killpg(step.pid, signal.SIGKILL)
+                send_process_group(step.pid, signal.SIGKILL)
                 _ = step.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_a_running_copy_blocks_copies_of_other_calls(self) -> None:

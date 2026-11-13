@@ -1825,7 +1825,7 @@ collect_hold_wait() {
 interrupt_hold_wait() {
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            kill -TERM -- "-$HOLD_WAITER_PID" 2>/dev/null || true
+            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$HOLD_WAITER_PID" TERM 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$HOLD_WAITER_PID" >&2; }
             if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
                 kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
                 VERIFY_HELPER_PID=""
