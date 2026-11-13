@@ -97,14 +97,21 @@ def setUpModule() -> None:
 
 def accounts_reader_calls(source: str) -> dict[str, set[str]]:
     """Collect each method called on the accounts configuration."""
+    tree = ast.parse(source)
+    configured_names = {"account_config"}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.arg) and isinstance(node.annotation, ast.Attribute)
+                and isinstance(node.annotation.value, ast.Name)
+                and node.annotation.value.id == "conf" and node.annotation.attr == "ConfigRead"):
+            configured_names.add(node.arg)
     readers: dict[str, set[str]] = {}
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.args and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)):
             continue
         receiver = node.func.value
-        configured = isinstance(receiver, ast.Name) and receiver.id == "account_config"
+        configured = isinstance(receiver, ast.Name) and receiver.id in configured_names
         if isinstance(receiver, ast.Call):
             configured = (isinstance(receiver.func, ast.Name) and receiver.func.id == "read_account_settings"
                 or isinstance(receiver.func, ast.Attribute) and receiver.func.attr == "read_account_settings"
@@ -5874,10 +5881,6 @@ with path.with_name(path.name + ".lock").open("a") as lock:
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
-        repair_file = self.home / ".codex1/session_index.jsonl"
-        repair_file.unlink(missing_ok=True)
-        _ = repair_file.write_text("fixture shared entry\n")
-        repair_line = f"codex1: {repair_file} is a real file; move it aside or merge it into ~/.codex"
         code, table, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         code, output, error = self.run_cli("status", "--json")
@@ -5902,13 +5905,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
         self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
         notes = table.split("\n\n", 2)[2].strip().splitlines()
-        problems = cast(list[str], document["problems"])
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
-        self.assertIn(repair_line, notes)
-        self.assertNotIn(repair_line, problems)
-        self.assertEqual(problems, [note.removeprefix("* ") for note in notes if note != repair_line])
-        usage_line = next(note for note in notes if "usage unavailable" in note)
-        self.assertIn(usage_line.removeprefix("* "), problems)
+        self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
         self.assertTrue(any(note.startswith("* ") for note in notes))
         for row in rows:
             self.assertNotIn("login", row)
@@ -5921,6 +5919,21 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((code, error), (0, ""))
         changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
         self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_real_codex_history_file_has_the_same_repair_line_in_the_table_and_json_problems(self) -> None:
+        _ = self.json_status_fixture()
+        history = self.home / ".codex1/history.jsonl"
+        history.unlink(missing_ok=True)
+        _ = history.write_text("fixture shared entry\n")
+        repair_line = f"codex1: {history} is a real file; move it aside or merge it into ~/.codex"
+        code, table, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        document = cast(accounts.StatusDocument, json.loads(output))
+        self.assertIn(repair_line, table.splitlines())
+        self.assertIn(repair_line, document["problems"])
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_json_and_table_refresh_the_same_stale_logins_once_each(self) -> None:
@@ -10272,35 +10285,6 @@ class StatusProblemCauseTests(unittest.TestCase):
                 assert isinstance(problem.step, accounts.ProblemStep)
                 self.assertIn(step, problem.step.instruction)
                 self.assertEqual(accounts.render_status_problem(problem).split(":", 1)[0], problem.subject)
-
-    def test_shared_home_repairs_have_a_typed_cause_and_keep_their_text(self) -> None:
-        path = self.home / ".codex1/sessions"
-        target = self.home / ".codex/sessions"
-        cases = (
-            (f"{path} is a real file; move it aside or merge it into ~/.codex", True),
-            (f"repair {path}: resolve clashing entries fixture with {target}, then rerun", True),
-            (f"repair {path}: move its contents into a shared folder at {target}, then rerun", True),
-            (f"repair {path}: atomic no-replace moves to {target} are unavailable; "
-             + "move the entries without replacing shared content, then rerun", True),
-            (f"repair {path}: could not move into {target}: fixture failure; then rerun", True),
-            (f"repair {path}: fixture unrelated failure", False),
-        )
-        for diagnostic, home_repair in cases:
-            with self.subTest(diagnostic=diagnostic):
-                problem = accounts.status_check_problem("accounts: " + diagnostic, "codex1",
-                    setup="run accounts.py setup codex1", login="run codex login")
-                self.assertEqual(isinstance(problem.cause, accounts.SharedHomeRepair), home_repair)
-                expected = "codex1: " + diagnostic
-                if "; " not in diagnostic:
-                    expected += "; run accounts.py setup codex1"
-                self.assertEqual(accounts.render_status_problem(problem), expected)
-                reading = self.reading("fixture@notexample.com", noted=True, diagnostics=("accounts: " + diagnostic,))
-                self.assertIn(expected, accounts.render_status_table(reading).splitlines())
-                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-                self.assertEqual(expected in document["problems"], not home_repair)
-                usage_line = next(note for note in reading.notes if "usage unavailable" in note)
-                self.assertIn(usage_line, accounts.render_status_table(reading).splitlines())
-                self.assertIn(usage_line.removeprefix("* "), document["problems"])
 
     def test_account_state_merge_uses_the_cause_after_wording_changes(self) -> None:
         directory = self.home / ".claude2"

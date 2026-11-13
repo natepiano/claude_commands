@@ -395,10 +395,8 @@ The usage reader takes the date from `claudeAiOauth.refreshTokenExpiresAt` in th
 Both live paths use this source, so the disk identity shortcut still avoids a Claude process start.
 The usage store and the timer cache preserve the date without storing other credential fields.
 An accepted reading without a date removes the stored date.
-Status classifies shared-home repairs before rendering.
-The text board keeps these repair lines.
-JSON omits these lines from `problems`, so cargo-handler and unit-board panes do not show them.
-All other problem lines remain in JSON.
+Both renderers use the same problem lines from `StatusReading.notes`, including shared-home repairs.
+JSON `problems` matches the text board's problem lines, with only the `* ` footnote prefix removed.
 Each account row exports `sessions` beside `role_counts`.
 Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
