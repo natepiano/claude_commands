@@ -83,6 +83,7 @@ MIN_OUTSIDE_DIRECTORY_BYTES = 1 << 30
 
 FOLDERS: list[tuple[str, str]] = [
     ("~/rust", "~/rust"),
+    ("~/.local/state", "~/.local/state"),
     ("/tmp", "/tmp"),
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
