@@ -29,6 +29,20 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
 
+SNAPSHOT_ERROR_PATTERNS = (
+    r'^An error occurred \(',
+    r'^aws:\s*(?i:error|\[error\]):',
+    r'^Invalid choice\b',
+    r'^Parameter validation failed\b',
+    r'^Unable to locate credentials\b',
+    r'^Could not connect to the endpoint\b',
+    r'^[A-Z][A-Za-z]*:\s',
+)
+SNAPSHOT_DUMP_LINE = re.compile(
+    r'(?i)^(?:(?:request|response|headers?)\b|'
+    + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
+
+
 class AwsExecutor(Protocol):
     def __call__(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                  timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]: ...
@@ -173,12 +187,16 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         document = read_snapshot(directory)
         prices = list(ledger.rows(document, 'prices'))
         readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
+        reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         status = 0
         for region in regions:
+            read_name = 'price'
             try:
                 target = api.in_region(region)
                 regional = fetch_spot_prices(target, sizes, now)
+                read_name = 'Standard quota'
                 standard = spot_quota(target)
+                read_name = 'G and VT quota'
                 gpu = spot_quota(target, 'L-3819A6DF')
                 prices = [row for row in prices if row.get('region') != region]
                 prices.extend(dict(region=row.region, zone=row.zone, instance_type=row.instance_type,
@@ -186,7 +204,17 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 readings = [row for row in readings if row.get('region') != region]
                 readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
-                print(f'aws_target: snapshot {region} unavailable: {type(error).__name__}', file=sys.stderr)
+                raw_lines: list[str] = []
+                for raw_line in str(error).splitlines():
+                    if SNAPSHOT_DUMP_LINE.match(raw_line.lstrip()):
+                        break
+                    raw_lines.append(raw_line)
+                redacted = admin_secrets.redact('\n'.join(raw_lines))
+                lines = [line.strip() for line in redacted.splitlines() if line.strip()]
+                error_line = next((line for line in lines if any(re.match(pattern, line)
+                    for pattern in SNAPSHOT_ERROR_PATTERNS)), lines[0] if lines else '')
+                reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
+                print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
                 status = 1
         write_text_atomic(directory / 'spot-prices.json', json.dumps(
             {'prices': prices, 'regions': readings}, sort_keys=True) + '\n')

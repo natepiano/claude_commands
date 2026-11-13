@@ -264,6 +264,21 @@ The existing `prices` array keeps its ranking format: `region`, `zone`, `instanc
 The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
 A regional failure preserves that region's previous prices, quotas, and read time.
 Other regions still refresh, and the command returns a failure status.
+Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
+The read name is `price`, `Standard quota`, or `G and VT quota`.
+The shared `admin_secrets.redact` helper removes AWS account ids, ARNs, access key ids, and instance, subnet, AMI, volume, and snapshot ids.
+The helper first removes credential field values and all following text, including wrapped values.
+It preserves credential fields that already contain `[redacted]`, so repeated redaction keeps appended deployment reports.
+It then removes known credentials and AWS identifiers, including wrapped account ids, access key ids, and ARNs.
+The snapshot first removes request dumps, response dumps, headers, structured dump lines, and all lines after each dump marker.
+It redacts the remaining raw text and selects the first AWS or CLI error line that matches `SNAPSHOT_ERROR_PATTERNS`.
+Every pattern matches only at the start of a line.
+The patterns accept both CLI error formats, `aws: error:` and `aws: [ERROR]:`, with any letter case for `error`.
+They also accept standalone `Invalid choice` and `Parameter validation failed` lines.
+If no line matches, it selects the first non-empty line.
+It discards all other lines, including usage text and request dumps.
+It normalizes that line's whitespace and redacts it again.
+`snapshot_error_reason_max_chars=240` limits the reason after both redaction passes.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
