@@ -1304,3 +1304,12 @@ From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queu
 ### Phase 66 — Retire /build:queue · status: todo
 
 From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation (Lucide icons): Changes and Builds. sdlc's admin-console unit builds the console. The contract, through builds:
+
+1. Add `memory_feed.page_url() -> str`: the body of `page_link` without the print. `page_link` prints it. It raises one of `review_link.SNAPSHOT_ERRORS` when the page is not available.
+2. Rename the page title and heading from "Build memory on natedev" to "Builds" (the user's name). Rename it in `/build:page` too.
+3. The page allows same-origin framing (no `X-Frame-Options DENY`, no `frame-ancestors 'none'`). It draws no site navigation. Links that leave the page use `target=_top`.
+4. Do not edit `config/console.conf`; admin-console adds the builds block. Land before 14:30.
