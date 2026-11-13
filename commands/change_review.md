@@ -132,8 +132,13 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 When the user asks to review changes, follow [Bare command](#bare-command).
 
-The page has Questions, Changes, and Rebuilds tabs with waiting counts.
-Questions and Changes show **Showrunner** before their staff-based tabs and show one card at a time.
+The page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
+The selected tab joins the content panel and has an accent line on its top edge.
+Use the arrow keys, Home, and End to select a tab.
+Questions and Changes show one card at a time.
+The compact **Showrunner:** menu starts with **All (n)**, then lists each showrunner with its waiting count.
+All is the default and includes every showrunner in the existing item order.
+The URL retains the selected type, filter, and card across page loads and automatic updates.
 Each type tab shows its own count. The page has no combined total.
 The page updates itself without a full reload through its existing GET URL.
 `page_refresh_seconds` starts at 15 seconds and permits 5 to 300 seconds.
@@ -144,9 +149,9 @@ Replacement continues when all unsaved fields are empty or the save ends.
 After a successful save, the page requests a fresh update to exclude older responses.
 A failed load changes nothing; the next interval tries again.
 The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
-An empty showrunner tab shows `No questions for this showrunner.` or `No changes for this showrunner.`
+An empty showrunner filter shows `No questions for this showrunner.` or `No changes for this showrunner.`
 An empty type shows `No questions to answer.` or `No changes to review.`
-The selected showrunner tab supplies the count; the card has no separate remaining count.
+The selected showrunner filter supplies the count; the card has no separate remaining count.
 A question stays with the showrunner whose question list holds it.
 An unknown question owner appears under **Owner unavailable**.
 Owned question cards show the title before the filed text, choices, and `Asked by <session>`.
@@ -154,7 +159,7 @@ They omit the separate Question label and keep `Answer` and `Save answer`.
 An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
 Save answer records the answer and opens the next waiting question.
 Skip for now skips a question without saving.
-It hides when no other item waits in the selected showrunner tab.
+It hides when no other item waits in the selected showrunner filter.
 Questions have no Ask showrunner to check or Ask a question controls.
 A stale question refuses an answer if another session already answered it.
 Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
@@ -172,26 +177,28 @@ Unknown staff IDs appear as `Unknown session: <id>`.
 The Mac block states that updates can take five minutes while the Mac is reachable.
 The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
-Rebuilds has no showrunner tabs, card navigation, Skip for now, or answer form.
+Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
 One closed Details disclosure holds the ID, date, commit, and kind, with 16px space after the title.
 How to check or Proof stays in the main view.
-Works and Does not work are the main actions; Ask showrunner to check and Ask a question are secondary actions.
+Works and Does not work are the main actions.
+Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
 The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
 Reviewed rows keep the production name recorded at the verdict.
 Renames and transfers do not rewrite these cells.
-The **Owner unavailable** tab shows an unknown id or a broken staff parent chain.
+The **Owner unavailable** option shows an unknown id or a broken staff parent chain.
 Verdicts save without sending a message.
-This tab offers no question control, and the server refuses question submissions without saving.
+These rows hide all showrunner actions, including Send feedback.
+The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
-Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
-The selected tab draws its full outline inside its edges, including the first and last tabs.
+Menu options with waiting changes precede empty options in alphabetical order.
+Keyboard focus keeps its visible outline.
 Answers save in the background.
-Each successful save opens the next waiting change in the same tab.
+Each successful save opens the next waiting change in the same filter.
 Navigation during a save prevents this automatic change.
 Skip for now skips a change without saving an answer.
 A failed HTTP save keeps the typed text, answer form, and waiting count, and shows `Not saved: <reason>`.
@@ -201,11 +208,15 @@ Manual navigation clears this notice.
 A direct link to a saved verdict shows **Saved: <answer>**.
 Ask showrunner to check removes the row from every waiting count and Skip for now order when the request saves.
 A direct link shows **The showrunner will validate this** without answer buttons.
-Ask a question uses the **Comment or question** field.
+Ask a question uses the **Comment, question or feedback** field.
 It removes the row from every waiting count until the showrunner answers.
 A direct link shows **The showrunner will answer this** without answer buttons.
-The page has no Send feedback control.
-Works and Does not work save the text from **Comment or question** as their comment.
+Send feedback asks the showrunner to act on the text.
+Open feedback removes the row from every waiting count until the showrunner records its action.
+A direct link shows **The showrunner will act on this** without answer buttons.
+The recorded note shows **Showrunner: <note>**, and the row returns to the count.
+Feedback uses the existing question delivery record, retry budget, and startup recovery.
+Works and Does not work save the text from **Comment, question or feedback** as their comment.
 The server retains its verdict rules for text that starts with `works` or `fine`.
 The server manages delivery; the page shows no delivery notes, links, or resend controls.
 The server reads `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf` when delivery starts.
@@ -306,6 +317,19 @@ The answer and cells can hold several lines; lines that start with `- ` or `1. `
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
 The command refuses an old or unknown ID, a different answer, or a row without an open question.
+
+## Feedback
+
+1. Read the feedback and its `Feedback id` in the change review message.
+2. Complete the directed action.
+3. Record what you did with the feedback id:
+
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<what you did>"
+```
+
+The note returns the row to the user's waiting count.
+A verdict closes the row under the existing verdict rules.
 
 ## Never a question
 
