@@ -148,15 +148,22 @@ def _judgment_rule(component: Rule, path: str) -> Rule:
     return replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
 
 
+WORKSPACE_BUILD_INPUTS = frozenset({
+    "Cargo.toml", "Cargo.lock", ".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain",
+})
+
+
 def protected_ticket_files(files: frozenset[str], crates: tuple[str, ...]) -> frozenset[str]:
     """A ticket's edit paths and the build inputs those paths depend on."""
-    protected = {"Cargo.toml", "Cargo.lock", *files}
+    protected = {*WORKSPACE_BUILD_INPUTS, *files}
     for path in files:
-        if path in ("Cargo.toml", "Cargo.lock"):
+        if path in WORKSPACE_BUILD_INPUTS:
             continue
         crate = next((crate for crate in crates if crate == "." or path == crate or path.startswith(crate + "/")), "")
         if not crate:
-            raise LedgerError(f"unknown crate for {path}")
+            if path.endswith(".rs"):
+                raise LedgerError(f"unknown crate for {path}")
+            continue
         if path == crate:
             raise LedgerError(f"directory footprint cannot be proved for {path}")
         protected.update(str(PurePosixPath(crate) / name) for name in ("Cargo.toml", "build.rs"))

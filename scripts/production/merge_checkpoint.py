@@ -1727,11 +1727,10 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         address = child_runner("address", request.child.name)
         if not address:
             raise Refusal(f"no address for {request.child.name}")
-        result = subprocess.run([
-            PYTHON, script, "--to", address, "--from", request.production.name,
+        result = subprocess.run(session_send.send_argv("--to", address, "--from", request.production.name,
             "--text", f"From the showrunner of {request.production.name}: hand-off {request.checkpoint[:7]} merged as {merge_head[:7]}.",
-            "--timeout", "10",
-        ], capture_output=True, text=True, check=False, timeout=15)
+            "--timeout", "10", send_script=Path(script), python_interpreter=PYTHON,
+        ), capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
             raise Refusal(f"send.py: {failure_detail(result)}")
     except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:

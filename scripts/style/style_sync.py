@@ -139,12 +139,11 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
-    sent = subprocess.run([
-        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", caller,
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
         "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
-        "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+        "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+    ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(sent.returncode, sent.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"sent", "skipped", "kept", "replaced"}:
@@ -516,11 +515,10 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     address = runner_value("address", parent)
     if not address:
         raise Refusal(f"no address for {parent}")
-    result = subprocess.run([
-        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+    result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
         "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
-        "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+        "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+    ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"queued", "kept"}:
@@ -603,11 +601,10 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 address = director_address(directors, unit)
                 name = next(production.name for production in productions
                             if unit in {assignment.unit for assignment in production.config.assignments})
-                result = subprocess.run([
-                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+                result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
                     "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
-                    "--timeout", str(SEND_SECONDS),
-                ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+                    "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+                ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
                     raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, style_ledger.LedgerError, subprocess.TimeoutExpired) as error:
