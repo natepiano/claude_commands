@@ -89,6 +89,40 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                 self.assert_resources_released()
                 self.assert_no_cache_verdict()
 
+    def test_reaping_waits_for_cleanup_before_delivering_the_saved_status(self) -> None:
+        self.pause_state_move()
+        release = self.control / "cleanup-release"
+        self.addCleanup(release.touch)
+        process = self.start_supervised_verify("lint", TEST_BLOCK_STAGE="mend")
+        self.wait_for_running(self.control / "running", process)
+        self.assert_resources_held()
+        _ = (self.control / "cleanup-armed").touch()
+        send_process_group(process.pid, signal.SIGTERM)
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5)
+        path = self.control / "lint-run.json"
+        with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
+              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual(pending["status"], "running")
+            self.assertNotIn("exit_code", pending)
+            delivery.assert_not_called()
+            _ = release.touch()
+            self.wait_for_group_exit(process.pid, timeout=5)
+            self.assert_resources_released()
+            self.assert_no_cache_verdict()
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
+            finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+            delivery.assert_called_once()
+            delivered = cast(detached_runs.CompletedCommand, delivery.call_args.args[1])
+            self.assertEqual(delivered.code, 143)
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            delivery.assert_called_once()
+
     def pause_state_move(self, *, after_first_natedev: bool = False) -> None:
         move = self.root / "stubs/mv"
         real_move = shutil.which("mv")

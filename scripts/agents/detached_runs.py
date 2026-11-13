@@ -36,7 +36,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -81,6 +81,8 @@ class RunRecord(TypedDict):
     log: str
     started_at: float
     pid: int
+    command_pid: NotRequired[int]
+    command_started: NotRequired[str]
     director_dir: str
     done_message_file: str
     # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
@@ -226,25 +228,38 @@ def _number(value: object, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+def _group_is_live(group: int) -> bool:
+    """Keep the run pending while its group has live processes or cannot be read."""
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
+                                capture_output=True, text=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return True
+        if int(fields[0]) == group and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
 def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
-    """A running record that no supervisor runs. A record with no pid yet is still starting for its
-    first minute: `start` writes the record before it spawns the supervisor."""
+    """Recover a running record after its supervisor and live group processes end."""
     if raw.get("status") != "running":
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        return not detached_run_process.supervises(pid, path)
+        return not detached_run_process.supervises(pid, path) and not _group_is_live(pid)
     started = _number(raw.get("started_at"), now)
     return now - started >= DETACHED_RUN_START_GRACE_SECS
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
-    """End each running record whose supervisor is gone, of one worker or of all, and return their run ids.
+    """Recover results after the supervisor and its live group processes end.
 
-    Its worker gets a FAIL result with no exit status, unless a newer run of the same command in
-    the same folder answers for it. On 2026-10-22 a unit stopped 23 queued runs by their process
-    group; a supervisor that dies that way delivers nothing, and its worker waited for a result
-    that never came. A claim file keeps two callers from delivering one result twice.
+    Deliver the saved command status when available.
+    A claim file prevents duplicate delivery.
     """
     runs = _runs_dir(session_dir)
     if not runs.is_dir():
@@ -643,16 +658,32 @@ def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
-    """Run the command in the supervisor's process group and return its status."""
+    """Publish the child identity before the command runs in the supervisor's group."""
+    # The shell keeps its PID across exec and waits for identity publication.
+    gate = 'read -r ready || exit 125; exec 0</dev/null; exec "$@"'
     try:
         with log.open("ab") as output:
-            child = subprocess.Popen(command, env=environment, process_group=os.getpgrp(),
-                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+            child = subprocess.Popen(["/bin/sh", "-c", gate, "detached-command", *command],
+                                     env=environment, process_group=os.getpgrp(),
+                                     stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
             _ = output.write(f"detached_runs: command did not start: {exc}\n")
         return 127
 
+    assert child.stdin is not None
+    with child.stdin:
+        started = process_start.process_start(child.pid)
+        if not isinstance(started, process_start.Started):
+            with log.open("a", encoding="utf-8") as output:
+                _ = output.write("detached_runs: command identity is unavailable; command did not start\n")
+        else:
+            path = Path(environment["UNIT_DETACHED_RECORD"])
+            with record_lock(path):
+                record = _read_record(path)
+                record.update(command_pid=child.pid, command_started=started.start)
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            _ = child.stdin.write(b"start\n")
     return _exit_status(child.wait())
 
 
@@ -706,11 +737,16 @@ def command_supervise(args: argparse.Namespace) -> int:
 def command_record_exit(args: argparse.Namespace) -> int:
     """Save the command status before its orphan record is completed."""
     path = Path(str(getattr(args, "record", "")))
-    record = _read_record(path)
-    if not detached_run_process.runs_command(os.getppid(), record["command"]):
-        return 0
-    record["exit_code"] = int(getattr(args, "exit_code", 0))
-    _ = _write_record(path, record)
+    caller = os.getppid()
+    with record_lock(path):
+        record = _read_record(path)
+        if record["status"] != "running" or record.get("command_pid") != caller:
+            return 0
+        started = process_start.process_start(caller)
+        if not isinstance(started, process_start.Started) or started.start != record.get("command_started"):
+            return 0
+        record["exit_code"] = int(getattr(args, "exit_code", 0))
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
     return 0
 
 
