@@ -118,7 +118,12 @@ def next_sitecustomize(filename: str, search: list[str] | None = None) -> None:
             remaining.append(entry)
     spec = PathFinder.find_spec("sitecustomize", remaining)
     if spec is not None and spec.loader is not None:
+        from typing import cast
+
         module = module_from_spec(spec)
+        # Keep hook contexts active for the process lifetime.
+        hooks = cast(list[ModuleType], sys.modules["_devtools_checkout"].__dict__.setdefault("startup_hooks", []))
+        hooks.append(module)
         spec.loader.exec_module(module)
 
 

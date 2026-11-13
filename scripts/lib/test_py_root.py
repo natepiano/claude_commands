@@ -31,7 +31,7 @@ def audit():
 '''
 COPY_IMPORT_TEST = COPY_IMPORT_AUDIT + '''
 import unittest
-from scripts.build_targets import test_aws_status
+from scripts.build_targets import test_targets
 from scripts.mac_test import test_cargo_manifest
 
 class CopyImportsTests(unittest.TestCase):
@@ -268,6 +268,13 @@ class PythonRootTests(unittest.TestCase):
                 "with fake_cargo_output_roots(children=True):\n"
                 "    subprocess.run([sys.executable, '-c', sys.argv[1]], cwd=sys.argv[2], check=True)\n"
             )
+            cargo_probe = (
+                "import gc; gc.collect()\n"
+                + "from unittest.mock import Mock\n"
+                + "from scripts.lib import cargo_output\n"
+                + "assert isinstance(cargo_output.read_cargo_output_roots, Mock), 'Cargo hook released its mock'\n"
+                + probe
+            )
             environment = {**os.environ, "PYTHONPATH": "", "XDG_CACHE_HOME": str(base / "cache"),
                            "CONF_DIR": str(child / "config")}
             coverage = str(parent / "scripts/test_times/coverage_child")
@@ -275,7 +282,7 @@ class PythonRootTests(unittest.TestCase):
                 ("coverage command", ["-c", probe], coverage),
                 ("coverage module", ["-m", "scripts.startup_probe"], coverage),
                 ("repeat budget", ["-c", repeat, str(child), probe], ""),
-                ("Cargo output", ["-c", cargo, probe, str(child)], ""),
+                ("Cargo output", ["-c", cargo, cargo_probe, str(child)], ""),
             )
             for label, arguments, pythonpath in cases:
                 with self.subTest(hook=label):
