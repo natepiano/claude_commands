@@ -446,7 +446,7 @@ ENTRIES = (
     # sender from the session's own name; a script with no session record names itself with --from.
     # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.
     PushText("quota.paid_credits", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
         "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
         + "Turn off: work moves to Claude until {next_reset}.",
@@ -458,7 +458,7 @@ ENTRIES = (
     # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
     # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.
     PushText("quota.paid_credits_queued", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
         "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
         + "Leave on (recommended): workers spend these credits until your queued move runs. "
         + "If the credits run out first, workers wait.\n\n"

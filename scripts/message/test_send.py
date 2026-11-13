@@ -4852,7 +4852,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
         self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -4878,7 +4878,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
         self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -4895,7 +4895,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
-                                    ("Codex workers", "They spend credits now.", "Set use_credits: off in codex2.md"),
+                                    ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
             with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):

@@ -133,7 +133,7 @@ Missing readings are null.
 Reset and read times are ISO 8601 UTC strings.
 Credits are a number, `"unlimited"`, or null.
 Claude has null credits and `use_credits: false`.
-Codex `use_credits` is true unless its note says `use_credits: off`.
+Codex `use_credits` is true only when `codex_credit_accounts` in `config/accounts.conf` names the account.
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
@@ -575,7 +575,7 @@ Unknown or expired usage needs a fresh reading.
 
 A workers next entry blocks provider-refusal and credits-off fallback moves.
 Without a workers entry, a provider quota refusal moves workers to the selected Codex account with room.
-Low quota above zero changes nothing; weekly zero with `use_credits: off` also requests a move.
+Low quota above zero changes nothing; weekly zero on an account that may not spend credits also requests a move.
 A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice.
 An unknown window or reset, a passed reset, or exactly 20 minutes remaining causes a move.
 The selected home becomes the `workers` role through the `swap workers` path.
@@ -590,7 +590,7 @@ A worker refusal does not keep the group request open.
 The next assign moves a refused or stopped worker to the selected account, so a lasting anomaly cannot cause endless group retries.
 One detached unit handles all targets without overlapping moves.
 Direct Codex worker moves use the same runner and read the selected role before each worker.
-A Codex worker move skips a target whose note says `use_credits: off` and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
+A Codex worker move skips a target that may not spend credits and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
 Claude worker moves use the same run lock and retain the requested Claude label.
 It reads the selected role before each worker and checks it again before it ends.
 A role change causes another pass over workers that need the new account.
@@ -756,7 +756,7 @@ Legacy stored `default` values read as numbers on their next normal write.
 Historical move entries use evidence recorded at the time, or show `home account unresolved`.
 Setup creates `~/.codexN` when no home holds that account.
 
-Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values mean on. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
+`codex_credit_accounts` in `config/accounts.conf` names the Codex accounts that may spend paid credits. Every other Codex account is off. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
 
 Account notes use numbered filenames such as `claude1.md` and `codex2.md`.
 Each note has a `role` list and a `sessions` count from the current roster.

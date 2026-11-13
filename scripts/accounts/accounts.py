@@ -3111,7 +3111,7 @@ class TargetCanWork:
 
 @dataclass(frozen=True)
 class CreditsOffTarget:
-    """The target has use_credits off and no included usage left."""
+    """The target may not spend credits and has no included usage left."""
 
     reason: str
 
@@ -3129,7 +3129,7 @@ def _codex_target_credit_block(label: str, now: datetime) -> TargetCanWork | Cre
         return TargetCanWork()
     if _codex_reading_can_work(FreshReading(reading.weekly, reading.five_hour, "0"), now, agent_accounts.CreditsOff()):
         return TargetCanWork()
-    return CreditsOffTarget(f"{label}: use_credits is off and its included usage is gone; the worker stays")
+    return CreditsOffTarget(f"{label}: it may not spend credits and its included usage is gone; the worker stays")
 
 
 @settings_report_scope()

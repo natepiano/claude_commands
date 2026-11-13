@@ -200,7 +200,7 @@ PAID_CREDITS_QUEUED_TEXT = "quota.paid_credits_queued"
 PAID_CREDITS_QUEUED_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user'
                             + ' --text-id quota.paid_credits_queued --value account=<account> --value machine=<machine>'
                             + ' --value credits=<paid credits left> --value "refill=<when its plan refills>"')
-PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\buse_credits\b", re.IGNORECASE)
+PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\bcodex_credit_accounts\b", re.IGNORECASE)
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)

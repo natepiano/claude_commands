@@ -506,8 +506,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.assertEqual(push.need, "decision")
         self.assertIsInstance(push.action, ActionRequired)
         assert isinstance(push.action, ActionRequired)
-        self.assertIn("use_credits: off", push.action.text)
-        self.assertIn("codex1.md", push.action.text)
+        self.assertIn("remove codex1 from codex_credit_accounts", push.action.text)
         self.assertIn("gate-fixture", push.action.text)
         self.assertIn("Its plan refills", push.body)
         self.assertIn("paid credits", push.title + push.body)
@@ -1033,11 +1032,9 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         assert request["kind"] == "requested"
         self.assertEqual(request.get("cause"), "credits off")
 
-    def test_zero_reads_the_selected_accounts_setting_and_invalid_values_log_once(self) -> None:
+    def test_zero_reads_the_selected_accounts_setting(self) -> None:
         _ = self.note(2, "off")
-        _ = self.note(1, "sometimes")
-        lines = self.alert()
-        self.assertEqual(lines.count("codex1: use_credits must be on or off; reading it as on"), 1)
+        _ = self.alert()
         self.swap.assert_not_called()
         self.assertIn("6,370", self.zero_pushes()[-1].body)
 
@@ -1117,19 +1114,6 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.relay.assert_not_called()
         with quota_alert.state_file() as state:
             self.assertNotIn("codex1", state.get("codex_zero", {}))
-
-    def test_zero_invalid_credit_setting_mid_episode_still_reads_as_on(self) -> None:
-        _ = self.alert()
-        _ = self.note(1, "invalid")
-        log = self.alert(self.now + timedelta(minutes=2))
-        self.assertEqual(log.count("codex1: use_credits must be on or off; reading it as on"), 1)
-        self.swap.assert_not_called()
-        self.history([(0, 6370), (60, 6370)])
-        _ = self.alert(self.now + timedelta(hours=1))
-        self.assertEqual(len(self.zero_pushes()), 2)
-        self.assertIn("forecast", self.zero_pushes()[-1].id)
-        with quota_alert.state_file() as state:
-            self.assertEqual(state.get("codex_zero", {})["codex1"]["credits"], "on")
 
     def test_zero_does_not_open_from_a_stale_selected_snapshot(self) -> None:
         readings = self.readings(self.now)
