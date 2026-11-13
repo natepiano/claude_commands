@@ -77,7 +77,7 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
    | done | `agents/test_shutdown_cli.py` (Phase 236, `f65598a5a`) | Retired and resume class snapshots, copied per test to fixed roots. | One fixture writer. | aws CPU 37.48 to 34.47 s; peak 226.1 to 225.4 MiB |
    | done | `agents/test_models_conf_publish.py` (Phase 238, `0a5f1f853`) | One class publication seed, copied per test to a fixed class root. | One fixture writer. | aws CPU 32.83 to 31.49 s; peak 104.2 to 104.4 MiB |
    | done | `buildlog/test_record.py` (Phase 237, `4f9a19c62`) | One class seed repository replaces `git init` and the empty commit in 84 tests. | One writer. | aws CPU 11.87 to 11.49 s; peak 136.6 to 135.5 MiB |
-   | done | Unit config fixture callers (Phase 239, `dc08e6574`) | One class baseline of formatted config bytes; real Taplo stays in format and publication tests. | One fixture writer. | aws CPU 29.99 to 28.57 s and 2.40 to 2.18 s; peak 155.5 to 159.4 and 76.6 to 76.8 MiB |
+   | done | Lifecycle unit configs (Phase 239, `dc08e6574` and repair) | The lifecycle class writes both unit configs once; the parked config cache was removed in review. | One fixture writer. | aws CPU 29.45 to 28.07 s; peak 160.9 to 156.9 MiB |
    | done | `production/test_ci_points.py` (Phase 241, `07a15ce4c`) | One class fixture, copied per test to a fixed root. | One fixture writer. | aws CPU 13.40 to 11.94 s; peak 165.2 to 152.2 MiB |
 
    Each trial needs an assertion map, the owner's go, unchanged test counts, paired peak memory and a measured aws gain. Seeds must keep private refs, indexes, origins and worktree links; tested fetches, commits, races and recovery stay real.

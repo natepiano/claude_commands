@@ -3616,9 +3616,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### As-built
 
-- `ParkedConfigBaseline` (`production/unit_config_test_support.py`) holds the immutable live and parked config bytes, one per class and repository format. Later `park_config` calls copy those bytes, keep equal files' modification times and keep the real Git exclusion checks. `production_lifecycle_test_support.py` writes the alpha and beta configs once before `running_snapshot`; `running()` copies them with the repository.
-- Fixture Taplo starts fell from 46 to 8 (unit config) and from 112 to 2 (lifecycle). Tests that check formatting or publication keep real Taplo. All 120 test bodies did not change.
-- aws paired trial, 3 rounds: `test_production_lifecycle` CPU 29.990 to 28.570 s, peak 155.5 to 159.4 MiB; `test_unit_config` 2.398 to 2.183 s, peak 76.6 to 76.8 MiB; `lib/test_git_exclude` unchanged. Checkpoint `dc08e6574`.
+- `production_lifecycle_test_support.py` writes the alpha and beta unit configs once before `running_snapshot`; `running()` copies them with the repository. Lifecycle fixture Taplo starts fell from 112 to 2. All 70 lifecycle test bodies did not change.
+- The repair (sdlc review) removed the `ParkedConfigBaseline` cache from `unit_config_test_support.py`: it copied the side effects of park by hand, so a change to park would leave the fixture wrong without an error. `park_config` runs real park again.
+- aws paired trial of the lifecycle part alone, 3 rounds: `test_production_lifecycle` CPU 29.450 to 28.069 s, peak 160.9 to 156.9 MiB; `test_unit_config` unchanged. Checkpoint `dc08e6574` and the repair checkpoint.
 
 ### Phase 240 — The message process fixture finds descendants without a host scan  · status: todo
 **Depends on:** none
