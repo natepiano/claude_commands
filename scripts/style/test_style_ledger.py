@@ -112,6 +112,31 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                 if name == "ambiguous":
                     self.assertIn("is ambiguous", refused.exception.stderr)
 
+        samples = ("", "one", "one\n", "one\r\ntwo\rthree\n", "first\u2028second\n", "one")
+        paths = tuple(f"line-count-{index}.txt" for index in range(len(samples)))
+        for path, text in zip(paths, samples):
+            self.write(path, text)
+        counted_tip = self.commit("Line counts")
+        with self.ledger() as ledger:
+            _ = ledger._tip(counted_tip)  # pyright: ignore[reportPrivateUsage]
+            with mock.patch.object(style_ledger, "blob_contents", wraps=style_ledger.blob_contents) as batch:
+                counts = ledger.line_counts(counted_tip, paths)
+                self.assertEqual(counts, {path: len(text.splitlines()) for path, text in zip(paths, samples)})
+                batch.assert_called_once()
+            with mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected Git process")):
+                self.assertEqual(ledger.line_counts(counted_tip, paths), counts)
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                stored = cast(tuple[int], connection.execute("SELECT COUNT(*) FROM refill_objects").fetchone())[0]
+                self.assertEqual(stored, len(set(samples)))
+        # Stored lengths survive a new ledger handle.
+        with self.ledger() as ledger:
+            self.assertEqual(ledger.line_counts(counted_tip, paths), counts)
+        self.write("invalid-lines.txt", "")
+        _ = (self.repo / "invalid-lines.txt").write_bytes(b"\xff")
+        invalid_tip = self.commit("Invalid source encoding")
+        with self.ledger() as ledger, self.assertRaises(UnicodeDecodeError):
+            _ = ledger.line_counts(invalid_tip, ("invalid-lines.txt",))
+
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")
         path = self.rule_dir / "metadata.md"
@@ -634,6 +659,26 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                          [(style_ledger.Filed(proposal), style_ledger.ReadByPerson("nate")),
                           (style_ledger.Filed(proposal), style_ledger.NotReadByPerson()),
                           (style_ledger.Built(proposal), style_ledger.ReadByPerson("ana"))])
+        expected = ledger.held_findings(style_ledger.AllHeldFindings())
+        with mock.patch.object(ledger, "_held", side_effect=AssertionError("bulk read used a point lookup")):
+            for selection in (style_ledger.AllHeldFindings(), style_ledger.HeldFindingsInState("filed"),
+                              style_ledger.HeldFindingsInState("built"), style_ledger.UnfiledFindingsFromOpenTickets()):
+                with self.subTest(selection=selection):
+                    queries: list[str] = []
+                    ledger_connection = ledger._connection  # pyright: ignore[reportPrivateUsage]
+                    ledger_connection.set_trace_callback(queries.append)
+                    try:
+                        observed = ledger.held_findings(selection)
+                    finally:
+                        ledger_connection.set_trace_callback(None)
+                    self.assertEqual(sum("FROM held_findings h LEFT JOIN" in query for query in queries), 1)
+                    if isinstance(selection, style_ledger.AllHeldFindings):
+                        self.assertEqual(observed, expected)
+                    elif isinstance(selection, style_ledger.HeldFindingsInState):
+                        expected_state = style_ledger.Filed if selection.state == "filed" else style_ledger.Built
+                        self.assertEqual(observed, tuple(finding for finding in expected if isinstance(finding.state, expected_state)))
+                    else:
+                        self.assertEqual(observed, ())
         shown = {not_applied: "filed again by nate: a person read the code", checked: "",
                  applied: "applied, read by ana: a person read the code"}
         listed = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--json").stdout))

@@ -179,8 +179,6 @@ class ReadFiles:
             raise LedgerError("--reads requires at least one file")
 
 
-
-
 class ChangedBeforeLock(LedgerError):
     """Rows a writer read before its write lock changed before it took the lock."""
 
@@ -919,7 +917,6 @@ def mapped_evidence_line(mapped: declarations.MappedSite) -> str:
 def outside_evidence_suffix(evidence: OutsideRenameNotProven) -> str:
     return ("; " + mapped_evidence_line(evidence.mapped)
             + f"; outside rename not proved: {', '.join(evidence.reasons)}")
-
 
 
 @dataclass(frozen=True)
@@ -2361,6 +2358,13 @@ MIGRATIONS = {
             PRIMARY KEY(finding_id, path)
         );
     """,
+    40: """
+        CREATE TABLE IF NOT EXISTS refill_objects (
+            object_store TEXT NOT NULL, object_id TEXT NOT NULL, reader_version INTEGER NOT NULL,
+            fact_kind TEXT NOT NULL, fact_key TEXT NOT NULL, line_count INTEGER NOT NULL,
+            PRIMARY KEY(object_store, object_id, reader_version, fact_kind, fact_key)
+        );
+    """,
 }
 
 
@@ -2479,11 +2483,31 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
     return found.row
 
 
+type HeldFindingRow = tuple[
+    str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName,
+    str, str, int, str, str, str, str, int, str, str, str, str,
+    str, str, int, str, str, str, str, int,
+]
+
+
+@dataclass
+class HeldFindingReads:
+    """The ordered finding rows observed between ledger writes."""
+
+    version: tuple[int, int, bool] = (-1, -1, False)
+    rows: tuple[HeldFindingRow, ...] = ()
+    findings: tuple[HeldFinding, ...] = ()
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
                  resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
+        self._finding_reads: list[HeldFindingReads] = []
+        self._refill_changes: int = 0
+        self._refill_object_store: str = ""
+        self._refill_available_blobs: set[str] = set()
         self._git_operation_depth: int = 0
         self.database: Path = database
         self.git_cache: GitReadCache | NoGitReadCache = git_cache
@@ -4621,14 +4645,42 @@ class Ledger:
             # Every return reads its row before the commit, so a write after the commit cannot change what it returns.
             return held_site(free[0])
 
+    def selection_version(self) -> tuple[int, int, bool]:
+        """Identify local writes, external commits, and transaction boundaries."""
+        return (cast(tuple[int], self._connection.execute("PRAGMA data_version").fetchone())[0],
+                self._connection.total_changes - self._refill_changes, self._connection.in_transaction)
+
+    @contextmanager
+    def finding_reads(self) -> Generator[None]:
+        """Share bulk finding rows within one selection observation."""
+        self._finding_reads.append(HeldFindingReads())
+        try:
+            yield
+        finally:
+            _ = self._finding_reads.pop()
+
+    def _held_rows(self, where: str = "", parameters: tuple[str, ...] = ()) -> tuple[HeldFindingRow, ...]:
+        """Read finding states, withdrawal reasons, and rename dispositions in one query."""
+        columns = ("finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,"
+                   "build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by,followed_from,"
+                   "followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by")
+        query = ("SELECT " + ",".join("h." + name for name in columns.split(","))
+                 + ",COALESCE(w.rule_blob,''),COALESCE(r.name,''),COALESCE(r.line,0),"
+                 + "COALESCE(r.text,''),COALESCE(r.kind,''),COALESCE(r.reason,''),COALESCE(t.state,''),"
+                 + "CASE WHEN w.finding_id IS NULL THEN 0 ELSE 1 END "
+                 + "FROM held_findings h LEFT JOIN rule_body_withdrawals w ON w.finding_id=h.finding_id "
+                 + "LEFT JOIN rename_dispositions r ON r.finding_id=h.finding_id "
+                 + "LEFT JOIN tickets t ON t.id=h.ticket " + where + " ORDER BY h.created_at,h.finding_id")
+        return tuple(cast(list[HeldFindingRow], self._connection.execute(query, parameters).fetchall()))
+
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str, str, str]], self._connection.execute(
-            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by,"
-            + "followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by FROM held_findings WHERE finding_id=?", (finding_id,),
-        ).fetchall())
+        rows = self._held_rows("WHERE h.finding_id=?", (finding_id,))
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
-        row = rows[0]
+        return self._held_from(rows[0])
+
+    def _held_from(self, row: HeldFindingRow) -> HeldFinding:
+        """Decode the same state for bulk reads and point reads."""
         state: HeldState
         match row[10]:
             case "filed":
@@ -4638,11 +4690,8 @@ class Ledger:
             case "built":
                 state = Built(Path(row[11]))
             case "withdrawn":
-                changed = cast(list[tuple[str]], self._connection.execute(
-                    "SELECT rule_blob FROM rule_body_withdrawals WHERE finding_id=?", (finding_id,),
-                ).fetchall())
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                                  RuleBodyChanged(changed[0][0]) if changed else
+                                  RuleBodyChanged(row[23]) if row[30] else
                                   DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
                                   else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
@@ -4659,15 +4708,18 @@ class Ledger:
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
                            ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo(),
                            FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor,
-                           self.rename_disposition(finding_id))
+                           self._rename_disposition(row[24:29]))
 
     def rename_disposition(self, finding_id: str) -> OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock:
         rows = cast(list[tuple[str, int, str, str, str]], self._connection.execute(
             "SELECT name,line,text,kind,reason FROM rename_dispositions WHERE finding_id=?", (finding_id,),
         ).fetchall())
-        if not rows:
+        return self._rename_disposition(rows[0] if rows else ("", 0, "", "", ""))
+
+    def _rename_disposition(self, row: tuple[str, int, str, str, str]) -> OuterBindingBlocked | OuterBindingUnproved | NoOuterBindingBlock:
+        name, line, text, kind, reason = row
+        if not kind:
             return NoOuterBindingBlock()
-        name, line, text, kind, reason = rows[0]
         if kind == "unproved":
             return OuterBindingUnproved(reason, line, text)
         return OuterBindingBlocked(f"rename blocked by outer binding {name!r} at line {line}", name, line, text)
@@ -4746,20 +4798,64 @@ class Ledger:
         return NoJudgedCommit()
 
     def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
-        if isinstance(selection, UnfiledFindingsFromOpenTickets):
-            query = self._connection.execute(
-                "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.ticket "
-                + "WHERE h.state='unfiled' AND t.state IN ('assigned','checkpointed') "
-                + "ORDER BY h.created_at,h.finding_id",
-            )
-        elif isinstance(selection, HeldFindingsInState):
-            query = self._connection.execute(
-                "SELECT finding_id FROM held_findings WHERE state=? ORDER BY created_at,finding_id", (selection.state,),
-            )
+        if self._finding_reads:
+            stage = self._finding_reads[-1]
+            version = self.selection_version()
+            if stage.version != version:
+                stage.rows = self._held_rows()
+                stage.findings = tuple(self._held_from(row) for row in stage.rows)
+                stage.version = version
+            rows = stage.rows
         else:
-            query = self._connection.execute("SELECT finding_id FROM held_findings ORDER BY created_at,finding_id")
-        rows = cast(list[tuple[str]], query.fetchall())
-        return tuple(self._held(row[0]) for row in rows)
+            where = ("WHERE h.state='unfiled' AND t.state IN ('assigned','checkpointed')"
+                     if isinstance(selection, UnfiledFindingsFromOpenTickets)
+                     else "WHERE h.state=?" if isinstance(selection, HeldFindingsInState) else "")
+            parameters = (selection.state,) if isinstance(selection, HeldFindingsInState) else ()
+            return tuple(self._held_from(row) for row in self._held_rows(where, parameters))
+        return tuple(finding for row, finding in zip(rows, stage.findings)
+                     if (not isinstance(selection, HeldFindingsInState) or row[10] == selection.state)
+                     and (not isinstance(selection, UnfiledFindingsFromOpenTickets)
+                          or (row[10] == "unfiled" and row[29] in ("assigned", "checkpointed"))))
+
+    def line_counts(self, commit: str, paths: tuple[str, ...]) -> dict[str, int]:
+        """Store strict UTF-8 splitlines counts by immutable blob identity."""
+        if not paths:
+            return {}
+        tip = self._tip(commit)
+        blobs = {path: tip.blobs[path] for path in paths if path in tip.blobs}
+        if not self._refill_object_store:
+            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        store = self._refill_object_store
+        counts: dict[str, int] = {}
+        unread: dict[str, str] = {}
+        for blob in dict.fromkeys(blobs.values()):
+            row = cast(tuple[int] | None, self._connection.execute(
+                "SELECT line_count FROM refill_objects WHERE object_store=? AND object_id=? "
+                + "AND reader_version=1 AND fact_kind='line_count' AND fact_key=''",
+                (store, blob)).fetchone())
+            if row is None:
+                unread[blob] = blob
+            else:
+                counts[blob] = row[0]
+        required = {blob: blob for blob in blobs.values() if blob not in self._refill_available_blobs or blob in unread}
+        for blob, content in blob_contents(self.repo, required) if required else ():
+            if blob in unread:
+                counts[blob] = len(content.decode().replace("\r\n", "\n").replace("\r", "\n").splitlines())
+            self._refill_available_blobs.add(blob)
+        if unread:
+            transaction = self._connection.in_transaction
+            before = self._connection.total_changes
+            _ = self._connection.executemany(
+                "INSERT OR IGNORE INTO refill_objects VALUES (?,?,1,'line_count','',?)",
+                ((store, blob, counts[blob]) for blob in unread))
+            self._refill_changes += self._connection.total_changes - before
+            if not transaction:
+                self._connection.commit()
+        result = {path: counts[blob] for path, blob in blobs.items()}
+        for path in paths:
+            if path not in result:
+                result[path] = len(_git_bytes(self.repo, "show", f"{commit}:{path}").stdout.decode().splitlines())
+        return result
 
     def _cell_finding_states(self, rule: str, path: str, commit: str) -> tuple[tuple[str, HeldStateName], ...]:
         """Map each finding to its rule cell without loading unrelated finding evidence."""
@@ -7845,7 +7941,6 @@ class Ledger:
                     continue
                 counts = [str(count) for count in (row.current, row.stale, row.open, row.awaiting_merge, row.held)]
                 print("\t".join([row.rule_id, *counts, str(complete[row.rule_id]).lower()]))
-
 
 
 @dataclass(frozen=True)
