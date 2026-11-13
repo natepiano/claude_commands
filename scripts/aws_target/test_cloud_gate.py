@@ -574,6 +574,17 @@ class CloudGateTests(CostFixture):
         self.assertEqual(self.execute()['status'], 'complete')
         self.assertEqual(self.fake.launches[-1]['InstanceType'], 'm7a.4xlarge')
 
+    def test_type_outside_the_deployed_stack_is_skipped(self) -> None:
+        self.deployment['instance_types'] = ['m7a.4xlarge']
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual({launch['InstanceType'] for launch in self.fake.launches}, {'m7a.4xlarge'})
+
+    def test_stack_without_a_configured_type_falls_back_before_launch(self) -> None:
+        self.deployment['instance_types'] = ['c7a.4xlarge']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.fake.launches, [])
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+
     def test_expired_pending_sweep_searches_both_regions(self) -> None:
         path = self.root / 'cloud_gate.conf'
         _ = path.write_text(re.sub(r'(?m)^(regions|spot_candidate_regions)=.*$',

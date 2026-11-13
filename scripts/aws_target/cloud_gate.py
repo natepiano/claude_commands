@@ -562,6 +562,16 @@ class GateWorker:
             self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
+        if 'instance_types' in deployment:
+            # The stack policy allows only the types of the last deploy.py up.
+            deployed = cast(list[str], deployment['instance_types'])
+            missing = [size for size in sizes if size not in deployed]
+            if missing:
+                print(f'Cloud gate skips {" ".join(missing)}: the stack does not allow it. Run deploy.py up.', flush=True)
+            sizes = [size for size in sizes if size in deployed]
+            if not sizes and not path.exists():
+                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                return LocalFallback('The stack allows no configured gate type; run deploy.py up')
         variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
                     for regional in ledger.rows(deployment, 'regions') for size in sizes for row in ledger.rows(regional, 'subnets')]
         if not path.exists():
