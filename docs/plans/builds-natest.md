@@ -3584,7 +3584,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `ImmutableGitSeed.copy_to` (`production/cli_fixture.py`) raises `ValueError` when the config does not hold the seed origin text, so an escaped path never leaves a copy that points at the seed. Its 11 caller modules (470 tests) pass. All 120 test bodies and 602 assertion expressions did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: CPU 30.596 to 26.526 s; peak 119.8 to 119.2 MiB. Checkpoint `3ff00e6ad`.
 
-### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: todo
+### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: done
 **Depends on:** Phase 234
 
 #### Work Order

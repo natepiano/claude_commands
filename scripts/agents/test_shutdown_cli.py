@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from functools import cached_property
 from enum import Enum
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import cast, final, override
+from typing import ClassVar, cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
@@ -210,7 +211,56 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(delegated.call_count, 1)
 
 
-class RetireUnitTests(unittest.TestCase):
+class ShutdownRepositoryFixture(unittest.TestCase):
+    repository_root: ClassVar[Path]
+    repository_snapshot: ClassVar[Path]
+    snapshot_available: ClassVar[bool] = False
+    root: Path = Path()
+    checkout: Path = Path()
+    worktree: Path = Path()
+    doc: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        folder = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="shutdown-repository-"))
+        cls.repository_root = Path(folder).resolve() / "case"
+        cls.repository_snapshot = cls.repository_root.with_name("snapshot")
+        cls.repository_root.mkdir()
+        builder = cls()
+        builder.root = cls.repository_root
+        with mock.patch.dict(os.environ, {"HOME": str(builder.root)}):
+            builder.build_repository()
+        _ = shutil.copytree(cls.repository_root, cls.repository_snapshot)
+        shutil.rmtree(cls.repository_root)
+        cls.snapshot_available = True
+        cls.addClassCleanup(setattr, cls, "snapshot_available", False)
+
+    def bind_repository(self) -> None:
+        self.checkout = self.root / "checkout"
+        self.worktree = self.root / "alpha-wt"
+        self.doc = self.checkout / "alpha-production.md"
+
+    def restore_repository(self) -> None:
+        cls = type(self)
+        if cls.snapshot_available:
+            cls.snapshot_available = False
+            self.addCleanup(setattr, cls, "snapshot_available", True)
+            self.root = cls.repository_root
+            self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+            _ = shutil.copytree(cls.repository_snapshot, self.root)
+            self.bind_repository()
+        else:
+            # Nested fixtures need separate roots to preserve the outer repository.
+            self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+            with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+                self.build_repository()
+
+    def build_repository(self) -> None:
+        raise NotImplementedError
+
+
+class RetireUnitTests(ShutdownRepositoryFixture):
     @cached_property
     def pane_world(self) -> PaneWorld:
         return PaneWorld()
@@ -541,16 +591,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
 
     @override
-    def setUp(self) -> None:
-        _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.staff = StaffTestCase()
-        self.staff.setUp()
-        self.addCleanup(self.staff.doCleanups)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = self.limits()
-        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+    def build_repository(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"
@@ -576,6 +617,17 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge alpha", "alpha-branch")
 
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        self.restore_repository()
+        _ = self.limits()
+        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
@@ -1272,7 +1324,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(copies.remote_record_path(mirror).exists())
 
 @final
-class ResumeUnitTests(unittest.TestCase):
+class ResumeUnitTests(ShutdownRepositoryFixture):
     def test_retired_resume_passes_the_selected_account_to_the_launcher(self) -> None:
         code, output = self.resume("--to", "claude3")
         self.assertEqual(code, 0, output)
@@ -1391,14 +1443,7 @@ class ResumeUnitTests(unittest.TestCase):
 
 
     @override
-    def setUp(self) -> None:
-        self.staff = StaffTestCase()
-        self.staff.setUp()
-        self.addCleanup(self.staff.doCleanups)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        for name in ("shutdown", "production", "direct"):
-            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+    def build_repository(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"
@@ -1413,6 +1458,16 @@ class ResumeUnitTests(unittest.TestCase):
         _ = git(self.checkout, "add", "-A")
         _ = git(self.checkout, "commit", "-q", "-m", "production")
         _ = git(self.checkout, "push", "-q", "origin", "main")
+
+    @override
+    def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        self.restore_repository()
+        for name in ("shutdown", "production", "direct"):
+            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
         self.configs = [self.root / "claude1", self.root / "claude2"]
         self.transcript(self.configs[0])
