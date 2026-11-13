@@ -621,8 +621,9 @@ For each distinct user-visible result:
    from checkpoint <checkpoint-sha>."`, `--production <showrunner name>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
    several results, pass `--separate-result` for every row. A row on hana's
-   list is the bare `C<n>`; a row on any other list names its showrunner,
-   `<showrunner>/C<n>` (`natedev/C3`).
+   list uses the bare `C<n>` as its feature-log ID.
+   Other feature-log IDs retain the list name, such as `natedev/C3`.
+   The displayed review ID names the responsible showrunner and can differ from the feature-log ID.
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -660,9 +661,9 @@ returns it to its unit.
 1. **Feature log.** Use only `ProjectSpec.closes_by_change_review` in
    `scripts/feature_log/feature_log.py` to select projects, such as Hana and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
-   review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
-   other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
-   is named for (`natedev/C3`).
+   feature-log review ID remains bare `C<n>` on hana's list.
+   Other lists retain `<list>/C<n>`, using the list filename's showrunner, such as `natedev/C3`.
+   Use that stored ID even when the page displays a different responsible showrunner.
    A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Correct wrong
