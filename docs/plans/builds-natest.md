@@ -3838,31 +3838,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Depends on:** Phase 257
 **Owner:** report unit; builds gave the go 2026-11-13 (no open change to the file).
 
-#### Work Order
+#### As-built
 
-**Goal:** `lint/test_sweep.py` uses less CPU in aws pairs, through folded and removed tests; every behavior check stays.
+Checkpoint 6d2acbfb9. Only `scripts/lint/test_sweep.py` changed; no test is removed or folded.
 
-**Decision:** count phase. The prize is aws CPU (user 2026-11-13): fold or remove a test only where it cuts setup or run CPU. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. Director 2026-11-13: the accounts module costs only 14.9 CPU s for 488 tests (30 ms each), so it moved out. `lint/test_sweep.py` is the top untouched module with many tests: rank 20, 32.9 median CPU s, 348 tests.
-
-**Spec:**
-1. List groups of tests with the same setup and the same result under test. Fold each group into one table test with `subTest`, one row for each old check. Keep each old assertion as a row assertion.
-2. Run `python3 scripts/test_times/coverage_overlap.py scripts/lint test_sweep.py`. Remove a candidate only when its covering test checks the same result. Name the covering test for each removal in the commit body.
-3. Do not fold tests whose setup or failure message differs in a way a row cannot express. Keep a test that checks a process boundary, a signal or a wait.
-4. Map each old test to its row or covering test in `phases/258/count_map.md`.
-5. Run the module three times and basedpyright. Report the test count and `module_cost.py` CPU before and after.
-
-**Files:**
-- `scripts/lint/test_sweep.py`
-
-**Workers:** 1 writer; one test module. No-worker mode: the director writes it.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere. Phase 252: bind private run roots with `bind_private_run_roots`.
-- sdlc count-phase terms: every behavior check stays; name each covering test; builds decides the order.
-
-**Acceptance gate:**
-- aws pairs (3 rounds) show a CPU gain; peak memory reported.
-- Every old check maps to a row or a named covering test.
-- The module passes three times; basedpyright 0 errors and 0 warnings.
-
+- `write()` allocates fixture file blocks with `posix_fallocate` on Linux, not random bytes. The sweep reads only `st_size` and `st_blocks`. Other platforms keep the random-byte write. The crossing recommendation test went from 12.7 to 0.3 local CPU s.
+- `skip_host_ci_targets` points `sweep_ci_targets` at a missing folder. `SweepCase.setUp` calls it, and the claim subtest calls it again after `local_remote_transport`. On natedev, floor tests had walked the real CI folders (about 730,000 entries).
+- Local module CPU: 40.1 s before, 13.2–13.9 s after. AWS pair (c7a.8xlarge, 3 rounds): median 15.88 → 10.95 CPU s.
