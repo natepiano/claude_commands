@@ -11,12 +11,15 @@ import sys
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast
+from unittest.mock import patch
 
+from scripts.agents import detached_runs
 from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.production import staff
 
 
 class CompletedLintRun(TypedDict):
@@ -44,11 +47,11 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             output, errors = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             self.fail("lint kept a verify process after its group received SIGTERM")
-        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        self.wait_for_group_exit(process.pid, timeout=5)
         record = cast(CompletedLintRun, json.loads((self.control / "lint-run.json").read_text()))
         log = (self.control / "lint-run.log").read_text()
         self.assertEqual(record["exit_code"], 143, log)
-        self.wait_for_group_exit(process.pid, timeout=5)
         for group in self.started_groups:
             self.assertEqual(self.live_group_processes(group), [], "lint kept a verify process")
         with self.admission.loop_turn():
@@ -59,6 +62,14 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assert_no_cache_verdict()
+        with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
+              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
+            finished = cast(detached_runs.RunRecord, json.loads((self.control / "lint-run.json").read_text()))
+            self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            delivery.assert_called_once()
 
     def test_group_term_stops_lint_and_releases_admission(self) -> None:
         for stage in ("mend", "clippy"):

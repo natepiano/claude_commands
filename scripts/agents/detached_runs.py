@@ -703,6 +703,17 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_record_exit(args: argparse.Namespace) -> int:
+    """Save the command status before its orphan record is completed."""
+    path = Path(str(getattr(args, "record", "")))
+    record = _read_record(path)
+    if not detached_run_process.runs_command(os.getppid(), record["command"]):
+        return 0
+    record["exit_code"] = int(getattr(args, "exit_code", 0))
+    _ = _write_record(path, record)
+    return 0
+
+
 def command_reap(args: argparse.Namespace) -> int:
     for run_id in reap_orphans(str(getattr(args, "session_dir", "")), str(getattr(args, "worker", "") or "")):
         print(f"run {run_id} ended: its supervisor is gone")
@@ -723,6 +734,10 @@ def main(argv: list[str] | None = None) -> int:
     supervise = verbs.add_parser("supervise", help="run one recorded command and deliver its result")
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
+    record_exit = verbs.add_parser("record-exit", help="save a command status without completing its run")
+    _ = record_exit.add_argument("record")
+    _ = record_exit.add_argument("exit_code", type=int, choices=range(256))
+    record_exit.set_defaults(handler=command_record_exit)
     delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)

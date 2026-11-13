@@ -813,6 +813,26 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
 
+    def test_record_exit_keeps_the_run_pending_until_orphan_reaping(self) -> None:
+        path = self.record(["bash", "verify.sh", "lint", "sample"])
+        self.update_record(path, pid=DEAD_PID, stop_reason="fixture group stop")
+        with patch.object(detached_run_process, "runs_command", return_value=False):
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
+        self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(path.read_text())))
+        with patch.object(detached_run_process, "runs_command", return_value=True) as matches:
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
+        matches.assert_called_once_with(os.getppid(), ["bash", "verify.sh", "lint", "sample"])
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["status"], record.get("exit_code"), record.get("stop_reason")),
+                         ("running", 143, "fixture group stop"))
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        self.assertEqual(json.loads(path.read_text())["status"], "finished")
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("FAIL (exit 143)", messages[0])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])
         record = self.supervise(path)
