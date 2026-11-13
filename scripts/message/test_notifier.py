@@ -70,28 +70,16 @@ class NotifierTests(unittest.TestCase):
         launcher_dir = self.root / "launcher-bin"
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
-        monitor = """import os
-import subprocess
-import sys
-from pathlib import Path
-code = 127
-try:
-    code = subprocess.run(sys.argv[2:], check=False).returncode
-finally:
-    Path(sys.argv[1], 'run-exit-' + str(os.getpid())).write_text(str(code))
-"""
+        # The caller installs the inherited ownership marker before launch.
+        # setsid runs the monitor shell in this background child, so $! and the monitor's $$ are one pid.
         _ = launcher.write_text(
             "\n".join((
-                "#!/usr/bin/env python3",
-                "import subprocess, os",
-                "from pathlib import Path",
-                "import sys",
-                "# The caller installs the inherited ownership marker before launch.",
-                f"monitor = {monitor!r}",
-                f"child = subprocess.Popen([sys.executable, '-c', monitor, {str(self.root)!r}, *sys.argv[sys.argv.index('--') + 1:]], "
-                + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-                + "stderr=subprocess.DEVNULL, start_new_session=True)",
-                f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
+                "#!/bin/sh",
+                'while [ "$1" != -- ]; do shift; done',
+                "shift",
+                """setsid /bin/sh -c '"$@"; code=$?; printf %s "$code" > "$0/run-exit-$$"' """
+                + f'{shlex.quote(str(self.root))} "$@" </dev/null >/dev/null 2>&1 &',
+                f'printf "%s\\n" "$!" >> {shlex.quote(str(self.launch_pids))}',
             )) + "\n"
         )
         launcher.chmod(0o755)
@@ -153,14 +141,13 @@ finally:
         pending.mkdir()
         launched = self.root / "drain.argv"
         launcher = self.launcher_dir / "systemd-run"
-        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
-            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        _ = launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(launched))}\n')
         config = self.root / "selected.conf"
         with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
                                          "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
             _ = self.successful("tick")
             _ = self.successful("tick")
-        arguments = cast(list[str], json.loads(launched.read_text()))
+        arguments = launched.read_text().splitlines()
         self.assertIn("--no-block", arguments)
         self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
         self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
@@ -740,46 +727,36 @@ finally:
         """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
         launcher = self.launcher_dir / "launchctl"
         _ = launcher.write_text(
-            """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import time
-
-state = Path(os.environ["FAKE_LAUNCHCTL_STATE"])
-action = sys.argv[1]
-if action == "submit":
-    label = sys.argv[sys.argv.index("-l") + 1]
-    (state / "submitted").write_text(label)
-    (state / f"{label}.command").write_text(json.dumps(sys.argv[sys.argv.index("--") + 1:]))
-elif action == "kickstart":
-    target = sys.argv[2]
-    (state / "kickstarted").write_text(target)
-    kickstart_rc = int(os.environ["FAKE_LAUNCHCTL_KICKSTART_RC"])
-    if kickstart_rc:
-        sys.exit(kickstart_rc)
-    label = target.split("/", 2)[2]
-    command = json.loads((state / f"{label}.command").read_text())
-    job = subprocess.Popen(
-        [sys.executable, __file__, "loop", label, *command],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    (state / "pid.tmp").write_text(str(job.pid))
-    os.replace(state / "pid.tmp", state / "pid")
-elif action == "loop":
-    label = sys.argv[2]
-    removed = state / f"{label}.removed"
-    while not removed.exists():
-        subprocess.run(sys.argv[3:], check=False)
-        time.sleep(0.05)
-elif action == "remove":
-    label = sys.argv[2]
-    fire_log = Path(os.environ["FAKE_LAUNCHCTL_FIRE"])
-    result = "after-fire" if fire_log.exists() and "run exit 7" in fire_log.read_text() else "before-fire"
-    (state / f"{label}.removed").write_text(result)
+            """#!/usr/bin/env -S zsh -f
+zmodload -F zsh/files b:zf_mv
+zmodload zsh/zselect
+state=$FAKE_LAUNCHCTL_STATE
+case $1 in
+  submit)
+    label=${@[${@[(i)-l]}+1]}
+    print -rn -- $label > $state/submitted
+    print -r -- ${(qq)@[${@[(i)--]}+1,-1]} > $state/$label.command ;;
+  kickstart)
+    print -rn -- $2 > $state/kickstarted
+    (( FAKE_LAUNCHCTL_KICKSTART_RC )) && exit $FAKE_LAUNCHCTL_KICKSTART_RC
+    label=${2#*/*/}
+    command=(${(Q)${(z)"$(<$state/$label.command)"}})
+    # setsid runs the loop in this background child, so $! is the loop's own group.
+    setsid $0 loop $label $command </dev/null >/dev/null 2>&1 &
+    print -r -- $! > $state/pid.tmp
+    zf_mv $state/pid.tmp $state/pid ;;
+  loop)
+    label=$2
+    shift 2
+    while [[ ! -e $state/$label.removed ]]; do
+      "$@"
+      zselect -t 5
+    done ;;
+  remove)
+    result=before-fire
+    [[ -e $FAKE_LAUNCHCTL_FIRE && "$(<$FAKE_LAUNCHCTL_FIRE)" == *"run exit 7"* ]] && result=after-fire
+    print -rn -- $result > $state/$2.removed ;;
+esac
 """
         )
         launcher.chmod(0o755)

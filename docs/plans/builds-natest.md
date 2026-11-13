@@ -3845,3 +3845,24 @@ Checkpoint 298f77624. Changed `scripts/message/test_repeat_guard.py` (`NOTICE_FI
 
 - The supervise role runs only `repeat_guard.notice_job`, imports only `repeat_guard` and exits. The drain and attempt roles keep their imports and patches.
 - AWS pair (c7a.8xlarge, 3 rounds): median 14.54 → 12.03 CPU s. Most of the rest is the drain and attempt processes, which import `send` and `staff`.
+
+### Phase 261 — The notifier tests start lighter launcher stubs  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### Work Order
+
+**Goal:** `message/test_notifier.py` uses less CPU in aws pairs; every behavior check stays.
+
+**Spec:**
+- Profile: 7.3 local CPU s. The production helpers `sessions.py member-socket` and `update_registration.py delivery` use about 4.3 of it; that part goes to sdlc as a proposal.
+- The fake `systemd-run` is a Python launcher that starts a Python monitor for each run-only job. Replace both with one `/bin/sh` stub that starts the command under `setsid` and writes the same `run-exit-<pid>` file and launch pid marker.
+- The drain test's fake `systemd-run` records its arguments one per line from `/bin/sh`, not JSON from Python.
+- The fake `launchctl` is a Python program for each action. Replace it with a `zsh` stub with the same submit, kickstart, loop and remove behavior.
+- Test file only.
+
+**Files:** `scripts/message/test_notifier.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:** the module passes; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
