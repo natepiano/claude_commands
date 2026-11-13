@@ -137,6 +137,21 @@ def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
 
 
 class PushTextTests(unittest.TestCase):
+    def test_login_sitting_examples_name_end_dates_and_steps_as_normal_notes(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "accounts.login_sitting")
+        self.assertEqual(entry.sender, "accounts")
+        self.assertEqual(entry.need, "note")
+        self.assertEqual([example.name for example in entry.examples], ["weekly", "safety"])
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertTrue(push.body.startswith("You asked "))
+                self.assertIn("login end dates", push.body)
+                self.assertIn("Sign out of claude.ai in the browser.", push.body)
+                self.assertIn("Sign in as that account.", push.body)
+                self.assertIn("run /login in a Claude session on that account.", push.body)
+                self.assertNotIn("No action needed.", push.message)
+
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
