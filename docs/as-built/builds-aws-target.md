@@ -28,6 +28,57 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## Hana guest safety files
+
+`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
+These files do not provision a machine or add a deployment command.
+Phase D must install and enable the units before the box accepts work.
+`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+
+The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
+It has no ordering or requirement dependency on the data disk, network, or tool setup.
+Tool setup runs after the guard and requires the bounded data mount.
+A failed setup or missing disk cannot prevent the guard from requesting poweroff.
+The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
+
+Phase C supplies `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
+The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
+The boot ID must match `/proc/sys/kernel/random/boot_id`.
+The guard and watchdog only read the permit and identity files.
+Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
+`permit_max_seconds=1800` bounds one renewal window.
+A permit beyond that window grants no permission.
+Phase C renews permission for longer steps through `write_permit()`.
+The writer uses a private temporary file and atomic rename.
+
+On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
+An unchanged permit retains that deadline across later reads and service restarts.
+A renewal with a changed expiry records a new bounded deadline when safety next reads it.
+The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
+A backward wall-clock change cannot extend the boot-clock deadline.
+
+Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
+Safety holds the lock from the permit read through the shutdown decision.
+Before killing work, safety writes `/run/hana-aws/shutdown.json` under the lock.
+This fence refuses later renewals and command admission for that boot.
+
+The independent watchdog starts after the guard and reads no controller or command state.
+At expiry, it sends SIGKILL to all command cgroups under `hana-work.slice`, then requests poweroff.
+A failed kill request still triggers the poweroff request.
+The watchdog checks at `watchdog_check_seconds` intervals and shortens its next interval to the permit deadline.
+Systemd also requests poweroff if a safety service fails.
+
+`admit_command()` requires enabled configuration, a fresh bounded permit, and a mounted data disk.
+It checks the shutdown fence and starts the command under the shared lock.
+Its start callback spawns the process and returns immediately.
+The caller waits for command completion outside the lock.
+It prepares an unprivileged command with a separate slice under `hana-work.slice`.
+Both the parent slice and each command enforce `step_cpu_limit` and `step_memory_gib` from configuration.
+The initial limits are 4 vCPUs and 24 GiB RAM.
+Phase F2 must use this command path after checking the actual data mount.
+`test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
+No safety test needs AWS or a running systemd manager.
+
 ## Removed builder: 2026-11-04
 
 `builder-removal.json` records the removal on 2026-11-04.
