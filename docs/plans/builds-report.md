@@ -1147,36 +1147,16 @@ From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahe
 
 ### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
 
-From builds (not the user), 2026-11-12: "the natedev disk-floor alert says 'no session found' for 15 of 17 live verify.sh pids. These are most likely worker runs, and the owner lookup misses them. Fix the lookup so the alert names each owner."
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
 
-Cause: `sweep.holder_sessions` walks a pid's ancestors to the nearest live Claude session. A worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`. No ancestor is a session, so the line says "no session found". Checked 2026-11-12 on pids 676514, 1226881, 1629641 and 1635396.
+#### As-built
 
-#### Work Order
-
-**Goal:** A floor alert names the unit director that owns each worker's detached run, and the holder message reaches that director.
-
-**Spec:**
-- `scripts/lint/sweep.py` `holder_sessions`: when `process_table.nearest_named` finds no session, look for the nearest ancestor that runs `detached_runs.py supervise <record path>`.
-  - Read that record (JSON). Accept it only when its `pid` equals that supervisor pid and its `status` is `running`.
-  - Find the worker with `staff.local_snapshot().by_id(StaffId(record["staff_id"]))`, then its parent with `parent_of`. The parent's name is the owner session.
-  - A missing or unreadable record, a missing staff row or a missing parent leaves the pid without a session. Do not raise.
-  - Read each record once per call, even when many pids share one supervisor.
-- `floor_out_of_reach_text` keeps its current line shapes. Do not add new text.
-- Reuse `scripts/agents/detached_run_process.py` or the `detached_runs` record reader where they fit. Do not copy record parsing that already exists.
-- Tests in `scripts/lint/test_sweep.py`: add rows to `test_a_pid_belongs_to_its_nearest_named_session`:
-  - a pid under a supervisor whose record names a worker with a parent maps to the parent's name;
-  - a record whose `pid` is not the supervisor pid maps to nothing;
-  - a record whose worker has no staff row maps to nothing.
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
-
-**Workers:** `1 writer`
-- writer: all files.
-
-**State:** none.
-
-**Acceptance gate:**
-- `scripts.lint.test_sweep` passes, with the new rows.
-- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
