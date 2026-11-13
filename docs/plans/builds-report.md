@@ -1144,3 +1144,52 @@ From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahe
 - `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
 - `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
 - `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.
+
+### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
+
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
+
+#### As-built
+
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
+
+**Files:**
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
+
+### Phase 58 — The tmp sweep judges closed phase folders of a run that is not open · status: done
+
+From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved deleting folders of finished runs in /tmp/claude/unit (open runs stay). … Fix tmp_sweep where it lives: a closed phase folder whose run has ended is a candidate, with the normal process and unsaved-git checks. Then run --plan and --apply with the fix."
+
+#### As-built
+
+- Cause: `run_folder_guards` kept a whole run folder for `SESSION_WORKTREE` or `DIRECTOR`, so every `phases/<id>/` folder of a finished run stayed while its director session lived.
+- `tmp_sweep.judge_entries`: a run kept only by `SESSION_WORKTREE` or `DIRECTOR` adds its `phases/` folder (not a link) to the judged parents. The `phases/` folder itself stays.
+- Open phase ids from `recorder_state.read_open_phase_ids`, mapped through `phase_reservation.phase_directory_name` (`ad hoc` is `adhoc`), keep their folders with the reason "its phase is open". An unreadable recorder state keeps every phase folder of that run.
+- `OPEN_RUN`, `UNREADABLE_RECORD`, an unreadable session registry and `UNENDED_WORKER` keep every phase folder. `run_folder_guards` no longer lets `SESSION_WORKTREE` replace `UNENDED_WORKER`.
+- Other phase folders use the run `tmp/` rules: the 4-hour idle rule, `IN_USE`, `WORKER_USES` and the git check.
+- `ClosedPhaseEntry` carries `CleanupEndReason.CLOSED_PHASE` into `--plan` and `--apply`. Removal checks again that the parent is a real folder at the judged root; otherwise the entry stays with "its phases parent changed".
+- Director ruling on review finding F003: the window between the parent recheck and `rmtree` stays. Every other sweep removal has the same window; a file-descriptor delete for all removals is a separate change.
+- Live run, 2026-11-12 20:18 EST: `--apply` deleted 641 closed phase folders, 5.5 GiB. Most of the 35 GiB in the first plan was gone before apply.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, `run_folder_guards`, `ClosedPhaseEntry`, `CleanupEndReason.CLOSED_PHASE`, `remove_entry`.
+- `scripts/lint/test_tmp_sweep.py` — rows in `assert_run_tmp_entries`, `OwnerTests`, `RunFolderTests` and `PaneRunTests`: both eligible guards, open and older open phases, `ad hoc`, fresh and used folders, unreadable state, an unended worker with a live worktree, a replaced parent, and `--plan`/`--apply`.
+
+### Phase 59 — The disk walk measures ~/.local/state · status: done
+
+From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~/.local/state/gpu-size-trial` in 90 min, and neither the disk walk nor the floor alert saw it; measure the large writers under `~/.local/state` too.
+
+#### As-built
+
+- `disk.FOLDERS` includes `~/.local/state`. Its walk rows (levels 0 to 3, cargo targets excluded) and growth total reach `read_disk_measurement` and the floor alert with no other change.
+- Measured 2026-11-12 20:25 EST: `~/.local/state` held 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+- The checkpoint also carries the package import block for `scripts/aws_target/gpu_size_trial.py`, which bootstrap added after the builds merge.
+
+**Files:**
+- `scripts/buildlog/disk.py` — `FOLDERS`.
+- `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
