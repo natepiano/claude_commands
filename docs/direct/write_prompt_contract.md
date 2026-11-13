@@ -53,6 +53,11 @@ Codex review prompts also include section 3's command block.
    log), check that `ps -p <pid> -o args=` still shows
    `detached_runs.py supervise` with that record's path, then run
    `kill -TERM -- -<pid>`.
+   The command shares the supervisor's process group, including through the systemd scope prefix.
+   The supervisor installs no signal handler.
+   After a group stop, the next start or worker restore reaps the record and delivers its result.
+   To recover it directly, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py reap --session-dir <run>`.
    ```
 
    Claude workers use `run_in_background: true` and end the turn until the result arrives.

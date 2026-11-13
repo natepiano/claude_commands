@@ -21,7 +21,6 @@ import stat
 from pathlib import Path
 import sys
 import tempfile
-import threading
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
@@ -35,28 +34,6 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
-
-
-@contextmanager
-def defer_signals() -> Generator[None]:
-    """Record cancellation and replay its first signal after handlers are restored."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    pending: list[int] = []
-
-    def record(number: int, frame: object) -> None:
-        del frame
-        pending.append(number)
-
-    previous = {number: signal.signal(number, record) for number in CANCELLATION_SIGNALS}
-    try:
-        yield
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
-        if pending:
-            signal.raise_signal(pending[0])
 
 
 class FolderPrefixes(Mapping[str, str]):
