@@ -3829,7 +3829,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 255 — The send tests do less repeated work  · status: todo
+### Phase 255 — The send tests do less repeated work  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -3881,8 +3881,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Files:**
 - `scripts/production/test_stall_watch.py`
+- `scripts/production/cli_fixture.py` (director, 17:20: `invoke_cli`'s `patch.dict(os.environ, clear=True)` was about 40% of the profiled CPU; 87 modules import the fixture)
+- `scripts/production/fake_unit_host.py` (director: one children update for each batch; 22 consumer modules)
 
-**Workers:** 1 writer; one test module.
+**Workers:** 1 writer; one test module. No-worker mode: the director writes it.
 - impl: all files.
 
 **Constraints from prior phases:**
@@ -3894,6 +3896,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The same test count and assertions; the module passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
+- The 22 `fake_unit_host` consumers pass. About 280 test modules reach `cli_fixture`, so the land runs the full gate.
 
 ### Phase 257 — The verify result environment tests do less repeated work  · status: todo
 **Depends on:** Phase 250
