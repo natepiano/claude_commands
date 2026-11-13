@@ -1,4 +1,4 @@
-"""Private verify inputs and the real embedded dev-feature parser."""
+"""Private verify inputs and the real dev-feature parser."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 from unittest.mock import patch
 from typing import override
 
+from scripts.direct import dev_features
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture
 
 
@@ -46,28 +46,17 @@ def isolate_verify_inputs(environment: dict[str, str], root: Path) -> None:
 
 
 def parse_dev_features(manifest: Path, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    """Execute the real parser with the CLI's private tool and file boundaries."""
-    match = re.search(r"^DEV_FEATURES_PY='\n(.*?)\n'$", VERIFY.read_text(), re.MULTILINE | re.DOTALL)
-    if match is None:
-        raise AssertionError("verify.sh no longer defines DEV_FEATURES_PY")
-    source = match[1]
+    """Run the real parser in this process with the CLI's environment and folder."""
     stdout, stderr = io.StringIO(), io.StringIO()
-    status = 0
     directory = Path.cwd()
     try:
         os.chdir(manifest.parent)
         with (patch.dict(os.environ, environment, clear=True),
-              patch.object(sys, "argv", ["-c", str(manifest)]),
               redirect_stdout(stdout), redirect_stderr(stderr)):
-            try:
-                exec(compile(source, str(VERIFY) + ":DEV_FEATURES_PY", "exec"), {})
-            except SystemExit as stopped:
-                if not isinstance(stopped.code, int):
-                    raise AssertionError("dev-feature parser returned a nonnumeric status") from stopped
-                status = stopped.code
+            status = dev_features.main([str(manifest)])
     finally:
         os.chdir(directory)
-    return subprocess.CompletedProcess([sys.executable, "-c", source, str(manifest)],
+    return subprocess.CompletedProcess([sys.executable, str(VERIFY.with_name("dev_features.py")), str(manifest)],
                                        status, stdout.getvalue(), stderr.getvalue())
 
 

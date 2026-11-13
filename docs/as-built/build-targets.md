@@ -570,7 +570,7 @@ No configuration maps repositories to unit gates.
 The helper reads JSON on stdin and writes shell-quoted `NAME=value` answers.
 Requests cover members, example features, test targets, check targets, build targets, untested examples, workspace root, and target directory.
 Queries and early doc exits need no metadata helper.
-`DEV_FEATURES_PY` reads the root manifest directly, so an invalid dev-feature list refuses before Cargo.
+`dev_features.py` reads the root manifest directly in the per-run helper, so an invalid dev-feature list refuses before Cargo.
 
 `take_check_targets` includes `--lib` only when a workspace member has a library target.
 A binary-only workspace therefore checks successfully.
@@ -744,7 +744,9 @@ Its idle process holds no caller output pipe.
 
 The background tree watcher keeps its own PID and signal handlers.
 The detached step recorders from `invoke.sh` also keep their own processes.
-Shell fixtures and scripts without `main` use their original process path.
+Shell fixtures and scripts with no line that starts `def main(` use their original process path.
+The helper finds that line with a text search, not a parse.
+The helper changes only the environment names that differ between calls.
 A failed helper request also uses that path.
 The change does not wrap or re-execute `verify.sh`.
 
