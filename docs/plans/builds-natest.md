@@ -3627,7 +3627,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Callers in other modules that build the fixture without class setup register the seed cleanup before the seed build, so a failed build leaves no seed. All 84 test bodies and assertions did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: CPU 11.874 to 11.493 s; peak 136.6 to 135.5 MiB. Admission (`admission_client.py`, 2.9 natedev CPU s) and `module_run.py` stay the top costs. Checkpoint `4f9a19c62`.
 
-### Phase 238 — The models publication tests copy one publication fixture  · status: todo
+### Phase 238 — The models publication tests copy one publication fixture  · status: done
 **Depends on:** Phase 234
 
 #### Work Order
