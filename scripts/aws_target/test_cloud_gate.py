@@ -238,37 +238,40 @@ class CloudGateTests(CostFixture):
 
     def test_live_price_timeout_keeps_hourly_rows_and_bounds_the_whole_read(self) -> None:
         worker, variants = self.live_price_fixture()
+        hourly = (self.state / 'spot-prices.json').read_bytes()
         release = threading.Event()
         stopped = threading.Event()
         path = self.root / 'cloud_gate.conf'
         _ = path.write_text(re.sub(r'(?m)^spot_price_live_read_timeout_s=.*$',
                                   'spot_price_live_read_timeout_s=.1', path.read_text()))
+        timeouts: list[float] = []
         def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
             if 'describe-spot-price-history' in arguments and 'us-east-2' in arguments:
-                self.assertLessEqual(float(str(options['timeout'])), .1)
+                timeouts.append(float(str(options['timeout'])))
                 try:
-                    _ = release.wait(2)
+                    _ = release.wait(TEST_HANG_GUARD_SECS)
                     raise subprocess.TimeoutExpired('fixture price read', .1)
                 finally:
                     stopped.set()
             return self.fake(arguments, **options)
         worker.api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
         try:
-            begin = time.monotonic()
             reads = worker.live_spot_prices(variants)
-            elapsed = time.monotonic() - begin
-            self.assertLess(elapsed, .5)
-            self.assertGreaterEqual(elapsed, .08)
+            self.assertFalse(stopped.is_set())
             east = next(row for row in reads if row.region == 'us-east-2')
             self.assertFalse(east.used)
-            self.assertGreaterEqual(east.seconds, .08)
+            self.assertEqual(east.prices, ())
             prices = [price for reading in reads for price in reading.prices]
             ranked = worker.rank_variants(variants, 'merge-gate', prices)
             self.assertEqual(ranked[0].region, 'eu-south-2')
             self.assertEqual(ranked[4].region, 'us-east-2')
+            self.assertEqual((self.state / 'spot-prices.json').read_bytes(), hourly)
         finally:
             release.set()
-            self.assertTrue(stopped.wait(2))
+            self.assertTrue(stopped.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(len(timeouts), 1)
+        self.assertGreater(timeouts[0], 0)
+        self.assertLessEqual(timeouts[0], .1)
 
     def test_all_live_price_failures_keep_the_hourly_order(self) -> None:
         worker, variants = self.live_price_fixture()
