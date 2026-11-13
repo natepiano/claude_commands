@@ -44,7 +44,6 @@ from scripts.buildlog import charts, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import placement
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, keep_aside_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
@@ -73,7 +72,9 @@ def feed_code_paths() -> tuple[str, ...]:
         _ = importlib.import_module(name)
     source_root = Path(__file__).resolve().parents[2]
     paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
-    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
+    paths.update((*STARTUP_FILES, "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
     for module in tuple(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if isinstance(source, str) and source.endswith(".py"):
@@ -481,6 +482,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    queued_priority_units: list[str]
     unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
@@ -988,26 +990,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": []})
     groups: dict[str, list[RunRow]] = {}
-    remote_groups: set[str] = set()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
         identity = feed_step_labels(step, labels, ci_runners)
         name, detail = step_text(step, names, labels=labels), identity.unit
         unit, state = detail, ""
-        if isinstance(memory, admission_records.RemoteMemoryUnavailable):
-            key = admission_records.execution_group(step, entry.owner)
-            if key in remote_groups:
-                continue
-            remote_groups.add(key)
-            remote_row: RunRow = {"name": name, "showrunner": identity.showrunner, "unit": unit,
-                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
-                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
-                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
-                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
-            walk.append(remote_row)
-            continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
                        or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
@@ -1057,8 +1045,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     machine = host_name()
     vcpus = os.cpu_count()
     for row in walk:
-        _ = row.setdefault("machine", machine)
-        _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
+        row["machine"] = machine
+        row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -1121,9 +1109,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
     unmatched_priority_text = ""
+    queued_priority_units: list[str] = []
     if isinstance(explanation.priority, admission_records.QueuePriority):
         priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
                       for entry in explanation.priority.entries}
+        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
         matched_units: set[str] = set()
         for work_row in (*work_rows, *waiting_rows):
             if work_row["unit"] in priorities:
@@ -1166,6 +1156,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,

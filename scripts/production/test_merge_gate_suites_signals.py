@@ -14,6 +14,7 @@ import subprocess
 import sys
 from typing import cast, final
 from unittest import mock
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate
 from scripts.direct.wait_for_test_state import wait_until
@@ -130,7 +131,7 @@ sys.stdin.read(1)
         self.environment["TMPDIR"] = str(parent)
         record = self.state / "nested-folders.json"
         module = self.checkout / "scripts" / "hooks" / "test_first.py"
-        self.write(module, f'''import json
+        program = f'''import json
 from pathlib import Path
 import signal
 import sys
@@ -155,7 +156,11 @@ def hold_nested_gate(request):
 
 build_folders.temporary_build_folder = hold_nested_gate
 merge_gate.run_suites(Path.cwd(), full=True)
-''')
+'''
+        helper = self.bin / "nested-gate.py"
+        self.write(helper, program)
+        shim = self.bin.parent / "scripts/lib/py"
+        self.write(module, "import os\n" + f"os.execv({str(shim)!r}, [{str(shim)!r}, {str(helper)!r}])\n")
         result = self.run_gate("--tests-only", "--module-time-limit-s", "10", own_process=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("killed: still running after 10 s, the module time limit", result.stdout)
@@ -223,6 +228,13 @@ sys.addaudithook(cleanup_event)
             # The entry point converts the default SIGINT exception to status 1.
             expected = 1 if number == signal.SIGINT else -number
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            [folder] = [entry for entry in parent.iterdir() if entry.is_dir()]
+            lock = folder.with_name(folder.name + ".lock")
+            lease = folder.with_name(folder.name + ".lease.json")
+            self.assertEqual(set(parent.iterdir()), {folder, lock, lease})
+            record = cast(dict[str, object], json.loads(lease.read_text()))
+            self.assertIsInstance(record["pid"], int)
+            self.assertEqual(build_folders.build_folder_state(folder), "free")
             recovered = self.run_gate("--tests-only", "--full", own_process=True)
             self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
             self.assertIn("merge undone", result.stderr + recovered.stdout)
@@ -236,13 +248,13 @@ sys.addaudithook(cleanup_event)
     def test_failed_gate_removes_its_folder(self) -> None:
         self.assert_gate_folder_removed("failure")
 
-    def test_sigterm_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigterm_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGTERM")
 
-    def test_sighup_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sighup_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGHUP")
 
-    def test_sigint_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigint_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGINT")
 
     @gate_suites("hooks")

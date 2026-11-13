@@ -15,6 +15,7 @@ from unittest.mock import patch
 from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -58,6 +59,7 @@ class DailySimplifyTests(NixFixture):
         direct = launcher / "scripts/direct"
         direct.mkdir()
         _ = (direct / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
+        copy_runtime(launcher, configuration=False)
         cls.agent_exec = launcher / "scripts/agents/agent_exec.sh"
 
     @override
@@ -118,7 +120,7 @@ if sys.argv[0].endswith(("assign.py", "simplify_daily.py")):
                 simplify_daily.write_text_atomic = publish_status
     sys.setprofile(enter)
 ''')
-        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
+        self.env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(startup)))
         self.script(self.bin / "claude", '''import json, os, subprocess, sys, uuid
 from pathlib import Path
 session = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())

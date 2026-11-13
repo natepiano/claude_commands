@@ -1256,3 +1256,38 @@ From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches s
 - Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
 
 **Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
+
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
+
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
+
+### Phase 65 — The build page titles the waiting section by its order · status: done
+
+From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/scratch/user-shot-queued-title.png`: a hairline after the Next step room row, and a title for the waiting section that names its order.
+
+#### As-built
+
+- The Next step room row keeps its place. A 1px hairline after it matches the one before it.
+- The waiting section has a title in the style of "Running, in start order":
+  - "Queued, in order of submission" with no bump.
+  - "Queued, <unit> first, then in submission order" for one bumped unit.
+  - "Queued, <unit> followed by <unit> and then in submission order" for more than one.
+- `memory_feed.py` sends `queued_priority_units`. It reads the queue's own `QueuePriority.entries` (written by `build_queue.py` bump) and the captured waiting order. It does not sort the queue. It drops absent units and duplicates.
+- Tests in `test_memory_feed.py` and `test_memory_hover.py` cover zero, one and two units, removed priorities, source order and escaped text. `memory_page_proof.mjs` checks 18 title cases at three widths in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 66 — Retire /build:queue · status: todo
+
+From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.

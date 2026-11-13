@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import write_python_tool
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -12,7 +14,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
@@ -233,20 +234,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, '''import runpy
-import sys
-from pathlib import Path
-def main():
-    if sys.argv[1] == "eligible":
-        print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")
-    else:
-        if sys.argv[1] == "constraints":
-            sys.argv.extend(("--local", "test target"))
-        runpy.run_path(str(Path.home() / ".claude/scripts/build_targets/build_targets.py"), run_name="__main__")
-
-if __name__ == "__main__":
-    main()
-''')
+        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
@@ -326,8 +314,7 @@ if __name__ == "__main__":
         })
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def write_shell(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")

@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.message import repeat_guard, send_budget
+from scripts.message import repeat_guard, send_budget, session_send
 from scripts.message.send_result import ConfirmedSendOutcome, send_outcome
 from scripts.production import staff
 
@@ -207,8 +207,7 @@ def _finish_notice(sender: str, failed_name: str, started_at: float, reported_co
 def send_notice(owner: str, text: str) -> None:
     """Send through the normal path without changing the failed send's output."""
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("send.py")),
-         "--to", owner, "--from", "send.py", "--text", text],
+        session_send.send_argv("--to", owner, "--from", "send.py", "--text", text),
         capture_output=True, text=True, check=False, timeout=send_budget.seconds(),
     )
     outcome = send_outcome(result.returncode, result.stdout)

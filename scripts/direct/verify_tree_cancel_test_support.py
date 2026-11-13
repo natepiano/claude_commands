@@ -1,12 +1,7 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
-)
-from scripts.build_queue import placement
-from scripts.mac_test import claim_state
-from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
@@ -101,23 +96,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import json
-import time
-arguments = sys.argv[1:]
 root = Path(os.environ["TEST_CONTROL"])
-result = Path(arguments[arguments.index("--result") + 1])
-''' + ASSIGNED_RUNNER_SETUP + r'''
 child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\"TEST_HANG_GUARD_SECS\"])); signal.pause()"])
 (root / "descendant.pid").write_text(str(child.pid))
 
 def cancel(signum, _frame):
-    global fixture_outcome, fixture_evidence, fixture_cleanup_confirmed
     child.terminate()
     child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
-    if "--assignment-file" in arguments:
-        fixture_outcome = placement.AttemptCancelled("the source tree changed")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private child has ended", time.time())
-        fixture_cleanup_confirmed = True
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
 
@@ -172,7 +157,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
-            "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
+            "PYTHONPATH": str(VERIFY.resolve().parents[1] / "lib/python_startup"), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })
 
@@ -184,16 +169,6 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.board = self.root / "board"
         self.admission = caller_admission(self, self.root, self.environment)
 
-        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            if key.destination.provider == "local":
-                paths = claim_state.StatePaths(self.root / "local-provider", key.destination.target, platform="linux")
-            else:
-                paths = claim_state.StatePaths(self.root / "mac-state", key.destination.target, registry_selected=True)
-            return private_provider_evidence(self.admission, key, paths)
-
-        self.admission.server.host_probe = provider
-        _ = caller_provider_controls(self, self.admission)
-
     def release_lint_rewrites(self, process: subprocess.Popen[str]) -> None:
         # Formatting runs before clippy fix, then runs again without rewriting.
         for stage in ("mend", "fmt", "fix"):
@@ -204,7 +179,9 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
 
     @staticmethod
     def write_tool(path: Path, code: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + code)
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup/sitecustomize.py"
+        bootstrap = f"import runpy, sys\nrunpy.run_path({str(startup)!r}, run_name='_fixture_python_startup')['select_checkout'](sys.argv)\n"
+        _ = path.write_text(f"#!{sys.executable}\n" + bootstrap + code)
         path.chmod(0o755)
 
     @staticmethod
@@ -329,9 +306,5 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
                                + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
-        state = self.root / "mac-state"
-        self.environment.update({"MAC_TEST_STATE_DIR": str(state), "CONF_DIR": str(settings.parent),
-            "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),
-            "TEST_RUNNER_STATE": str(self.control)})
         return {"VERIFY_MAC_RUNNER": str(runner),
-                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(settings.parent)}
+                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(Path(settings).parent)}

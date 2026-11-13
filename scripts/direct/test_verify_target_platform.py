@@ -1,14 +1,10 @@
-"""Read assigned platforms and reject unknown SSH destinations."""
+"""Read target platforms from eligibility rows without an interpreter."""
 
-import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
-from unittest import mock
-
-from scripts.build_targets import target_config
 
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -22,31 +18,11 @@ class VerifyTargetPlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             bash = shutil.which("bash")
             assert bash is not None
-            root = Path(directory)
-            rows = [line.split("\t") for line in table.splitlines()]
-            names = [row[0] for row in rows] or ["natedev"]
-            settings = ["targets=" + ",".join(names)]
-            for row in rows or [["natedev", "eligible", "-", "-", "-"]]:
-                name, _, _, config, platform = row
-                remote = config != "-"
-                settings.extend((f"kind.{name}={'ssh' if remote else 'local'}",
-                                 f"platform.{name}={platform if remote else 'linux'}"))
-                if remote:
-                    source = root / (name + ".conf")
-                    source.touch()
-                    settings.append(f"settings.{name}={source.name}")
-            _ = (root / "build_targets.conf").write_text("\n".join(settings) + "\n")
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                try:
-                    assigned = target_config.configured_ssh_target(target)
-                except target_config.ConfigError:
-                    return subprocess.CompletedProcess(["assigned-info", target], 1, "", "")
             environment = {
                 "HOME": directory, "PATH": directory,
                 "PY": str(Path(directory) / "no-python"),
                 "BUILD_TARGETS_SCRIPT": str(Path(directory) / "no-build-targets.py"),
-                "STEP_ASSIGNED_PLATFORM": assigned.platform, "STEP_ASSIGNED_TARGET": assigned.name,
-                "STEP_RUNS_ON": runs_on,
+                "STEP_TARGET_TABLE": table, "STEP_RUNS_ON": runs_on,
             }
             script = shell_functions(VERIFY, "target_platform") + '\ntarget_platform "$1"\n'
             return subprocess.run(

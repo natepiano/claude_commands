@@ -1,6 +1,8 @@
 """Check entry scripts without a package environment or a checkout working directory."""
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
 import os
 from pathlib import Path
 import shutil
@@ -34,7 +36,7 @@ class PackageRootTests(unittest.TestCase):
             _ = shutil.copyfile(ROOT / "scripts/message/send.py", entry)
             result = subprocess.run(
                 [sys.executable, str(entry), "--help"], cwd=directory,
-                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                env={**os.environ, "PYTHONPATH": str(ROOT / "scripts/lib/python_startup")},
                 capture_output=True, text=True, check=False, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -65,7 +67,7 @@ class PackageRootTests(unittest.TestCase):
             selected_checkout = folder / "selected"
             for relative_path in (
                 "scripts/prioritize/runner_lock.py", "scripts/prioritize/writer_lock.py",
-                "scripts/lib/package_root.py", "scripts/lib/py",
+                *STARTUP_FILES,
             ):
                 destination = selected_checkout / relative_path
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,98 @@ class PackageRootTests(unittest.TestCase):
                         self.assertEqual(result.stdout, "free\n")
                         self.assertEqual(result.stderr, "")
 
+    def test_entry_reuses_the_helper_loaded_by_the_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "entry.py"
+            _ = entry.write_text("""import runpy, sys
+compiled = []
+def record(event, arguments):
+    if event == 'compile' and str(arguments[1]).endswith('/python_startup/sitecustomize.py'):
+        compiled.append(arguments[1])
+sys.addaudithook(record)
+for attempt in range(2):
+    runpy.run_path(sys.argv[1])
+print(compiled)
+""")
+            result = subprocess.run(
+                [str(ROOT / "scripts/lib/py"), str(entry), str(ROOT / "scripts/lib/package_root.py")],
+                cwd=directory, env=dict(os.environ), capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "[]\n")
+
+    def test_entry_reuses_path_selection_when_search_paths_stay_the_same(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "entry.py"
+            _ = entry.write_text("""import runpy, sys
+helper = sys.modules['_devtools_python_startup']
+def repeated_filtering(value):
+    raise AssertionError('unchanged search paths were filtered again')
+helper.inherited_paths = repeated_filtering
+for attempt in range(2):
+    runpy.run_path(sys.argv[1])
+print('reused')
+""")
+            for options in ([], ["-I"]):
+                with self.subTest(options=options):
+                    result = subprocess.run(
+                        [str(ROOT / "scripts/lib/py"), *options, str(entry), str(ROOT / "scripts/lib/package_root.py")],
+                        cwd=directory, env=dict(os.environ), capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "reused\n")
+
+    def test_entry_refilters_changed_paths_environment_and_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            foreign = base / "foreign"
+            (foreign / "scripts").mkdir(parents=True)
+            entry = base / "entry.py"
+            _ = entry.write_text("""import os, runpy, sys
+bootstrap, foreign = sys.argv[1:]
+sys.path.insert(1, foreign)
+runpy.run_path(bootstrap)
+assert foreign not in sys.path, sys.path
+os.environ['PYTHONPATH'] = foreign
+runpy.run_path(bootstrap)
+assert 'PYTHONPATH' not in os.environ, os.environ.get('PYTHONPATH')
+os.environ['PYTHONPATH'] = ''
+runpy.run_path(bootstrap)
+assert 'PYTHONPATH' not in os.environ
+sys.path.insert(1, '.')
+runpy.run_path(bootstrap)
+assert '.' in sys.path, sys.path
+os.chdir(foreign)
+runpy.run_path(bootstrap)
+assert '.' not in sys.path, sys.path
+print('filtered')
+""")
+            result = subprocess.run(
+                [str(ROOT / "scripts/lib/py"), str(entry), str(ROOT / "scripts/lib/package_root.py"), str(foreign)],
+                cwd=directory, env=dict(os.environ), capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "filtered\n")
+
+    def test_entry_filters_a_foreign_package_in_its_automatic_script_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "bin"
+            package = folder / "scripts"
+            package.mkdir(parents=True)
+            _ = (package / "__init__.py").write_text("raise AssertionError('the foreign scripts package was imported')\n")
+            entry = folder / "entry.py"
+            _ = entry.write_text("""import runpy, sys
+from pathlib import Path
+runpy.run_path(sys.argv[1])
+assert str(Path(__file__).parent) not in sys.path, sys.path
+import scripts
+root = Path(sys.argv[1]).resolve().parents[2]
+assert list(scripts.__path__) == [str(root / 'scripts')], list(scripts.__path__)
+print('selected')
+""")
+            result = subprocess.run(
+                [str(ROOT / "scripts/lib/py"), str(entry), str(ROOT / "scripts/lib/package_root.py")],
+                cwd=directory, env=dict(os.environ), capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "selected\n")
+
     def test_an_existing_package_root_keeps_its_position_without_a_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
@@ -105,7 +199,7 @@ runpy.run_path(str(root / 'scripts/lib/package_root.py'))
 assert sys.path == before, (before, sys.path)
 assert sum(pathlib.Path(entry).resolve() == root for entry in sys.path) == 1
 """, str(ROOT)],
-                cwd=directory, env={**os.environ, "PYTHONPATH": str(ROOT)},
+                cwd=directory, env={**os.environ, "PYTHONPATH": str(ROOT / "scripts/lib/python_startup")},
                 capture_output=True, text=True, check=False, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

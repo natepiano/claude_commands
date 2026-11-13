@@ -447,7 +447,17 @@ If a stop includes the caller, restart continues in a detached process before th
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
 A stop checks the current conversation before it sends a signal.
-A failed row prints one anomaly line. Other rows continue.
+A failed row does not stop other rows.
+After the start pool finishes, restart reads each failed unit director or showrunner conversation again.
+If the read proves that the conversation stopped, restart retries that start once with the same arguments.
+A successful retry prints only `<name>: down; started`.
+If the row becomes live before the retry launches it, the retry prints only `<name>: unchanged`.
+A second failure prints `<name>: down: <reason>` on stdout and keeps the row pending.
+An error without text uses its type name as the reason.
+A live or unknown conversation keeps the existing anomaly line and gets no retry.
+Trust-write failures and row-lock refusals keep their existing behavior without a retry.
+An unreadable native identity in a retained pane excludes that pane from placement candidates.
+It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
@@ -461,6 +471,11 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
+The opening prompt and the Claude resume check share a cursor positioned before launch.
+The cursor skips complete historical records without parsing their JSON.
+Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
+If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.
+The cursor retains observed turns, so prompt submission does not remove evidence from the resume check.
 The reader leaves a final record without a newline unread until the writer completes it.
 The launch boundary follows the last complete newline.
 A malformed Codex record with a newline makes the transcript unreadable.

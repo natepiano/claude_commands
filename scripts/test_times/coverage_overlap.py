@@ -77,7 +77,10 @@ class ChildEnvironment:
         self.saved: dict[str, str] = {name: os.environ[name] for name in self.names if name in os.environ}
         child_path = str(Path(__file__).resolve().parent / "coverage_child")
         previous = self.saved.get("PYTHONPATH", "")
-        self.python_path: str = child_path + (os.pathsep + previous if previous else "")
+        from scripts.lib.python_startup.sitecustomize import inherited_paths
+
+        paths = inherited_paths(previous)
+        self.python_path: str = os.pathsep.join((child_path, *paths))
         self.leaves: str = " ".join(conf.read("test_times").words("COVERAGE_LEAF_PROGRAMS"))
 
     def start_test(self, test_id: str) -> None:

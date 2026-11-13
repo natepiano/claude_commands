@@ -1241,7 +1241,8 @@ from pathlib import Path
 import os
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
+import runpy
+runpy.run_path(str(Path(sys.argv[1]) / 'scripts/lib/python_startup/sitecustomize.py'), run_name='_trend_python_startup')["select_checkout"](sys.argv)
 from scripts.test_times import show
 from scripts.lib import file_lock
 class FixedTime(datetime):

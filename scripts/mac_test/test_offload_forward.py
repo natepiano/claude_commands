@@ -131,7 +131,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             with self.subTest(options=options):
                 answer = self.command(
                     "--workspace", runner_options=options, call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True, direct_placement=True,
+                    subprocess_cli=True, separate_stderr=True,
                 )
                 self.assertEqual(answer.returncode, 2, answer.stdout + answer.stderr)
                 self.assertIn("error:", answer.stderr)
@@ -149,7 +149,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--env", "bad-name"),
-            subprocess_cli=True, separate_stderr=True, direct_placement=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 2, answer.stdout + answer.stderr)
         self.assertFalse(self.result_path.exists())
@@ -177,7 +177,7 @@ class OffloadForwardTests(OffloadCommandFixture):
                 + 'if [[ $remote == *fetch_kib=* ]]; then'))
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots/", "--target", "mac"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         landing = self.state_directory / "fetched/call-forward/target/shots"
@@ -208,7 +208,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("missing")
@@ -221,7 +221,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_answer="fetch_kib=1025\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("too_large")
@@ -232,7 +232,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(pull_status=23)
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("failed")
@@ -246,7 +246,7 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.configure_fetch(fetch_answer=response, fetch_probe_status=status)
                 answer = self.command(
                     "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+                    subprocess_cli=True, separate_stderr=True,
                 )
                 self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
                 self.assert_fetch_wire("failed")
@@ -258,7 +258,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(hold_fetch_probe=True)
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertTrue((self.stub_directory / "fetch-probe-started").exists())
@@ -273,7 +273,7 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.sync_fixture()
                 answer = self.command(
                     "--workspace", runner_options=("--fetch", f"target/shots-{status}", "--call-id", f"call-{status}"), call_id="call-forward",
-                    subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+                    subprocess_cli=True, separate_stderr=True,
                 )
                 self.assertEqual(answer.returncode, exit_code, answer.stdout + answer.stderr)
                 self.assert_fetch_wire("fetched", wire_status, reason)
@@ -294,7 +294,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "declined", "off")
@@ -306,7 +306,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         _ = (landing / "keep").write_text("original")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assert_fetch_wire("failed")
@@ -325,7 +325,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertFalse((fetched / "old-call").exists())
