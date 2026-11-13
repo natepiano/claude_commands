@@ -534,7 +534,7 @@ function roomEquation(d) {
 }
 function ago(then, now) {
   const m = Math.max(0, Math.round((now - then) / 60));
-  if (m < 1) return "under 1 min";
+  if (m < 1) return "<1 min";
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
   return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} days`;
@@ -836,7 +836,7 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -908,7 +908,7 @@ function fitWalkDetails() {
       context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
       return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
     });
-    if (name === "duration") widths.push(context.measureText("waits 99 h 59 min").width + 16);
+    if (name === "duration") widths.push(context.measureText("99 h 59 min").width + 16);
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
