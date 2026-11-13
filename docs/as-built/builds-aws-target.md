@@ -352,10 +352,17 @@ The external administrator IAM policy also needs `servicequotas:ListRequestedSer
 Both quota codes use these same three IAM actions.
 `python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
 It shares the quota codes and region lists with `quota-request`.
-It groups the reads by region and prints progress and a final completion time.
-Each request row shows the region, quota name, asked value, current applied value, status, case ID, and date.
+Each region starts one terminal block with its name as the heading.
+Each quota shows its applied vCPUs once, above an aligned request table.
+The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
 Dates use the user's zone and the last update time, with the creation time as a fallback.
-A quota with no requests prints one row with status `none`.
+A quota with no requests prints `No requests.`
+The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
+The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
+It does not use the requested quota as proof of an applied quota.
+When every applied quota is too small, the summary says `no region has enough applied quota`.
+An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
+An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
 The report omits account IDs, ARNs, and request IDs.
 Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
 Any regional failure makes the command exit with status 1.

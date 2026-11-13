@@ -1160,7 +1160,7 @@ sys.exit(7)
                 self.assertNotIn('arn:', output.getvalue())
                 self.assertNotIn('123456789012', output.getvalue())
 
-    def test_quota_status_prints_history_and_none_rows_without_writes(self) -> None:
+    def test_quota_status_prints_aligned_regional_blocks_without_writes(self) -> None:
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         other, candidate = 'us-west-2', 'eu-north-1'
@@ -1202,11 +1202,11 @@ sys.exit(7)
             else:
                 rows: list[dict[str, object]] = []
                 if (region, code) == (home, 'L-34B43A08'):
-                    rows = [{'DesiredValue': desired[code] + 1, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
+                    rows = [{'DesiredValue': desired[code], 'Status': 'APPROVED', 'Created': created.timestamp(),
+                             'LastUpdated': created.timestamp()},
+                            {'DesiredValue': desired[code] + 1, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
                              'Created': created.isoformat(), 'LastUpdated': updated.isoformat(),
-                             'Id': 'private-request', 'Requester': 'private-account', 'QuotaArn': 'arn:private-quota'},
-                            {'DesiredValue': desired[code], 'Status': 'APPROVED', 'Created': created.timestamp(),
-                             'LastUpdated': updated.timestamp()}]
+                             'Id': 'private-request', 'Requester': 'private-account', 'QuotaArn': 'arn:private-quota'}]
                 elif (region, code) == (other, 'L-3819A6DF'):
                     rows = [{'DesiredValue': desired[code], 'Status': 'PENDING',
                              'Created': created.isoformat().replace('+00:00', 'Z')}]
@@ -1230,18 +1230,30 @@ sys.exit(7)
         self.assertEqual(calls, [(region, code, operation) for region, code in (
             (home, 'L-34B43A08'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'), (candidate, 'L-3819A6DF'))
             for operation in ('get-service-quota', history)])
-        rows = [line for line in output.getvalue().splitlines() if ' | ' in line]
-        self.assertEqual(rows, [
-            'region | quota | asked vCPUs | applied vCPUs | status | case id | updated',
-            f'{home} | Standard Spot | {desired["L-34B43A08"] + 1} | {desired["L-34B43A08"]} | CASE_OPENED | case-fixture | {date}',
-            f'{home} | Standard Spot | {desired["L-34B43A08"]} | {desired["L-34B43A08"]} | APPROVED | - | {date}',
-            f'{other} | Standard Spot | - | {desired["L-34B43A08"]} | none | - | -',
-            f'{other} | G and VT Spot | {desired["L-3819A6DF"]} | {desired["L-3819A6DF"]} | PENDING | - | {created_date}',
-            f'{candidate} | G and VT Spot | - | {desired["L-3819A6DF"]} | none | - | -'])
-        for region in (home, other, candidate):
-            self.assertIn(f'quota-status: reading quotas in {region}', output.getvalue())
-            self.assertRegex(output.getvalue(), f'quota-status: reading quotas in {region} done in [0-9]+ s')
-        self.assertEqual(output.getvalue().splitlines()[-1], 'quota-status: done at ' + date)
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line for line in lines if line and not line.startswith((' ', 'Summary:'))],
+                         [home, other, candidate])
+        self.assertEqual([line.strip() for line in lines if line.startswith('  ') and not line.startswith('    ')], [
+            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
+            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
+            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied',
+            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied'])
+        headers = [line for line in lines if 'Asked vCPUs' in line]
+        requests = [line for line in lines if line.startswith('    ') and any(
+            status in line for status in ('CASE_OPENED', 'APPROVED', 'PENDING'))]
+        self.assertEqual([re.split(r' {2,}', line.strip()) for line in requests], [
+            [str(desired['L-34B43A08'] + 1), 'CASE_OPENED', 'case-fixture', date],
+            [str(desired['L-34B43A08']), 'APPROVED', '-', created_date],
+            [str(desired['L-3819A6DF']), 'PENDING', '-', created_date]])
+        for line, status in zip(requests[:2], ('CASE_OPENED', 'APPROVED')):
+            self.assertEqual(line.index(status), headers[0].index('Status'))
+            self.assertEqual(line.index(date if status == 'CASE_OPENED' else created_date), headers[0].index('Updated'))
+        self.assertEqual(lines.count('    No requests.'), 2)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        fits = f'{other}, {candidate}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
+        self.assertEqual(lines[-1], f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+            + f'open requests: {home} Standard Spot {desired["L-34B43A08"] + 1} vCPUs (CASE_OPENED), '
+            + f'{other} G and VT Spot {desired["L-3819A6DF"]} vCPUs (PENDING)')
         for private in ('private-name', 'private-request', 'private-account', 'arn:', 'fixture-admin-id', 'fixture-admin-secret'):
             self.assertNotIn(private, output.getvalue() + errors.getvalue())
 
@@ -1283,13 +1295,78 @@ sys.exit(7)
                       redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                     self.assertEqual(deploy.main(), 1)
                 expected = 'TimeoutExpired' if failure == 'timeout' else 'AwsUnavailable' if failure == 'uncoded' else 'AccessDeniedException'
-                self.assertIn(f'{home}: Standard Spot quota status failed: {expected}', output.getvalue())
+                self.assertIn(f'    Quota status failed: {expected}', output.getvalue())
                 self.assertIn((other, 'L-34B43A08', history), calls)
                 self.assertIn((other, 'L-3819A6DF', history), calls)
                 self.assertIn((home, 'L-3819A6DF', history), calls)
-                self.assertTrue(output.getvalue().splitlines()[-1].startswith('quota-status: done at '))
+                summary = output.getvalue().splitlines()[-1]
+                self.assertTrue(summary.startswith('Summary: GPU trial needs '))
+                self.assertIn('request history unavailable: ' + home + ' Standard Spot', summary)
+                self.assertIn('open requests: unknown', summary)
                 for private in ('private-error', 'private-timeout', 'arn:'):
                     self.assertNotIn(private, output.getvalue() + errors.getvalue())
+
+    def test_quota_status_summary_uses_the_trial_types_and_ignores_closed_requests(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        text_setting(gates, 'regions', home)
+        text_setting(gates, 'spot_candidate_regions', home)
+        prices = gpu_size_trial.settings().spot_max_usd_per_hour
+        sizes = sorted(prices, key=lambda name: aws_target.largest_gate_vcpus((name,)))
+        applied = aws_target.largest_gate_vcpus((sizes[0],))
+        asked = conf.read(gates).whole('gpu_spot_quota_request_vcpus')
+        for size in (sizes[0], sizes[-1]):
+            with self.subTest(size=size):
+                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: str(prices[size])}))
+                needed = aws_target.largest_gate_vcpus(tuple(gpu_size_trial.settings().spot_max_usd_per_hour))
+                subject = self.deployment()
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    if operation == 'get-service-quota':
+                        reply: dict[str, object] = {'Quota': {'Value': applied}}
+                    else:
+                        self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                        reply = {'RequestedQuotas': [{'DesiredValue': asked, 'Status': status}
+                            for status in ('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST')]}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    self.assertTrue(subject.quota_status())
+                fits = home if applied >= needed else 'no region has enough applied quota'
+                self.assertEqual(output.getvalue().splitlines()[-1],
+                    f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: none')
+
+    def test_quota_status_summary_separates_unread_quotas_and_unread_history(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        other = 'us-west-2'
+        text_setting(gates, 'regions', home + ' ' + other)
+        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        history = 'list-requested-service-quota-change-history-by-quota'
+        for failure in ('get-service-quota', history):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    region = arguments[arguments.index('--region') + 1]
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    code = arguments[arguments.index('--quota-code') + 1]
+                    self.assertIn(operation, ('get-service-quota', history))
+                    if region == home and code == 'L-3819A6DF' and operation == failure:
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'An error occurred (AccessDeniedException) when calling quota operation: fixture refusal')
+                    reply: dict[str, object] = {'Quota': {'Value': needed}}
+                    if operation == history:
+                        reply = {'RequestedQuotas': [{'DesiredValue': needed, 'Status': 'PENDING'}]}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    self.assertFalse(subject.quota_status())
+                fits = f'{other}, unknown for {home}' if failure == 'get-service-quota' else f'{home}, {other}'
+                self.assertEqual(output.getvalue().splitlines()[-1],
+                    f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: unknown; '
+                    + f'request history unavailable: {home} G and VT Spot')
+                self.assertIn('PENDING', output.getvalue())
 
     def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
         subject = self.deployment()

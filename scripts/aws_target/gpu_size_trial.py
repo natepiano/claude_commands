@@ -91,6 +91,17 @@ def settings() -> TrialLimits:
                        conf.decimal(source.text('gpu_size_trial_box_extra_usd')), maximums)
 
 
+def required_vcpus(limits: TrialLimits) -> int:
+    """Derive the trial quota from every configured launch type."""
+    needed = 0
+    for size in limits.spot_max_usd_per_hour:
+        vcpus = largest_gate_vcpus((size,))
+        if not vcpus:
+            raise ValueError('No vCPU count is available for configured GPU type: ' + size)
+        needed = max(needed, vcpus)
+    return needed
+
+
 def digest(path: Path) -> str:
     with path.open('rb') as content:
         return hashlib.file_digest(content, 'sha256').hexdigest()
@@ -876,12 +887,7 @@ class GpuTrialWorker:
 
     def select_region(self, deployment: dict[str, object], limits: TrialLimits) -> dict[str, object]:
         values = conf.read_or_repository('cloud_gate')
-        needed = 0
-        for size in limits.spot_max_usd_per_hour:
-            vcpus = largest_gate_vcpus((size,))
-            if not vcpus:
-                raise ValueError('No vCPU count is available for configured GPU type: ' + size)
-            needed = max(needed, vcpus)
+        needed = required_vcpus(limits)
         regions = {str(row['region']): row for row in ledger.rows(deployment, 'regions')}
         applied: list[str] = []
         for region in values.words('spot_candidate_regions'):
