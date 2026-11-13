@@ -71,12 +71,17 @@ class ClaudeTableLayoutTests(unittest.TestCase):
             self.assertEqual(fitted.line_count(rows[0][2], 2), 1)
             self.assertTrue(fitted.keeps_table(headers, rows, width, 4))
 
-    def test_words_without_marks_break_only_from_the_break_width(self) -> None:
+    def test_words_without_marks_break_from_the_break_width_or_before_a_hard_wrap(self) -> None:
         headers = ("Unit", "Progress", "Workers", "Queued")
-        for word, broken in (("x" * 60, True), ("verification" * 2, False)):
-            with self.subTest(word=word):
-                source = [("unit", "🟩" * 20, word, word)]
-                rows = layout.continued(headers, source, 60, 4, 30)
-                cells = [cell for row in rows for cell in row[2:]]
-                self.assertEqual(" ".join(cells).replace(" ", ""), (word * 2).replace(" ", ""))
-                self.assertEqual(word not in cells, broken)
+        long_word = "x" * 60
+        rows = layout.continued(headers, [("unit", "🟩" * 20, long_word, long_word)], 60, 4, 30)
+        self.assertNotIn(long_word, [cell for row in rows for cell in row])
+        plain = "verification" * 2
+        identifier = "restart-record-replace-auto-silence"
+        rows = layout.continued(("Unit", "Workers", "Queued"), [("unit", plain, identifier)], 62, 4, 30)
+        self.assertEqual(rows[0][1], plain)
+        self.assertNotIn(identifier, rows[0][2])
+        rows = layout.continued(("Unit", "Workers"), [("unit", plain)], 30, 4, 30)
+        self.assertEqual("".join(cell for row in rows for cell in row[1].split()), plain)
+        self.assertNotIn(plain, [row[1] for row in rows])
+        self.assertFalse(layout.fit(("Unit", "Workers"), rows, 30).hard_wrap)

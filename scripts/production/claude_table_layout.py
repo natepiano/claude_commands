@@ -112,14 +112,17 @@ def _break_ids(headers: Sequence[str], rows: list[tuple[str, ...]], render_width
     """Break the longest word of a column until the column floors fit.
 
     A word breaks when it has an id mark or is at least `break_width` columns wide.
+    When no such word is left, any longest word over 3 columns breaks:
+    one break costs less than the hard wrap of every column.
     """
     available = _available(render_width, len(headers))
     floors = _floors(headers, rows)
     while sum(floors) > available:
-        candidates = [(column, word) for column, title in enumerate(headers) if title not in _FIXED_COLUMNS
-                      for word in {part for row in rows for part in row[column].split()}
-                      if terminal_width(word) == floors[column]
-                      and (_id_breaks(word) or terminal_width(word) >= break_width)]
+        longest = [(column, word) for column, title in enumerate(headers) if title not in _FIXED_COLUMNS
+                   for word in {part for row in rows for part in row[column].split()}
+                   if terminal_width(word) == floors[column] > 3]
+        candidates = ([(column, word) for column, word in longest
+                       if _id_breaks(word) or terminal_width(word) >= break_width] or longest)
         if not candidates:
             break
         column, word = max(candidates, key=lambda item: (floors[item[0]], item[1]))

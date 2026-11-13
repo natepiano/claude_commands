@@ -1385,11 +1385,12 @@ class UnitPhasesTests(unittest.TestCase):
             calls.append("records")
             return {}
 
-        def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo) -> str:
+        def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo, columns: int | None) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
+            self.assertIsNone(columns)
             calls.append("table")
             return "phase table"
 
@@ -1546,7 +1547,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
-        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone)
+        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone, columns=None)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")

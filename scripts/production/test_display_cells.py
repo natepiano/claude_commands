@@ -30,6 +30,16 @@ class WrappedTableTests(unittest.TestCase):
                 fitted = claude_table_layout.fit(titles, rows, width)
                 self.assertTrue(fitted.keeps_table(titles, rows, width, settings.whole("units_table_cell_lines")))
 
+    def test_ids_break_only_when_the_terminal_width_needs_it(self) -> None:
+        headers = ("Unit", "Status", "Progress", "Phase", "ETA Next", "ETA Plan", "Workers")
+        rows = [("admin-console", "busy", "🟩" * 20, "restart-record-replace", "no ETA stated",
+                 "17:05 · phase gate-time-limit: Thu 19:00 · late 20h 32m", "item137-bf9-final-callers working")]
+        for columns, phase in ((200, "restart-record-replace"), (120, "restart- record- replace"),
+                               (None, "restart- record- replace")):
+            with self.subTest(columns=columns):
+                _, shaped = display_cells.wrapped(headers, rows, columns)
+                self.assertEqual(shaped[0][3], phase)
+
     def test_wrapped_empty_table_keeps_its_headers(self) -> None:
         headers = ("Unit", "Notes", "Queued")
         self.assertEqual(display_cells.wrapped(headers, []), (headers, []))

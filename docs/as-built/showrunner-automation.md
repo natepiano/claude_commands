@@ -760,16 +760,21 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
     `claude_table_layout.py` models the width rule in Claude Code 2.1.319.
-    `units_table_floor_columns` sets the minimum terminal width in `config/production.conf`.
+    `unit_phases.py` run as a script reads its pane width once through `herdr.own_pane_columns`.
+    The read sends `pane.layout` for `HERDR_PANE_ID` to `HERDR_SOCKET_PATH`.
+    `units_table_width_read_milliseconds` limits the read; the median is under 1 ms.
+    Without a width, the tables use `units_table_floor_columns` in `config/production.conf` and print no anomaly.
+    Calls to `main` or `table` from tests pass the width or use the floor; they never read a live pane.
     `units_table_cell_lines` sets the cell line cap, which defaults to four.
     Cells that exceed the cap continue on rows that repeat Unit and fill one work cell.
     Item marks take priority over word boundaries when the script splits cells.
-    When the column minimums exceed the floor width, a space follows a `-`, `/` or `_` inside the longest ID.
+    When the column minimums exceed that width, a space follows a `-`, `/` or `_` inside the longest ID.
     The mark must join two letters or digits.
     A word without a mark breaks at the column share only from `units_table_break_columns` columns; shorter words stay whole.
+    When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks at the share.
     Unit, Status, Machine, and Progress keep their text.
-    The script fits both tables at the floor without changing the style table.
-    Each column can only grow above the floor.
+    The script fits both tables at that width without changing the style table.
+    Each column can only grow in a wider terminal.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
