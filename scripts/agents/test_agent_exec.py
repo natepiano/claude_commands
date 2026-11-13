@@ -58,7 +58,7 @@ class CodexCliLauncherTests(NixFixture):
         _ = selection.write_text('{"workers": "codex1"}')
         registry = write_registry(self.root / "models.conf", {
             "assignments": {"cli": "codex"},
-            "cli.codex": {"interactive": "gpt-test:high", "commit_prep": "gpt-test:high"},
+            "cli.codex": {"interactive": "gpt-test:high", "merge_branch": "gpt-test:high"},
             "cli.options": {"codex_service_tier": "default"},
             "codex.agents": {"gpt-test": "high"},
         })
@@ -75,7 +75,7 @@ _ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
 ''')
 
     def test_cli_repl_and_skill_use_the_workers_home_over_a_callers_home(self) -> None:
-        for arguments in ([], ["commit_prep", "noclippy"]):
+        for arguments in ([], ["merge_branch", "feature"]):
             for caller_home in ("", str(self.root / "other-codex-home")):
                 with self.subTest(arguments=arguments, caller_home=caller_home):
                     environment = dict(self.env)
@@ -90,7 +90,7 @@ _ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
                     expected = ["-m", "gpt-test", "-c", 'model_reasoning_effort="high"',
                                 "-c", 'service_tier="default"']
                     if arguments:
-                        expected.append("commit_prep noclippy")
+                        expected.append("merge_branch feature")
                     self.assertEqual(launched["arguments"], expected)
 
     def test_a_launch_inside_a_worker_reads_the_changed_registry(self) -> None:
@@ -146,7 +146,7 @@ if "NESTED_LAUNCH" not in os.environ:
 
     def test_unavailable_workers_account_refuses_before_codex_starts(self) -> None:
         (self.workers / "auth.json").unlink()
-        for arguments in ([], ["commit_prep", "noclippy"]):
+        for arguments in ([], ["merge_branch", "feature"]):
             with self.subTest(arguments=arguments):
                 result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh"), *arguments],
                                         env={**self.env, "CODEX_HOME": str(self.workers)}, cwd=self.work,

@@ -431,7 +431,7 @@ class CountTests(unittest.TestCase):
         remote_arguments = shlex.split(ssh[0][-1])
         self.assertIn("--here", remote_arguments)
         self.assertEqual(remote_arguments[remote_arguments.index("--showrunners") + 1], "runner from sender")
-        self.assertEqual(remote_arguments[remote_arguments.index("--units") + 1], "unit from sender")
+        self.assertEqual(remote_arguments[remote_arguments.index("--all-units") + 1], "unit from sender")
         self.assertIn("mac: peer runner - showrunner - sent", output.getvalue())
         self.assertIn("mac: peer director - unit director - sent", output.getvalue())
 
