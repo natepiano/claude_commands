@@ -1304,3 +1304,38 @@ From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queu
 ### Phase 66 — Retire /build:queue · status: todo
 
 From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
+
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
+
+### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
+
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
+
+#### As-built
+
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+
+### Phase 70 — Cloud step names carry their unit · status: todo
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: "you see how the unit shows for hana's trunk nextest? it should also show for the sdlc panes targeted test - so it should say "panes targeted test" but to save space probably it should just say "panes targeted". and the merge gate for builds when it is a showrunner doing a merge gate we should just say "showrunner merge" rather than merge gate - when it is a merge gate done by a showrunner - if it's a merge gate run by a unit director then it should say {unit} merge - so for merge gates it is either "showrunner merge" or "{unit} merge"".
+
+1. On the build page, a targeted test step reads "<unit> targeted".
+2. A merge gate step reads "showrunner merge" when a showrunner runs it, and "<unit> merge" when a unit director runs it.
+3. The name templates are new keys in `config/build_steps.conf`. The current `names.*` and `prose.*` values do not change.
+4. A step whose owner is not known keeps its current name.

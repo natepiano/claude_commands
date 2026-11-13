@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field as dataclass_field, replace
 from functools import cache, cached_property
+from enum import Enum
 import os
 import inspect
 import logging
@@ -67,6 +68,12 @@ class MacJobsUnavailable:
     """The command does not specify a positive jobs value."""
 
 
+class MacBuildOrigin(Enum):
+    CI = "ci"
+    NON_CI = "non-ci"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class MacBuild:
     pid: int
@@ -80,6 +87,7 @@ class MacBuild:
     counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
     recorded_unit: str = ""
     session: str = ""
+    origin: MacBuildOrigin = MacBuildOrigin.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -148,7 +156,7 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "resident_bytes": build.resident_bytes if isinstance(build.resident_bytes, int) else -1,
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
-            "recorded_unit": build.recorded_unit, "session": build.session}
+            "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
@@ -164,7 +172,8 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
-                    str(row["recorded_unit"]), str(row["session"]))
+                    str(row["recorded_unit"]), str(row["session"]),
+                    MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -290,26 +299,29 @@ def read_captures(processes):
 
 
 def project_record(folder):
-    tree = Path(folder).resolve()
-    for parent in (tree, *tree.parents):
-        for name in (".copy-record.json", ".scratch.json", ".gate.json", ".gate-copy.json"):
-            record = parent / name
-            try:
-                if record.is_symlink() or record.stat().st_size > 65536:
+    try:
+        tree = Path(folder).resolve()
+        for parent in (tree, *tree.parents):
+            for name in (".copy-record.json", ".scratch.json", ".gate.json", ".gate-copy.json"):
+                record = parent / name
+                try:
+                    if record.is_symlink() or record.stat().st_size > 65536:
+                        continue
+                    values = json.loads(record.read_text())
+                    owner = values.get("owner_unit", values.get("owner", ""))
+                    session = values.get("session", values.get("holder_session", ""))
+                    repo = values.get("repo", "")
+                    if name == ".gate-copy.json" and not tree.is_relative_to(parent):
+                        continue
+                    return dict(recorded_unit=owner if isinstance(owner, str) else "",
+                                session=session if isinstance(session, str) else "",
+                                repository=repo if isinstance(repo, str) else "")
+                except (FileNotFoundError, ValueError, TypeError):
                     continue
-                values = json.loads(record.read_text())
-                owner = values.get("owner_unit", values.get("owner", ""))
-                session = values.get("session", values.get("holder_session", ""))
-                repo = values.get("repo", "")
-                if name == ".gate-copy.json" and not tree.is_relative_to(parent):
-                    continue
-                return dict(recorded_unit=owner if isinstance(owner, str) else "",
-                            session=session if isinstance(session, str) else "",
-                            repository=repo if isinstance(repo, str) else "")
-            except (OSError, ValueError, TypeError):
-                continue
-        if (parent / ".git").exists():
-            break
+            if (parent / ".git").exists():
+                break
+    except OSError:
+        pass
     return dict(recorded_unit="", session="", repository="")
 
 
@@ -424,6 +436,22 @@ def running_test_pid(pid, folder, command, members, processes):
     return 0
 
 
+def build_origin(pid, processes):
+    """Identify a build with a GitHub Actions runner ancestor."""
+    cursor = pid
+    seen = set()
+    while cursor in processes and cursor not in seen:
+        seen.add(cursor)
+        try:
+            words = shlex.split(processes[cursor]["command"])
+        except ValueError:
+            return "unknown"
+        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
+            return "ci"
+        cursor = processes[cursor]["parent"]
+    return "non-ci"
+
+
 def read_builds():
     processes = read_processes()
     captures = read_captures(processes)
@@ -467,17 +495,36 @@ def read_builds():
         folder = capture.get("folder", cwd.get(pid, ""))
         if not folder:
             continue
-        record = project_record(folder)
+        try:
+            record = project_record(folder)
+        except Exception:
+            record = dict(recorded_unit="", session="", repository="")
         command = capture.get("command", processes[pid]["command"])
-        test_pid = running_test_pid(pid, folder, command, members, processes)
+        try:
+            test_pid = running_test_pid(pid, folder, command, members, processes)
+        except Exception:
+            test_pid = -1
+        try:
+            repository = record["repository"] or repository_name(folder)
+        except Exception:
+            repository = ""
+        try:
+            origin = build_origin(pid, processes)
+        except Exception:
+            origin = "unknown"
+        try:
+            folder = str(Path(folder).resolve())
+        except OSError:
+            pass
         tail = capture.get("progress_tail", "")
         if not tail and capture_ids:
             tail = captures[min(capture_ids, key=lambda value: processes[value]["started_at"])]["progress_tail"]
-        builds.append(dict(pid=pid, folder=str(Path(folder).resolve()), started_at=processes[pid]["started_at"],
+        builds.append(dict(pid=pid, folder=folder, started_at=processes[pid]["started_at"],
                            command=command, test_pid=test_pid,
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
-                           progress_tail=tail, repository=record["repository"] or repository_name(folder),
-                           recorded_unit=record["recorded_unit"], session=record["session"]))
+                           progress_tail=tail, repository=repository,
+                           recorded_unit=record["recorded_unit"], session=record["session"],
+                           origin=origin))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 

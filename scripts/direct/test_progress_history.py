@@ -4141,6 +4141,17 @@ with patch.object(fcntl, "flock", admission):
             )
             self.assertEqual(resumed, first)
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            original_prompt = prompt.read_text()
+            for changed_command in (command, [*command, "--summary", str(self.root / "summary.txt")]):
+                with self.subTest(prompt="changed active content", launcher=changed_command):
+                    _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
+                    with self.assertRaisesRegex(RuntimeError, "different prompt content"):
+                        _ = progress_history.begin_dispatch(
+                            session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                            worker_id=member.id, launcher_command=changed_command, prompt=prompt,
+                            kind="broad", lens="contract")
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                    _ = prompt.write_text(original_prompt)
             stage_two = self.root / "stage-two-prompt.txt"
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
             second_stage = progress_history.begin_dispatch(
@@ -4218,6 +4229,16 @@ with patch.object(fcntl, "flock", admission):
                         session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
                     )
                     self.assertEqual(result, progress_history.MatchedDispatch("impl2", instance))
+                    original_prompt = prompt.read_text()
+                    with self.subTest(prompt="changed content"):
+                        _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
+                        changed = progress_history.dispatch_worker(
+                            session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command)
+                        if status == "active":
+                            self.assertEqual(changed, progress_history.ActiveDispatchPromptConflict("impl2", instance))
+                        else:
+                            self.assertIsInstance(changed, progress_history.NoMatchedDispatch)
+                        _ = prompt.write_text(original_prompt)
                     for changed_prompt, changed_command in (
                         (self.root / "different-prompt.txt", command),
                         (prompt, [*command, "--new-dispatch"]),
