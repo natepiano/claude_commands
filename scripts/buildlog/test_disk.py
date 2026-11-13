@@ -457,38 +457,49 @@ class DiskTests(unittest.TestCase):
         self.assertGreater(by_path[str(target)]["bytes"], 0)
 
     def test_outside_directories_compare_previous_snapshot_and_count_new_directory(self) -> None:
-        root = self.base() / "tmp"
-        old = root / "old"
-        child = old / "child"
-        deep = child / "deep"
-        deep.mkdir(parents=True)
-        first_file = deep / "first"
-        _ = first_file.write_bytes(os.urandom(4096))
-        folders = [("tmp", str(root))]
+        for label, relative_root in (("tmp", "tmp"), ("~/.local/state", ".local/state")):
+            with self.subTest(root=label):
+                home = self.base()
+                root = home / relative_root
+                old = root / "old"
+                child = old / "child"
+                deep = child / "deep"
+                deep.mkdir(parents=True)
+                first_file = deep / "first"
+                _ = first_file.write_bytes(os.urandom(4096))
+                folders = ([folder for folder in disk.FOLDERS if folder[0] == label]
+                           if label == "~/.local/state" else [(label, str(root))])
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
-            disk.write_snapshot(first)
-            next_file = deep / "next"
-            _ = next_file.write_bytes(os.urandom(8192))
-            fresh = root / "new"
-            fresh.mkdir()
-            _ = (fresh / "new-file").write_bytes(os.urandom(4096))
-            second = disk.measure(
-                folders, lambda: filesystem.FilesystemUsage(0, 0), None,
-                disk.previous_outside_measurement(disk.read_snapshot()),
-            )
+                with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+                     mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
+                    first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
+                    disk.write_snapshot(first)
+                    next_file = deep / "next"
+                    _ = next_file.write_bytes(os.urandom(8192))
+                    fresh = root / "new"
+                    fresh.mkdir()
+                    _ = (fresh / "new-file").write_bytes(os.urandom(4096))
+                    second = disk.measure(
+                        folders, lambda: filesystem.FilesystemUsage(0, 0), None,
+                        disk.previous_outside_measurement(disk.read_snapshot()),
+                    )
 
-        growth = next_file.stat().st_blocks * 512
-        by_path = {row["path"]: row for row in second["outside_build_caches"]}
-        self.assertEqual(second["previous_measured_at"], first["measured_at"])
-        self.assertEqual(by_path[str(old)]["growth_bytes"], growth)
-        self.assertEqual(by_path[str(child)]["growth_bytes"], growth)
-        self.assertEqual(by_path[str(old)]["largest_child_growth_bytes"], growth)
-        self.assertEqual(by_path[str(child)]["largest_child_path"], str(deep))
-        self.assertEqual(by_path[str(child)]["largest_child_growth_bytes"], growth)
-        self.assertNotIn(str(deep), by_path)
-        self.assertEqual(by_path[str(fresh)]["growth_bytes"], by_path[str(fresh)]["bytes"])
+                growth = next_file.stat().st_blocks * 512
+                by_path = {row["path"]: row for row in second["outside_build_caches"]}
+                self.assertEqual(second["previous_measured_at"], first["measured_at"])
+                self.assertEqual(by_path[str(old)]["bytes"], first_file.stat().st_blocks * 512 + growth)
+                self.assertEqual(by_path[str(old)]["growth_bytes"], growth)
+                self.assertEqual(by_path[str(child)]["growth_bytes"], growth)
+                self.assertEqual(by_path[str(old)]["largest_child_growth_bytes"], growth)
+                self.assertEqual(by_path[str(child)]["largest_child_path"], str(deep))
+                self.assertEqual(by_path[str(child)]["largest_child_growth_bytes"], growth)
+                self.assertNotIn(str(deep), by_path)
+                self.assertEqual(by_path[str(fresh)]["growth_bytes"], by_path[str(fresh)]["bytes"])
+                new_bytes = (fresh / "new-file").stat().st_blocks * 512
+                self.assertEqual(second["outside_build_cache_totals"], [
+                    {"label": label, "bytes": first_file.stat().st_blocks * 512 + growth + new_bytes,
+                     "growth_bytes": growth + new_bytes},
+                ])
 
     def test_deleted_directory_reduces_folder_growth_without_a_listed_row(self) -> None:
         root = self.base() / "tmp"
