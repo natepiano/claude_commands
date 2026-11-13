@@ -3525,36 +3525,10 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Phase 222 made every gate run shared recovery, so the whole-machine guest reached `gate_state_dir()` and `test_gate_trial.py` `GuestTests.test_guest_uses_whole_machine_without_types_with_timeout_and_counts` failed. Now a `WholeMachine` run skips shared recovery (`merge_gate.py:1408`) and keeps its `run.json` and `operation.lock` in a private `merge-gate-recovery-*` directory under tmpfs (`:879`), removed at normal or failed exit. Nested runs keep their existing recovery owner. Shared recovery is unchanged; the guest test is unchanged. 179 aws target tests and 230 merge gate tests pass. Checkpoint `ef465ee86`.
 
-### Phase 229 — Unit move and shutdown tests find and remove their in-process CPU  · status: todo
+### Phase 229 — Unit move and shutdown tests find and remove their in-process CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/test_unit_move.py` and `scripts/agents/test_shutdown_cli.py` cost less CPU in aws pairs, with every test and assertion kept.
+- `unit_move.processes_inside` scanned the host `/proc` and ignored `HERDR_PROC`, so one move mixed host processes with private test records. It now reads `herdr.proc_root()`; `herdr._proc_root` is renamed with no alias. The fixtures (`rename_unit_test_support.py`, `rename_test_support.py`) publish the private process records the host scan never needed; `UnitRenameFixture` links only its own direct children for one call and skips that bridge on Darwin. A direct test in `test_unit_move.py` covers exact, descendant, unrelated and deleted cwd paths. No assertion changes. aws pairs: unit move 18.22 to 17.47 CPU s, shutdown CLI 36.95 to 36.54 CPU s, lower in every pair; peak 148.0 to 147.4 and 226.7 to 225.7 MiB. natedev medians fell 32–35%, because natedev has many host processes. On the aws trial guest, 18 shutdown CLI resume tests fail on base and changed alike; impl4 diagnoses. Checkpoint `46ab6fa60`.
 
-**Decision:** director, 2026-11-12. Fresh evidence moves these modules ahead of order row 1. Recent gates: unit move 72.9–91.2 CPU s, shutdown CLI 61.9–75.4 CPU s (the architect's cached 6.342 s was stale). Both import `rename_unit_test_support.py`. Owner go: sdlc. Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Evidence (local `module_cost.py --tests 10 --commands 15`): unit move 74.6 CPU s, of which 59.97 s is the module process itself and 3.43 s is 3,553 Git children. Shutdown CLI 77.1 CPU s, of which 40.12 s is the module process and 8.92 s is 8,676 Git children (plus 1.96 s upload-pack, 0.97 s taplo). Most CPU is in-process Python, not child processes.
-2. Find where the in-process CPU goes. Use a sampling profiler (`py-spy record --native` or `py-spy dump` while the slow tests run) or paired timed runs. Do not trust cProfile totals: it inflated a 0.5 s cost to 6.19 s before. Start at the slowest tests: unit move `FolderBranchRecoveryTests.test_immediate_staff_rename_recovers_each_git_stage` (11.05 s), `UnitFolderMoveTests.test_resume_in_a_new_pane_closes_the_old_terminal_and_keeps_a_reused_pane` (7.36 s); shutdown `FolderRenameTests.test_rename_finishes_a_pending_folder_move_before_renaming_its_folder_and_branch` (13.76 s), `UnitRenameTests.test_rename_unit_preserves_staff_and_worker_identity` (10.22 s).
-3. Before you change code, send the director one message: the top hot spots with file:line and the share of CPU each holds, and the fix you propose for each. Wait for the director's answer.
-4. Allowed fix kinds: a test-only seed or shared fixture (the repository preparation at `rename_unit_test_support.py:315` repeats init, commit and worktree add per test); removal of a busy wait or repeated parse in test support; a fix in production code only where the waste is a production defect, and then in the file where it lives.
-5. Keep every test and assertion. Keep real Git where a test proves a Git stage. Keep fresh processes where a test proves a process boundary.
-6. Run both modules, `scripts.production.test_rename_unit_style` and every other importer of a changed file, from the worktree root with `scripts/lib/py -m unittest`. Run basedpyright on each changed file.
-
-**Files:**
-- `scripts/production/rename_unit_test_support.py`
-- `scripts/production/test_unit_move.py`
-- `scripts/agents/test_shutdown_cli.py`
-- Other files only after the director's answer at Spec step 3.
-
-**Workers:** 1 writer; the shared fixture and its importers move together.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 214: a new test row calls the function directly, not a whole launcher.
-- Phase 217: in-process imports stay in `sys.modules` until the module process exits; report peak memory.
-
-**Acceptance gate:**
-- All tests and assertions remain in both modules; importers pass; basedpyright clean.
-- aws pairs show a CPU gain for each module; paired peak memory is reported; sdlc sees the diff before land.
