@@ -8,6 +8,7 @@ from scripts.herdr import herdr_types
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
+from scripts.agents.test_support import write_machine_config
 
 import io
 import json
@@ -146,6 +147,7 @@ class RosterTests(unittest.TestCase):
         transport_config = self.root / "config"
         transport_config.mkdir()
         write_text_atomic(transport_config / "direct.conf", "# Worker settings.\n")
+        write_machine_config(transport_config)
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
@@ -859,7 +861,7 @@ class RosterTests(unittest.TestCase):
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
         entries = self._entries()
-        machine = socket.gethostname().split(".", 1)[0]
+        machine = roster.machine_name()
 
         self.assertEqual(entries["alpha"], roster.RosterEntry(
             machine=machine, kind="claude", role="showrunner", name="alpha",
@@ -869,6 +871,7 @@ class RosterTests(unittest.TestCase):
             director=roster.NoDirector(),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("acd50bad-5afa-5d3d-b155-3766b7d113e0"),
+            registry_name=roster.RegistryName("runner"),
             account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["unit-one"], roster.RosterEntry(
@@ -881,6 +884,7 @@ class RosterTests(unittest.TestCase):
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("17e44ec4-3e24-5ae1-b10d-5cf30de9455b"),
+            registry_name=roster.RegistryName("director"),
             account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["alpha-test"].role, "worker")
@@ -1396,6 +1400,24 @@ class RosterTests(unittest.TestCase):
         shown = roster.shown_name(free)
         self.assertIsInstance(shown.job, roster.JobUnassigned)
         self.assertEqual(shown.render(), "worker:run/name-review")
+        native = "746a93a1-733c-4b53-9e98-000000000001"
+        address = f"session:{native}"
+        for updated, registry_name in enumerate(("", "mac"), start=1):
+            with self.subTest(registry_name=registry_name):
+                self._write_session(f"unowned-mac-{updated}", registry_name, native, self.home,
+                                    status="idle", updated=updated)
+                status, lines, errors = self._run_main()
+                self.assertEqual((status, errors), (0, []))
+                label = f"mac [{address}]" if registry_name else address
+                self.assertTrue(any(line.strip() == f"freestanding {label} — claude, idle, freestanding session, ~"
+                                    for line in lines))
+                status, lines, errors = self._run_main("--json")
+                self.assertEqual((status, errors), (0, []))
+                document = cast(dict[str, object], json.loads("\n".join(lines)))
+                rows = cast(list[dict[str, object]], document["entries"])
+                row = next(row for row in rows if row["address"] == address)
+                self.assertEqual(row["name"], "")
+                self.assertEqual(row["shown_name"], registry_name or address)
 
     def test_unit_rename_and_transfer_change_only_shown_location(self) -> None:
         original = replace(self._entry("fixed-address", "worker", "worker:run/fixed-address", kind="codex"),
@@ -1718,7 +1740,7 @@ class RosterTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abd1a227-f410-5c76-bc96-a0c77c0f3ef0"}):
             result, lines, errors = self._run_main(native_identity="abd1a227-f410-5c76-bc96-a0c77c0f3ef0")
         self.assertEqual((result, errors), (0, []))
-        self.assertTrue(any("session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0 (you)" in line for line in lines))
+        self.assertTrue(any("newest-free [session:abd1a227-f410-5c76-bc96-a0c77c0f3ef0] (you)" in line for line in lines))
 
     def test_showrunner_socket_identity_beats_a_duplicate_display_name(self) -> None:
         self._write_session(
@@ -2517,16 +2539,20 @@ class RosterTests(unittest.TestCase):
 
     def test_snapshot_without_account_decodes_as_peer_attribution_unavailable(self) -> None:
         row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
-                      machine="mac", account=roster.AccountLabel("claude3"))
+                      machine="mac", account=roster.AccountLabel("claude3"), registry_name=roster.RegistryName("mac"))
         encoded = roster.RosterSnapshot(roster.Roster([row], [])).encode()
         self.assertEqual(roster.RosterSnapshot.decode(encoded).result.entries[0].account,
                          roster.AccountLabel("claude3"))
+        self.assertEqual(roster.RosterSnapshot.decode(encoded).result.entries[0].registry_name,
+                         roster.RegistryName("mac"))
         old = cast(dict[str, object], json.loads(encoded))
         entries = cast(list[dict[str, object]], old["entries"])
         del entries[0]["account"]
+        del entries[0]["registry_name"]
         decoded = roster.RosterSnapshot.decode(json.dumps(old)).result.entries[0]
         self.assertEqual(decoded.name, "Mac director")
         self.assertIsInstance(decoded.account, roster.AccountAttributionUnavailable)
+        self.assertEqual(decoded.registry_name, roster.NoRegistryName())
 
     def test_peer_snapshot_timeout_keeps_the_machine_and_failure_reason(self) -> None:
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 20)):
@@ -2685,6 +2711,7 @@ class PaneRosterTests(StaffTestCase):
         config = self.root / "config"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")
+        write_machine_config(config)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
              mock.patch.object(account, "process_config_dir", return_value=None), \
@@ -2712,6 +2739,7 @@ class PaneRosterTests(StaffTestCase):
         config = self.root / "config"
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# Worker settings.\n")
+        write_machine_config(config)
         before = self.staff_file.read_bytes()
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config), "ROSTER_RUN_ROOT": str(self.root / "runs")}),
               mock.patch.object(worker_panes, "_client", return_value=world),

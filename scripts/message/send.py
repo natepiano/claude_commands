@@ -42,7 +42,7 @@ Worker addresses use native IDs from the local or peer roster for staff lookup.
 Each message records its runtime sender ID separately from `--from`.
 Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
 Queues and SSH forwarding retain the original sender ID.
-`--here` checks only this machine. `--machine` runs this script on HOST over ssh.
+`--here` checks only this machine. `--machine` accepts a configured alias or host name and uses its SSH alias.
 
 `--to user` requires a registered `--text-id`. The template supplies the title and action. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
@@ -142,6 +142,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 from scripts.herdr.place import HerdrPlace
+from scripts.agents import remote as machine_routes
 from scripts.herdr import herdr_types
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
@@ -3075,7 +3076,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--repeat-minutes", type=float,
                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
-    _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    _ = location.add_argument("--machine", help="deliver from a configured machine alias or host name")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
@@ -3178,6 +3179,11 @@ def parse(argv: list[str]) -> Options:
         action = parsed_action
     selection = RosterLookup(to)
     host = optional_str(attr(args, "machine"))
+    if host is not None:
+        mapped = machine_routes.machine_alias(host)
+        if isinstance(mapped, machine_routes.MachineNameRefused):
+            parser.error(mapped.reason)
+        host = mapped.alias
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
