@@ -775,6 +775,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Unit, Status, Machine, and Progress keep their text.
     The script fits both tables at that width without changing the style table.
     Each column can only grow in a wider terminal.
+    The minimums depend on live data: a long unit name or id can put them over the floor.
+    About 6% of width reads meet a herdr wait of about 100 ms; those runs shape for the floor, so a wide window can show break spaces.
+    `:` is no break mark, because it splits times such as `17:24`.
+    A zero-width space cannot replace the break space: Claude Code 2.1.319 wraps only at plain spaces.
+    A renderer change needs a new measure of the width rule.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
