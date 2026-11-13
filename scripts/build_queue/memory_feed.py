@@ -680,11 +680,13 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild]) -> Mapping[int, unit_
     if not builds:
         return {}
     try:
-        claims = [claim.record for claim in claim_state.read_claims(claim_state.state_paths())
-                  if claim.record.get("remote_host", "mac") == "mac"]
+        held_claims = [claim for claim in claim_state.read_claims(claim_state.state_paths())
+                       if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
     except claim_state.StateReadError:
         return {}
-    leases = [lease for lease in copies.held_remote_mirrors() if lease.identity.host == "mac"]
+    claims = [claim.record for claim in held_claims]
+    leases = [lease for lease in copies.held_remote_mirrors()
+              if lease.identity.host.rsplit("@", 1)[-1] == "mac"]
     labels = unit_labels.unit_labels_for([claim["submitting_session"] for claim in claims], os.environ)
 
     def contains(folder: str, project: str) -> bool:
@@ -704,11 +706,21 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild]) -> Mapping[int, unit_
             sessions.add(build.session)
         matches = {labels[claim["submitting_session"]] for claim in claims
                    if claim["submitting_session"] in labels and
+                   (not build.session or build.session == claim["submitting_session"]) and
                    (contains(claim["worktree"], build.folder) or
                     claim["submitting_session"] in sessions and
                     claim.get("repo_name", "") == build.repository)}
         if len(matches) == 1:
             result[build.pid] = next(iter(matches))
+        elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
+              not any(contains(claim["worktree"], build.folder) for claim in claims)):
+            repository_claims = [claim for claim in held_claims
+                                 if isinstance(claim.scope, claim_state.RepositoryScope) and
+                                 claim.scope.name == build.repository]
+            if len(repository_claims) == 1:
+                session = repository_claims[0].record["submitting_session"]
+                if session in labels:
+                    result[build.pid] = labels[session]
     return result
 
 

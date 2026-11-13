@@ -162,6 +162,48 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
+    def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
+        for origin in queue_view.MacBuildOrigin:
+            with self.subTest(origin=origin):
+                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin)
+                row = queue_view.mac_build_record(build)
+                self.assertEqual(queue_view.mac_build_from_record(row), build)
+                del row["origin"]
+                self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
+
+    def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            processes: dict[int, dict[str, object]] = {
+                100: {"parent": 90, "command": "/bin/cargo build", "executable": "/bin/cargo",
+                      "resident_bytes": 1234, "started_at": NOW},
+                90: {"parent": 80, "command": "/bin/sh build.sh", "executable": "/bin/sh",
+                     "resident_bytes": 0, "started_at": NOW},
+                80: {"parent": 1, "command": "", "executable": "/runner", "resident_bytes": 0, "started_at": NOW},
+            }
+            for command, parent, expected in (
+                ("/actions/Runner.Worker spawn", 1, "ci"),
+                ('"/actions runner/Runner.Listener" run', 1, "ci"),
+                ("/bin/echo Runner.Worker", 1, "non-ci"),
+                ("/actions/Runner.Worker-helper", 1, "non-ci"),
+                ("/bin/sh build.sh", 90, "non-ci"),
+            ):
+                with self.subTest(command=command, parent=parent):
+                    processes[80]["command"] = command
+                    processes[80]["parent"] = parent
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        f"read_processes = lambda: {processes!r}\n" +
+                        "read_captures = lambda processes: {}\n" +
+                        f"output = lambda arguments: 'p100\\nn{folder}\\n'\n" +
+                        "repository_name = lambda folder: 'hana'\n" +
+                        "print(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["pid"], 100)
+                    self.assertEqual(rows[0]["origin"], expected)
+
     def test_mac_names_use_the_package_then_the_repository(self) -> None:
         for command, repository, expected in (
             ("cargo build --release -p hana", "", "hana build"),
