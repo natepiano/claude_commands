@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
@@ -73,11 +74,20 @@ class UnitWithoutRunningDirector:
 DirectorRelationship = DirectsUnit | UnderDirector | UnitWithoutRunningDirector | NoDirector
 
 
+class OwnerRole(StrEnum):
+    """The role of the owner for whom a session runs a step."""
+
+    UNKNOWN = "unknown"
+    SHOWRUNNER = "showrunner"
+    UNIT = "unit"
+
+
 @dataclass(frozen=True)
 class UnitLabels:
     session: str
     showrunner: str = "—"
     unit: str = "—"
+    role: OwnerRole = OwnerRole.UNKNOWN
 
     @property
     def owner_text(self) -> str:
@@ -105,7 +115,15 @@ def make_labels(name: str, showrunner: ShowrunnerRelationship,
     production = " ".join(production_of(showrunner).split())
     unit = " ".join(unit_of(director).split())
     session = " ".join(name.split())
-    return UnitLabels(session, production or "—", unit or "—")
+    if isinstance(showrunner, RunsProduction):
+        role = OwnerRole.SHOWRUNNER
+    elif isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)):
+        role = OwnerRole.UNIT
+    elif isinstance(showrunner, (UnderShowrunner, ProductionWithoutRunningShowrunner)):
+        role = OwnerRole.SHOWRUNNER
+    else:
+        role = OwnerRole.UNKNOWN
+    return UnitLabels(session, production or "—", unit or "—", role)
 
 
 def production_of(showrunner: ShowrunnerRelationship) -> str:
@@ -343,10 +361,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                                             known_sessions={record["sessionId"]: record for record in records},
                                             membership=record, resolver=resolver)
         runners = showrunner_ids(records, registered, membership=record)
-        directors: dict[str, str] = {
-            row.current_session: parent.current_session for row in record.find(kind="worker")
-            if (parent := record.parent_of(row)) is not None}
-        places = production_places(records, set(directors), diagnostics,
+        workers: dict[str, staff.StaffRow] = {
+            row.current_session: row for row in record.find(kind="worker")
+            if record.parent_of(row) is not None}
+        places = production_places(records, set(workers), diagnostics,
                                    record=record, resolver=resolver)
         # Read names from staff for the native sessions in this registry.
         names: dict[str, str] = {
@@ -361,15 +379,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             elif session_id in places:
                 showrunner = places[session_id].showrunner
                 director = places[session_id].director
-            elif session_id in directors:
-                owner = directors[session_id]
-                place = places.get(owner)
-                unit = ""
-                if place is not None:
-                    showrunner = place.showrunner
-                    unit = place.director.unit
-                director = (UnderDirector(unit, names[owner], f"session:{owner}")
-                            if owner in names else UnitWithoutRunningDirector(unit))
+            elif session_id in workers:
+                director, showrunner = staff_relationships(
+                    record, workers[session_id], names,
+                    {key: place.showrunner for key, place in places.items()})
             labels[session_id] = make_labels(names[session_id], showrunner, director)
         labels.update(codex_unit_labels(wanted - labels.keys(), records, places, membership=record))
         labels.update(recorded_owner_labels(wanted - labels.keys(), record))

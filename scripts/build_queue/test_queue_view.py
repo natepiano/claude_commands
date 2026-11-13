@@ -77,10 +77,11 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     running = replace(model.reading.view.running[0], session_id=identity.session_id,
                                       session_name=identity.name, unit=identity.unit)
                     for step in (waiter, running):
-                        self.assertEqual(queue_evidence.step_labels(step, labels), UnitLabels(owner.name, "hana", "demo"))
+                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT)
+                        self.assertEqual(queue_evidence.step_labels(step, labels), expected)
                     cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
                     self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
-                                     UnitLabels(owner.name, "hana", "demo"))
+                                     expected)
 
     def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
@@ -162,6 +163,77 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
+    def test_project_record_returns_empty_for_an_unreadable_folder(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folder = fixture.root / "unreadable"
+            folder.mkdir()
+            folder.chmod(0)
+            try:
+                script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                    f"print(json.dumps(project_record({str(folder)!r})))")
+                result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+            finally:
+                folder.chmod(0o700)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(json.loads(result.stdout.removesuffix("rc=0\n")),
+                             {"recorded_unit": "", "session": "", "repository": ""})
+
+    def test_project_record_catches_each_filesystem_error(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            for operation in ("resolve", "is_symlink", "stat", "exists", "read_text"):
+                with self.subTest(operation=operation):
+                    record = fixture.root / ".copy-record.json"
+                    if operation == "read_text":
+                        _ = record.write_text('{}')
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        "from unittest.mock import patch\n"
+                        + f"with patch.object(Path, {operation!r}, side_effect=PermissionError('unreadable')):\n"
+                        + f"    print(json.dumps(project_record({str(fixture.root)!r})))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(json.loads(result.stdout.removesuffix("rc=0\n")),
+                                     {"recorded_unit": "", "session": "", "repository": ""})
+
+    def test_mac_reader_keeps_rows_when_one_row_field_fails(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            folders = {pid: str(fixture.root / str(pid)) for pid in (100, 200, 300)}
+            processes = {pid: {"parent": 1, "command": "cargo build", "executable": "/bin/cargo",
+                              "resident_bytes": pid, "started_at": NOW + pid} for pid in folders}
+            captures = {pid: {"folder": folder, "command": "cargo build", "progress_tail": ""}
+                        for pid, folder in folders.items()}
+            for failed in ("project_record", "repository_name", "running_test_pid", "build_origin"):
+                with self.subTest(failed=failed):
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                        f"read_processes = lambda: {processes!r}\n"
+                        + f"read_captures = lambda processes: {captures!r}\n"
+                        + "output = lambda arguments: ''\n"
+                        + "def project_record(folder):\n"
+                        + "    return dict(recorded_unit='unit', session='session', repository='')\n"
+                        + "repository_name = lambda folder: 'repo'\n"
+                        + "running_test_pid = lambda pid, *args: pid + 1\n"
+                        + "build_origin = lambda pid, processes: 'ci'\n"
+                        + f"original = {failed}\n"
+                        + "def fail_one(value, *args):\n"
+                        + f"    if value in (200, {folders[200]!r}):\n"
+                        + "        raise PermissionError('unreadable row')\n"
+                        + "    return original(value, *args)\n"
+                        + f"{failed} = fail_one\nprint(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    self.assertEqual([row["pid"] for row in rows], [100, 200, 300])
+                    for row in rows:
+                        bad = row["pid"] == 200
+                        self.assertEqual(row["recorded_unit"], "" if bad and failed == "project_record" else "unit")
+                        self.assertEqual(row["session"], "" if bad and failed == "project_record" else "session")
+                        self.assertEqual(row["repository"], "" if bad and failed == "repository_name" else "repo")
+                        self.assertEqual(row["test_pid"], -1 if bad and failed == "running_test_pid" else int(cast(int, row["pid"])) + 1)
+                        self.assertEqual(row["origin"], "unknown" if bad and failed == "build_origin" else "ci")
+
     def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
         for origin in queue_view.MacBuildOrigin:
             with self.subTest(origin=origin):
@@ -441,6 +513,35 @@ class MacQueueViewTests(unittest.TestCase):
 
 
 class CloudQueueViewTests(unittest.TestCase):
+    def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
+        model = self.cloud_model()[0]
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        for step, owner, expected in (
+            ("targeted-test", director, "panes targeted"),
+            ("merge-gate", director, "panes merge"),
+            ("merge-gate", runner, "showrunner merge"),
+            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
+            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
+            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("build", director, "build"),
+            ("literal{step}", director, "literal{step}"),
+        ):
+            with self.subTest(step=step, owner=owner):
+                current = replace(row, identity=replace(row.identity, step=step))
+                labeled = replace(model, labels={row.identity.session_id: owner})
+                self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
+        current = replace(row, identity=replace(row.identity, step="targeted-test"))
+        settings = dict(model.names.settings)
+        settings["owned.targeted-test"] = "targeted for {unit}"
+        configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
+        self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
+        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
+        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))
         empty_mac_reading(fixture)

@@ -1963,7 +1963,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 #### As-built
 
 - `SharedCPUPool.acquire` in `scripts/production/merge_gate.py` waits in `select` on the jobserver descriptor and a private signal wakeup pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`, `signal.set_wakeup_fd`). A stop signal wakes the wait when the kernel delivers it to another thread, or when it arrives just before the wait starts. Either case used to leave the gate blocked in `read()` until the 600 s hang guard.
-- When the jobserver is readable, `acquire` takes the token through `try_acquire` inside `build_folders.defer_signals()`. Another gate can take the token first; the loop then waits again. `try_acquire` keeps the empty-read `GateRefused` and slot ownership.
+- When the jobserver is readable, `acquire` takes the token through `try_acquire` inside `cancellation.defer_cleanup_signals()`. Another gate can take the token first. The loop then waits again. `try_acquire` keeps the empty-read `GateRefused` and slot ownership.
 - `test_merge_gate_suites_resources.py` patches `select.select` and waits on the real `pool.blocking`. `test_stop_during_a_blocking_read_returns_every_owned_slot` has rows `before_wait`, `process` and `sender_thread` (`signal.pthread_kill` to the sender thread). `test_stop_after_blocking_acquisition_returns_the_new_slot_too` has rows `read` and `return`. Every row requires every token to return.
 - Measured on copies with a 3 s guard: guard waits 11/40 alone and 1/40 under CPU load before; 0/40 and 0/40 after.
 
@@ -1972,7 +1972,7 @@ A changed `config/<name>.conf` selects every test module whose transitive import
 - `scripts/production/test_merge_gate_suites_resources.py` — the stop and acquire rows
 
 **Gotchas:**
-- The wakeup descriptor is set and restored inside `build_folders.defer_signals()`. `ExitStack` restores the previous wakeup descriptor before it closes the pipe.
+- The wakeup descriptor is set and restored inside `cancellation.defer_cleanup_signals()`. `ExitStack` restores the previous wakeup descriptor before it closes the pipe.
 
 **Ruled out:**
 - A signal pipe in the test fixture only: it hides the production race.
@@ -3476,7 +3476,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 #### As-built
 
-- `scripts/production/merge_gate.py` and `scripts/test_times/module_run.py` install no signal handlers. The old `defer_signals` windows use the `pthread_sigmask` context; `rollback_signals` and its `gate_box.py` caller are gone. Each gate writes one run record (pid and start identity, process groups, tmp roots, FIFO CPU tokens, rollback intent) by atomic rename; a clean end removes it. The next gate start recovers a dead gate's record: it sends SIGTERM then SIGKILL to its groups (SIGKILL also when the leader has ended), restores tokens, removes folders and rolls back under the checkout lock after a HEAD check. Failed recovery keeps the record. Module children get SIGKILL parent death; `module_run.py` keeps the SIGKILL status without a signal reset. Signal tests assert exact statuses (SIGINT 1, else `-signal`). Also touches queue (builds ruling): `queue_place.py` `defer_cleanup_signals` reads the previous mask first and blocks inside the `try`; one row in `test_queue_place.py`. 17 modules, 323 pass. Checkpoint `b17e9b84e`.
+- `scripts/production/merge_gate.py` and `scripts/test_times/module_run.py` install no signal handlers. Cleanup uses `cancellation.defer_cleanup_signals()`, which blocks signals through `pthread_sigmask`. The rollback handler and its `gate_box.py` caller are gone. Each gate writes one run record by atomic rename. The record contains process identities, groups, temporary roots, CPU tokens, and rollback intent. A clean end removes it. The next gate recovers a dead gate’s record. Recovery sends TERM, then KILL, to its groups even if the leader ended. Recovery restores tokens and removes folders. It checks HEAD under the checkout lock before rollback. Failed recovery keeps the record. Module children receive KILL when their parent dies. Signal tests require exact statuses: INT gives 1; other signals give `-signal`. Queue cleanup reads the previous mask before it blocks signals inside `try`. The queue test checks this order. Validation passed 323 tests in 17 modules. Checkpoint: `b17e9b84e`.
 
 ### Phase 223 — Simplify lens tests call the daily command in process  · status: done
 **Depends on:** none
@@ -3554,7 +3554,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Two of the five chain415 failures came from this branch. `buildlog/test_gate_index.py` now expects the nullable `vcpus` column from Phase 219.
 - Phase 222 masked cancellation signals only in the calling thread. A process-directed SIGINT taken by another thread broke `reap_gate_job`: it lost status and CPU, then raised `ChildProcessError`. `scripts/lib/cancellation.py` now owns `CANCELLATION_SIGNALS`, `defer_cleanup_signals` and `start_masked_thread`, which starts an existing thread under the mask so it inherits it. The gate_box guest memory monitor, the queue_place sampler, the `copies.available_tree` waiter and the admission test fixture loop start through it. QueuePlace records its child before the sampler starts. No signal handlers.
 - Base failures with owners, sent to builds: `direct/test_verify_admission_signals.py` (builds-queue `730e73dc1`, build-followups-test-speed `f085ddb08a`), `herdr/test_worker_panes.py` (staff-copies `7676e0473`, quota-refusal `b711e365a`), `review_links/test_change_page.py` (sdlc-fix-rounds `8786bfbef3`).
-- `build_folders.defer_signals` still installs signal handlers. sdlc devtools owns it and has ordered its deletion. Checkpoint `4f09f6f20`.
+- The nosignals phase removes the unused signal recorder from `build_folders.py`. Callers keep `cancellation.defer_cleanup_signals()`, which uses a signal mask. The earlier deletion order was recorded at checkpoint `4f09f6f20`.
 
 ### Phase 233 — The lifecycle tests reuse one running-state repository  · status: done
 **Depends on:** Phase 232

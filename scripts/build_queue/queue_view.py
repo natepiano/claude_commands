@@ -299,26 +299,29 @@ def read_captures(processes):
 
 
 def project_record(folder):
-    tree = Path(folder).resolve()
-    for parent in (tree, *tree.parents):
-        for name in (".copy-record.json", ".scratch.json", ".gate.json", ".gate-copy.json"):
-            record = parent / name
-            try:
-                if record.is_symlink() or record.stat().st_size > 65536:
+    try:
+        tree = Path(folder).resolve()
+        for parent in (tree, *tree.parents):
+            for name in (".copy-record.json", ".scratch.json", ".gate.json", ".gate-copy.json"):
+                record = parent / name
+                try:
+                    if record.is_symlink() or record.stat().st_size > 65536:
+                        continue
+                    values = json.loads(record.read_text())
+                    owner = values.get("owner_unit", values.get("owner", ""))
+                    session = values.get("session", values.get("holder_session", ""))
+                    repo = values.get("repo", "")
+                    if name == ".gate-copy.json" and not tree.is_relative_to(parent):
+                        continue
+                    return dict(recorded_unit=owner if isinstance(owner, str) else "",
+                                session=session if isinstance(session, str) else "",
+                                repository=repo if isinstance(repo, str) else "")
+                except (FileNotFoundError, ValueError, TypeError):
                     continue
-                values = json.loads(record.read_text())
-                owner = values.get("owner_unit", values.get("owner", ""))
-                session = values.get("session", values.get("holder_session", ""))
-                repo = values.get("repo", "")
-                if name == ".gate-copy.json" and not tree.is_relative_to(parent):
-                    continue
-                return dict(recorded_unit=owner if isinstance(owner, str) else "",
-                            session=session if isinstance(session, str) else "",
-                            repository=repo if isinstance(repo, str) else "")
-            except (OSError, ValueError, TypeError):
-                continue
-        if (parent / ".git").exists():
-            break
+            if (parent / ".git").exists():
+                break
+    except OSError:
+        pass
     return dict(recorded_unit="", session="", repository="")
 
 
@@ -492,18 +495,36 @@ def read_builds():
         folder = capture.get("folder", cwd.get(pid, ""))
         if not folder:
             continue
-        record = project_record(folder)
+        try:
+            record = project_record(folder)
+        except Exception:
+            record = dict(recorded_unit="", session="", repository="")
         command = capture.get("command", processes[pid]["command"])
-        test_pid = running_test_pid(pid, folder, command, members, processes)
+        try:
+            test_pid = running_test_pid(pid, folder, command, members, processes)
+        except Exception:
+            test_pid = -1
+        try:
+            repository = record["repository"] or repository_name(folder)
+        except Exception:
+            repository = ""
+        try:
+            origin = build_origin(pid, processes)
+        except Exception:
+            origin = "unknown"
+        try:
+            folder = str(Path(folder).resolve())
+        except OSError:
+            pass
         tail = capture.get("progress_tail", "")
         if not tail and capture_ids:
             tail = captures[min(capture_ids, key=lambda value: processes[value]["started_at"])]["progress_tail"]
-        builds.append(dict(pid=pid, folder=str(Path(folder).resolve()), started_at=processes[pid]["started_at"],
+        builds.append(dict(pid=pid, folder=folder, started_at=processes[pid]["started_at"],
                            command=command, test_pid=test_pid,
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
-                           progress_tail=tail, repository=record["repository"] or repository_name(folder),
+                           progress_tail=tail, repository=repository,
                            recorded_unit=record["recorded_unit"], session=record["session"],
-                           origin=build_origin(pid, processes)))
+                           origin=origin))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
@@ -960,6 +981,15 @@ def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
     label = model.cloud_labels.get(identity.session_id, UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED))
     return replace(label, unit=gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels)
                    or unit_labels.OWNER_NOT_RECORDED)
+
+
+def cloud_step_name(row: wire.CloudRow, model: QueueModel) -> str:
+    """Name page steps from their recorded owner's labels."""
+    label = model.cloud_labels.get(row.identity.session_id)
+    if label is None:
+        return model.names.shown(row.identity.step)
+    unit = label.unit if label.unit not in ("", "—", unit_labels.OWNER_NOT_RECORDED) else ""
+    return model.names.for_owner(row.identity.step, unit, label.role)
 
 
 @dataclass(frozen=True)

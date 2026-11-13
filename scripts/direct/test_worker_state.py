@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from contextlib import redirect_stderr
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.direct import worker_state
@@ -27,9 +27,19 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class WorkerClaimTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        scope = json.dumps(["test-host", "test-boot", "test-namespace"])
+        scope_patch = patch.object(worker_state, "_claim_scope", return_value=scope)
+        _ = scope_patch.start()
+        self.addCleanup(scope_patch.stop)
+
     def write_claim(self, run: Path, pid: int, started: str) -> Path:
         path = run / "impl_claim_impl.json"
-        _ = path.write_text(json.dumps({"pid": pid, "started": started, "worker": "impl"}))
+        worker_state.publish_worker_claim(path, "impl")
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update({"pid": pid, "started": started})
+        _ = path.write_text(json.dumps(record))
         return path
 
     def test_an_absent_file_has_no_worker_claim(self) -> None:
@@ -49,11 +59,44 @@ class WorkerClaimTests(unittest.TestCase):
             _ = claim.write_text("{}")
             self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.NoWorkerClaim)
 
-    def test_a_live_pid_without_a_start_has_an_ended_claim(self) -> None:
+    def test_a_live_pid_without_a_start_keeps_its_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            claim = Path(directory) / "claim.json"
-            _ = claim.write_text(json.dumps({"pid": os.getpid(), "worker": "impl"}))
-            self.assertIsInstance(worker_state.read_worker_claim(claim), worker_state.EndedWorkerClaim)
+            run = Path(directory)
+            claim = run / "impl_claim_impl.json"
+            worker_state.publish_worker_claim(claim, "impl")
+            record = cast(dict[str, object], json.loads(claim.read_text()))
+            del record["started"]
+            _ = claim.write_text(json.dumps(record))
+            status = run / "impl_status_impl"
+            _ = status.write_text("implementing\n")
+            self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(os.getpid()))
+            _ = worker_state.worker_status_paths(run)
+            self.assertEqual(status.read_text(), "implementing\n")
+            self.assertFalse((run / "board.log").exists())
+
+    def test_missing_or_foreign_scope_cannot_recover_a_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            claim = self.write_claim(run, os.getpid(), "different-start")
+            original = cast(dict[str, object], json.loads(claim.read_text()))
+            scope = cast(list[str], json.loads(str(original["scope"])))
+            for part in ("missing", "host", "boot", "namespace", "unreadable"):
+                with self.subTest(part=part):
+                    record = dict(original)
+                    if part == "missing":
+                        del record["scope"]
+                    elif part != "unreadable":
+                        changed = list(scope)
+                        changed[("host", "boot", "namespace").index(part)] += "-foreign"
+                        record["scope"] = json.dumps(changed)
+                    _ = claim.write_text(json.dumps(record))
+                    status = run / "impl_status_impl"
+                    _ = status.write_text("implementing\n")
+                    with patch.object(worker_state, "_claim_scope", return_value="" if part == "unreadable" else original["scope"]):
+                        self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(os.getpid()))
+                        _ = worker_state.worker_status_paths(run)
+                    self.assertEqual(status.read_text(), "implementing\n")
+                    self.assertFalse((run / "board.log").exists())
 
     def test_publication_records_the_launcher_start_and_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -62,6 +105,9 @@ class WorkerClaimTests(unittest.TestCase):
             assert isinstance(started, process_start.Started)
             worker_state.publish_worker_claim(claim, "impl")
             record = cast(dict[str, object], json.loads(claim.read_text()))
+            scope = record.pop("scope")
+            self.assertIsInstance(scope, str)
+            self.assertTrue(scope)
             self.assertEqual(record, {"pid": os.getpid(), "started": started.start, "worker": "impl"})
 
     def test_publication_reports_an_unreadable_start_and_records_the_launcher_and_worker(self) -> None:
@@ -74,7 +120,9 @@ class WorkerClaimTests(unittest.TestCase):
             with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(proc.parent)}), patch.object(sys, "platform", "linux"), redirect_stderr(errors):
                 worker_state.publish_worker_claim(claim, "impl")
             record = cast(dict[str, object], json.loads(claim.read_text()))
+            self.assertTrue(record.pop("scope"))
             self.assertEqual(record, {"pid": os.getpid(), "worker": "impl"})
+            self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(os.getpid()))
             diagnostic, = errors.getvalue().splitlines()
             self.assertTrue(diagnostic.startswith("anomaly: "), diagnostic)
 

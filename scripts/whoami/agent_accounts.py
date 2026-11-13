@@ -362,6 +362,18 @@ class UsageSaveFailed:
 UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
 
 
+@dataclass(frozen=True)
+class LoginEndKnown:
+    """The server time limit for a Claude login."""
+
+    at: datetime
+
+
+@dataclass(frozen=True)
+class LoginEndUnknown:
+    """The reading has no login end date."""
+
+
 def usage_store_warning_line(warning: UsageStoreWarning) -> str:
     if isinstance(warning, UsageClaimFailed):
         return f"usage store: could not claim the read; {warning.reason}; read without a hold"
@@ -392,6 +404,7 @@ class Report:
     usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
     store_warnings: tuple[UsageStoreWarning, ...] = ()
+    login_ends_at: LoginEndKnown | LoginEndUnknown = field(default_factory=LoginEndUnknown)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -424,6 +437,7 @@ class ClaudeOauth(TypedDict, total=False):
     subscriptionType: str
     # Epoch milliseconds.
     expiresAt: int
+    refreshTokenExpiresAt: int | None
 
 
 class ClaudeCredentials(TypedDict, total=False):
@@ -523,6 +537,17 @@ def parse_reset(value: object) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+def login_end_from_iso(value: object) -> LoginEndKnown | LoginEndUnknown:
+    """Decode a stored login end date without using the machine's zone."""
+    at = parse_reset(value) if isinstance(value, str) else None
+    return LoginEndKnown(at.astimezone(timezone.utc)) if at is not None and at.tzinfo is not None else LoginEndUnknown()
+
+
+def login_end_iso(value: LoginEndKnown | LoginEndUnknown) -> str | None:
+    """Encode a known login end date as UTC for stored and public JSON."""
+    return value.at.astimezone(timezone.utc).isoformat() if isinstance(value, LoginEndKnown) else None
 
 
 def executable(name: str) -> str:
@@ -815,6 +840,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             if not stored_credentials:
                 stored_credentials = claude_credentials() if config_dir is None else claude_credentials(config_dir)
             oauth = stored_credentials.get("claudeAiOauth", {})
+            login_end = oauth.get("refreshTokenExpiresAt")
+            if login_end is not None:
+                report.login_ends_at = LoginEndKnown(datetime.fromtimestamp(login_end / 1000, timezone.utc))
             token = oauth.get("accessToken")
             expires = oauth.get("expiresAt")
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.
