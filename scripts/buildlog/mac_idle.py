@@ -329,7 +329,7 @@ def repair_message(call: VerifyCall, cause: str) -> str:
 
 @dataclass(frozen=True)
 class NatedevJobOnMac:
-    """A legacy job or a live claim whose Mac work has not gone idle."""
+    """A local or CI job is working on the Mac."""
 
 
 class FreeMac:
@@ -358,7 +358,8 @@ class MacStateUnreadable:
     reason: str
 
 
-def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | MacUnreachable | MacStateUnreadable:
+def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
+             ) -> NatedevJobOnMac | IdleMac | MacUnreachable | MacStateUnreadable:
     """Use the claim owner's live rule and its saved work reading; never contact the Mac."""
     from scripts.mac_test import mac_test
 
@@ -368,7 +369,9 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
         live = tuple(claim for claim in mac_test.read_claims(mac_test.StatePaths(paths.mac_state))
                      if mac_test.run_is_live(claim.record))
         block = mac_test.read_block(paths.mac_state / "block.json")
-        if any("work_idle_since" not in claim.record for claim in live):
+        if (any("work_idle_since" not in claim.record for claim in live)
+                or isinstance(block, mac_test.PendingMacBlock)
+                and isinstance(block.waiting_on, mac_test.WaitingOnCiMacJob)):
             return NatedevJobOnMac()
         try:
             until = float((paths.mac_state / "unreachable_until").read_text())
@@ -385,6 +388,10 @@ def mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | IdleMac | Mac
             holder = claim.get("holder_session", "")
             delivery = mac_test.RecordedSession(holder, holder) if holder else mac_test.HolderQueue("unknown")
             return IdleReservation("claim_idle", holder, claim["what"], delivery, live)
+        if waiting_for_mac:
+            config = mac_test.read_config()
+            if config.ci_repo and isinstance(mac_test.ci_activity(config), mac_test.CiMacJobRunning):
+                return NatedevJobOnMac()
         return FreeMac()
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))
@@ -486,10 +493,10 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
         except BlockingIOError:
             return
         idle_file = paths.state / "idle.json"
-        reading = mac_work(paths, now)
         has_steps = any(step_record.record_directory().glob("*.json"))
         live: dict[int, LiveProcess] = {}
         calls = waiting_calls(paths, live) if has_steps else ()
+        reading = mac_work(paths, now, waiting_for_mac=bool(calls))
         settings = mac_idle_alert.read_idle_config()
         calls = calls_past_wait_limit(paths, calls, now, settings.alert_seconds)
         previous = mac_idle_alert.read_alert(paths.state / "alert.json")

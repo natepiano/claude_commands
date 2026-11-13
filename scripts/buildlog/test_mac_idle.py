@@ -102,6 +102,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
         self.step()
         _ = self.enterContext(mock.patch.object(mac_idle, "notify_outage", return_value=True))
+        _ = self.enterContext(mock.patch.object(mac_test, "run_gh", return_value=mac_test.GhAnswer("[]")))
 
     def step(self, kind: str = "test", state: step_record.StepState = step_record.StepState.WAITING_HOLD,
              mac_allowed: bool = True, updated: str = "1970-01-01T00:16:40Z") -> None:
@@ -510,6 +511,71 @@ done
             mac_idle.watch_once(self.paths, 1600, 100)
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["state"], saved["waiting"]), ("busy", 1))
+
+    def test_ci_mac_work_controls_idle_alerts_only_while_steps_wait(self) -> None:
+        for block_kind, job_status, steps_wait, state, cause, lookups in (
+            ("ci_mac_job", "in_progress", True, "busy", "", 0),
+            ("ci_job", "queued", True, "idle", "blocked", 0),
+            ("", "in_progress", True, "busy", "", 3),
+            ("", "completed", True, "idle", "free", 3),
+            ("", "unknown", True, "idle", "free", 1),
+            ("", "in_progress", False, "idle", "free", 0),
+            ("active", "in_progress", True, "idle", "blocked", 0),
+            ("claim", "in_progress", True, "idle", "claim_idle", 0),
+            ("", "queued before running", True, "busy", "", 4),
+        ):
+            with self.subTest(block=block_kind, job=job_status, steps_wait=steps_wait):
+                (self.paths.mac_state / "block.json").unlink(missing_ok=True)
+                (self.paths.mac_state / "claims/research.json").unlink(missing_ok=True)
+                (self.paths.state / "alert.json").unlink(missing_ok=True)
+                mac_idle.marker_path(self.paths, self.call.call_id).unlink(missing_ok=True)
+                mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
+                self.step()
+                if not steps_wait:
+                    step_record.record_path(self.call.call_id).unlink()
+                if block_kind in ("ci_job", "ci_mac_job"):
+                    since = datetime.fromtimestamp(1000, timezone.utc)
+                    waiting = (mac_test.WAITING_ON_CI_MAC_JOB if block_kind == "ci_mac_job"
+                               else mac_test.WAITING_ON_CI_JOB)
+                    block = mac_test.PendingMacBlock("research", "render", since, since + timedelta(hours=4),
+                        mac_test.HolderQueue("research"), mac_test.NO_SHOWRUNNER, "off_before", waiting)
+                    mac_test.write_block(self.paths.mac_state / "block.json", block)
+                elif block_kind == "active":
+                    self.block()
+                elif block_kind == "claim":
+                    _ = self.claim()
+
+                def gh(config: mac_test.MacTestConfig, *arguments: str) -> mac_test.GhResult:
+                    if job_status == "unknown":
+                        return mac_test.GhFailure("API unavailable")
+                    if arguments[:2] == ("run", "list"):
+                        status = arguments[arguments.index("--status") + 1]
+                        runs = ([{"databaseId": 40 if status == "queued" else 41,
+                                  "createdAt": datetime.now(timezone.utc).isoformat()}]
+                                if status == "in_progress" or job_status == "queued before running" else [])
+                        return mac_test.GhAnswer(json.dumps(runs))
+                    status = ("queued" if arguments[2] == "40" else "in_progress"
+                              if job_status == "queued before running" else job_status)
+                    return mac_test.GhAnswer(json.dumps({"jobs": [{"name": config.ci_job, "status": status}]}))
+
+                with mock.patch.object(mac_test, "run_gh", side_effect=gh) as query, \
+                     mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify, \
+                     mock.patch.object(mac_idle, "push_outage", return_value=True) as push:
+                    mac_idle.watch_once(self.paths, 1600, 100)
+                saved = mac_idle.read_record(self.paths.state / "alert.json")
+                self.assertEqual((saved["state"], saved["cause"]), (state, cause))
+                self.assertEqual(query.call_count, lookups)
+                if state == "busy":
+                    notify.assert_not_called()
+                    push.assert_not_called()
+                    self.assertIsNone(mac_idle_alert.alert_line(self.paths.state / "alert.json", 1600, ZoneInfo("UTC")))
+                    self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
+                elif steps_wait:
+                    notify.assert_called_once()
+                    push.assert_called_once()
+                else:
+                    notify.assert_not_called()
+                    push.assert_not_called()
 
     def test_missing_or_bad_idle_configuration_produces_a_watch_diagnostic(self) -> None:
         self.block()

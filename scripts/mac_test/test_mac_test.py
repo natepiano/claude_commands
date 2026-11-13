@@ -1791,6 +1791,8 @@ for arguments in (
         active_runs: tuple[tuple[str, str, float, list[GhJob], str], ...] = (
             ("queued", "queued", 1, [], "ci_job"),
             ("in_progress", "in_progress", 1, [], "ci_job"),
+            ("Mac queued", "in_progress", 1, [{"name": CI_JOB, "status": "queued"}], "ci_job"),
+            ("Mac running", "in_progress", 1, [{"name": CI_JOB, "status": "in_progress"}], "ci_mac_job"),
             ("old queued", "queued", 61, [], ""),
             ("old in_progress", "in_progress", 61, [], "ci_job"),
             ("at limit", "queued", 60, [], "ci_job"),
@@ -1829,10 +1831,19 @@ for arguments in (
                 if waiting:
                     if waiting == "ci_job":
                         self.assertIn("a CI run may still use the Mac", result.stdout)
+                    elif waiting == "ci_mac_job":
+                        self.assertIn("hana CI is running on the Mac", result.stdout)
                     else:
                         self.assertIn("gh returned invalid JSON", result.stdout)
                     self.assertEqual(block["state"], "pending")
                     self.assertEqual(block["waiting_on"], {"kind": waiting})
+                    decoded = mac_test.read_block(self.state_directory / "block.json")
+                    self.assertIsInstance(decoded, mac_test.PendingMacBlock)
+                    assert isinstance(decoded, mac_test.PendingMacBlock)
+                    self.assertEqual(mac_test.block_record(decoded)["waiting_on"], {"kind": waiting})
+                    self.assertEqual(mac_test.pending_wait_text(decoded.waiting_on),
+                        "hana CI is running on the Mac" if waiting == "ci_mac_job" else
+                        "a CI run may still use the Mac" if waiting == "ci_job" else "CI could not be checked")
                 else:
                     self.assertEqual(block["state"], "active")
 
@@ -1851,41 +1862,41 @@ for arguments in (
         self.assertEqual(self.block_state()["state"], "active")
 
     def test_busy_ci_keeps_block_pending_until_watch_sends_once(self) -> None:
-        self.gh["queued"] = [{"databaseId": 41, "createdAt": datetime.now(timezone.utc).isoformat()}]
-        self.gh["jobs"] = {
-            "41": [{"name": CI_JOB, "status": "in_progress", "conclusion": ""}]
-        }
-        self.sync_gh()
-        pending = self.command("block", "--holder", "alice", "--for", "rendering")
-        block = self.block_state()
-        self.assert_command(
-            pending,
-            0,
-            "Block pending for alice: a CI run may still use the Mac. Nothing new "
-            + "starts there, and you get a message when CI no longer needs the Mac.\n"
-            + self.expiry_line(block),
-        )
-        self.assertEqual(block["state"], "pending")
-        self.assertEqual(block["waiting_on"], {"kind": "ci_job"})
+        for status, kind, text in (
+            ("queued", "ci_job", "a CI run may still use the Mac. Nothing new starts there, "
+             + "and you get a message when CI no longer needs the Mac."),
+            ("in_progress", "ci_mac_job", "hana CI is running on the Mac. Nothing new starts there, "
+             + "and you get a message when it finishes."),
+        ):
+            with self.subTest(status=status):
+                self.clear_log("send-delivered")
+                (self.stub_directory / "send-keys.json").unlink(missing_ok=True)
+                self.gh["queued"] = [{"databaseId": 41, "createdAt": datetime.now(timezone.utc).isoformat()}]
+                self.gh["jobs"] = {"41": [{"name": CI_JOB, "status": status, "conclusion": ""}]}
+                self.sync_gh()
+                pending = self.command("block", "--holder", "alice", "--for", "rendering")
+                block = self.block_state()
+                self.assert_command(pending, 0, f"Block pending for alice: {text}\n" + self.expiry_line(block))
+                self.assertEqual(block["state"], "pending")
+                self.assertEqual(block["waiting_on"], {"kind": kind})
 
-        self.gh["variable"] = "false"
-        self.gh["queued"] = []
-        self.gh["jobs"] = {}
-        self.sync_gh()
-        watcher = self.start_command("watch")
-        # The watcher records the message as sent only after the send process
-        # exits, which is later than the stand-in's delivery log line.
-        active = self.wait_for_free_message({"kind": "sent"})
-        self.assertEqual(active["state"], "active")
-        deliveries = self.logged_arguments("send-delivered")
-        self.assertEqual(len(deliveries), 1)
-        self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
+                self.gh["variable"] = "false"
+                self.gh["queued"] = []
+                self.gh["jobs"] = {}
+                self.sync_gh()
+                watcher = self.start_command("watch")
+                # Read the saved receipt after the sender finishes.
+                active = self.wait_for_free_message({"kind": "sent"})
+                self.assertEqual(active["state"], "active")
+                deliveries = self.logged_arguments("send-delivered")
+                self.assertEqual(len(deliveries), 1)
+                self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
 
-        unblocked = self.command("unblock", "--holder", "alice")
-        self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        self.assertEqual(watcher.returncode, 0, stdout + stderr)
-        self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
+                unblocked = self.command("unblock", "--holder", "alice")
+                self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
+                stdout, stderr = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(watcher.returncode, 0, stdout + stderr)
+                self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
 
     def test_failed_busy_check_records_unknown_ci(self) -> None:
         self.gh["failures"] = [

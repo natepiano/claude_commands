@@ -114,7 +114,7 @@ class NoReviewTrial(NamedTuple):
 
 class Unit(NamedTuple):
     name: str
-    plan: Path
+    plan: Path | unit_config.StandbyPlan | unit_config.PermanentPlan
     worktree: Path
     branch: str
     staff_id: staff.StaffId
@@ -213,8 +213,7 @@ def unit_from_row(row: staff.StaffRow, resolver: session_staff.RowResolver) -> U
         return UnitUnavailable(name, "no unit configuration")
     if not isinstance(config, unit_config.UnitConfig):
         return UnitUnavailable(name, config.reason)
-    plan = (config.plan.path if isinstance(config.plan, unit_config.PlanFile)
-            else Path("standby" if isinstance(config.plan, unit_config.StandbyPlan) else "permanent"))
+    plan = config.plan.path if isinstance(config.plan, unit_config.PlanFile) else config.plan
     return Unit(name, plan, location.path, branch.name, row.id)
 
 
@@ -556,15 +555,18 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
 
 def checkpoint_plan(request: MergeRequest) -> Path:
     """Use a closing item's subject slug or retain the configured plan."""
+    plan = request.unit.plan
+    configured_path = (plan if isinstance(plan, Path) else
+                       Path("standby" if isinstance(plan, unit_config.StandbyPlan) else "permanent"))
     if isinstance(request.kind, CodeCheckpoint):
-        return request.unit.plan
+        return configured_path
     subject = good(git(request.production.checkout, "show", "-s", "--format=%s", request.commit), "scope")
     pattern = (r"shrink\(([^()/\\]+)\): phase \S+ — .+" if isinstance(request.kind, ShrinkCommit)
                else r"docs\(([^()/\\]+)\): as-built")
     match = re.fullmatch(pattern, subject)
-    if match and isinstance(request.kind, AsBuiltCommit):
+    if match and (isinstance(request.kind, AsBuiltCommit) or not isinstance(plan, Path)):
         return Path("docs/plans") / (match[1] + ".md")
-    return request.unit.plan.with_name(match[1] + ".md") if match else request.unit.plan
+    return configured_path.with_name(match[1] + ".md") if match else configured_path
 
 
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
@@ -1013,7 +1015,7 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         script = checkpoint_gate.tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
         review_command = [PYTHON, script]
-        command = [*review_command, "add", "--unit", request.unit.name, "--plan", request.unit.plan.as_posix(),
+        command = [*review_command, "add", "--unit", request.unit.name, "--plan", checkpoint_plan(request).as_posix(),
                    "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,

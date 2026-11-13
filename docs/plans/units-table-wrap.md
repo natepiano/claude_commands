@@ -61,50 +61,22 @@ The showrunner's ruling:
 
 ### Phase 2 — Each open phase shows its work, its wait and its latest ETA  · status: done
 
-The user, relayed by the cargo-liner showrunner at 22:20 EST on 2026-11-12: "i can't actually tell what any of them are working on - which should be the intent of this command". The sdlc showrunner sent this evidence from the plan-delegate run records:
+#### As-built
 
-1. A run with several open phases shows only one. Port run 386d8d90 has Phase 8 open (repair round 1, fix worker since 20:17, stated ETA 19:15). The table shows only Phase 10, and lists Phase 8 under Queued as `plan: phase 8`. The tile run (branch `remove-running-section-tile`) has 62, 58d, 32j, 58f, 60 and 43j open; the table shows only 62.
-2. ETA Next shows an old promise. Handler run 54fb1c7e: the last `eta_stated` for Phase 3 is 21:30 (stated at 18:25 EST). The table shows `15:30 · late 6h 49m`.
-3. `no ETA` does not say why. Port Phase 8 has a passed ETA and shows `no ETA`.
-4. Status `idle` hides waits. Three directors show `idle` while their workers wait on the build queue (`wait_started`, `HolderNotNamed`). The table shows neither the wait nor its length. Handler round 2 fix took 18:42–22:05; about 2 h of that were waits.
-5. Workers shows `—` for port and tile, but port's fix worker and tile's impl workers have open passes.
-
-#### Work Order
-
-**Goal:** In `/showrunner:units` for the cargo-liner production, every open phase of each unit's newest run shows what it does, what it waits on with the wait length, its latest stated ETA, and its workers. The run records are the source.
-
-**Spec:**
-
-1. **Find each cause first.** For each of the five evidence items, read the named run records and the code path that builds the cell (`scripts/direct/phase_table.py`, `scripts/direct/worker_runs.py`, `scripts/production/unit_phases.py`). Post the cause of each item on the board with the record lines and code lines. Fix each cause where it lives.
-2. **One row per open phase.** Each open phase of a unit's newest run gets its own row in both tables, in phase order. The first row of a unit carries the unit-wide cells (Status, Machine, Progress, ETA Plan). Later rows of the same unit repeat the Unit name and show `—` in the unit-wide cells. A unit with no open phase keeps one row as now. An open phase never appears under Queued.
-3. **Latest ETA.** ETA Next for a phase row is the latest `eta_stated` for that phase instance. A passed ETA shows its time and `late <length>`. `no ETA` appears only when the run states no ETA for that phase; it reads `no ETA stated`.
-4. **Waits.** Notes for a phase row ends with `waiting on <what> <length>` while a worker or the director of that phase waits (for example a build queue wait from `wait_started`). The wait text names the holder when the record names one. Status keeps the session classifier; the wait shows in Notes.
-5. **Workers.** The Workers cell of a phase row lists the workers with open passes in that phase, from the run records, with the existing worker text rules.
-6. **Tests.** Add rows to the existing tests in `scripts/production/test_unit_phases.py`, and in `scripts/direct/test_phase_table.py` or `scripts/direct/test_worker_runs.py` when a cause lives there. Build each fixture from the shape of the evidence records, in a temporary folder. Use no live unit.
-7. **Docs.** Update `commands/showrunner/units.md` and the "Unit phases" entry in `docs/as-built/showrunner-automation.md` in the same commit as the code.
-8. **Proof.** Screenshot `/showrunner:units` for the cargo-liner production in a Claude Code terminal 170 columns wide, before the change and after. Save the PNG files under the session folder, never in the repository.
-
-**Constraints from prior phases:**
-- Phase 1 put Workers last in the status table (`table()` in `scripts/production/unit_phases.py`) and left the work table as `Unit | Notes | Non-Phase Work | Queued`.
-- Both phase tables pass through `display_cells.wrapped(headers, rows)`: full cell text, all-`—` columns removed. Claude Code wraps each cell at the terminal width; never cut text with `…`, insert `<br>` or add continuation rows. `units_table_columns` sets only the style table.
-- `single_spaced(text)` in `unit_phases.py` is the one whitespace rule for cell text. `shortened()` (80 characters) now applies only to the Workers cell and ETA Next.
-- The test lane includes `scripts.production.test_display_cells`.
+- Each open phase of a unit's current run has its own row in both tables, in plan order. The first row carries Status, Machine, Progress, ETA Plan and Queued; later rows of the unit show `—` there. Phases outside the plan get their own rows.
+- Notes read `phase <id> — <title>`, then an informative current step, fix rounds, and each open wait with its holder (the staff name when known) and its length. A wait reason that already states its wait keeps its own words.
+- ETA Next is the latest `eta_stated` for that phase: `late <length>` when passed, `no ETA stated` when none. ETA Plan also names promises for unfinished target phases with no open row.
+- Workers lists the open recorded passes of that phase instance, with their detached run states.
+- `newest_unit_runs` prefers the staff row's current run over newer ad hoc runs. `run_is_finished(events)` lets the latest `run_finished` or `reopened` event decide.
+- Only the latest `phase_finished` of a phase id decides done; `error` and `stopped` finishes are not done. `build_run` keeps each finish status.
 
 **Files:**
-- `scripts/production/unit_phases.py` — row layout, Notes, ETA Next, Workers.
-- `scripts/direct/phase_table.py` — open phase instances and their ETA, when a cause lives there.
-- `scripts/direct/worker_runs.py` — open passes and waits, when a cause lives there.
-- `scripts/production/test_unit_phases.py`, `scripts/direct/test_phase_table.py`, `scripts/direct/test_worker_runs.py` — test rows.
-- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — docs.
+- `scripts/production/unit_phases.py` — phase rows, `phase_notes_cell`, `phase_eta_cell`, `pending_eta_cell`, `run_is_finished`.
+- `scripts/direct/phase_table.py` — `_open_instances` returns every open instance of the newest run.
+- `scripts/direct/worker_runs.py` — `phase_workers`, `phase_waits`, `PhaseWait`, `NamedWaitHolder`/`UnnamedWaitHolder`.
+- `scripts/production/test_unit_phases.py`, `scripts/direct/test_phase_table.py`, `scripts/direct/test_worker_runs.py` — the row and record cases.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the row and cell rules.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — runs step 1, then writes steps 2–5 and 7.
-- `test` — makes the before screenshot at once, writes the step 6 rows, keeps the test lane green, and makes the after screenshot when `impl` posts `done`.
+**Gotchas:** an `eta_stated` record can target a phase other than the active one (`eta_phase_id`). A reopened run keeps its earlier `run_finished` event.
 
-**State:** none.
-
-**Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
-2. The Test command passes for the test lane, `scripts.direct.test_phase_table` and `scripts.direct.test_worker_runs`.
-3. Live: `scripts/lib/py scripts/production/unit_phases.py --production cargo-liner` shows each open phase of the port, tile and handler runs on its own row, with its latest stated ETA, its waits and its workers.
-4. The after screenshot shows each evidence item fixed; the before screenshot shows the old view.
+**Ruled out:** moving an explicit ETA target to the active phase — the record names the promised phase; hiding an errored phase from Queued — it is waiting work.

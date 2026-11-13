@@ -42,6 +42,7 @@ from scripts.mac_test.claim_state import (
     Showrunner as Showrunner,
     WaitingOnLocalRun as WaitingOnLocalRun,
     WaitingOnCiJob as WaitingOnCiJob,
+    WaitingOnCiMacJob as WaitingOnCiMacJob,
     WaitingOnUnknownCi as WaitingOnUnknownCi,
     WaitingOn as WaitingOn,
     FreeMessageNotNeeded as FreeMessageNotNeeded,
@@ -131,6 +132,7 @@ NO_REMOTE_JOB = NoRemoteJob()
 NO_MAC_BLOCK = NoMacBlock()
 NO_SHOWRUNNER = NoShowrunner()
 WAITING_ON_CI_JOB = WaitingOnCiJob()
+WAITING_ON_CI_MAC_JOB = WaitingOnCiMacJob()
 WAITING_ON_UNKNOWN_CI = WaitingOnUnknownCi()
 FREE_MESSAGE_NOT_NEEDED = FreeMessageNotNeeded()
 FREE_MESSAGE_SENT = FreeMessageSent()
@@ -178,8 +180,12 @@ class CiIdle:
     """No queued or running CI Mac job exists."""
 
 
-class CiBusy:
-    """A queued or running CI Mac job exists."""
+class CiJobNotStarted:
+    """A CI run still needs its Mac job to start."""
+
+
+class CiMacJobRunning:
+    """A CI Mac job is running on the Mac."""
 
 
 @dataclass(frozen=True)
@@ -189,9 +195,10 @@ class CiUnknown:
     line: str
 
 
-CiActivity = CiIdle | CiBusy | CiUnknown
+CiActivity = CiIdle | CiJobNotStarted | CiMacJobRunning | CiUnknown
 CI_IDLE = CiIdle()
-CI_BUSY = CiBusy()
+CI_JOB_NOT_STARTED = CiJobNotStarted()
+CI_MAC_JOB_RUNNING = CiMacJobRunning()
 
 
 class NoProblem:
@@ -440,6 +447,8 @@ def decode_waiting(value: object, path: Path) -> WaitingOn:
             return WaitingOnLocalRun(what)
     if kind == "ci_job" and set(item) == {"kind"}:
         return WAITING_ON_CI_JOB
+    if kind == "ci_mac_job" and set(item) == {"kind"}:
+        return WAITING_ON_CI_MAC_JOB
     if kind == "ci_unknown" and set(item) == {"kind"}:
         return WAITING_ON_UNKNOWN_CI
     raise StateReadError(f"{path} has an invalid block record")
@@ -557,6 +566,8 @@ def block_record(block: PendingMacBlock | ActiveMacBlock) -> dict[str, object]:
             record["waiting_on"] = {"kind": "local_run", "what": waiting.what}
         elif isinstance(waiting, WaitingOnCiJob):
             record["waiting_on"] = {"kind": "ci_job"}
+        elif isinstance(waiting, WaitingOnCiMacJob):
+            record["waiting_on"] = {"kind": "ci_mac_job"}
         else:
             record["waiting_on"] = {"kind": "ci_unknown"}
     else:
@@ -907,6 +918,7 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             if created_at.tzinfo is None:
                 return CiUnknown("gh returned invalid JSON")
             runs[database_id] = CiRun(status, created_at)
+    activity: CiIdle | CiJobNotStarted = CI_IDLE
     for database_id, run in runs.items():
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
@@ -921,12 +933,15 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             job = cast(dict[str, object], raw_job)
             if job.get("name") != config.ci_job:
                 continue
+            if job.get("status") == "in_progress":
+                return CI_MAC_JOB_RUNNING
             if job.get("status") != "completed":
-                return CI_BUSY
-            mac_job_completed = True
+                activity = CI_JOB_NOT_STARTED
+            else:
+                mac_job_completed = True
         if not mac_job_completed:
-            return CI_BUSY
-    return CI_IDLE
+            activity = CI_JOB_NOT_STARTED
+    return activity
 
 
 def switch_ci_off(config: MacTestConfig) -> CiSwitchOffResult:
@@ -1665,8 +1680,9 @@ def full_settle(
                 write_block(paths.block, block)
         elif config.ci_repo:
             activity = ci_activity(config)
-            if isinstance(activity, CiBusy):
-                block = pending_with_wait(block, WAITING_ON_CI_JOB)
+            if isinstance(activity, (CiJobNotStarted, CiMacJobRunning)):
+                block = pending_with_wait(block, WAITING_ON_CI_MAC_JOB
+                                          if isinstance(activity, CiMacJobRunning) else WAITING_ON_CI_JOB)
                 with locked(paths.lock):
                     write_block(paths.block, block)
             elif isinstance(activity, CiUnknown):
@@ -2185,6 +2201,11 @@ def block_state_line(
             f"Block pending for {holder_name(block.holder)}: {waiting.what} is running on {host}. "
             + "Nothing new starts there, and you get a message when it ends."
         )
+    if isinstance(waiting, WaitingOnCiMacJob):
+        return (
+            f"Block pending for {holder_name(block.holder)}: hana CI is running on the Mac. "
+            + "Nothing new starts there, and you get a message when it finishes."
+        )
     if isinstance(waiting, WaitingOnCiJob):
         return (
             f"Block pending for {holder_name(block.holder)}: a CI run may still use the Mac. "
@@ -2347,6 +2368,8 @@ def command_unblock(
 def pending_wait_text(waiting: WaitingOn) -> str:
     if isinstance(waiting, WaitingOnLocalRun):
         return "a test is running"
+    if isinstance(waiting, WaitingOnCiMacJob):
+        return "hana CI is running on the Mac"
     if isinstance(waiting, WaitingOnCiJob):
         return "a CI run may still use the Mac"
     return "CI could not be checked"

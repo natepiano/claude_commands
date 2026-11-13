@@ -1317,3 +1317,25 @@ From builds (not the user), 2026-11-13: the user wants one admin console with a 
 - `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
 
 **Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
+
+### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
+
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
+
+#### As-built
+
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+
+### Phase 70 — Cloud step names carry their unit · status: todo
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: "you see how the unit shows for hana's trunk nextest? it should also show for the sdlc panes targeted test - so it should say "panes targeted test" but to save space probably it should just say "panes targeted". and the merge gate for builds when it is a showrunner doing a merge gate we should just say "showrunner merge" rather than merge gate - when it is a merge gate done by a showrunner - if it's a merge gate run by a unit director then it should say {unit} merge - so for merge gates it is either "showrunner merge" or "{unit} merge"".
+
+1. On the build page, a targeted test step reads "<unit> targeted".
+2. A merge gate step reads "showrunner merge" when a showrunner runs it, and "<unit> merge" when a unit director runs it.
+3. The name templates are new keys in `config/build_steps.conf`. The current `names.*` and `prose.*` values do not change.
+4. A step whose owner is not known keeps its current name.
