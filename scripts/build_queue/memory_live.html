@@ -78,6 +78,9 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
+#tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
+#tip .mac-tip-fields dt { text-align: left; }
+#tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 #tip b { display: block; margin-bottom: 2px; }
 .mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); transition: left 0.6s ease; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
@@ -381,6 +384,30 @@ Object.assign(TIPS, {
   "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
   "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
 });
+function macRow(row) {
+  return row.kind === "mac-build" || row.kind === "mac-unavailable";
+}
+function stageText(row) {
+  if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
+  return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
+}
+function macTipFields(row, data) {
+  const fields = [["Machine", "mac"],
+    ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
+    ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
+    ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
+  if (row.progress?.kind === "RowProgress") fields.push(["Progress",
+    `${row.progress.done} of ${row.progress.total} ${row.progress.unit} · ${formatPercent(row.progress.percent, row.progress.done === row.progress.total)}`]);
+  return fields;
+}
+function tooltipHtml(key, data) {
+  const [head, body] = tipText(key, data);
+  const [kind, index] = key.split(":");
+  const row = kind === "row" ? data.walk[+index] : null;
+  if (!row || !macRow(row)) return `<b>${esc(head)}</b>${esc(body)}`;
+  return `<b>${esc(head)}</b><span>Mac memory does not count against natedev.</span><dl class="mac-tip-fields">` +
+    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") + `</dl>`;
+}
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
@@ -397,9 +424,10 @@ function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
 function rowUnit(row) {
-  return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
+  return row.ci ? "hana CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
 function rowOwner(row, waiting = false) {
+  if (macRow(row)) return row.repository || "";
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
   }
@@ -433,6 +461,8 @@ function rawTipText(key, d) {
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
+    if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
+      "Mac memory does not count against natedev.\n" + macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n")];
     if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: ${r.machine}. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
@@ -488,8 +518,7 @@ let tipKey = null;
 function showTip(key, x, y) {
   if (!latest) return;
   tipKey = key;
-  const [head, body] = tipText(key, latest);
-  tip.innerHTML = `<b>${esc(head)}</b>${esc(body)}`;
+  tip.innerHTML = tooltipHtml(key, latest);
   tip.classList.add("on");
   placeTip(x, y);
 }
@@ -562,7 +591,7 @@ function render(d) {
   for (const [k, v] of Object.entries(segVals)) $(`l-${k}`).textContent = f1(v);
   latest = d;
   setTimeout(fitLabels, 650);
-  if (tipKey) { const [h, b] = tipText(tipKey, d); tip.innerHTML = `<b>${esc(h)}</b>${esc(b)}`; }
+  if (tipKey) tip.innerHTML = tooltipHtml(tipKey, d);
 
 
   renderWalk(d);
@@ -748,14 +777,14 @@ function renderWalk(d) {
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th>`;
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       `<td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.ci_runners?.some(runner => runner.state === "busy"))];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.ci_runners?.some(runner => runner.state === "busy"))];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells(r.progress?.kind === "RowProgress" ? r.progress.phase : "—",
+    cells(stageText(r),
       r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
@@ -847,7 +876,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
-  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
+  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
@@ -930,7 +959,7 @@ function placeMemoryBars(d) {
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
-    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${memoryAmount(amount.value)}</span>`).join("");
+    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
     const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
@@ -940,7 +969,15 @@ function placeMemoryBars(d) {
     const index = Number(row.dataset.run), run = d.walk[index];
     let bars = "";
     const amounts = [];
-    if (run.ci) {
+    if (macRow(run)) {
+      if (run.kind === "mac-build" && recorded(run.used)) {
+        const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
+        bars = box(0, useWidth, "seg-used");
+        amounts.push({kind: "used-amount", left: 0, value: run.used});
+        if (run.progress?.kind === "RowProgress") amounts.push({kind: "progress-amount", left: useWidth,
+          text: `${formatPercent(run.progress.percent, run.progress.done === run.progress.total)} done`});
+      }
+    } else if (run.ci) {
       bars = box(used, ciWidth, "seg-ci", "ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
@@ -963,7 +1000,8 @@ function placeMemoryBars(d) {
     row.querySelector(".track").innerHTML = bars;
     if (run.kind !== "cloud") {
       placeAmounts(row, amounts);
-      if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
+      if (run.kind === "mac-unavailable") row.querySelector(".amounts").textContent = run.status;
+      else if (!recorded(run.used)) row.querySelector(".amounts").textContent = macRow(run) ? "Used unavailable" : `Use unavailable: ${run.used.reason}`;
     }
   }
   const roomTrack = document.querySelector(".wrow.room .track");

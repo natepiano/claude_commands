@@ -23,7 +23,7 @@ from scripts.lib import process_start as process_identity
 
 class VerifySshTargetsTests(VerifySshTargetsFixture):
     def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
-        self.configure("aws,natedev")
+        self.configure("linux,natedev")
         result = self.verify("test", "sample", "--local", "requires local files", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.ssh_events(), [])
@@ -40,24 +40,24 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         self.check_busy_startup("after-probe")
 
     def check_busy_startup(self, mode: str) -> None:
-        self.configure("aws,spare,natedev")
+        self.configure("linux,spare,natedev")
         result = self.verify("test", "sample", "--no-cache", extra={
-            "TEST_SSH_MODES": json.dumps({"aws": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+            "TEST_SSH_MODES": json.dumps({"linux": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.ssh_events()
-        self.assertEqual([event["target"] for event in events], ["aws", "spare"],
+        self.assertEqual([event["target"] for event in events], ["linux", "spare"],
                          json.dumps(events) + result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
         self.assertNotIn("release", events[0]["actions"])
         self.assertEqual(events[0]["queued_at"], "100.25")
         self.assertEqual(events[1]["queued_at"], "100.25")
-        self.assertTrue((self.runner_state / "aws.marker").exists())
-        state = self.target_state("aws")
+        self.assertTrue((self.runner_state / "linux.marker").exists())
+        state = self.target_state("linux")
         self.assertTrue(list((state / "claims").glob("**/*.json")))
         self.assertFalse((state / "unreachable_until").exists())
         self.assertNotIn("Traceback", result.stdout + result.stderr)
         attempts = self.attempts()
-        self.assertEqual([attempt["target"] for attempt in attempts], ["aws", "spare"])
+        self.assertEqual([attempt["target"] for attempt in attempts], ["linux", "spare"])
         self.assertEqual((attempts[0]["outcome"], attempts[0]["completion"], attempts[0]["cleanup"]),
                          ("declined", "missing", "unconfirmed"))
         self.assertIsNone(attempts[0]["unresolved_count"])
@@ -72,7 +72,7 @@ class SshReservationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
-        _ = write_config_fixture(self.fixture.root / "aws_target.conf", "offload=on\nslots=1\nslots.hana=1\n")
+        _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\nslots=1\nslots.hana=1\n")
 
     def reserve(self, pid: int) -> tuple[int, Path]:
         path = self.fixture.root / f"reservation-{pid}"
@@ -83,10 +83,10 @@ class SshReservationTests(unittest.TestCase):
         return build_targets.command_reserve(args), path
 
     def test_retry_recovers_its_claim_when_the_reservation_file_was_not_published(self) -> None:
-        state = mac_test.state_paths("aws")
+        state = mac_test.state_paths("linux")
         args = mac_test.CliArguments()
-        args.target, args.repo_root, args.pid = "aws", str(self.fixture.root), 71
-        args.settings, args.package, args.verb = str(self.fixture.root / "aws_target.conf"), "linux-part", "nextest"
+        args.target, args.repo_root, args.pid = "linux", str(self.fixture.root), 71
+        args.settings, args.package, args.verb = str(self.fixture.root / "linux.conf"), "linux-part", "nextest"
         with redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim_wait(args, state), 0)
         claim, = mac_test.read_claims(state)
@@ -94,7 +94,7 @@ class SshReservationTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         status, answer = self.reserve(71)
         self.assertEqual(status, 0)
-        self.assertEqual(answer.read_text().split("\t")[0], "aws")
+        self.assertEqual(answer.read_text().split("\t")[0], "linux")
         recovered, = mac_test.read_claims(state)
         self.assertEqual(recovered.path, claim.path)
         self.assertEqual(recovered.record, claim.record)
@@ -102,7 +102,7 @@ class SshReservationTests(unittest.TestCase):
 
     def test_wait_release_keeps_a_claim_from_an_earlier_process_with_the_same_pid(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        state = mac_test.state_paths("aws")
+        state = mac_test.state_paths("linux")
         claim, = mac_test.read_claims(state)
         identity = claim_state.claim_identity(claim.record)
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("reused-start")):
@@ -115,23 +115,23 @@ class SshReservationTests(unittest.TestCase):
     def test_reservation_race_keeps_the_loser_queued_without_an_answer(self) -> None:
         status, first = self.reserve(71)
         self.assertEqual(status, 0)
-        self.assertEqual(first.read_text().split("\t")[0], "aws")
+        self.assertEqual(first.read_text().split("\t")[0], "linux")
         with mock.patch.object(mac_test, "free_now", return_value="free"):
             status, losing = self.reserve(72)
         self.assertEqual(status, 1)
         self.assertFalse(losing.exists())
-        claims = mac_test.read_claims(mac_test.state_paths("aws"))
+        claims = mac_test.read_claims(mac_test.state_paths("linux"))
         self.assertEqual([claim.record["pid"] for claim in claims], [71])
         self.assertNotIn("remote_host", claims[0].record)
 
     def test_runner_adopts_the_reserved_slot_without_an_unclaimed_interval(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        paths = mac_test.state_paths("aws")
+        paths = mac_test.state_paths("linux")
         original, = mac_test.read_claims(paths)
         identity = claim_state.claim_identity(original.record)
         args = mac_test.CliArguments()
-        args.target, args.worktree, args.what = "aws", str(self.fixture.root), "check hana"
-        args.pid, args.from_pid, args.remote = 91, 71, "fake-aws"
+        args.target, args.worktree, args.what = "linux", str(self.fixture.root), "check hana"
+        args.pid, args.from_pid, args.remote = 91, 71, "fake-linux"
         args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
         unlink = Path.unlink
 
@@ -145,7 +145,7 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(transferred.path, original.path)
         self.assertEqual(transferred.scope, original.scope)
         self.assertEqual(transferred.record["pid"], 91)
-        self.assertEqual(transferred.record.get("remote_host"), "fake-aws")
+        self.assertEqual(transferred.record.get("remote_host"), "fake-linux")
         self.assertEqual(build_targets.command_release_wait(71, identity=identity, session=NoOwningSession()), 0)
         self.assertEqual(build_targets.command_release_wait(91, identity=identity, session=NoOwningSession()), 0)
         self.assertTrue(original.path.exists())
@@ -153,10 +153,10 @@ class SshReservationTests(unittest.TestCase):
 
     def test_exit_releases_only_an_untransferred_local_reservation(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        claim, = mac_test.read_claims(mac_test.state_paths("aws"))
+        claim, = mac_test.read_claims(mac_test.state_paths("linux"))
         self.assertEqual(build_targets.command_release_wait(71,
             identity=claim_state.claim_identity(claim.record), session=NoOwningSession()), 0)
-        self.assertEqual(mac_test.read_claims(mac_test.state_paths("aws")), ())
+        self.assertEqual(mac_test.read_claims(mac_test.state_paths("linux")), ())
         self.assertEqual(self.reserve(72)[0], 0)
 
 
@@ -177,11 +177,11 @@ class SshResultBoundaryTests(unittest.TestCase):
                                           unresolved_count=offload.UnresolvedLeftoverCount(), evidence_at=150.5)
         with redirect_stdout(io.StringIO()):
             status = offload.write_result(offload.PassedOnTarget(4.5), offload.ResultFile(destination),
-                                          target="aws", evidence=evidence)
+                                          target="linux", evidence=evidence)
         self.assertEqual(status, 0)
         fields = dict(line.split("=", 1) for line in destination.read_text().splitlines())
         self.assertEqual(fields["outcome"], "passed")
-        self.assertEqual(fields["target"], "aws")
+        self.assertEqual(fields["target"], "linux")
         self.assertEqual(fields["slot"], "2")
         self.assertEqual(fields["completion"], "confirmed")
         self.assertEqual(fields["cleanup"], "unconfirmed")
@@ -217,12 +217,12 @@ import os
 from pathlib import Path
 import sys
 words = sys.argv[1:]
-settings = str(Path(os.environ["CONF_DIR"]) / "aws_target.conf")
+settings = str(Path(os.environ["CONF_DIR"]) / "linux_target.conf")
 if words[0] == "eligible":
     print("any_target")
-    print("aws\teligible\t-\t" + settings + "\tlinux")
+    print("linux\teligible\t-\t" + settings + "\tlinux")
 elif words[0] == "reserve":
-    Path(words[words.index("--reservation-file") + 1]).write_text("aws\t" + settings + "\n")
+    Path(words[words.index("--reservation-file") + 1]).write_text("linux\t" + settings + "\n")
     Path(words[words.index("--claim-identity-file") + 1]).write_text("doc-claim\tdoc-episode\tdoc-attempt\t\n")
 elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":
     raise AssertionError("pinned doc requested local admission")
@@ -230,15 +230,15 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
     raise AssertionError(words)
 ''')
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
-        _ = config.write_text("targets=aws,natedev\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
+        _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
                               + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(config.parent / "aws_target.conf", "offload=on\n", template="aws_target")
+        _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")
         self.environment["TEST_PINNED_DOC"] = "1" if pinned else "0"
-        runner_source = runner.read_text().replace('"mac=" + result', '"outcome=" + result + "\\ntarget=aws"')
+        runner_source = runner.read_text().replace('"mac=" + result', '"outcome=" + result + "\\ntarget=linux"')
         runner_source = runner_source.replace('words = sys.argv[1:]', '''words = sys.argv[1:]
-assert words[words.index("--target") + 1] == "aws"
+assert words[words.index("--target") + 1] == "linux"
 Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
         self.executable(runner, runner_source)
         staged = self.repo / "alpha/src/lib.rs"
@@ -248,7 +248,7 @@ Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
         _ = (self.repo / "notes.md").write_text("private fixture")
         original_index = (self.repo / ".git/index").read_bytes()
 
-        result = self.verify("--target", "aws") if pinned else self.verify()
+        result = self.verify("--target", "linux") if pinned else self.verify()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(Path(self.environment["TEST_LINUX_DOC_RUN"]).exists())
