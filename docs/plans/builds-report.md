@@ -1068,37 +1068,28 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/report.py` — the `disk_section` closing line.
 - `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
 
-### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: todo
+### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: done
 
 Found by the Phase 52 reviews (finding F001, routed here).
 
-**Pending decision: raise `sweep_snapshot_max_age_seconds` from 900 to 100800**
+From the user (via the builds showrunner), 2026-11-12: "approve. Question: allow a 28-hour-old folder snapshot for the disk floor alert (sweep_snapshot_max_age_seconds 900 -> 100800)."
 
-Actual problem:
-`scripts/lint/sweep.py` `folder_choices` (line 3316) offers folders in a floor-crossing alert only when the last folder walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders, and `disk_measurement_lines` (line 3150) marks the measurement "stale".
+Problem: `folder_choices` offers folders only when the last walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders and marks the measurement "stale".
 
-What exists now:
-- `config/lint.conf`: `sweep_snapshot_max_age_seconds=900`.
-- `buildlog disk` walks once a day in the 03:00 hour (user's zone) and refreshes only free and used space at other times.
-- Two walks can be more than 25 hours apart: on the day clocks go back, 03:08 EDT to 03:10 EST the next day is 90,120 seconds, and a walk takes about 8 minutes.
-
-What should change:
-- Raise the value to 100800 (28 hours) through `/tune`. Then "stale" means a missed daily walk, with room for the clock change, timer drift and the walk time.
-
-Recommendation:
-Raise it to 100800. A changed config value needs the user's go. Sent to the builds showrunner 2026-11-12.
+`/tune` published 100800 on main (d83275f72). Two walks can be 90,120 seconds apart on the day clocks go back.
 
 #### Work Order
 
 **Goal:** A floor-crossing alert offers folder choices from the last daily disk walk, and calls the measurement stale only when a daily walk was missed.
 
 **Spec:**
-- `config/lint.conf`: set `sweep_snapshot_max_age_seconds` to the approved value through `/tune`. Update its Basis line: the disk walk runs once a day (Phase 52), and the value covers a 25-hour day plus timer drift and the walk time.
+- `config/lint.conf`: `/tune` set the value on main. On this branch change only the comment above it: the disk walk runs once a day, and the limit covers a 25-hour day, timer drift and the walk time. Do not edit the value line.
 - Folder freshness stays on `measured_at` (the walk time). `capacity_measured_at` does not make folder sizes fresh. No code change in `sweep.py` is expected.
 - `docs/as-built/build-followups.md` **Measuring** paragraph: say that `snapshot()` walks only when no full previous snapshot exists, or when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` (user's zone). Other runs refresh free and used space only and set `capacity_measured_at`. Add the two-time report line beside the one-time example.
 - Add rows to the existing tests in `scripts/lint/test_sweep.py` (do not add a new test):
   - in `test_unavailable_crossing_measurement_names_no_folder`'s neighbor that checks offered choices: a measurement 26 hours old under the approved limit offers its folders;
   - a measurement older than the limit offers none and says "stale".
+  - The rows set the limit in their own settings. They do not read the live config.
 
 **Files:**
 - `config/lint.conf`
@@ -1106,7 +1097,7 @@ Raise it to 100800. A changed config value needs the user's go. Sent to the buil
 - `docs/as-built/build-followups.md`
 
 **Workers:** `1 writer`
-- writer: the config value and the sweep test rows.
+- writer: the config comment, the Measuring paragraph and the sweep test rows.
 
 **State:** none.
 
