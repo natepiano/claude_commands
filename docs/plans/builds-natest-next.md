@@ -58,10 +58,15 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
 
    | Order | Work | Split and limits | Planning effort |
    | --- | --- | --- | --- |
-   | 1 | `direct/test_simplify_lens.py:125` through `simplify_daily.main():121` | One writer. Keep dispatch, real Git, reviewer children and failure injection. | 2–4 h |
-   | 2 | `production/test_change_review.py:1356,1636` | One writer. Keep fresh CLI evidence; add deterministic contention before the parent releases its lock. | 1–3 h |
-   | 3 | `direct/test_assign_claude_workers.py` and `test_assign_claude_claims.py` through `assign_claude_test_support.py:445` | One writer for the shared fixture; include the follow and records importers; move the repeated `direct_cli_calls` setUp into the shared fixture. | 2–4 h |
-   | beside | The Rule 2 candidates in item 11 | One writer per file; no shared support changes; two removal reviews; apart from speed comparisons. | — |
+   | done | `direct/test_simplify_lens.py` (Phase 223, `8ee605e7f`): aws CPU 19.23 to 9.67 s; peak 143.7 to 148.1 MiB. Its command ceiling is retired. | — | — |
+   | open | `production/test_change_review.py` (Phase 225) | One writer; aws trial pending. | — |
+   | open | `direct/test_assign_claude_*` (Phase 226) | One writer; aws trial pending. | — |
+   | 1 | `production/test_production_lifecycle.py` (26.487 cached CPU s): profile the archive commands and the repeated running-state preparation at support `:229` (commands already use `invoke_cli` at `:260`; Phase 177 measured 28 archive commands at 3.273 local CPU s) | One writer owns `production_lifecycle_test_support.py` and its importer. | 2–4 h |
+   | 2 | `production/test_unit_move.py` (6.342): trial a private seed for the repeated repository preparation at `rename_unit_test_support.py:315` | One writer; include `agents/test_shutdown_cli.py`, which shares the fixture. | 2–4 h |
+   | 3 | `production/test_unit_config.py` (2.625): trial a seed for initialization and the empty commit at `unit_config_test_support.py:39` | One writer; include `lib/test_git_exclude.py`, which shares the fixture. | 1–3 h |
+   | beside | The Rule 2 candidates in item 11 (separate from speed comparisons) | One writer per file; no shared support changes; two removal reviews; apart from speed comparisons. | — |
+
+   Order rows 1–3 are provisional (architect after Phase 224). Fresh profiles can change them. Each trial needs an assertion map, the owner's go, unchanged test counts, paired peak memory and a measured aws gain. Other candidates keep no proved budget: `production/test_staff.py` 13.251 (in-process CLI at `:54`; four callers rebuild Git checkouts through `:664`), `mac_test/test_offload_cleanup.py` 34.516 and `message/test_notifier.py` 30.236.
 
    Cached gate CPU (03:59 UTC, before Phases 219–221): `message/test_roster.py` 28.900 s (Rule 2 only); `production/test_add_unit.py` 19.880 s (already `invoke_cli` at `add_unit_test_support.py:682` and a class seed at `:235`; no new conversion budget); `production/test_staff_sources.py` 4.386 s (real Git fixture at `staff_test_support.py:959`; unmeasured); `production/test_proposal_issue.py` 0.605 s (already calls `proposal_issue.main` at `:114`). Follow keeps nine assignment starts in five process cases (`test_assign_claude_follow.py:31,127,156,186,213`) and recorder helpers at `assign_claude_test_support.py:357`: no follow-only phase without new attribution. devtools also freed `test_unit_move`, `test_unit_config`, `test_production_lifecycle` and `test_staff` (sdlc, 2026-11-12, main `b6f17093e`); screen them with the next profile refresh.
 
@@ -191,6 +196,8 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
 `types/basedpyright` takes 2-4 min in a gate (report-unit, 2026-11-03). It is not in the gate's module files; Phase 2 records it, and it goes to the proposal below, never to a speed phase.
 
 ## Items to consider
+
+- Shared admission stub (architect after Phase 224, minor). Phase 223 copies the admission stub at `direct/test_simplify_lens.py:60` and `direct/review_launcher_test_support.py:184`. Put one `install_admitted_assign_gate(direct_dir)` helper in `recorder_fixture.py` for both callers. Keep launcher construction separate: simplify copies the real `agent_exec.sh`; review uses `STUB_AGENT_EXEC` at `:196`.
 
 - [x] **Trivial-test review of `scripts/production/test_unit_lookup.py`.** Done in Phase 218 (`76007751d`): 67 to 60 tests under Rule 2.
 

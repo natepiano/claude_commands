@@ -3556,3 +3556,42 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - Assignment starts fall; all tests and assertions remain in the four modules; importers pass; basedpyright clean.
 - aws pairs show a gain for workers and claims and no loss for follow and records; sdlc sees the diff before land.
+
+### Phase 227 — Gate recovery frees CPU tokens across checkouts and rolls back only an idle checkout  · status: todo
+**Depends on:** Phase 222
+
+#### Work Order
+
+**Goal:** a dead gate's shared CPU tokens return to the pool for a gate in any checkout, and recovery never rolls back a checkout that a live gate uses.
+
+**Decision:** architect review after Phase 224, findings 2 and 3. builds holds the land of 222 and 223 until this phase checkpoints; the land chain is 219, 222, 223 and 227. Finding 1 (`build_folders.py` handlers) goes from builds to sdlc devtools; it is not in this phase.
+
+**Spec:**
+1. Defect 1: `gate_run_directory()` (`merge_gate.py:786`) keeps records per checkout, but `shared_cpu_pool()` (`:417`) uses one shared FIFO. A gate in checkout B never reads dead gate A's record in checkout A, so A's tokens stay lost and B can wait with no deadline.
+2. Fix 1: before a gate takes shared CPU tokens, recover dead owners in every directory under `gate_state_dir() / "active-runs"`, not only its own checkout's directory. Keep the per-directory `LOCK_EX` while it reads each directory. Keep the live-owner test (`process_start` pid and start identity) unchanged.
+3. Defect 2: rollback in `GateRecovery` (`:765`) runs under `scratch.copy_lock()`, which is `LOCK_SH` (`scratch.py:255`). It does not exclude a live gate. Gate C can roll back dead gate A's merge while live gate B tests the same checkout.
+4. Fix 2: add one per-checkout gate operation lock file in the checkout's run directory. A live gate holds it `LOCK_SH` from after its own recovery until its record is removed. Rollback takes it `LOCK_EX | LOCK_NB`, and checks HEAD and rolls back inside that lock.
+5. When the exclusive lock is busy, recovery frees the dead gate's groups, tokens and folders, keeps only the rollback intent in its record, and prints one line. A later gate start finishes that rollback. Recovery never blocks on a live gate.
+6. A gate must not take its own operation lock before it calls recovery; otherwise it excludes its own rollback.
+7. Do not change `scratch.copy_lock()`. Do not add signal handlers (user rule, Phase 222).
+8. Add rows to the existing recovery tests in `scripts/production/test_merge_gate_suites_signals.py` (test growth rule 1: add rows to existing tests):
+   - a dead gate's record in checkout A, recovered by a gate start in checkout B, returns its tokens to the FIFO;
+   - a dead gate's rollback with a live shared holder on the same checkout keeps the rollback intent and leaves HEAD unchanged; the next start without the holder rolls back.
+   Call the recovery functions directly. Do not start a whole gate for a new row.
+9. Run `scripts/lib/py -m unittest scripts.production.test_merge_gate_suites_signals` and the other `scripts/production/test_merge_gate*.py` modules from the worktree root. Run basedpyright on each changed file.
+
+**Files:**
+- `scripts/production/merge_gate.py`
+- `scripts/production/test_merge_gate_suites_signals.py`
+
+**Workers:** 1 writer; both fixes share the recovery record and its tests.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 222: the gate installs no signal handlers. One run record per gate by atomic rename; a clean end removes it; the next gate start recovers a dead gate's record.
+- Phase 219: the gate time limit stays as built.
+
+**Acceptance gate:**
+- Both new rows fail on the old code and pass on the new code.
+- All `scripts/production/test_merge_gate*.py` modules pass; basedpyright clean on both files.
+- No signal handler anywhere in the diff; sdlc sees the diff before land.
