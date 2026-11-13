@@ -497,8 +497,11 @@ class GateWorker:
 
     def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
                       live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
-        """Prefer available capacity, larger sizes, and the lowest total gate cost."""
+        """Prefer available capacity, the configured type order, and the lowest total gate cost."""
         values = settings()
+        types = values.words('instance_types')
+        def type_rank(variant: GateLaunchVariant) -> int:
+            return types.index(variant.instance_type) if variant.instance_type in types else len(types)
         policy = conf.read(self.settings_path)
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
@@ -545,13 +548,11 @@ class GateWorker:
             raise ValueError('The regional gate delay must be nonnegative')
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
             position, variant = item
-            size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', variant.instance_type)
-            vcpus = (2 if size[1] == 'large' else 4 * int(size[2] or '1')) if size else 0
             key = (variant.region, variant.instance_type, variant.zone)
             cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
-            return cooled(variant), -vcpus, key not in prices, cost, position
+            return cooled(variant), type_rank(variant), key not in prices, cost, position
         return [variant for _, variant in sorted(enumerate(variants), key=order)]
 
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:

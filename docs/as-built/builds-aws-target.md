@@ -213,7 +213,7 @@ The list must start with the home region and must not repeat a region.
 The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-The gate ranks deployed types and public zones by size and expected cost before launch.
+The gate ranks deployed types and public zones by the configured type order and expected cost before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
@@ -369,8 +369,9 @@ The live read never writes `spot-prices.json`.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
 Resumed launches keep the saved ranking and evidence without another live read.
 Available variants precede variants under a capacity cooldown.
-Within each group, larger vCPU sizes precede smaller sizes.
-Types with equal vCPU counts compete on expected gate cost.
+Within each group, types follow the `instance_types` order. The first type is the preferred size; later types are capacity fallbacks.
+Variants of one type compete on expected gate cost.
+Without any current price, the configured region, type, and zone order stays.
 That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.

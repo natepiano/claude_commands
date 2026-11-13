@@ -34,6 +34,7 @@ from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
 from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 
@@ -327,8 +328,7 @@ class CloudGateTests(CostFixture):
             self.assertEqual(east.prices, ())
             prices = [price for reading in reads for price in reading.prices]
             ranked = worker.rank_variants(variants, 'merge-gate', prices)
-            self.assertEqual(ranked[0].region, 'eu-south-2')
-            self.assertEqual(ranked[4].region, 'us-east-2')
+            self.assertEqual([row.region for row in ranked[:4]], ['eu-south-2'] * 2 + ['us-east-2'] * 2)
             self.assertEqual((self.state / 'spot-prices.json').read_bytes(), hourly)
         finally:
             release.set()
@@ -404,20 +404,21 @@ class CloudGateTests(CostFixture):
     def test_variant_prices_prefer_the_cheapest_zone_and_preserve_equal_price_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[:4], variants[:4])
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[:4], [variants[0], variants[1], variants[6], variants[7]])
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
         ranked = worker.rank_variants(variants, 'merge-gate')
         self.assertEqual(ranked[:2], [variants[7], variants[0]])
         self.assertFalse(any('describe-spot-price-history' in command for command in self.fake.commands))
 
-    def test_equal_vcpu_types_compete_on_price_and_smaller_sizes_remain_fallbacks(self) -> None:
+    def test_configured_type_order_comes_before_price(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-east-2', 'c7a.8xlarge', 'us-east-2a'): '.2',
                                       ('us-east-2', 'm7a.4xlarge', 'us-east-2a'): '.001'})
         ranked = worker.rank_variants(variants, 'merge-gate')
-        self.assertEqual(ranked[0], variants[2])
-        self.assertTrue(all(row.instance_type.endswith('8xlarge') for row in ranked[:8]))
-        self.assertTrue(all(row.instance_type.endswith('4xlarge') for row in ranked[8:]))
+        types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
+        self.assertEqual([row.instance_type for row in ranked], [size for size in types for _ in range(4)])
+        self.assertEqual(ranked[4], variants[2])
+        self.assertEqual(ranked[8], variants[4])
 
     def test_absent_stale_or_invalid_prices_preserve_configured_order(self) -> None:
         worker, variants = self.steering_fixture()
@@ -432,7 +433,7 @@ class CloudGateTests(CostFixture):
         self.variant_prices([variants[6]], {})
         ranked = worker.rank_variants(variants, 'merge-gate')
         self.assertEqual(ranked[0], variants[6])
-        self.assertEqual(ranked[1:4], variants[:4][:3])
+        self.assertEqual(ranked[1:4], [variants[0], variants[1], variants[7]])
         self.assertEqual(ranked[-4:], [variants[4], variants[5], variants[10], variants[11]])
 
     def test_zone_capacity_cooldown_ends_after_the_configured_window(self) -> None:
