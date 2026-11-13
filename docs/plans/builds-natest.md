@@ -3760,7 +3760,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `scripts/lib/unit_runs_test_support.py`: `bind_private_run_roots(case, root)` patches `RUN_ROOT`, `FORMER_RUN_ROOT` and `ASTRA_RUN_ROOT` to folders under `root` only while each equals its `/tmp/claude` default; cleanup registers before each start.
 - The rename fixtures (`test_shutdown_cli`, `rename_unit_test_support`, `rename_test_support`, `test_rename_unit_processes`) and `AddUnitTestCase` (`add_unit_test_support`) bind through the helper.
 - `scripts/test_times/module_run.py` gives each gate module a private `SCRATCH_ROOT` and `ASTRA_REVIEW_DIR`, removed at the end and before a signal exit.
-- Probe: zero real-root reads in 5 modules over 3 rounds. natedev CPU `test_shutdown_cli` 37.9 -> 30.1 s; correctness fix (the aws host has no live run folders). Tests and assertions unchanged; director reviews approve. Checkpoint 87396194c.
+- Probe: zero real-root reads in 5 modules over 3 rounds. natedev CPU `test_shutdown_cli` 37.9 -> 30.1 s; correctness fix (the aws host has no live run folders). Every test stays; one assertion in `test_both_roots_are_read_the_new_name_first` now reads `run_roots()` from a fresh interpreter's stdout, with the same expected tuple. Director reviews approve. Checkpoint 87396194c.
 - Observation: a `test_shutdown_cli` child reads host `/proc/<pid>/cwd` and `fd` links (a host process scan, not a run-root read).
 
 ### Phase 253 — The shutdown CLI tests copy class-built Git repositories  · status: todo
