@@ -3565,3 +3565,37 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `running()` replaces `origin.git`, `checkout`, `alpha` and `beta` with copies from that snapshot. The fixed paths keep the Git worktree links valid. Then it writes the per-test staff rows, panes, transcripts, unit config, exclude entry and log.
 - The test module did not change: 70 tests, all assertions and `run_lifecycle_process` stay. `running()` Git commands went from 448 to 56 in each module run.
 - aws paired trial, 3 rounds on c7a.8xlarge: CPU median 32.730 s to 30.856 s (saving 1.876 s); peak 155.2 to 159.2 MiB. natedev module_cost CPU 34.848 to 26.544 s. Checkpoint `1b63e07bf`.
+
+### Phase 234 — The unit config tests copy one seed repository  · status: todo
+**Depends on:** Phase 233
+
+#### Work Order
+
+**Goal:** `production/test_unit_config.py` and `lib/test_git_exclude.py` use less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** next-items order row 3 (devtools freed the module, sdlc 2026-11-12; builds go 2026-11-13 03:43). Cached gate median 2.625 CPU s. `UnitConfigFixture.setUp` (`unit_config_test_support.py:29`) runs `git init` and an empty commit in each of 50 tests (45 in `test_unit_config.py`, 5 in `test_git_exclude.py`).
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_unit_config.py lib/test_git_exclude.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. If the per-test `git init` and commit are a top cost: build one seed repository in `setUpClass` and copy it into each test's new temporary root in `setUp`. Keep the per-test home, environment, staff file and staff rows. The seed must be the same as the old per-test result: branch `main`, one empty commit, the same `.git/info/exclude`.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+5. Run both modules and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/production/unit_config_test_support.py`
+- `scripts/production/test_unit_config.py` and `scripts/lib/test_git_exclude.py` (only if a test reads a fixture step that moves)
+
+**Workers:** 1 writer; one fixture file and its two importers.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere; threads start through `scripts/lib/cancellation.start_masked_thread`.
+- Phase 233: a class snapshot copied to the same path keeps Git worktree links valid. This fixture uses a new temporary root in each test, so a copy must hold no absolute path into the seed.
+- Land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test counts and assertions; both modules pass three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
