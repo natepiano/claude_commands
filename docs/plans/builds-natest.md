@@ -3484,3 +3484,98 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 #### As-built
 
 - `scripts/direct/test_simplify_lens.py` calls `simplify_daily.main` in process through `invoke_cli`. `assign_gate.called_by_assign` refuses an in-process reviewer (unittest is the ancestor), and the guard stays. `simplify_daily.py` names its launcher path in one constant, `AGENT_EXEC`; the in-process cases bind it to a private launcher with an admission stub (the `review_launcher_test_support.py:184` pattern). The full `assign.sh` case and the status-write failure case keep the real guard. All 15 tests and 80 assertions stay; assignment starts 18 → 2. aws pairs, 3 rounds: 19.23 → 9.67 CPU s (9.56 s saved), peak 143.7 → 148.1 MiB. sdlc approved the diff. Checkpoint `8ee605e7f`.
+
+### Phase 224 — The module runner supervisor restores its signal mask on every path  · status: todo
+**Depends on:** Phase 222
+
+#### Work Order
+
+**Goal:** `scripts/test_times/module_run.py` never leaves SIGTERM, SIGINT, SIGHUP or SIGCHLD blocked in a process that continues after an error or in the test child.
+
+**Decision:** builds showrunner, 2026-11-12: `run_with_descendant_cleanup():580` calls `pthread_sigmask(SIG_BLOCK, ...)` before any `try`, the pattern Phase 222 fixed in `queue_place.py`. Check it; fix it if a signal or an error there can leave the mask blocked.
+
+**Spec:**
+1. Trace each path after the block at `:580`: the `signalfd` failure at `:587`, the `pidfd_open` and `prctl` failures, the test child after `fork()`, and the supervisor end. The supervisor blocks these signals by design, so `signalfd` can read them.
+2. A path is a defect only when a process continues to run Python or a test with the mask blocked. A process that exits at once is not a defect.
+3. For each defect: read the previous mask first, block inside the `try`, and restore it in the `finally` or in the child before tests start.
+4. Add one row in `scripts/test_times/test_module_run.py` for each defect. If no path is a defect, change no code and report each path with the line that makes it safe.
+5. Add no signal handler. Keep every test and assertion.
+6. Run `test_module_run.py`, `test_module_cost.py`, `scripts/production/test_merge_gate_suites_signals.py` and basedpyright on each changed file.
+
+**Files:**
+- `scripts/test_times/module_run.py`
+- `scripts/test_times/test_module_run.py`
+
+**Workers:** 1 writer; one source file and its test.
+- impl: both files.
+
+**Constraints from prior phases:**
+- Phase 222: `module_run.py` installs no signal handler; the test child gets SIGKILL parent death; the supervisor keeps the SIGKILL status without a signal reset.
+
+**Acceptance gate:**
+- Each path is reported as safe or fixed with a test row; no handler; the four modules pass; basedpyright clean.
+
+### Phase 225 — Change review tests prove contention without fresh interpreters  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/production/test_change_review.py` costs less CPU in aws pairs, with its list-lock and numbering proofs kept.
+
+**Decision:** sdlc freed the module for speed work (2026-11-12) and gave the go. Base: main `015832dfe` (fix-rounds `f25163b78` rows), merged at `41622ad5b`. Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+
+**Spec:**
+1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on the module. Work the slowest cases first.
+2. `test_two_readiness_calls_share_the_list_lock_without_duplicate_rows` (`:1377`): today the parent releases its directory lock at `:1387` (`os.close`) before the children import, so no contention is proven. Add a deterministic contention event: the parent holds the list lock until both children wait on it.
+3. The readiness case (`:1377`, 2 children) and the eight-add case (8 children across two lists; Phase 168 found it at `:1636`, so find its current line) may fork in place of a fresh interpreter. Each child closes inherited parent lock descriptors before contention, keeps its own output capture, environment and intended patches, and does not inherit unrelated parent patches. Keep process-group cleanup.
+4. Content cases that start the CLI only to read its result may call it in process through `invoke_cli` (`scripts/production/cli_fixture.py:84`). Keep one fresh CLI case for each entry point.
+5. Keep every test and assertion. Change no shared support file; if a helper cannot serve a case, report the case and stop.
+6. Run the module, its importers and basedpyright on each changed file.
+
+**Files:**
+- `scripts/production/test_change_review.py`
+
+**Workers:** 1 writer; one test file.
+- impl: the test file.
+
+**Constraints from prior phases:**
+- Phase 168: fork estimates at `8d1005406`: eight adds 1.994 CPU s, readiness 0.501 CPU s (children × (start + entry import); fork and cleanup not subtracted). Entry import 0.22 s.
+- Phase 214: in-process launch reads carry `MODELS_CONFIG_TIER_ONLY=1`, so no catalog sync starts.
+
+**Acceptance gate:**
+- Contention is proven; all tests and assertions remain; importers pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
+### Phase 226 — Workers and claims tests share one in-process launch fixture  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/direct/test_assign_claude_workers.py` and `test_assign_claude_claims.py` make content calls in process through the shared fixture, and aws pairs show a CPU gain.
+
+**Decision:** architect review after Phase 219 (order row 3); sdlc gave the go (2026-11-12). Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+
+**Spec:**
+1. Refresh both profiles first: `module_cost.py --tests 10 --commands 15`.
+2. Move the repeated `direct_cli_calls` setUp from `test_assign_claude_follow.py` and `test_assign_claude_records.py` into `assign_claude_test_support.py` as one fixture switch. Both importers keep their current cases.
+3. Turn the switch on in workers and claims. Content calls go through `run_assignment` (`assign_claude_test_support.py:445`) in process.
+4. Keep real processes for: workers startup hook `:18` and child observations `:91`; claims live-PID refusal `:30`, PID reuse `:48` and dead-child evidence `:67`.
+5. Keep every test and assertion. The fixture sets `MODELS_CONFIG_TIER_ONLY=1`.
+6. Run the four modules, other importers of the support file and basedpyright on each changed file.
+
+**Files:**
+- `scripts/direct/assign_claude_test_support.py`
+- `scripts/direct/test_assign_claude_workers.py`
+- `scripts/direct/test_assign_claude_claims.py`
+- `scripts/direct/test_assign_claude_follow.py`
+- `scripts/direct/test_assign_claude_records.py`
+
+**Workers:** 1 writer; the shared fixture and its importers move together.
+- impl: all five files.
+
+**Constraints from prior phases:**
+- Phase 221: follow and records turn on `run_assignment` in each setUp; nine cases keep real processes. sdlc asked to move that setUp into the shared fixture when a third module adopts it.
+
+**Acceptance gate:**
+- Assignment starts fall; all tests and assertions remain in the four modules; importers pass; basedpyright clean.
+- aws pairs show a gain for workers and claims and no loss for follow and records; sdlc sees the diff before land.
