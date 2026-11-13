@@ -3623,37 +3623,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 240 — The message process fixture finds descendants without a host scan  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The message process fixture finds owned descendants without a scan of every host process, and its importers use less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** next-items row 0a (host scans); sdlc owner go 2026-11-13 13:38. `OwnedTestProcesses.pin_descendants` (`scripts/message/process_test_support.py:90`) reads `/proc/<pid>/environ` for every process on the host, each time `stop_and_kill` (`:218`) loops. Phase 230 measured 53.9 natedev CPU s in 7 modules. The cost grows with the host process count, not with the test.
-
-**Spec:**
-1. Profile first, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD <each importer module> --tests 10`. Importers: `message/test_process_test_support.py`, `message/test_top_level.py`, `message/test_repeat_guard.py`, `message/test_notifier.py`, `message/test_rca.py`, `production/test_merge_gate_suites_resources.py`, `test_times/test_module_run.py`. Name the CPU in `pin_descendants`.
-2. On Linux, find owned descendants from the process tree under the test process, not from all of `/proc`. `scripts/lib/descendants.py` `adopt_descendants()` makes a process a child subreaper, so orphaned descendants stay in its tree. Read the tree through `/proc/<pid>/task/<tid>/children`, then check the owner marker only on those processes. Keep the pidfd pin and the stop, kill and reap order.
-3. A descendant that leaves the tree (a new session that is not reparented to the subreaper) must still be found, or the change must prove that the subreaper keeps it. Map each case to the test that proves it.
-4. Keep the macOS path (`darwin.user_processes`) unchanged unless the profile shows a cost there.
-5. Change test support files only. No signal handlers.
-6. Keep every test and assertion. Map each changed step to the assertions that read its result.
-7. Run each importer three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-8. The director runs the aws pairs.
-
-**Files:**
-- `scripts/message/process_test_support.py`
-
-**Workers:** 1 writer; one shared fixture and its importers.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 230: the host-scan census that measured this cost.
-- Phase 232: no signal handlers anywhere.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test counts and assertions; each importer passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `OwnedTestProcesses.pin_descendants` (`message/process_test_support.py`) walks the descendant task trees (`/proc/<pid>/task/<tid>/children`) under the subreaper on Linux and revisits each parent after its descendants, so a child forked during the walk is found. It no longer scans every process on the host. Owner markers, pidfd pinning, the stop, kill and reap order and the macOS branch did not change.
+- All 198 test bodies and 829 assertion calls in the 7 importers did not change. natedev attribution: `pin_descendants` 47.8 to 0.05 CPU s; the old scan cost grows with the host's process count.
+- aws paired trial, 3 rounds, sum of 7 modules: CPU 57.11 to 55.19 s (notifier 11.67 to 9.94; `repeat_guard` 15.55 to 15.90). Peak per module changed by -13.5 to +1.9 MiB. Checkpoint `f16184193`.
 
 ### Phase 241 — The CI points tests copy one seed repository  · status: done
 **Depends on:** none
