@@ -32,7 +32,17 @@ This document describes the implementation and its constraints.
 Shared whoami modules use canonical `scripts.whoami` imports.
 Loading the same module under two names creates distinct runtime types and breaks state checks across callers.
 
-The agent-notes job runs notes, quota alerts, pacing, refusal moves, and unit recovery as separate parts.
+The agent-notes job runs these parts in separate processes:
+
+1. Notes.
+2. Quota alerts.
+3. Pacing.
+4. Refusal moves.
+5. Unit recovery.
+6. Login reminders.
+7. Phase note pruning.
+8. Vault commits.
+
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
@@ -40,8 +50,10 @@ Neither job collects recovery snapshots or a desktop session note.
 
 ## Preventive login reminders
 
-The argument-free notes pass calls `login_sittings.run` after `refusal_watch.run`.
-A separate error block preserves the notes output when the reminder fails.
+The `Part.LOGINS` timer part calls `login_sittings.run` in its own child process.
+It runs in parallel with the other independent parts.
+`parts.logins` in `config/agent_notes.toml` sets a 120-second interval and a 45-second process limit.
+The argument-free `agent_notes.main` path does not call this reminder.
 The Mac usage refresher does not call this reminder.
 The module sends only on `login_sitting_machine`.
 It reads local dates through `accounts.read_status(source=StoredUsageOnly())`.

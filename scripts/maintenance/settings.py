@@ -16,6 +16,7 @@ class Part(str, Enum):
     PACER = "pacer"
     REFUSALS = "refusals"
     WATCHDOG = "watchdog"
+    LOGINS = "logins"
     PRUNE = "prune"
     VAULT = "vault"
 

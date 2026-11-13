@@ -712,14 +712,6 @@ def main() -> None:
             except Exception as error:
                 reason = str(error).splitlines()[0] if str(error) else type(error).__name__
                 print(f"refusal watcher: {reason}", file=sys.stderr)
-            try:
-                from scripts.accounts import login_sittings
-
-                for line in login_sittings.run(datetime.now(timezone.utc)):
-                    print(line)
-            except Exception as error:
-                reason = str(error).splitlines()[0] if str(error) else type(error).__name__
-                print(f"login sittings: {reason}", file=sys.stderr)
 
 
 if __name__ == "__main__":

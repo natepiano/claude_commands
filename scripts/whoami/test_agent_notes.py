@@ -39,7 +39,7 @@ from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSourc
                             codex_credits, reset_credits)
 from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
-from scripts.accounts import accounts, login_sittings, refusal_watch, refusals, role_map
+from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
 from scripts.maintenance.schedule import ScheduleBusy, locked_history
@@ -113,7 +113,6 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
         _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))
-        _ = self.enterContext(patch.object(login_sittings, "run", return_value=[]))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
@@ -1169,9 +1168,6 @@ class AgentNotesTests(unittest.TestCase):
         def watched(*_args: object, **_kwargs: object) -> list[str]:
             events.append("watcher")
             return ["fixture watcher decision"]
-        def sitting(*_args: object, **_kwargs: object) -> list[str]:
-            events.append("sitting")
-            return ["fixture sitting decision"]
         with (patch.object(sys, "argv", ["agent_notes.py"]),
               patch.object(agent_notes, "live_reports", return_value=[]),
               patch.object(five_hour, "watch", return_value=[]),
@@ -1179,39 +1175,10 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(agent_notes, "alert", side_effect=alerted),
               patch.object(codex_pacer, "tick", side_effect=paced),
               patch.object(agent_notes, "mark_tier"),
-              patch.object(refusal_watch, "run", side_effect=watched),
-              patch.object(login_sittings, "run", side_effect=sitting), redirect_stdout(io.StringIO()) as output):
+              patch.object(refusal_watch, "run", side_effect=watched), redirect_stdout(io.StringIO()) as output):
             agent_notes.main()
-        self.assertEqual(events, ["notes", "alert", "pacer", "watcher", "sitting"])
+        self.assertEqual(events, ["notes", "alert", "pacer", "watcher"])
         self.assertIn("fixture watcher decision", output.getvalue())
-        self.assertIn("fixture sitting decision", output.getvalue())
-
-    def test_login_sitting_failure_prints_one_stderr_line_and_keeps_the_notes_output(self) -> None:
-        with (patch.object(sys, "argv", ["agent_notes.py"]),
-              patch.object(agent_notes, "live_reports", return_value=[]),
-              patch.object(five_hour, "watch", return_value=[]),
-              patch.object(agent_notes, "alert", return_value=["fixture alert"]),
-              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
-              patch.object(refusal_watch, "run", return_value=["fixture watcher"]),
-              patch.object(login_sittings, "run", side_effect=OSError("fixture sitting unavailable\nmore detail")),
-              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            agent_notes.main()
-        self.assertEqual(errors.getvalue(), "login sittings: fixture sitting unavailable\n")
-        self.assertIn("fixture alert", output.getvalue())
-        self.assertIn("fixture watcher", output.getvalue())
-
-    def test_login_sittings_still_run_after_a_refusal_watcher_failure(self) -> None:
-        with (patch.object(sys, "argv", ["agent_notes.py"]),
-              patch.object(agent_notes, "live_reports", return_value=[]),
-              patch.object(five_hour, "watch", return_value=[]),
-              patch.object(agent_notes, "alert", return_value=[]),
-              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
-              patch.object(refusal_watch, "run", side_effect=OSError("fixture watcher unavailable")),
-              patch.object(login_sittings, "run", return_value=["fixture sitting"]) as sitting,
-              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
-            agent_notes.main()
-        sitting.assert_called_once()
-        self.assertIn("fixture sitting", output.getvalue())
 
     def test_watcher_failure_prints_one_stderr_line_without_failing_notes_update(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py"]),
