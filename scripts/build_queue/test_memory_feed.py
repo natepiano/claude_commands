@@ -7,7 +7,7 @@ import json
 import io
 import os
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
@@ -1114,6 +1114,47 @@ class MemoryFeedTests(unittest.TestCase):
                 expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
                 self.assertEqual(remote["status"], expected)
 
+    def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels) -> memory_feed.MemoryPage:
+        """Supply one owner for running and waiting cloud steps."""
+        reading = cloud_reading(reservation_reading())
+        rows = tuple(replace(row, identity=replace(row.identity, step=step)) for row in reading.cloud)
+        labels = {row.identity.session_id: owner for row in rows}
+        with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            return memory_feed.reading()
+
+    def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
+        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                          unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        merge_staff = unit_labels.make_labels("sdlc-merge-gate", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                             unit_labels.DirectsUnit("sdlc-merge-gate"))
+        unit_worker = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                              unit_labels.UnderDirector("panes", "panes", ""))
+        runner_worker = unit_labels.make_labels("land", unit_labels.UnderShowrunner("builds", "builds", ""),
+                                                unit_labels.NoDirector())
+        unknown = unit_labels.UnitLabels("unknown")
+        for step, owner, expected in (
+            ("targeted-test", director, "panes targeted"),
+            ("merge-gate", runner, "showrunner merge"),
+            ("merge-gate", director, "panes merge"),
+            ("merge-gate", merge_staff, "sdlc-merge-gate merge"),
+            ("merge-gate", unit_worker, "panes merge"),
+            ("merge-gate", runner_worker, "showrunner merge"),
+            ("targeted-test", unknown, "targeted test"),
+            ("merge-gate", unknown, "merge gate"),
+            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "targeted test"),
+            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
+            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "targeted test"),
+            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
+        ):
+            with self.subTest(step=step, owner=owner):
+                page = self.cloud_owner_page(step, owner)
+                running = [row for row in page["walk"] if row.get("kind") == "cloud"]
+                waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+                self.assertEqual([row["name"] for row in running], [expected])
+                self.assertEqual([row["name"] for row in waiting], [expected])
+
     def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
         _ = (self.root / "cloud_gate.conf").write_text(
             "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
@@ -1463,6 +1504,19 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                          unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        for version in ("before", "after"):
+            def recorded_name(row: wire.CloudRow, model: queue_view.QueueModel) -> str:
+                return model.names.shown(row.identity.step)
+            naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
+            with (naming if version == "before" else nullcontext()):
+                targeted = fixture.cloud_owner_page("targeted-test", director)
+                merge = fixture.cloud_owner_page("merge-gate", runner)
+            targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
+            targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
+            pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
