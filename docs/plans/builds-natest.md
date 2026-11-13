@@ -3770,35 +3770,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 246 — The fast track tests copy class seed repositories  · status: todo
+### Phase 246 — The fast track tests copy class seed repositories  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_fast_track.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** Third module by gate median CPU (52.0 s). sdlc owner go 2026-11-13 15:20, profile first. Phase 230 profile: 7,446 Git starts (19.5 CPU s) and 22 `fast_track.py` starts (19.9 CPU s) in 50 tests.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_fast_track.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If per-test Git setup is a top cost: build it once per class and copy it per test, as Phases 235–238 did. Keep each `fast_track.py` start that a test checks for exit status, recovery records or published state. A copy must hold no path into the seed. Keep tested patches, restores, retries and recovery real.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/test_fast_track.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235–238: class seed copies; register cleanup before a copy (Phase 236 and 237 findings).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- Profile only; no source change. `MergeCheckpointFixture.setUpClass` already builds the repositories once and saves a class snapshot; per-test setup starts no Git command (`FastTrackTests.setUp` 2.6 CPU s over 50 tests).
+- Module 49.1 natedev CPU s: Git 7,446 starts (17.5 s) and `fast_track.py` 22 starts (11.9 s) run inside tested `fast_track.py` behavior (restores, patches, retries, publication, recovery). A test-only change has no budget left.
+- Architecture proposal to sdlc: profile `fast_track.py` itself (0.54 CPU s and about 340 Git starts per run).
