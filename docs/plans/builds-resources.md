@@ -2349,3 +2349,41 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `config/mac_test.conf` — `ci_jobless_queued_minutes`
 
 **Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.
+
+### Phase 113 — A cargo version or help call runs during a build hold  · status: done
+
+**Depends on:** none.
+
+**Source (2026-11-13, builds showrunner, from hana trunk):** "During the cables natedev build hold, verify.sh test failed with 'cargo nextest is required' after it took the cargo token (run 20261113T014546-1850303-7c52). invoke.sh:512 runs 'cargo nextest --version' through the build_hold cargo wrapper; the wrapper refuses raw cargo during a hold. Expected: the version check does not go through the hold refusal. Fix it at the source."
+
+#### Work Order
+
+**Goal:** a cargo call that only prints a version or help text runs at once, also during a build hold.
+
+**Measured:**
+1. `have_nextest()` (`scripts/lint/invoke.sh`) runs `cargo nextest --version >/dev/null 2>&1`.
+2. The hold wrapper `scripts/build_hold/cargo` names `nextest` a building subcommand. During a hold, `hold_applies.py` refuses the call with exit 1, so `require_nextest()` prints `cargo nextest is required` and exits 2. nextest 0.9.143 is installed.
+3. `ci_cargo_front.building_call()` already treats `-V`, `--version`, `-h` and `--help` after the subcommand (and before `--`) as no build, except `--version` for `install`.
+
+**Spec:**
+1. In `scripts/build_hold/cargo`, after the subcommand is found, scan the later arguments up to `--`. When one is `-h` or `--help`, or `-V` or `--version` with a subcommand other than `install`, `exec` the real cargo at once, as for a non-building subcommand.
+2. Keep the Bash-only path: no Python and no scope for such a call.
+3. Change nothing else in the wrapper or in `invoke.sh`.
+
+**Tests** (`scripts/build_hold/test_cargo_wrapper.py`):
+1. Add rows to `test_non_building_commands_skip_scope_and_python`: `["nextest", "--version"]`, `["clippy", "-V"]`, `["build", "--help"]`, `["test", "-h"]`.
+2. Add rows to `test_building_commands_use_builds_slice` (or the existing test of building calls, as it fits): `["install", "--version", "1.0", "x"]` and `["nextest", "run", "--", "--help"]` still build.
+
+**Files:**
+- `scripts/build_hold/cargo`
+- `scripts/build_hold/test_cargo_wrapper.py`
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.build_hold.test_cargo_wrapper`.
+2. Lint: `basedpyright` on the test file, once after the edits.
+
+**Speed:** one more loop over the arguments in Bash, only for a building subcommand.
