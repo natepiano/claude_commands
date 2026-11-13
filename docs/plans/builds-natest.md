@@ -3546,38 +3546,13 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - The paired aws guest (`gate_box.py` paired environment) did not set `HERDR_BIN`, so 18 `agents/test_shutdown_cli.py` tests raised `HerdrMissing` on base and changed alike. `merge_gate.TEST_HERDR_BIN` is now the one definition; `test_module_environment` sets it after the inherited environment. The normal guest, both `module_cost.py` paths and `fast_track.fast_check` drop their copies; the paired supervisor embeds the constant beside the copied builder. `module_cost.py` now gives a module the gate's full environment. All 136 shutdown CLI tests pass through `module_cost.py` with `HERDR_BIN` unset. Checkpoint `0db93aadd`.
 
-### Phase 232 — The chain415 gate failures are fixed or owned  · status: todo
+### Phase 232 — The chain415 gate failures are fixed or owned  · status: done
 **Depends on:** Phase 231
 
-#### Work Order
+#### As-built
 
-**Goal:** each of the five modules that failed the chain415 full gate passes on the natest tip, or its failure is shown to come from base builds with a named owner.
+- Two of the five chain415 failures came from this branch. `buildlog/test_gate_index.py` now expects the nullable `vcpus` column from Phase 219.
+- Phase 222 masked cancellation signals only in the calling thread. A process-directed SIGINT taken by another thread broke `reap_gate_job`: it lost status and CPU, then raised `ChildProcessError`. `scripts/lib/cancellation.py` now owns `CANCELLATION_SIGNALS`, `defer_cleanup_signals` and `start_masked_thread`, which starts an existing thread under the mask so it inherits it. The gate_box guest memory monitor, the queue_place sampler, the `copies.available_tree` waiter and the admission test fixture loop start through it. QueuePlace records its child before the sampler starts. No signal handlers.
+- Base failures with owners, sent to builds: `direct/test_verify_admission_signals.py` (builds-queue `730e73dc1`, build-followups-test-speed `f085ddb08a`), `herdr/test_worker_panes.py` (staff-copies `7676e0473`, quota-refusal `b711e365a`), `review_links/test_change_page.py` (sdlc-fix-rounds `8786bfbef3`).
+- `build_folders.defer_signals` still installs signal handlers; it is a next item. Checkpoint `4f09f6f20`.
 
-**Decision:** builds showrunner, 2026-11-13. chain415 (natest tip 0f884af39 on builds e8bf18dd5) is red in the full gate on natedev. The gate waited 55 minutes for memory, so load was high. Fix the failures from this branch; name the owner of each base failure; send one repair tip that carries Phases 219–231.
-
-**Spec:**
-1. The five failing tests (log: `/tmp/claude/unit/2113de4f-9913-485a-9a51-61558bfd81db/phases/232/chain415_gate.log`):
-   1. `buildlog/test_gate_index.py` `test_gate_rows_preserve_fields_attempts_and_recorded_attempt_totals`: a row gains `'vcpus': None`. It fails again when rerun alone. This branch changed `scripts/buildlog/index.py`.
-   2. `production/test_merge_gate_suites_resources.py` `test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup`: `reap_gate_job` raises `ChildProcessError` at `merge_gate.py:989`; returncode is None, not 7. This branch changed `merge_gate.py` (Phases 219, 222, 227, 228).
-   3. `direct/test_verify_admission_signals.py` `test_sigterm_ends_admission_and_reaps_the_doc_step`: fixture hang guard at `wait_for_test_state.py:56`, then an unexpected cargo doc call.
-   4. `herdr/test_worker_panes.py` `test_concurrent_starts_publish_one_row_and_one_pane`: the two results differ (`SessionHome` against `HomeUnknown`).
-   5. `review_links/test_change_page.py` `test_skip_save_and_empty_states_in_the_browser` (light and dark): "feature log failed", a 503 answer.
-2. For each test, run its module at base `e8bf18dd5` and at the natest tip `aed5bc350`. Use `python3 ~/.claude/scripts/copies/copies.py run --repo $PWD --commit <sha> -- <command>`. Run a module three times if one run passes. Run each heavy probe under `systemd-run --user --scope -q -p MemoryMax=2G`.
-3. Classify each test: fails on the tip only (this branch), fails on both (base), or fails only under load (flaky). For a flaky test, find the race and name it by file:line.
-4. For a failure from this branch, fix it where it lives, with the smallest change. Keep every test and assertion. No signal handlers anywhere.
-5. For a base failure, name the last commit that touched the cause and its unit, from `git log`.
-6. Run each changed module and basedpyright on each changed file.
-
-**Workers:** 2 writers, split by test.
-- impl4: tests 1 and 2 (`scripts/buildlog/`, `scripts/production/merge_gate.py` and their tests).
-- fix2: tests 3, 4 and 5 (diagnosis first; edit only after the classification says this branch).
-
-**Constraints from prior phases:**
-- Phase 222: no signal handlers anywhere.
-- Phase 219: gates and targeted runs stop at a time limit.
-- Phase 231: `test_module_environment` sets `HERDR_BIN`.
-
-**Acceptance gate:**
-- Each of the five tests is classified with evidence.
-- Each failure from this branch is fixed and its module passes at the tip.
-- Each base failure names its commit and unit.
