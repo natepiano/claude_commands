@@ -93,9 +93,20 @@ def _line(connection: socket.socket, pending: bytearray, deadline: float) -> byt
     return line
 
 
+def _is_placement_control(request: wire.Request) -> bool:
+    return isinstance(request, (wire.PlacementRequest, wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport))
+
+
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
+    if _is_placement_control(request):
+        reply = _call(request, lambda _wait: None)
+        if isinstance(reply, LeftQueue):
+            raise _QueueLeft()
+        if isinstance(reply, wire.Refused):
+            raise wire.AdmissionUnavailable(reply.reason)
+        return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
@@ -293,8 +304,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
-          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
-    acquisition = isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
+          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization:
+    acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.BuildHistoryRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
@@ -332,8 +343,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
              *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
-             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue:
+             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization:
     first = request
+    placement_control = _is_placement_control(first)
     leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
@@ -348,7 +360,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     restarted = False
     last_valid = CLOCK.monotonic()
     last_silence_notice = last_valid
-    if isinstance(configuration, wire.AcquisitionTiming) and retry.unreachable_deadline == float("inf"):
+    if (not isinstance(configuration, wire.CleanupTiming)
+            and (isinstance(configuration, wire.AcquisitionTiming) or placement_control)
+            and retry.unreachable_deadline == float("inf")):
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
 
     def check_unreachable() -> None:
@@ -410,9 +424,13 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
-                        if generation_query:
+                        if generation_query or placement_control:
                             return reply
                         return _refused(reply.reason, checker=isinstance(first, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)))
+                    if placement_control:
+                        if isinstance(reply, (wire.Assignment, wire.PlacementWait, wire.DispatchStatus, wire.FirstAuthorization)):
+                            return reply
+                        raise CheckerFailure("invalid placement control answer")
                     if generation_query:
                         if retry.left_queue():
                             return LeftQueue()
@@ -506,6 +524,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 except Exception as refresh_error:
                     reason = str(refresh_error) or "checker returned an error"
         except (OSError, TransportUnavailable) as error:
+            if placement_control and isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
+                reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused"
+                raise wire.AdmissionUnavailable(reason) from error
             if retry.launch_without_wait or CLOCK.monotonic() >= retry.deadline:
                 return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
             restart_error = isinstance(error, TransportUnavailable) or error.errno in (errno.ECONNRESET, errno.EPIPE)

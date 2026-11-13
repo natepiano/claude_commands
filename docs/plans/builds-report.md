@@ -1256,3 +1256,18 @@ From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches s
 - Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
 
 **Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
+
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
+
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
