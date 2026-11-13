@@ -3620,7 +3620,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The repair (sdlc review) removed the `ParkedConfigBaseline` cache from `unit_config_test_support.py`: it copied the side effects of park by hand, so a change to park would leave the fixture wrong without an error. `park_config` runs real park again.
 - aws paired trial of the lifecycle part alone, 3 rounds: `test_production_lifecycle` CPU 29.450 to 28.069 s, peak 160.9 to 156.9 MiB; `test_unit_config` unchanged. Checkpoint `dc08e6574` and the repair checkpoint.
 
-### Phase 240 — The message process fixture finds descendants without a host scan  · status: todo
+### Phase 240 — The message process fixture finds descendants without a host scan  · status: done
 **Depends on:** none
 
 #### Work Order
