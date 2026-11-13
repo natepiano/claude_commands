@@ -37,7 +37,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertIn(f"Started {expected} ago.", str(tips))
                 self.assertIn(f"Waiting for {expected}.", str(tips))
 
-    def test_queued_titles_name_priority_units_without_moving_the_room_row(self) -> None:
+    def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
         for units, expected in (([], "Queued, in order of submission"),
                                 (["research"], "Queued, research first, then in submission order"),
                                 (["research", "cables"], "Queued, research followed by cables and then in submission order"),
@@ -50,14 +50,20 @@ class MemoryHoverTests(unittest.TestCase):
                 root = ElementTree.fromstring(f"<root>{rendered}</root>")
                 chart = root.find("./div[@class='walk-chart']")
                 assert chart is not None
-                title = chart.find("./div[@class='queue-title section-head']")
+                header = chart.find("./div[@class='walk-chart-head queue-head']")
+                assert header is not None
+                title = header.find("./span[@class='queue-title section-head']")
                 assert title is not None
                 self.assertEqual(title.text, expected)
+                self.assertEqual(title.get("title"), expected)
                 room = chart.find("./div[@class='wrow room']")
                 assert room is not None
                 children = list(chart)
-                self.assertEqual(children.index(room) + 1, children.index(title))
-                self.assertEqual(children[children.index(title) + 1].get("class"), "walk-chart-head queue-head")
+                self.assertEqual(children.index(room) + 1, children.index(header))
+                self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:0")
+                table_rows = root.findall(".//tbody/tr")
+                self.assertEqual([row.get("class") for row in table_rows],
+                                 ["", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/th[@class='step']/span"), "first")
 
