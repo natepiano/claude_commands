@@ -20,6 +20,30 @@ GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_queued_titles_name_priority_units_without_moving_the_room_row(self) -> None:
+        for units, expected in (([], "Queued, in order of submission"),
+                                (["research"], "Queued, research first, then in submission order"),
+                                (["research", "cables"], "Queued, research followed by cables and then in submission order"),
+                                (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
+            with self.subTest(units=units):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
+                    "walk": [{"name": "running", "queued": True}],
+                    "waiters": [{"name": "first", "since": 100, "detail": "research", "pid": 200}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                chart = root.find("./div[@class='walk-chart']")
+                assert chart is not None
+                title = chart.find("./div[@class='queue-title section-head']")
+                assert title is not None
+                self.assertEqual(title.text, expected)
+                room = chart.find("./div[@class='wrow room']")
+                assert room is not None
+                children = list(chart)
+                self.assertEqual(children.index(room) + 1, children.index(title))
+                self.assertEqual(children[children.index(title) + 1].get("class"), "walk-chart-head queue-head")
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='place']"), "1")
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/th[@class='step']/span"), "first")
+
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
         for phase, unit, done, total, percent, expected in (
             ("building", "units", 7, 10, 70, "70.0%"),

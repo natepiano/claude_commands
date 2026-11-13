@@ -46,10 +46,21 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ())
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
-def with_queue_priority(reading: admission_records.QueueRead) -> admission_records.QueueRead:
+def with_queue_priority(reading: admission_records.QueueRead, units: tuple[str, ...] = ("research",)
+                        ) -> admission_records.QueueRead:
     """Add a private user priority to the reading."""
-    priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "research", 'why': "the user's bump", 'set_at': reading.explanation.now, 'set_by': "fixture-user"},), admission_records.SettledPriority())
+    priority = admission_records.QueuePriority(tuple({"unit": unit, "why": "the user's bump",
+        "set_at": reading.explanation.now, "set_by": "fixture-user"} for unit in units))
     return replace(reading, explanation=replace(reading.explanation, priority=priority))
+
+
+def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...]) -> admission_records.QueueRead:
+    """Supply an ordered queue with repeated units and an older normal step."""
+    waiting = tuple(admission_records.WaitingStep(200 + index, f"wait-{index}", unit, "nextest",
+        f"/fixture/{unit}", 100 - index * 10, admission_records.GIB, admission_records.NeedsMemory(), unit=unit)
+        for index, unit in enumerate(("research", "research", "cables", "normal")))
+    current = replace(reading, view=replace(reading.view, waiting=waiting))
+    return with_queue_priority(current, units) if units else current
 
 
 def report_fixture(*, empty: bool = False) -> charts.PageData:
@@ -916,6 +927,22 @@ class MemoryFeedTests(unittest.TestCase):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["priority_text"], expected)
 
+    def test_queued_priorities_follow_the_captured_order_and_clear_when_removed(self) -> None:
+        base = reservation_reading()
+        for units, expected in (((), []), (("research",), ["research"]),
+                                (("research", "cables"), ["research", "cables"]),
+                                (("cables", "research", "absent"), ["research", "cables"]),
+                                (("absent",), [])):
+            with self.subTest(priority=units):
+                reading = queued_reading(base, units)
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    payload = memory_feed.reading()
+                self.assertEqual(payload["queued_priority_units"], expected)
+                self.assertEqual([row["pid"] for row in payload["waiters"]], [200, 201, 202, 203])
+                self.assertEqual([row["since"] for row in payload["waiters"]], [100, 90, 80, 70])
+                decoded = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
+                self.assertEqual(decoded["queued_priority_units"], expected)
+
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(
             reservation_reading(), admission_records.StartSpacingWait(110))))
@@ -1339,6 +1366,10 @@ def write_browser_fixture(folder: Path) -> None:
         pages: dict[str, object] = {}
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
+                pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        for name, units in (("queued_none", ()), ("queued_one", ("research",)),
+                            ("queued_two", ("research", "cables"))):
+            with mock.patch.object(admission_client, "view", return_value=queued_reading(base, units)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         readings["priority"] = with_queue_priority(base)
         with mock.patch.object(admission_client, "view", return_value=readings["priority"]):
