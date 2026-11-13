@@ -323,10 +323,16 @@ A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
 
-Restart refreshes each retained unknown director pane once, without a delay.
-It reuses that pane when the read proves a shell with no native agent.
-A successful replacement closes the retained shell through the existing restore path.
-A pane with a live agent or another row stays open.
+Restart waits within `START_SECONDS` for an exiting agent in its retained pane.
+It reuses that pane when fresh reads prove a shell with no native agent.
+After that budget, restart opens the replacement tab.
+The existing resume-check loop closes the old shell through the restore path when its agent exits.
+The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
+A caller without shared resume checks runs the same cleanup loop before `start_row` returns.
+Failed destination cleanup uses the destination session.
+Source cleanup uses the source session and its original terminal.
+If the old agent outlives that check, one anomaly names the pane, which stays for retire.
+A pane with a live agent, another native owner, or a changed terminal stays open.
 The source record stays until closure, absence, or another native owner is proved.
 Producer publication also keeps a prior binding while its pane remains open.
 It removes a prior binding when a read proves absence or another native owner.

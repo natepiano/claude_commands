@@ -169,12 +169,75 @@ class NoDirectorResumeChecks(Enum):
     CURRENT = "this caller does not check director progress"
 
 
+class RetainedPaneState(Enum):
+    SHELL = "the retained pane has no native agent"
+    EXITING = "the retained pane still has work or unknown evidence"
+    ABSENT = "the retained pane is absent"
+    FOREIGN = "another terminal or native owner holds the pane"
+
+
+@dataclass(frozen=True)
+class RetainedRestartPane:
+    """The original terminal and publication owned by the restarted row."""
+
+    row: staff.StaffRow
+    publication: pane_launch.LaunchPublication
+    client: herdr.Herdr
+    terminal: str
+
+    def state(self) -> RetainedPaneState:
+        try:
+            pane = next((pane for pane in self.client.panes()
+                         if pane["pane_id"] == self.publication.entry["pane_id"]), None)
+            if pane is None:
+                return RetainedPaneState.ABSENT
+            if not self.terminal or pane.get("terminal_id") != self.terminal:
+                return RetainedPaneState.FOREIGN
+            identities = pane_launch.native_sessions(self.client, pane)
+            if identities - {str(self.row.current_session)}:
+                return RetainedPaneState.FOREIGN
+            if not identities and isinstance(self.client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+                return RetainedPaneState.SHELL
+        except (OSError, ValueError, herdr_types.HerdrFailure):
+            pass
+        return RetainedPaneState.EXITING
+
+
+@dataclass(frozen=True)
+class ReplacedRestartPane:
+    """A retained source whose replacement started before its terminal became idle."""
+
+    source: RetainedRestartPane
+    destination_client: herdr.Herdr
+    destination: Path
+    attempt: pane_launch.ResumeAttempt
+    proof: pane_launch.VerifiedResume
+
+    def finish(self) -> bool:
+        state = self.source.state()
+        if state is RetainedPaneState.FOREIGN:
+            return True
+        if state is RetainedPaneState.EXITING:
+            return False
+        try:
+            pane_launch.finish_restore(self.source.publication.path, self.source.publication.entry,
+                self.attempt, self.proof, close=self.destination_client.close_tab_confirmed,
+                destination=self.destination,
+                close_source=lambda pane: self.source.client.close_tab_confirmed(pane, terminal=self.source.terminal),
+                source_pane=pane_launch.ResumeSourcePane(self.source.publication.entry["pane_id"]))
+            return pane_launch.read_strict(self.source.publication.path).get(
+                self.source.publication.entry["pane_id"]) != self.source.publication.entry
+        except (OSError, ValueError, herdr_types.HerdrFailure):
+            return False
+
+
 @dataclass
 class DirectorResumeChecks:
     checks: list[DirectorResumeCheck] = field(default_factory=list)
+    replaced_panes: list[ReplacedRestartPane] = field(default_factory=list)
 
     def report(self) -> None:
-        if not self.checks:
+        if not self.checks and not self.replaced_panes:
             return
         try:
             settings = conf.read("shutdown")
@@ -187,10 +250,11 @@ class DirectorResumeChecks:
             return
         states = [ResumeCheckState.NO_MESSAGE] * len(self.checks)
         while True:
+            self.replaced_panes = [pane for pane in self.replaced_panes if not pane.finish()]
             for index, check in enumerate(self.checks):
                 if states[index] is not ResumeCheckState.RESUMED:
                     states[index] = check.progress()
-            if all(state is ResumeCheckState.RESUMED for state in states):
+            if not self.replaced_panes and all(state is ResumeCheckState.RESUMED for state in states):
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -200,7 +264,11 @@ class DirectorResumeChecks:
             if state is not ResumeCheckState.RESUMED:
                 print(f"{check.name}: restart check: {state.value}")
         passed = sum(state is ResumeCheckState.RESUMED for state in states)
-        print(f"restart check: {passed} of {len(self.checks)} directors resumed")
+        if self.checks:
+            print(f"restart check: {passed} of {len(self.checks)} directors resumed")
+        for pane in self.replaced_panes:
+            _anomaly(pane.source.row, f"source pane {pane.source.client.session}:"
+                     + f"{pane.source.publication.entry['pane_id']} still has work after the restart check")
 
 
 class ClaudeTrustWriteFailed(OSError):
@@ -467,6 +535,9 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
             environment = {**names.environment(projected), **environment}
+        settings = conf.read("shutdown")
+        start_seconds = settings.number("START_SECONDS")
+        reuse_deadline = time.monotonic() + operation_deadline.remaining(start_seconds)
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
                        client.saved_row_tab(str(row.id), row.name, workspace))
@@ -480,6 +551,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             raise OSError(str(prepared))
         target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
         source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
+        exiting_source: RetainedRestartPane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         source_client = client
         try:
             if publication is not None and publication.path != pane_record.record_path(client.session):
@@ -489,6 +561,25 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(record, locations))
             panes = pane_launch.reference_panes(pane_launch.StaffLaunchReference(row.id), record, source_client,
                                                 entries, evidence=evidence)
+            if not panes and publication is not None and original is not None:
+                retained = next((pane for pane in locations if pane["pane_id"] == original["pane_id"]
+                                 and any(unknown.pane == pane["pane_id"] for unknown in evidence.scan.unknown)), None)
+                if retained is not None:
+                    exiting_source = RetainedRestartPane(row, publication, source_client, str(retained.get("terminal_id", "")))
+                    state = exiting_source.state()
+                    while state is RetainedPaneState.EXITING:
+                        remaining = reuse_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(operation_deadline.remaining(min(0.1, remaining)))
+                        state = exiting_source.state()
+                    source_pane = pane_launch.ResumeSourcePane(original["pane_id"])
+                    if state is RetainedPaneState.SHELL:
+                        panes = [retained]
+                        if row.kind == "producer" and source_client.session == client.session:
+                            target = client.producer_row_tab(str(row.id), row.name, workspace, record=record)
+                    elif state is RetainedPaneState.FOREIGN:
+                        source_pane = pane_launch.ResumeSourceAbsent.OTHER_OWNER
             if len(panes) > 1:
                 _anomaly(row, "duplicate panes retained")
             elif panes:
@@ -519,8 +610,6 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             return ""
         if isinstance(current, herdr.UnknownConversation) and not isinstance(live, herdr.UnknownConversation):
             herdr.conversation_note(current)
-        settings = conf.read("shutdown")
-        start_seconds = settings.number("START_SECONDS")
         operation_deadline.check()
         check: DirectorResumeCheck | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT
         if isinstance(opening, herdr.OpeningPrompt):
@@ -577,7 +666,17 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if (publication is not None and original is not None and projected is not None
                 and (publication.path != path or result.pane != original["pane_id"])):
             try:
-                if (isinstance(source_pane, pane_launch.ResumeSourceAbsent)
+                if isinstance(exiting_source, RetainedRestartPane):
+                    completed = expectation.expected_launch(projected) if row.kind == "producer" else projected
+                    cleanup = ReplacedRestartPane(exiting_source, client, path,
+                                                  pane_launch.resume_attempt(path, result.pane),
+                                                  names.resume_proof(original, completed))
+                    if not cleanup.finish():
+                        if isinstance(resume_checks, DirectorResumeChecks):
+                            resume_checks.replaced_panes.append(cleanup)
+                        else:
+                            DirectorResumeChecks(replaced_panes=[cleanup]).report()
+                elif (isinstance(source_pane, pane_launch.ResumeSourceAbsent)
                         or not pane_holds_other_work(source_client, source_pane.pane, str(row.current_session))):
                     completed = expectation.expected_launch(projected) if row.kind == "producer" else projected
                     pane_launch.finish_restore(publication.path, original,
