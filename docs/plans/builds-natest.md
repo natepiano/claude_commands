@@ -3834,25 +3834,25 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Each run starts about 16 Python helpers: `build_targets.py` 30 starts 5.2 s, `verify_helper.py` 16 starts 2.5 s, `admission_client.py` 18 starts 2.4 s, `build_folders.py` 39 starts 2.1 s, `tree_watch.py` 49 starts 2.1 s. Imports are 15-20 ms of each start.
 - Every run is read by an assertion, so the test-only floor is the current cost. Architecture proposal to sdlc: one helper process per `verify.sh` run; the 69 verify fixture modules are 868 of 4,763 CPU s in a full gate (18%).
 
-### Phase 258 — The accounts tests use less CPU through fewer tests  · status: todo
+### Phase 258 — The lint sweep tests use less CPU through fewer tests  · status: todo
 **Depends on:** Phase 257
-**Blocked by:** accounts change 5827e6dc7 on main — builds gave the go 2026-11-13 and says when it lands; then start from main.
+**Blocked by:** builds names the owner of `lint/test_sweep.py` and gives the go.
 
 #### Work Order
 
-**Goal:** `accounts/test_accounts.py` uses less CPU in aws pairs, through folded and removed tests; every behavior check stays.
+**Goal:** `lint/test_sweep.py` uses less CPU in aws pairs, through folded and removed tests; every behavior check stays.
 
-**Decision:** count phase. The prize is aws CPU (user 2026-11-13): fold or remove a test only where it cuts setup or run CPU. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. This module has the most tests (488).
+**Decision:** count phase. The prize is aws CPU (user 2026-11-13): fold or remove a test only where it cuts setup or run CPU. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. Director 2026-11-13: the accounts module costs only 14.9 CPU s for 488 tests (30 ms each), so it moved out. `lint/test_sweep.py` is the top untouched module with many tests: rank 20, 32.9 median CPU s, 348 tests.
 
 **Spec:**
 1. List groups of tests with the same setup and the same result under test. Fold each group into one table test with `subTest`, one row for each old check. Keep each old assertion as a row assertion.
-2. Run `python3 scripts/test_times/coverage_overlap.py scripts/accounts test_accounts.py`. Remove a candidate only when its covering test checks the same result. Name the covering test for each removal in the commit body.
+2. Run `python3 scripts/test_times/coverage_overlap.py scripts/lint test_sweep.py`. Remove a candidate only when its covering test checks the same result. Name the covering test for each removal in the commit body.
 3. Do not fold tests whose setup or failure message differs in a way a row cannot express. Keep a test that checks a process boundary, a signal or a wait.
 4. Map each old test to its row or covering test in `phases/258/count_map.md`.
 5. Run the module three times and basedpyright. Report the test count and `module_cost.py` CPU before and after.
 
 **Files:**
-- `scripts/accounts/test_accounts.py`
+- `scripts/lint/test_sweep.py`
 
 **Workers:** 1 writer; one test module. No-worker mode: the director writes it.
 - impl: all files.
