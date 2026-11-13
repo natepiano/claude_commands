@@ -3796,7 +3796,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 254 — The roster tests do less repeated work  · status: todo
+### Phase 254 — The roster tests do less repeated work  · status: done
 **Depends on:** none
 
 #### Work Order

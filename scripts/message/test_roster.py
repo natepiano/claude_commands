@@ -54,7 +54,10 @@ from scripts.message import roster
 from scripts.message import send
 from scripts.production import unit_lookup
 from scripts.lib import unit_runs
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.herdr import herdr
+from scripts.herdr import fake_herdr
 from scripts.herdr.fake_herdr import CommandResponse, herdr_listener
 from scripts.message import sessions, session_records
 from scripts.message.relay_identity import relay_session_name
@@ -108,6 +111,7 @@ class RosterTests(unittest.TestCase):
         # Fixture processes run as this test's own pid: never read the real account it runs on.
         _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        bind_private_run_roots(self, self.root / "private-runs")
         self.home = self.root / "home"
         self.sessions = self.root / "sessions"
         self.notifier = self.root / "notifier"
@@ -196,6 +200,17 @@ class RosterTests(unittest.TestCase):
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
         ))
         _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", return_value=self._herdr_fixture(self._herdr_sessions())))
+        run_program = herdr.run_program
+
+        def run_fixture(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+                        environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[0] != str(SCRIPTS / "herdr/fake_herdr.py") or process_boundary_for_case(self):
+                return run_program(argv, timeout, environment=environment)
+            child_environment = herdr.unmarked_environment() if environment is None else herdr.child_environment(environment)
+            return invoke_cli(fake_herdr, lambda: fake_herdr.main(argv[1:]), argv[1:],
+                              child_environment, Path.cwd())
+
+        _ = self.enterContext(mock.patch.object(herdr, "run_program", new=run_fixture))
         running_session = session_records.running_session
         def fixture_running(record: sessions.SessionRecord) -> bool:
             return record["pid"] == 991100 or running_session(record)
@@ -2139,6 +2154,7 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("herdr native:w1:p1", without_worker)
         self.assertIn("herdr native:w1:p3", without_worker)
 
+    @process_boundary
     def test_codex_pane_without_a_session_report_uses_its_process_identity(self) -> None:
         world = self.pane_world
         row = fixture_member("producer", name="process-pane")
@@ -2178,6 +2194,7 @@ class RosterTests(unittest.TestCase):
         commands = [cast(list[str], json.loads(line)) for line in (self.root / "herdr.jsonl").read_text().splitlines()]
         self.assertNotIn(["--session", "native", "pane", "process-info", "--pane", "w1:p6"], commands)
 
+    @process_boundary
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
         binary = self._herdr_fixture({"default": {"code": 1, "stdout": json.dumps({
             "error": {"code": "closed", "message": "fixture herdr unavailable"}
@@ -2191,6 +2208,7 @@ class RosterTests(unittest.TestCase):
         self.assertTrue(any("herdr sessions" in problem for problem in found.problems))
         self.assertTrue(all("fixture herdr unavailable" in problem for problem in found.problems))
 
+    @process_boundary
     def test_an_unreadable_herdr_session_keeps_codex_rows_from_other_sessions(self) -> None:
         responses = self._herdr_sessions()
         sessions_response = {"sessions": [herdr.SessionEntry(name=name, running=True, default=False,
@@ -2771,6 +2789,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        bind_private_run_roots(self, self.root / "private-runs")
         self.runs = self.root / "runs"
         self.registry = self.root / "sessions"
         notifier = self.root / "notifier"
