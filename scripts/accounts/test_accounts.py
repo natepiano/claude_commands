@@ -7143,6 +7143,51 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                     for row in workers:
                         self.assertEqual(staff.retire(row.id), row)
 
+    def test_detached_move_skips_a_credits_off_target_whose_included_usage_is_gone(self) -> None:
+        _ = self.workers_fixture()
+        now = datetime.now(timezone.utc)
+        for weekly_left, use_credits, moved in ((0.0, "off", False), (0.0, "on", True), (40.0, "off", True)):
+            case = f"{weekly_left}-{use_credits}"
+            with self.subTest(weekly_left=weekly_left, use_credits=use_credits):
+                self.write_note("codex1", "target@example.invalid", use_credits=use_credits)
+                workers = (self.workers_member("first-" + case), self.workers_member("second-" + case))
+                reading = refusals.FreshReading(refusals.ReadingWindow(weekly_left, refusals.KnownReset(now + timedelta(days=2)), now),
+                                                refusals.NoWindow(), "200")
+                _ = accounts.accounts_config_file().write_text('{"workers": "codex2"}\n')
+                moves.append_move(moves.RequestedMove(kind="requested", at=now.isoformat(), tool="codex", subject="workers",
+                    move_id="request-" + case, cause="refusal", why="codex2 refused",
+                    **{"from": "codex2", "to": "codex1"}, window="weekly"))
+                calls: list[staff.StaffId] = []
+
+                def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
+                         why: str, run: Path) -> accounts.SessionMoveOutcome:
+                    del record, target_label, why, run
+                    calls.append(row.id)
+                    return accounts.SessionMoveRefused(row.id, "fixture worker refused")
+
+                with (patch.object(accounts, "_launch_worker_moves"),
+                      patch.object(refusals, "stored_reading", return_value=reading),
+                      patch.object(pane_moves, "move_worker", side_effect=move)):
+                    _ = accounts.swap("workers", "codex1", why="codex2 refused", cause="refusal", worker_moves="detach")
+                    result = accounts.move_workers("codex1", follow_role=True)
+                worker_ids = {row.id for row in workers}
+                self.assertEqual(worker_ids <= set(calls), moved)
+                outcome = next(row for row in reversed(moves.read_moves())
+                               if row["move_id"] == "request-" + case and row["kind"] != "requested")
+                if moved:
+                    self.assertEqual(outcome["kind"], "confirmed")
+                else:
+                    self.assertEqual(calls, [])
+                    reason = "codex1: use_credits is off and its included usage is gone; the worker stays"
+                    self.assertEqual(outcome, {**outcome, "kind": "failed", "reason": reason})
+                    assert isinstance(result, accounts.GroupMoveStartFailed)
+                    self.assertEqual({outcome.reason for outcome in result.outcomes
+                                      if isinstance(outcome, accounts.SessionMoveRefused)}, {reason})
+                self.assertFalse(moves.store_file().with_name("workers_move.json").exists())
+                with patch.object(staff, "require_stopped", return_value=None):
+                    for row in workers:
+                        self.assertEqual(staff.retire(row.id), row)
+
     def test_unset_workers_role_refuses_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
             message = "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>"
