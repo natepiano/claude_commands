@@ -49,26 +49,37 @@ def building_call(arguments: Sequence[str]) -> bool:
         if value in GLOBAL_VALUES:
             _ = next(values, "")
         elif not value.startswith(("-", "+")):
+            for argument in values:
+                if argument == "--":
+                    break
+                if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
+                    return False
             return value in BUILDING
     return False
 
 
 def cargo_path(explicit: str, front: Path) -> tuple[str, str]:
-    """Keep the admission front before cargo-tile without recursive calls."""
+    """Keep job tools on PATH and remove folders that would call the front again."""
     front = front.resolve()
-    entries = [entry for entry in os.get_exec_path() if Path(entry or ".").resolve() != front.parent]
+    entries: list[str] = []
+    command = ""
+    for entry in os.get_exec_path():
+        folder = Path(entry or ".")
+        if folder.resolve() == front.parent:
+            continue
+        candidate = folder / "cargo"
+        executable = candidate.is_file() and os.access(candidate, os.X_OK)
+        if executable and candidate.resolve() == front:
+            continue
+        entries.append(entry)
+        if not command and executable:
+            command = str(candidate.absolute())
     if explicit:
         command = str(Path(explicit).absolute())
         directory = str(Path(command).parent)
-        if directory in entries:
-            entries = entries[entries.index(directory):]
-        else:
-            entries = [directory, *entries]
+        entries = [directory, *(entry for entry in entries if entry != directory)]
+    if command:
         return command, os.pathsep.join(entries)
-    for index, directory in enumerate(entries):
-        candidate = Path(directory or ".") / "cargo"
-        if candidate.is_file() and os.access(candidate, os.X_OK) and candidate.resolve() != front:
-            return str(candidate.absolute()), os.pathsep.join(entries[index:])
     raise FileNotFoundError("cargo: no cargo executable after the admission front")
 
 
