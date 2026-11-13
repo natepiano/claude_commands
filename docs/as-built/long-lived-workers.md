@@ -23,14 +23,24 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
+The launcher returns when a child accepts that dispatch through `scripts.lib.detached.start_detached`.
+The child uses a separate session, so a signal to the caller's process group does not stop it.
 A compaction must write its transcript record within `WORKER_COMPACT_SECONDS`.
-A failed compaction prints one error line, and the dispatch sends no prompt.
+The same deadline bounds `/compact --wait --timeout` and the following turn-end wait.
+Only the compaction record proves completion; a turn-start record does not.
+The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
+It writes its output to `compact-<dispatch id>.log` in the run folder.
+A compaction failure sends no prompt and clears only matching `/compact` composer text.
+A detached delivery failure ends the pass with `error` and reports through the existing completion hook.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 
 ## Pane submission and completion
 
-`assign.sh` returns after successful prompt delivery. Exit 0 means submitted.
+`assign.sh` returns after successful prompt delivery or an accepted detached compaction. Both return exit 0.
+The early return prints `compaction runs detached; the prompt follows` with the worker name.
+The pass stays active while the child completes delivery.
+An assignment with no compaction due keeps its attached delivery path.
 Codex dispatch also requires the prompt in its transcript before it reports submission.
 Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
 An unproved Codex prompt returns uncertain when this bound passes or the process exits.
@@ -591,7 +601,8 @@ The [session roster](session-roster.md) shows open roles through their current s
 `worker_lock` holds the parent's named creation lock until the new worker has a fixed staff id.
 `WorkerLockHold.bind` locks that fixed id before creation serialization ends.
 A competing dispatch returns `Kept` when the lock is held.
-`worker.py dispatch` holds this lock from pass creation through prompt submission.
+`worker.py dispatch` holds this lock from pass creation through prompt submission or detached handoff.
+The detached child takes the same lock before compaction and keeps it through prompt delivery.
 It releases the lock before the completion hook ends the pass.
 `worker_dispatch_state` keeps an active pass with a saved submission held during this gap.
 A transcript that ends with the dispatch DONE line proves completion before the hook records the pass end.
