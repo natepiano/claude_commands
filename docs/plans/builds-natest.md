@@ -3658,35 +3658,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 241 — The CI points tests copy one seed repository  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_ci_points.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 seed inventory; sdlc owner go 2026-11-13 14:40. `setUp` (`test_ci_points.py:173`) runs about nine Git commands in each of 34 tests (306 calls).
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_ci_points.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the per-test Git setup is a top cost: build it once per class and copy it per test, as Phases 235–238 did. Absolute origin or worktree paths need a fixed per-class root or a rewrite after the copy. A copy must hold no path into the seed. Keep tested fetches, commits, races and recovery real.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/test_ci_points.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235–238: class seed copies; register cleanup before a copy (Phase 236 and 237 findings).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `production/test_ci_points.py` builds the full fixture once per class (`build_fixture` keeps the old setup body) and copies it per test to the same fixed root. Origin, document, staff and environment paths select the restored root. Each test gets its own environment dictionary and a refreshed checkout index; cleanup registrations precede each build or copy.
+- setUp ran 11 Git commands in each of 34 tests; it now copies. Tested fetches, commits, locks, races and recovery stay real. All 34 test bodies and 277 assertion expressions did not change.
+- aws paired trial, 3 rounds: CPU 13.399 to 11.942 s; peak 165.2 to 152.2 MiB. Checkpoint `07a15ce4c`.
 
 ### Phase 242 — The notifier tests start fewer shells  · status: todo
 **Depends on:** none
