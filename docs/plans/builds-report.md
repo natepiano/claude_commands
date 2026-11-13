@@ -1288,6 +1288,10 @@ From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/sc
 
 **Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
 
+### Phase 67 — The Queued title shares the waiting header row · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers". Put the phase 65 title on the waiting header row (`# | Done | Waiting | Unit | Pid | Machine | vCPU`), bottom-aligned with those headers, at its current font, so the empty row goes away.
+
 ### Phase 66 — Retire /build:queue · status: todo
 
 From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
