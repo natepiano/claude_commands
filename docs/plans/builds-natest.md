@@ -3587,36 +3587,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 2; sdlc owner go 2026-11-13 13:38. Cached gate median 38.41 CPU s. `RetireUnitTests.setUp` (`test_shutdown_cli.py:544`) runs about 13 Git commands in each of its tests: bare init, clone, three config, add, commit, push, worktree add, add, commit, push, merge. `ResumeUnitTests.setUp` (`:1394`) runs about 8: bare init, clone, three config, add, commit, push.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the setup Git work is a top cost: build a retired-state snapshot and a resume-state snapshot once per class, and copy it in `setUp`. The production doc holds the absolute checkout path, and the worktree links are absolute. So either keep one fixed root path per class and restore into it (as Phase 233 did), or rewrite every absolute path after the copy. Keep the per-test staff rows, configs, run folder, holds, pane world, unit config and patches.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/agents/test_shutdown_cli.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 229: the move process scan reads the selected process root; keep that.
-- Phase 232: no signal handlers anywhere.
-- Phase 233: a class snapshot restored to the same path keeps Git worktree links valid.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `RetireUnitTests` and `ResumeUnitTests` (`agents/test_shutdown_cli.py`) build the retired and resume repository states once per class at fixed roots. Each test copies its snapshot back. Nested retirement fixtures keep separate roots.
+- `restore_repository` registers the removal of the destination before the copy, so a failed copy leaves no partial folder (closure of review finding F001). All 136 test bodies and 943 assertion sites did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 37.478 to 34.466 s; peak 226.1 to 225.4 MiB. FolderRename pending move (16.6 natedev CPU s) and UnitRename identity (9.9 s) are the next costs. Checkpoint `f65598a5a`.
 
 ### Phase 237 — The build record tests copy one seed repository  · status: done
 **Depends on:** Phase 234
