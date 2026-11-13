@@ -237,11 +237,15 @@ class MacQueueViewTests(unittest.TestCase):
     def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
         for origin in queue_view.MacBuildOrigin:
             with self.subTest(origin=origin):
-                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin)
+                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin,
+                                            ci_runner="hana-mac-1", ci_job="test-hana")
                 row = queue_view.mac_build_record(build)
                 self.assertEqual(queue_view.mac_build_from_record(row), build)
                 del row["origin"]
                 self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
+                del row["ci_runner"], row["ci_job"]
+                self.assertEqual(queue_view.mac_build_from_record(row).ci_runner, "")
+                self.assertEqual(queue_view.mac_build_from_record(row).ci_job, "")
 
     def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -268,6 +272,7 @@ class MacQueueViewTests(unittest.TestCase):
                         "read_captures = lambda processes: {}\n" +
                         f"output = lambda arguments: 'p100\\nn{folder}\\n'\n" +
                         "repository_name = lambda folder: 'hana'\n" +
+                        "process_environment = lambda pid: {'RUNNER_NAME': 'hana-mac-1', 'GITHUB_JOB': 'test-hana'}\n" +
                         "print(json.dumps(read_builds()))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -275,6 +280,8 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(len(rows), 1)
                     self.assertEqual(rows[0]["pid"], 100)
                     self.assertEqual(rows[0]["origin"], expected)
+                    self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
+                    self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
     def test_mac_names_use_the_package_then_the_repository(self) -> None:
         for command, repository, expected in (
@@ -527,8 +534,8 @@ class CloudQueueViewTests(unittest.TestCase):
             ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
             ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
             ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("build", director, "build"),
-            ("literal{step}", director, "literal{step}"),
+            ("build", director, "panes build"),
+            ("literal{step}", director, "panes literal{step}"),
         ):
             with self.subTest(step=step, owner=owner):
                 current = replace(row, identity=replace(row.identity, step=step))

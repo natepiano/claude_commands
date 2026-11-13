@@ -321,11 +321,15 @@ class MemoryFeedTests(unittest.TestCase):
                       mock.patch.object(memory_feed, "read_ci_runner", side_effect=runner_record)):
                     page = memory_feed.reading()
                 run = next(row for row in page["walk"] if row.get("queued"))
-                self.assertEqual(run.get("showrunner"), "hana CI")
-                self.assertEqual(page["waiters"][0]["showrunner"], "hana CI")
-                self.assertEqual(run["unit"], runner)
+                self.assertEqual(run.get("showrunner"), "")
+                self.assertEqual(run.get("ci_label"), "unrelated display name")
+                self.assertEqual(run["name"], "CI nextest")
+                self.assertEqual(page["waiters"][0]["showrunner"], "")
+                self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
+                self.assertEqual(run["unit"], "")
                 ci = next(row for row in page["walk"] if row.get("ci"))
-                self.assertEqual(ci["unit"], "hana CI")
+                self.assertEqual(ci["unit"], "")
+                self.assertTrue(ci.get("ci_label"))
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 
@@ -784,6 +788,29 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertTrue(all(count == 1 for count in reads.values()))
         self.assertNotIn(agent / "memory.swap.current", reads)
 
+    def owner_swap_reading(self, owner: unit_labels.UnitLabels) -> memory_feed.SwapReading:
+        """Read a real swap counter with its recorded staff owner."""
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("builds.slice", admission_records.GIB)
+        scope = self.cgroup("builds.slice/owner.scope", admission_records.GIB)
+        step = reservation_reading().view.running[0]
+        memory = step.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        step = replace(step, measured=replace(memory,
+                       anonymous_source=admission_records.ScopeSource(scope, frozenset())))
+        reading = memory_feed.read_swap((step,), {step.session_id: owner}, 6, read_step_names())
+        assert isinstance(reading, memory_feed.SwapReading)
+        return reading
+
+    def test_swap_rows_keep_the_showrunner_and_unit_for_tooltips(self) -> None:
+        owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                       unit_labels.UnderDirector("research", "research", ""))
+        reading = self.owner_swap_reading(owner)
+        row, = [row for row in reading.rows if row.get("unit") == "research"]
+        self.assertEqual(row.get("showrunner"), "hana")
+        self.assertEqual(row["bytes"], admission_records.GIB)
+        self.assertEqual(sum(row["bytes"] for row in reading.rows if row["kind"] != "total"), reading.used)
+
     def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
         _ = self.cgroup("system.slice", 2 ** 20 - 7)
@@ -1122,6 +1149,65 @@ class MemoryFeedTests(unittest.TestCase):
         with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             return memory_feed.reading()
+
+    def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:
+        """Use the same owner across the local, Mac, and cloud rows."""
+        reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission()))
+        cloud = tuple(replace(row, identity=replace(row.identity, step="nextest",
+                      unit=owner.unit if owner.unit != "—" else "")) for row in reading.cloud)
+        reading = replace(reading, cloud=cloud)
+        labels = {step.session_id: owner for step in (*reading.view.running, *reading.view.waiting)}
+        labels.update({row.identity.session_id: owner for row in cloud})
+        build = queue_view.MacBuild(90082, "/Users/nate/hana", reading.explanation.now - 45,
+            "cargo nextest run --jobs=8", "hana", queue_view.MacTesting(90083), admission_records.GIB,
+            origin=queue_view.MacBuildOrigin.CI if ci else queue_view.MacBuildOrigin.NON_CI,
+            ci_runner="hana-mac-1" if ci else "", ci_job="test-hana" if ci else "")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
+                  reading.explanation.now, (build,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={build.pid: owner})):
+            return memory_feed.reading()
+
+    def test_step_owners_name_every_machine_and_both_tables(self) -> None:
+        for owner, name in (
+            (unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                unit_labels.UnderDirector("research", "research", "")), "research nextest"),
+            (unit_labels.make_labels("hana", unit_labels.RunsProduction("hana"), unit_labels.NoDirector()),
+                "showrunner nextest"),
+        ):
+            with self.subTest(role=owner.role):
+                page = self.owner_machine_page(owner)
+                self.assertEqual({row.get("machine") for row in page["walk"]}, {"fixture", "mac", "aws"})
+                for row in (*page["walk"], *page["waiters"]):
+                    self.assertEqual(row["name"], name)
+                    self.assertEqual(row.get("showrunner"), "hana")
+                    self.assertEqual(row["unit"], owner.unit)
+
+    def test_mac_ci_uses_the_configured_label_without_a_staff_owner(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
+        page = self.owner_machine_page(unit_labels.UnitLabels("unknown"), ci=True)
+        mac, = [row for row in page["walk"] if row.get("kind") == "mac-build"]
+        self.assertEqual(mac["name"], "CI nextest")
+        self.assertEqual(mac.get("ci_label"), "hana CI · hana-mac-1 · test-hana")
+        self.assertEqual(mac.get("showrunner"), "")
+        self.assertEqual(mac["unit"], "")
+        for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI · hana-mac-1"),
+                                   ("", "test-hana", "hana CI · test-hana")):
+            with self.subTest(runner=runner, job=job):
+                build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
+                    origin=queue_view.MacBuildOrigin.CI, ci_runner=runner, ci_job=job)
+                row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
+                                              unit_labels.UnitLabels("unknown"), names=read_step_names())
+                self.assertEqual(row["name"], "CI nextest")
+                self.assertEqual(row.get("ci_label"), label)
+
+    def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
+        page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["hana nextest"])
+        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
+        local, = [row for row in page["walk"] if not row.get("kind")]
+        self.assertEqual(local["name"], "fixture-project nextest")
 
     def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
@@ -1517,6 +1603,21 @@ def write_browser_fixture(folder: Path) -> None:
             targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
             targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
             pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
+        owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                        unit_labels.UnderDirector("research", "research", ""))
+        pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))
+        cast(dict[str, object], pages["step_owners"])["swap_by"] = fixture.owner_swap_reading(owner).rows
+        ci_page = fixture.owner_machine_page(owner, ci=True)
+        ci_row, = [row for row in ci_page["walk"] if row.get("kind") == "mac-build"]
+        ci_waiter = ci_page["waiters"][0]
+        ci_waiter["name"] = ci_row["name"]
+        ci_waiter["showrunner"] = ""
+        ci_waiter["unit"] = ""
+        ci_waiter["detail"] = ""
+        ci_waiter["ci_label"] = ci_row.get("ci_label", "")
+        pages["step_ci"] = json.loads(memory_feed.page_json(ci_page))
+        pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
+            unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
