@@ -3789,7 +3789,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `message/test_send.py`: `setUpModule` calls it; `repeat_guard.py` starts 262 -> 5.
 - aws pairs: 31.409 -> 13.550 CPU s (paired median saving 17.865 s); peak 180.2 -> 180.4 MiB. 317 tests and their assertions unchanged; director reviews approve. Checkpoint 8fc1fdc55.
 
-### Phase 256 — The stall watch tests do less repeated work  · status: todo
+### Phase 256 — The stall watch tests do less repeated work  · status: done
 **Depends on:** none
 
 #### Work Order

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import io
@@ -178,7 +179,7 @@ raise SystemExit(1)
         self.projects.mkdir()
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
-        self.send_log = self.root / "sends.jsonl"
+        self.send_log = self.root / "sends.txt"
         self.rca_log = self.root / "rca-sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
@@ -186,9 +187,12 @@ raise SystemExit(1)
         self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
-        executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
+        # Shell builtins print the rows; a cat child would double the starts for each snapshot.
+        executable(self.bin / "ps", "#!/bin/sh\nwhile IFS= read -r row; do printf '%s\\n' \"$row\"; done < \"$STALL_TEST_PS_FILE\"\n")
+        # The record is a Python literal, and json loads only for a fail list. A json import adds
+        # about 60% to the start time of this stub, and stall_watch starts it for each delivery.
         executable(self.bin / "send.py", """#!/usr/bin/env python3
-import json, os, sys, time
+import os, sys, time
 args = sys.argv[1:]
 retire = args[:1] == ['retire']
 record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
@@ -197,7 +201,7 @@ if retire:
     record['command'] = 'retire'
 if '--value' in args:
     record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
-line = (json.dumps(record) + '\\n').encode()
+line = (repr(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
@@ -207,7 +211,13 @@ while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < ex
     if time.monotonic() >= deadline:
         raise SystemExit('send barrier did not receive every concurrent delivery')
     time.sleep(0.01)
-fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
+with open(os.environ['STALL_TEST_FAIL_FILE']) as targets:
+    text = targets.read()
+if text == '[]':
+    fail = []
+else:
+    import json
+    fail = json.loads(text)
 # A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
 if retire:
     raise SystemExit(3 if 'retire' in fail else 0)
@@ -572,7 +582,7 @@ always=natedev
     def sent(self) -> list[dict[str, str]]:
         if not self.send_log.exists():
             return []
-        return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+        return [ast.literal_eval(line) for line in self.send_log.read_text().splitlines()]
 
     def moved_director_run(self, *, finished: bool = False) -> Path:
         """Keep stale staff and document paths while the held run uses another worktree."""
