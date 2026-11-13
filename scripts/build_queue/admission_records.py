@@ -422,13 +422,23 @@ class CompilerServiceMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class ServiceJobStateNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
     diagnostic: str = ""
     cgroup: str = ""
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
     pid: int | PidNotRecorded = field(kw_only=True)
-    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+    # Keep this wire union stable for pinned clients.
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = field(
+        default=NotServiceSlice(), metadata={"acquisition_unused": True})
+    # New service states belong in this optional field.
+    service_job_state: ServiceJobStateNotRecorded = field(
+        default_factory=ServiceJobStateNotRecorded, kw_only=True, metadata={"acquisition_unused": True})
 
 
 @dataclass(frozen=True)
