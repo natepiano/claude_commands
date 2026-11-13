@@ -36,6 +36,10 @@ from scripts.build_queue.admission_test_support import (
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
 from scripts.build_queue.test_snapshot_codec import service_snapshot
+from scripts.build_queue import placement
+from scripts.build_queue.test_placement import (
+    PlacementFixture, adopt_assignment, assignment_for, placement_request, publish_candidate,
+)
 from scripts.lint.memory_test_support import commit_config_fixture, config_environment
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
@@ -1300,6 +1304,90 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(client.main(), 2)
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
+
+    def placement_control_query(self, fixture: PlacementFixture, operation: str
+                                ) -> tuple[wire.Request, Callable[[], object], wire.Reply]:
+        submitted = placement_request(fixture)
+        evidence = publish_candidate(fixture, submitted)
+        self.assertEqual(evidence.key, fixture.server.host_evidence_key(submitted, submitted.constraints.candidates[0].destination))
+        assigned = assignment_for(fixture, submitted)
+        claim = adopt_assignment(fixture, submitted, assigned)
+        request: wire.Request
+        query: Callable[[], object]
+        if operation == "placement":
+            request = submitted
+            query = lambda: client.request_placement(submitted)
+        elif operation == "claim":
+            failure = wire.ClaimFailure("failed-claim", assigned, "busy")
+            request = failure
+            query = lambda: client.claim_failure(failure)
+        elif operation == "permission":
+            permission = wire.ConsumePermission("launch-permission", assigned, claim)
+            request = permission
+            query = lambda: client.consume_permission(permission)
+        elif operation == "execution":
+            execution = wire.ExecutionReport("finished-step", assigned, claim, placement.ExecutionNotStarted())
+            request = execution
+            query = lambda: client.report_execution(execution)
+        else:
+            raise AssertionError(f"unknown placement operation: {operation}")
+        expected, = fixture.server.handle_request(request)
+        return request, query, expected
+
+    def test_placement_requests_wait_for_slow_answers_and_refuse_dead_services(self) -> None:
+        for operation in ("placement", "claim", "permission", "execution"):
+            for service_state in ("slow", "missing", "refused"):
+                with self.subTest(operation=operation, service=service_state), PlacementFixture() as fixture:
+                    fixture.configure(silence_seconds=1)
+                    request, query, expected = self.placement_control_query(fixture, operation)
+                    response = (Exchange(TimeoutError(), reply_bytes(expected)) if service_state == "slow" else
+                                Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                                Exchange(connect_error=ConnectionRefusedError()))
+                    transport = self.use_transport(fixture, response)
+                    with redirect_stderr(io.StringIO()) as errors:
+                        if service_state == "slow":
+                            self.assertEqual(query(), expected)
+                            self.assertEqual(fixture.clock.monotonic(), 1)
+                            self.assertIn("admission service not answering", errors.getvalue())
+                            self.assertEqual(transport.requests, [replace(request,
+                                code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+                        else:
+                            with self.assertRaises(wire.AdmissionUnavailable) as error:
+                                result = query()
+                                self.fail(f"dead service returned {result!r}")
+                            self.assertEqual(error.exception.reason,
+                                "no socket" if service_state == "missing" else "connect refused")
+                            self.assertEqual(fixture.clock.monotonic(), 0)
+                            self.assertFalse(transport.requests)
+                    self.assertEqual(len(transport.attempts), 1)
+                    self.assertFalse(fixture.clock.sleeps)
+                    self.doCleanups()
+
+    def test_placement_requests_bound_silence_and_repeated_resets_at_the_unreachable_limit(self) -> None:
+        for operation in ("placement", "claim", "permission", "execution"):
+            for failure in ("silence", "resets"):
+                for limit in (3, 60):
+                    with self.subTest(operation=operation, failure=failure, limit=limit), PlacementFixture() as fixture:
+                        fixture.configure(unreachable_limit_seconds=limit)
+                        request, query, expected = self.placement_control_query(fixture, operation)
+                        self.assertNotIsInstance(expected, wire.Refused)
+                        exchanges = ([Exchange(TimeoutError())] if failure == "silence" else
+                                     [Exchange(TimedChunk(1, b'{"kind":'), event)
+                                      for event in [ConnectionResetError(errno.ECONNRESET, "reset")] * limit])
+                        transport = self.use_transport(fixture, *exchanges)
+                        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(wire.AdmissionUnavailable) as error:
+                            result = query()
+                            self.fail(f"unreachable service returned {result!r}")
+                        self.assertEqual(fixture.clock.monotonic(), limit)
+                        duration = "1 min" if limit == 60 else f"{limit} s"
+                        self.assertEqual(error.exception.reason,
+                            f"build queue unreachable for {duration}; step stopped; cargo token given back")
+                        self.assertIn(error.exception.reason, errors.getvalue())
+                        self.assertEqual(len(transport.attempts), len(exchanges))
+                        self.assertEqual(transport.requests, [replace(request,
+                            code_version=client.LOADED_ADMISSION_CODE_VERSION)] * len(exchanges))
+                        self.assertFalse(fixture.clock.sleeps)
+                        self.doCleanups()
 
     def test_query_timeout_uses_configuration_for_the_complete_reply(self) -> None:
         with AdmissionFixture() as fixture:

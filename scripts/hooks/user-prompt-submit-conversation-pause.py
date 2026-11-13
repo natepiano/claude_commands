@@ -102,6 +102,8 @@ def main() -> None:
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
+        if source is conversation_pause.PromptSource.SCHEDULED:
+            conversation_pause.consume_scheduled_prompt(session_id, prompt)
         # Read the staff pointer so long waits retain the current run.
         from scripts.lib import unit_runs
 

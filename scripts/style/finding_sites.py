@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import cached_property
 from enum import Enum, auto
 import re
+import zlib
 from typing import final
 
 from scripts.style import declarations
@@ -125,14 +127,29 @@ class NestedSyntax(Enum):
 class SourceSites:
     """A single immutable UTF-8 blob; parsing and ownership indexes are shared by its findings."""
 
-    def __init__(self, source: str) -> None:
-        self.source: str = source
-        self.lines: tuple[str, ...] = tuple(source.splitlines(keepends=True))
+    def __init__(self, source: str, reader: Callable[[str], declarations.DeclaredFile] = declarations.read_declarations) -> None:
+        self._read_declarations: Callable[[str], declarations.DeclaredFile] = reader
+        self._compressed_source: bytes = zlib.compress(source.encode(), level=1)
         self._owners: dict[int, declarations.DeclaredItem | declarations.NoDeclarationAtLine] = {}
+
+    @property
+    def source(self) -> str:
+        return zlib.decompress(self._compressed_source).decode()
+
+    @cached_property
+    def lines(self) -> tuple[str, ...]:
+        return tuple(self.source.splitlines(keepends=True))
+
+    def release_parsed(self) -> None:
+        """Release indexes after the current findings finish their source reads."""
+        self._owners.clear()
+        for name in ("lines", "declared", "identities", "occurrences", "skeleton", "span_reading", "item_reading"):
+            if name in self.__dict__:
+                del self.__dict__[name]
 
     @cached_property
     def declared(self) -> declarations.DeclaredFile:
-        return declarations.read_declarations(self.source)
+        return self._read_declarations(self.source)
 
     def owner(self, line: int) -> declarations.DeclaredItem | declarations.NoDeclarationAtLine:
         if line not in self._owners:
@@ -159,9 +176,9 @@ class SourceSites:
     @cached_property
     def span_reading(self) -> tuple[style_footprint.TokenSpan, ...] | style_footprint.UnreadableTokenSpans:
         try:
-            return style_footprint.token_spans(self.source)
+            return self.declared.source_token_spans
         except style_footprint.UnreadableTokenSpans as error:
-            return error
+            return style_footprint.UnreadableTokenSpans(str(error))
 
     @property
     def spans(self) -> tuple[style_footprint.TokenSpan, ...]:
@@ -508,8 +525,8 @@ class SourceSites:
                 return False
             item = min(enclosing, key=lambda item: item.last - item.first)
             source = "".join(self.lines[item.first - 1:item.last])
-        before = style_footprint.tokens(subject)
-        words = style_footprint.tokens(source)
+        before = declarations.source_tokens(subject)
+        words = declarations.source_tokens(source)
         return bool(before) and any(words[start:start + len(before)] == before
                                     for start in range(len(words) - len(before) + 1))
 

@@ -28,9 +28,10 @@ from scripts.style.ledger_test_support import LedgerTestCase, PARENT_FILE
 class RefillSpeedTests(LedgerTestCase):
     def test_distinct_item_bodies_share_source_tokens(self) -> None:
         source = "fn first() { one(); }\nfn second() { two(); }\n"
-        file = declarations.read_declarations(source)
-        expected = [declarations.read_declarations(source).item_body(item) for item in file.declared_items]
+        items = declarations.read_declarations(source).declared_items
+        expected = [declarations.read_declarations(source).item_body(item) for item in items]
         with mock.patch.object(style_footprint, "token_spans", wraps=style_footprint.token_spans) as reads:
+            file = declarations.read_declarations(source)
             actual = [file.item_body(item) for item in file.declared_items]
             self.assertEqual(actual, expected)
             self.assertEqual(reads.call_count, 1)
