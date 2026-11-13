@@ -3500,75 +3500,20 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `scripts/production/test_change_review.py`: the lock readiness case (`:1393`) uses two forked children, not fresh interpreters. The parent keeps the list lock until both children report a failed nonblocking lock attempt. The eight-add numbering case keeps one fresh CLI process (`:1724`) and seven forked processes. Each fork closes inherited lock descriptors and keeps process-group cleanup. All 136 tests and 545 assertions are unchanged.
 - AWS paired trial (3 rounds): CPU 16.32 → 14.38 s; median peak 156.3 → 147.2 MiB. Local 13.73 → 9.50 s. Checkpoint `2cc7b7d02`.
 
-### Phase 226 — Workers and claims tests share one in-process launch fixture  · status: todo
+### Phase 226 — Workers and claims tests share one in-process launch fixture  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_assign_claude_workers.py` and `test_assign_claude_claims.py` make content calls in process through the shared fixture, and aws pairs show a CPU gain.
+- `scripts/direct/assign_claude_test_support.py:633` `InProcessAssignClaudeLauncherFixture` holds one switch: its setUp calls the inherited fixture, sets `MODELS_CONFIG_TIER_ONLY=1` and turns on in-process content calls through `run_assignment` (`:445`). A `process_boundary` marker keeps 14 real-process cases (workers 2, claims 3, follow 5, records 4). Follow and records lose their own setUp copies. The adapter captures `check-launch` output so the staff-refusal assertions see stderr. All 29 test bodies and 200 assertions are unchanged.
+- AWS paired trial (3 rounds, c7a.8xlarge), CPU s: claims 11.08 → 7.92, follow 30.87 → 28.28, records 26.66 → 17.28, workers 13.08 → 9.36 (18.84 s in all). Median peak rises 26–36 MiB per module (for example workers 216.4 → 249.5). Checkpoint `ff5068f46`.
 
-**Decision:** architect review after Phase 219 (order row 3); sdlc gave the go (2026-11-12). Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
-
-**Spec:**
-1. Refresh both profiles first: `module_cost.py --tests 10 --commands 15`.
-2. Move the repeated `direct_cli_calls` setUp from `test_assign_claude_follow.py` and `test_assign_claude_records.py` into `assign_claude_test_support.py` as one fixture switch. Both importers keep their current cases.
-3. Turn the switch on in workers and claims. Content calls go through `run_assignment` (`assign_claude_test_support.py:445`) in process.
-4. Keep real processes for: workers startup hook `:18` and child observations `:91`; claims live-PID refusal `:30`, PID reuse `:48` and dead-child evidence `:67`.
-5. Keep every test and assertion. The fixture sets `MODELS_CONFIG_TIER_ONLY=1`.
-6. Run the four modules, other importers of the support file and basedpyright on each changed file.
-
-**Files:**
-- `scripts/direct/assign_claude_test_support.py`
-- `scripts/direct/test_assign_claude_workers.py`
-- `scripts/direct/test_assign_claude_claims.py`
-- `scripts/direct/test_assign_claude_follow.py`
-- `scripts/direct/test_assign_claude_records.py`
-
-**Workers:** 1 writer; the shared fixture and its importers move together.
-- impl: all five files.
-
-**Constraints from prior phases:**
-- Phase 221: follow and records turn on `run_assignment` in each setUp; nine cases keep real processes. sdlc asked to move that setUp into the shared fixture when a third module adopts it.
-
-**Acceptance gate:**
-- Assignment starts fall; all tests and assertions remain in the four modules; importers pass; basedpyright clean.
-- aws pairs show a gain for workers and claims and no loss for follow and records; sdlc sees the diff before land.
-
-### Phase 227 — Gate recovery frees CPU tokens across checkouts and rolls back only an idle checkout  · status: todo
+### Phase 227 — Gate recovery frees CPU tokens across checkouts and rolls back only an idle checkout  · status: done
 **Depends on:** Phase 222
 
-#### Work Order
+#### As-built
 
-**Goal:** a dead gate's shared CPU tokens return to the pool for a gate in any checkout, and recovery never rolls back a checkout that a live gate uses.
-
-**Decision:** architect review after Phase 224, findings 2 and 3. builds holds the land of 222 and 223 until this phase checkpoints; the land chain is 219, 222, 223 and 227. Finding 1 (`build_folders.py` handlers) goes from builds to sdlc devtools; it is not in this phase.
-
-**Spec:**
-1. Defect 1: `gate_run_directory()` (`merge_gate.py:786`) keeps records per checkout, but `shared_cpu_pool()` (`:417`) uses one shared FIFO. A gate in checkout B never reads dead gate A's record in checkout A, so A's tokens stay lost and B can wait with no deadline.
-2. Fix 1: before a gate takes shared CPU tokens, recover dead owners in every directory under `gate_state_dir() / "active-runs"`, not only its own checkout's directory. Keep the per-directory `LOCK_EX` while it reads each directory. Keep the live-owner test (`process_start` pid and start identity) unchanged.
-3. Defect 2: rollback in `GateRecovery` (`:765`) runs under `scratch.copy_lock()`, which is `LOCK_SH` (`scratch.py:255`). It does not exclude a live gate. Gate C can roll back dead gate A's merge while live gate B tests the same checkout.
-4. Fix 2: add one per-checkout gate operation lock file in the checkout's run directory. A live gate holds it `LOCK_SH` from after its own recovery until its record is removed. Rollback takes it `LOCK_EX | LOCK_NB`, and checks HEAD and rolls back inside that lock.
-5. When the exclusive lock is busy, recovery frees the dead gate's groups, tokens and folders, keeps only the rollback intent in its record, and prints one line. A later gate start finishes that rollback. Recovery never blocks on a live gate.
-6. A gate must not take its own operation lock before it calls recovery; otherwise it excludes its own rollback.
-7. Do not change `scratch.copy_lock()`. Do not add signal handlers (user rule, Phase 222).
-8. Add rows to the existing recovery tests in `scripts/production/test_merge_gate_suites_signals.py` (test growth rule 1: add rows to existing tests):
-   - a dead gate's record in checkout A, recovered by a gate start in checkout B, returns its tokens to the FIFO;
-   - a dead gate's rollback with a live shared holder on the same checkout keeps the rollback intent and leaves HEAD unchanged; the next start without the holder rolls back.
-   Call the recovery functions directly. Do not start a whole gate for a new row.
-9. Run `scripts/lib/py -m unittest scripts.production.test_merge_gate_suites_signals` and the other `scripts/production/test_merge_gate*.py` modules from the worktree root. Run basedpyright on each changed file.
-
-**Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/production/test_merge_gate_suites_signals.py`
-
-**Workers:** 1 writer; both fixes share the recovery record and its tests.
-- impl: both files.
-
-**Constraints from prior phases:**
-- Phase 222: the gate installs no signal handlers. One run record per gate by atomic rename; a clean end removes it; the next gate start recovers a dead gate's record.
-- Phase 219: the gate time limit stays as built.
-
-**Acceptance gate:**
-- Both new rows fail on the old code and pass on the new code.
-- All `scripts/production/test_merge_gate*.py` modules pass; basedpyright clean on both files.
-- No signal handler anywhere in the diff; sdlc sees the diff before land.
+- `scripts/production/merge_gate.py:799` recovery reads every checkout directory under `active-runs`, each under its own `LOCK_EX` directory lock (`:815`). A dead gate's FIFO CPU tokens return for a gate in any checkout.
+- Each checkout run directory has an `operation.lock`. A live gate takes it `LOCK_SH` after its own recovery (`:859,864`) and keeps it until its clean record removal (`:875`). Rollback takes it `LOCK_EX | LOCK_NB` (`:766`) and checks HEAD and rolls back inside it. When busy, recovery frees groups, tokens and folders, keeps only the rollback intent, prints one line and leaves HEAD unchanged; a later start finishes the rollback. `scratch.copy_lock()` is unchanged; no signal handler is added.
+- `test_merge_gate_suites_signals.py:81` gains two rows (other-checkout token return; deferred rollback under a live holder); both fail on the old code. 230 merge gate tests pass. Checkpoint `2c59524fa`.
+- Open (routed by builds to sdlc devtools): `scripts/lib/build_folders.py:47,262,286` still installs signal handlers on the gate path through `temporary_build_folder()`.
