@@ -119,9 +119,8 @@ def secret_path(settings: Path) -> Path:
 
 
 def credentials_file() -> Path:
-    value = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
-    if not value:
-        raise SecretsRefused('AWS_SHARED_CREDENTIALS_FILE must name the private scaler credential file')
+    """Resolve the scaler file from the environment override or gate configuration."""
+    value = os.environ.get('AWS_SHARED_CREDENTIALS_FILE') or conf.read_or_repository('cloud_gate').text('credential_file')
     return Path(value).expanduser()
 
 

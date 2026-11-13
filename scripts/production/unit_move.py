@@ -1,7 +1,7 @@
 """Move unit folders with exact rename recovery records.
 
-Explicit folder moves stop and resume live sessions.
-Renames move folders only when the worktree is idle.
+Folder moves defer while workers or detached commands run.
+Idle moves preserve the director's session through a restart.
 """
 from __future__ import annotations
 try:
@@ -314,7 +314,7 @@ def unit_conversation(found: unit_lookup.LabeledSession | None, *, session_id: s
     if not session_id:
         return NoUnitConversation()
     entry = pane_record.read(found.place.session).get(found.place.pane) if found is not None else None
-    if entry is None or entry["session_id"] != session_id:
+    if entry is None or pane_launch.reference_id(entry) != session_id:
         try:
             entry = pane_record.launch_for_session(session_id)
         except ValueError as error:
@@ -603,18 +603,19 @@ def move_locked(unit: staff.StaffId, folder: Path) -> bool:
     return lock.exists() and lock.read_text().strip() == f"staff:{unit}"
 
 
-def _lock_move(folder: Path, unit: staff.StaffId) -> None:
+def _lock_move(folder: Path, unit: staff.StaffId) -> bool:
     """Keep only the fixed unit identity in Git during a folder move."""
     lock = _worktree_lock(folder)
     if lock.exists():
         if lock.read_text().strip() != f"staff:{unit}":
             raise RenameRefused(f"worktree is locked: {folder}")
-    else:
-        _ = git(folder, "worktree", "lock", "--reason", f"staff:{unit}", str(folder))
+        return False
+    _ = git(folder, "worktree", "lock", "--reason", f"staff:{unit}", str(folder))
+    return True
 
 
 def _unlock_move(folder: Path, unit: staff.StaffId) -> bool:
-    """Release only this unit's native lock after staff records the destination."""
+    """Release only this unit's native lock after a move or an early refusal."""
     lock = _worktree_lock(folder)
     if not lock.exists() or lock.read_text().strip() != f"staff:{unit}":
         return False
@@ -627,27 +628,162 @@ def move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBra
     return _move_folder(unit, destination, branch=branch)
 
 
-def worktree_busy(row: staff.StaffRow, record: staff.StaffSnapshot, folder: Path) -> bool:
-    """Require live process evidence before a rename defers its move."""
-    if processes_inside(folder):
-        return True
-    runs = {row.run.path.resolve()} if isinstance(row.run, staff.OpenRun) else set[Path]()
+class FolderMoveRuns(NamedTuple):
+    """The saved paths that a folder move must preserve."""
+    run_folders: tuple[Path, ...]
+    dispatch_records: tuple[Path, ...]
+    supervisor_records: tuple[Path, ...]
+    unit_run_folders: tuple[Path, ...]
+
+
+def folder_move_runs(row: staff.StaffRow, record: staff.StaffSnapshot) -> FolderMoveRuns:
     members = {row.id, *(member.id for member in record.find(kind="worker", parent=row.id))}
+    runs: set[Path] = set()
+    unit_runs_owned: set[Path] = set()
+    dispatches: set[Path] = set()
+    for member in record.rows:
+        if isinstance(member.run, staff.OpenRun):
+            runs.add(member.run.path.resolve())
+            if member.id in members:
+                unit_runs_owned.add(member.run.path.resolve())
+        link = staff.record_path().parent / "dispatches" / str(member.id)
+        if exists(link):
+            path = link.resolve()
+            dispatches.add(path)
+            if member.id in members:
+                unit_runs_owned.add(path.parent)
+    runs.update(path.parent for path in dispatches)
     paths = {path for root in unit_runs.run_roots()
              for path in root.glob(f"*/{worker_lifecycle.DETACHED_RUNS_DIR}/*.json")}
     paths.update(path for run in runs for path in (run / worker_lifecycle.DETACHED_RUNS_DIR).glob("*.json"))
-    for path in paths:
+    return FolderMoveRuns(tuple(sorted(runs)), tuple(sorted(dispatches)), tuple(sorted(paths)), tuple(sorted(unit_runs_owned)))
+
+
+def require_outside_run_paths(runs: FolderMoveRuns, folder: Path) -> None:
+    """Refuse a move before it makes saved run paths unreachable."""
+    for path in (*runs.dispatch_records, *runs.run_folders, *runs.supervisor_records):
+        if path.resolve().is_relative_to(folder):
+            raise RenameRefused(f"run path is inside the worktree: {path.resolve()}")
+
+
+class DirectorMoveProcesses(NamedTuple):
+    """Keep the proved director and its pane ancestors through one folder move."""
+    roots: frozenset[int]
+    pane_ancestors: frozenset[int]
+
+
+class DirectorMoveRead(Enum):
+    CURRENT = "read the director processes"
+
+
+def _director_move_processes(row: staff.StaffRow) -> DirectorMoveProcesses:
+    roots: frozenset[int] = frozenset()
+    try:
+        observed = herdr.read_conversation(str(row.current_session))
+        if isinstance(observed, herdr.LiveConversation) and len(observed.pids) == 1:
+            pid = observed.pids[0]
+            if herdr.native_process(pid, observed.kind).current_identity == row.current_session:
+                roots = frozenset({pid})
+                place = herdr.herdr_place_of(pid)
+                if isinstance(place, herdr.HerdrPlace):
+                    shell = pane_record.pane_shell_pid(place)
+                    ancestors: set[int] = set()
+                    while pid > 1 and pid not in ancestors:
+                        ancestors.add(pid)
+                        if pid == shell:
+                            return DirectorMoveProcesses(roots, frozenset(ancestors))
+                        pid = pane_record.process_parent(pid)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+        pass
+    return DirectorMoveProcesses(roots, frozenset())
+
+
+def move_processes_inside(row: staff.StaffRow, folder: Path, *,
+                          preserved_workers: Iterable[staff.StaffRow] = (),
+                          director: DirectorMoveProcesses | DirectorMoveRead = DirectorMoveRead.CURRENT) -> list[int]:
+    """Keep worker trees blocking while excluding the caller and the proved director pane chain."""
+    processes = processes_inside(folder)
+    if not processes:
+        return []
+    parents: dict[int, int] = {}
+
+    def ancestors(pid: int) -> set[int]:
+        found: set[int] = set()
+        while pid > 1 and pid not in found:
+            found.add(pid)
+            try:
+                if pid not in parents:
+                    parents[pid] = pane_record.process_parent(pid)
+                pid = parents[pid]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                break
+        return found
+
+    caller = ancestors(os.getpid())
+    director = _director_move_processes(row) if isinstance(director, DirectorMoveRead) else director
+    workers: set[int] = set()
+    for member in preserved_workers:
+        try:
+            observed = herdr.read_conversation(str(member.current_session))
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+            return processes
+        if isinstance(observed, herdr.UnknownConversation):
+            return processes
+        if isinstance(observed, herdr.LiveConversation):
+            for pid in observed.pids:
+                try:
+                    if herdr.native_process(pid, observed.kind).current_identity != member.current_session:
+                        continue
+                except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
+                    pass
+                workers.add(pid)
+    blocking: list[int] = []
+    for pid in processes:
+        lineage = ancestors(pid)
+        if workers.intersection(lineage):
+            blocking.append(pid)
+            continue
+        if pid in caller or pid in director.pane_ancestors:
+            continue
+        if not director.roots.intersection(lineage):
+            blocking.append(pid)
+    return blocking
+
+
+def running_work(row: staff.StaffRow, record: staff.StaffSnapshot, folder: Path,
+                 runs: FolderMoveRuns, processes: Iterable[int]) -> tuple[str, ...]:
+    """Name running processes and detached commands for moves and renames."""
+    workers = record.find(kind="worker", parent=row.id)
+    names: list[str] = []
+    members = {row.id, *(member.id for member in workers)}
+    folder_path = re.compile(r"(?<![\w./-])" + re.escape(str(folder)) + r"(?=$|[/\s'\";|&<>])")
+    for path in runs.supervisor_records:
         try:
             fields = worker_lifecycle.read_json_object(path)
         except (OSError, ValueError):
             continue
         pid = fields.get("pid")
         member = fields.get("staff_id")
-        if (fields.get("status") == "running" and isinstance(pid, int)
-                and (path.parent.parent.resolve() in runs or isinstance(member, str) and member in members)
+        command = fields.get("command")
+        command_inside = (isinstance(command, list)
+            and any(isinstance(argument, str) and folder_path.search(argument) is not None
+                    for argument in cast(list[object], command)))
+        cwd = fields.get("cwd")
+        cwd_inside = isinstance(cwd, str) and bool(cwd) and Path(cwd).expanduser().resolve().is_relative_to(folder)
+        if (isinstance(pid, int)
+                and (path.parent.parent.resolve() in runs.unit_run_folders
+                     or isinstance(member, str) and member in members or command_inside or cwd_inside)
                 and detached_run_process.supervises(pid, path)):
-            return True
-    return False
+            label = str(fields.get("label") or path.stem)
+            names.append(" ".join(label.splitlines()))
+    names.extend(f"process {pid}" for pid in processes)
+    return tuple(names)
+
+
+def worktree_busy(row: staff.StaffRow, record: staff.StaffSnapshot, folder: Path) -> bool:
+    """Require live process evidence before a rename defers its move."""
+    processes = move_processes_inside(row, folder, preserved_workers=record.find(kind="worker", parent=row.id))
+    return bool(running_work(row, record, folder, folder_move_runs(row, record), processes))
 
 
 def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch) -> bool:
@@ -705,7 +841,7 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         changed = False
         push_finished = False
-        _lock_move(folder, unit)
+        _ = _lock_move(folder, unit)
         try:
             if folder != destination:
                 _check_move_deadline()
@@ -745,7 +881,7 @@ def _push_moved_branch(checkout: Path, branch: str) -> None:
 
 
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
-    """Stop live rows, move the worktree and branch, and resume those rows."""
+    """Defer running work, then move the idle worktree and resume the director."""
     destination = destination.expanduser().resolve()
     with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
           staff.row_operation(str(unit)), ExitStack() as locks):
@@ -762,6 +898,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         old = location.path.expanduser().resolve()
         require_move_destination(record, row, destination)
         folder = old if old.exists() else destination
+        runs = folder_move_runs(row, record)
+        require_outside_run_paths(runs, old)
+        if folder != old:
+            require_outside_run_paths(runs, folder)
+        director = _director_move_processes(row)
+        if work := running_work(row, record, folder, runs, move_processes_inside(row, folder, director=director)):
+            print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")
+            return False
         if not folder.exists():
             changed = isinstance(location, staff.RemovedWorktree) and location.path != destination
             if changed:
@@ -799,6 +943,9 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             return found
 
         live = observe().copy()
+        if workers := [member.name for member in members if member.kind == "worker" and member.id in live]:
+            print(f"{row.name}: folder move deferred while {', '.join(workers)} runs; rerun when idle")
+            return False
         for member in members:
             if member.id not in live:
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
@@ -821,9 +968,10 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         retained = {member.id: (pane["pane_id"], pane.get("terminal_id", ""))
                     for member in members if member.id in live
                     for pane in panes if pane["session_id"] == member.current_session}
+        move_lock_created = False
         try:
             if folder != destination:
-                _lock_move(folder, unit)
+                move_lock_created = _lock_move(folder, unit)
             stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
                 for member in members:
@@ -838,6 +986,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 if not _wait_folder_rows(observe, live, running=False):
                     print(f"unit_move: anomaly: {row.name}: stop is incomplete", file=sys.stderr)
                     return False
+            current = staff.snapshot()
+            runs = folder_move_runs(row, current)
+            require_outside_run_paths(runs, folder)
+            work = list(running_work(row, current, folder, runs, move_processes_inside(row, folder, director=director)))
+            work.extend(member.name for member in live_members(current.find(kind="worker", parent=unit), current))
+            if work:
+                print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")
+                return False
             if folder != destination:
                 _check_move_deadline()
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -854,6 +1010,8 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 folder = destination
             current = record
             try:
+                if folder == old and move_lock_created:
+                    _ = _unlock_move(folder, unit)
                 _check_move_deadline()
                 current = staff.snapshot()
                 _check_move_deadline()

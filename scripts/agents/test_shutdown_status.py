@@ -100,7 +100,7 @@ class ShutdownStatusTests(ShutdownTestCase):
 
     def test_stop_reports_each_unresolved_worker_and_the_director_result(self) -> None:
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
-                                current_session=staff.StaffId("director-session"))
+                                current_session=staff.StaffId("director-session"), unit_type=staff.UnitDetails("direct"))
         row = staff.StaffRow(staff.StaffId("worker"), "worker", "impl", staff.ReportsTo(parent.id),
                              current_session=staff.StaffId("worker-session"))
         record = staff.StaffSnapshot((parent, row))

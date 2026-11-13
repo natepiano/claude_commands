@@ -2541,7 +2541,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Gotchas:**
 - `conf_reads.py` binds `os.open`, `os.write` and `os.close` at import, so a test that patches them does not catch the record.
-- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`. The Mac context-economy payload ships both.
+- A fixture checkout that copies `conf.py` must also copy `conf_reads.py`.
 - Nine raw readers do not record: `statusline.sh`, `lint_config.sh`, `progress_history.py`, `verify.sh`, `new_account.py`, `zone.py`, `tune.py`, the `models_registry.py` edit snapshots and `deploy.py`.
 - A new reader is missed until the next full gate records it.
 

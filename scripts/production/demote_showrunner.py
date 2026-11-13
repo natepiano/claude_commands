@@ -49,6 +49,7 @@ class Demotion:
     branch: str
     plan: Path
     port: unit_config.AppPort | unit_config.NoAppPort = field(default_factory=unit_config.NoAppPort)
+    unit_type: staff.UnitType = "direct"
 
 
 def record_path(parent: Production, name: str) -> Path:
@@ -95,7 +96,7 @@ def child_plan(child: Production, plan: Path) -> Path:
 
 
 def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault, record: staff.StaffSnapshot,
-            port: unit_config.AppPort | unit_config.NoAppPort) -> Demotion:
+            port: unit_config.AppPort | unit_config.NoAppPort, unit_type: staff.UnitType = "direct") -> Demotion:
     try:
         row = showrunners.owner_for(name, record)
     except ValueError as error:
@@ -128,7 +129,7 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
                       + f"commit it on {child.merge_branch} or keep it untracked")
     promote_showrunner.check_director(name, marked, marked.claude, worktree, skip_path=plan)
     check_units(child, record)
-    return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port)
+    return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port, unit_type)
 
 
 def saved_request(parent: Production, fields: dict[str, object]) -> Demotion:
@@ -137,7 +138,8 @@ def saved_request(parent: Production, fields: dict[str, object]) -> Demotion:
     claude = unit_lookup.LiveClaude(str(fields["session"]), row.current_session, str(fields["socket"]), int(str(fields["pid"])))
     marked = unit_lookup.LabeledSession(row.name, claude, herdr.HerdrPlace(str(fields["host"]), str(fields["pane"])))
     return Demotion(parent, child, marked, claude, Path(str(fields["worktree"])), str(fields["branch"]), Path(str(fields["plan"])),
-                    unit_config.parse_port_cell(str(fields.get("port", ""))))
+                    unit_config.parse_port_cell(str(fields.get("port", ""))),
+                    add_unit.saved_unit_type(fields))
 
 
 def save(path: Path, fields: dict[str, object], step: Step) -> None:
@@ -225,6 +227,7 @@ def launch(request: Demotion) -> int:
     flag = "--resume" if (isinstance(live_session(session, staff.snapshot()), unit_lookup.NoSession)
                          or add_unit.pending_opening(request.parent, request.child.name, session)) else "--attach"
     return add_unit.main(["--production", request.parent.name, request.child.name, "--plan", str(plan),
+                          "--unit-type", request.unit_type,
                           flag, session, "--cwd", str(request.worktree), "--config-dir", str(target.dir), *port])
 
 
@@ -245,7 +248,7 @@ def restore(path: Path) -> int:
         _ = staff.change_director(source.id, staff.ShowrunnerRole(source.name, source.parent.id, source.doc))
         for identity in cast(list[str], fields["directors"]):
             _ = staff.move(staff.StaffId(identity), staff.ReportsTo(source.id))
-        entry = cast(pane_launch.PaneLaunch, fields["launch"])
+        entry = pane_record.resume_launch(cast(pane_launch.PaneLaunch, fields["launch"]))
         environment = entry["environment"].copy()
         if isinstance(source.home, staff.SessionHome):
             environment.update(named_account_environment(source.home.path))
@@ -303,7 +306,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
     if completed < Step.CONVERTED:
         _ = add_unit.git(request.child, "switch", request.branch)
         _ = staff.change_director(request.child.owner.id, staff.UnitRole(request.child.name, request.parent.owner.id,
-                                 staff.PresentWorktree(remote.local_machine(), request.worktree)))
+                                 staff.PresentWorktree(remote.local_machine(), request.worktree), request.unit_type))
         save(path, fields, Step.CONVERTED)
     if completed < Step.DOCUMENTED:
         unit_document(request)
@@ -337,6 +340,7 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--plan", default=unit_config.PlanDefault(), type=Path)
     _ = parser.add_argument("--check", action="store_true")
     _ = parser.add_argument("--port", type=int)
+    _ = parser.add_argument("--unit-type", choices=staff.UNIT_TYPES)
     args = parser.parse_args(argv)
     record = staff.snapshot()
     parent = read_production(showrunners.own_name(), record=record)
@@ -344,6 +348,7 @@ def _main(argv: list[str]) -> int:
     path = record_path(parent, name)
     plan = cast(Path | unit_config.PlanDefault, args.plan)
     raw_port = cast(int | None, args.port)
+    unit_type = cast(staff.UnitType | None, args.unit_type)
     port = unit_config.NoAppPort() if raw_port is None else unit_config.AppPort(raw_port)
     fields: dict[str, object] = {}
     if path.exists():
@@ -358,10 +363,11 @@ def _main(argv: list[str]) -> int:
     if fields:
         request = saved_request(parent, fields)
         if ((isinstance(plan, Path) and child_plan(request.child, plan) != request.plan)
-                or (raw_port is not None and port != request.port)):
-            raise Refusal(f"{name}: the pending demotion uses {request.plan} and port {request.port}")
+                or (raw_port is not None and port != request.port)
+                or (unit_type is not None and unit_type != request.unit_type)):
+            raise Refusal(f"{name}: the pending demotion uses {request.plan}, port {request.port}, and type {request.unit_type}")
     else:
-        request = checked(parent, name, plan, record, port)
+        request = checked(parent, name, plan, record, port, unit_type or "direct")
     port = request.port
     if cast(bool, args.check):
         print(f"check: {name} can become a unit of {parent.name}")
@@ -376,6 +382,7 @@ def _main(argv: list[str]) -> int:
         fields = {"source": request.child.owner.to_json(), "session": request.claude.name, "socket": request.claude.socket,
                   "pid": request.claude.pid, "host": request.marked.place.session, "pane": request.marked.place.pane,
                   "worktree": str(request.worktree), "branch": request.branch, "plan": str(request.plan), "port": str(port.number) if isinstance(port, unit_config.AppPort) else "",
+                  "unit_type": request.unit_type,
                   "launch": retained, "directors": [row.id for row in record.rows
                       if row.parent == staff.ReportsTo(request.child.owner.id) and row.kind in {"unit", "showrunner"}]}
         save(path, fields, Step.PREPARED)

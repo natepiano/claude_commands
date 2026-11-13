@@ -73,7 +73,8 @@ class ProposalIssueTests(unittest.TestCase):
         rows = tuple(staff.StaffRow(staff.StaffId(fixture_runtime_id(name)), kind,
                                     unit_names.name(name) if kind == "unit" else name,
                                     staff.ReportsTo(staff.StaffId(fixture_runtime_id("hana"))) if kind == "unit" else staff.StaffRoot(),
-                                    current_session=staff.StaffId(fixture_runtime_id(name)))
+                                    current_session=staff.StaffId(fixture_runtime_id(name)),
+                                    unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
                      for name, kind in members)
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
         _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value=fixture_runtime_id("hana")))
@@ -140,14 +141,20 @@ class ProposalIssueTests(unittest.TestCase):
         arguments = ["create", str(issue), "--project", "alpha", "--short", "alpha", "--proposed-by", "sample-style",
                      "--extra-tags", "style", "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "3", "--body-file", str(body), "--template", str(template)]
         ranking = "goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐"
-        for label, flags, expected in (("new style issue", [], ""),
-                                       ("ranked style issue", ["--proposed-ranking", ranking], ranking)):
-            with self.subTest(ranking=expected):
+        for label, flags, expected, proposer in (
+                ("new style issue", [], "", "sample-style"),
+                ("ranked style issue", ["--proposed-ranking", ranking], ranking, "sample-style"),
+                ("unit name issue", [], "", "names"),
+                ("unit id issue", [], "", fixture_runtime_id("names"))):
+            with self.subTest(ranking=expected, proposer=proposer):
                 destination = self.root / (label + ".md")
                 command = [*arguments]
                 command[1] = str(destination)
+                command[command.index("--proposed-by") + 1] = proposer
                 code, _, err = self.run_cli(*command, *flags)
                 self.assertEqual(code, 0, err)
+                expected_id = fixture_runtime_id("sample-style" if proposer == "sample-style" else "names")
+                self.assertIn(f'proposed_by: "{expected_id}"', destination.read_text())
                 self.assertIn(f"\n\nProposed ranking: {expected}\n\n<!-- style-decision:start -->\n# Findings\nBefore and after.\n",
                               destination.read_text())
         from scripts.production.issues import frontmatter

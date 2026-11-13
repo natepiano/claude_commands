@@ -119,7 +119,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--operation", type=AssignmentOperation, choices=tuple(AssignmentOperation),
                             default=AssignmentOperation.DISPATCH)
     _ = parser.add_argument("--target", choices=("staff-worker", "consultation-pane", "durable-design-role"), default="staff-worker")
-    _ = parser.add_argument("--policy", choices=("friend", "astra-reviewer", "astra-designer"), default="")
+    _ = parser.add_argument("--policy", choices=("astra-reviewer", "astra-designer"), default="")
     _ = parser.add_argument("--parent", default="")
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
@@ -144,7 +144,7 @@ def parse_arguments() -> Arguments:
         parser.error("--policy is required for this target")
     if args.target == "consultation-pane" and not args.new_worker:
         parser.error("consultation-pane requires --new-worker")
-    if args.target == "durable-design-role" and (not args.parent or args.policy == "friend"):
+    if args.target == "durable-design-role" and not args.parent:
         parser.error("durable-design-role requires --parent and an Astra policy")
     if not args.prompt and args.target == "staff-worker":
         parser.error("--prompt is required")
@@ -567,14 +567,10 @@ def require_live_director() -> None:
 def pane_policy(name: str, *, model: str = "", effort: str = "") -> worker_panes.LaunchPolicy:
     """Resolve one explicit launch policy and its model overrides."""
     try:
-        if name == "friend":
-            task = "ask_a_friend.consultation"
-            policy = worker_panes.worker_policy(models_registry.launch_settings("ask_a_friend", "consultation"))
-        else:
-            if name not in ("astra-reviewer", "astra-designer"):
-                refuse(f"unknown pane policy: {name}")
-            task = "design_roles." + name.removeprefix("astra-")
-            policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
+        if name not in ("astra-reviewer", "astra-designer"):
+            refuse(f"unknown pane policy: {name}")
+        task = "design_roles." + name.removeprefix("astra-")
+        policy = worker_panes.launch_policy(cast(staff.WorkerRole, name))
         if model or effort:
             family, selected_model, selected_effort, tier = resolve_model(
                 Arguments(model=model, effort=effort), task, dict(os.environ))
@@ -699,7 +695,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
         passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(args.new_worker))
         repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
                       import_module("scripts.herdr.turn_end").repeat_completion_notice)
-        repeat(matched.worker_name, parent, run, passed)()
+        repeat(args.new_worker, parent, run, passed)()
         return staff_worker.DispatchSubmission.SUBMITTED
     for arguments in (["start-run", "--session-dir", str(run), "--working-dir", str(cwd)],
                       ["start-phase", "--session-dir", str(run), "--phase-id", "astra-review",
@@ -772,16 +768,16 @@ def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
             return
         if any(entry.get("team_slot") != slot for entry in passes):
             return
-        names: set[str] = set()
         record = staff.local_snapshot()
-        for path in run.glob("impl_worker_*.json"):
-            row = record.by_id(staff.StaffId(text(read_object(path).get("staff_id"))))
-            if row is not None:
-                names.add(row.name)
         parent = worker_admission.parent(record, run=run)
-        names.update(row.name for row in record.find(kind="worker", parent=parent.id))
-        own_names = {slot, *(text(entry.get("worker_name")) for entry in passes if entry.get("worker_name"))}
-        if names - own_names:
+        members = record.find(kind="worker", parent=parent.id)
+        own = {text(entry.get("worker_id")) for entry in passes}
+        for path in run.glob("impl_worker_*.json"):
+            entry = read_object(path)
+            if entry.get("slot") == slot:
+                own.add(text(entry.get("staff_id")))
+        own.update(row.id for row in members if row.name == slot)
+        if {row.id for row in members} - own:
             return
         held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), record=record)
         if {Path(folder).resolve() for folder in held} != {run}:

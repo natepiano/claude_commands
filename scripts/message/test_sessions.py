@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
@@ -76,6 +77,7 @@ class SessionLookupTests(ShutdownTestCase):
         _ = (self.sessions / filename).write_text(json.dumps(data))
         if not entrypoint.startswith("sdk-") and not any(row.name == name for row in self.members.values()):
             self.members[session_id] = staff.StaffRow(staff.StaffId(session_id), "unit", name, staff.StaffRoot(),
+                                                     unit_type=staff.UnitDetails("direct"),
                                                      current_session=staff.StaffId(session_id))
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -157,6 +159,7 @@ class SessionLookupTests(ShutdownTestCase):
         data["formerNames"] = ["former label"]
         _ = (self.sessions / "one.json").write_text(json.dumps(data))
         self.members = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "showrunner", staff.StaffRoot(),
+                                               unit_type=staff.UnitDetails("direct"),
                                                current_session=staff.StaffId("sid-123"))}
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
             live = sessions.live_sessions()
@@ -215,6 +218,12 @@ class SessionLookupTests(ShutdownTestCase):
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
             live = sessions.live_sessions()
         self.assertEqual(sessions.addressed("natedev", live), record)
+        fixed = self.members["sid-real"]
+        self.record("replacement.json", name="replacement-display", session_id="sid-replacement", entrypoint="cli")
+        self.members[fixed.id] = replace(fixed, current_session=staff.StaffId("sid-replacement"))
+        replacement = self.run_cli("member-socket", "session:" + fixed.id)
+        self.assertEqual((replacement.returncode, replacement.stdout, replacement.stderr),
+                         (0, str(self.socket_path) + "\n", ""))
 
     def test_a_saved_pid_identifies_a_live_relay_without_a_name_or_entrypoint_hint(self) -> None:
         self.record("relay.json", name="ordinary-looking-name", session_id="sid-relay")
@@ -264,7 +273,8 @@ class SessionLookupTests(ShutdownTestCase):
                                           tmux="", formerNames=[])
         records = [record("handler", "bare"), record("modules-unit", "suffixed"), record("modules", "exact")]
         self.members = {row["sessionId"]: staff.StaffRow(staff.StaffId(row["sessionId"]), "unit", row["name"],
-                                                       staff.StaffRoot(), current_session=staff.StaffId(row["sessionId"]))
+                                                       staff.StaffRoot(), unit_type=staff.UnitDetails("direct"),
+                                                       current_session=staff.StaffId(row["sessionId"]))
                         for row in records}
         found = [sessions.named(name, records) for name in ("handler", "handler-unit", "modules-unit", "modules", "gone")]
         self.assertEqual([None if item is None else item["sessionId"] for item in found],

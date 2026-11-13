@@ -1552,10 +1552,7 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
         row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)
                     if unit_names.name(item.name) == unit_names.name(unit)), None)
         if row is not None:
-            from scripts.message import sessions
-            live = next((item for item in sessions.live_sessions() if item["sessionId"] == row.current_session), None)
-            if live is not None:
-                name = live["name"]
+            name = row.name
         break
     cleaned = name.replace("/", "-").replace("\0", "-").lstrip(".")
     return cleaned or unit
@@ -1849,8 +1846,9 @@ def refresh(session_dir: Path) -> None:
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions
     try:
-        showrunner = next((item["name"] for item in sessions.live_sessions()
-                           if owner is not None and item["sessionId"] == owner.current_session), "")
+        live = sessions.live_sessions()
+        showrunner = owner.name if owner is not None and any(
+            item["sessionId"] == owner.current_session for item in live) else ""
     except OSError as error:
         raise Refusal(f"cannot look up the showrunner of {production.name}: {error}") from error
     if showrunner:
@@ -1869,12 +1867,15 @@ def refresh(session_dir: Path) -> None:
             "phase note target is not owned by "
             + f"{production.name}/{reference.unit}: {target}"
         )
+    unit = next(row for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
+                if row.name == unit_names.name(reference.unit))
+    display_name = next((item["name"] for item in live if item["sessionId"] == unit.current_session), name)
+    display_name = display_name.replace("/", "-").replace("\0", "-").lstrip(".") or reference.unit
     _write_note(
         target,
         _note_text(
-            name,
-            next(row.id for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
-                 if row.name == unit_names.name(reference.unit)),
+            display_name,
+            unit.id,
             record,
         ),
         production.name,

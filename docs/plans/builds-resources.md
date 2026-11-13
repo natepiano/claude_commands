@@ -230,8 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
-   `read_cycle()` (`build_hold.py:994`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:983`) returns `Path | None`, for the same no-current-cycle state.
-   Return the existing `NoCycle` (`build_hold.py:83`) from both in place of `None`. Add no second type for this state.
+   `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
+   Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
    Update `read_cycle_for_change()` and its test callers.
    Dailies callers were retired on 2026-11-11.
    Update the test callers too. Six test files narrow the result with `assert cycle is not None`, a check that `NoCycle` passes.
@@ -240,7 +240,7 @@ Own what a build may use and when it starts: memory admission and the memory que
    `memory_gate.sh` and `invoke.sh` use the installed admission client.
    `verify.sh` uses the installed helpers for holds, local release waits, detached runs, Mac idle state and build targets.
    Keep documented script overrides for tests. Test routing under a private `HOME`.
-   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1171) use the installed hold writer.
+   `top_level.py` and unit retirement in `scripts/agents/shutdown.py` (its `build_hold.py release --holder` call at line 1438) use the installed hold writer.
    `merge_gate.py` already runs from the installed copy. Record that fact without changing its hold reader.
 6. Keep repository and step fields separate in service snapshots and queue queries.
    Reuse `repository_name` on waiters and `repo` on reservations. Add no parallel repository field or prefix parser.
@@ -2265,3 +2265,39 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the type owner and the grant reader.
 
 **Gotchas:** tests patch `hold_enforcer.admitted_processes`, not `build_hold.admitted_processes`. `basedpyright` counts an import inside a function as a cycle edge, so an import of `admission_service` anywhere in `build_hold` makes the cycles again.
+
+### Phase 107 — A natedev hold never stops a run that holds a live Mac or AWS claim  · status: done
+
+#### As-built
+
+- A natedev hold keeps each process family that holds a live Mac or AWS claim. `holds_claim(process, processes, claimed)` is true when the process, an ancestor or a descendant has a claimed identity (pid and start time). The claim pid is the `offload.py` process.
+- `hold_enforcer.claimed_processes()` returns `build_hold.LiveClaims(identities)`, or `build_hold.ClaimsUnreadable(reason)` on `ClaimStateUnreadable` or `ConfigError`.
+- `decide_builds(..., claimed)` allows a claimed family first, with the reason `holds a live Mac or AWS claim`. `StopBuildsAndTests.stop()` signals no claimed process, and `kill_survivors()` cancels the kill of a process that became claimed.
+- `run()`, `drain()`, `report()`, `scan()` and `build_hold.audit_builds` read the process table first, then the claims. On `ClaimsUnreadable` the enforcer sends no signals, logs `claims unreadable; enforcement waits: …` once, retries each second, and logs `claims readable; enforcement resumes` on recovery.
+- `is_outermost_gate()` is shared by `classify_drain_runs()` and the `hold --drain` start. With unreadable claims, a drain start keeps every outermost gate.
+- `build_hold.BuildClass` has `claimed`; the audit shows it as `holds a live Mac or AWS claim`, and `audit_hold` skips it.
+- A Mac-eligible step in `waiting_hold` or `waiting_mac` keeps its route to the Mac. `hold --drain` keeps its own rules (cargo child, admission reservation, claim) and still waits for working runs.
+
+**Files:**
+- `scripts/build_hold/hold_enforcer.py` — claim read, family check, enforcer loop, drain
+- `scripts/build_hold/build_hold.py` — `LiveClaims`, `ClaimsUnreadable`, the `claimed` audit class
+- `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_hold/test_build_hold.py` — claim, stale record, ended claim, pending kill, waiting route, unreadable and recovery, read order, drain rows
+- `commands/build/hold.md`, `docs/as-built/builds-aws-target.md` — the rule text
+
+**Gotchas:** read the process table before the claim records. The reverse order lets a claim taken between the two reads receive TERM.
+
+### Phase 108 — The floor keeps the build output of a copy with a live or waiting verify.sh build  · status: done
+
+#### As-built
+
+- `process_uses()` counts a `verify.sh` process as a user of its workspace target, the same as a cargo-nextest run. A process is a `verify.sh` process when the basename of argv[0] is `verify.sh`, or argv[0] is `bash`, `sh`, `zsh` or `dash` and the first argument without a leading `-` has the basename `verify.sh`.
+- A `verify.sh` that waits in the build queue is a live process, so its target is in use for its whole wait.
+- `workspace_targets(argv, cwd, environ, targets)` (formerly `nextest_targets`) resolves the target for both runners: `--target-dir`, `CARGO_TARGET_DIR`, cargo config, then the target beside a folder that holds the cwd.
+- The use text is `runs verify.sh in <cwd>`. The rule applies to every `process_uses()` caller: the floor, the floor alert choices and the hand cleanup. No flag or config key controls it.
+
+**Files:**
+- `scripts/lint/sweep.py` — `process_uses()`, `workspace_targets()`
+- `scripts/lint/test_sweep.py` — the verify recheck row and a 9-row invocation table (bash, direct call, `bash -e`, sh, `zsh -f`, dash, other.sh, `CARGO_TARGET_DIR`, another workspace)
+- `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
+
+**Gotchas:** `bash -o pipefail verify.sh` is not matched, because the first argument without a leading `-` is `pipefail`.

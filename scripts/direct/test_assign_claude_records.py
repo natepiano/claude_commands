@@ -205,7 +205,9 @@ class AssignClaudeLauncherWorkerTests(support.AssignClaudeLauncherFixture):
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)[name]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)[name]["status"], "completed")
-        self.assertEqual(self.open_passes(session_dir)[name]["worker_name"], name)
+        passed = self.open_passes(session_dir)[name]
+        self.assertEqual(passed["worker_id"], self.recorded_worker(session_dir).id)
+        self.assertNotIn("worker_name", passed)
         # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
         self.assertEqual((self.root / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (self.root / "delivered_message.txt").read_text(encoding="utf-8")

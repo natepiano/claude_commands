@@ -18,6 +18,7 @@ class FinalPassTests(FinalPassFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         folder = Path(self.environment["HOME"]) / "changed/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         _ = shutil.copyfile(VERIFY.parent / "final_pass.py", folder / "final_pass.py")
         changed = folder / "verify.sh"
@@ -68,6 +69,7 @@ class FinalPassTests(FinalPassFixture):
     def test_python_trace_records_sigterm_and_preserves_signal_status(self) -> None:
         folder = self.root.parent / "terminated/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         changed = folder / "verify.sh"
         _ = shutil.copyfile(VERIFY, changed)

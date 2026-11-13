@@ -46,5 +46,10 @@ For each mode, pick the single change with the largest measurable gain for its c
 
 LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/next efficiency` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
 
+For a unit caller, add ` [by: <staff id>]` after the gain tag in each manually written ledger line.
+Use the unit's fixed staff id from `staff.snapshot().by_current_session(staff.caller_identity()).id`.
+When the line has no gain tag, add the source tag after the title.
+Put the source tag before ` — proposed`.
+
 Then `SendMessage` to the address `~/.claude/scripts/lib/py ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/next efficiency` reads every night's reports. After the last mode, stay open: the user may open its `nightly-review` tab in the `agents` herdr session to ask about it.
 </Proposal>

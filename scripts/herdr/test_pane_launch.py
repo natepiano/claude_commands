@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
 from contextvars import Context
 import tempfile
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, override
+from typing import Literal, override, cast
 from unittest.mock import patch
 
 
@@ -61,7 +62,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
     def test_producer_publication_replaces_only_its_proved_binding(self) -> None:
         cases = ("control same pane", "move", "native reference", "different records", "interrupted records", "interrupted then unit write",
                  "wrong identity", "wrong backend", "wrong folder", "unread flags", "ended", "stale process",
-                 "stale publication", "repeated publication", "requested account", "wrong requested account", "separate wrong requested account", "compaction after clear")
+                 "stale publication", "repeated publication", "requested account", "wrong requested account", "separate wrong requested account", "compaction after clear", "staff facts removed")
         for kind in ("claude", "codex"):
             for case in cases:
                 with self.subTest(kind=kind, case=case), tempfile.TemporaryDirectory() as directory:
@@ -77,17 +78,23 @@ class LaunchEnvironmentTests(unittest.TestCase):
                     registry = write_registry(root / "models.conf", {"producers": {owner.name: f"{kind}:{model}:high"}})
                     source = root / "source.json"
                     destination = root / "destination.json" if case in ("different records", "interrupted records", "interrupted then unit write") else source
-                    old = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)
-                    old["staff_id"] = owner.id
-                    old["written_at"] = "2026-01-01T00:00:00+00:00"
+                    observation = pane_launch.launch("old", owner.id, str(root), {}, [kind], kind=kind)
+                    observation["written_at"] = "2026-01-01T00:00:00+00:00"
+                    retained = pane_launch.StaffPaneLaunch(pane_id="old", staff_id=owner.id,
+                        model=observation["model"], remote_control=observation["remote_control"],
+                        environment=observation["environment"], flags_read=observation["flags_read"],
+                        ended=False, written_at=observation["written_at"])
+                    if "codex_policy" in observation:
+                        retained["codex_policy"] = observation["codex_policy"]
+                    old: pane_launch.PaneLaunch = retained
                     if case == "native reference":
-                        old["session_id"] = owner.current_session
+                        old = {**observation, "session_id": owner.current_session}
                     unrelated: dict[str, pane_launch.PaneLaunch] = {
-                        "other": {**old, "pane_id": "other", "session_id": other.id, "staff_id": other.id},
-                        "unit": {**old, "pane_id": "unit", "session_id": member.id, "staff_id": member.id}}
+                        "other": {**retained, "pane_id": "other", "staff_id": other.id},
+                        "unit": {**retained, "pane_id": "unit", "staff_id": member.id}}
                     pane_launch.save(source, {"old": old, **unrelated})
                     target = "old" if case == "control same pane" else "new"
-                    launch = old.copy()
+                    launch = observation.copy()
                     launch.update(pane_id=target, session_id=owner.current_session, kind=kind,
                                   pid=456, proc_start="current", written_at="2026-02-01T00:00:00+00:00")
                     if case == "wrong backend":
@@ -157,6 +164,8 @@ class LaunchEnvironmentTests(unittest.TestCase):
                                   patch.object(herdr, "native_process", return_value=cleared_process)):
                                 Context().run(pane_launch.write, destination, launch, sources=(source, destination))
                         committed = pane_launch.read_strict(destination)[target]
+                        if case == "staff facts removed":
+                            self.assertEqual(set(committed) & {"session_id", "name", "cwd", "kind", "config_dir"}, set())
                         if case == "compaction after clear":
                             self.assertEqual(committed["written_at"], launch["written_at"])
                         if case == "stale publication":
@@ -169,7 +178,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                             self.assertEqual(destination.read_bytes(), before)
                     combined = {pane: entry for path in {source, destination} for pane, entry in pane_launch.read_strict(path).items()}
                     self.assertEqual(combined, {**unrelated, target: committed})
-                    self.assertEqual(committed["session_id"], owner.id)
+                    self.assertEqual(cast(pane_launch.StaffPaneLaunch, committed)["staff_id"], owner.id)
 
     def test_readout_keeps_a_staffed_pane_with_an_unknown_home(self) -> None:
         row = staff.StaffRow(staff.StaffId("TEST-unknown-home"), "producer", "TEST-unknown-home", staff.STAFF_ROOT,
@@ -193,6 +202,23 @@ class LaunchEnvironmentTests(unittest.TestCase):
                 self.assertEqual(pane_launch.read_valid_entries(path, record=staff.StaffSnapshot((row,))), entries)
                 snapshot.assert_not_called()
             self.assertEqual(pane_launch.read_strict(path), entries)
+            user_home = Path(directory) / "home"
+            user_home.mkdir()
+            for source in ("configured", "staff", "numbered"):
+                for folder in ("sessions", "archived_sessions"):
+                    with self.subTest(source=source, folder=folder):
+                        home = user_home / ".codex2" if source == "numbered" else Path(directory) / source
+                        identity = f"{row.current_session}-{source}-{folder}"
+                        transcript = home / folder / f"{identity}.jsonl"
+                        transcript.parent.mkdir(parents=True, exist_ok=True)
+                        transcript.touch()
+                        current = replace(row, current_session=staff.StaffId(identity),
+                                          home=staff.SessionHome(home) if source == "staff" else staff.HomeUnknown())
+                        with (patch.dict(os.environ, {"HOME": str(user_home),
+                                                      "CODEX_HOME": str(home) if source == "configured" else ""}),
+                              patch.object(pane_launch, "native_kind", return_value=""),
+                              patch.object(sessions, "transcript_locations", return_value=[])):
+                            self.assertEqual(pane_launch.current_kind(current), "codex")
 
     def test_environment_boundaries_use_the_shared_identity_filter(self) -> None:
         environment = {"STAFF_ID": "old", "SHOWRUNNER_UNIT": "old", "CODEX_THREAD_ID": "native", "PATH": "/bin"}

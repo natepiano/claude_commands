@@ -1,4 +1,5 @@
 // Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
+// The optional third argument names the previous page for comparison images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -14,10 +15,12 @@ const callerFolder = process.argv[2];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1]))', folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, stdio:'pipe'});
+  const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
+  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+    .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -27,6 +30,7 @@ try {
     reading.read_at = now;
   }
   const base = readings.good;
+  base.waiters = structuredClone(readings.spacing.waiters);
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
@@ -46,7 +50,6 @@ try {
   extra.name = 'second nextest'; extra.pid = 222;
   readings.shrink.walk.unshift(extra);
   readings.shrink.waiters = [];
-  readings.shrink.waiting = 0;
   function pngPixels(buffer) {
     let width, height, channels;
     const chunks = [];
@@ -85,23 +88,38 @@ try {
   const server = createServer((req, res) => {
     const isData = req.url.startsWith('/memory.json');
     res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : page);
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
-    const profile = await mkdtemp(join(tmpdir(), 'memory-proof-chrome-'));
+    // Chrome needs a short path for its Unix sockets.
+    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
     try {
+      const temporary = join(profile, 'tmp');
+      await mkdir(temporary);
       const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);
       });
       let ws;
+      let debuggerError;
+      const pending = new Map();
+      const events = new Map();
+      const rejectPending = error => {
+        debuggerError ||= error;
+        for (const request of pending.values()) request.reject(debuggerError);
+        for (const event of events.values()) event.reject(debuggerError);
+        pending.clear();
+        events.clear();
+      };
+      chrome.once('exit', () => rejectPending(new Error('Chrome closed during a debugger request.')));
+      chrome.once('error', rejectPending);
       try {
         const endpoint = await new Promise((resolve, reject) => {
           let output = '';
@@ -114,10 +132,9 @@ try {
           chrome.once('exit', () => reject(new Error('Chrome closed before its debugger started.')));
         });
         ws = new WebSocket(endpoint);
-        await once(ws, 'open');
+        ws.addEventListener('close', () => rejectPending(new Error('Chrome debugger connection closed.')));
+        await Promise.race([once(ws, 'open'), exited.then(() => { throw debuggerError; })]);
         let id = 0;
-        const pending = new Map();
-        const events = new Map();
         ws.addEventListener('message', event => {
           const message = JSON.parse(event.data);
           if (message.id) {
@@ -128,10 +145,11 @@ try {
             else request.resolve(message.result);
           } else {
             const key = `${message.sessionId || ''}:${message.method}`;
-            if (events.has(key)) { events.get(key)(message.params); events.delete(key); }
+            if (events.has(key)) { events.get(key).resolve(message.params); events.delete(key); }
           }
         });
         const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+          if (debuggerError) { reject(debuggerError); return; }
           const next = ++id;
           pending.set(next, {resolve,reject});
           ws.send(JSON.stringify({id:next,method,params,...(sessionId ? {sessionId} : {})}));
@@ -149,10 +167,10 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
-        await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/memory_live.html`});
-        await loaded;
-        await evaluate(`(async () => {
+        const navigate = async path => {
+          const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
+          await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
+          await evaluate(`(async () => {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
@@ -162,7 +180,9 @@ try {
           window.render = () => {};
           await document.fonts.ready;
           fitLabels();
-        })()`);
+          })()`);
+        };
+        await navigate('memory_live.html');
 
         const proofs = [];
         const show = async (reading, clearTip=true) => evaluate(`(async () => {
@@ -224,6 +244,18 @@ try {
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
                 headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                answer:text('#answer'),
+                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
+                queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
+                queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
+                stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
+                layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
+                rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
+                  const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
+                    document.querySelector('.wrow.room');
+                  return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
+                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
+                }),
                 machine:table.querySelector('td.machine')?.textContent,
                 cap:rect(document.querySelector('#mark')), room:text('#v-room'),
                 capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
@@ -255,7 +287,14 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+            assert.deepEqual(proof.headings, ['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.answer,'Next step room');
+            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Unit','Pid','Machine','vCPU']);
+            assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
+            assert.ok(proof.stages.includes('testing'));
+            assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
+            for(const offsets of proof.rowOffsets)
+              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
             assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -296,7 +335,6 @@ try {
             const shot = await call('Page.captureScreenshot', {format:'png', captureBeyondViewport:true,
               clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
             const pixels = Buffer.from(shot.data,'base64');
-            await writeFile(join(folder, `${theme}-${width}.png`),pixels);
             const pixel=pngPixels(pixels);
             const expected=proof.progressColor.match(/[0-9.]+/g).slice(0,3).map(Number);
             const x=Math.floor(proof.progress.left+proof.progress.width/2);
@@ -382,6 +420,43 @@ try {
               unit.dispatchEvent(new Event('change'));
             })()`);
 
+            for(const [name,detail] of [
+              ['cloud_stage','tools ready'],
+              ['cloud_region','tests start · eu-south-2, zone a'],
+              ['cloud_zone','eu-south-2, zone us-east-1b'],
+              ['cloud_empty','']]) {
+              await show(readings[name]);
+              const detailProof=await evaluate(`(() => {
+                const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
+                const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
+                const amounts=chart.querySelector('.amounts');
+                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                  ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
+                  rootFont:getComputedStyle(document.documentElement).fontSize,
+                  beside:document.querySelector('#walk').classList.contains('beside'),
+                  detailRight:amounts.getBoundingClientRect().right,
+                  tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
+              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
+              assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
+              if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
+                'The AWS detail text crosses into the table.');
+              assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
+              assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
+              if(name==='cloud_region' && process.env.MEMORY_PAGE_SHOT) {
+                const clip=await evaluate(`(() => {
+                  const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,`${theme}-${width}-aws.png`),Buffer.from(shot.data,'base64'));
+              }
+            }
+
             for(const [name,lateAge,modules,failed] of [
               ['cloud','2 min','7 of 12 modules','1 failed module'],
               ['cloud_zero','2 d','123456 of 999999 modules','123456 failed modules']]) {
@@ -423,10 +498,10 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:document.querySelector('#walk').closest('.card').textContent,
+                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Machine','vCPU','Unit','Pid']);
+            assert.deepEqual(cloudProof.headings,['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -485,9 +560,58 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
-            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],['good','']]) {
+            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
+              ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
-              assert.equal(await evaluate("document.querySelector('#priority-line').textContent"),expected);
+              const priority=await evaluate(`(() => {
+                const index=latest.walk.findIndex(row=>row.queued);
+                return tipText('row:'+index,latest).join(' ');
+              })()`);
+              assert.equal(priority.includes("queue priority:"),!!expected);
+              if(expected) assert.ok(priority.includes(expected));
+              const heading=await evaluate("tipText('walkhead',latest).join(' ')");
+              const unmatched=name==='priority_unmatched';
+              assert.equal(heading.includes("queue priority:"),unmatched);
+              if(unmatched) assert.equal(heading.split("queue priority: research (the user's bump)").length-1,1);
+              if(unmatched && theme==='dark' && width===1400) {
+                const clip=await evaluate(`(() => {
+                  const heading=document.querySelector('[data-tip="walkhead"]');
+                  heading.scrollIntoView({block:'start'});
+                  const h=heading.getBoundingClientRect();
+                  heading.dispatchEvent(new MouseEvent('click',{bubbles:true,clientX:h.left+10,clientY:h.bottom}));
+                  const tip=document.querySelector('#tip');
+                  if(!tip.classList.contains('on') || !tip.textContent.includes(latest.unmatched_priority_text))
+                    throw new Error('The heading click loses the unmatched priority.');
+                  const r=heading.closest('.card').getBoundingClientRect();
+                  return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
+            }
+            await show(base);
+
+            for (const state of ['idle','busy']) {
+              const ciReading=structuredClone(base);
+              ciReading.walk.push({name:'hana CI',ci:true,queued:false,used:0.125,reserved:0,
+                counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
+                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state}]});
+              ciReading.ci_ram=0.125;
+              ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
+              await show(ciReading);
+              const ciProof=await evaluate(`(() => {
+                const key='row:'+(latest.walk.length-1);
+                const table=document.querySelector('.walk-table tr[data-tip="'+key+'"]');
+                const chart=document.querySelector('.wrow[data-tip="'+key+'"]');
+                return {table:!!table,chart:!!chart,stage:table?.querySelector('.place').textContent,
+                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram};
+              })()`);
+              assert.equal(ciProof.table,state==='busy');
+              assert.equal(ciProof.chart,state==='busy');
+              if(state==='busy') assert.equal(ciProof.stage,'—');
+              assert.equal(ciProof.ci,0.125);
+              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
             }
             await show(base);
 
@@ -497,10 +621,13 @@ try {
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
+            const withoutWait=structuredClone(base);
+            withoutWait.waiters=[];
+            await show(withoutWait);
             const beforeWait=await positions();
             const waiting=structuredClone(base);
             waiting.waiters=structuredClone(readings.spacing.waiters);
-            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;waiting.waiting=1;
+            waiting.waiters[0].detail='fixture-unit';waiting.waiters[0].pid=51;
             await show(waiting);
             const afterWait=await positions();
             for(let index=0;index<beforeWait.length;index++) {
@@ -519,9 +646,9 @@ try {
 
             for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
               await show(readings[name]);
-              const state=await evaluate(`({text:document.querySelector('#wait-reasons').textContent,
+              const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
-              assert.ok(state.text.includes(expected), name+' has no visible reason.');
+              assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
             }
@@ -550,10 +677,11 @@ try {
               }
             }
             await show(readings.shrink);
+            assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
             await evaluate(`showTip('row:${readings.shrink.walk.length-1}',200,200)`);
             const smaller=structuredClone(base);
             smaller.walk=smaller.walk.filter(row=>!row.queued);
-            smaller.waiters=[];smaller.waiting=0;
+            smaller.waiters=[];
             await show(smaller,false);
             const shrink=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
               tooltip:document.querySelector('#tip').textContent, text:document.querySelector('#walk').textContent})`);
@@ -627,7 +755,49 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,failures},null,2)+'\n');
+        const comparisons = [];
+        if (beforePage) {
+          const review = structuredClone(readings.spacing);
+          review.priority_text = "queue priority: port (the user's bump)";
+          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          const head = review.waiters[0];
+          Object.assign(head, {name:'port nextest',unit:'port',need:1.9,reason:'free memory',
+            head_text:review.head_text,priority_text:review.priority_text});
+          review.waiters.push({...head,name:'trunk nextest',unit:'trunk',pid:201,
+            reason:'head protection · behind #1',head_text:'',priority_text:''});
+          review.waiters.push({...head,name:'fps nextest',unit:'fps',pid:202,
+            reason:'estimate expired',head_text:'',priority_text:''});
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          for (const version of ['after','before']) {
+            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+            await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+            for (const width of [1400,390]) {
+              await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+              await show(review);
+              const comparison = await evaluate(`(() => {
+                const walk=document.querySelector('#walk'),card=walk.closest('.card');
+                const r=card.getBoundingClientRect();
+                return {tables:walk.querySelectorAll('table').length,
+                  lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
+                  layout:walk.classList.contains('beside')?'beside':'stacked',
+                  head:tipText('wait:0',latest).join(' '),
+                  clip:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}};
+              })()`);
+              assert.equal(comparison.tables, version === 'after' ? 1 : 0);
+              assert.equal(comparison.lists, version === 'after' ? 0 : 3);
+              if(version === 'after') {
+                assert.equal(comparison.layout,width===1400?'beside':'stacked');
+                for(const value of [review.head_text,review.priority_text,'free memory'])
+                  assert.equal(comparison.head.split(value).length-1,1);
+              }
+              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:comparison.clip});
+              await writeFile(join(folder,`${version}-${width}.png`),Buffer.from(shot.data,'base64'));
+              comparisons.push({version,width,...comparison});
+            }
+          }
+        }
+        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
+          failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
       } finally {
         if(ws) ws.close();

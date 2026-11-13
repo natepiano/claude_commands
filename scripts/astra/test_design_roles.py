@@ -648,9 +648,17 @@ class DurableRolesTests(HeldRolePaneCase):
                          [self.instance(opened, "designer").name])
 
     def test_pane_open_rerun_after_add_recovers_the_idle_worker_without_another_add(self) -> None:
+        self.recover_after_add(close_pane=False)
+
+    def test_pane_open_rerun_after_add_recovers_the_closed_worker_without_another_add(self) -> None:
+        self.recover_after_add(close_pane=True)
+
+    def recover_after_add(self, *, close_pane: bool) -> None:
         world = self.pane_start()
         with stop_once(design_roles, "_assign_command"), self.assertRaises(InjectedStop):
             _ = self.open_designer()
+        if close_pane:
+            world.remove_pane("w1:p1")
         with redirect_stderr(io.StringIO()) as errors:
             saved = self.open_designer()
         self.assertIn("creation outcome unknown", errors.getvalue())

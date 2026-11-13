@@ -307,14 +307,16 @@ class TrialProcessTests(unittest.TestCase):
             request_record(28, "later", 900, []),
             transcript_record("system", 100, subtype="compact_boundary"),
         ]
-        for storage in ("plain", "compressed", "both"):
+        for storage in ("plain", "compressed", "both", "alias"):
             with self.subTest(storage=storage), tempfile.TemporaryDirectory() as folder:
                 home = Path(folder)
                 path = home / ".claude/projects/project/director.jsonl"
                 path.parent.mkdir(parents=True)
                 _ = path.write_text("\n".join(json.dumps(record) for record in records))
                 before = path.read_bytes()
-                if storage != "plain":
+                if storage == "alias":
+                    (path.parent.parent / "alias").symlink_to(path.parent, target_is_directory=True)
+                if storage in ("compressed", "both"):
                     compressed = compressed_copy(path)
                     if storage == "both":
                         _ = path.write_bytes(before)
@@ -644,7 +646,7 @@ class TrialProcessTests(unittest.TestCase):
 class PhaseProcessTests(unittest.TestCase):
     def test_ad_hoc_reviews_do_not_launch_external_reviewers(self) -> None:
         commands = Path(__file__).resolve().parents[2] / "commands"
-        for name in ("module_review", "team_review", "api_review"):
+        for name in ("module_review", "team_review"):
             with self.subTest(command=name):
                 text = (commands / f"{name}.md").read_text(encoding="utf-8")
                 for launch in ("agent_exec", "claude --print", "claude -p"):

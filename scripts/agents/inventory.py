@@ -24,6 +24,7 @@ from scripts.direct.assign_gate import WORKER_LAUNCHERS
 from scripts.herdr import herdr_types
 from scripts.whoami import account
 from scripts.agents import remote
+from scripts.lib import unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.herdr import herdr
 from scripts.message import sessions
@@ -412,6 +413,7 @@ def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]
 
 def _newest_unit_plans() -> dict[str, str]:
     newest: dict[str, tuple[float, str]] = {}
+    record = staff.local_snapshot()
     directory = unit_lookup.runs_dir()
     try:
         paths = list(directory.glob("*.jsonl"))
@@ -427,10 +429,11 @@ def _newest_unit_plans() -> dict[str, str]:
         if not isinstance(value, dict):
             continue
         event = cast(dict[str, object], value)
-        main_agent = event.get("main_agent")
-        if not isinstance(main_agent, dict):
+        reference = event.get(unit_runs.OWNER_FIELD)
+        owner = record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else None
+        if owner is None or owner.kind != "unit":
             continue
-        session_id = _string(cast(dict[str, object], main_agent).get("session_id"))
+        session_id = owner.current_session
         plan = _string(event.get("plan_doc")) or _string(event.get("plan"))
         started = event.get("run_started_at")
         rank = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else modified

@@ -637,7 +637,7 @@ def _idle(design: HeldDesign) -> None:
 
 
 def _pane_recovery_idle(lifecycle: HeldWorker) -> None:
-    result = _worker_command(['list', '--json'])
+    result = _worker_command(['list', 'all', '--json'])
     listing = cast(list[object], json.loads(result.stdout))
     fields = next((_object(value) for value in listing if _object(value).get('id') == lifecycle.staff_id),
                   dict[str, object]())

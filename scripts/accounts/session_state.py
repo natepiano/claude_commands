@@ -10,7 +10,7 @@ from typing import Literal, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "idle", "paused", "exited"]
+SessionState = Literal["busy", "starting", "waiting", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -53,7 +53,6 @@ NO_DETACHED_WORK = RunningDetachedWork()
 def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = ()) -> RunningDetachedWork:
     """Read each run folder once for the complete display."""
     from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
-    from scripts.production import session_staff
 
     live_runs = cast(Callable[[Path, frozenset[staff.StaffId]], Sequence[Mapping[str, object]]],
                      import_module("scripts.agents.detached_runs").live_runs_for_staff)
@@ -79,7 +78,7 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
         inputs.add(directory)
         inputs.update(directory.glob("*.json"))
         for run in live_runs(directory, frozenset(identities)):
-            row = session_staff.worker_row(run, record)
+            row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
             if row is not None:
                 busy.add(row.id)
                 label = run.get("label")
@@ -96,8 +95,13 @@ def classify(member: staff.StaffRow | UnrecordedStaff,
     hold = staff_state(member)
     if hold != "active":
         return hold
+    if isinstance(activity, LiveActivity):
+        if activity.status == "busy":
+            return "busy"
+        if activity.status == "starting":
+            return "starting"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "busy"
+        return "waiting"
     if isinstance(activity, NoLiveSession):
         return "exited"
-    return "busy" if activity.status == "busy" else "idle"
+    return "idle"

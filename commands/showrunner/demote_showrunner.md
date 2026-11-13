@@ -13,6 +13,8 @@ The child keeps its conversation and resumes on the units account.
 The plan comes from its saved configuration or production document.
 Hana units receive the lowest free BRP port in the configured unit range when no port is recorded.
 Optional `--plan` and `--port` values override the defaults.
+Pass `--unit-type direct|merge|style` when supplied; the default is `direct`.
+An omitted type keeps the saved type during a pending demotion.
 Relative plan paths start at the child's checkout.
 Use `--check` to inspect the request without changes.
 Repeat the child name to continue a pending demotion.

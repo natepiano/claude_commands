@@ -19,12 +19,14 @@ import json
 import mmap
 import os
 import socket
+import sys
 import traceback
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, TypedDict, cast
 
 
 UNKNOWN_IDENTITY = "unknown"
@@ -35,6 +37,7 @@ SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
 CI_POLLED_NAME = "polled.json"
 DISK_NAME = "disk.json"
+DISK_WALK_REQUEST_NAME = "disk-walk-request.json"
 DEFAULT_ROOT_DISPLAY = "~/.local/state/buildlog"
 ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
 
@@ -42,6 +45,46 @@ ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
 def root() -> Path:
     override = os.environ.get("BUILDLOG_DIR")
     return Path(override) if override else Path(DEFAULT_ROOT_DISPLAY).expanduser()
+
+
+class DiskWalkRequest(TypedDict):
+    requested_at: str
+    alert_at: str
+    unnamed_bytes: int
+
+
+class DiskWalkRequestState(Enum):
+    ABSENT = "no walk requested"
+    UNREADABLE = "walk request cannot be read"
+
+
+def read_disk_walk_request() -> DiskWalkRequest | DiskWalkRequestState:
+    path = root() / DISK_WALK_REQUEST_NAME
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+        if not isinstance(raw, dict):
+            raise ValueError("expected an object")
+        data = cast(dict[str, object], raw)
+        requested_at, alert_at, unnamed_bytes = data["requested_at"], data["alert_at"], data["unnamed_bytes"]
+        if not isinstance(requested_at, str) or not isinstance(alert_at, str):
+            raise ValueError("invalid request times")
+        for stamp in (requested_at, alert_at):
+            if datetime.fromisoformat(stamp).tzinfo is None:
+                raise ValueError("request time lacks a zone")
+        if type(unnamed_bytes) is not int:
+            raise ValueError("invalid unnamed_bytes")
+        return {"requested_at": requested_at, "alert_at": alert_at, "unnamed_bytes": unnamed_bytes}
+    except FileNotFoundError:
+        return DiskWalkRequestState.ABSENT
+    except (OSError, UnicodeError, ValueError, KeyError) as error:
+        print(f"buildlog: cannot read {path}: {error}", file=sys.stderr)
+        return DiskWalkRequestState.UNREADABLE
+
+
+def write_disk_walk_request(request: DiskWalkRequest) -> None:
+    from scripts.lib.atomic_file import write_text_atomic
+
+    write_text_atomic(root() / DISK_WALK_REQUEST_NAME, json.dumps(request) + "\n")
 
 
 def host_name() -> str:

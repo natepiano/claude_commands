@@ -120,7 +120,7 @@ The index, report, Mac outcome reader, and step estimator read the recorded pack
 
 The walk is too slow for report time, so a job measures and the report reads.
 
-**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first, then calls `measure(FOLDERS, lambda: filesystem_usage("/"), floor)`. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walking; the command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr, exits 1, and the previous `disk.json` stays.
+**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first. It walks folders during the configured quiet hour, or refreshes capacity between walks. A large unnamed fall requests one walk through `disk-walk-request.json`. The request needs recent floor records with the same held roots and filesystem. The floor sweep deletes the request after it sends the folder growth follow-up. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walk. The command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr. It exits 1 and keeps the previous `disk.json`.
 
 ```python
 FOLDERS = [("~/rust", "~/rust"), ("/tmp", "/tmp"),

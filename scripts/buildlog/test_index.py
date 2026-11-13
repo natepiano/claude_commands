@@ -482,8 +482,8 @@ class IndexTests(unittest.TestCase):
         sidecars = [old_path.with_name(old_path.name + suffix) for suffix in SQLITE_SIDECARS]
         for path in sidecars:
             _ = path.write_bytes(b"old schema sidecar")
-        os.utime(old_path, (old, old))
-        os.utime(recent_path, (old, recent))
+        for path, accessed, modified in ((old_path, recent, old), (recent_path, old, recent)):
+            os.utime(path, (accessed, modified))
         self.assertEqual(index.update(), 0)
         self.assertTrue(old_path.is_file())
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=1")
@@ -495,7 +495,7 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(recent_path.is_file())
         os.utime(recent_path, (recent, old))
         self.assertEqual(index.update(), 0)
-        self.assertTrue(recent_path.is_file())
+        self.assertFalse(recent_path.exists())
         self.assertEqual(self.ids(), ["retained"])
         _ = write_config_fixture(config / "buildlog.conf", "INDEX_UNUSED_DAYS=0")
         self.assertEqual(index.update(), 0)

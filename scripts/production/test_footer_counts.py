@@ -164,8 +164,9 @@ class FooterCountsTests(unittest.TestCase):
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {owner.id}\n")
+        sources: list[Path] = []
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state), "USER_ZONE": "UTC"}):
-            line, due, sources = counts_row.row(instance)
+            line, due = counts_row.row(instance, sources)
         self.assertEqual(line, "For you: 1 question")
         self.assertEqual(due, "")
         self.assertIn(folder, sources)
@@ -214,6 +215,46 @@ class FooterCountsTests(unittest.TestCase):
                        f"- **Improvement queue:** {ledger}", f"- **Efficiency ledger:** `{efficiency}`")
         self.assertEqual(footer_counts.read_counts(doc, questions=1),
                          FooterCounts(changes=2, proposals=2, questions=1, efficiency=2))
+
+    def test_a_source_counts_only_its_waiting_items_and_omits_unrouted_rows(self) -> None:
+        own = unit_membership("production", "own").id
+        other = unit_membership("production", "other").id
+        empty = unit_membership("production", "empty").id
+        listing = self.root / "change-review - production.md"
+        _ = listing.write_text(
+            "## To review\n\n| # | Change | How to check | Producer |\n"
+            + "| --- | --- | --- | --- |\n"
+            + f"| C1 | Own first | Read | {own} |\n| C2 | Own second | Read | {own} |\n"
+            + f"| C3 | Other | Read | {other} |\n| C4 | Legacy | Read | |\n"
+            + "| C5 | Unrouted | Read | missing-producer |\n")
+        folder = self.root / "issues"
+        folder.mkdir()
+        for name, source, status in (("own first", own, "open"), ("own second", own, "open"),
+                                     ("other", other, "open"), ("legacy", "", "open"), ("closed", own, "closed")):
+            issue(folder, name, status, "proposal", source)
+        backlog = self.root / "backlog.md"
+        _ = backlog.write_text("- 2026-11-12 Legacy plan — proposed\n")
+        ledger = self.root / "efficiency.md"
+        efficiency_lines = (
+            f"- 2026-11-12 config: Own first [gain/week: 12 min] [by: {own}] — proposed\n"
+            + f"- 2026-11-12 config: Own second [by: {own}] — deferred\n"
+            + f"- 2026-11-12 config: Other [by: {other}] — proposed\n"
+            + "- 2026-11-12 config: Legacy — proposed\n"
+            + f"- 2026-11-12 config: Done [by: {own}] — accepted, applied\n")
+        doc = self.doc(f"- **Change review:** {listing}", f"- **Proposals:** {folder}",
+                       f"- **Improvement queue:** {backlog}", f"- **Efficiency ledger:** {ledger}")
+        for extra, full_efficiency, own_efficiency in (
+                ("", 4, 2),
+                (f"- 2026-11-12 config: T [by: {own}] — deferred; related item — done\n", 5, 3),
+                (f"- 2026-11-12 config: T [by: {own}]  — proposed\n", 5, 3)):
+            _ = ledger.write_text(efficiency_lines + extra)
+            for source, expected in (
+                    ("", FooterCounts(changes=4, proposals=4, efficiency=full_efficiency, unrouted=1)),
+                    (own, FooterCounts(changes=2, proposals=2, efficiency=own_efficiency)),
+                    (other, FooterCounts(changes=1, proposals=1, efficiency=1)),
+                    (empty, FooterCounts())):
+                with self.subTest(extra=extra, source=source):
+                    self.assertEqual(footer_counts.read_counts(doc, source=source), expected)
 
     def test_proposed_backlog_line_counts_as_a_proposal_and_next_shows_it(self) -> None:
         ledger = self.root / "ledger.md"

@@ -84,7 +84,7 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, staff.ReportsTo(parent.id), current_session=row.id,
-                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled(), home=row.home))
+                                worktree=staff.PresentWorktree("natedev", self.unit), doc=staff.DocUnfilled(), home=row.home, unit_type=staff.UnitDetails("direct")))
         self.assert_ok(self.transfer("verify"))
 
     def test_transfer_changes_only_the_staff_parent(self) -> None:
