@@ -1271,3 +1271,16 @@ From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited
 - Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
 
 **Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
+
+### Phase 65 — The build page titles the waiting section by its order · status: done
+
+From builds (not the user), 2026-11-13, with the user's words and shot `/tmp/claude/scratch/user-shot-queued-title.png`: "i want the next step room in the middle to be where it is but then a hairline after it as well as before and then the Queued section should have a title of Queued, in order of submission ... if order of submission has been changed by a prioritization bump it should say Queued, {unit} first, then in submission order (and if multiple units then Queued, {unit} followed by {unit} and then in submission order".
+
+1. Keep the Next step room row in place. Add a hairline after it, the same as the one before it.
+2. Title the waiting section like "Running, in start order": "Queued, in order of submission".
+3. When bumps moved steps ahead: "Queued, <unit> first, then in submission order". For more than one: "Queued, <unit> followed by <unit> and then in submission order".
+4. Use the queue's own priority data, with no copy of the order logic. Keep the diff small: queue 44ad also edits `memory_live.html`.
+
+### Phase 66 — Retire /build:queue · status: todo
+
+From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
