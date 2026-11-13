@@ -838,6 +838,9 @@ class LinuxShellTests(unittest.TestCase):
             def wait(self) -> int:
                 return wire.returncode
 
+            def poll(self) -> int:
+                return self.wait()
+
         def stream(arguments: Sequence[str]) -> offload.RemoteRunStatus:
             with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
                 return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
@@ -1396,6 +1399,9 @@ class LinuxProcessTests(unittest.TestCase):
                 def wait(self) -> int:
                     return 0
 
+                def poll(self) -> int:
+                    return self.wait()
+
             with mock.patch.object(subprocess, "Popen", return_value=CompletedRemoteStep()):
                 return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
 
@@ -1520,6 +1526,9 @@ class LinuxProcessTests(unittest.TestCase):
 
                 def wait(self) -> int:
                     return reply.returncode
+
+                def poll(self) -> int:
+                    return self.wait()
 
             with mock.patch.object(subprocess, "Popen", return_value=RemoteStartup()):
                 return offload.ProcessController.stream_mac_run(dispatch.controller, arguments)
@@ -1957,6 +1966,12 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertEqual(argv[0], "ssh", f"Unexpected external command: {argv}")
         self.commands.append(argv)
         self.actions.append("cleanup")
+        identity = self.controller.claim_identity
+        if ("dispatch_start_settled=" in argv[-1] and self.cleanup_reply.returncode == 0
+                and isinstance(identity, claim_state.ClaimIdentity)):
+            marker = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
+            return subprocess.CompletedProcess(argv, self.cleanup_reply.returncode,
+                marker + self.cleanup_reply.stdout, self.cleanup_reply.stderr)
         return self.cleanup_reply
 
     def run_request(self, request: offload.OffloadRequest) -> tuple[offload.MacOffloadResult, str, str]:
@@ -2088,6 +2103,9 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIsInstance(result, offload.LostMacRun)
         retained = self.fixture.claims("linux")
         self.assertIn(os.getpid(), retained)
+        old_claim = retained[os.getpid()]
+        old_identity = claim_state.ClaimIdentity(*(cast(str, old_claim[field])
+                                                  for field in ("claim_id", "episode", "attempt")))
         self.assertNotIn("release", self.actions)
         self.assertIn("linux stays busy", errors)
         self.assertNotIn("Mac stays busy", errors)
@@ -2100,7 +2118,12 @@ class LinuxDispatchTests(unittest.TestCase):
             retry, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(retry, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
+        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
+        settlements = [argv[-1] for argv in self.commands
+                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
+                       and "dispatch_start_settled=" in argv[-1]
+                       and offload.pending_start_key(old_identity) in argv[-1]]
+        self.assertEqual(len(settlements), 1)
         self.assertFalse(self.fixture.claims("linux"))
 
     def test_live_slot_children_block_new_work_until_cleanup_confirms_they_ended(self) -> None:
@@ -2123,6 +2146,9 @@ class LinuxDispatchTests(unittest.TestCase):
 
             def wait(self) -> int:
                 return 0
+
+            def poll(self) -> int:
+                return self.wait()
 
         def stream_child_run(arguments: Sequence[str]) -> offload.RemoteRunStatus:
             self.commands.append(list(arguments))
@@ -2149,6 +2175,9 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertNotIn("run", self.actions)
         self.assertNotIn("release", self.actions)
         self.assertIn(999, self.fixture.claims("linux"))
+        old_claim = self.fixture.claims("linux")[999]
+        old_identity = claim_state.ClaimIdentity(*(cast(str, old_claim[field])
+                                                  for field in ("claim_id", "episode", "attempt")))
 
         self.cleanup_reply = subprocess.CompletedProcess([], 0, "leftovers=0\nrc=0\n", "")
         self.fixture.dead.add(999)
@@ -2156,7 +2185,12 @@ class LinuxDispatchTests(unittest.TestCase):
         with mock.patch.object(os, "getpid", return_value=1000):
             fresh, _, _ = self.run_request(self.request())
         self.assertIsInstance(fresh, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
+        self.assertEqual(self.actions[:5], ["claim:13", "cleanup", "release", "cleanup", "claim:0"])
+        settlements = [argv[-1] for argv in self.commands
+                       if argv[0] == "ssh" and shlex.split(argv[-1])[:2] == ["python3", "-c"]
+                       and "dispatch_start_settled=" in argv[-1]
+                       and offload.pending_start_key(old_identity) in argv[-1]]
+        self.assertEqual(len(settlements), 1)
         self.assertFalse(self.fixture.claims("linux"))
 
     def test_deleted_worktree_cleanup_selects_only_the_retained_slot(self) -> None:

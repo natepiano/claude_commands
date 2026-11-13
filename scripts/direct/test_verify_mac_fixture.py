@@ -16,8 +16,8 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
 
 
 @final
@@ -95,6 +95,41 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
             if child.poll() is None:
                 child.kill()
             _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_exceptional_verify_exit_stops_its_processes_before_the_next_case(self) -> None:
+        for failure in (subprocess.TimeoutExpired("verify", 0), FixtureHang("the fixture stopped")):
+            with self.subTest(failure=type(failure).__name__):
+                process = subprocess.Popen([sys.executable, "-c", """
+import subprocess
+from pathlib import Path
+import os
+from scripts.direct.wait_for_test_state import wait_for_file
+child = subprocess.Popen(["sleep", "300"])
+print("ready", flush=True)
+wait_for_file(Path(os.environ["TEST_RUNNER_STATE"]) / "exception-release")
+"""], cwd=VERIFY.parents[2], env=self.environment, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, start_new_session=True)
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline(), "ready\n")
+                communicate = process.communicate
+                first = True
+
+                def interrupt(timeout: float) -> tuple[str, str]:
+                    nonlocal first
+                    if first:
+                        first = False
+                        raise failure
+                    return communicate(timeout=timeout)
+
+                try:
+                    with mock.patch.object(self, "start_verify", return_value=process), \
+                         mock.patch.object(process, "communicate", side_effect=interrupt), \
+                         self.assertRaises(type(failure)):
+                        _ = self.verify("test", "sample")
+                    self.assertIsNotNone(process.poll())
+                    self.assertEqual(processes_carrying(self.child_marker()), set())
+                finally:
+                    self.stop_verify(process)
 
     def test_build_tools_cannot_use_the_host_path(self) -> None:
         host_tools = self.root / "host-tools"

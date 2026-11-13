@@ -3447,39 +3447,15 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - `scripts/production/test_unit_lookup.py` went from 67 to 60 tests under Rule 2. The removed tests checked a constructor type, timer and process-scan call counts, and a retired history tail reader. The `live_hosts` helper and unused `renamed_production` rows went with them. All 60 retained tests and 205 assertions are unchanged. Both blind reviews approved each removal. Checkpoint `76007751d`.
 
-### Phase 219 — Gates and targeted runs stop at a time limit  · status: todo
+### Phase 219 — Gates and targeted runs stop at a time limit  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a merge gate or a targeted test run that runs longer than a configured factor times its normal wall time on the same vCPU count stops, ends its AWS box, and reports red to the owner with the modules still running and the failed modules with their tracebacks.
-
-**Decision:** the user, via builds, 2026-11-12: "we need to not wait that long - if it is not done within 50% more than our normal speed for that vcpu, then we should pre-emptively kill it and send it back to the owner to fix" and "this needs to be a configurable value". builds: top priority, ahead of test speed work. sdlc gives its go for `merge_gate.py`. aws owns the box-end call.
-
-**Spec:**
-1. Find each place a gate runs: the local gate on natedev (`scripts/production/merge_gate.py`) and the cloud gate (`scripts/aws_target/cloud_gate.py`, `gate_box.py`). Find the gate index that `/test_times suites` reads (`scripts/test_times/gate_record.py`, `show.py`). If a gate record does not hold the vCPU count, add it.
-2. Add one config key, `GATE_TIME_LIMIT_FACTOR=1.5`, in `config/merge_gate.conf`, with a comment and a range line that does not repeat the value. Read it through the existing config reader. Tests set their own factor and never read the live value.
-3. One function computes the normal wall time: the median wall time of recent passing full gates on the same vCPU count, from the gate index. Use the existing `TOP_RUNS` count of runs. With no passing record for that vCPU count, set no limit and print one line that says so.
-4. Full gate limit = factor × that median.
-5. Targeted run limit = factor × the larger of (a) the longest selected module's median wall time and (b) the sum of the selected modules' median wall times divided by the run's job count. Use only records on the same vCPU count. A module with no record adds nothing. With no record for any selected module, set no limit and print one line.
-6. Enforce the limit in the gate's existing wait loop with a monotonic deadline. Add no signal handler. Past the deadline, stop all running module groups through the existing stop path (`merge_gate.py:720`), and mark the gate red with the reason `time limit`.
-7. The red result names the limit, the elapsed time, the modules still running when the gate stopped, and each failed module with its saved traceback (the `GATE_FAILURE_LOG_KIB` tail). Send it to the owner through the same path a failed gate uses now.
-8. Cloud gate: past the deadline, also end the AWS box through the existing teardown call. If no call ends one box, stop and report; the director asks aws.
-9. Tests: direct calls with a fake clock and fake history; no real long runs, no whole gate runs for a limit check. Rows: same vCPU count only; passing gates only; the factor comes from config; no history gives no limit; the deadline stops the running modules and names them; failed modules carry tracebacks; the cloud path calls box end; the targeted limit rule.
-
-**Files:**
-- `scripts/production/merge_gate.py`, `scripts/production/targeted_test.py`
-- `config/merge_gate.conf`
-- `scripts/test_times/gate_record.py` (vCPU count, history read)
-- `scripts/aws_target/cloud_gate.py` or `gate_box.py` (box end)
-- their test modules
-
-**Workers:** 1 writer; the limit function is shared by every file.
-- impl: all files.
-
-**Acceptance gate:**
-- All merge-gate, targeted-test, test_times and aws_target modules pass; basedpyright clean on each changed file.
-- A fake-clock test shows a gate past its limit stops, names its running modules, and reports red.
+- `config/merge_gate.conf` adds `GATE_TIME_LIMIT_FACTOR=1.5`. `scripts/test_times/gate_record.py` computes both limits from the newest `TOP_RUNS` passing records on the same vCPU count: a full gate uses the median gate wall time; a targeted run uses max(longest selected module median, summed module medians ÷ jobs). Any selected module with no passing history, or no history for the vCPU count, gives `NoGateTimeLimit` and one printed line. The index records `vcpus`; old records stay readable.
+- `merge_gate.py` reaps finished jobs first, then applies the monotonic deadline and stops the rest through `stop_gate_jobs`. `cloud_gate.py` reads the result once more, then ends the box through the existing `terminate` call; `gate_box.py` enforces the limit on the guest. A result that finishes before the deadline passes.
+- The red report reads `time limit: limit <s>; elapsed <s>; running modules: …`, then each failed module with its traceback tail. Owner notices go through `session_send.send_argv` and `send.py`, which reach unit names and staff IDs. The gate adds no signal handlers.
+- One fix round closed three review findings (finished cloud result, finished local job, owner reach) and two sdlc requests. 994 tests pass in 30 modules; basedpyright clean. Live AWS teardown is not yet seen. Checkpoint `bd55aa60b`.
 
 ### Phase 220 — Pane summary tests call the summary function directly  · status: done
 **Depends on:** none
@@ -3488,33 +3464,113 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 - Three pane summary cases in `scripts/direct/test_assign_claude_panes.py` call `claude_worker._summary` directly through one `summary_turn` fixture method and the `WRITE_SUMMARY` constant (sdlc asked for both). The cleanup-before-cut case keeps the whole launcher. Launcher starts fell from 4 to 1. Three launcher exit checks became checks of the unchanged source log bytes, because `_summary` returns None; the launcher case still checks the exit. All 4 tests and 12 assertions stay. aws pairs, 3 rounds: `direct/test_assign_claude_panes.py` 8.26 → 2.46 CPU s (5.80 s saved); peak memory 157.7 → 164.0 MiB. sdlc approved the diff. Checkpoint `dcaafbc0c`.
 
-### Phase 221 — Follow and records tests make content calls in process  · status: todo
+### Phase 221 — Follow and records tests make content calls in process  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the content calls in `scripts/direct/test_assign_claude_follow.py` and `scripts/direct/test_assign_claude_records.py` run the assignment in process through the existing adapter (`assign_claude_test_support.py:445`, `run_assignment`), and aws pairs show a CPU gain.
+- Each setUp in `scripts/direct/test_assign_claude_follow.py` and `test_assign_claude_records.py` turns on the existing `run_assignment` adapter. Nine cases keep real processes for startup hooks, child observations, recorder failures and status order. Both fixtures set `MODELS_CONFIG_TIER_ONLY=1`, so in-process calls start no catalog sync. All 18 tests and 136 assertions stay. aws pairs, 3 rounds: records 31.52 → 25.96 CPU s (5.56 s saved), peak 167.0 → 173.2 MiB; follow 32.16 → 30.92 CPU s (0.96 s saved), peak 220.2 → 225.1 MiB. sdlc approved the diff; move the repeated setUp into the shared launcher fixture when a third module adopts it. Checkpoint `a5bce07e7`.
 
-**Decision:** architect reviews 25 and 26, 2026-11-12. Owner go: sdlc showrunner, 2026-11-12; send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+### Phase 222 — The merge gate installs no signal handlers  · status: done
+**Depends on:** Phase 219
 
-**Spec:**
-1. Refresh the profiles first: `module_cost.py --tests 10 --commands 15` on both modules.
-2. Turn on `direct_cli_calls` for the content cases (`test_assign_claude_follow.py:23,118,175,201`; `test_assign_claude_records.py:35,72,185`). Use `process_boundary_for_case` to keep a real process where a case proves it.
-3. Keep real processes for injected startup hooks, child observations, recorder failures and status-order observations.
-4. Keep every test and assertion. Change no shared support file unless the adapter cannot serve a case; then report the case and stop.
-5. Run both modules, every module that imports `assign_claude_test_support.py`, and basedpyright on each changed file.
+#### As-built
 
-**Files:**
-- `scripts/direct/test_assign_claude_follow.py`
-- `scripts/direct/test_assign_claude_records.py`
+- `scripts/production/merge_gate.py` and `scripts/test_times/module_run.py` install no signal handlers. The old `defer_signals` windows use the `pthread_sigmask` context; `rollback_signals` and its `gate_box.py` caller are gone. Each gate writes one run record (pid and start identity, process groups, tmp roots, FIFO CPU tokens, rollback intent) by atomic rename; a clean end removes it. The next gate start recovers a dead gate's record: it sends SIGTERM then SIGKILL to its groups (SIGKILL also when the leader has ended), restores tokens, removes folders and rolls back under the checkout lock after a HEAD check. Failed recovery keeps the record. Module children get SIGKILL parent death; `module_run.py` keeps the SIGKILL status without a signal reset. Signal tests assert exact statuses (SIGINT 1, else `-signal`). Also touches queue (builds ruling): `queue_place.py` `defer_cleanup_signals` reads the previous mask first and blocks inside the `try`; one row in `test_queue_place.py`. 17 modules, 323 pass. Checkpoint `b17e9b84e`.
 
-**Workers:** 1 writer; both modules use the same adapter.
-- impl: both files.
+### Phase 223 — Simplify lens tests call the daily command in process  · status: done
+**Depends on:** none
 
-**Constraints from prior phases:**
-- Phase 214: `resolve_model` reads the launch table in process; test environments carry the tier-only guard.
-- Census: follow 0–6.539 s (12 assignment tasks), records 0–6.299 s (16 tasks); ceilings, not savings.
+#### As-built
 
-**Acceptance gate:**
-- Python starts fall; all tests and assertions remain; importer modules pass; basedpyright clean.
-- aws pairs show a gain per module; sdlc sees the diff before land.
+- `scripts/direct/test_simplify_lens.py` calls `simplify_daily.main` in process through `invoke_cli`. `assign_gate.called_by_assign` refuses an in-process reviewer (unittest is the ancestor), and the guard stays. `simplify_daily.py` names its launcher path in one constant, `AGENT_EXEC`; the in-process cases bind it to a private launcher with an admission stub (the `review_launcher_test_support.py:184` pattern). The full `assign.sh` case and the status-write failure case keep the real guard. All 15 tests and 80 assertions stay; assignment starts 18 → 2. aws pairs, 3 rounds: 19.23 → 9.67 CPU s (9.56 s saved), peak 143.7 → 148.1 MiB. sdlc approved the diff. Checkpoint `8ee605e7f`.
+
+### Phase 224 — The module runner supervisor restores its signal mask on every path  · status: done
+**Depends on:** Phase 222
+
+#### As-built
+
+- Audit only; no code change. `run_with_descendant_cleanup()` blocks SIGTERM, SIGINT, SIGHUP and SIGCHLD at `module_run.py:580` by design, so `signalfd` can read them. Its sole caller (`:664`) has no catch, so a `signalfd`, `pidfd_open` or `prctl` error ends the process. The test child restores SIGCHLD and the previous mask at `:607-608` before `main()`; parent loss kills it with SIGKILL. The supervisor restores the mask at `:659` before `sys.exit`; signal termination exits through `:653-658`. No path keeps a process running with the mask blocked. `test_module_run.py` (24), `test_module_cost.py` (10) and `test_merge_gate_suites_signals.py` (12) pass; basedpyright clean.
+
+### Phase 225 — Change review tests prove contention without fresh interpreters  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/production/test_change_review.py`: the lock readiness case (`:1393`) uses two forked children, not fresh interpreters. The parent keeps the list lock until both children report a failed nonblocking lock attempt. The eight-add numbering case keeps one fresh CLI process (`:1724`) and seven forked processes. Each fork closes inherited lock descriptors and keeps process-group cleanup. All 136 tests and 545 assertions are unchanged.
+- AWS paired trial (3 rounds): CPU 16.32 → 14.38 s; median peak 156.3 → 147.2 MiB. Local 13.73 → 9.50 s. Checkpoint `2cc7b7d02`.
+
+### Phase 226 — Workers and claims tests share one in-process launch fixture  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/direct/assign_claude_test_support.py:633` `InProcessAssignClaudeLauncherFixture` holds one switch: its setUp calls the inherited fixture, sets `MODELS_CONFIG_TIER_ONLY=1` and turns on in-process content calls through `run_assignment` (`:445`). A `process_boundary` marker keeps 14 real-process cases (workers 2, claims 3, follow 5, records 4). Follow and records lose their own setUp copies. The adapter captures `check-launch` output so the staff-refusal assertions see stderr. All 29 test bodies and 200 assertions are unchanged.
+- AWS paired trial (3 rounds, c7a.8xlarge), CPU s: claims 11.08 → 7.92, follow 30.87 → 28.28, records 26.66 → 17.28, workers 13.08 → 9.36 (18.84 s in all). Median peak rises 26–36 MiB per module (for example workers 216.4 → 249.5). Checkpoint `ff5068f46`.
+
+### Phase 227 — Gate recovery frees CPU tokens across checkouts and rolls back only an idle checkout  · status: done
+**Depends on:** Phase 222
+
+#### As-built
+
+- `scripts/production/merge_gate.py:799` recovery reads every checkout directory under `active-runs`, each under its own `LOCK_EX` directory lock (`:815`). A dead gate's FIFO CPU tokens return for a gate in any checkout.
+- Each checkout run directory has an `operation.lock`. A live gate takes it `LOCK_SH` after its own recovery (`:859,864`) and keeps it until its clean record removal (`:875`). Rollback takes it `LOCK_EX | LOCK_NB` (`:766`) and checks HEAD and rolls back inside it. When busy, recovery frees groups, tokens and folders, keeps only the rollback intent, prints one line and leaves HEAD unchanged; a later start finishes the rollback. `scratch.copy_lock()` is unchanged; no signal handler is added.
+- `test_merge_gate_suites_signals.py:81` gains two rows (other-checkout token return; deferred rollback under a live holder); both fail on the old code. 230 merge gate tests pass. Checkpoint `2c59524fa`.
+- Open (routed by builds to sdlc devtools): `scripts/lib/build_folders.py:47,262,286` still installs signal handlers on the gate path through `temporary_build_folder()`.
+
+### Phase 228 — The whole-machine cloud guest keeps no shared gate state  · status: done
+**Depends on:** Phase 227
+
+#### As-built
+
+- Phase 222 made every gate run shared recovery, so the whole-machine guest reached `gate_state_dir()` and `test_gate_trial.py` `GuestTests.test_guest_uses_whole_machine_without_types_with_timeout_and_counts` failed. Now a `WholeMachine` run skips shared recovery (`merge_gate.py:1408`) and keeps its `run.json` and `operation.lock` in a private `merge-gate-recovery-*` directory under tmpfs (`:879`), removed at normal or failed exit. Nested runs keep their existing recovery owner. Shared recovery is unchanged; the guest test is unchanged. 179 aws target tests and 230 merge gate tests pass. Checkpoint `ef465ee86`.
+
+### Phase 229 — Unit move and shutdown tests find and remove their in-process CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `unit_move.processes_inside` scanned the host `/proc` and ignored `HERDR_PROC`, so one move mixed host processes with private test records. It now reads `herdr.proc_root()`; `herdr._proc_root` is renamed with no alias. The fixtures (`rename_unit_test_support.py`, `rename_test_support.py`) publish the private process records the host scan never needed; `UnitRenameFixture` links only its own direct children for one call and skips that bridge on Darwin. A direct test in `test_unit_move.py` covers exact, descendant, unrelated and deleted cwd paths. No assertion changes. aws pairs: unit move 18.22 to 17.47 CPU s, shutdown CLI 36.95 to 36.54 CPU s, lower in every pair; peak 148.0 to 147.4 and 226.7 to 225.7 MiB. natedev medians fell 32–35%, because natedev has many host processes. On the aws trial guest, 18 shutdown CLI resume tests fail on base and changed alike; impl4 diagnoses. Checkpoint `46ab6fa60`.
+
+### Phase 230 — Find the tests that scan every host process  · status: done
+**Depends on:** Phase 229
+
+#### As-built
+
+- Research only; no repository change. Report: unit session `phases/230/report.txt` (baseline `8d8ef549c`). 45 static scan sites; 209 of 210 paired comparisons pass. Host scan CPU on natedev, scan against a small private process view: `message/process_test_support.py:105` `OwnedTestProcesses.pin_descendants` 53.9 s (7 modules); `direct/verify_mac_offload_test_support.py:93` `processes_carrying` 35.0 s (70 modules); `lint/tmp_sweep.py:523` via `copies.scan_mirror_processes` 24.4 s (6); `production/merge_gate.py:618` `process_memory_mib` 11.6 s (15); `lint/memory_admit.py:873` 6.4 s (2); `direct/board.sh:311` `live_group` 5.0 s (79); `verify_token_wait_test_support.py:279` 2.4 s; `message/process_table.py:23` 1.5 s; `verify_token_ownership_test_support.py:36` 1.0 s; `lint/sweep.py:1230` 0.7 s. Each fix keeps real owned processes and reads only the owned PIDs or the selected root. Slow modules now: verify_wait_holder 90.9 CPU s (progress_history.py 89 starts 24.6 s; build_targets.py 50 starts 11.1 s), crate_run 56.2 (Git 24,108 starts 25.8 s), fast_track 37.5 (fast_track.py 22 starts 19.9 s; Git 7,446 starts 19.5 s).
+
+### Phase 231 — Every test module run sees no host herdr  · status: done
+**Depends on:** Phase 229
+
+#### As-built
+
+- The paired aws guest (`gate_box.py` paired environment) did not set `HERDR_BIN`, so 18 `agents/test_shutdown_cli.py` tests raised `HerdrMissing` on base and changed alike. `merge_gate.TEST_HERDR_BIN` is now the one definition; `test_module_environment` sets it after the inherited environment. The normal guest, both `module_cost.py` paths and `fast_track.fast_check` drop their copies; the paired supervisor embeds the constant beside the copied builder. `module_cost.py` now gives a module the gate's full environment. All 136 shutdown CLI tests pass through `module_cost.py` with `HERDR_BIN` unset. Checkpoint `0db93aadd`.
+
+### Phase 232 — The chain415 gate failures are fixed or owned  · status: done
+**Depends on:** Phase 231
+
+#### As-built
+
+- Two of the five chain415 failures came from this branch. `buildlog/test_gate_index.py` now expects the nullable `vcpus` column from Phase 219.
+- Phase 222 masked cancellation signals only in the calling thread. A process-directed SIGINT taken by another thread broke `reap_gate_job`: it lost status and CPU, then raised `ChildProcessError`. `scripts/lib/cancellation.py` now owns `CANCELLATION_SIGNALS`, `defer_cleanup_signals` and `start_masked_thread`, which starts an existing thread under the mask so it inherits it. The gate_box guest memory monitor, the queue_place sampler, the `copies.available_tree` waiter and the admission test fixture loop start through it. QueuePlace records its child before the sampler starts. No signal handlers.
+- Base failures with owners, sent to builds: `direct/test_verify_admission_signals.py` (builds-queue `730e73dc1`, build-followups-test-speed `f085ddb08a`), `herdr/test_worker_panes.py` (staff-copies `7676e0473`, quota-refusal `b711e365a`), `review_links/test_change_page.py` (sdlc-fix-rounds `8786bfbef3`).
+- `build_folders.defer_signals` still installs signal handlers. sdlc devtools owns it and has ordered its deletion. Checkpoint `4f09f6f20`.
+
+### Phase 233 — The lifecycle tests reuse one running-state repository  · status: done
+**Depends on:** Phase 232
+
+#### As-built
+
+- `LifecycleFixture.setUpClass` (`production_lifecycle_test_support.py`) saves a second snapshot, `running_snapshot`, after `build_running_repository()`. That method holds the Git part of the old `running()`: branch switch, running document add and commit, two pushes, two worktree adds.
+- `running()` replaces `origin.git`, `checkout`, `alpha` and `beta` with copies from that snapshot. The fixed paths keep the Git worktree links valid. Then it writes the per-test staff rows, panes, transcripts, unit config, exclude entry and log.
+- The test module did not change: 70 tests, all assertions and `run_lifecycle_process` stay. `running()` Git commands went from 448 to 56 in each module run.
+- aws paired trial, 3 rounds on c7a.8xlarge: CPU median 32.730 s to 30.856 s (saving 1.876 s); peak 155.2 to 159.2 MiB. natedev module_cost CPU 34.848 to 26.544 s. Checkpoint `1b63e07bf`.
+
+### Phase 234 — The unit config tests copy one seed repository  · status: done
+**Depends on:** Phase 233
+
+#### As-built
+
+- `UnitConfigFixture.setUpClass` (`unit_config_test_support.py`) builds one seed repository under a private home: `git init` on `main` and one empty commit. `setUp` copies it into each test's new root. Each test keeps its own home, environment, staff file and staff rows.
+- The three fixture classes inherit the seed. `test_unit_config.py` (45 tests) and `lib/test_git_exclude.py` (5 tests) did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: `test_unit_config.py` CPU 3.099 to 2.947 s; `test_git_exclude.py` 0.295 to 0.285 s; peak unchanged. natedev module_cost 3.915 to 1.744 s for both. Taplo (158 starts, 1.16 natedev CPU s) is now the top command in `test_unit_config.py`. Checkpoint `63acaa3e0`.

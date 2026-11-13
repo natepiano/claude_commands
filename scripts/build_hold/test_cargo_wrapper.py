@@ -170,6 +170,9 @@ class CargoWrapperTest(unittest.TestCase):
             [], ["metadata"], ["fmt"], ["tree"], ["--version"], ["--help"],
             ["custom-command"], ["+nightly", "metadata"],
             ["--config", "test", "metadata"], ["--color", "build", "tree"],
+            ["nextest", "--version"], ["clippy", "-V"],
+            ["build", "--help"], ["test", "-h"], ["install", "--help"],
+            ["+nightly", "--color", "auto", "nextest", "--version"],
         ):
             with self.subTest(args=args):
                 done = self.invoke(*args)
@@ -180,13 +183,14 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertFalse(self.python_log.exists())
 
     def test_building_commands_use_builds_slice(self) -> None:
-        for command in (
+        calls = [[command, "--", "$HOME", "${HOME}", "$$", "two words", ""] for command in (
             "build", "b", "check", "c", "clippy", "test", "t", "nextest",
             "run", "r", "bench", "doc", "d", "rustc", "rustdoc", "fix",
             "install", "miri", "mend",
-        ):
-            with self.subTest(command=command):
-                args = [command, "--", "$HOME", "${HOME}", "$$", "two words", ""]
+        )]
+        calls.extend((["install", "--version", "1.0", "x"], ["nextest", "run", "--", "--help"]))
+        for args in calls:
+            with self.subTest(args=args):
                 done = self.invoke(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assert_cargo(args)

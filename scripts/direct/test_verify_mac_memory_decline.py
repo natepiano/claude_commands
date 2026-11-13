@@ -4,12 +4,14 @@ from __future__ import annotations
 import unittest
 from typing import final
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
+from scripts.build_queue import placement
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class VerifyMacMemoryDeclineTests(VerifyMacMemoryRetryFixture):
-    def test_permanent_mac_decline_has_no_leave_hook(self) -> None:
+    def test_permanent_mac_decline_has_no_remote_retry(self) -> None:
         meminfo = self.hold_memory()
         self.set_mac_answer("declined", "no_tests", 75)
         clock = self.control_routing_clock()
@@ -22,7 +24,12 @@ class VerifyMacMemoryDeclineTests(VerifyMacMemoryRetryFixture):
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 1)
-        self.assertEqual(self.free_now_settings(), [])
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            attempts = [saved for saved in admission.server.assignments.values()
+                        if saved.assignment.destination.provider == "mac"]
+            self.assertEqual(len(attempts), 1)
+            self.assertIsInstance(attempts[0].retry, placement.DoNotRetry)
         self.assertEqual(len(self.local_runs()), 1)
 
 

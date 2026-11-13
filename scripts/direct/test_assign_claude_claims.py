@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 
-from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
+from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
+from scripts.production.cli_fixture import process_boundary
 from scripts.lib import process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
+class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture):
     def test_phase_launch_records_its_baseline_before_the_worker_opens(self) -> None:
         session = self.start_phase("first-baseline")
         head = subprocess.run(["git", "-C", str(self.working_dir), "rev-parse", "HEAD"], check=True,
@@ -26,6 +27,7 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         self.assertEqual((session / "baseline-at-worker-open").read_text(), head)
 
 
+    @process_boundary
     def test_live_claim_refuses_a_second_claude_launcher_without_a_pass(self) -> None:
         session = self.start_phase("live-claim")
         _ = self.claude_worker(session)
@@ -44,6 +46,7 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         self.assertEqual(claim.read_text(), saved)
         self.assertFalse((self.root / "delivered_message.txt").exists())
 
+    @process_boundary
     def test_a_reused_live_pid_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("reused-pid-claim")
         _ = self.claude_worker(session)
@@ -64,6 +67,7 @@ class AssignClaudeLauncherWorkerTests(AssignClaudeLauncherFixture):
         finished_pass, = self.launch_records(session, "pass_finished")
         self.assertEqual(finished_pass["status"], "completed")
 
+    @process_boundary
     def test_stale_claim_recovers_before_a_claude_follow(self) -> None:
         session = self.start_phase("stale-claim")
         _ = self.claude_worker(session)

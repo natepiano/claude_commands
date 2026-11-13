@@ -47,7 +47,9 @@ class FinalPassTests(FinalPassFixture):
                 self.assertGreaterEqual(int(cpu_ms), 0)
         # The final command starts its proof before the gate and finishes it on exit.
         self.assertEqual(names.count("final_pass.py"), 2, rows)
-        self.assertEqual(names.count("verify_metadata.py"), 1, rows)
+        calls = Path(str(trace) + ".calls").read_text().splitlines()
+        metadata_calls = [row for row in calls if row.split("\t")[0] == "verify_metadata.py"]
+        self.assertEqual(len(metadata_calls), 1, calls)
 
         query = self.verify("final", "--saved")
         self.assertEqual(query.returncode, 0, query.stdout + query.stderr)

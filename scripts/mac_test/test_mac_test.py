@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stdout, redirect_stderr
+from collections.abc import Callable
 import io
 import json
 import fcntl
@@ -3015,6 +3016,15 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")))
 
+    @staticmethod
+    def run_private_shell(command: str, root: Path,
+                          command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+                          command_process: type[subprocess.Popen[str]] = subprocess.Popen,
+                          command_sleep: Callable[[float], None] = time.sleep) -> subprocess.CompletedProcess[str]:
+        with mock.patch.object(subprocess, "Popen", command_process), mock.patch.object(time, "sleep", command_sleep):
+            return command_runner(["bash", "-c", command], cwd=root, env=dict(os.environ),
+                                  capture_output=True, text=True, check=False, timeout=5)
+
     def test_complete_idle_config_is_read_once_by_mac_test(self) -> None:
         selected = Path(os.environ["MAC_TEST_CONFIG"])
         _ = selected.write_text((SCRIPT.parents[1].parent / "config/mac_test.conf").read_text())
@@ -3192,6 +3202,51 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         with mock.patch.object(mac_test, "start_watcher") as release_watch:
             self.assertEqual(mac_test.command_release(arguments, self.paths), 0)
         release_watch.assert_called_once_with(self.paths)
+
+        with self.subTest(prepared_fence=True):
+            from scripts.mac_test import offload, claim_state
+
+            self.paths.block.unlink()
+            record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)),
+                                      work_idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
+            identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                                 cast(str, record["attempt"]))
+
+            def run_shell(command: str) -> subprocess.CompletedProcess[str]:
+                return self.run_private_shell(command, self.root)
+
+            prepared = run_shell(offload.prepare_start_fence_command(identity, "mac"))
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            fence_directory = self.root / offload.start_fence_relative(identity, "mac").parent
+            pending = offload.pending_start_path(self.paths.target, identity)
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            _ = pending.write_text("pending")
+            pending_before = pending.read_bytes()
+            transport_calls = 0
+
+            def release_transport(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                nonlocal transport_calls
+                del options
+                transport_calls += 1
+                self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+                if transport_calls == 1:
+                    return subprocess.CompletedProcess(arguments, 255, "", "private SSH failure")
+                return run_shell(arguments[-1])
+
+            with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
+                 mock.patch.object(mac_test, "send_message", return_value=True) as send, \
+                 mock.patch.object(subprocess, "run", side_effect=release_transport):
+                _ = self.watch_once()
+                self.assertEqual(self.read_claim(), record)
+                self.assertEqual(pending.read_bytes(), pending_before)
+                self.assertEqual(len(list(fence_directory.iterdir())), 1)
+                send.assert_not_called()
+                _ = self.watch_once()
+            self.assertFalse(self.paths.run.exists())
+            self.assertFalse(pending.exists())
+            self.assertEqual(list(fence_directory.iterdir()), [])
+            self.assertEqual(transport_calls, 2)
+            send.assert_called_once()
 
     def test_process_claim_release_message_keeps_process_bound_claim_command(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))

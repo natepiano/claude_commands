@@ -7,6 +7,7 @@ import shutil
 
 from scripts.aws_target import ledger
 from scripts.aws_target.aws_target import largest_gate_vcpus, read_snapshot
+from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf
 
 
@@ -32,13 +33,15 @@ def render(directory: Path, now: int, *, width: int | None = None, settings_path
     lines = ['Spot prices (USD/h; lowest zone)']
     for start in range(0, len(regions), count):
         columns = regions[start:start + count]
-        lines.append('type'.ljust(label_width) + ''.join('  ' + region.rjust(column_width) for region in columns))
+        rows: list[list[str]] = []
         for size in sizes:
             cells: list[str] = []
             for region in columns:
                 price = minimum.get((region, size))
                 cells.append('-' if price is None else f'{price:.4f}')
-            lines.append(size.ljust(label_width) + ''.join('  ' + cell.rjust(column_width) for cell in cells))
+            rows.append([size, *cells])
+        lines.extend(aligned_table(['type', *columns], rows, right=frozenset(range(1, len(columns) + 1)),
+                                  minimum_widths=[label_width, *(column_width for _ in columns)]))
         lines.append('')
     for region in regions:
         reading = readings.get(region)

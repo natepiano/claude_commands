@@ -12,6 +12,7 @@ _STARTED_AT = time.perf_counter()
 startup_cpu_s = 0.0
 __unittest = True
 
+import ctypes
 import json
 import os
 import fcntl
@@ -22,6 +23,7 @@ from functools import wraps
 from inspect import currentframe
 from pathlib import Path
 import resource
+import select
 import signal
 import stat
 import sys
@@ -565,53 +567,73 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
         raise
 
 
-class RunnerInterrupted(BaseException):
-    """A signal requests the end of the runner and its descendants."""
-
-
 def run_with_descendant_cleanup() -> None:
-    """Run tests in a child while the parent reaps their orphaned processes."""
+    """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
         main()
         return
-    watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    libc = ctypes.CDLL(None, use_errno=True)
+    watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
-    received: list[int] = []
-    cleaning = False
-
-    def interrupted(number: int, frame: object) -> None:
-        del frame
-        received.append(number)
-        if not cleaning:
-            raise RunnerInterrupted
-
-    previous = {number: signal.signal(number, interrupted) for number in watched}
     previous_sigchld = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    signal_set = (ctypes.c_ulong * 16)()
+    _ = cast(int, libc.sigemptyset(ctypes.byref(signal_set)))
+    for number in watched:
+        _ = cast(int, libc.sigaddset(ctypes.byref(signal_set), number))
+    signal_fd = cast(int, libc.signalfd(-1, ctypes.byref(signal_set), os.O_CLOEXEC | os.O_NONBLOCK))
+    if signal_fd < 0:
+        raise OSError(ctypes.get_errno(), "cannot watch runner signals")
+    parent_fds: list[int] = []
+    parent = os.environ.pop("MERGE_GATE_PARENT_PID", "")
+    if parent:
+        # No test child exists before the parent-death handoff completes.
+        parent_fds.append(os.pidfd_open(int(parent)))
+        if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
+            raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
     usage = resource.getrusage(resource.RUSAGE_SELF)
+    supervisor = os.getpid()
     test_pid = os.fork()
     if test_pid == 0:
+        for descriptor in [signal_fd, *parent_fds]:
+            os.close(descriptor)
+        if cast(int, libc.prctl(1, signal.SIGKILL, 0, 0, 0)) != 0:
+            raise OSError(ctypes.get_errno(), "cannot set the test parent death signal")
+        if os.getppid() != supervisor:
+            os.kill(os.getpid(), signal.SIGKILL)
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
         main()
         return
     status = 0
+    received = 0
+    test_fd = os.pidfd_open(test_pid)
     try:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
         while True:
-            pid, child_status = os.waitpid(-1, 0)
-            if pid == test_pid:
-                status = child_status
+            ready, _, _ = select.select([signal_fd, test_fd, *parent_fds], [], [])
+            if any(descriptor in ready for descriptor in parent_fds):
+                received = signal.SIGKILL
                 break
-    except RunnerInterrupted:
-        pass
+            if signal_fd in ready:
+                number = int.from_bytes(os.read(signal_fd, 128)[:4], sys.byteorder)
+                if number != signal.SIGCHLD:
+                    received = number
+                    break
+            ended = False
+            while True:
+                pid, child_status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                if pid == test_pid:
+                    status = child_status
+                    ended = True
+                    break
+            if ended:
+                break
     finally:
-        cleaning = True
         while True:
             children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
             for child in children:
@@ -625,11 +647,16 @@ def run_with_descendant_cleanup() -> None:
                 break
             if pid == test_pid:
                 status = child_status
+        for descriptor in [signal_fd, test_fd, *parent_fds]:
+            os.close(descriptor)
     exit_code = os.waitstatus_to_exitcode(status)
     if received or exit_code < 0:
-        number = received[0] if received else -exit_code
-        _ = signal.signal(number, signal.SIG_DFL)
+        number = received or -exit_code
+        if number not in (signal.SIGKILL, signal.SIGSTOP):
+            _ = signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
+        _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, {number})
+    _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
     sys.exit(exit_code)
 
 

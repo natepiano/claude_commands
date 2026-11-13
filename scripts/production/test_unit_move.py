@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -85,6 +86,8 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
                   mock.patch.object(herdr, "Herdr", return_value=client)):
                 resumed = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", owner.current_session,
                                    "--cwd", str(old), "--model", "opus")
+            shutil.rmtree(Path(self.env["HERDR_PROC"]) / str(shell_pid))
+            shutil.rmtree(Path(self.env["HERDR_PROC"]) / "102")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             destination = self.root / "moved-alpha"
             arguments = ["move-folder", "--unit", owner.id, "--to", str(destination)]
@@ -144,6 +147,18 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 mock.patch.object(pane_record, "pane_shell_pid", return_value=shell),
             ):
                 self.assertEqual(unit_move.move_processes_inside(self.owner, self.source), [above_pane, *extra])
+
+    def test_processes_inside_reads_the_selected_process_root(self) -> None:
+        process_root = self.root / "selected-proc"
+        process_root.mkdir()
+        for pid, cwd in ((41, str(self.source)), (23, str(self.source / "child")),
+                         (17, str(self.source) + "-other"), (31, str(self.source) + " (deleted)")):
+            process = process_root / str(pid)
+            process.mkdir()
+            (process / "cwd").symlink_to(cwd)
+        with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process_root)}),
+              mock.patch.object(sys, "platform", "linux")):
+            self.assertEqual(unit_move.processes_inside(self.source), [23, 31, 41])
 
     def test_running_unit_stops_moves_and_resumes_current_session(self) -> None:
         from scripts.agents import detached_run_process

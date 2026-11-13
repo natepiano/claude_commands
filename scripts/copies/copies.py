@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, conf, copy_record, file_lock, git_index, scratch
+from scripts.lib import build_folders, cancellation, conf, copy_record, file_lock, git_index, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -603,6 +603,11 @@ def claim_tree(tree: Path, *, create: bool, inherited_fds: list[int] | None = No
         yield ClaimState.ACQUIRED if idle and same else ClaimState.BUSY if same else ClaimState.REPLACED
 
 
+@dataclass(frozen=True)
+class WaiterNotStarted:
+    """No thread waits for the first checkout's busy mark."""
+
+
 @contextmanager
 def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generator[GateLease]:
     candidates = tree_paths(owner, repo, pool)
@@ -617,7 +622,7 @@ def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generato
         finally:
             wake.set()
 
-    waiter = Thread(target=first_tree_released, daemon=True)
+    waiter: WaiterNotStarted | Thread = WaiterNotStarted()
     while True:
         candidates = tree_paths(owner, repo, pool)
         for tree in candidates:
@@ -638,10 +643,10 @@ def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generato
             print(f"copies: waiting for {held}", file=sys.stderr, flush=True)
             announced = True
         if (candidates[0] / scratch.BUSY).exists() and not removing_path(candidates[0]).exists():
-            if not waiter.is_alive():
+            if isinstance(waiter, WaiterNotStarted) or not waiter.is_alive():
                 wake.clear()
                 waiter = Thread(target=first_tree_released, daemon=True)
-                waiter.start()
+                cancellation.start_masked_thread(waiter)
         _ = wake.wait(pool.wait_seconds)
 
 
