@@ -20,6 +20,43 @@ GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
+        for phase, unit, done, total, percent, expected in (
+            ("building", "units", 7, 10, 70, "70.0%"),
+            ("testing", "modules", 722, 727, None, "99.3%"),
+            ("testing", "tests", 0, 12, 0, "0.0%"),
+            ("testing", "modules", 12, 12, 100, "100.0%"),
+            ("testing", "modules", 11, 12, 100, "99.9%"),
+        ):
+            counter: dict[str, object] = {"kind": "RowProgress", "phase": phase, "unit": unit,
+                                         "done": done, "total": total}
+            if percent is not None:
+                counter["percent"] = percent
+            with self.subTest(counter=counter):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                        "walk": [{"name": "counter", "queued": True, "progress": counter},
+                                 {"name": "unknown", "queued": True, "progress": {"kind": "NoProgress"}}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                row = root.find(".//tr[@data-tip='row:0']")
+                assert row is not None
+                self.assertEqual(row[0].text, phase)
+                self.assertEqual(row[1].get("class"), "done")
+                self.assertEqual(row[1].text, expected)
+                self.assertEqual(root.findtext(".//tr[@data-tip='row:1']/td[@class='done']"), "—")
+
+    def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
+        data = {"read_at": 200, "walk": [{"kind": "mac-build", "machine": "mac", "name": "hana nextest",
+            "used": 3.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacTesting"},
+            "progress": {"kind": "RowProgress", "phase": "testing", "unit": "tests",
+                         "done": 7, "total": 10, "percent": 70}}]}
+        rendered = self.page_expression("tooltipHtml('row:0', data)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual(root[-1].get("class"), "mac-note")
+        self.assertEqual(root[-1].text, "Mac memory does not count against natedev.")
+        self.assertEqual(root[-2].tag, "dl")
+        self.assertIn("70.0%", "".join(root[-2].itertext()))
+
     def test_the_memory_page_hover_shows_the_captured_phase_percent_hold_and_reason(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
@@ -106,9 +143,9 @@ class MemoryHoverTests(unittest.TestCase):
                      "progress": {"kind": "NoProgress"}},
                     {"name": "Mac test", "kind": "cloud", "machine": "mac",
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
-                    {"name": "hana CI", "ci": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "hana CI", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "NoProgress"}},
-                    {"name": "CI counter", "ci": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "CI counter", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                 ]
                 waiting_kinds: tuple[tuple[str, dict[str, object]], ...] = (
@@ -124,7 +161,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Step", "Duration", "Unit", "Pid", "Machine", "vCPU"])
+                                 ["Stage", "Done", "Step", "Duration", "Unit", "Pid", "Machine", "vCPU"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:{index}']")
@@ -137,7 +174,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(spacers), int(waiting))
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Step", "Waiting", "Unit", "Pid", "Machine", "vCPU"])
+                                     ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Machine", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:{index}']")
@@ -158,11 +195,12 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual([int(tick.text or "0") for tick in root], expected)
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
-        for state in ("idle", "busy", "unreadable"):
+        for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
             with self.subTest(state=state):
                 data = {"total": 64, "cap": 48, "taken": 4.125, "used": 3, "ci_ram": 0.125,
                         "read_at": 200, "waiters": [], "walk": [{
-                            "name": "hana CI", "ci": True, "ci_runners": [{"state": state}],
+                            "name": "hana CI", "ci": True, "admitted": state == "busy",
+                            "ci_runners": [{"state": "busy" if state in ("waiting", "unmatched") else state}],
                             "used": 0.125, "queued": False, "started_at": 100,
                             "progress": {"kind": "NoProgress"}}]}
                 result = cast(list[object], self.page_expression(
@@ -224,8 +262,8 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{result[0]}</root>")
         row = root.find(".//tr[@data-tip='row:0']")
         assert row is not None
-        self.assertEqual([row[index].text for index in (0, 2, 4, 6)], ["—", "—", "—", "—"])
-        self.assertEqual(row[3][0].text, "—")
+        self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
+        self.assertEqual(row[4][0].text, "—")
         self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
@@ -325,6 +363,24 @@ class MemoryHoverTests(unittest.TestCase):
                 result = self.page_expression(f"tipText('{key}', data)", {"walk":[],"waiters":[],"swap_by":[]})
                 self.assertIn("Item unavailable", str(result))
                 self.assertNotIn("undefined", str(result))
+
+    def test_ci_tooltip_shows_a_failed_memory_reading(self) -> None:
+        diagnostic = "CI memory reading failed: permission denied <memory.current>"
+        for recorded_diagnostic in (diagnostic, ""):
+            with self.subTest(diagnostic=recorded_diagnostic):
+                data = {"ci_ram": 0, "walk": [{"ci": True, "used": 0,
+                    "diagnostic": recorded_diagnostic, "ci_runners": [{"state": "busy", "job": "tests"}]}]}
+                for key in ("ci", "row:0"):
+                    rendered = self.page_expression(f"renderTooltip(tooltipFor('{key}', data))", data)
+                    root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                    fields = {row.findtext("dt"): row.findtext("dd") for row in root.findall("dl/div")}
+                    if recorded_diagnostic:
+                        self.assertEqual(fields.get("Diagnostic"), diagnostic)
+                        self.assertEqual("".join(root.itertext()).count(diagnostic), 1)
+                    else:
+                        self.assertNotIn("Diagnostic", fields)
+                    self.assertEqual(fields["Status"], "1 job running")
+                    self.assertEqual(fields["Jobs"], "tests")
 
     def test_ci_tooltip_preserves_unreadable_runner_states(self) -> None:
         cases: tuple[tuple[list[dict[str, object]], str, str], ...] = (

@@ -303,9 +303,9 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
@@ -518,7 +518,7 @@ try {
                 slots:'cloud '+latest.cloud_slots_used+' of '+latest.cloud_slots+' slots',
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -592,11 +592,11 @@ try {
             }
             await show(base);
 
-            for (const state of ['idle','busy']) {
+            for (const state of ['idle','waiting','unmatched','busy']) {
               const ciReading=structuredClone(base);
-              ciReading.walk.push({name:'hana CI',ci:true,queued:false,used:0.125,reserved:0,
+              ciReading.walk.push({name:'hana CI',ci:true,admitted:state==='busy',queued:false,used:0.125,reserved:0,
                 counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
-                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state}]});
+                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
               ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
               await show(ciReading);
@@ -623,8 +623,10 @@ try {
                 const chart=document.querySelector('.wrow[data-run="'+index+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="row:'+index+'"]');
                 return {name:row.name,stage:table.querySelector('.place').textContent,
-                  unit:table.querySelector('.unit').textContent,percent:chart.querySelector('.progress-amount').textContent,
-                  used:chart.querySelector('.seg-used').getBoundingClientRect().width,
+                  unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
+                  underBar:!!chart.querySelector('.progress-amount'),
+                  used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
+                  color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
                   tip:renderTooltip(tooltipFor('row:'+index,latest)),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
@@ -633,7 +635,7 @@ try {
             })()`);
             assert.equal(macProof.length,3);
             assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
-            assert.deepEqual(macProof.map(row=>row.percent),['60.4% done','64.7% done','98.3% done']);
+            assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
@@ -644,6 +646,7 @@ try {
               assert.equal(row.stage,'building');
               assert.ok(Math.abs(row.used-row.expected)<1);
               assert.equal(row.hatched,false);
+              assert.equal(row.underBar,false);
               assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
               assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
             }
@@ -855,6 +858,114 @@ try {
           refreshLayoutProofs.push({version,loaded,held,recovered});
         }
         const comparisons = [];
+        {
+          const review = structuredClone(readings.spacing);
+          review.priority_text = "Priority: the user's bump";
+          review.head_text = `Free: ${review.available.toFixed(1)} GiB`;
+          const local = review.walk.find(row => row.queued);
+          local.machine = 'natedev';
+          const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
+          Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
+            progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
+          const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
+          Object.assign(aws, {machine:'aws',used:1.5});
+          const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
+            started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
+            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
+          review.walk = [local, mac, aws, ci];
+          review.waiters = [{...review.waiters[0],name:'hana CI doctests',unit:'hana CI',detail:'hana CI',reason:'CI needs free memory',head:true,priority:{unit:'hana CI',why:"the user's bump"},
+            head_text:review.head_text,priority_text:review.priority_text}];
+          review.ci_ram = 0.125;
+          review.taken = review.used + review.ci_ram + review.reserved;
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const version of beforePage ? ['before','after'] : ['after']) {
+              await call('Emulation.setDeviceMetricsOverride', {width:1800,height:1200,deviceScaleFactor:1,mobile:false});
+              await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+              await show(review);
+              const comparison = await evaluate(`(() => {
+                const table=document.querySelector('.walk-table');
+                const mac=document.querySelector('.wrow[data-run="1"]');
+                const macBar=mac.querySelector('.seg-remote,.seg-used');
+                const awsBar=document.querySelector('.wrow[data-run="2"] .seg-remote');
+                return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
+                  done:table.querySelector('tr[data-tip="row:1"] .done')?.textContent,
+                  underBar:!!mac.querySelector('.progress-amount'),
+                  remoteColor:getComputedStyle(macBar).backgroundColor,
+                  awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
+                  localColor:getComputedStyle(document.querySelector('.wrow[data-run="0"] .seg-used')).backgroundColor,
+                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
+                  ciVisible:!!table.querySelector('tr[data-tip="row:3"]'),
+                  waiting:table.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                  pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
+              })()`);
+              if(version==='after') {
+                assert.deepEqual(comparison.headers.slice(0,2),['Stage','Done']);
+                assert.equal(comparison.done,'99.3%');
+                assert.equal(comparison.underBar,false);
+                assert.notEqual(comparison.remoteColor,comparison.localColor);
+                assert.equal(comparison.remoteColor,comparison.awsColor);
+                const rgb = hex => 'rgb('+hex.slice(1).match(/../g).map(part=>parseInt(part,16)).join(', ')+')';
+                assert.equal(comparison.remoteColor,rgb(review.colors[theme].remote_memory));
+                assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
+                assert.equal(new Set(comparison.machineColors).size,3);
+                assert.equal(comparison.ciVisible,false);
+                assert.equal(comparison.waiting,'hana CI');
+                assert.equal(comparison.pageOverflow,false);
+              } else {
+                assert.equal(comparison.ciVisible,true);
+                assert.equal(comparison.underBar,true);
+                assert.equal(comparison.remoteColor,comparison.localColor);
+              }
+              const capture = async (name, selector) => {
+                const clip=await evaluate(`(() => {
+                  const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+                  return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,`${version}-${theme}-${name}.png`),Buffer.from(shot.data,'base64'));
+              };
+              await capture('c1507-b','#walk');
+              await capture('hanaci-row','#walk');
+              await evaluate(`showTip('row:1',180,160)`);
+              const note = await evaluate(`(() => {
+                const tip=document.querySelector('#tip');
+                const note=tip.querySelector('span');
+                const fields=tip.querySelector('dl');
+                return {last:tip.lastElementChild===note,nowrap:getComputedStyle(note).whiteSpace,
+                  note:note.textContent,fieldsBottom:fields.getBoundingClientRect().bottom,noteTop:note.getBoundingClientRect().top};
+              })()`);
+              if(version==='after') {
+                assert.equal(note.last,true);
+                assert.equal(note.nowrap,'nowrap');
+                assert.ok(note.noteTop>=note.fieldsBottom);
+              }
+              await capture('c1507-a','#tip');
+              const responsive = [];
+              if(version==='after') {
+                for(const width of [1400,390]) {
+                  await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+                  await show(review);
+                  const layout = await evaluate(`(() => {
+                    const walk=document.querySelector('#walk'),card=walk.closest('.card');
+                    return {tables:walk.querySelectorAll('table').length,
+                      lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
+                      layout:walk.classList.contains('beside')?'beside':'stacked',
+                      head:tipText('wait:0',latest).join(' ')};
+                  })()`);
+                  assert.equal(layout.tables,1);
+                  assert.equal(layout.lists,0);
+                  assert.equal(layout.layout,width===1400?'beside':'stacked');
+                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                    assert.equal(layout.head.split(value).length-1,1);
+                  responsive.push({width,...layout});
+                }
+              }
+              comparisons.push({version,theme,...comparison,note,responsive});
+
+            }
+          }
+        }
         const review = structuredClone(base);
         Object.assign(review,{total:60.5,available:7.6,used:12.4,ci_ram:0,reserved:15.8,taken:28.2,
           floor:3,shown_safety:3,cap:17,room:0,shortfall:11.2,other:40.5,shown_reserved:4.6});

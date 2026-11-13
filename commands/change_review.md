@@ -178,6 +178,9 @@ The Mac block states that updates can take five minutes while the Mac is reachab
 The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
+The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
+It combines these needs with cached system comparisons without duplicate machines.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds; failed or empty evaluations retry on the next refresh.
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.

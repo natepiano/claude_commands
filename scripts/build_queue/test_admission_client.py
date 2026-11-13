@@ -35,6 +35,7 @@ from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
+from scripts.build_queue.test_snapshot_codec import service_snapshot
 from scripts.lint.memory_test_support import commit_config_fixture, config_environment
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
@@ -47,6 +48,60 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
+        raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
+        snapshot = cast(dict[str, object], cast(dict[str, object], raw["data"])["snapshot"])
+        return raw, snapshot
+
+    def test_unknown_unused_service_variants_keep_the_wait_and_allow_admission(self) -> None:
+        for field in ("job_state", "service_job_state"):
+            with self.subTest(field=field), AdmissionFixture() as fixture:
+                request = fixture.request()
+                raw, snapshot = self.service_wait_record()
+                memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+                memory[field] = {"kind": "FutureServiceJob"}
+                transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.admit(request, waits.append, lambda: request)
+                self.assertEqual(result, GRANTED)
+                self.assertEqual(len(waits), 1)
+                measured = waits[0].snapshot.running[0].measured
+                assert isinstance(measured, records.UnownedSliceMemory)
+                self.assertEqual(measured.bytes, 123)
+                self.assertEqual(transport.requests, [request])
+                self.assertNotIn("memory admission check failed", output.getvalue())
+                self.doCleanups()
+
+    def test_unknown_used_wait_variant_keeps_the_named_checker_error(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            raw, snapshot = self.service_wait_record()
+            snapshot["head_reason"] = {"kind": "FutureAdmissionReason"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode()))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, wire.Refused("invalid snapshot variant"))
+            self.assertIn("memory admission check failed (invalid snapshot variant); step refused", output.getvalue())
+            self.assertEqual(transport.requests, [request])
+
+    def test_unused_service_variants_do_not_extend_the_silent_queue_deadline(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            raw, snapshot = self.service_wait_record()
+            memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+            memory["service_job_state"] = {"kind": "FutureServiceJob"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), TimeoutError()))
+            waits: list[wire.Wait] = []
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+            self.assertEqual(result, wire.Refused(
+                "build queue unreachable for 5 s; step stopped; cargo token given back"))
+            self.assertEqual(fixture.clock.monotonic(), 5)
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(transport.requests, [request])
+            self.assertNotIn("memory admission check failed", output.getvalue())
+
     def test_history_generation_reads_current_configuration_at_use(self) -> None:
         with AdmissionFixture() as fixture:
             transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))

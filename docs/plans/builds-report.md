@@ -1193,3 +1193,51 @@ From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~
 **Files:**
 - `scripts/buildlog/disk.py` — `FOLDERS`.
 - `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
+
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+
+**Reverted 2026-11-13, landed again in phase 62.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below holds again, with the job state change in phase 62.
+
+From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
+
+#### As-built
+
+- `config/memory_feed.conf` holds eight colors as six hex digits: `remote_memory_light`/`_dark` and `machine_{natedev,mac,aws}_light`/`_dark`. `memory_feed.FeedConfiguration.colors` reads them once and checks each value; `memory.json` carries them as `colors` (`PageColors`, by theme).
+- `memory_live.html` draws a Mac or AWS used bar in the remote color, colors the Machine text by machine, and shows a Done column after Stage in the Running and Waiting tables (`—` without a percent). The "N% done" text under the bar is gone, and the Mac note is the last tooltip line, on one line.
+- `scope_activity.py` adds `WaitingServiceJob` and `UnmatchedServiceJob`; `ServiceJobState` is the closed union. `memory_admit.service_job_state` matches each `Runner.Worker` process tree against reservation pids (Running), then waiter pid and start time (Waiting), else Unmatched. `memory_admit.py` and `admission_service.py` both classify through it; `admission_records.py` and `queue_evidence.py` read every state.
+- `build_ci_row` sets `admitted` only for `RunningServiceJob`, so a hana CI row shows in Running only for a matched reservation. A waiting job stays in the Waiting table. CI amounts, `duplicate_use`, the taken total and the cap do not change.
+- Text colors exceed 5.55:1 contrast in light and 7.79:1 in dark. `memory_page_proof.mjs` saves before and after screenshots of the three user-shot elements in both themes and keeps the after-page table, note list, layout and tooltip checks.
+
+**Files:**
+- `config/memory_feed.conf`, `config/README.md` — the eight color keys.
+- `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
+- `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
+- `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: done
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, with a test that the client at `7fdfd9a6a` parses the new service snapshot.
+
+#### As-built
+
+- The phase 60 as-built above applies again, with one change: `WaitingServiceJob` and `UnmatchedServiceJob` go only in `UnownedSliceMemory.service_job_state`, beside `ServiceJobStateNotRecorded`.
+- `job_state` keeps `RunningServiceJob`, `IdleService` and `NotServiceSlice`. A waiting or unmatched worker keeps the `job_state` value the code before phase 60 wrote, so older clients see no change.
+- `build_ci_row`, `queue_evidence` and `admission_service` read `service_job_state`. The hana CI row shows in Running only for a worker matched to a reservation.
+- `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
+
+**Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
