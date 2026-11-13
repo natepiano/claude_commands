@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, ScopeProcesses, ServiceJobState)
+    NotServiceSlice, RunningServiceJob, ScopeProcesses)
 
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -428,7 +428,7 @@ class UnownedSliceMemory(MeasuredMemory):
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
     pid: int | PidNotRecorded = field(kw_only=True)
-    job_state: ServiceJobState = NotServiceSlice()
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
 
 
 @dataclass(frozen=True)

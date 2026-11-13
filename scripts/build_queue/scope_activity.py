@@ -55,19 +55,6 @@ class RunningServiceJob:
 
 
 @dataclass(frozen=True)
-class WaitingServiceJob:
-    started_at: float
-
-
-@dataclass(frozen=True)
-class UnmatchedServiceJob:
-    started_at: float
-
-
-ServiceJobState = RunningServiceJob | WaitingServiceJob | UnmatchedServiceJob | IdleService | NotServiceSlice
-
-
-@dataclass(frozen=True)
 class ScopeProcess:
     pid: int
     program: str
