@@ -483,23 +483,47 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack) -> bool:
+    """Hold path's lease lock when it is free. A missing lock file means no lease."""
+    try:
+        descriptor = _open_lock(path, directory, create=False)
+    except FileNotFoundError:
+        return True
+    _ = stack.callback(os.close, descriptor)
+    return _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
+
+
+def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
+    """Hold every lease lock below path without following links. False when an owner holds one."""
+    def unreadable(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
+        for name in files:
+            stem = name.removesuffix(".lock")
+            if stem != name and (stem in folders or stem + ".lease.json" in files):
+                if not _hold_free_lease(Path(top) / stem, directory, stack):
+                    return False
+    return True
+
+
 @contextmanager
-def collector_lease(path: Path) -> Generator[bool]:
+def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
     """Hold a managed folder's lease lock while a collector judges and removes it.
 
     Yield False when an owner holds the lease. A folder without a lock file has no lease.
+    With children, also hold every lease below the folder; a held one, or an unreadable
+    folder, is busy.
     """
     with ExitStack() as stack:
         try:
             directory = stack.enter_context(_folder_parent(path, path.parent, create=False))
-            descriptor = _open_lock(path, directory, create=False)
+            free = _hold_free_lease(path, directory, stack) and (not children or _hold_child_leases(path, stack))
         except FileNotFoundError:
             free = True
         except (OSError, ValueError):
             free = False
-        else:
-            _ = stack.callback(os.close, descriptor)
-            free = _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
         yield free
 
 

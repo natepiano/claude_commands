@@ -212,6 +212,7 @@ Do not add slots, rescue refs, or size limits during bf1.
 **Devtools part (bf2d):** `build_folders.collector_lease` holds a managed folder's lease lock without waiting.
 `scratch.removal_lock` and `scratch.judgment_lock` take it first and hold it through judgment and deletion; a held lease is busy.
 The folder audit, the tmp sweep, scratch end, the floor sweep and copy removal get the guard through these locks.
+**Held child leases (bf2p):** `removal_lock` also holds every lease lock below the folder through deletion; a held one keeps the parent.
 `tmp_sweep.py` still reports the old busy reason; resources can use `scratch.BUSY_REASON`.
 **Estimate:** 8 worker hours.
 **Depends on:** bf1.
