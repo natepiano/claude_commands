@@ -12,6 +12,7 @@ import subprocess
 import sys
 from typing import cast, final
 from unittest import mock
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate
 from scripts.direct.wait_for_test_state import wait_until
@@ -125,18 +126,27 @@ sys.addaudithook(cleanup_event)
         self.assertIn("merge undone", result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertEqual(list(parent.iterdir()), [], result.stdout + result.stderr)
+        if number:
+            [folder] = [entry for entry in parent.iterdir() if entry.is_dir()]
+            lock = folder.with_name(folder.name + ".lock")
+            lease = folder.with_name(folder.name + ".lease.json")
+            self.assertEqual(set(parent.iterdir()), {folder, lock, lease})
+            record = cast(dict[str, object], json.loads(lease.read_text()))
+            self.assertIsInstance(record["pid"], int)
+            self.assertEqual(build_folders.build_folder_state(folder), "free")
+        else:
+            self.assertEqual(list(parent.iterdir()), [], result.stdout + result.stderr)
 
     def test_failed_gate_removes_its_folder(self) -> None:
         self.assert_gate_folder_removed("failure")
 
-    def test_sigterm_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigterm_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGTERM")
 
-    def test_sighup_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sighup_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGHUP")
 
-    def test_sigint_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigint_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGINT")
 
     @gate_suites("hooks")
