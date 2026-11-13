@@ -762,6 +762,25 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+`QueuePlace.popen` installs no signal handler.
+It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
+It then restores the caller's previous signal mask.
+The program wrapper unblocks these signals before exec.
+The program wrapper atomically publishes a `ProgramStart` record before execution.
+The record contains the holder identity, program identity, and memory scope.
+The wrapper checks the holder's PID and start time before and after publication.
+A dead holder prevents program execution.
+A later interruption leaves the complete record in the build log's `program-starts` directory.
+The next start stops recorded scopes or program groups with dead holders before it requests admission.
+It removes their records after their scopes or process trees become empty.
+Normal cleanup removes the record after the program and its descendants stop.
+Temporary queue-place folder names contain the holder's PID and start time.
+The next start removes this account's folders after those exact holders end.
+Folder allocation and removal use a signal mask and install no handler.
+SIGTERM uses its default action and can leave cleanup for the next start or service read.
+Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
+`defer_cleanup_signals` retains its signal mask during normal cleanup.
+It uses `pthread_sigmask` and installs no handler.
 
 ### Startup, cut-over, and rollback
 
@@ -1686,13 +1705,53 @@ The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` 
 The first column shows `building` or `testing` from the recorded progress counter.
 A row without a counter shows `—`.
 Local builds, merge gates, and cloud rows use their recorded counters.
-Native Mac builds and hana CI currently have no counter.
+hana CI currently has no admission counter.
 The Running table shows hana CI only when a recorded runner has a busy job.
 Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
 The narrow layout adds the `Step` column.
+The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
+It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
+A v3 registration must match the current boot, process start time, uid, PID, and generation.
+The reader reads at most 64 KiB from each registration and log.
+It groups descendant cargo calls and compilers under their top-level cargo run.
+Native projects and both test mirrors appear as separate runs.
+The recorded project directory identifies the run; a compiler's crate directory does not.
+The step name uses the command's package, then the repository when the command has no package.
+A step name never contains an unknown-value dash.
+The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
+The Mac row shows the repository on its second label line.
+The stage uses a test counter or a running test binary as evidence for `testing`.
+The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
+It embeds the shared Cargo folder reader in the same Mac reading.
+The Mac kernel supplies only the selected Cargo path environment fields.
+Observed compiler output folders also identify test binaries, as they do in cargo tile.
+The reader resolves symlinks before it compares directory components.
+A test binary under a custom target folder can supply `testing` without a counter.
+Build scripts and binaries outside the selected output folders do not supply `testing`.
+The stage otherwise shows `building` for an observed cargo run.
+The reader uses the same captured Cargo and nextest output that cargo tile reads.
+The page shows the recorded done percentage and a progress line.
+The command's `--test-threads`, `-j`, or `--jobs` value supplies vCPU.
+An absent positive value supplies `—`.
+The Unit comes from the submitting session in a matching Mac claim and that session's staff record.
+A remote mirror session and repository can identify that claim.
+A mirror lease can identify the claim session.
+The copy record's fallback owner does not supply a Unit.
+The page shows `—` when no claim supplies an owner.
+The Mac row uses the local used-memory style and the same GiB scale.
+Its memory is the sum of resident memory for the run's process tree.
+The Mac row has no reservation or hatching and changes no natedev memory total.
+The Mac tooltip states that its memory does not count against natedev.
+It aligns Machine, Started, Used, and Reading age in labelled rows.
+A readable counter adds a Progress row.
+A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
+The feed log retains raw errors; the page shows only the status and reading age.
+CI runner records supply the `hana CI` owner for their Running and Waiting steps.
+The aggregate running CI row also shows Unit `hana CI`.
+The feed compares the step's recorded runner unit with the runner records, not page text.
 The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.

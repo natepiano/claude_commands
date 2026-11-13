@@ -13,6 +13,7 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -275,6 +276,29 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
         home = self.named_account()
         _ = staff.set_home(owner.id, staff.SessionHome(home))
+        for copied_facts, stale_owner in (({"session_id": native}, False),
+                                         ({"doc": str(self.root / "kid-production.md")}, False),
+                                         ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, False),
+                                         ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, True)):
+            with self.subTest(copied_facts=copied_facts, stale_owner=stale_owner):
+                _ = staff.set_home(owner.id, staff.SessionHome(home))
+                admitted = staff.by_id(owner.id)
+                assert admitted is not None
+                completion_receipt.write_receipt(receipt_path, owner.id, {**saved.fields, **copied_facts})
+                pending = completion_receipt.read_launch_receipt(receipt_path, staff.snapshot())
+                assert isinstance(pending, completion_receipt.OwnedReceipt)
+                if stale_owner:
+                    pending = completion_receipt.OwnedReceipt(replace(admitted, home=staff.HomeUnknown()), pending.fields)
+
+                with patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "showrunner"):
+                    finished = add_showrunner.finish_publication(pending)
+
+                self.assertEqual(staff.by_id(owner.id), admitted)
+                self.assertEqual(finished.owner, admitted)
+                self.assertEqual(finished.fields, saved.fields)
+                launch = add_showrunner.ShowrunnerLaunch.from_receipt(finished)
+                self.assertEqual((launch.session_id, launch.config_dir), (current, home))
+                self.assertEqual(json.loads(receipt_path.read_text()), saved.fields)
         transcript = home / "projects/fixture" / f"{current}.jsonl"
         write_text_atomic(transcript, '{}\n')
         self.starts(current, registers="renamed-kid")

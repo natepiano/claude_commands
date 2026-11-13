@@ -15,6 +15,7 @@ from importlib import import_module
 from functools import partial
 import io
 import json
+import math
 import os
 import re
 import time
@@ -232,6 +233,7 @@ def _client() -> herdr.Herdr:
 
 
 def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "", *,
+                   deadline: float = math.inf,
                    on_submission: Callable[[], object] = lambda: None) -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
@@ -240,7 +242,7 @@ def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action:
     if action == "prompt":
         arguments.append(script_prompt(line))
     elif action == "compact":
-        arguments.extend(("/compact", "--wait"))
+        arguments.extend(("/compact", "--timeout", str(max(0, int((deadline - time.monotonic()) * 1000))), "--wait"))
     command = client.argv(*arguments)
     _ = on_submission()
     result = subprocess.run(command, text=True, capture_output=True, check=False)
@@ -267,11 +269,23 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
             usage = rollouts.token_usage(record)
             if usage is not None:
                 tokens = usage.uncached_input + usage.cached_input + usage.output
+        offset = stream.tell()
     if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS"):
-        _agent_command(client, current, "compact")
-        ended = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
+        deadline = time.monotonic() + conf.read("direct").number("WORKER_COMPACT_SECONDS")
+        _agent_command(client, current, "compact", deadline=deadline)
+        ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
         if isinstance(ended, herdr.WaitTimedOut):
-            raise herdr_types.HerdrFailure("compaction did not finish before the settle bound", "timeout")
+            raise herdr_types.HerdrFailure("compaction did not finish before the compaction bound", "timeout")
+        source = worker_admission.transcript_source(current.row, backend)
+        with open_transcript(source) as stream:
+            _ = stream.seek(offset)
+            for line in stream:
+                if not line.endswith(b"\n"):
+                    break
+                record = rollouts.decode_rollout(line.decode("utf-8"))
+                if record is not None and rollouts.is_compaction(record):
+                    return
+        raise herdr_types.HerdrFailure("compaction has no transcript proof", "not_submitted")
 
 
 def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCode:
@@ -516,9 +530,16 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         return ExitCode.BUSY
     try:
         _compact_before_dispatch(client, current)
-    except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         reason = " ".join(str(error).splitlines())
-        print(f"{current.row.name}: compaction failed: {reason}; prompt is sent without compaction", file=sys.stderr)
+        try:
+            composer = client.composer(current.pane)
+            if isinstance(composer, herdr.ComposerInput) and composer.text.strip() == "/compact":
+                client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
+            reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
+        print(f"{current.row.name}: compaction failed: {reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:

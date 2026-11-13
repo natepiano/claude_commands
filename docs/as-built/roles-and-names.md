@@ -9,10 +9,14 @@ This doc records how the development process names its roles, where each name li
 **Three role meanings.** `scripts/message/roster.py` keeps these apart:
 
 - `Role` is the organizational role, the `RosterEntry.role` value.
-- `WorkerAssignment` holds a `WorkerRole`: `impl`, `test`, `fix` or `review`.
+- `WorkerAssignment` holds a `staff.WorkerRole`: `impl`, `test`, `fix`, `review`, `astra-designer`, or `astra-reviewer`.
 - `Job` is the shown job. A session with no job holds `JobUnassigned`, as `AssignmentUnrecorded` or `AssignmentUnreadable`.
 
 `docs/as-built/session-roster.md` describes the roster.
+
+Staff records a worker's current role through `KnownWorkerRole` and `set_worker_role`.
+The agents log keeps dated attribution for usage reports, not the current role.
+An addressed reviewer's lens comes from dispatch evidence.
 
 **Names that can change.** `config/names.toml` has `[jobs]` and `[audiences]`. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit. `scripts/lib/names.py` is the one loader: `load_names(path)` returns `Names` or a `NamesError`, and `runtime_names()` loads once per process. Record keys, addresses, session names and pane labels keep the key.
 

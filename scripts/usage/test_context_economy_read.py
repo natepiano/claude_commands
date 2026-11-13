@@ -398,6 +398,12 @@ class ContextEconomyReadTests(unittest.TestCase):
               patch.object(cache_module, "prefix_anchor", side_effect=AssertionError("warm prefix read"))):
             self.assertEqual(self.cached_families(self.since), cold)
 
+        path = self.projects / "project/parent-fixture.jsonl"
+        separate = cache_module.ParseCheckpoint(path.stat().st_size, "command summaries")
+        with closing(cache_module.TranscriptCache(database_name="command_use.sqlite3")) as cache:
+            self.assertEqual(cache.read(path, "claude", lambda path, held: separate), separate)
+        self.assertEqual(self.cached_families(self.since), cold)
+
     def test_appends_resume_both_parsers_at_the_last_complete_line(self) -> None:
         paths = [self.transcript("version-restarts.jsonl", "project/versions.jsonl"), self.codex_rollout()]
         original = {path: path.read_bytes() for path in paths}
@@ -585,25 +591,26 @@ class ContextEconomyReadTests(unittest.TestCase):
         configuration = self.root / "configuration/context_economy.conf"
         _ = configuration.write_text(configuration.read_text().replace(
             "cache_max_megabytes = 512", "cache_max_megabytes = 1"))
-        paths = [self.projects / f"summary-{index}.jsonl" for index in range(2)]
-        for path in paths:
-            _ = path.write_text("source\n")
-        summary = cache_module.ParseCheckpoint(7, "x" * 700_000)
-        with closing(cache_module.TranscriptCache()) as cache:
-            with patch.object(time, "time_ns", side_effect=[1, 2, 3]):
-                for path in paths:
-                    self.assertEqual(cache.read(path, "claude", lambda path, held: summary), summary)
-                if deleted:
-                    paths[0].unlink()
-                else:
-                    self.assertEqual(cache.read(paths[0], "claude", lambda path, held: summary), summary)
-        with closing(cache_module.TranscriptCache()) as cache:
-            parse = Mock(return_value=summary)
-            parse_file = cast(Callable[[Path, cache_module.ParseCheckpoint], cache_module.ParseCheckpoint], parse)
-            self.assertEqual(cache.read(paths[0], "claude", parse_file), summary)
-            parse.assert_not_called()
-            self.assertEqual(cache.read(paths[1], "claude", parse_file), summary)
-            parse.assert_called_once_with(paths[1].resolve(), cache_module.ParseCheckpoint())
+        for database_name in ("summaries.sqlite3", "command_use.sqlite3"):
+            paths = [self.projects / f"summary-{index}.jsonl" for index in range(2)]
+            for path in paths:
+                _ = path.write_text("source\n")
+            summary = cache_module.ParseCheckpoint(7, "x" * 700_000)
+            with closing(cache_module.TranscriptCache(database_name=database_name)) as cache:
+                with patch.object(time, "time_ns", side_effect=[1, 2, 3]):
+                    for path in paths:
+                        self.assertEqual(cache.read(path, "claude", lambda path, held: summary), summary)
+                    if deleted:
+                        paths[0].unlink()
+                    else:
+                        self.assertEqual(cache.read(paths[0], "claude", lambda path, held: summary), summary)
+            with closing(cache_module.TranscriptCache(database_name=database_name)) as cache:
+                parse = Mock(return_value=summary)
+                parse_file = cast(Callable[[Path, cache_module.ParseCheckpoint], cache_module.ParseCheckpoint], parse)
+                self.assertEqual(cache.read(paths[0], "claude", parse_file), summary)
+                parse.assert_not_called()
+                self.assertEqual(cache.read(paths[1], "claude", parse_file), summary)
+                parse.assert_called_once_with(paths[1].resolve(), cache_module.ParseCheckpoint())
 
     def test_progress_rewrites_terminal_lines_and_keeps_pipe_lines_separate(self) -> None:
         for terminal, separator in ((True, "\r"), (False, "\n")):
