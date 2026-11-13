@@ -57,6 +57,27 @@ def setUpModule() -> None:
 @final
 class HeldRolePaneTests(HeldRolePaneCase):
 
+    def test_configured_checkout_at_a_unit_path_keeps_independent_ownership(self) -> None:
+        parent = self.panes.command_case.fixture.parent
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.panes.root),
+                               expected=parent.worktree)
+        design = self.panes.open("designer")
+        self.assertEqual(design.checkout, design_roles.INDEPENDENT_CHECKOUT)
+        current_parent = staff.by_id(parent.id)
+        assert current_parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.panes.root / "moved-parent"),
+                               expected=current_parent.worktree)
+        current = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(current.checkout, design_roles.INDEPENDENT_CHECKOUT)
+        self.assertEqual(current.repository, str(self.panes.root))
+        self.assertEqual(current.document, str(self.panes.root / "design.md"))
+        assert isinstance(current.binding, design_roles.DesignBoundToPhase)
+        self.assertEqual(current.binding.checkout, design_roles.INDEPENDENT_CHECKOUT)
+        self.assertEqual(design_roles.binding_repository(current.binding), str(self.panes.root))
+        reopened = self.panes.open("designer")
+        self.assertEqual(reopened, current)
+        self.assertEqual(len(self.panes.world.launches), 1)
+
     def test_held_role_opens_and_dispatches_when_the_design_is_outside_the_parent_worktree(self) -> None:
         parent = self.panes.command_case.fixture.parent
         worktree = self.panes.root / "parent-checkout"
@@ -453,7 +474,7 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = self.enterContext(patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1")))
         _ = self.enterContext(patch.object(agent_accounts, "codex_account_home", return_value=
             agent_accounts.CodexHomeHoldingLogin("codex1", self.root / "codex-home", "fixture@example.invalid")))
-        design_roles.register_repository("fixture-repo", {"natedev": str(self.repository),
+        design_roles.register_repository("fixture-repo", {"natedev": design_roles.UnitCheckout(unit.id),
                                                     "macbook": str(self.root / "mac-checkout")})
         self.run_a = self.phase("run-a", "instance-a")
         self.run_b = self.phase("run-b", "instance-b")
@@ -562,6 +583,9 @@ class DurableRolesTests(HeldRolePaneCase):
         identifier = design.placement.design_id
         with stop_once(design_roles, "_save"), self.assertRaises(InjectedStop):
             design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
         design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
         moved = design_roles.read_design(identifier)
         self.assertEqual(moved.repository, str(destination))
@@ -569,6 +593,61 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
         _ = self.resume(moved, "designer")
         self.assertEqual(len(self.launches), 1)
+
+    def test_checkout_move_before_save_resumes_its_transition_after_staff_moves(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        directory = design_roles.design_directory(identifier)
+        transition = directory / "transition.json"
+        destination = self.root / "move-before-save"
+        _ = self.repository.rename(destination)
+        with stop_once(design_roles, "_save", when="before"), self.assertRaises(InjectedStop):
+            design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        self.assertTrue(transition.exists())
+        self.assertEqual(design_roles.read_design(identifier).placement.generation, 1)
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
+        design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        moved = design_roles.read_design(identifier)
+        self.assertEqual(moved.placement.generation, 2)
+        self.assertFalse(transition.exists())
+        self.assertEqual(moved.checkout, design_roles.UnitCheckout(parent.id))
+        self.assertEqual(moved.repository, str(destination))
+        self.assertEqual(moved.roles, design.roles)
+        before = (directory / "design.json").read_bytes()
+        design_roles.move_checkout(str(self.repository), str(destination), reason="checkout move")
+        self.assertEqual((directory / "design.json").read_bytes(), before)
+        self.assertEqual(len(self.launches), 1)
+
+    def test_path_only_registration_at_a_unit_path_stays_independent(self) -> None:
+        design_roles.register_repository("independent-path", {"natedev": str(self.repository)})
+        placement = self.authority("reserve", {"repository_id": "independent-path", "host": "natedev",
+                                               "document": "design.md", "request_id": "path-only"})
+        self.assertNotIn("repository_owner", placement)
+        self.assertEqual(placement["checkout"], str(self.repository))
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.root / "another-unit-path"),
+                               expected=parent.worktree)
+        resolved = self.authority("resolve", {"repository_id": "independent-path", "host": "natedev",
+                                              "document": "design.md"})
+        self.assertEqual(resolved, placement)
+
+    def test_cli_registers_an_explicit_unit_owner(self) -> None:
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        self.assertEqual(design_roles.main(["register", "--repository", "explicit-unit", "--host", "natedev",
+                                          "--repository-owner", parent.id]), 0)
+        registry = cast(dict[str, dict[str, object]], json.loads(
+            (self.root / "ownership/repositories.json").read_text()))
+        self.assertEqual(registry["explicit-unit"]["checkouts"], {"natedev": {"repository_owner": parent.id}})
+        destination = self.root / "explicit-owner-moved"
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
+        placement = self.authority("reserve", {"repository_id": "explicit-unit", "host": "natedev",
+                                               "document": "design.md", "request_id": "explicit-owner"})
+        self.assertEqual(placement["repository_owner"], parent.id)
+        self.assertNotIn("checkout", placement)
 
     def authority(self, operation: str, payload: dict[str, object]) -> dict[str, object]:
         return design_roles._authority_local(operation, payload)  # pyright: ignore[reportPrivateUsage]
@@ -843,6 +922,9 @@ class DurableRolesTests(HeldRolePaneCase):
         with (stop_once(Path, "unlink", when="before", matches=lambda path: path == transition),
               self.assertRaises(InjectedStop)):
             move()
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
         saved = design_roles.read_design(identifier)
         self.assertTrue(transition.exists())
         move()
@@ -1276,6 +1358,11 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual(self.panes.world.closed, [])
 
     def test_open_with_a_phase_and_no_checkout_saves_the_design_repository(self) -> None:
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        with self.subTest(checkout="another caller"), patch.dict(os.environ, {"CODEX_THREAD_ID": fixture_runtime_id("another-design-caller")}):
+            self.assertEqual(design_roles._registered_path(  # pyright: ignore[reportPrivateUsage]
+                {"repository_owner": parent.id}, "natedev", staff.snapshot()), str(self.repository))
         output = io.StringIO()
         with redirect_stdout(output):
             code = design_roles.main(["open", "--repository", "fixture-repo", "--document", "design.md",
@@ -1294,6 +1381,15 @@ class DurableRolesTests(HeldRolePaneCase):
         binding = cast(dict[str, object], fields["binding"])
         self.assertEqual(binding["repository_owner"], parent.id)
         self.assertNotIn("repository", binding)
+        ownership = self.root / "ownership/repositories.json"
+        registered = cast(dict[str, dict[str, object]], json.loads(ownership.read_text()))
+        self.assertEqual(registered["fixture-repo"]["checkouts"],
+                         {"natedev": {"repository_owner": parent.id}, "macbook": str(self.root / "mac-checkout")})
+        placement, = (self.root / "ownership/placements").glob("*.json")
+        placed = cast(dict[str, object], json.loads(placement.read_text()))
+        self.assertEqual(placed["repository_owner"], parent.id)
+        self.assertNotIn("checkout", placed)
+        authority_before = ownership.read_bytes(), placement.read_bytes()
         for row, destination in (("original-document", self.repository),
                                  ("moved-document", self.root / "staff-moved-checkout")):
             with self.subTest(row=row):
@@ -1311,6 +1407,9 @@ class DurableRolesTests(HeldRolePaneCase):
                 self.assertEqual(current.document, str(destination / "design.md"))
                 self.assertEqual(design_roles.held_document(destination / "design.md"), current)
                 self.assertEqual(path.read_bytes(), before)
+                reopened = self.open_designer()
+                self.assertEqual(reopened.placement.design_id, design.placement.design_id)
+                self.assertEqual((ownership.read_bytes(), placement.read_bytes()), authority_before)
                 reply = self.resume(current, "designer")
                 prompt = design_roles.design_directory(design.placement.design_id) / "prompts" / reply.name
                 header = astra_work.read_header(prompt)
@@ -1883,6 +1982,10 @@ class DurableRolesTests(HeldRolePaneCase):
         current = design_roles.rebind(design.placement.design_id, expected_generation=1, reason='checkout move',
                                       repository=str(destination), document=str(destination / 'design.md'),
                                       binding=replace(self.binding(self.run_a), repository=str(destination)))
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
+        current = design_roles.read_design(design.placement.design_id)
         self.assertEqual(current.repository, str(destination))
         self.assertEqual(current.document, str(destination / 'design.md'))
         self.assertEqual(current.placement.generation, 2)
@@ -1893,6 +1996,59 @@ class DurableRolesTests(HeldRolePaneCase):
         self.assertEqual([(role, thread) for role, thread, _text in self.dispatches],
                          [('designer', '9309c903-5894-501a-8aa7-f33ea912e074'), ('reviewer', '364898ad-f177-5514-80f3-b82001fa95d9')])
         self.assertEqual(len(self.launches), 2)
+
+    def assert_checkout_ownership_survives_move(self, *, independent: bool, operation: str) -> None:
+        parent = staff.by_path("demo/design")
+        assert parent is not None
+        expected = design_roles.INDEPENDENT_CHECKOUT if independent else design_roles.UnitCheckout(parent.id)
+        if independent:
+            registry = self.root / "ownership/repositories.json"
+            records = cast(dict[str, dict[str, object]], json.loads(registry.read_text()))
+            records["fixture-repo"]["checkouts"] = {"natedev": {"configured_checkout": str(self.repository)}}
+            write_text_atomic(registry, json.dumps(records))
+        design = self.open_designer()
+        self.assertEqual(design.checkout, expected)
+        destination = self.root / "ownership-destination"
+        _ = self.repository.rename(destination)
+        destination_owner = parent
+        if independent:
+            destination_owner = fixture_member("unit", name="destination-owner", parent=parent.parent,
+                                               worktree=staff.PresentWorktree("natedev", destination))
+        if operation == "move":
+            design_roles.move_checkout(str(self.repository), str(destination), reason="ownership test")
+            current = design_roles.read_design(design.placement.design_id)
+        else:
+            current = design_roles.rebind(design.placement.design_id, expected_generation=1,
+                reason="ownership test", repository=str(destination), document=str(destination / "design.md"),
+                binding=replace(self.binding(self.run_a), repository=str(destination), checkout=expected))
+        self.assertEqual(current.checkout, expected)
+        assert isinstance(current.binding, design_roles.DesignBoundToPhase)
+        self.assertEqual(current.binding.checkout, expected)
+        path = design_roles.design_directory(design.placement.design_id) / "design.json"
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(saved.get("repository_owner"), None if independent else parent.id)
+        if independent:
+            _ = staff.set_worktree(destination_owner.id, staff.PresentWorktree("natedev", self.root / "other-unit-moved"),
+                                   expected=destination_owner.worktree)
+        else:
+            _ = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", destination), expected=parent.worktree)
+        current = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(current.repository, str(destination))
+        self.assertEqual(current.document, str(destination / "design.md"))
+        self.assertEqual(current.roles, design.roles)
+        self.assertEqual(len(self.launches), 1)
+
+    def test_checkout_move_preserves_the_unit_owner_before_staff_moves(self) -> None:
+        self.assert_checkout_ownership_survives_move(independent=False, operation="move")
+
+    def test_checkout_move_preserves_independence_at_another_unit_path(self) -> None:
+        self.assert_checkout_ownership_survives_move(independent=True, operation="move")
+
+    def test_rebind_preserves_the_unit_owner_before_staff_moves(self) -> None:
+        self.assert_checkout_ownership_survives_move(independent=False, operation="rebind")
+
+    def test_rebind_preserves_independence_at_another_unit_path(self) -> None:
+        self.assert_checkout_ownership_survives_move(independent=True, operation="rebind")
 
 
     def test_a_unit_transfer_moves_the_holder_to_the_receiving_production(self) -> None:

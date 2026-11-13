@@ -762,6 +762,25 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+`QueuePlace.popen` installs no signal handler.
+It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
+It then restores the caller's previous signal mask.
+The program wrapper unblocks these signals before exec.
+The program wrapper atomically publishes a `ProgramStart` record before execution.
+The record contains the holder identity, program identity, and memory scope.
+The wrapper checks the holder's PID and start time before and after publication.
+A dead holder prevents program execution.
+A later interruption leaves the complete record in the build log's `program-starts` directory.
+The next start stops recorded scopes or program groups with dead holders before it requests admission.
+It removes their records after their scopes or process trees become empty.
+Normal cleanup removes the record after the program and its descendants stop.
+Temporary queue-place folder names contain the holder's PID and start time.
+The next start removes this account's folders after those exact holders end.
+Folder allocation and removal use a signal mask and install no handler.
+SIGTERM uses its default action and can leave cleanup for the next start or service read.
+Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
+`defer_cleanup_signals` retains its signal mask during normal cleanup.
+It uses `pthread_sigmask` and installs no handler.
 
 ### Startup, cut-over, and rollback
 
@@ -1682,7 +1701,18 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
-Running rows show a `machine` column after `min` and before `pid`.
+The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+The first column shows `building` or `testing` from the recorded progress counter.
+A row without a counter shows `—`.
+Local builds, merge gates, and cloud rows use their recorded counters.
+Native Mac builds and hana CI currently have no counter.
+The Running table shows hana CI only when a recorded runner has a busy job.
+Idle or unreadable runners have no separate Running row.
+Their memory remains in the taken total, the cap, and the summary tooltip.
+Waiting rows use `#` in the first column for their queue place.
+Both sections use the same column widths.
+The narrow layout adds the `Step` column.
+The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.
