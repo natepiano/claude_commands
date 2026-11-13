@@ -1326,7 +1326,7 @@ class Deployment:
                    + cloud_gate.settings().number('termination_timeout_s') * len(limits.spot_max_usd_per_hour))
         def execute(arguments: Sequence[str]) -> int:
             return self.execute(arguments, capture_output=False, text=True, timeout=timeout, check=False).returncode
-        return gpu_size_trial.start_service(folder.expanduser().resolve(), self.directory.resolve(),
+        return gpu_size_trial.start_service(folder, self.directory.resolve(),
                                             self.settings_path.resolve(), execute) == 0
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:

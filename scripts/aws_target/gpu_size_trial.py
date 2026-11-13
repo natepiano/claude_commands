@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import base64
 import inspect
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager, ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import fcntl
 import hashlib
 import json
 import math
@@ -37,6 +39,10 @@ WRAPPER = Path(__file__).with_name('gpu_trial_wrapper.py')
 ARCHIVE_PROFILE = 'gpu-size-trial-archive'
 NEXTEST_LOG_TAIL_BYTES = 1024 * 1024
 NEXTEST_LOG_TAIL_CHUNK_BYTES = 64 * 1024
+PREPARED_NAMES = frozenset(('hana-tests.tar.zst', 'closure.export', 'source.tar', 'cargo-home',
+    'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json', 'manifest.json', 'inventory.json',
+    'gpu_trial_wrapper.py', 'machines', 'prepare.log'))
+RUN_INPUT_NAMES = ('hana-tests.tar.zst', 'closure.export', 'source.tar', 'payload.tar', 'cargo-home')
 
 
 @dataclass(frozen=True)
@@ -169,16 +175,98 @@ def preflight(source: Path, environment: Mapping[str, str]) -> dict[str, str]:
     return tools
 
 
+def trial_root() -> Path:
+    return Path.home() / '.local/state/gpu-size-trial'
+
+
+def host_trial_folder(folder: Path) -> Path:
+    """Require a canonical direct child of the host trial root."""
+    path = folder.expanduser().absolute()
+    resolved = path.resolve()
+    if path != resolved or resolved.parent != trial_root().resolve() or resolved.name == '.locks':
+        raise ValueError('The host trial folder must be a canonical direct child of the trial root without directory links')
+    return resolved
+
+
+def remove_path(path: Path) -> None:
+    """Remove owned output without following a directory link."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
+
+
+@contextmanager
+def trial_lock(folder: Path, *, exclusive: bool = False) -> Generator[None]:
+    key = hashlib.sha256(str(folder.resolve()).encode()).hexdigest()
+    directory = trial_root() / '.locks' / key
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'controller.lock').open('a') as lock:
+        fcntl.flock(lock, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def held_trial(folder: Path) -> Generator[None]:
+    folder = host_trial_folder(folder)
+    with ExitStack() as held:
+        with control_lock(trial_root()):
+            if not folder.is_dir() or folder.is_symlink():
+                raise ValueError('The trial folder is absent or is a directory link')
+            _ = held.enter_context(trial_lock(folder))
+        yield
+
+
+@contextmanager
+def new_trial(folder: Path) -> Generator[None]:
+    folder = host_trial_folder(folder)
+    root = trial_root()
+    with ExitStack() as held:
+        with control_lock(root):
+            if folder.exists() or folder.is_symlink():
+                raise FileExistsError('The new trial folder already exists: ' + str(folder))
+            previous_folders = [host_trial_folder(path) for path in sorted(root.iterdir())
+                                if path.name != '.locks' and (path.is_dir() or path.is_symlink())]
+            busy = False
+            for previous in previous_folders:
+                try:
+                    with trial_lock(previous, exclusive=True):
+                        _ = host_trial_folder(previous)
+                        remove_path(previous)
+                except BlockingIOError:
+                    busy = True
+            if busy:
+                raise ValueError('A GPU trial folder is held by a live run; finish that run before preparing another trial')
+            _ = held.enter_context(trial_lock(folder))
+            folder.mkdir(parents=True, exist_ok=False)
+        yield
+
+
+def remove_run_inputs(folder: Path, at: float) -> None:
+    folder = host_trial_folder(folder)
+    cloud_gate.save(folder / 'inputs-removed.json', {'at': at})
+    for name in RUN_INPUT_NAMES:
+        remove_path(folder / name)
+
+
 def prepare(repo: Path, commit: str, folder: Path) -> None:
+    with new_trial(folder):
+        prepare_locked(repo, commit, folder)
+
+
+def prepare_locked(repo: Path, commit: str, folder: Path) -> None:
     """Check external tools, then admit the local preparation worker."""
-    limits = settings()
-    resolved = checked(['git', 'rev-parse', '--verify', commit + '^{commit}'], repo)
-    if not re.fullmatch('[0-9a-f]{40}', resolved):
-        raise ValueError('The trial needs a resolved Git commit')
-    folder.mkdir(parents=True, exist_ok=False)
+    folder = host_trial_folder(folder)
     log = folder / 'prepare.log'
     try:
         log.touch()
+        limits = settings()
+        resolved = checked(['git', 'rev-parse', '--verify', commit + '^{commit}'], repo)
+        if not re.fullmatch('[0-9a-f]{40}', resolved):
+            raise ValueError('The trial needs a resolved Git commit')
         source = export_source(repo, resolved, folder)
         tools = preflight(source, trial_environment())
         write_json(folder / 'request.json', {'repo': str(repo), 'commit': resolved,
@@ -199,16 +287,14 @@ def prepare(repo: Path, commit: str, folder: Path) -> None:
             if status:
                 raise GateRefused(f'GPU trial preparation failed with exit {status}: {log}')
     except Exception as error:
+        _ = host_trial_folder(folder)
         with log.open('a') as output:
             _ = output.write(str(error) + '\n')
         append_failed_nextest_logs(folder)
         for path in folder.iterdir():
             if path == log:
                 continue
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
+            remove_path(path)
         raise
     print(folder)
 
@@ -416,7 +502,9 @@ def no_publish(_run: Path) -> None:
 def measure_machine(folder: Path, machine: str, source: Path, environment: Mapping[str, str], *,
                     prefix: Sequence[str] = ('nix', 'develop', '--no-write-lock-file', '.#default', '-c'),
                     vulkaninfo: str = 'vulkaninfo',
-                    publish: Callable[[Path], None] = no_publish) -> None:
+                    publish: Callable[[Path], None] = no_publish, host: bool = True) -> None:
+    if host:
+        folder = host_trial_folder(folder)
     destination = folder / 'machines' / machine
     destination.mkdir(parents=True, exist_ok=False)
     payload = checked([*prefix, vulkaninfo, '--summary'], source, environment=environment)
@@ -427,31 +515,43 @@ def measure_machine(folder: Path, machine: str, source: Path, environment: Mappi
     for number in (1, 2):
         run = destination / str(number)
         run.mkdir()
-        run_source = run / 'source'
-        _ = shutil.copytree(source, run_source, ignore=shutil.ignore_patterns('target', '.git'))
-        config = run / 'nextest.toml'
-        text = (source / '.config/nextest.toml').read_text()
-        # Keep all existing groups, priorities, and timeouts.
-        text = junit_config(text, run / 'junit.xml')
-        _ = config.write_text(text)
-        wrapper = shlex.join([sys.executable, str(folder / 'gpu_trial_wrapper.py')])
-        run_environment = {**environment, 'GPU_TRIAL_SAMPLES': str(run / 'samples'),
-                           'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER': wrapper,
-                           'CARGO_TARGET_DIR': str(run / 'cargo-target')}
-        # Nextest requires the explicit extraction directory to exist.
-        (run / 'archive').mkdir()
-        command = [*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'run', *archive_arguments(folder, run_source),
-                   '--extract-to', str(run / 'archive'), '--config-file', str(config), '--retries', '0', '--no-fail-fast']
-        with (run / 'nextest.log').open('wb') as output:
-            status = subprocess.run(command, cwd=run_source, env=run_environment,
-                                    stdout=output, stderr=subprocess.STDOUT, check=False).returncode
-        write_json(run / 'run.json', {'status': status, 'config_sha256': digest(config)})
-        publish(run)
-        if status not in (0, 100):
-            raise ValueError(f'Nextest could not complete run {number}; exit {status}')
+        try:
+            run_source = run / 'source'
+            _ = shutil.copytree(source, run_source, ignore=shutil.ignore_patterns('target', '.git'))
+            config = run / 'nextest.toml'
+            text = (source / '.config/nextest.toml').read_text()
+            # Keep all existing groups, priorities, and timeouts.
+            text = junit_config(text, run / 'junit.xml')
+            _ = config.write_text(text)
+            wrapper = shlex.join([sys.executable, str(folder / 'gpu_trial_wrapper.py')])
+            run_environment = {**environment, 'GPU_TRIAL_SAMPLES': str(run / 'samples'),
+                               'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER': wrapper,
+                               'CARGO_TARGET_DIR': str(run / 'cargo-target')}
+            # Nextest requires the explicit extraction directory to exist.
+            (run / 'archive').mkdir()
+            command = [*prefix, environment.get('GPU_TRIAL_CARGO', 'cargo'), 'nextest', 'run', *archive_arguments(folder, run_source),
+                       '--extract-to', str(run / 'archive'), '--config-file', str(config), '--retries', '0', '--no-fail-fast']
+            with (run / 'nextest.log').open('wb') as output:
+                status = subprocess.run(command, cwd=run_source, env=run_environment,
+                                        stdout=output, stderr=subprocess.STDOUT, check=False).returncode
+            write_json(run / 'run.json', {'status': status, 'config_sha256': digest(config)})
+            publish(run)
+            if status not in (0, 100):
+                raise ValueError(f'Nextest could not complete run {number}; exit {status}')
+        finally:
+            if host:
+                _ = host_trial_folder(folder)
+            for name in ('archive', 'source', 'cargo-target'):
+                remove_path(run / name)
 
 
 def prepare_worker(folder: Path) -> None:
+    with held_trial(folder):
+        prepare_worker_locked(folder)
+
+
+def prepare_worker_locked(folder: Path) -> None:
+    folder = host_trial_folder(folder)
     request = read_json(folder / 'request.json')
     repo, commit = Path(str(request['repo'])), str(request['commit'])
     tools = {name: str(path) for name, path in mapping(request['tools']).items()}
@@ -486,9 +586,20 @@ def prepare_worker(folder: Path) -> None:
             'gpu_trial_wrapper.py', 'inventory.json')},
         'locks': {name: digest(source / name) for name in ('Cargo.lock', 'flake.lock')}}
     write_json(folder / 'manifest.json', manifest)
+    _ = host_trial_folder(folder)
+    remove_path(source)
+    source.mkdir()
+    with tarfile.open(folder / 'source.tar') as archive:
+        archive.extractall(source, filter='data')
+    remove_path(folder / 'archive-nextest.toml')
+    remove_path(folder / 'toolchain-probe-home')
     measure_machine(folder, 'natedev', source, environment, prefix=prefix, vulkaninfo=vulkaninfo)
     manifest['state'] = 'prepared'
     write_json(folder / 'manifest.json', manifest)
+    _ = host_trial_folder(folder)
+    for path in folder.iterdir():
+        if path.name not in PREPARED_NAMES:
+            remove_path(path)
 
 
 @dataclass(frozen=True)
@@ -610,19 +721,29 @@ def validate_prepared(folder: Path) -> dict[str, object]:
         raise ValueError('Prepare the trial again with the Nix toolchain and current GPU system module')
     if manifest.get('state') != 'prepared' or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(manifest['trial'])):
         raise ValueError('The trial folder has no completed preparation')
+    removed = (folder / 'inputs-removed.json').exists()
+    uploaded = removed and (folder / 'online.json').exists() and read_json(folder / 'online.json').get('uploaded') is True
     for name, checksum in mapping(manifest['sha256']).items():
-        if Path(name).name != name or digest(folder / name) != checksum:
+        if Path(name).name != name:
+            raise ValueError('The manifest contains an invalid artifact name')
+        if removed and name in RUN_INPUT_NAMES and not (folder / name).exists():
+            if not uploaded:
+                raise ValueError('The trial inputs were removed before upload; prepare another trial')
+            continue
+        if digest(folder / name) != checksum:
             raise ValueError('The prepared artifact differs from the manifest: ' + name)
     return manifest
 
 
 def start_service(folder: Path, directory: Path, settings_path: Path,
                   execute: Callable[[Sequence[str]], int]) -> int:
-    manifest = validate_prepared(folder)
-    unit = 'gpu-size-trial-' + hashlib.sha256(str(manifest['trial']).encode()).hexdigest()[:24]
-    command = cloud_gate.service_command('scripts.aws_target.gpu_size_trial',
-        ['--worker', str(folder), '--directory', str(directory), '--settings', str(settings_path)], unit)
-    return execute(command)
+    folder = host_trial_folder(folder)
+    with held_trial(folder):
+        manifest = validate_prepared(folder)
+        unit = 'gpu-size-trial-' + hashlib.sha256(str(manifest['trial']).encode()).hexdigest()[:24]
+        command = cloud_gate.service_command('scripts.aws_target.gpu_size_trial',
+            ['--worker', str(folder), '--directory', str(directory), '--settings', str(settings_path)], unit)
+        return execute(command)
 
 
 GUEST = r'''
@@ -670,7 +791,7 @@ try:
         raise ValueError('The box nextest version differs from the prepared version')
     environment = trial_environment()
     environment['CARGO_HOME'] = str(root / 'cargo-home')
-    measure_machine(root, str(links['instance_type']), source, environment, prefix=(), publish=publish)
+    measure_machine(root, str(links['instance_type']), source, environment, prefix=(), publish=publish, host=False)
     status = 'complete'
 except Exception as error:
     reason = str(error)
@@ -684,7 +805,7 @@ finally:
 
 
 def guest_program() -> str:
-    functions = (mapping, read_json, write_json, digest, checked, hardware_vulkan, trial_environment,
+    functions = (mapping, read_json, write_json, digest, checked, hardware_vulkan, trial_environment, remove_path,
                  archive_arguments, junit_config, no_publish, measure_machine)
     return ('from __future__ import annotations\n'
             + 'from pathlib import Path\nfrom collections.abc import Callable, Mapping, Sequence\n'
@@ -808,20 +929,25 @@ class GpuTrialWorker:
             _ = self.gates.api.call('cp', str(path), 's3://' + bucket + '/' + key, '--only-show-errors', service='s3', timeout_s=settings().lifetime_minutes * 60)
 
     def artifacts(self, folder: Path, online: dict[str, object]) -> None:
+        folder = host_trial_folder(folder)
         if online.get('uploaded'):
             return
         payload = folder / 'payload.tar'
         _ = (folder / 'guest.py').write_text(guest_program())
-        with tarfile.open(payload, 'w') as archive:
-            for name in ('source.tar', 'cargo-home', 'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json',
-                         'manifest.json', 'inventory.json', 'gpu_trial_wrapper.py', 'guest.py'):
-                archive.add(folder / name, arcname=name)
-        prefix = 'requests/gpu-size-trial/' + str(online['trial'])
-        for name in ('payload.tar', 'closure.export', 'hana-tests.tar.zst', 'manifest.json'):
-            self.upload(str(online['bucket']), prefix + '/' + name, folder / name)
-        online['uploaded'] = True
-        online['payload_sha256'] = digest(payload)
-        cloud_gate.save(folder / 'online.json', online)
+        try:
+            with tarfile.open(payload, 'w') as archive:
+                for name in ('source.tar', 'cargo-home', 'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json',
+                             'manifest.json', 'inventory.json', 'gpu_trial_wrapper.py', 'guest.py'):
+                    archive.add(folder / name, arcname=name)
+            prefix = 'requests/gpu-size-trial/' + str(online['trial'])
+            for name in ('payload.tar', 'closure.export', 'hana-tests.tar.zst', 'manifest.json'):
+                self.upload(str(online['bucket']), prefix + '/' + name, folder / name)
+            online['uploaded'] = True
+            online['payload_sha256'] = digest(payload)
+            cloud_gate.save(folder / 'online.json', online)
+        finally:
+            _ = host_trial_folder(folder)
+            remove_path(payload)
 
     def signed_links(self, folder: Path, online: dict[str, object], request: dict[str, object]) -> dict[str, str]:
         reply = self.gates.api.call('export-credentials', '--format', 'process', service='configure')
@@ -833,13 +959,14 @@ class GpuTrialWorker:
             return gate_box.presign(method, str(online['bucket']) + '.s3.' + home + '.amazonaws.com', key,
                                     home, signing, datetime.fromtimestamp(now, UTC), max(1, int(str(request['expires'])) - now))
         result_prefix = 'artifacts/gpu-size-trial/' + str(request['attempt'])
+        hashes = mapping(read_json(folder / 'manifest.json')['sha256'])
         return {'payload': url('GET', prefix + '/payload.tar'), 'closure': url('GET', prefix + '/closure.export'),
                 'archive': url('GET', prefix + '/hana-tests.tar.zst'),
                 'result-1': url('PUT', result_prefix + '/result-1.tar.gz'),
                 'result-2': url('PUT', result_prefix + '/result-2.tar.gz'),
                 'finished': url('PUT', result_prefix + '/finished.json'),
                 'payload_sha256': str(online['payload_sha256']),
-                'closure_sha256': digest(folder / 'closure.export'), 'archive_sha256': digest(folder / 'hana-tests.tar.zst'),
+                'closure_sha256': str(hashes['closure.export']), 'archive_sha256': str(hashes['hana-tests.tar.zst']),
                 'instance_type': str(request['instance_type']), 'started': str(request['started'])}
 
     def cleanup(self, folder: Path) -> bool:
@@ -881,6 +1008,17 @@ class GpuTrialWorker:
                         else {'status': 'incomplete', 'reason': 'The box reached its early stop time'})
 
     def execute(self, folder: Path, deployment: dict[str, object]) -> None:
+        folder = host_trial_folder(folder)
+        with held_trial(folder):
+            try:
+                self.run_trial(folder, deployment)
+            except Exception as error:
+                cloud_gate.save(folder / 'run-error.json', {'status': 'failed', 'reason': str(error)})
+                raise
+            finally:
+                remove_run_inputs(folder, self.gates.clock())
+
+    def run_trial(self, folder: Path, deployment: dict[str, object]) -> None:
         manifest = validate_prepared(folder)
         path = folder / 'online.json'
         if path.exists():
@@ -1005,6 +1143,11 @@ def online_main(arguments: Sequence[str]) -> int:
     directory, settings_path = cast(Path, args.directory), cast(Path, args.settings)
     cleanup = cast(Path | None, args.cleanup)
     folder = cleanup if cleanup is not None else cast(Path, args.worker)
+    try:
+        folder = host_trial_folder(folder)
+    except ValueError as error:
+        print('GPU size trial refused: ' + str(error), file=sys.stderr)
+        return 1
     configuration = conf.read(settings_path)
     api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
                  cloud_gate.settings().number('api_timeout_s'))
@@ -1013,7 +1156,14 @@ def online_main(arguments: Sequence[str]) -> int:
     with control_lock(directory / 'gpu-size-trial'):
         try:
             if cleanup is not None:
-                return int(not worker.cleanup(folder))
+                with held_trial(folder):
+                    try:
+                        return int(not worker.cleanup(folder))
+                    finally:
+                        if not (folder / 'online-result.json').exists() and not (folder / 'run-error.json').exists():
+                            cloud_gate.save(folder / 'run-error.json', {'status': 'failed',
+                                'reason': 'The online worker ended before it saved a final result'})
+                        remove_run_inputs(folder, worker.gates.clock())
             deployment = gate_deployment(directory / 'gate-deployment.json', api.region)
             worker.execute(folder, deployment)
             return 0
@@ -1040,12 +1190,12 @@ def main(arguments: Sequence[str]) -> int:
         worker = cast(Path | None, args.prepare_worker)
         command = cast(str | None, args.command)
         if worker is not None:
-            prepare_worker(worker.resolve())
+            prepare_worker(host_trial_folder(worker))
         elif command == 'prepare':
             prepare(cast(Path, args.repo).expanduser().resolve(), cast(str, args.commit),
-                    cast(Path, args.trial_folder).expanduser().resolve())
+                    host_trial_folder(cast(Path, args.trial_folder)))
         elif command == 'compare':
-            print(compare(cast(Path, args.trial_folder).expanduser().resolve()), end='')
+            print(compare(host_trial_folder(cast(Path, args.trial_folder))), end='')
         else:
             parser.error('Choose prepare or compare')
     except (OSError, ValueError, KeyError, subprocess.SubprocessError, GateRefused) as error:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from io import BytesIO, StringIO
 import base64
@@ -68,7 +68,7 @@ class GpuTrialTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**config_environment(self.root / 'config'),
-                'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})))
+                'HOME': str(self.root), 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})))
 
     def test_limits_follow_live_configuration(self) -> None:
         before = trial.settings()
@@ -242,6 +242,131 @@ elif name == 'cargo':
                 self.assertEqual(trial.comparison(flaky, candidate), 'inconclusive')
         self.assertEqual(trial.comparison(incomplete, same), 'incomplete')
 
+    def test_new_prepare_removes_previous_folders_without_following_links(self) -> None:
+        root = trial.trial_root()
+        root.mkdir(parents=True)
+        outside = self.root / 'outside'
+        outside.mkdir()
+        _ = (outside / 'keep').write_text('fixture outside data')
+        for name in ('prepared', 'failed', 'abandoned'):
+            previous = root / name
+            previous.mkdir()
+            _ = (previous / 'closure.export').write_bytes(b'fixture old closure')
+            (previous / 'profile').symlink_to(outside, target_is_directory=True)
+        first = root / 'first'
+        with trial.new_trial(first):
+            self.assertEqual([path.name for path in root.iterdir() if path.is_dir() and not path.name.startswith('.')], ['first'])
+            _ = (first / 'manifest.json').write_text('fixture prepared')
+        second = root / 'second'
+        with trial.new_trial(second):
+            self.assertFalse(first.exists())
+            self.assertTrue(second.is_dir())
+        self.assertEqual((outside / 'keep').read_text(), 'fixture outside data')
+
+    def test_new_prepare_refuses_to_stack_while_a_folder_is_held(self) -> None:
+        root = trial.trial_root()
+        current = root / 'held'
+        with trial.new_trial(current):
+            _ = (current / 'closure.export').write_bytes(b'fixture held closure')
+            abandoned = root / 'abandoned'
+            abandoned.mkdir()
+            _ = (abandoned / 'source.tar').write_bytes(b'fixture old source')
+            with self.assertRaisesRegex(ValueError, 'held by a live run'):
+                with trial.new_trial(root / 'next'):
+                    self.fail('A second preparation must not start')
+            self.assertEqual((current / 'closure.export').read_bytes(), b'fixture held closure')
+            self.assertFalse(abandoned.exists())
+            self.assertFalse((root / 'next').exists())
+        with trial.new_trial(root / 'next'):
+            self.assertFalse(current.exists())
+
+    def test_invalid_host_folders_never_prune_or_remove_inputs(self) -> None:
+        root = trial.trial_root()
+        current = root / 'current'
+        current.mkdir(parents=True)
+        outside = self.root / 'outside'
+        outside.mkdir()
+        nested = root / 'group/trial'
+        nested.mkdir(parents=True)
+        alias = root / 'alias'
+        alias.symlink_to(current, target_is_directory=True)
+        outside_alias = root / 'outside-alias'
+        outside_alias.symlink_to(outside, target_is_directory=True)
+        parent_alias = self.root / 'root-alias'
+        parent_alias.symlink_to(root, target_is_directory=True)
+        for folder in (current, outside, nested):
+            _ = (folder / 'closure.export').write_text('fixture input')
+        before = set(root.iterdir())
+        for folder in (nested, outside, alias, outside_alias, parent_alias / 'current', root / '.locks'):
+            with self.subTest(folder=folder):
+                with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+                    with trial.new_trial(folder):
+                        self.fail('An invalid preparation must not start')
+                with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+                    with trial.held_trial(folder):
+                        self.fail('An invalid folder must not acquire a lock')
+                with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+                    trial.remove_run_inputs(folder, 1)
+                for command in ('prepare', 'compare'):
+                    with redirect_stderr(StringIO()):
+                        self.assertEqual(trial.main([command, '--trial-folder', str(folder)]), 1)
+                self.assertEqual(set(root.iterdir()), before)
+                for saved in (current, outside, nested):
+                    self.assertEqual((saved / 'closure.export').read_text(), 'fixture input')
+                    self.assertFalse((saved / 'inputs-removed.json').exists())
+        with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+            with trial.new_trial(root / 'next'):
+                self.fail('A linked prior folder must prevent pruning')
+        self.assertEqual(set(root.iterdir()), before | {root / 'controller.lock'})
+        self.assertTrue((current / 'closure.export').is_file())
+        self.assertTrue((nested / 'closure.export').is_file())
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(outside_alias.is_symlink())
+
+    def test_measurement_removes_large_workspaces_on_every_exit(self) -> None:
+        source = self.root / 'measurement-source'
+        (source / '.config').mkdir(parents=True)
+        _ = (source / '.config/nextest.toml').write_text('[profile.ci]\n')
+        for status in (0, 100, 96, 'error'):
+            with self.subTest(status=status):
+                folder = trial.trial_root() / ('measurement-' + str(status))
+                folder.mkdir(parents=True)
+                trial.write_json(folder / 'request.json', {'commit': 'fixture-commit'})
+                _ = (folder / 'hana-tests.tar.zst').write_bytes(b'fixture archive')
+                calls: list[Path] = []
+                def execute(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+                    run = Path(argv[argv.index('--extract-to') + 1]).parent
+                    for previous in calls:
+                        self.assertFalse((previous / 'archive').exists())
+                        self.assertFalse((previous / 'source').exists())
+                    calls.append(run)
+                    _ = (run / 'archive/binary').write_bytes(b'fixture extracted binary')
+                    (run / 'cargo-target').mkdir()
+                    _ = (run / 'cargo-target/output').write_bytes(b'fixture build output')
+                    _ = (run / 'junit.xml').write_text('<testsuites/>')
+                    (run / 'samples').mkdir()
+                    trial.write_json(run / 'samples/test.json', {'fixture': True})
+                    _ = cast(BinaryIO, options['stdout']).write(b'fixture nextest log\n')
+                    if status == 'error':
+                        raise OSError('fixture nextest process error')
+                    return subprocess.CompletedProcess(argv, int(status), b'', b'')
+                with (mock.patch.object(trial, 'checked', return_value=HARDWARE),
+                      mock.patch.object(subprocess, 'run', side_effect=execute)):
+                    if status == 'error':
+                        with self.assertRaisesRegex(OSError, 'fixture nextest process error'):
+                            trial.measure_machine(folder, 'natedev', source, {}, prefix=())
+                    elif status == 96:
+                        with self.assertRaisesRegex(ValueError, 'exit 96'):
+                            trial.measure_machine(folder, 'natedev', source, {}, prefix=())
+                    else:
+                        trial.measure_machine(folder, 'natedev', source, {}, prefix=())
+                self.assertEqual(len(calls), 2 if status in (0, 100) else 1)
+                for run in calls:
+                    for name in ('archive', 'source', 'cargo-target'):
+                        self.assertFalse((run / name).exists())
+                    for name in ('junit.xml', 'samples/test.json', 'nextest.log'):
+                        self.assertTrue((run / name).is_file())
+
     def test_prepare_stops_before_build_when_hold_refuses(self) -> None:
         outside = self.root / 'outside'
         outside.mkdir()
@@ -262,13 +387,13 @@ elif name == 'cargo':
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=GateRefused('held')),
               mock.patch.object(merge_gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held'):
-                trial.prepare(self.root, 'HEAD', self.root / 'trial')
+                trial.prepare(self.root, 'HEAD', trial.trial_root() / 'trial')
         admission.assert_not_called()
         self.assertEqual(command.call_count, 1)
         self.assertEqual(command.call_args.args[0][0], 'git')
-        self.assertFalse((self.root / 'trial/closure.export').exists())
-        self.assertEqual(list((self.root / 'trial').iterdir()), [self.root / 'trial/prepare.log'])
-        self.assertIn('held', (self.root / 'trial/prepare.log').read_text())
+        self.assertFalse((trial.trial_root() / 'trial/closure.export').exists())
+        self.assertEqual(list((trial.trial_root() / 'trial').iterdir()), [trial.trial_root() / 'trial/prepare.log'])
+        self.assertIn('held', (trial.trial_root() / 'trial/prepare.log').read_text())
         self.assertTrue((outside / 'keep').exists())
 
     def test_prepare_checks_hold_again_after_admission(self) -> None:
@@ -278,13 +403,13 @@ elif name == 'cargo':
               mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free', side_effect=[None, GateRefused('held again')]),
               mock.patch.object(merge_gate, 'gate_reservation') as admission):
             with self.assertRaisesRegex(GateRefused, 'held again'):
-                trial.prepare(self.root, 'HEAD', self.root / 'trial')
+                trial.prepare(self.root, 'HEAD', trial.trial_root() / 'trial')
         place = cast(mock.MagicMock, cast(mock.MagicMock, cast(mock.MagicMock, admission.return_value).__enter__).return_value)
         popen = cast(mock.MagicMock, place.popen)
         popen.assert_not_called()
 
     def test_prepare_uses_admitted_worker(self) -> None:
-        folder = self.root / 'trial'
+        folder = trial.trial_root() / 'trial'
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={'vulkaninfo': '/nix/store/fixture/bin/vulkaninfo'}),
@@ -307,7 +432,7 @@ elif name == 'cargo':
         self.assertTrue((folder / 'prepare.log').exists())
 
     def test_prepare_worker_failure_keeps_only_log(self) -> None:
-        folder = self.root / 'trial'
+        folder = trial.trial_root() / 'trial'
         with (mock.patch.object(trial, 'checked', return_value='a' * 40),
               mock.patch.object(trial, 'export_source'),
               mock.patch.object(trial, 'preflight', return_value={}),
@@ -323,7 +448,7 @@ elif name == 'cargo':
         self.assertIn('exit 1', (folder / 'prepare.log').read_text())
 
     def test_prepare_failure_retains_failed_log_tails_before_cleanup(self) -> None:
-        folder = self.root / 'trial'
+        folder = trial.trial_root() / 'trial'
 
         def fail() -> int:
             for machine, status in (('setup-error', 96), ('test-failure', 100), ('passed', 0), ('interrupted', None)):
@@ -421,10 +546,10 @@ elif name == 'cargo':
                       mock.patch.object(merge_gate.BuildHoldWait, 'wait_until_free') as hold,
                       mock.patch.object(merge_gate, 'gate_reservation') as admission):
                     with self.assertRaisesRegex(ValueError, missing):
-                        trial.prepare(self.root, 'HEAD', self.root / missing)
+                        trial.prepare(self.root, 'HEAD', trial.trial_root() / missing)
                 hold.assert_not_called()
                 admission.assert_not_called()
-                self.assertEqual(list((self.root / missing).iterdir()), [self.root / missing / 'prepare.log'])
+                self.assertEqual(list((trial.trial_root() / missing).iterdir()), [trial.trial_root() / missing / 'prepare.log'])
 
     def test_preflight_refuses_software_vulkan_and_command_timeout(self) -> None:
         for failure in ('software', 'timeout'):
@@ -536,8 +661,13 @@ elif name == 'cargo':
                      'user.email=fixture@example.invalid', 'commit', '-qm', 'Fixture source']):
             _ = subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True, timeout=10)
         commit = trial.checked(['git', 'rev-parse', 'HEAD'], repo)
-        folder = self.root / 'trial'
-        folder.mkdir()
+        folder = trial.trial_root() / 'trial'
+        folder.mkdir(parents=True)
+        outside = self.root / 'profile-target'
+        outside.mkdir()
+        _ = (outside / 'keep').write_text('fixture runtime data')
+        for name in ('toolchain-profile', 'runtime-profile', 'runtime-profile-1-link', 'system-profile'):
+            (folder / name).symlink_to(outside, target_is_directory=True)
         limits = trial.settings()
         trial.write_json(folder / 'request.json', {'repo': str(repo), 'commit': commit,
             'limits': {'spot_max_usd_per_hour': {key: str(value) for key, value in limits.spot_max_usd_per_hour.items()}}})
@@ -611,7 +741,13 @@ elif name == 'cargo':
                 _ = cast(BinaryIO, kwargs['stdout']).write(b'fixture closure')
             else:
                 commands.append(tuple(argv))
-                self.assertTrue(Path(argv[argv.index('--extract-to') + 1]).is_dir())
+                extraction = Path(argv[argv.index('--extract-to') + 1])
+                self.assertTrue(extraction.is_dir())
+                self.assertFalse((folder / 'source/target').exists())
+                if extraction.parent.name == '2':
+                    self.assertFalse((extraction.parent.parent / '1/archive').exists())
+                    self.assertFalse((extraction.parent.parent / '1/source').exists())
+                _ = (extraction / 'binary').write_bytes(b'fixture extracted binary')
                 environment = cast(dict[str, str], kwargs['env'])
                 samples = Path(environment['GPU_TRIAL_SAMPLES'])
                 samples.mkdir()
@@ -633,6 +769,11 @@ elif name == 'cargo':
             trial.prepare_worker(folder)
         manifest = trial.read_json(folder / 'manifest.json')
         self.assertEqual(manifest['state'], 'prepared')
+        self.assertTrue({path.name for path in folder.iterdir()} <= trial.PREPARED_NAMES)
+        self.assertEqual((outside / 'keep').read_text(), 'fixture runtime data')
+        for name in ('source', 'archive-nextest.toml', 'toolchain-probe-home',
+                     'machines/natedev/1/archive', 'machines/natedev/2/archive'):
+            self.assertFalse((folder / name).exists())
         self.assertEqual(manifest['commit'], commit)
         self.assertEqual(manifest['vulkan_tools'], '/nix/store/fixture-vulkan-tools')
         self.assertEqual(trial.read_json(folder / 'machines/natedev/machine.json')['adapters'], [
@@ -824,8 +965,8 @@ class GpuOnlineTests(CostFixture):
         super().setUp()
         candidates = conf.read('cloud_gate').words('spot_candidate_regions')
         region = candidates[0]
-        self.folder = self.root / 'gpu-trial'
-        self.folder.mkdir()
+        self.folder = trial.trial_root() / 'gpu-trial'
+        self.folder.mkdir(parents=True)
         limits = trial.settings()
         prices = dict(list(limits.spot_max_usd_per_hour.items())[:2])
         _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_spot_max_usd_per_hour='
@@ -837,7 +978,7 @@ class GpuOnlineTests(CostFixture):
         trial.write_json(self.folder / 'inventory.json', {'tests': [{'binary': 'fixture', 'test': 'test'}]})
         manifest: dict[str, object] = {'schema': 2, 'toolchain_source': 'nix', 'state': 'prepared', 'trial': 'stable-fixture-trial', 'commit': 'a' * 40,
             'system': '/nix/store/fixture-system', 'toolchain': '/nix/store/fixture-rust',
-            'limits': {'limit_usd': str(limits.limit_usd)},
+            'limits': {'limit_usd': str(limits.limit_usd), 'spot_max_usd_per_hour': {key: str(value) for key, value in prices.items()}},
             'sha256': {name: trial.digest(path) for path in self.folder.iterdir() if path.is_file()
                        for name in (path.name,)}}
         trial.write_json(self.folder / 'manifest.json', manifest)
@@ -857,6 +998,77 @@ class GpuOnlineTests(CostFixture):
     def execute(self) -> None:
         with redirect_stdout(StringIO()):
             self.worker.execute(self.folder, self.deployment)
+
+    def test_online_completion_keeps_results_and_removes_large_inputs(self) -> None:
+        self.execute()
+        self.assertEqual(trial.read_json(self.folder / 'online-result.json')['status'], 'complete')
+        for name in trial.RUN_INPUT_NAMES:
+            self.assertFalse((self.folder / name).exists())
+        for size in self.fake.types:
+            self.assertTrue((self.folder / 'machines' / size / '1/junit.xml').is_file())
+            self.assertTrue((self.folder / 'boxes' / size / 'outcome.json').is_file())
+        self.assertIn('GPU size trial', trial.compare(self.folder))
+        self.assertEqual(trial.validate_prepared(self.folder)['trial'], 'stable-fixture-trial')
+
+    def test_invalid_online_folders_never_execute_or_remove_inputs(self) -> None:
+        nested = trial.trial_root() / 'group/trial'
+        nested.mkdir(parents=True)
+        outside = self.root / 'outside-trial'
+        outside.mkdir()
+        alias = trial.trial_root() / 'alias'
+        alias.symlink_to(self.folder, target_is_directory=True)
+        for folder in (nested, outside):
+            _ = (folder / 'closure.export').write_text('fixture input')
+        for folder in (nested, outside, alias):
+            with self.subTest(folder=folder):
+                original = (folder / 'closure.export').read_bytes()
+                with mock.patch.object(self.worker, 'run_trial') as run:
+                    with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+                        self.worker.execute(folder, self.deployment)
+                    run.assert_not_called()
+                with mock.patch.object(trial, 'AwsCli') as api, redirect_stderr(StringIO()):
+                    for mode in ('--worker', '--cleanup'):
+                        self.assertEqual(trial.online_main([mode, str(folder), '--directory', str(self.state),
+                                                           '--settings', str(self.settings)]), 1)
+                    api.assert_not_called()
+                service = mock.Mock(return_value=0)
+                with self.assertRaisesRegex(ValueError, 'canonical direct child'):
+                    _ = trial.start_service(folder, self.state, self.settings, service)
+                service.assert_not_called()
+                self.assertEqual((folder / 'closure.export').read_bytes(), original)
+                for name in ('run-error.json', 'inputs-removed.json'):
+                    self.assertFalse((folder / name).exists())
+        self.assertEqual(self.fake.events, [])
+
+    def test_online_failure_saves_the_error_before_removing_inputs(self) -> None:
+        self.fake.fail_result = True
+        with self.assertRaises(AwsUnavailable):
+            self.execute()
+        self.assertEqual(trial.read_json(self.folder / 'run-error.json')['status'], 'failed')
+        self.assertTrue((self.folder / 'boxes' / self.fake.types[0] / 'launch.json').is_file())
+        for name in trial.RUN_INPUT_NAMES:
+            self.assertFalse((self.folder / name).exists())
+
+    def test_stop_cleanup_saves_an_error_and_removes_interrupted_run_inputs(self) -> None:
+        with (mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+              mock.patch.object(trial.GpuTrialWorker, 'cleanup', return_value=True) as cleanup):
+            status = trial.online_main(['--cleanup', str(self.folder), '--directory', str(self.state),
+                                        '--settings', str(self.settings)])
+        self.assertEqual(status, 0)
+        cleanup.assert_called_once_with(self.folder)
+        self.assertIn('before it saved a final result', str(trial.read_json(self.folder / 'run-error.json')['reason']))
+        for name in trial.RUN_INPUT_NAMES:
+            self.assertFalse((self.folder / name).exists())
+        self.assertTrue((self.folder / 'manifest.json').is_file())
+
+    def test_upload_failure_removes_the_payload_and_requires_new_preparation(self) -> None:
+        with mock.patch.object(self.worker, 'upload', side_effect=AwsUnavailable('fixture upload failed')):
+            with self.assertRaisesRegex(AwsUnavailable, 'fixture upload failed'):
+                self.execute()
+        for name in trial.RUN_INPUT_NAMES:
+            self.assertFalse((self.folder / name).exists())
+        with self.assertRaisesRegex(ValueError, 'inputs were removed before upload'):
+            _ = trial.validate_prepared(self.folder)
 
     def test_old_preparation_requires_the_nix_toolchain_fix(self) -> None:
         manifest = trial.read_json(self.folder / 'manifest.json')
@@ -970,8 +1182,12 @@ class GpuOnlineTests(CostFixture):
                              conf.read('cloud_gate').whole('gpu_size_trial_root_gib'))
 
     def test_budget_counts_previous_open_reservation(self) -> None:
-        with mock.patch.object(self.worker, 'artifacts', side_effect=ValueError('fixture stops before artifacts')):
-            with self.assertRaisesRegex(ValueError, 'fixture stops before artifacts'):
+        artifacts = self.worker.artifacts
+        def uploaded(folder: Path, online: dict[str, object]) -> None:
+            artifacts(folder, online)
+            raise ValueError('fixture stops after upload')
+        with mock.patch.object(self.worker, 'artifacts', side_effect=uploaded):
+            with self.assertRaisesRegex(ValueError, 'fixture stops after upload'):
                 self.execute()
         limits = trial.settings()
         first = self.fake.types[0]
@@ -1035,6 +1251,10 @@ class GpuOnlineTests(CostFixture):
         commands: list[list[str]] = []
         def execute(arguments: Sequence[str]) -> int:
             commands.append(list(arguments))
+            with trial.held_trial(self.folder):
+                with self.assertRaisesRegex(ValueError, 'held by a live run'):
+                    with trial.new_trial(trial.trial_root() / 'next'):
+                        self.fail('The service must hold its prepared folder')
             return 0
         credential = self.root / 'override-credentials'
         with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': str(credential)}):

@@ -206,7 +206,27 @@ python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
 `prepare` prints the trial folder.
 It waits for build admission and a natedev hold release.
 It builds the archive and NixOS closure, then runs the archive twice on natedev.
-Use that same folder for the online run and each restart.
+Use that same folder for the online run and each restart after upload.
+Host trial folders must be canonical direct children of `~/.local/state/gpu-size-trial`.
+The commands refuse nested paths, outside paths, and paths through directory links before deletion.
+A new preparation removes earlier folders under `~/.local/state/gpu-size-trial` when no live run holds their locks.
+It refuses to create a second folder while an earlier folder is held.
+The active preparation and online service hold those locks.
+Preparation deletes the build tree after it creates the archive and closure.
+It keeps a clean source copy only until baseline measurement ends.
+Each measurement deletes its extracted archive, source copy, and Cargo target directory on success or failure.
+The reports, samples, and logs remain.
+
+The prepared folder keeps these files:
+
+1. `hana-tests.tar.zst`, `closure.export`, and `source.tar`.
+2. `cargo-home/`, `runtime.env`, `gpu-trial.nix`, and `gpu_trial_wrapper.py`.
+3. `closure.json`, `request.json`, `manifest.json`, and `inventory.json`.
+4. `machines/` with baseline results and `prepare.log`.
+
+With the measured inputs, preparation peaks near 32 GiB and keeps about 12 GiB when ready.
+Local measurement uses about 19 GiB with one extracted archive.
+These estimates cover the trial folder; Nix store use is separate.
 
 The Rust tools come from Nix.
 Old preparations require a new `prepare` run before the service can use them.
@@ -240,6 +260,11 @@ It reports `price above max` when no offered zone fits the configured maximum.
 It never substitutes another type or region.
 
 The service uploads the archive, closure, manifest, and runtime files to the home-region bucket.
+It removes its temporary upload payload after upload, including an upload failure.
+When the online run ends, it saves the result or error and removes the archive, closure export, source tar, and Cargo cache.
+Metadata, reports, samples, and logs remain for comparison.
+A restart uses the uploaded inputs and saved hashes.
+A failure before upload requires a new preparation.
 Boxes receive signed URLs.
 They receive no AWS credential file.
 Each box imports the prepared NixOS closure and reboots once.
@@ -251,6 +276,7 @@ It starts termination five minutes before the configured lifetime ends.
 The expiry tag triggers two minutes before the lifetime ends.
 An unconfirmed termination blocks the next box.
 The service's `ExecStopPost` command repeats cleanup after a failure.
+It saves an error and removes large inputs when an interrupted worker leaves no final result.
 
 The ledger reserves the type maximum multiplied by the lifetime hours, plus the configured box extra.
 It counts completed costs and open reservations against the same trial ID.
