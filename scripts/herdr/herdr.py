@@ -1056,6 +1056,31 @@ def herdr_binary() -> str:
     return binary
 
 
+def own_pane_columns(timeout: float) -> int | None:
+    """Return the width in columns of the pane that runs this process, or None when herdr cannot tell in time."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not pane or not path:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(timeout)
+            stream.connect(path)
+            stream.sendall((json.dumps({"id": "pane-columns", "method": "pane.layout",
+                                        "params": {"pane_id": pane}}) + "\n").encode())
+            with stream.makefile("r", encoding="utf-8") as reply:
+                response = decode_object(reply.readline(), "herdr pane.layout")
+        layout = json_object(json_object(response.get("result"), "herdr pane.layout").get("layout"), "herdr pane.layout")
+        for item in json_items(layout.get("panes"), "herdr pane.layout"):
+            row = json_object(item, "herdr pane")
+            width = json_object(row.get("rect"), "herdr pane rect").get("width")
+            if row.get("pane_id") == pane and isinstance(width, int):
+                return width
+    except (OSError, HerdrFailure):
+        return None
+    return None
+
+
 # A tab or workspace gone from the shared session keeps its saved place this long, so a restart
 # puts it back where it was. A production retired for longer than this loses its place.
 LAYOUT_KEEP_SECONDS = 14 * 24 * 3600
