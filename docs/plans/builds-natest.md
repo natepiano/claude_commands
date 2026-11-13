@@ -3755,48 +3755,13 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 252 — Tests never reach the real unit run roots  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** No test reads or writes the real unit run roots (`/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/astra`). One shared helper binds them; a test-support default makes them unreachable.
-
-**Decision:** sdlc owner assignment 2026-11-13 15:14, from the Phase 243 finding. `test_shutdown_cli.py` rename fixtures read 422,583 live run JSON files. `unit_runs.RUN_ROOT`, `FORMER_RUN_ROOT` and `ASTRA_RUN_ROOT` (`scripts/lib/unit_runs.py:31-33`) are set at import from `SCRATCH_ROOT` and `ASTRA_REVIEW_DIR`. Test fixtures patch some roots and leave others real.
-
-**Spec:**
-1. Add one shared helper, `bind_private_run_roots(case, root)`, in a test-support module beside `unit_runs` (for example `scripts/lib/unit_runs_test_support.py`). It patches `RUN_ROOT`, `FORMER_RUN_ROOT` and `ASTRA_RUN_ROOT` to folders under `root`. It registers `patch.stop` before `patch.start`. It makes no folder and holds no snapshot path.
-2. Replace `bind_rename_run_roots` (`scripts/agents/test_shutdown_cli.py:2824`) with the shared helper.
-3. Use the helper in the fixtures that leave a root real:
-   - `scripts/production/rename_unit_test_support.py` `FolderRenameFixture` (used by four classes in `scripts/production/test_unit_move.py`: `UnitFolderMoveTests`, `FolderBranchRecoveryTests`, `FolderRenameConfigTests`, `FolderMoveReviewTests`).
-   - `scripts/production/rename_test_support.py:238` `FolderMoveFixture` (patches `RUN_ROOT` only; `CodexPaneRestoreTests` in `scripts/agents/test_pane_restore.py` reaches `FORMER_RUN_ROOT`).
-   - `scripts/production/test_rename_unit_processes.py:171` `RunRecordLookupTests` (patches `RUN_ROOT` only; `run_is_open` reaches `run_roots`).
-   Keep any root a test sets on purpose; the helper only replaces a real root.
-4. Add the default: find the one entry that every Python test process passes through (the gate runner, `scripts/test_times/module_run.py`, the `verify.sh` Python lane). Set `SCRATCH_ROOT` and `ASTRA_REVIEW_DIR` there to a private folder for the run, removed at the end. Then a fixture without the helper resolves to a private root. If no single entry exists, report the entries to the director before you change one.
-5. Search for other modules that reach the three roots or `run_roots()` without a private binding. Fix each in a test file, or list it with its evidence.
-6. Prove it: an observation probe (as in `phases/243/impl4/empty_roots.py`) records zero reads of the real roots for each changed module.
-7. Run each changed test module three times and basedpyright on each changed file. Report `module_cost.py` CPU before and after for each changed module.
-
-**Files:**
-- `scripts/lib/unit_runs_test_support.py` (new) — hub
-- `scripts/agents/test_shutdown_cli.py`
-- `scripts/production/rename_unit_test_support.py`
-- `scripts/production/rename_test_support.py`
-- `scripts/production/test_rename_unit_processes.py`
-- the test runner entry from step 4
-- other modules from step 5
-
-**Workers:** 1 writer; the helper is a hub every other file needs.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 243 is folded into this phase. `scripts/agents/test_shutdown_cli.py` holds its uncommitted change (SHA-256 06d351b53e4bb9afa1c3e9ca4590921bd965fcae517433da7154f93243ce9f6c): `bind_rename_run_roots` binds `RUN_ROOT` and `FORMER_RUN_ROOT` for three rename classes. Build on it; replace the helper with the shared one. Evidence: `phases/243/impl4/`. Its aws pairs show no gain (34.319 -> 34.423 CPU s): the aws host has no live run folders. The 81.5 -> 37.8 natedev gain is the host's live run folders. So this phase is a correctness fix.
-- Phases 236, 237, 251: register each cleanup before the step that can leave partial state.
-- sdlc terms: test and test-support files only; every test and assertion stays. A correctness fix needs no aws gain; report the aws pairs for changed modules.
-
-**Acceptance gate:**
-- The same test count and assertions in every changed module; each passes three times.
-- The probe shows zero reads of the real roots for each changed module.
-- A fixture with no helper, run under the default, resolves to a private root.
-- basedpyright 0 errors and 0 warnings on each changed file.
+- `scripts/lib/unit_runs_test_support.py`: `bind_private_run_roots(case, root)` patches `RUN_ROOT`, `FORMER_RUN_ROOT` and `ASTRA_RUN_ROOT` to folders under `root` only while each equals its `/tmp/claude` default; cleanup registers before each start.
+- The rename fixtures (`test_shutdown_cli`, `rename_unit_test_support`, `rename_test_support`, `test_rename_unit_processes`) and `AddUnitTestCase` (`add_unit_test_support`) bind through the helper.
+- `scripts/test_times/module_run.py` gives each gate module a private `SCRATCH_ROOT` and `ASTRA_REVIEW_DIR`, removed at the end and before a signal exit.
+- Probe: zero real-root reads in 5 modules over 3 rounds. natedev CPU `test_shutdown_cli` 37.9 -> 30.1 s; correctness fix (the aws host has no live run folders). Tests and assertions unchanged; director reviews approve. Checkpoint 87396194c.
+- Observation: a `test_shutdown_cli` child reads host `/proc/<pid>/cwd` and `fd` links (a host process scan, not a run-root read).
 
 ### Phase 253 — The shutdown CLI tests copy class-built Git repositories  · status: todo
 **Depends on:** Phase 252
