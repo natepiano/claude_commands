@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send roster groups a message, with one concurrent delivery per recipient.
 
-  broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | --units TEXT |
+  broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
                            --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 
 Overlapping groups receive the text of the last selecting flag. The sender is
@@ -14,6 +14,7 @@ try:
 except FileNotFoundError:
     pass
 
+import json
 import os
 import shlex
 import subprocess
@@ -31,7 +32,7 @@ from scripts.lib import names as display_names  # noqa: E402
 from scripts.message import session_send
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
-USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | --units TEXT"
+USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
          + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
 AT_ONCE = 24
@@ -50,6 +51,12 @@ class Showrunners:
 @dataclass(frozen=True)
 class UnitDirectors:
     """Every unit director."""
+
+
+@dataclass(frozen=True)
+class UnitsOfProduction:
+    address: str
+    production: str
 
 
 @dataclass(frozen=True)
@@ -74,13 +81,14 @@ class TopLevel:
     """Claude sessions that receive top-level announcements."""
 
 
-BroadcastGroup = AllRoles | Showrunners | UnitDirectors | Agents | Workers | WorkersOfUnit | TopLevel
+BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction | Agents | Workers | WorkersOfUnit | TopLevel
 Outcome = Literal["sent", "no live session", "NOT sent"]
 FLAGS: dict[str, BroadcastGroup] = {
     "--all": AllRoles(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
     "--agents": Agents(), "--workers": Workers(), "--top-level": TopLevel(),
-    # Internal replay spelling selects all workers without inheriting an earlier --of.
+    # Internal replay spellings keep unscoped groups independent of earlier scopes.
     "--all-workers": Workers(),
+    "--all-units": UnitDirectors(),
 }
 
 
@@ -122,6 +130,9 @@ def selects(group: BroadcastGroup, entry: roster.RosterEntry) -> bool:
             return entry.role == "showrunner"
         case UnitDirectors():
             return entry.role == "unit director"
+        case UnitsOfProduction(address):
+            return (entry.role == "unit director" and isinstance(entry.showrunner, roster.UnderShowrunner)
+                    and entry.showrunner.address == address)
         case Agents():
             return entry.role in ("worker", "freestanding")
         case Workers():
@@ -243,6 +254,24 @@ def _unit_group(target: str, entries: Sequence[roster.RosterEntry]) -> WorkersOf
                          director.machine)
 
 
+def _production_group(target: str, entries: Sequence[roster.RosterEntry]) -> UnitsOfProduction:
+    showrunners = [(entry, f"session:{entry.session.session_id}") for entry in entries
+                   if entry.role == "showrunner" and isinstance(entry.session, roster.ClaudeSession)]
+    matches = [(entry, address) for entry, address in showrunners if entry.name == target or address == target]
+    if len(matches) != 1:
+        known = matches if matches else showrunners
+        descriptions = [f"  {entry.name} ({entry.machine}): {address}" for entry, address in known]
+        loaded = display_names.runtime_names()
+        role_label = loaded.job("showrunner") if isinstance(loaded, display_names.Names) else "director"
+        reason = (f"{target} matches more than one {role_label}:" if matches
+                  else f"unknown production {target}; known showrunners:")
+        raise ValueError("\n".join([reason, *descriptions]))
+    showrunner, address = matches[0]
+    production = (showrunner.showrunner.production if isinstance(showrunner.showrunner, roster.RunsProduction)
+                  else showrunner.name)
+    return UnitsOfProduction(address, production)
+
+
 def _group_name(group: BroadcastGroup) -> str:
     loaded = display_names.runtime_names()
     if not isinstance(loaded, display_names.Names):
@@ -255,6 +284,8 @@ def _group_name(group: BroadcastGroup) -> str:
             key = "showrunners"
         case UnitDirectors():
             key = "unit_directors"
+        case UnitsOfProduction(production=production):
+            return f"{loaded.audience('unit_directors')} of {production}"
         case Agents():
             key = "agents"
         case Workers():
@@ -279,8 +310,12 @@ def _remote_arguments(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
     for group, text in texts.items():
         if isinstance(group, WorkersOfUnit):
             arguments.extend(("--of", group.address, "--workers", text))
+        elif isinstance(group, UnitsOfProduction):
+            arguments.extend(("--resolved-production", json.dumps([group.address, group.production]), "--units", text))
         elif isinstance(group, Workers):
             arguments.extend(("--all-workers", text))
+        elif isinstance(group, UnitDirectors):
+            arguments.extend(("--all-units", text))
         else:
             flag = next(flag for flag, candidate in FLAGS.items() if candidate == group)
             arguments.extend((flag, text))
@@ -345,6 +380,7 @@ def main(arguments: list[str]) -> int:
     pairs: list[tuple[str, str]] = []
     sender = ""
     scope: roster.RosterScope = roster.AllMachines()
+    production_pending = False
     index = 0
     while index < len(arguments):
         flag = arguments[index]
@@ -352,7 +388,7 @@ def main(arguments: list[str]) -> int:
             scope = roster.ThisMachine()
             index += 1
             continue
-        if index + 1 >= len(arguments) or flag not in FLAGS.keys() | {"--of", "--from"}:
+        if index + 1 >= len(arguments) or flag not in FLAGS.keys() | {"--of", "--production", "--resolved-production", "--from"}:
             print(USAGE, file=sys.stderr)
             return 2
         value = arguments[index + 1]
@@ -360,19 +396,25 @@ def main(arguments: list[str]) -> int:
             sender = value
         else:
             pairs.append((flag, value))
+            if flag == "--production":
+                production_pending = True
+            elif flag == "--units":
+                production_pending = False
         index += 2
-    if not sender or not any(flag in FLAGS for flag, _ in pairs):
+    if not sender or not any(flag in FLAGS for flag, _ in pairs) or production_pending:
         print(USAGE, file=sys.stderr)
         return 2
     identity = roster.sender_identity(os.environ)
-    if any(flag == "--of" for flag, _ in pairs):
+    production_scope = any(flag in ("--production", "--resolved-production") for flag, _ in pairs)
+    if production_scope or any(flag == "--of" for flag, _ in pairs):
         result = roster.roster(os.environ, scope)
         for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()
-        failures = [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")]
+        failures = (result.problems if production_scope else
+                    [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")])
         if failures:
-            # A partial roster cannot prove that a director name is unique.
+            # Production delivery needs every row; unit name resolution needs a reachable peer.
             _ = report([Delivery(PeerOutput(host, f"NOT sent: {failures[0]}"), "NOT sent", "")])
             return 1
         unit_entries = result.entries
@@ -382,19 +424,28 @@ def main(arguments: list[str]) -> int:
         unit_entries = entries
     texts: dict[BroadcastGroup, str] = {}
     workers: Workers | WorkersOfUnit = Workers()
+    units: UnitDirectors | UnitsOfProduction = UnitDirectors()
     scope_pending = False
+    production_pending = False
     try:
         for flag, text in pairs:
             if flag == "--of":
                 workers = _unit_group(text, unit_entries)
                 scope_pending = True
                 continue
-            group = workers if flag == "--workers" else FLAGS[flag]
+            if flag in ("--production", "--resolved-production"):
+                units = (_production_group(text, unit_entries) if flag == "--production"
+                         else UnitsOfProduction(*cast(tuple[str, str], json.loads(text))))
+                production_pending = True
+                continue
+            group = workers if flag == "--workers" else units if flag == "--units" else FLAGS[flag]
             if flag == "--workers":
                 scope_pending = False
+            if flag == "--units":
+                production_pending = False
             _ = texts.pop(group, None)
             texts[group] = text
-        if scope_pending:
+        if scope_pending or production_pending:
             print(USAGE, file=sys.stderr)
             return 2
     except ValueError as error:
