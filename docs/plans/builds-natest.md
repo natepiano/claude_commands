@@ -3647,35 +3647,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 237 — The build record tests copy one seed repository  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `buildlog/test_record.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 4; sdlc owner go 2026-11-13 13:38. `setUp` (`test_record.py:126-129`) runs `git init` and an empty commit in each of 84 tests.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD buildlog/test_record.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the per-test `git init` and commit are a top cost: build one seed repository in `setUpClass` and copy it into each test's `self.repo`, as Phase 234 did in `unit_config_test_support.py`. Keep admission state, build records, environment and patches private per test. The copy must hold no absolute path into the seed.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/buildlog/test_record.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 234: the seed pattern in `unit_config_test_support.py` (class seed under a private home; `shutil.copytree` per test).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `RecordTests.setUpClass` (`buildlog/test_record.py`) builds one seed repository under a private home: `git init` on `main` and one empty commit. `setUp` copies it into each test's `self.repo`. Admission state, build records, tools, environment and patches stay private per test.
+- Callers in other modules that build the fixture without class setup register the seed cleanup before the seed build, so a failed build leaves no seed. All 84 test bodies and assertions did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 11.874 to 11.493 s; peak 136.6 to 135.5 MiB. Admission (`admission_client.py`, 2.9 natedev CPU s) and `module_run.py` stay the top costs. Checkpoint `4f9a19c62`.
 
 ### Phase 238 — The models publication tests copy one publication fixture  · status: todo
 **Depends on:** Phase 234
