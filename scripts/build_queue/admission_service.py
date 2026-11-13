@@ -1159,6 +1159,10 @@ class AdmissionServer:
         self._prune_runs()
         self._claim_slots()
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
+        if remaining.priority != self.priority:
+            ordered, priority = gate.apply_queue_priority(remaining.ordered, gate.QueueOrderContext(self.priority, {}))
+            remaining = replace(remaining, ordered=ordered, priority=priority,
+                                waiter_orders={records.waiter_owner(row): records.waiter_priority(row) for _, row in ordered})
         return replace(remaining, slots=tuple(self.slots.values()))
 
     def persist(self) -> None:
@@ -1292,7 +1296,24 @@ class AdmissionServer:
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
+    def _prune_priority(self) -> bool:
+        self._finish_priority()
+        if not isinstance(self.priority, records.QueuePriority):
+            return False
+        identities = {records.priority_step(waiting.row) for waiting in self.waiters.values()}
+        identities.update(records.priority_step(record.queue_waiter) for record in self.reservations.values())
+        identities.update(records.SelectedPriorityStep(place.owner.pid, place.owner.start_time, place.since)
+                          for place in self.places.values())
+        entries = tuple(entry for entry in self.priority.entries
+                        if entry["step"] in identities and self._live(wire.Owner(entry["step"].pid, entry["step"].start_time)))
+        if entries == self.priority.entries:
+            return False
+        self.priority = records.QueuePriority(entries) if entries else records.NoQueuePriority()
+        self.persist()
+        return True
+
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
+        _ = self._prune_priority()
         rows = self._ordered_waiters()
         sessions = [row.get("session_id", "") for _, row in rows if not row.get("unit")]
         labels: Mapping[str, gate.UnitMembership] = (
@@ -2110,6 +2131,7 @@ class AdmissionServer:
             self.ledger[episode] = replace(previous, ended_at=self.clock.now())
         if isinstance(ending, (ReleaseStatus, TokenWaiting)):
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
+        _ = self._prune_priority()
         self.persist()
 
     def host_evidence_key(self, request: wire.PlacementRequest,
@@ -2983,6 +3005,8 @@ done
         if isinstance(request, wire.BuildHistoryRequest):
             return [wire.BuildHistoryReply(self.build_history_generation)]
         if isinstance(request, (wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
+            if self._prune_priority():
+                self.pass_stale = True
             if not isinstance(self.pending_configuration, NoPass):
                 _ = self.run_pass()
             elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
@@ -3132,19 +3156,20 @@ done
             if isinstance(request, wire.PrioritySetRequest):
                 if not request.unit.strip():
                     return self._mutation_reply(key, wire.Refused("unit is required"))
+                _ = self._prune_priority()
                 entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
-                if any(entry["unit"] == request.unit for entry in entries):
-                    return self._mutation_reply(key, wire.Ok())
                 rows = [waiting.row for waiting in self.waiters.values()]
                 rows.extend(record.queue_waiter for record in self.reservations.values())
-                recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
-                units = {label.unit for session, label in labels.items() if session not in recorded_sessions}
-                units.update(row.get("unit", "") for row in rows if row.get("unit", ""))
-                if request.unit == "—" or request.unit not in units:
+                selected = next((row for row in rows if records.priority_step(row) == request.step
+                                 and self._live(wire.Owner(row["pid"], row["start_time"]))), None)
+                if (selected is None or request.unit == "—"
+                        or gate.queue_unit(selected.get("unit", ""), selected.get("session_id", ""), labels) != request.unit):
                     return self._mutation_reply(key, wire.Refused(
-                        f"unknown unit {request.unit}; the queue priority did not change"))
+                        f"no live step matches {request.selector or request.unit}; the queue priority did not change"))
+                if any(entry["step"] == request.step for entry in entries):
+                    return self._mutation_reply(key, wire.Ok())
                 changed = True
-                entry: records.PriorityEntry = {"unit": request.unit, "why": request.why,
+                entry: records.PriorityEntry = {"step": request.step, "unit": request.unit, "why": request.why,
                     "set_at": self.clock.now(), "set_by": request.actor}
                 entries = (*entries, entry)
                 unit, why, actor = request.unit, request.why, request.actor
@@ -3281,6 +3306,7 @@ done
                 del self.waiters[episode]
                 changed = True
         if changed:
+            _ = self._prune_priority()
             self.persist()
         return changed
 

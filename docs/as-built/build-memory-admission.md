@@ -276,7 +276,7 @@ The memory page keeps this memory in Other.
 
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the room, keep-asides, and cap.
 The first two minutes use the same calculation. A run never counts its use twice.
-The display shows zero room for a shortfall. The cap explanation shows the shortfall.
+The display shows zero room for a shortfall. A labelled bracket shows the full shortfall beyond the cap.
 These readings never reduce a promise from history.
 
 Waiting runs follow priority, first run arrival, and PID order.
@@ -344,13 +344,22 @@ A failed first query shows `Build queue could not be read.`
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Set one step’s priority or clear selected priorities |
 | `admit_head` | Waive existing keep-asides for the head when free memory permits |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
-It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
-The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+`/build:queue bump <position|session|folder> [--why <reason>]` selects one live waiting or running step.
+`SelectedPriorityStep` binds the bump to its PID, process start time, and queue arrival time.
+The service validates that identity and its unit before it stores the bump.
+An unmatched selector exits 3 without a priority change.
+The priority remains through admission and ends with completion, cancellation, or owner death.
+A later step from the same unit has normal priority.
+Both command paths resolve the caller's staff name for the default reason.
+They preserve an explicit `--why` exactly and retain the caller identifier in `set_by`.
+An unavailable staff record uses the caller identifier; a shell without a session uses `user`.
+The mutation's `Ok` proves success even when the second view is unavailable.
+That case returns 0 and states that the new place is not known now.
+The view timeout remains 0.5 seconds.
 The queue commands `bump`, `clear`, and `admit-head` work from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
 The pane passes its session id to mutating commands. Read-only commands keep their existing environment.
@@ -904,7 +913,15 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
-Queue-priority commands accept only unit labels in the local roster. Only sessions with a real unit supply membership; the no-unit display placeholder supplies none. Unknown units, including that placeholder, leave the old priority unchanged and return `build queue: unknown unit <unit>; the queue priority did not change` on stdout with exit 3. The pane shows this through its existing refusal protocol. Callers pass a unit as `--unit=<unit>`, including names that start with `-`. The pane passes its own session id to the command. Each card shows the stored priority reason once and counts priority steps as `N of <unit> (queue priority)`; old per-step bump records are not card reasons. Clearing an unreadable priority file removes it and names the removed file.
+Queue-priority commands require a real unit and a live selected step.
+The no-unit display placeholder supplies no membership.
+An invalid or ended selector leaves the priority unchanged.
+The bump command returns `build queue: no live step matches <selector>` on stdout with exit 3.
+The pane shows the command result through its existing refusal protocol.
+The pane passes its session id to the command.
+Each card shows the stored reason once and counts priority steps as `N of <unit> (queue priority)`.
+Old per-step bump records are not card reasons.
+Clearing an unreadable priority file removes it and names the removed file.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -1633,9 +1650,11 @@ Token waiters keep their clocks and places but cannot protect room as the head.
 `TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
 The renderers use the eligible head's position and token history.
 
-Priority accepts real roster units, including units without a waiting step.
+Priority requires a live selected step with a real unit.
 The no-unit display placeholder is not a unit.
-Unassigned sessions retain `NormalOrder`, including with an old placeholder priority record.
+Unassigned sessions retain `NormalOrder`.
+The service reads only priorities with a typed selected-step identity.
+Deployment converts unit-only entries outside the repository before the new service starts.
 The pane passes its session id explicitly.
 Unknown units return exit 3 with a stdout line starting `build queue: `.
 Cards show `N of <unit> (queue priority)` once and use the saved reason.
@@ -1797,7 +1816,7 @@ The Mac row uses the local used-memory style and the same GiB scale.
 Its memory is the sum of resident memory for the run's process tree.
 The Mac row has no reservation or hatching and changes no natedev memory total.
 The Mac tooltip states that its memory does not count against natedev.
-It aligns Machine, Started, Used, and Reading age in labelled rows.
+It uses the shared tooltip renderer for Machine, Status, Started, Used, and Reading age.
 A readable counter adds a Progress row.
 A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
 The feed log retains raw errors; the page shows only the status and reading age.
@@ -1989,3 +2008,63 @@ Session TMPDIRs and unit session folders remain for later session commands.
 
 `verify.sh` shares one Python process across synchronous helper calls.
 See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.
+
+
+## Build page tooltips and reservation demand
+
+The page uses one tooltip renderer for memory items, running steps, waiting steps, swap rows, and chart points.
+Each tooltip has a title, at most one short definition, and at most eight aligned name/value rows.
+The width stays at 300 pixels or less.
+The renderer escapes all titles, definitions, names, and values.
+Chart points retain accessible descriptions and support keyboard focus.
+
+The page uses these labels consistently: Free, Safety, Reserved, Needs, Next step room, and Shortfall.
+Free means available RAM, including memory the system can reclaim.
+Safety means the policy allowance that the queue excludes from the cap.
+Reserved means memory held for existing runs.
+The page sums each run's own reservation; it does not clamp combined need minus combined use.
+
+The summary separates physical RAM from reservation demand.
+A Free bracket includes Safety.
+The reservation track shows full hatching, including demand beyond the cap.
+A Shortfall bracket labels the amount beyond the cap.
+Running rows use the same scale and retain their full reservations.
+The scale extends when demand exceeds physical RAM, and a marker identifies the physical RAM boundary.
+The page moves the step table below the chart when shortfall requires the space beyond the cap.
+
+Calculation tooltips show signed terms, a rule line, and a result.
+The result uses `=` only when the displayed terms reconcile.
+It uses `≈` when independent rounding changes the displayed sum.
+One memory formatter serves page labels and tooltips, including small amounts in MiB, KiB, or bytes.
+
+Waiting tooltips put Waiting and Reason first.
+The first local waiter's tooltip also shows Free, Safety, Reserved, Next step room, and Shortfall.
+The Priority row uses the stored priority reason.
+Unmatched priorities appear in a visible list.
+Estimate targets show the recorded source, history window, failed run, extra room, and limit.
+Long member lists stay in expandable page details.
+
+Pressure admission remains unchanged: Full exceeds its limit, or Some and Swap both exceed their limits.
+Individual gauge labels say Limit.
+A value equal to its limit does not indicate a pressure hold.
+The pressure decision, gauges, and tooltips use the same captured reading.
+Unavailable pressure evidence stays unavailable.
+
+Swap totals also come from the captured host reading.
+The feed reads cgroup attribution separately and retains the signed difference from those totals.
+It does not read host swap totals again while building the pressure display.
+
+The page measures the table at its intrinsic width before choosing its position.
+A shortfall can move the table below the chart.
+When room returns, the same reading restores the original cap position and table layout.
+The browser proof checks this through ordinary feed refreshes without taking screenshots during the check.
+
+The Running axis uses the same range and ticks as the summary axis, including demand beyond the cap.
+When the table sits below the chart, Step and Unit retain their full text.
+A narrow screen scrolls the table horizontally instead of clipping those values.
+The table fits without scrolling when the page has sufficient width.
+
+CI tooltips keep the count of unreadable runners, including readings with busy and unreadable runners.
+When all runner readings fail, the Jobs row says unavailable instead of none.
+Estimate tooltips describe recorded measured, buildlog, pooled, and fallback sources, including their recorded run counts where applicable.
+A recorded source remains visible when its detailed basis is not recorded.
