@@ -27,7 +27,8 @@ folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/
 when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
 session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays, as does each run's tmp/ (its TMPDIR).
 Run keep reasons keep the run folder. Its tmp/ entries use the 4 h and process-use rules.
-An unreadable ownership record keeps those entries. Each session temp entry also uses the 4 h rule.
+A director or session worktree guard permits the same checks for closed phases. Open runs and open phases stay.
+Unreadable ownership or phase state keeps the affected entries. Each session temp entry also uses the 4 h rule.
 In a temp folder a folder's ctime is no change, since
 systemd-tmpfiles-clean moves it each day when it sets the folder's times back. In a temp folder (/tmp, $TMPDIR
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
@@ -108,6 +109,7 @@ from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
+from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -203,6 +205,7 @@ TASK_OPEN = "its task is open and it changed in the last 7 days"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
 UNREADABLE = "it cannot be read"
+PHASE_OPEN = "its phase is open"
 WORKER_USES = "a live worker uses it"
 UNSAVED_WORK = "it holds unsaved git work"
 GIT_DEPTH = 3
@@ -805,7 +808,8 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                 working = state.get("working_dir", "")
                 if not isinstance(working, str):
                     raise ValueError("run worktree unreadable")
-                if working and os.path.realpath(working) in use.worktrees:
+                if (working and os.path.realpath(working) in use.worktrees
+                        and kept.get(folder) is not RunKeepReason.UNENDED_WORKER):
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
             if os.path.realpath(folder) in opened:
                 kept[folder] = RunKeepReason.OPEN_RUN
@@ -1019,6 +1023,10 @@ class RemovableEntry:
     reason: str = "idle and unused"
 
 
+class ClosedPhaseEntry(RemovableEntry):
+    """The phase is closed under a director or session worktree guard."""
+
+
 def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -1060,7 +1068,22 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     for path in workers.unreadable_records:
         print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)
     temp_live = None if live is None else live | workers.threads
-    judged = roots.all() + inner + temp_parents(roots, temp_live)
+    phase_parents: dict[str, list[str]] = {}
+    unreadable_phases: set[str] = set()
+    if live is not None:
+        for folder, guard in guarded.items():
+            if guard not in (RunKeepReason.SESSION_WORKTREE, RunKeepReason.DIRECTOR):
+                continue
+            phases = Path(folder) / "phases"
+            if not phases.is_dir() or phases.is_symlink():
+                continue
+            try:
+                phase_parents[str(phases)] = [phase_reservation.phase_directory_name(phase)
+                                             for phase in recorder_state.read_open_phase_ids(Path(folder))]
+            except (OSError, ValueError):
+                phase_parents[str(phases)] = []
+                unreadable_phases.add(str(phases))
+    judged = roots.all() + inner + temp_parents(roots, temp_live) + tuple(phase_parents)
     pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
     uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
@@ -1074,13 +1097,18 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                     reason = state.why
                 elif isinstance(state, scratch.Unknown):
                     reason = state.reason
-            # Run guards keep tmp/ entries only when ownership or the session registry cannot be read.
+            if root in unreadable_phases:
+                reason = UNREADABLE
+            elif entry.name in phase_parents.get(root, []):
+                reason = PHASE_OPEN
+            # Eligible run entries still use the shared age, process and git checks.
             if reason != ROOT:
                 # Resolve only the parents: a link inside a protected run is judged where it lies.
                 path = os.path.join(os.path.realpath(os.path.dirname(entry.path)), entry.name)
                 for folder, guard in guarded.items():
-                    if (root == os.path.join(folder, RUN_TEMP_NAME)
-                            and live is not None and guard is not RunKeepReason.UNREADABLE_RECORD):
+                    if (live is not None and (
+                            root == os.path.join(folder, RUN_TEMP_NAME) and guard is not RunKeepReason.UNREADABLE_RECORD
+                            or root == os.path.join(folder, "phases") and root in phase_parents)):
                         continue
                     if path == folder or path.startswith(folder + os.sep) or folder.startswith(path + os.sep):
                         reason = NO_SESSIONS if live is None else guard.value
@@ -1105,7 +1133,10 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
-            yield RemovableEntry(entry.path, root, newest, size)
+            if root in phase_parents:
+                yield ClosedPhaseEntry(entry.path, root, newest, size, CleanupEndReason.CLOSED_PHASE.value)
+            else:
+                yield RemovableEntry(entry.path, root, newest, size)
 
 
 def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
@@ -1134,6 +1165,11 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
 def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
+    if isinstance(entry, ClosedPhaseEntry):
+        parent = Path(entry.path).parent
+        if parent.is_symlink() or not parent.is_dir() or os.path.realpath(parent) != entry.root:
+            result.keep(entry.path, "its phases parent changed")
+            return False
     if not dry_run:
         try:
             path = Path(entry.path)
@@ -1198,6 +1234,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
 
 
 class CleanupEndReason(Enum):
+    CLOSED_PHASE = "its phase is closed and its run has no open run pointer; idle and unused"
     WORKERS_ENDED = "all pane workers stopped or closed; idle and unused"
     TASK_ENDED = "its scratch task ended; idle and unused"
     VERIFY_STOPPED = "its recorded verify.sh run stopped; idle and unused"
@@ -1217,6 +1254,8 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
 
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    if isinstance(entry, ClosedPhaseEntry):
+        return CleanupEndReason.CLOSED_PHASE
     try:
         for root in roots.runs:
             relative = Path(entry.path).relative_to(root) if Path(entry.path).is_relative_to(root) else Path()

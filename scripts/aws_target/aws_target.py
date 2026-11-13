@@ -16,15 +16,17 @@ import fcntl
 import json
 from pathlib import Path
 import re
+import os
 import subprocess
 import sys
 import time
 from typing import Protocol, cast, final, get_args
 
 from scripts.aws_target import ledger, measurement
-from scripts.aws_target.config import gate_deployment, read_settings
+from scripts.aws_target.config import read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 
 
 class AwsExecutor(Protocol):
@@ -105,6 +107,95 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     return largest
 
 
+def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
+    """Read the applied regional Spot quota in vCPUs."""
+    reply = api.call('get-service-quota', '--service-code', 'ec2',
+                     '--quota-code', code, service='service-quotas')
+    value = conf.decimal(str(ledger.mapping(reply['Quota'])['Value']))
+    if not value.is_finite() or value < 0:
+        raise ValueError('The Spot quota is invalid')
+    return value
+
+
+def fetch_spot_prices(api: AwsCli, sizes: Sequence[str], now: int) -> tuple[ledger.RegionalSpotPrice, ...]:
+    """Read every page and select the latest price for each type and zone."""
+    reply = api.call('describe-spot-price-history', '--instance-types', *sizes,
+        '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(now, UTC).isoformat())
+    return ledger.regional_spot_prices(api.region, reply, sizes, now)
+
+
+def read_snapshot(directory: Path) -> dict[str, object]:
+    """Read the local price and quota snapshot without creating files."""
+    try:
+        return ledger.mapping(cast(object, json.loads((directory / 'spot-prices.json').read_text())))
+    except FileNotFoundError:
+        return {'prices': [], 'regions': []}
+
+
+def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
+             clock: Callable[[], float] = time.time) -> int:
+    """Replace successful regional reads and preserve failed regional reads."""
+    # Import here because administrator deployment also uses the shared read functions.
+    from scripts.aws_target import admin_secrets
+
+    configuration = conf.read(settings_path)
+    values = conf.read_or_repository('cloud_gate')
+    regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
+    sizes = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('gpu_instance_types'))))
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'spot-prices.lock').open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        now = int(clock())
+        _ = lock.seek(0)
+        try:
+            last = int(lock.read().strip() or '0')
+        except ValueError:
+            last = 0
+        if last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
+            return 0
+        environment = {key: value for key, value in os.environ.items() if key not in (
+            'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
+            'AWS_CONFIG_FILE', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE')}
+        environment['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
+        environment['AWS_CONFIG_FILE'] = os.devnull
+        environment['AWS_EC2_METADATA_DISABLED'] = 'true'
+
+        def scaler_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                           timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            _ = env
+            return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=environment)
+
+        api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
+                     configuration.number('aws_timeout_s'), scaler_execute)
+        document = read_snapshot(directory)
+        prices = list(ledger.rows(document, 'prices'))
+        readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
+        status = 0
+        for region in regions:
+            try:
+                target = api.in_region(region)
+                regional = fetch_spot_prices(target, sizes, now)
+                standard = spot_quota(target)
+                gpu = spot_quota(target, 'L-3819A6DF')
+                prices = [row for row in prices if row.get('region') != region]
+                prices.extend(dict(region=row.region, zone=row.zone, instance_type=row.instance_type,
+                    usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
+                readings = [row for row in readings if row.get('region') != region]
+                readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
+            except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
+                print(f'aws_target: snapshot {region} unavailable: {type(error).__name__}', file=sys.stderr)
+                status = 1
+        write_text_atomic(directory / 'spot-prices.json', json.dumps(
+            {'prices': prices, 'regions': readings}, sort_keys=True) + '\n')
+        _ = lock.seek(0)
+        _ = lock.truncate()
+        _ = lock.write(str(now))
+        return status
+
+
 USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}})
 
 
@@ -179,57 +270,9 @@ class AccountRefresh:
     def tick(self) -> None:
         now = int(self.clock())
         configuration = conf.read(self.settings_path)
-        self._gate_prices(configuration, now)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
                      configuration.number('aws_timeout_s'), self.execute)
         _ = self.refresh_charges(api, now)
-
-    def _gate_prices(self, configuration: conf.ConfigRead, now: int) -> None:
-        """Refresh gate prices even when the former builder route is disabled."""
-        manifest = self.directory / 'gate-deployment.json'
-        if not manifest.exists():
-            return
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with (self.directory / 'spot-prices.lock').open('a+') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            _ = lock.seek(0)
-            try:
-                last = int(lock.read().strip() or '0')
-            except ValueError:
-                last = 0
-            if last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
-                return
-            _ = lock.seek(0)
-            _ = lock.truncate()
-            _ = lock.write(str(now))
-            lock.flush()
-            try:
-                values = conf.read_or_repository('cloud_gate')
-                home = configuration.text('region')
-                deployed = ledger.rows(gate_deployment(manifest, home), 'regions')
-                regions = tuple(dict.fromkeys([*values.words('spot_candidate_regions'),
-                    *[ledger.text(row, 'region') for row in deployed]]))
-                sizes = values.words('instance_types')
-                api = AwsCli(configuration.text('credentials_profile'), home, configuration.number('aws_timeout_s'), self.execute)
-                prices: list[ledger.RegionalSpotPrice] = []
-                for region in regions:
-                    raw = api.in_region(region).call('describe-spot-price-history', '--instance-types', *sizes,
-                        '--product-descriptions', 'Linux/UNIX', '--start-time', datetime.fromtimestamp(now, UTC).isoformat(),
-                        '--no-paginate', '--max-results', '1000')
-                    regional_prices = ledger.regional_spot_prices(region, raw, sizes, now)
-                    keys = {(row.zone, row.instance_type) for row in regional_prices}
-                    zones = {ledger.text(subnet, 'zone') for row in deployed if row['region'] == region
-                             for subnet in ledger.rows(row, 'subnets')}
-                    if (not regional_prices or set(sizes) - {size for _, size in keys}
-                            or any((zone, size) not in keys for zone in zones for size in sizes)):
-                        raise ValueError('The regional Spot price reply omits a type or deployed zone')
-                    prices.extend(regional_prices)
-                ledger.write_spot_prices(self.directory, prices)
-            except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
-                print('aws_target: gate price read unavailable: ' + type(error).__name__, file=sys.stderr)
 
     def refresh_charges(self, api: AwsCli, now: int) -> measurement.ChargeRead | measurement.MeasurementUnavailable:
 
@@ -242,10 +285,12 @@ class AccountRefresh:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('tick',))
+    _ = parser.add_argument('command', choices=('tick', 'snapshot'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     args = parser.parse_args(namespace=RefreshArguments())
+    if args.command == 'snapshot':
+        return snapshot(args.settings, args.directory)
     AccountRefresh(args.settings, args.directory).tick()
     return 0
 
@@ -253,6 +298,7 @@ def main() -> int:
 class RefreshArguments(argparse.Namespace):
     def __init__(self) -> None:
         super().__init__()
+        self.command: str = ''
         self.settings: Path = conf.path('aws_target')
         self.directory: Path = ssh_target_state_directory('aws')
 

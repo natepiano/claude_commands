@@ -7075,6 +7075,42 @@ class HolderSessionTests(unittest.TestCase):
             self.assertEqual(sweep.holder_sessions([300, 400, 999]), {300: "hana-unit"})
         self.assertEqual(sweep.holder_sessions([]), {})
 
+        from scripts.agents import worker_lifecycle
+        from scripts.production import staff
+
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = base / "detached.json"
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "builds-director", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl2", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("worker-session"))
+        table.update({
+            500: process_table.Process(500, 1, "python3", f"python3 detached_runs.py supervise {path}"),
+            600: process_table.Process(600, 500, "verify.sh", "bash verify.sh test"),
+            700: process_table.Process(700, 600, "cargo", "cargo nextest run"),
+        })
+        for case in ("worker", "wrong pid", "missing worker", "missing parent", "finished", "missing", "unreadable"):
+            with self.subTest(case=case):
+                rows = (worker,) if case == "missing parent" else (director, worker)
+                _ = path.write_text(json.dumps({
+                    "pid": 501 if case == "wrong pid" else 500,
+                    "status": "finished" if case == "finished" else "running",
+                    "staff_id": "unknown" if case == "missing worker" else str(worker.id),
+                }))
+                if case == "missing":
+                    path.unlink()
+                elif case == "unreadable":
+                    _ = path.write_text("{")
+                with (mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(sessions, "live_sessions", return_value=[record]),
+                      mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(rows)),
+                      mock.patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as read):
+                    expected = {300: "hana-unit"}
+                    if case == "worker":
+                        expected.update({600: "builds-director", 700: "builds-director"})
+                    self.assertEqual(sweep.holder_sessions([300, 600, 700, 999]), expected)
+                    read.assert_called_once_with(path)
+
 
 class BudgetTests(unittest.TestCase):
     @override
