@@ -72,4 +72,10 @@ An unexpected screen prompt ends no turn, and the director finds it only when it
 2. Answer with `worker.py answer <name> --text "<answer>"`.
 3. End the director turn until the next hook message.
 
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+Use `answer <name> --text "Read the assigned prompt and do the work."` to resubmit the work.
+For an active pass, `answer` adds the saved DONE instruction and keeps the pass and delivery.
+The normal turn hook sends the completion notice after the matching DONE reply.
+A blocked Codex question receives only the supplied answer text.
+
 A repeated saved launcher reads the receipt and returns without another submission.
