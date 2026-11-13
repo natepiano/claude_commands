@@ -56,43 +56,26 @@ The sdlc showrunner's ruling (2026-11-13, 15:40 EST):
 
 ### Phase 1 — Both tables keep table form from the floor width upward  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** In `/showrunner:units`, Claude Code 2.1.319 shows both phase tables as tables at every terminal width from `units_table_floor_columns` upward. No cell needs more than the renderer's line cap at that width. Long text continues on extra rows of the same unit.
-
-**Spec:**
-
-1. **Config.** Add two keys to `config/production.conf`, each with a comment and a range line:
-   - `units_table_floor_columns` — the narrowest terminal width, in terminal columns, where both phase tables keep table form. Set it to the measured value from step 6.
-   - `units_table_cell_lines=4` — the most lines Claude Code 2.1.319 lets one table cell wrap to before it stacks the table.
-   Read both at use, the same way `style_units.py` reads `units_table_columns`.
-2. **Renderer width rule, one module.** Put the Claude Code width rule, continuation rows and id breaks in `scripts/production/claude_table_layout.py`. The width rule is the four diagnosis items above. Give the module one public entry point for the fit. It takes headers, rows and a render width. It returns each column's width and whether wrapping is hard. Name the Claude Code version and the binary location in the module docstring. Measure display width with the rule `display_cells` already uses; each Progress character is 2 columns. Find the render width from the terminal width: measure the difference (the reply indent) in step 7, and keep it as one named value.
-3. **Continuation rows.** At the floor width, a cell that needs more lines than the cap splits into continuation rows of the same unit. Split at item marks first (` · `, then `; `), then at word boundaries. Each piece fills the cap without going over it. A continuation row repeats the Unit name and leaves every other cell empty. Splitting changes full widths, so compute the layout again until no cell needs more lines than the cap. Header cells also count.
-4. **Long ids.** While the sum of column floors at the floor width exceeds the available width, break the longest word of the widest breakable column. Unit, Status, Machine and Progress are not breakable. Break after the last `-`, `/` or `_` between two letters or digits before the column's share; with none, break at the share. A word without a mark breaks only from `units_table_break_columns`, or when no other word can break. A break is one space, so Claude Code can wrap there.
-5. **Monotonic.** Above the floor, every column width only grows, so table form holds. Keep that true. The script shapes for the calling pane width from herdr, and uses the floor when it cannot read one (showrunner ruling for C1514).
-6. **Measure the floor.** With the module, find the narrowest terminal width where table 1 of sdlc, builds and cargo-liner keeps table form after steps 3 and 4, and the Progress bar does not wrap. Set `units_table_floor_columns` to the largest of the three. Put the three measured values in your summary.
-7. **Proof in the renderer.** On natedev, run Claude Code 2.1.319 in a terminal window sized to an exact column count, have it print the `unit_phases.py --production sdlc` output as Markdown (as `/showrunner:units` does), and save a PNG. Take shots at about 200 columns, at 140 and at the floor, once with origin/sdlc's `unit_phases.py` (before) and once with this tree (after). Use one `scratch.py new --worker --name shots` folder; name files `before-<cols>.png` and `after-<cols>.png`. Put the folder path in your summary; the director holds the folder for the checkpoint notice. Use the shots also to confirm the reply indent from step 2: find the narrowest width where the before output still shows table form, and compare it with the module's prediction.
-8. **Tests.** Build rows from the shape of the evidence in `test_claude_table_layout.py` and `test_unit_phases.py`. Use no live unit.
-   - A Queued cell of 400 characters at the floor width becomes continuation rows; each piece fits the cap at the floor width.
-   - A Notes cell with ` · ` marks splits at a mark before a word boundary.
-   - A Phase id of 22 characters and a Workers label of 25 characters in a table whose floors do not fit: each breaks at a hyphen, and the module then predicts no hard wrap.
-   - Above the floor, the module predicts table form for the same rows at a wider width.
-9. **Docs.** Update `commands/showrunner/units.md` (replace "Keep each phase on one Markdown row"; name continuation rows, the floor key and the line cap) and the "Unit phases" entry in `docs/as-built/showrunner-automation.md` in the same commit.
+- `scripts/production/claude_table_layout.py` models the Claude Code 2.1.319 table width rule. `fit(headers, rows, render_width)` returns `ColumnFit(widths, hard_wrap)`; `ColumnFit.keeps_table` predicts table form against the 4-line cap and the `p - 4` width limit.
+- `continued(headers, rows, render_width, line_cap, break_width)` splits a cell over the cap into continuation rows of the same unit, at ` · `, then `; `, then a word boundary, and repeats until no cell exceeds the cap. Unit, Status, Machine and Progress never split.
+- While the column floors exceed the available width, the longest word of the widest breakable column gets one space: after the last `-`, `/` or `_` between two letters or digits within the column share, else at the share for a word of at least `break_width` columns. When no such word is left, the longest word over 3 columns breaks, because one break costs less than the renderer's hard wrap of every column.
+- `unit_phases.py`, run as a script, reads its pane width once through `herdr.own_pane_columns`: the socket method `pane.layout` for `HERDR_PANE_ID`, limited by `units_table_width_read_milliseconds` (50). Median 0.7 ms, p90 7.7 ms; about 6% of reads meet a herdr wait of about 100 ms.
+- `display_cells.wrapped(headers, rows, columns)` shapes both phase tables for that width minus `REPLY_INDENT` (0). Without a width, it uses `units_table_floor_columns` (120) and prints no anomaly. Calls from tests never read a live pane.
+- sdlc shots: no id breaks at 200; ids break at 140 and 120; both tables keep table form at all three widths.
 
 **Files:**
-- `scripts/production/claude_table_layout.py` — new: the renderer width rule, continuation rows and id breaks.
-- `scripts/production/display_cells.py` — `wrapped()` uses the new module.
-- `scripts/production/unit_phases.py` — both tables go through the new fit.
-- `scripts/production/test_claude_table_layout.py`, `scripts/production/test_display_cells.py`, `scripts/production/test_unit_phases.py`, `scripts/agents/test_shutdown_cli.py` — the rows and the config fixture.
-- `config/production.conf`, `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — keys and docs.
+- `scripts/production/claude_table_layout.py` — the renderer model, continuation rows and word breaks.
+- `scripts/herdr/herdr.py` — `own_pane_columns(timeout)`.
+- `scripts/production/display_cells.py` — `pane_columns()` and `wrapped()`.
+- `scripts/production/unit_phases.py` — `main(arguments, columns)` and `table(..., columns)`; the script entry point reads the width.
+- `config/production.conf` — `units_table_floor_columns=120`, `units_table_cell_lines=4`, `units_table_break_columns=30`, `units_table_width_read_milliseconds=50`.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the rules above.
 
-**Workers:** `1 writer`
-- `impl` — writes steps 1–9 and keeps the test lane green.
+**Gotchas:** The floor depends on live data: a new unit name `sdlc-merge-gate` put the sdlc minimums 1 column over 120. A read that times out shapes for the floor, so a wide window can show break spaces. The model matches Claude Code 2.1.319; a renderer change needs a new measure.
 
-**State:** none.
-
-**Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
-2. The Test command passes for the test lane.
-3. Live: `env PYTHONPATH="$PWD" scripts/lib/py -m scripts.production.unit_phases --production sdlc` (also builds and cargo-liner): the module predicts table form for both tables at the floor width.
-4. Renderer: the after shots show both tables as tables at all three widths. The before shot at the floor shows the stacked form.
+**Ruled out:**
+- `:` as a break mark: it split times such as `17:24`.
+- A zero-width space as the break: Claude Code splits words only at plain spaces.
+- Shaping only for the floor: it showed break spaces at every width.
