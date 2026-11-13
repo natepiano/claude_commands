@@ -1300,7 +1300,7 @@ def unit_local_command() -> int:
                     journal.unlink(missing_ok=True)
                 except OSError as error:
                     print(f"anomaly: {row.name}: cannot remove retirement journal: {' '.join(str(error).splitlines())}")
-                retirement_close_idle_shell(pane)
+                retirement_close_idle_shell(pane, row, record)
             elif fields["action"] == "retire":
                 settings = conf.read("production")
                 journal = retirement_journal(row)
@@ -1416,18 +1416,58 @@ def retirement_idle_shell(place: RetiringPane | herdr.NoPane, pid: int) -> bool:
         return False
 
 
-def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane) -> None:
-    if isinstance(place, herdr.NoPane):
-        return
+def retirement_close_idle_shell(place: RetiringPane | herdr.NoPane,
+                                owner: staff.StaffRow, record: staff.StaffSnapshot) -> None:
+    owners = {owner.id, *(member.id for member in record.find(kind="worker", parent=owner.id))}
+    retained: dict[str, set[str]] = {}
+    publications: dict[str, dict[str, pane_launch.PaneLaunch]] = {}
     try:
-        client = herdr.Herdr(place.session)
-        pane = next((pane for pane in client.panes() if pane["pane_id"] == place.pane), None)
-        if pane is not None and not isinstance(client.pane_activity(place.pane), herdr.PaneAtShell):
-            print(f"anomaly: {place.session}:{place.pane}: foreground work keeps the pane open")
-        elif not client.close_retained_pane(place.pane, terminal=place.terminal):
-            print(f"anomaly: {place.session}:{place.pane}: pane close is not confirmed")
+        for path in pane_record.record_directory().glob("*.json"):
+            entries = pane_record.read_strict(path.stem)
+            publications[path.stem] = entries
+            owned = {pane for pane, entry in entries.items()
+                     if isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)
+                     and reference.id in owners}
+            if owned:
+                retained[path.stem] = owned
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-        print(f"anomaly: {place.session}:{place.pane}: pane close failed: {error}")
+        print(f"anomaly: {owner.name}: cannot read retained panes: {error}")
+        return
+    if isinstance(place, RetiringPane):
+        retained.setdefault(place.session, set()).add(place.pane)
+        _ = publications.setdefault(place.session, {})
+    for session, identities in retained.items():
+        try:
+            client = herdr.Herdr(session)
+            panes = {pane["pane_id"]: pane for pane in client.panes()}
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            print(f"anomaly: {session}: pane close failed: {error}")
+            continue
+        for identity in sorted(identities, key=lambda identity: (
+                isinstance(place, RetiringPane) and session == place.session and identity == place.pane, identity)):
+            try:
+                pane = panes.get(identity)
+                if isinstance(place, RetiringPane) and session == place.session and identity == place.pane:
+                    terminal = place.terminal
+                else:
+                    terminal = str(pane.get("terminal_id", "")) if pane is not None else ""
+                if pane is None or pane.get("terminal_id") != terminal:
+                    if not client.close_retained_pane(identity, terminal=terminal):
+                        print(f"anomaly: {session}:{identity}: pane close is not confirmed")
+                    continue
+                launch = publications[session].get(identity)
+                reference = pane_launch.launch_reference(launch, record) if launch is not None else None
+                if reference is not None and (not isinstance(reference, pane_launch.StaffLaunchReference)
+                                               or reference.id not in owners):
+                    continue
+                if (not isinstance(client.pane_activity(identity), herdr.PaneAtShell)
+                        or pane_launch.native_sessions(client, pane)):
+                    print(f"anomaly: {session}:{identity}: foreground work keeps the pane open")
+                    continue
+                if not client.close_retained_pane(identity, terminal=terminal):
+                    print(f"anomaly: {session}:{identity}: pane close is not confirmed")
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                print(f"anomaly: {session}:{identity}: pane close failed: {error}")
 
 def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, record: staff.StaffSnapshot,
                              pane_workers: list[worker_panes.WorkerPane], pane: RetiringPane | herdr.NoPane,
@@ -1525,7 +1565,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         except copies.CopyError as error:
             print(f"anomaly: {error}".replace("\n", " "))
         print("unchanged")
-        retirement_close_idle_shell(pane)
+        retirement_close_idle_shell(pane, row, record)
         return 0
     refused = retirement_refusals(unit, settings=settings)
     if refused:
@@ -1549,7 +1589,7 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     _ = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, unit.worktree, retained_branch),
                            expected=row.worktree)
     print(f"{unit.name} retired")
-    retirement_close_idle_shell(pane)
+    retirement_close_idle_shell(pane, row, record)
     return 0
 
 ADD_UNIT = SCRIPTS / "production" / "add_unit.py"

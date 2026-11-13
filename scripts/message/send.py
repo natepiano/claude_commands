@@ -8,8 +8,8 @@ every message follows are /message (~/.claude/commands/message.md).
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
-                                                          the ones a session or script sends
+  send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence]
+                          a registered push; --help lists the templates
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
@@ -55,6 +55,8 @@ the key until `reopen`. A failed send does not count. A delivered send or a
 message kept for later delivery holds the window, so a retry cannot deliver a
 queued copy twice. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
+`--through-silence` sends a user push during silence. Review and priority stay the same.
+A normal push does not repeat or need acknowledgement.
 
 One event sends one emergency push. An emergency push (`--to user --need blocked`)
 with no `--key` gets the key `user-emergency:<sender>:<first 12 hex of the title's
@@ -801,6 +803,7 @@ class Options(NamedTuple):
     reference: push_reference.PushReference = push_reference.NO_REFERENCE
 
     recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
+    silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE
 
     @property
     def to(self) -> str:
@@ -2666,7 +2669,7 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
     return original
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False) -> Result:
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = (), due: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False, silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> Result:
     """Reach the user. The channel is this function's business alone."""
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
@@ -2677,6 +2680,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
                    "--text-id", text_id, *(["--answerable"] if answerable else [])]
         for value in values:
             command.extend(["--value", value])
+    if silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
+        command[2:2] = ["--through-silence"]
     if due:
         command[2:2] = ["--due", due]
     if reference["kind"] != "none":
@@ -2807,6 +2812,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
             forwarded += ["--recipient-key", options.recipient_identity.name]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.silence_policy == silence.SilencePolicy.SEND_THROUGH_SILENCE:
+            forwarded += ["--through-silence"]
         if options.reference["kind"] != "none":
             forwarded += ["--push-reference", json.dumps(options.reference)]
         if options.due:
@@ -3041,6 +3048,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--through-silence", action="store_true", help="to `user`: send during silence with the same review and priority")
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
     _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
@@ -3154,6 +3162,8 @@ def parse(argv: list[str]) -> Options:
     action_text = optional_str(attr(args, "action"))
     no_action = attr(args, "no_action") is True
     if to != USER:
+        if attr(args, "through_silence") is True:
+            parser.error("--through-silence must go with --to user")
         if attr(args, "answerable") is True:
             parser.error("--answerable goes with --to user")
         if action_text is not None or no_action:
@@ -3176,7 +3186,7 @@ def parse(argv: list[str]) -> Options:
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference", "recipient_identity"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender", "sender_origin", "reference", "recipient_identity", "silence_policy"}}
     recipient_key = optional_str(attr(args, "recipient_key"))
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
@@ -3189,6 +3199,8 @@ def parse(argv: list[str]) -> Options:
                       report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved(),
                       sender_origin=origin, due=due, reference=reference,
+                      silence_policy=(silence.SilencePolicy.SEND_THROUGH_SILENCE if attr(args, "through_silence") is True
+                                      else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
     if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
@@ -3524,7 +3536,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender))
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexSessionRecipient):

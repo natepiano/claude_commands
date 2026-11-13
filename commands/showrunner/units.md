@@ -9,7 +9,7 @@ Run this in the showrunner session. Run
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
 Print the tables as Markdown in the reply, without code fences.
-Keep each unit on one Markdown row so Claude Code wraps its cells within the terminal width.
+Keep each phase on one Markdown row so Claude Code wraps its cells within the terminal width.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
 For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule.
@@ -37,8 +37,16 @@ For units outside the `Style units` table in a production without `Kind: style`,
 Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
 Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
 Both tables use the same unit order.
+Each open phase of a unit's newest run gets one row in each table.
+The current staff run pointer selects the unit run before newer completed ad hoc records.
+Rows follow the configured plan order, then the start order for phases outside that plan.
+Each row repeats the Unit name.
+Only the first row shows Status, Machine, Progress, ETA Plan, and Queued.
+Later rows use `—` in those cells.
+A unit without open phases keeps one row.
+A run remains open after a `reopened` event until a later `run_finished` event.
 Workers uses the configured display name.
-ETA Plan appears only when at least one row has unfinished plan phases.
+ETA Plan appears when a unit has unfinished plan phases or a promise for an unfinished target without an open row.
 
 1. **Progress** shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
    It uses one cell per phase, or 20 equal groups above 20 phases.
@@ -49,35 +57,52 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    `Progress: 🟩 done · 🟨 open · ⬜ not started`.
    A blank line separates table 2 from the legend or table 1.
    The style table has no Progress legend.
-2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
+2. **Phase** shows the phase id for an open phase row.
+   Without an open phase, it shows `<done>/<total>` from Progress, or `—` with no phases.
    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
    A finished newest run supplies no fallback.
-3. **Notes** shows `phase <id> — <step>: <task>` for the open phase.
-   The newest run supplies the open step; no step uses the phase title.
+3. **Notes** starts with `phase <id> — <phase title>` for the open phase.
+   The phase instance in the newest run supplies the open step.
+   A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
+   Empty text, role-only text, and `<label> dispatch` add nothing.
+   Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
    Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
-4. **ETA Next** shows the latest promise for the open plan phase first.
-   Without an open plan phase, it uses the newest open phase outside the plan.
+   Each open worker or director wait appends ` · waiting on <reason> <elapsed>`.
+   A recorded holder adds `(held by <holder>)` before the elapsed time.
+   A matching staff ID or current session ID uses the staff name.
+   An unknown holder keeps its recorded name or ID.
+   A reason that starts with `waiting on`, `waiting for`, or either phrase after `blocked:` keeps that wording.
+   A finished wait or pass removes its wait text.
+   Status keeps the session classifier even while Notes shows a wait.
+4. **ETA Next** shows the latest stated promise for that row's phase instance.
+   `eta_phase_id` names the target; the active instance on an ETA event does not override that target.
    Without open work, it uses the next not-started plan phase with a promise.
    A passed promise adds ` · late <elapsed>`.
-   Open work without a promise shows `no ETA`; no open work or promised phase gives `—`.
+   Open work without a promise shows `no ETA stated`; no open work or promised phase gives `—`.
    Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
 5. **ETA Plan** shows the predicted plan finish in the same time form, without `ends`.
    It never precedes the latest promise of any open or not-started plan phase.
-   A row without an unfinished plan shows `—`.
-6. **Workers** lists workers with runs before workers that are working.
+   The first row also names promises for unfinished targets without open rows, as `phase <id>: <time>[ · late <elapsed>]`.
+   The latest `phase_finished` event for each target decides whether that target is done.
+   Only status `completed` marks a target as done.
+   A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
+   That target's promise remains visible.
+   A row without an unfinished plan or such a promise shows `—`.
+6. **Workers** lists workers with open passes in that row's phase instance, from the run records.
+   It lists workers with detached runs before workers that are working.
    Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
-   Idle workers append ` +<n> idle` to a nonempty cell.
-   Closed workers and workers on another machine add nothing.
-7. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
-   It excludes the phase that Notes names in the same row.
-   With no remaining phase, it shows `—`.
+   A finished pass removes its worker.
+   Without an open phase row, the cell keeps the existing pane observation rules.
+7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
+   A row without a recorded phase instance keeps the existing summary for work outside the plan.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
    It excludes each queue item whose text equals Notes in the same row.
    Each part adds ` +<n> more` for later items.
    The queue count includes only remaining items.
    With no remaining queue item, it shows the plan part or `—`.
    Plan work includes every phase that is neither done nor open.
+   Every open phase of the newest run stays outside Queued, including phases absent from the configured plan.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 

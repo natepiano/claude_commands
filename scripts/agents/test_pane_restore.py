@@ -457,7 +457,7 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(client.closed, [])
                 self.assertIn("pane close anomaly:", output)
                 self.assertEqual(output.count("pane close anomaly:"), 1)
-                self.assertEqual(list(pane_record.read("agents")), ["w1:p3"])
+                self.assertEqual(list(pane_record.read("agents")), ["w1:p2", "w1:p3"])
                 self.assertIn("w1:p2", [row["pane_id"] for row in client.rows])
 
     def test_unknown_staff_home_reports_once_and_keeps_normal_account_selection(self) -> None:

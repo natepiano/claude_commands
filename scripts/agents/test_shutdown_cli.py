@@ -240,6 +240,35 @@ class RetireUnitTests(unittest.TestCase):
         ])
 
 
+        for foreign, placement in ((False, "retained unit shells"), (True, "foreign row"),
+                                   (False, "director gone"), (False, "worker in another tab")):
+            with self.subTest(tab=placement):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    owner = staff.by_id(case.unit_staff_id)
+                    assert owner is not None
+                    case.pane_world.session = "alpha"
+                    worker = staff.snapshot().find(kind="worker", parent=owner.id)[0]
+                    case.pane_world.record(worker, "w1:p2")
+                    if placement != "director gone":
+                        case.pane_world.add(owner, "w1:p1", live=False)
+                    if placement == "worker in another tab":
+                        case.pane_world.add(worker, "w1:p4", live=False, tab="w1:t2")
+                    sibling = (fixture_member("unit", name="other", parent=owner.parent.id)
+                               if foreign and isinstance(owner.parent, staff.ReportsTo) else owner)
+                    if placement in ("retained unit shells", "foreign row"):
+                        case.pane_world.add(sibling, "w1:p3", live=False)
+                        case.pane_world.record(sibling, "w1:p3")
+                    code, output = case.retire()
+                    case.assertEqual(code, 0, output)
+                    panes = {pane["pane_id"] for pane in case.pane_world.panes() if pane.get("tab_id") == "w1:t1"}
+                    case.assertEqual(panes, {"w1:p3"} if foreign else set())
+                    case.assertNotIn("w1:p4", case.pane_world.locations)
+                    case.assertIsNotNone(staff.by_id(worker.id))
+                finally:
+                    case.doCleanups()
+
     def test_retirement_continues_after_a_member_stop_raises(self) -> None:
         def stop(identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped | stop_resume.NotRunning:
             if identity == DIRECTOR:
