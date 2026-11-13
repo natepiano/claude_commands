@@ -1229,7 +1229,7 @@ From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, a
 - `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
 - `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
 
-### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: todo
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
 
 From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61. The waiting and unmatched CI job states go in the new optional field.
 From builds (not the user), 2026-11-13: a test proves that the client at `7fdfd9a6a` parses the new service snapshot.
