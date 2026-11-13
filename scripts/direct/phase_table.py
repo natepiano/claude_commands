@@ -929,6 +929,29 @@ def _with_history(
     )
 
 
+def with_run_promises(record: PhaseRecord, events: list[dict[str, object]]) -> PhaseRecord:
+    """Use one run's promise trails and preserve the plan's duration predictions."""
+    runs = [events]
+    instances = _phase_instances(runs)
+    phases: list[plan_history.PlanPhase] = [
+        {"id": row.phase, "title": row.title, "done": isinstance(row, DonePhase)}
+        for row in record.phases
+    ]
+    assigned = _instances_by_phase(phases, instances)
+    rows: list[DonePhase | OpenPhase | TodoPhase] = []
+    current = record.current
+    for row, related in zip(record.phases, assigned, strict=True):
+        history = _phase_history(runs, related, row)
+        enriched = replace(row, eta_trail=history.eta_trail)
+        rows.append(enriched)
+        if isinstance(current, OpenPhase) and current.phase == row.phase:
+            current = replace(current, eta_trail=history.eta_trail)
+    if isinstance(current, OpenPhase) and current.phase not in {row.phase for row in rows}:
+        related = [instance for instance in instances if instance.instance_id == current.instance_id]
+        current = replace(current, eta_trail=_phase_history(runs, related, current).eta_trail)
+    return record._replace(current=current, phases=rows, plan_finish=_plan_finish(rows))
+
+
 def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
     """Select the run that its owner's staff pointer names."""
     opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
