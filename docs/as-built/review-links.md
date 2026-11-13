@@ -83,6 +83,57 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Hana console
+
+`change_page.py` without rows prints `/<snapshot>/console.html?page=changes`.
+Selected-row links with `--production NAME C27` still open `changes.html` directly.
+`scripts/review_links/console.py` publishes the console beside its Changes snapshot.
+The server applies the same root, traversal, private-file, and symlink rules to both pages.
+The console adds a same-origin content policy and permits same-origin framing.
+Its title is **Hana console**, followed by the selected page title.
+
+The left navigation has icons and labels for Changes and Builds.
+The desktop top bar shows only the selected page title.
+Its toggle collapses the labels into an icon rail.
+Hover and keyboard focus show each collapsed label.
+The browser stores the collapse state in `localStorage`.
+Each storage operation catches failures, so blocked storage does not stop navigation.
+The selected page fills a same-origin frame beside the navigation.
+The shell follows the system light or dark theme.
+At phone width, a slim top bar shows **Hana console** and a menu button.
+The frame uses the full page width below the top bar.
+The menu button opens the navigation above the frame.
+A page choice, the Escape key, or a click outside closes the navigation.
+The phone navigation starts closed and does not change the stored desktop state.
+
+`?page=<id>` selects a page.
+Missing and unknown ids select the first configured entry.
+Navigation clicks update this query with `history.replaceState`.
+
+`config/console.conf` defines entries in file order.
+The publisher reads it through `conf.read("console")` when it creates the link.
+Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
+The URL value has the form `python:<module>:<function>`.
+The function takes no arguments and returns a URL path under the review root.
+The console also accepts a full URL from the configured review origin and converts it to a path.
+The URL function raises one of `review_link.SNAPSHOT_ERRORS` when the page is unavailable.
+An absent function also makes the entry unavailable.
+That entry remains visible and shows **Not available** when selected.
+Publishing the console again resolves the current configuration and page availability.
+
+A page joins with one configuration block and its URL function.
+The page serves itself at that path and permits same-origin framing.
+A link that leaves the page uses `target="_top"`.
+The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
+`change_page.page_url` reuses the existing Changes publisher.
+The Builds entry calls `memory_feed.page_url`.
+That function returns the configured Builds page URL without publishing a reading.
+
+The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+That folder includes the version, source, and ISC license.
+The console inlines the icons and makes no CDN, font, script, or stylesheet request.
+
 ### Questions, Changes, and Rebuilds
 
 The review page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
