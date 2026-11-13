@@ -536,6 +536,28 @@ An unconfirmed worker stop needs targeted proof of process absence before restar
 Live or unknown evidence leaves the worker pending.
 The worker check uses the same function as the Codex row check.
 
+### Legacy Claude launchers
+
+`assign_claude.run` installs no signal handler.
+Its child commands inherit the launcher's process group.
+Stop that group to stop the launcher and its child commands.
+`assign.sh` uses `exec` for `assign.py` and creates no separate process group.
+The current native worker path does not call the legacy Claude launcher.
+
+The launcher checks the claim owner under the claim lock before each publication.
+The launcher records its PID and process start in `impl_claim_<slot>.json` before work starts.
+The claim also records the host, boot, and PID namespace.
+`read_worker_claim` rejects dead processes, zombie processes, and reused PIDs.
+It compares local processes only when the saved scope matches the current scope.
+It retains claims with missing start evidence, missing scope, different scope, or unreadable identity.
+Status readers recover an `implementing` status whose launcher has ended.
+They write `error` and add a blocked board entry under the claim lock.
+The next assignment can replace the ended claim.
+Normal completion still releases the claim.
+An interrupted exit retains the claim, including a Python `KeyboardInterrupt` from SIGINT.
+A killed launcher cannot record pass completion.
+Its ledger entry keeps the last saved state.
+
 ### Gates during a session restart
 
 A session stop sends TERM, then KILL after the grace period, to the one proved agent PID (`stop_resume.py`).
