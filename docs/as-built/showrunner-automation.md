@@ -638,6 +638,12 @@ Saved progress state uses the fixed staff reference instead of a copied session 
   A cut adds `…` and never splits a wide character.
   Fixed columns and minimum text widths can exceed a smaller configured width.
   The command reads terminal metadata, never pane contents.
+  - **One read per command:** `unit_phases.main` takes one `staff.snapshot()` and opens `plan_history.history_snapshot(snapshot)` inside `herdr.observation_snapshot()`.
+    Inside that scope, `plan_history.staff_record()`, `run_starts()` and `read_run_events(path)` return the shared staff record, run headers and run events.
+    Each run file is read once per command.
+    The live-unit reader thread runs `live_units.read_units(name, record=snapshot, ...)` through `copy_context().run`, so it uses the same snapshot.
+    A thread started without `copy_context()` does not see the snapshot and reads everything again.
+    On natedev, `--production sdlc` prints in about 2 seconds.
   - **Status and anomalies:** The phase status table and the style table derive Status through the shared classifier and staff hold fields.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
     `units_of(name)` uses that reader and prints its anomalies on stderr.

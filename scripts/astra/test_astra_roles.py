@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import contextlib
 import io
+import fcntl
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from scripts.astra import design_roles  # noqa: E402
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import process_start
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.stop_injection_test_support import stop_in_child
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
@@ -83,8 +85,9 @@ class AstraRolesTests(StaffTestCase):
             assert not isinstance(held, astra_roles.HoldWorkerUnavailable)
             self.assertEqual(held["lifetime"], astra_roles.HeldDesignRole(design_id, "designer"))
             record = cast(dict[str, object], json.loads((self.state / "99340615-2159-5777-b1c8-71572890df55.json").read_text()))
-            self.assertEqual({key: record[key] for key in ("design_id", "role_id", "session_dir", "worker", "pid")},
-                             {"design_id": design_id, "role_id": "designer", "session_dir": None, "worker": None, "pid": None})
+            self.assertEqual({key: value for key, value in record.items() if key != "held_at"},
+                             {"staff_id": "99340615-2159-5777-b1c8-71572890df55", "design_id": design_id,
+                              "role_id": "designer", "pid": None})
             world = PaneWorld()
             row = staff.by_id(staff.StaffId("99340615-2159-5777-b1c8-71572890df55"))
             assert row is not None
@@ -165,6 +168,22 @@ class AstraRolesTests(StaffTestCase):
         ])
         for role in roles:
             self.assertTrue({"session_dir", "worker", "pid"}.isdisjoint(role))
+        locks: list[bool] = []
+
+        def locked_write(path: Path, text: str) -> None:
+            with (self.state / "lock").open("a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    locks.append(True)
+                else:
+                    locks.append(False)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+            write_text_atomic(path, text)
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(astra_roles, "write_text_atomic", side_effect=locked_write):
+            _ = astra_roles.hold("designer", astra_roles.ExecProcess(os.getpid()), "5048811c-26db-50f1-bf82-b3c52202e7ff")
+        self.assertEqual(locks, [True])
 
 
 
@@ -182,7 +201,6 @@ class AstraRolesTests(StaffTestCase):
             assert isinstance(started, process_start.Started)
             self.assertEqual({key: value for key, value in records[0].items() if key != "held_at"}, {
                 "staff_id": "4f832112-25a1-5946-bf2c-52640f8daba4",
-                "session_dir": None, "worker": None,
                 "pid": process.pid, "pid_start": started.start, "state": "busy",
             })
         finally:
