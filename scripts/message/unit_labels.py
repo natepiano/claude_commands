@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
@@ -73,11 +74,20 @@ class UnitWithoutRunningDirector:
 DirectorRelationship = DirectsUnit | UnderDirector | UnitWithoutRunningDirector | NoDirector
 
 
+class OwnerRole(StrEnum):
+    """The role of the owner for whom a session runs a step."""
+
+    UNKNOWN = "unknown"
+    SHOWRUNNER = "showrunner"
+    UNIT = "unit"
+
+
 @dataclass(frozen=True)
 class UnitLabels:
     session: str
     showrunner: str = "—"
     unit: str = "—"
+    role: OwnerRole = OwnerRole.UNKNOWN
 
     @property
     def owner_text(self) -> str:
@@ -105,7 +115,15 @@ def make_labels(name: str, showrunner: ShowrunnerRelationship,
     production = " ".join(production_of(showrunner).split())
     unit = " ".join(unit_of(director).split())
     session = " ".join(name.split())
-    return UnitLabels(session, production or "—", unit or "—")
+    if isinstance(showrunner, RunsProduction):
+        role = OwnerRole.SHOWRUNNER
+    elif isinstance(director, (DirectsUnit, UnderDirector, UnitWithoutRunningDirector)):
+        role = OwnerRole.UNIT
+    elif isinstance(showrunner, (UnderShowrunner, ProductionWithoutRunningShowrunner)):
+        role = OwnerRole.SHOWRUNNER
+    else:
+        role = OwnerRole.UNKNOWN
+    return UnitLabels(session, production or "—", unit or "—", role)
 
 
 def production_of(showrunner: ShowrunnerRelationship) -> str:

@@ -962,6 +962,15 @@ def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
                    or unit_labels.OWNER_NOT_RECORDED)
 
 
+def cloud_step_name(row: wire.CloudRow, model: QueueModel) -> str:
+    """Name page steps from their recorded owner's labels."""
+    label = model.cloud_labels.get(row.identity.session_id)
+    if label is None:
+        return model.names.shown(row.identity.step)
+    unit = label.unit if label.unit not in ("", "—", unit_labels.OWNER_NOT_RECORDED) else ""
+    return model.names.for_owner(row.identity.step, unit, label.role)
+
+
 @dataclass(frozen=True)
 class WaitingBuild:
     position: int
