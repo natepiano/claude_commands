@@ -1320,14 +1320,16 @@ From builds (not the user), 2026-11-13: the user wants one admin console with a 
 
 ### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
 
-From builds (not the user), 2026-11-13: the user's screenshot shows the Mac row "hana build" (Mac pid 68214, 41 min) with Unit "—". Its claim is `hana.json`, "research P16 Mac shots build", session 650d6070, which `unit_labels` resolves to research. The build runs in a hand-made clone `~/rust/hana_p16shots_<epoch>`. That folder is outside the claim worktree and outside every copies mirror, so `memory_feed.mac_build_units` finds no match.
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
 
-Director check, 2026-11-13: the claim also records `remote_host` as `natemccoy@mac`, and `mac_build_units` keeps only claims whose `remote_host` is exactly `mac`.
+#### As-built
 
-1. The Mac has one claim slot per repository. A Mac build that records no session and matches no worktree or mirror takes the unit of its repository's one Mac claim. A build that records a different session takes no unit.
-2. A claim's `remote_host` names the Mac when its host part (after any `user@`) is `mac`.
-3. A hana CI process on the Mac never takes a claim's unit through this match.
-4. The worktree and mirror matches keep their current results.
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
 
 ### Phase 70 — Cloud step names carry their unit · status: todo
 
