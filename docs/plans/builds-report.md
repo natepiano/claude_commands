@@ -1342,8 +1342,9 @@ From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-
 - One cloud naming helper in `queue_view.py` names both the Running and the Queued rows.
 - A worker's step belongs to its owner (director decision, 2026-11-13). sdlc's merge worker, staff kind unit, reads "sdlc-merge-gate merge".
 - Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
+- Repair (merge test red, from builds): live Claude workers take their labels through `staff_relationships` and `make_labels`, so the live, recorded and roster readers give the same role. `priority_labels` order does not change.
 
-**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
+**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/build_queue/test_admission_service.py`; `scripts/message/test_roster.py`; `scripts/production/test_unit_lookup.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
 
 ### Phase 69f — The Mac reading survives an unreadable folder · status: done
 
@@ -1353,3 +1354,15 @@ From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading a
 2. `read_builds` keeps a row when one field fails, and the other rows stay.
 3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
 4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
+
+### Phase 71 — Every row names its unit and showrunner · status: todo
+
+From the user (via builds), 2026-11-13: "it's working but i can't tell who is the showrunner for hana nextest running on the mac - it needs to show the showrunner in small text underneath and it should show the {unit} {step} above - if it is a showrunner run thing then it should say showrunner nextest and still show the name of the showrunner before it. the showrunner and the unit should be on every hoverable tooltip so i don't have to guess". Screenshot: /tmp/claude/scratch/user-shot-mac-showrunner-names.png. <!-- allow-banned: user quote --> From builds (not the user), 2026-11-13: items 1-5.
+
+1. Every row on every machine (natedev, Mac, AWS), Running and Queued, has the top line "{unit} {step}". A showrunner run reads "showrunner {step}".
+2. The small text under it is the showrunner name, for example "hana".
+3. A CI row has no unit or showrunner: the top line is "CI {step}", and the small text is the current ci_label (hana CI · runner · job).
+4. Every hover tooltip on the page names the showrunner and the unit, or CI.
+5. Proof: before and after shots of the Mac CI row (pid 90082 in the shot) and one tooltip.
+6. From the user (via builds), 2026-11-13: "space between columns Done and Duration should be consistent - there is too much space between these two column headers that could be used". Screenshot: /tmp/claude/scratch/user-shot-done-duration-gap.png. From builds (not the user): every column gap in the Running and Queued tables has the same width, the Waiting header included. The freed space goes to the Unit column, so "owner not recorded" shows in full. Proof: before and after shots of both tables.
+7. From the user (via builds), 2026-11-13: "rename Machine column header to Target - rename Duration to Dur - this should give a couple of chars back in many circumstances". From builds (not the user): rename both headers in the Running and Queued tables and anywhere else the page uses them. The freed space goes to Unit.
