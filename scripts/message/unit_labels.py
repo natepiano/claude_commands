@@ -361,10 +361,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
                                             known_sessions={record["sessionId"]: record for record in records},
                                             membership=record, resolver=resolver)
         runners = showrunner_ids(records, registered, membership=record)
-        directors: dict[str, str] = {
-            row.current_session: parent.current_session for row in record.find(kind="worker")
-            if (parent := record.parent_of(row)) is not None}
-        places = production_places(records, set(directors), diagnostics,
+        workers: dict[str, staff.StaffRow] = {
+            row.current_session: row for row in record.find(kind="worker")
+            if record.parent_of(row) is not None}
+        places = production_places(records, set(workers), diagnostics,
                                    record=record, resolver=resolver)
         # Read names from staff for the native sessions in this registry.
         names: dict[str, str] = {
@@ -379,15 +379,10 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
             elif session_id in places:
                 showrunner = places[session_id].showrunner
                 director = places[session_id].director
-            elif session_id in directors:
-                owner = directors[session_id]
-                place = places.get(owner)
-                unit = ""
-                if place is not None:
-                    showrunner = place.showrunner
-                    unit = place.director.unit
-                director = (UnderDirector(unit, names[owner], f"session:{owner}")
-                            if owner in names else UnitWithoutRunningDirector(unit))
+            elif session_id in workers:
+                director, showrunner = staff_relationships(
+                    record, workers[session_id], names,
+                    {key: place.showrunner for key, place in places.items()})
             labels[session_id] = make_labels(names[session_id], showrunner, director)
         labels.update(codex_unit_labels(wanted - labels.keys(), records, places, membership=record))
         labels.update(recorded_owner_labels(wanted - labels.keys(), record))

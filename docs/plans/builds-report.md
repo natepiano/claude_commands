@@ -1344,3 +1344,12 @@ From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-
 - Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
 
 **Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
+
+### Phase 69f — The Mac reading survives an unreadable folder · status: done
+
+From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading at 13:20. `project_record` called `Path.exists()` on `/Users/hana-ci/actions-runner/_work/hana/hana/.git`, which natepiano cannot read, so a `PermissionError` failed the whole read.
+
+1. `project_record` returns the empty record on `OSError`, so an unreadable folder reads as unknown.
+2. `read_builds` keeps a row when one field fails, and the other rows stay.
+3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
+4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
