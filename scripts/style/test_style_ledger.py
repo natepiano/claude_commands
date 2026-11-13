@@ -376,19 +376,23 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertEqual(len(upgraded.ticket_open(ticket_owner_id("names"))), 2)
         self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
-        for route in ("sql", "ledger"):
-            with self.subTest(candidate_migration=route):
-                database = self.root / f"phase-one-{route}.sqlite"
+        for source_version, route in ((40, "sql"), (40, "ledger"), (41, "sql"), (41, "ledger")):
+            with self.subTest(candidate_migration=route, source_version=source_version):
+                database = self.root / f"phase-one-{source_version}-{route}.sqlite"
                 with closing(sqlite3.connect(database)) as connection:
                     for number, migration in sorted(style_ledger.MIGRATIONS.items()):
-                        if number <= 40:
+                        if number <= source_version:
                             _ = connection.executescript(migration)
-                    _ = connection.execute("INSERT INTO refill_objects VALUES ('store','blob',1,'line_count','',7)")
+                    _ = connection.execute(
+                        "INSERT INTO refill_objects(object_store,object_id,reader_version,fact_kind,fact_key,line_count) "
+                        + "VALUES ('store','blob',1,'line_count','',7)")
                     _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
-                    _ = connection.execute("INSERT INTO schema_version VALUES (40)")
+                    _ = connection.execute("INSERT INTO schema_version VALUES (?)", (source_version,))
                     connection.commit()
                     if route == "sql":
-                        _ = connection.executescript(style_ledger.MIGRATIONS[41])
+                        for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                            if number > source_version:
+                                _ = connection.executescript(migration)
                 if route == "ledger":
                     with style_ledger.Ledger(self.repo, database):
                         pass
