@@ -1274,12 +1274,19 @@ From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited
 
 ### Phase 65 — The build page titles the waiting section by its order · status: done
 
-From builds (not the user), 2026-11-13, with the user's words and shot `/tmp/claude/scratch/user-shot-queued-title.png`: "i want the next step room in the middle to be where it is but then a hairline after it as well as before and then the Queued section should have a title of Queued, in order of submission ... if order of submission has been changed by a prioritization bump it should say Queued, {unit} first, then in submission order (and if multiple units then Queued, {unit} followed by {unit} and then in submission order".
+From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/scratch/user-shot-queued-title.png`: a hairline after the Next step room row, and a title for the waiting section that names its order.
 
-1. Keep the Next step room row in place. Add a hairline after it, the same as the one before it.
-2. Title the waiting section like "Running, in start order": "Queued, in order of submission".
-3. When bumps moved steps ahead: "Queued, <unit> first, then in submission order". For more than one: "Queued, <unit> followed by <unit> and then in submission order".
-4. Use the queue's own priority data, with no copy of the order logic. Keep the diff small: queue 44ad also edits `memory_live.html`.
+#### As-built
+
+- The Next step room row keeps its place. A 1px hairline after it matches the one before it.
+- The waiting section has a title in the style of "Running, in start order":
+  - "Queued, in order of submission" with no bump.
+  - "Queued, <unit> first, then in submission order" for one bumped unit.
+  - "Queued, <unit> followed by <unit> and then in submission order" for more than one.
+- `memory_feed.py` sends `queued_priority_units`. It reads the queue's own `QueuePriority.entries` (written by `build_queue.py` bump) and the captured waiting order. It does not sort the queue. It drops absent units and duplicates.
+- Tests in `test_memory_feed.py` and `test_memory_hover.py` cover zero, one and two units, removed priorities, source order and escaped text. `memory_page_proof.mjs` checks 18 title cases at three widths in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
 
 ### Phase 66 — Retire /build:queue · status: todo
 
