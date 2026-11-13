@@ -111,10 +111,11 @@ class MemoryHoverTests(unittest.TestCase):
                     {"name": "CI counter", "ci": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                 ]
+                waiting_kinds: tuple[tuple[str, dict[str, object]], ...] = (
+                    ("first", {}), ("cloud wait", {"kind": "cloud"}), ("second", {}))
                 waiters = [{"name": name, "since": 100, "detail": "fixture", "pid": 20 + index,
                             "progress": {"kind": "RowProgress", "phase": "building"}, **extra}
-                           for index, (name, extra) in enumerate((
-                               ("first", {}), ("cloud wait", {"kind": "cloud"}), ("second", {})))]
+                           for index, (name, extra) in enumerate(waiting_kinds)]
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
                         "walk": running, "waiters": waiters if waiting else []}
                 rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
@@ -164,6 +165,56 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(result[1:], ["4.1 of 48.0 GiB taken", 0.125, 3])
                 if rows:
                     self.assertEqual(rows[0][0].text, "—")
+                    ci_unit = rows[0].find("td[@class='unit']/span")
+                    assert ci_unit is not None
+                    self.assertEqual(ci_unit.text, "hana CI")
+
+    def test_mac_row_uses_its_stage_unit_memory_and_aligned_tooltip(self) -> None:
+        for stage, expected in (("MacBuilding", "building"), ("MacTesting", "testing"),
+                                ("MacTestingCounter", "testing"), ("MacStageUnavailable", "—")):
+            with self.subTest(stage=stage):
+                row = {"kind": "mac-build", "name": "hana nextest", "unit": "trunk", "pid": 710001,
+                       "machine": "mac", "vcpus": 12, "repository": "hana", "showrunner": "hana", "started_at": 100, "read_at": 190,
+                       "used": 3.5, "stage": {"kind": stage}}
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [row], "waiters": []}
+                result = cast(list[str], self.page_expression(
+                    "(renderWalk(data), [$('walk').innerHTML, tooltipHtml('row:0', data)])", data, walk=True))
+                table = ElementTree.fromstring(f"<root>{result[0]}</root>")
+                metadata = table.find(".//tr[@data-tip='row:0']")
+                assert metadata is not None
+                self.assertEqual(metadata[0].text, expected)
+                unit = metadata.find("td[@class='unit']")
+                vcpus = metadata.find("td[@class='vcpus']")
+                assert unit is not None and vcpus is not None
+                self.assertEqual(unit[0].text, "trunk")
+                self.assertEqual(vcpus.text, "12")
+                owner = table.find(".//div[@data-run='0']/span/span[@class='owner']")
+                assert owner is not None
+                self.assertEqual(owner.text, "hana")
+                tooltip = ElementTree.fromstring(f"<root>{result[1]}</root>")
+                title = tooltip.find("b")
+                sentence = tooltip.find("span")
+                machine = tooltip.find("dl/dd")
+                assert title is not None and sentence is not None and machine is not None
+                self.assertEqual(title.text, "hana nextest · 3.5 GiB")
+                self.assertEqual(sentence.text, "Mac memory does not count against natedev.")
+                self.assertEqual([cell.text for cell in tooltip.findall("dl/dt")], ["Machine", "Started", "Used", "Reading age"])
+                self.assertEqual(machine.text, "mac")
+                self.assertIn("3.5 GiB", result[1])
+
+    def test_mac_failed_reading_shows_a_short_status_and_unknown_cells(self) -> None:
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [], "walk": [{
+            "kind": "mac-unavailable", "name": "Mac builds", "unit": "—", "machine": "mac",
+            "started_at": 0, "read_at": 0, "used": {"kind": "MacMemoryUnavailable"},
+            "stage": {"kind": "MacStageUnavailable"}, "status": "Mac reading is old · age unavailable"}]}
+        result = cast(list[str], self.page_expression(
+            "(renderWalk(data), [$('walk').innerHTML, tooltipHtml('row:0', data)])", data, walk=True))
+        root = ElementTree.fromstring(f"<root>{result[0]}</root>")
+        row = root.find(".//tr[@data-tip='row:0']")
+        assert row is not None
+        self.assertEqual([row[index].text for index in (0, 2, 4, 6)], ["—", "—", "—", "—"])
+        self.assertEqual(row[3][0].text, "—")
+        self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         head = "Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots"
