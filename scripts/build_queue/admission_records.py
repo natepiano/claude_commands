@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -437,8 +437,15 @@ class UnownedSliceMemory(MeasuredMemory):
     job_state: RunningServiceJob | IdleService | NotServiceSlice = field(
         default=NotServiceSlice(), metadata={"acquisition_unused": True})
     # New service states belong in this optional field.
-    service_job_state: ServiceJobStateNotRecorded = field(
+    service_job_state: ServiceJobState | ServiceJobStateNotRecorded = field(
         default_factory=ServiceJobStateNotRecorded, kw_only=True, metadata={"acquisition_unused": True})
+
+
+def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -> ServiceJobState:
+    """Read the current state, with the legacy state for older snapshots."""
+    if isinstance(memory, UnownedSliceMemory) and not isinstance(memory.service_job_state, ServiceJobStateNotRecorded):
+        return memory.service_job_state
+    return memory.job_state
 
 
 @dataclass(frozen=True)

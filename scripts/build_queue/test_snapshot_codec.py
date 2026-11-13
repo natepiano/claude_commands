@@ -13,7 +13,7 @@ from unittest import mock
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import wait_reply
-from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob
+from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,17 @@ def pinned_snapshot_reader() -> Generator[tuple[Callable[[object, object], objec
 class SnapshotCodecTests(unittest.TestCase):
     def test_pinned_client_schema_ignores_new_service_states_in_the_optional_field(self) -> None:
         with pinned_snapshot_reader() as (parse, schema):
-            for kind in ("ServiceJobStateNotRecorded", "WaitingServiceJob", "UnmatchedServiceJob"):
-                with self.subTest(kind=kind):
-                    raw = cast(dict[str, object], codec.snapshot_value(service_snapshot()))
+            for current in (records.ServiceJobStateNotRecorded(), WaitingServiceJob(100), UnmatchedServiceJob(100)):
+                with self.subTest(state=current):
+                    snapshot = service_snapshot()
+                    original = snapshot.running[0].measured
+                    assert isinstance(original, records.UnownedSliceMemory)
+                    snapshot = replace(snapshot, running=(replace(snapshot.running[0],
+                        measured=replace(original, service_job_state=current)),))
+                    raw = cast(dict[str, object], codec.snapshot_value(snapshot))
+                    self.assertEqual(codec.parse_snapshot_value(raw, records.AdmissionWaitSnapshot), snapshot)
                     running = cast(list[dict[str, object]], raw["running"])
                     memory = cast(dict[str, object], running[0]["measured"])
-                    memory["service_job_state"] = {"kind": kind, "started_at": 100}
                     parsed = parse(raw, schema)
                     steps = cast(tuple[object, ...], getattr(parsed, "running"))
                     measured = cast(object, getattr(steps[0], "measured"))
