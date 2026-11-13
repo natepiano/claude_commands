@@ -69,7 +69,7 @@
 **Acceptance gate:** `test_morty_identity.py`, `test_send.py`, `test_session_staff.py`, `test_staff_sources.py` and `test_staff_accessors.py` pass.
 The checkpoint gate passes. basedpyright reports zero errors and zero warnings. No file outside this plan names `MORTY_NATIVE_ID`.
 
-### Phase 2 — Catch-up reader for the earlier conversation  · status: todo
+### Phase 2 — Catch-up reader for the earlier conversation  · status: done
 
 #### Work Order
 
