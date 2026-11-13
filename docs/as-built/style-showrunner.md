@@ -771,11 +771,51 @@ Historical commit groups release their file bytes and comparison data when their
 The step releases all remaining compact file facts after its final outcome.
 `_declared_files` retains compact item facts across commit groups.
 The current tip retains module facts, extern facts, and file bytes until the step ends.
-Judgment comparisons retain commit inventories for later judgments and the declaration step.
+Cold judgment comparisons retain commit inventories for later judgments and the declaration step.
 Each commit inventory is built once before the declaration step completes.
 The step releases parsing, compressed sources, file bytes, and inventories after its final outcome.
 It retains anchors, follow evidence, outcomes, current item metadata, and compact comparison results.
 These lifetimes also apply when a declaration read fails.
+
+Schema 42 maintains coverage in `refill_cells`.
+`refill_tables` stores source counters and applied counters.
+`refill_rows` stores the latest version and deletion state for each changed source key.
+An unchanged source row has implicit version zero.
+Insert, update, and delete triggers cover six source tables:
+
+1. `judgments`.
+2. `rule_generations`.
+3. `invalidated_held_judgments`.
+4. `held_cell_corrections`.
+5. `lint_runs`.
+6. `sync`.
+
+The triggers mark dependent cells in the source transaction.
+Python and SQLite use the same unescaped Unicode JSON keys for judgment membership.
+A key change records the old key as deleted and the new key as present.
+Cell dependencies include judgment membership, source rows, generations, scope membership, history, and removal barriers.
+The existing coverage code supplies each cell universe and its order.
+Changed rules, paths, ignores, manifests, and generator sites update that universe.
+Each catalog and execution checkout has a separate projection.
+The `synced` view retains current state, verdict, crate, family, and tier.
+The indexed `refill_cell_counts` view groups those contributions.
+
+`refill_inputs` stores immutable scope comparisons, ancestry results, and exact `RustCode` digests by reader version.
+Scope comparisons include declared scope, explicit reads, family, fingerprints, and both commits.
+The existing judgment code computes each missing result.
+It retains active generations, administrative rule equivalence, removal barriers, and newest-first judgment order.
+The shared comparison does not extend comment-only carry to another family.
+Each observation verifies required Git objects before it uses stored results.
+Dependencies include the manifests, configuration blobs, and recursive trees read to construct historical tips.
+Reader version 2 replaces results with incomplete object dependencies.
+An unchanged cell needs no historical source bytes.
+Publication compares source versions and retains dirty work after an intervening mutation.
+Derived fact writes do not change the connection-local source revision.
+Site readers therefore retain their observed rows across comparison-fact publication.
+Read-only coverage uses the original calculation.
+Only maintained coverage calculations read or write persistent judgment facts.
+Ticket proofs retain their Git reads and create no comparison facts before their source transaction.
+
 The second reading in `follow_declarations` returns the same result when the rows and approvals remain unchanged.
 `run_follow` uses its planned reading directly when no outcome requires a finding write.
 It calls `follow_declarations` only for a move, rename, removal, or `FindingSite` with `UnchangedSite` evidence.
@@ -846,7 +886,9 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - Hand-off readers use git ancestry and the recorded checkpoint.
 - No acknowledgment of a hand-off precedes a successful push.
 - `proposal_issue.create` keeps both `_decision_path_state` checks, before and inside the folder lock.
-- Every state reader compares a judgment with a tip through `_judgment_inputs_match`. A judgment with reads compares only by `_read_fingerprint`.
+- Missing judgment comparisons use `_judgment_inputs_match`.
+  Explicit reads retain their named input set.
+  Maintained cells reuse the result only while their source versions and immutable inputs match.
 - Every waive write picks a `WaiveActor` variant and passes it through `_waive_actor_record`. A new actor kind extends `WaiveActor` and `WaiveProvenance`, and `_held` maps it back from `waive_provenance` and `waived_by`. `decline_findings` takes only a `DeclineActor`. `replace_held` replaces only a unit's waive, and an unrecorded waive only with `--person`.
 - Readers count proposals by the approval record, not only the stage. Never write stages on read.
 - `style_footprint.tokens`, `closing` and `attribute_spans` keep their behavior; `declarations.py` and `style_ledger.py` use them.
