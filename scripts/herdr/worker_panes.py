@@ -276,8 +276,12 @@ class WorkerLockHold:
 
 
 @contextmanager
-def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) -> Generator[WorkerLockHold | Kept]:
-    """Serialize creation, then hold the published worker's fixed-id lock."""
+def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
+                deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[WorkerLockHold | Kept]:
+    """Serialize creation, then hold the published worker's fixed-id lock.
+
+    A deadline waits for a published worker's lock until that monotonic time.
+    """
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
@@ -294,7 +298,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
         hold = WorkerLockHold(parent, name, operations, blocking=blocking)
         try:
             if row is not None:
-                hold.bind(row)
+                hold.bind(row, deadline=deadline)
         except BlockingIOError:
             yield Kept("dispatch lock is held")
             return
