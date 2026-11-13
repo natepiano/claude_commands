@@ -1,8 +1,7 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
-from scripts.build_queue import placement
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -108,7 +107,7 @@ class VerifyDocFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.exists():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="verify-doc-test-")))
             self.build_fixture()
-            self.start_admission()
+            _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
         self.addCleanup(shutil.rmtree, self.root)
@@ -118,13 +117,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.environment = self.fixture_environment.copy()
-        self.start_admission()
-
-    def start_admission(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.05)
-        admission.server.host_probe = lambda key: private_caller_provider(admission, self.environment, key)
-        _ = caller_provider_controls(self, admission)
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         self.repo = self.root / "workspace"
@@ -141,9 +134,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
         targets = tools / "build-targets.py"
-        self.executable(targets, f'import runpy\nrunpy.run_path({str(SCRIPTS / "build_targets/build_targets.py")!r}, run_name="__main__")\n')
-        _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        self.executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
@@ -226,41 +217,33 @@ class VerifyDocFixture(unittest.TestCase):
         holders.mkdir()
         _ = (holders / "other").write_text("private hold")
         settings = self.root / "mac.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
-        _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
+        _ = settings.write_text("offload=on\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         self.environment["MAC_TEST_STATE_DIR"] = str(self.root / "mac-state")
-        admission = caller_admission(self, self.root, self.environment)
-        controls = caller_provider_controls(self, admission)
-        controls.set_host("mac", placement.AllowedHost())
-        self.environment["TEST_REAL_RECORD"] = str(SCRIPTS / "buildlog/record.py")
-        from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
-
+        targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
+        self.executable(targets, '''
+import os
+from pathlib import Path
+import sys
+if sys.argv[1] == "eligible":
+    print("any_target")
+    print("natedev\\teligible\\t-\\t-\\t-")
+    print("mac\\teligible\\t-\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
+elif sys.argv[1] in ("register-local", "check-local"):
+    raise SystemExit(10)
+''')
         runner = self.root / "mac-doc.py"
         self.executable(runner, '''
 import os
 from pathlib import Path
 import sys
-import time
 words = sys.argv[1:]
-arguments = words
-root = Path(os.environ["TEST_ORIGINAL_REPO"]).parent
-result = Path(words[words.index("--result") + 1])
-''' + ASSIGNED_RUNNER_SETUP + '''
 assert words[words.index("--verb") + 1] == "doc"
 assert words[words.index("--repo-root") + 1] == os.environ["TEST_ORIGINAL_REPO"]
 os.chdir(words[words.index("--source-root") + 1])
 result = "failed" if int(os.environ.get("TEST_DOC_STATUS", "0")) else "passed"
 Path(words[words.index("--result") + 1]).write_text("mac=" + result + "\\nseconds=0\\n")
-''' + CARGO_STUB.replace('arguments = sys.argv[1:]', 'arguments = ["doc", *words[words.index("--") + 1:]]').replace(
-    '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))',
-    '''    if "--assignment-file" in words:
-        fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_DOC_STATUS", "0")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
-        fixture_cleanup_confirmed = True
-    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))'''))
+''' + CARGO_STUB.replace('arguments = sys.argv[1:]', 'arguments = ["doc", *words[words.index("--") + 1:]]'))
         self.environment["VERIFY_MAC_RUNNER"] = str(runner)

@@ -20,11 +20,10 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger
-from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test, offload, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
@@ -135,23 +134,30 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertGreater(len(self.events()), before)
         self.assertEqual(self.release_reservation(), 0)
 
-    def run_reserve_cli(self, *, new_step: bool) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, str(Path(build_targets.__file__)), "reserve", "--target", "box",
-                   "--repo-root", str(self.repository), "--package", "hana", "--kind", "test",
-                   "--pid", str(os.getpid()), "--reservation-file", str(self.root / "ssh-reservation")]
-        if new_step:
-            command.append("--new-step")
-        return subprocess.run(command, capture_output=True, text=True, check=False, env=self.environment)
+    def run_hook(self, command: str) -> subprocess.CompletedProcess[str]:
+        script = shell_functions(VERIFY, "target_platform", "step_can_retry", "remote_step_kind",
+                                 "ssh_reserve_hook", "ssh_retry_hook")
+        script += '\nSTEP_RUNS_ON=any_target\nSTEP_WRITES_TREE=0\nCMD=test\nMAC_ONLY=0\n'
+        script += 'STEP_CAN_RETRY=1\nSSH_RETIRED_SETTINGS=()\nSSH_RETRY_SETTINGS=()\nSSH_RETRY_DEADLINES=()\n'
+        script += 'SSH_RETRY_AFTER_SETTINGS=""\nMAC_LEAVE_SETTINGS=""\nMAC_RETRY_AFTER=0\n'
+        script += 'SSH_RETRYABLE_REASON="^(busy|blocked)$"\n'
+        for name, value in {"PY": str(VERIFY.parents[1] / "lib/py"),
+                            "BUILD_TARGETS_SCRIPT": str(Path(build_targets.__file__)),
+                            "DOC_REPO_TOP": str(self.repository), "PKG": "hana",
+                            "HOLD_WAIT_DIR": str(self.root), "MAC_SETTINGS": str(self.linux_settings),
+                            "STEP_TARGET_TABLE": f"box\teligible\t-\t{self.linux_settings}\tlinux"}.items():
+            script += f"{name}={shlex.quote(value)}\n"
+        script += f'hook=$({command})\nprintf "%s\\n" "$hook"\neval "$hook"\n'
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
 
-    def test_retry_refuses_a_failed_target_without_a_new_probe(self) -> None:
+    def test_retry_hook_reserves_without_the_new_step_flag(self) -> None:
         self.fixture["probe_status"] = 255
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         self.healthy()
-        before = self.events_for("ssh")
-        result = self.run_reserve_cli(new_step=False)
+        result = self.run_hook("ssh_retry_hook")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.events_for("ssh"), before)
+        self.assertNotIn("--new-step", result.stdout)
         self.assertEqual(self.free(), "bad")
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
 
@@ -160,13 +166,9 @@ class FailedProbeTests(OffloadCommandFixture):
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         self.healthy()
-        before = self.events_for("ssh")
-        result = self.run_reserve_cli(new_step=True)
+        result = self.run_hook('ssh_reserve_hook box "$MAC_SETTINGS" 0')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        probes = self.events_for("ssh")[len(before):]
-        self.assertEqual(len(probes), 1, probes)
-        self.assertEqual(probes[0]["args"][-1], "true")
-        self.assertFalse(probes[0]["claimed"], "the probe must precede the claim")
+        self.assertIn("--new-step", result.stdout)
         self.assertEqual((self.root / "ssh-reservation").read_text(), f"box\t{self.linux_settings}\n")
         self.assertEqual(self.release_reservation(), 0)
 
@@ -558,10 +560,9 @@ if command == "true":
 if command.startswith("printf"):
     raise SystemExit(subprocess.run(["bash", "-c", command], check=False).returncode)
 words = shlex.split(command)
-if "dispatch_start_settled=" in command and "leftovers=0" in command:
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
 if "probe" in words and any("linux_runner.py" in word for word in words):
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
+    script = Path.home() / ".claude/scripts/mac_test/linux_runner.py"
+    os.execv(sys.executable, [sys.executable, str(script), *words[words.index("probe"):]])
 raise SystemExit("Unexpected remote command: " + command)
 ''')
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
@@ -577,7 +578,7 @@ raise SystemExit("Unexpected remote command: " + command)
 
 
 class StepRecoveryTests(VerifyLintScopeFixture):
-    def test_each_compiling_lint_command_has_one_placement_episode(self) -> None:
+    def test_each_local_lint_step_reads_eligibility_once_with_the_new_step_flag(self) -> None:
         settings = self.root / "mac_test.conf"
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = (self.root / "build_targets.conf").write_text(
@@ -586,40 +587,30 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         state = self.root / "mac-state"
         state.mkdir()
         _ = (state / "failed_probe").write_text("failed\n")
-        admission = caller_admission(self, self.root, self.environment)
-        requests: list[wire.PlacementRequest] = []
-        previous = admission.server.handle_request
-
-        def observe(request: wire.Request,
-                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                requests.append(request)
-            return previous(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=observe))
+        observer = self.root / "python-observer"
+        calls = self.root / "eligibility-calls"
+        self.write_executable(observer,
+            'import json, os, sys\nfrom pathlib import Path\n'
+            + 'if sys.argv[1:3] == [os.environ["BUILD_TARGETS_SCRIPT"], "eligible"]:\n'
+            + f'    with Path({str(calls)!r}).open("a") as output:\n'
+            + '        output.write(json.dumps(sys.argv[2:]) + "\\n")\n'
+            + f'os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n')
         self.environment.update({"BUILD_TARGETS_SCRIPT": str(Path(build_targets.__file__)),
-                                 "MAC_TEST_STATE_DIR": str(state)})
+            "MAC_TEST_STATE_DIR": str(state), "CLAUDE_PYTHON": str(observer)})
         self.write_config(clippy="on")
         # A held recovery lock keeps the mark while the real local steps run.
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.verify("lint", "sample", "--local", "local fixture tools")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        episodes = {request.episode: request.constraints.command for request in requests}
+        rows = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()]
         local_steps = [row for row in self.cargo_calls()
                        if row[:1] in (["mend"], ["+nightly"], ["clippy"]) and "--version" not in row]
         taplo_steps = [json.loads(line) for line in self.taplo_events.read_text().splitlines()]
         self.assertGreaterEqual(len(local_steps), 2)
-        self.assertTrue(taplo_steps)
-        for name in ("mend", "clippy"):
-            expected = [row for row in local_steps if row[0] == name]
-            placed = [command for command in episodes.values() if name in command]
-            self.assertEqual(len(placed), len(expected), (name, episodes, local_steps))
-            self.assertEqual(len(placed), 1, (name, episodes))
-        self.assertEqual(len(episodes), 2, episodes)
-        self.assertEqual([request for request in requests if "fmt" in request.constraints.command], [])
-        self.assertEqual([request for request in requests if "taplo" in request.constraints.command], [])
-        self.assertEqual(list((self.root / "mac-state/claims").glob("*.json")), [])
+        self.assertEqual(len(rows), len(local_steps) + len(taplo_steps), (rows, local_steps, taplo_steps))
+        for row in rows:
+            self.assertIn("--new-step", row)
 
     def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
         _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
@@ -660,7 +651,6 @@ class StepRecoveryTests(VerifyLintScopeFixture):
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 root = Path(os.environ["PACKAGE_ROOT"])
 command = sys.argv[-1]
@@ -669,8 +659,6 @@ if command == "true":
 if command.startswith("printf") and ".build-target-script-commit" in command:
     (root / "remote-stamp").write_text("fixture")
     raise SystemExit(0)
-if "dispatch_start_settled=" in command and "leftovers=0" in command:
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
 if "linux_runner.py" in command and "probe" in command:
     with (root / "recovery-probes").open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + "\n")
@@ -684,9 +672,6 @@ raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
-        admission = caller_admission(self, self.root, self.environment)
-        admission.server.host_probe = admission.server.read_provider_evidence
         result = self.verify("lint", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(args[:1] == ["clippy"] for args in self.cargo_calls()))

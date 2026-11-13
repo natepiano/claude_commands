@@ -85,69 +85,18 @@ Version 2 replies can carry `CloudQueueRead` records.
 The shared codec encodes the new place field and its frozen dataclasses.
 Old requests default to local admission when they omit the place field.
 
-Version 3 supplies placement messages for converted verify, offload, copy-watch, and shared lint callers.
-`PlacementRequest` carries the episode, profile, fixed constraints, checked coordinator, run identity, and local admission context.
-The context carries the actual arguments, sidecar, call identity, test width, and fresh-test state.
-Missing context becomes `LocalAdmissionUnavailable` at the wire boundary.
-Configured candidates remain in the request through disk, busy, hold, and reachability changes.
-Fixed pins, platform rules, tree writes, local artifacts, and final-step rules restrict those candidates.
-Dynamic exclusions remain refreshed evidence.
-Saved disk exclusions remain diagnostic evidence.
-`SourceKeyKnown` carries an available source key.
-`SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
-An unavailable key permits placement and sends no source key with the copy.
+Version 3 adds placement messages without changing existing routing callers.
+`PlacementRequest` carries the episode, profile, fixed constraints and checked submitting owner.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
 `Assignment` carries a persisted destination and attempt; it grants no execution permission.
 `ClaimFailure` closes the exact assignment before another placement decision.
-`ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
-The coordinator remains separate from its offload child.
-The service checks the local process tree before it accepts that child as the holder.
-Cleanup takeover supplies no launch authority.
+`ConsumePermission` carries the exact assignment and adopted provider claim reference.
 The first valid consumption returns `FirstAuthorization` after the state write completes.
 Every repeated consumption returns `DispatchStatus`, including a retry with a different transport request id.
 Unknown, changed and closed attempts grant no authority.
-`ExecutionReport` supplies typed outcomes and execution evidence without creating another durable provider lifecycle.
-`DispatchPathSettled` confirms that the adapter has resolved its pending claim and start operations.
-An empty remote observation cannot establish that condition.
-A settled prelaunch refusal permits retry only after fresh provider evidence confirms that the exact claim has departed.
-The service retains terminal reports while cached evidence still contains the claim.
-Later passes reevaluate those reports after provider evidence refreshes.
-The saved terminal report preserves the outcome, dispatch settlement, and original report time across restart.
-Execution observations remain reconstructed evidence.
-The retry deadline uses the original report time.
-`AttemptDeclined` preserves caller policy for no-tests results and lost runs after confirmed cleanup.
-An unavailable observation cannot substitute for confirmed cleanup or a settled dispatch path.
-Busy, blocked, and disk refusals retain normal polling.
-Other temporary Mac refusals delay that destination for 180 seconds.
-Final command results remain terminal.
-A retry retains the episode, queue time, run place, and priority.
-Each retry receives a new attempt identity.
-A late report cannot close a replacement attempt.
+`ExecutionReport` supplies execution evidence without creating another durable provider lifecycle.
 Version 1 and 2 requests retain their existing local or scaler destinations and reply shapes.
 Placement messages require version 3.
-
-Converted local candidates and fixed local waiters use the same queue order and memory planner.
-Priority changes affect the next placement pass.
-The planner evaluates continuation memory, pressure, spacing, starts-alone admission, and head protection.
-Remote selection removes the local projection before local effects commit.
-It releases that waiting step's unused continuation claim.
-It changes no local start spacing.
-`LocalPlacementGranted` carries the existing local reservation and execution controls.
-The adapter uses that grant without a second admission request.
-
-`TokenRequired`, `TokenHeld`, and `TokenNotRequired` describe the local execution prerequisite.
-`PrerequisiteReport` updates that state separately from fixed constraints.
-Restart requires fresh token confirmation for requests that need a token.
-A token waiter holds no local reservation and can receive a remote assignment.
-The adapter keeps token renewal active during placement waits.
-
-Remote rows carry execution evidence and the assigned host.
-Physical grouping includes the host, generation, PID, and start time.
-Unavailable remote identity remains uncertain.
-Remote memory remains unavailable and contributes zero to local admission accounting.
-A speculative local parent retains its actual reservation.
-The queue selects the newest eligible speculative copy by call start time, then call identity.
-The watcher keeps result collection and loser stopping.
 `CloudSlotWait` carries the used slots and slot limit in wait replies.
 `CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
 Local queue readings keep their existing wire form when no cloud row exists.
@@ -366,8 +315,7 @@ Unavailable settings produce refusals rather than replacement policy values.
 
 `admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
 It also holds placement requests, assignments and current attempt keys.
-`SavedPlacementAssignment` retains assignment state, launch permission, exact provider reference, consumed holder identity, and retry decision.
-It also retains a terminal report intent until fresh provider evidence permits settlement.
+`SavedPlacementAssignment` retains the assignment state, launch permission and exact provider reference.
 The consumption ledger key contains the episode and attempt, independent of the transport request id.
 The ledger stores status, never a replayable authorization.
 Current attempts retain their ledger entries through the existing replay retention path.

@@ -12,7 +12,6 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
-from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
@@ -42,9 +41,8 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
 
     def check_busy_startup(self, mode: str) -> None:
         self.configure("linux,spare,natedev")
-        with self.spare_after_linux_refusal():
-            result = self.verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": json.dumps({"linux": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": json.dumps({"linux": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.ssh_events()
         self.assertEqual([event["target"] for event in events], ["linux", "spare"],
@@ -203,14 +201,6 @@ class SshResultBoundaryTests(unittest.TestCase):
 
 
 class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
-    @override
-    def start_admission(self) -> None:
-        super().start_admission()
-        admission = caller_admission(self, self.root, self.environment)
-        _ = admission.occupy_host()
-        with admission.loop_turn():
-            admission.free(0)
-
     def test_linux_doc_judges_the_staged_tree_without_a_local_hold(self) -> None:
         self.linux_doc_case(pinned=False)
 
@@ -221,19 +211,13 @@ class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
         self.enable_held_mac_doc()
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
-        self.environment["TEST_SOURCE_REPO"] = str(Path(__file__).resolve().parents[2])
         targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
         self.executable(targets, r'''
 import os
 from pathlib import Path
 import sys
-import runpy
 words = sys.argv[1:]
 settings = str(Path(os.environ["CONF_DIR"]) / "linux_target.conf")
-if words[0] in ("constraints", "submitting-session", "source-key", "assigned-info", "reserve", "recover-reservation", "release-wait"):
-    source = Path(os.environ["TEST_SOURCE_REPO"])
-    runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
-    raise SystemExit(0)
 if words[0] == "eligible":
     print("any_target")
     print("linux\teligible\t-\t" + settings + "\tlinux")
@@ -248,7 +232,7 @@ elif words[0] not in ("release-wait", "register-local", "check-local"):
         config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
                               + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", template="mac_test")
+        _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
         self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")
         self.environment["TEST_PINNED_DOC"] = "1" if pinned else "0"

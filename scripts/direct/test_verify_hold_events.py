@@ -59,19 +59,11 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         from scripts.build_targets import build_targets
 
         self.hold()
-        library = ctypes.CDLL
-        caller = threading.get_ident()
-
-        def unavailable_for_caller(name: str | None, *, use_errno: bool = False) -> object:
-            if threading.get_ident() == caller:
-                return object()
-            return library(name, use_errno=use_errno)
-
         def release_on_poll(_seconds: float) -> None:
             grant_call(self.cycle_file)
 
         with local_hold_environment(self.fixture.environment):
-            with mock.patch.object(ctypes, "CDLL", side_effect=unavailable_for_caller), \
+            with mock.patch.object(ctypes, "CDLL", return_value=object()), \
                  mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
                 self.assertEqual(build_targets.command_wait_local("polling-call"), 0)
             polling.assert_called_once_with(0.01)
@@ -121,7 +113,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         removed = threading.Event()
         add_watch = inotify.add_watch
 
-        def remove_before_watch(descriptor: int, path: Path, mask: int = inotify.DIRECTORY_CHANGES) -> int:
+        def remove_before_watch(descriptor: int, path: Path, mask: int) -> int:
             if path == vanished:
                 vanished.rmdir()
                 removed.set()

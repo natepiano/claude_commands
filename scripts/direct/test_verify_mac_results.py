@@ -22,8 +22,12 @@ class VerifyMacResultsTests(VerifyMacOffloadFixture):
         self.assertEqual(record["mac_s"], 3.25)
 
     def test_mac_failure_stops_before_token_and_local_run(self) -> None:
-        result = self.verify("test", "sample", "--no-cache",
-            extra={"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        result = self.call_mac_functions('''
+bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
+TOKEN_HELD=1
+route_test
+exit 99
+''', extra={"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
         runners = self.runner_events()
@@ -70,7 +74,7 @@ class VerifyMacResultsTests(VerifyMacOffloadFixture):
         self.assertNotIn("host=mac", saved[0].read_text())
 
     def test_filtered_mac_pass_ends_the_call_with_a_mac_pass_record(self) -> None:
-        result = self.verify("test", "sample", "--filter", "alpha",
+        result = self.call_mac_functions('route_test; exit 99',
             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0", "TEST_DIRECT_FILTER": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", result.stdout)

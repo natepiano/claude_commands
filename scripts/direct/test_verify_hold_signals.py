@@ -30,8 +30,8 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         process = self.start_memory_queued_lint()
         queued = self.memory_queue_pids()
         self.assertTrue(queued, "the admission service must register the waiting step")
-        self.assertEqual(queued, {process.pid},
-                         "the coordinator waits at admission before any step starts")
+        self.assertTrue(all(os.getpgid(pid) != process.pid for pid in queued),
+                        "the step must have its own process group")
         started = time.monotonic()
         send_process_group(process.pid, signum)
         survivors = self.wait_for_owned_exit(5)

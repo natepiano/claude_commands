@@ -12,23 +12,20 @@ class VerifyMacMemoryHandoffTests(VerifyMacMemoryRetryFixture):
     def test_leaving_memory_wait_after_release_runs_on_the_mac(self) -> None:
         cycle = self.routing_fixture()
         _ = self.hold_memory()
-        process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
-            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
-            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
-        })
-        self.addCleanup(self.stop_verify, process)
+        once = self.runner_state / "free-once"
+        process = self.start_routing(once=once)
         self.release_local_hold()
-        self.wait_for_memory_wait(process)
-        self.wait_until(lambda: sum(key.destination.provider == "mac"
-                                   for key in self.provider_observations) >= 2,
-                        "two private provider observations", (process,))
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        # Routing asks free-now once after its sleep; later calls are the hook's.
+        self.wait_until(lambda: len(self.free_now_settings()) >= 2, "the leave hook", (process,))
         self.assertEqual(self.local_runs(), [])
         _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = once.write_text("free\n")
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
         runners = self.runner_events()
-        self.assertEqual(len(runners), 1)
+        self.assertEqual(len(runners), 2)
 
         self.assert_no_pending_calls(cycle)
         self.assertEqual(self.routing_record()["target"], "mac")

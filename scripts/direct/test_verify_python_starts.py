@@ -38,12 +38,11 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
-        # The trace counts interpreter starts, not calls inside the helper.
-        self.assertEqual(counts["tree_watch.py"], 2, rows)
+        # The builds signal-status guard removes one stopped-step query.
+        self.assertEqual(counts["tree_watch.py"], 11, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
-        self.assertEqual(counts["step_context.py"], 0, rows)
-        # The live helper serves synchronous calls, so they start no interpreter.
-        self.assertLessEqual(len(rows), 7, counts)
+        self.assertEqual(counts["step_context.py"], 1, rows)
+        self.assertEqual(len(rows), 24, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
