@@ -3701,7 +3701,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Module 50.3 natedev CPU s, 4,355 processes: real `verify.sh` routing runs. `build_targets.py` 49 starts 7.8 s, `python3 -c` 40 starts 3.0 s, `verify_helper.py` 17 starts 2.6 s, `build_folders.py` 46 starts 2.5 s, `detached_runs.py` 17 starts 2.0 s.
 - Top test `pinned_target_refusal_keeps_the_reason_and_never_runs_locally` 10.1 s runs four real refusals, about 2.5 CPU s each. Architecture proposal to sdlc: a verify refusal costs about 2.5 CPU s in helper starts.
 
-### Phase 249 — The bulk run tests do less repeated work  · status: todo
+### Phase 249 — The bulk run tests do less repeated work  · status: done
 **Depends on:** none
 
 #### Work Order
