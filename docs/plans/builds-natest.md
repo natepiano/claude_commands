@@ -3565,3 +3565,12 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `running()` replaces `origin.git`, `checkout`, `alpha` and `beta` with copies from that snapshot. The fixed paths keep the Git worktree links valid. Then it writes the per-test staff rows, panes, transcripts, unit config, exclude entry and log.
 - The test module did not change: 70 tests, all assertions and `run_lifecycle_process` stay. `running()` Git commands went from 448 to 56 in each module run.
 - aws paired trial, 3 rounds on c7a.8xlarge: CPU median 32.730 s to 30.856 s (saving 1.876 s); peak 155.2 to 159.2 MiB. natedev module_cost CPU 34.848 to 26.544 s. Checkpoint `1b63e07bf`.
+
+### Phase 234 — The unit config tests copy one seed repository  · status: done
+**Depends on:** Phase 233
+
+#### As-built
+
+- `UnitConfigFixture.setUpClass` (`unit_config_test_support.py`) builds one seed repository under a private home: `git init` on `main` and one empty commit. `setUp` copies it into each test's new root. Each test keeps its own home, environment, staff file and staff rows.
+- The three fixture classes inherit the seed. `test_unit_config.py` (45 tests) and `lib/test_git_exclude.py` (5 tests) did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: `test_unit_config.py` CPU 3.099 to 2.947 s; `test_git_exclude.py` 0.295 to 0.285 s; peak unchanged. natedev module_cost 3.915 to 1.744 s for both. Taplo (158 starts, 1.16 natedev CPU s) is now the top command in `test_unit_config.py`. Checkpoint `63acaa3e0`.
