@@ -1396,22 +1396,66 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
-    """The live Claude session each pid runs under: the nearest ancestor a session record names."""
+    """Find each process's session or the director of its detached worker."""
     if not pids:
         return {}
+    from scripts.agents import worker_lifecycle
     from scripts.message import process_table
     from scripts.message.sessions import live_sessions
+    from scripts.production import staff
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
         return {}
     names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
+
+    @cache
+    def membership() -> staff.StaffSnapshot:
+        return staff.local_snapshot()
+
+    @cache
+    def detached_record(record_path: Path) -> dict[str, object]:
+        try:
+            return worker_lifecycle.read_json_object(record_path)
+        except (OSError, ValueError, UnicodeError):
+            return {}
+
+    def detached_owner(supervisor_pid: int, record_path: Path) -> str:
+        try:
+            record = detached_record(record_path)
+            identity = record.get("staff_id")
+            if (record.get("pid") != supervisor_pid or record.get("status") != "running"
+                    or not isinstance(identity, str)):
+                return ""
+            snapshot = membership()
+            worker = snapshot.by_id(staff.StaffId(identity))
+            parent = snapshot.parent_of(worker) if worker is not None else None
+            return parent.name if parent is not None else ""
+        except (OSError, ValueError, UnicodeError):
+            return ""
+
     found: dict[int, str] = {}
     for pid in pids:
         process = table.get(pid)
         name = process_table.nearest_named(process, table, names) if process is not None else None
         if name is not None:
             found[pid] = name
+            continue
+        seen: set[int] = set()
+        while process is not None and process.pid not in seen:
+            seen.add(process.pid)
+            try:
+                arguments = shlex.split(process.arguments)
+            except ValueError:
+                arguments = []
+            records = [Path(arguments[index + 2]) for index, argument in enumerate(arguments[:-2])
+                       if Path(argument).name == "detached_runs.py" and arguments[index + 1] == "supervise"]
+            if records:
+                owner = detached_owner(process.pid, records[0])
+                if owner:
+                    found[pid] = owner
+                break
+            process = table.get(process.parent)
     return found
 
 
