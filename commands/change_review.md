@@ -272,7 +272,10 @@ A verdict beginning `works` or `fine`, after optional `okay`/`ok` and a row id
 (`c17`), lands the row. Case and later words do not affect the result; any
 other start returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
 feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
-there leaves the row open. Then:
+there leaves the row open.
+Different review rows can land feature-log notes on one merge link without `--separate-result`.
+The review page sends one failure alert per list, row, and error text.
+Then:
 
 ```sh
 … verdict <production> --row <id> --verdict "<the user's words>"
