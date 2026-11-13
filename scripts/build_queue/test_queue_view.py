@@ -1470,19 +1470,19 @@ class QueueViewTests(QueueViewFixtureTests):
 
     def test_pressure_threshold_text_uses_the_policy_in_the_reading(self) -> None:
         config = self.fixture.root / "build_admission.conf"
-        write_memory_config(config, full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12", recovery_start_seconds="45")
+        write_memory_config(config, full_pressure_limit="9", some_pressure_limit="12", recovery_start_seconds="45")
         with mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)}):
             policy = admission_records.read_memory_config().policy
-            write_memory_config(config, full_pressure_limit="3", swap_used_limit="90", some_pressure_limit="30")
+            write_memory_config(config, full_pressure_limit="3", some_pressure_limit="30")
             model = self.fixture.model()
         model = replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, policy=policy)))
         with mock.patch.object(admission_records, "read_memory_config", side_effect=AssertionError("render read config")):
             _, full = queue_view.pressure_check(admission_records.MemoryPressure(10, condition="full"), model)
-            _, swap = queue_view.pressure_check(admission_records.MemoryPressure(0, 15, 80, condition="swap"), model)
+            _, some = queue_view.pressure_check(admission_records.MemoryPressure(0, 15, 80, condition="some"), model)
             _, recovery = queue_view.pressure_check(admission_records.MemoryPressure(0, next_start_at=NOW + 45, condition="full"), model)
         self.assertIn("starts below full avg10 9.0%", full)
-        self.assertIn("swap is at most 70% or some avg10 is at most 12.0%", swap)
+        self.assertIn("starts below some avg10 12.0%", some)
         self.assertIn("starts below full avg10 9.0%", recovery)
         self.assertNotIn("one start per", recovery)
 

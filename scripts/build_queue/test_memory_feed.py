@@ -255,14 +255,16 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_pressure_text_on_the_page_rounds_down_to_one_decimal(self) -> None:
         baseline = reservation_reading()
-        for pressure in (admission_records.MemoryPressure(0, swap_used_percent=95.99, condition="swap"),
-                         admission_records.MemoryPressure(0, swap_used_percent=95.99)):
+        for pressure, expected in (
+            (admission_records.MemoryPressure(0, some_avg10=30, condition="some"), "some avg10 30.0"),
+            (admission_records.MemoryPressure(0, swap_used_percent=95.99), "swap 95.9% used"),
+        ):
             with self.subTest(condition=pressure.condition):
                 inputs = replace(baseline.explanation.decided_from, pressure=pressure)
                 reading = gate.queue_read_from(inputs, admission_policy_fixture())
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
-                self.assertIn("swap 95.9% used", page["pressure"])
+                self.assertIn(expected, page["pressure"])
                 self.assertNotIn("96.0%", page["pressure"])
 
 
@@ -442,6 +444,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(page["total"], 60)
         self.assertEqual(page["available"], 30)
         self.assertEqual(page["walk"], [])
+        self.assertEqual(page["limits"], {"some": 25, "full": 5})
         self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json"})
         for name in ("memory_live.html", "memory.json"):
             with self.subTest(name=name):

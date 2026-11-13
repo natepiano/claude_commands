@@ -2423,3 +2423,66 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/buildlog/mac_idle.py` — `mac_work` reads a running CI Mac job as Mac work
 - `scripts/mac_test/test_mac_test.py` — `test_busy_ci_keeps_block_pending_until_watch_sends_once` is a queued/running table
 - `scripts/buildlog/test_mac_idle.py` — rows for a running CI Mac job with a block and with no block
+
+### Phase 117 — The memory pressure hold fires on some pressure alone  · status: done
+
+**Depends on:** none. It lands alone, before the jobserver test-thread work. The `scripts/build_queue/` files are queue-unit's; the checkpoint notice names them as also-touched.
+
+**Source (2026-11-13, builds showrunner):** "Fix 2 now, alone: the pressure hold fires on memory some avg10 above its configured threshold alone; drop the AND with swap. Keep the threshold in config." At the natedev freeze at 12:26, memory some avg10 reached 91% while swap was 50% used. The hold needs swap above 85% too, so it did not fire.
+
+**Source (2026-11-13, the user, via the showrunner):** "yes, delete the unused settings. Delete swap_used_limit from config/build_admission.conf in the pressure-hold phase, with its comment, its reader and its tests. Search for any other setting this phase leaves unused and delete it too."
+
+#### Work Order
+
+**Goal:** the queue starts no new step while memory some avg10 is above `some_pressure_limit`, whatever the swap use.
+
+**Measured:**
+1. `pressure_from_readings()` (`scripts/lint/memory_admit.py`) holds with condition `"swap"` only when swap use is above `swap_used_limit` and some avg10 is above `some_avg10_limit`. It holds with condition `"full"` when full avg10 is above `full_avg10_limit`.
+2. `MemoryPressure.condition` (`scripts/build_queue/admission_records.py`) is `Literal["full", "swap"]` or not recorded.
+3. These texts name the `"swap"` condition: `admission_records.pressure_text()`, `queue_evidence.pressure_text()` ("starts when swap is at most …"), and `admission_client.wait_reasons()` ("swap memory pressure").
+4. The memory page (`scripts/build_queue/memory_live.html`) says "The queue holds above <swap limit> swap used." It takes the limit from `limits.swap` in `memory_feed.py`, draws it as a red line on the swap gauge, and uses it in the "near a limit" level.
+
+**Spec:**
+1. `pressure_from_readings()` holds with condition `"full"` when full avg10 is above `full_avg10_limit`. Else it holds with condition `"some"` when some avg10 is above `some_avg10_limit`. Else there is no hold. Swap use does not change the result.
+2. Change the condition type to `Literal["full", "some"]`. If a saved record or a wire reply can carry the condition, a saved `"swap"` value still reads, as `"some"`.
+3. The `"some"` texts name some pressure:
+   - `admission_records.pressure_text()`: `memory pressure: some avg10 <v>`.
+   - `queue_evidence.pressure_text()`: `; starts below some avg10 <limit>%`.
+   - `admission_client.wait_reasons()`: `some memory pressure`.
+4. Delete the `swap_used_limit` key and its comment from `config/build_admission.conf` and from `scripts/lint/fixtures/build_admission.conf`. Delete the `PressurePolicy.swap_used_limit` field, its reader in `read_memory_config()`, and the test rows that set it. Delete any other setting that this phase leaves unused.
+5. The memory page: the swap gauge shows swap use with no limit line, and its hover text says that swap use alone does not hold the queue. The "near a limit" level uses some and full only. `memory_feed.py` stops sending `limits.swap`.
+6. Change no other admission rule, wire field or record format.
+
+**Tests:**
+1. `scripts/lint/test_memory_admit.py`: a row with some avg10 above the limit and swap below its limit holds with `"some"`. A row with full above its limit holds with `"full"`. A row with both below has no hold, also with swap at 100%.
+2. Change the existing tests that expect `"swap"` or the swap texts, including `scripts/production/test_merge_gate_suites_admission.py` (`test_swap_wait_reason_uses_the_policy_saved_in_the_check_result`) and `scripts/build_queue/test_queue_evidence.py`.
+3. A saved `"swap"` condition reads as `"some"`, if Spec item 2 applies.
+4. `scripts/build_queue/test_memory_feed.py` and `scripts/build_queue/test_memory_hover.py`: the feed has no `limits.swap`, and the swap gauge hover text is the new text.
+
+**Files:**
+- `config/build_admission.conf`
+- `scripts/lint/fixtures/build_admission.conf`
+- `scripts/lint/memory_admit.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/admission_records.py`
+- `scripts/build_queue/admission_client.py`
+- `scripts/build_queue/queue_evidence.py`
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/memory_live.html`
+- `scripts/build_queue/snapshot_codec.py`
+- `scripts/build_queue/test_queue_evidence.py`
+- `scripts/build_queue/test_memory_feed.py`
+- `scripts/build_queue/test_memory_hover.py`
+- `scripts/build_queue/test_admission_protocol.py`
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/production/test_merge_gate_suites_admission.py`
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.lint.test_memory_admit`, `scripts.build_queue.test_queue_evidence`, `scripts.build_queue.test_memory_feed`, `scripts.build_queue.test_memory_hover`, `scripts.build_queue.test_admission_client`, and `scripts.production.test_merge_gate_suites_admission`.
+2. Lint: `basedpyright` on the changed Python files, once after the edits.
+
+**Speed:** the predicate does one less comparison; no new read.

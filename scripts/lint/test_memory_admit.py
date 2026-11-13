@@ -3796,17 +3796,25 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         return self.pass_for(pid, need, 40, seconds=seconds)
 
 
-    def test_swap_and_some_need_both_strict_thresholds(self) -> None:
-        for index, (free, some, expected) in enumerate(((14, 26, "hold"), (15, 26, "admit"),
-                                     (14, 25, "admit"), (90, 37, "admit"), (1, 0, "admit"))):
-            with self.subTest(swap_free=free, some=some):
-                self.readings_for(swap_free=free, some=some)
+    def test_pressure_holds_above_either_strict_threshold_without_swap(self) -> None:
+        for index, (free, some, full, condition) in enumerate((
+            (14, 26, 0, "some"), (15, 26, 0, "some"), (14, 25, 0, ""),
+            (90, 37, 0, "some"), (50, 91, 0, "some"), (1, 0, 0, ""), (0, 0, 0, ""),
+            (100, 0, 6, "full"), (100, 26, 6, "full"), (0, 25, 5, ""),
+        )):
+            with self.subTest(swap_free=free, some=some, full=full):
+                self.readings_for(swap_free=free, some=some, full=full)
                 result = self.admit_at(seconds=120 * index)
-                self.assertEqual(result.decision.state, expected)
-                if expected == "hold":
+                self.assertEqual(result.decision.state, "hold" if condition else "admit")
+                if condition:
+                    self.assertIsInstance(result.decision.pressure, admission_records.MemoryPressure)
+                    if isinstance(result.decision.pressure, admission_records.MemoryPressure):
+                        self.assertEqual(result.decision.pressure.condition, condition)
                     self.assertIsInstance(result.reason, admission_records.HeadAdmissionStatus)
                     if isinstance(result.reason, admission_records.HeadAdmissionStatus):
-                        self.assertIn("swap", admission_records.head_wait_text(result.reason, ZoneInfo("UTC")))
+                        self.assertIn(f"{condition} avg10", admission_records.head_wait_text(result.reason, ZoneInfo("UTC")))
+                else:
+                    self.assertIsInstance(result.decision.pressure, admission_records.NoPressureHold)
 
 
     def test_sccache_anon_is_one_charge_and_missing_or_unreadable_is_zero(self) -> None:
@@ -3869,7 +3877,7 @@ class PressureAdmissionTests(MemoryQueueFixture):
     def test_full_memory_stall_holds_only_above_five(self) -> None:
         for full in (4, 5, 6):
             with self.subTest(full_avg10=full):
-                _ = self.pressure.write_text(f"some avg10=71.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
+                _ = self.pressure.write_text(f"some avg10=0.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
                 self.assert_admission(full > 5)
 
     def test_idle_swap_at_ninety_nine_percent_does_not_hold_low_pressure_admission(self) -> None:
@@ -5752,7 +5760,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
     def test_invalid_policy_values_name_the_default_and_the_bad_input(self) -> None:
         baseline = admission_records.read_memory_config()
         keys = ("slot_gap_seconds", "estimate_refresh_seconds", "recovery_start_seconds",
-                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")
+                "full_pressure_limit", "some_pressure_limit")
         for key in keys:
             for raw in (None, "abc", "-5", "nan", "inf", "0"):
                 with self.subTest(key=key, raw=raw):
@@ -5810,14 +5818,14 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
 
 
     def test_pressure_reader_uses_the_supplied_thresholds_after_config_edit(self) -> None:
-        self.write_config(full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12")
+        self.write_config(full_pressure_limit="9", some_pressure_limit="12")
         policy = admission_records.read_memory_config().policy
         _ = (self.root / "pressure").write_text("full avg10=8\nsome avg10=15\n")
         host = admission_records.HostMemory(20 * GIB, 60 * GIB, 10 * GIB, 2 * GIB)
-        self.write_config(full_pressure_limit="3", swap_used_limit="95", some_pressure_limit="30")
+        self.write_config(full_pressure_limit="3", some_pressure_limit="30")
         with patch.object(admission_records, "read_memory_config", side_effect=AssertionError("reader reread config")):
-            self.assertEqual(gate.read_pressure(host, policy=policy), admission_records.MemoryPressure(8, 15, 80, condition="swap"))
-            self.assertIsInstance(gate.read_pressure(policy=policy), admission_records.NoPressureHold)
+            self.assertEqual(gate.read_pressure(host, policy=policy), admission_records.MemoryPressure(8, 15, 80, condition="some"))
+            self.assertEqual(gate.read_pressure(policy=policy), admission_records.MemoryPressure(8, 15, 0, condition="some"))
             self.assertEqual(gate.read_pressure(host, policy=admission_policy_fixture()),
                              admission_records.MemoryPressure(8, 15, 80, condition="full"))
 

@@ -147,9 +147,8 @@ def pressure_text(pressure: admission_records.MemoryPressure | admission_records
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
     if isinstance(pressure.condition, admission_records.PressureConditionNotRecorded):
         return values + "; condition not recorded by service"
-    if pressure.condition == "swap":
-        return (values + f"; starts when swap is at most {policy.pressure.swap_used_limit:g}% "
-                + f"or some avg10 is at most {policy.pressure.some_avg10_limit:.1f}%")
+    if pressure.condition == "some":
+        return values + f"; starts below some avg10 {policy.pressure.some_avg10_limit:.1f}%"
     return values + f"; starts below full avg10 {policy.pressure.full_avg10_limit:.1f}%"
 
 

@@ -425,7 +425,6 @@ class PressureValues(TypedDict):
 class PressureLimits(TypedDict):
     some: float
     full: float
-    swap: float
 
 
 class ReportCost(TypedDict):
@@ -1160,7 +1159,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
-        "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit, "swap": policy.swap_used_limit},
+        "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
         "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }

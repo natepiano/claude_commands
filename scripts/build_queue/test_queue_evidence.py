@@ -256,7 +256,8 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_pressure_formatters_keep_the_recorded_hold_condition(self) -> None:
         pressure_path = self.root / "pressure"
         for full, some, swap, detail in (
-            (0, 30, 90, "swap"),
+            (0, 30, 90, "some"),
+            (0, 30, 10, "some"),
             (8, 0, 0, "full avg10"),
             (8, 0, 90, "full avg10"),
         ):
@@ -269,12 +270,12 @@ class QueueEvidenceTests(unittest.TestCase):
                 pressure = gate.read_pressure(host, policy=policy)
                 assert isinstance(pressure, records.MemoryPressure)
                 changed = replace(policy, pressure=replace(policy.pressure,
-                    full_avg10_limit=100, swap_used_limit=100, some_avg10_limit=100))
+                    full_avg10_limit=100, some_avg10_limit=100))
                 memory_text = records.pressure_text(pressure)
                 evidence = queue_evidence.pressure_text(pressure, changed)
-                if detail == "swap":
-                    self.assertIn("swap", memory_text)
-                    self.assertIn("starts when swap", evidence)
+                if detail == "some":
+                    self.assertEqual(memory_text, "memory pressure: some avg10 30.0")
+                    self.assertIn("starts below some avg10 100.0%", evidence)
                     self.assertNotIn("starts below full", evidence)
                 else:
                     self.assertIn("full avg10", memory_text)

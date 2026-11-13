@@ -1221,9 +1221,9 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
 
 def pressure_from_readings(full: float, some: float, swap: float, policy: AdmissionPolicy) -> Pressure:
     """Use one pressure predicate for live admission and replay estimates."""
-    if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
-        return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    if full > policy.pressure.full_avg10_limit:
+        return MemoryPressure(full, some, swap, condition="full")
+    return MemoryPressure(full, some, swap, condition="some") if some > policy.pressure.some_avg10_limit else NO_PRESSURE_HOLD
 
 
 def admission_dir(root: Path) -> Path:
