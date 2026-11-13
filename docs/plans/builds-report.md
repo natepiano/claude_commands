@@ -1147,30 +1147,47 @@ From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahe
 
 ### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
 
-From builds (not the user), 2026-11-12: "the natedev disk-floor alert says 'no session found' for 15 of 17 live verify.sh pids. These are most likely worker runs, and the owner lookup misses them. Fix the lookup so the alert names each owner."
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
 
-Cause: `sweep.holder_sessions` walks a pid's ancestors to the nearest live Claude session. A worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`. No ancestor is a session, so the line says "no session found". Checked 2026-11-12 on pids 676514, 1226881, 1629641 and 1635396.
+#### As-built
+
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
+
+**Files:**
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
+
+### Phase 58 — The tmp sweep judges closed phase folders of a run that is not open · status: done
+
+From builds (not the user), 2026-11-12: "TOP PRIORITY. natedev disk is 281 GiB free, 19 GiB under the 300 floor. The user approved deleting folders of finished runs in /tmp/claude/unit (open runs stay). … Fix tmp_sweep where it lives: a closed phase folder whose run has ended is a candidate, with the normal process and unsaved-git checks. Then run --plan and --apply with the fix."
+
+Cause: `run_folder_guards` keeps a whole run folder for `SESSION_WORKTREE` or `DIRECTOR`, and the sweep judges only the run's `tmp/` entries (Phase 54). A finished run whose director session still lives keeps every `phases/<id>/` folder. Measured 2026-11-12 19:50 EST: closed phase folders hold 32.6 GiB in finished runs (recorder status completed, stopped or ended) and 10.8 GiB in runs with no finish status.
 
 #### Work Order
 
-**Goal:** A floor alert names the unit director that owns each worker's detached run, and the holder message reaches that director.
+**Goal:** In a run folder that a `SESSION_WORKTREE` or `DIRECTOR` guard keeps, each `phases/` entry that is not an open phase is judged like a run `tmp/` entry.
 
 **Spec:**
-- `scripts/lint/sweep.py` `holder_sessions`: when `process_table.nearest_named` finds no session, look for the nearest ancestor that runs `detached_runs.py supervise <record path>`.
-  - Read that record (JSON). Accept it only when its `pid` equals that supervisor pid and its `status` is `running`.
-  - Find the worker with `staff.local_snapshot().by_id(StaffId(record["staff_id"]))`, then its parent with `parent_of`. The parent's name is the owner session.
-  - A missing or unreadable record, a missing staff row or a missing parent leaves the pid without a session. Do not raise.
-  - Read each record once per call, even when many pids share one supervisor.
-- `floor_out_of_reach_text` keeps its current line shapes. Do not add new text.
-- Reuse `scripts/agents/detached_run_process.py` or the `detached_runs` record reader where they fit. Do not copy record parsing that already exists.
-- Tests in `scripts/lint/test_sweep.py`: add rows to `test_a_pid_belongs_to_its_nearest_named_session`:
-  - a pid under a supervisor whose record names a worker with a parent maps to the parent's name;
-  - a record whose `pid` is not the supervisor pid maps to nothing;
-  - a record whose worker has no staff row maps to nothing.
+- `scripts/lint/tmp_sweep.py`:
+  - Add each guarded run's `phases/` folder (not a link) to the judged parents, beside the run `tmp/` folders in `temp_parents` or next to it. The `phases/` folder itself stays.
+  - Only runs whose guard is `RunKeepReason.SESSION_WORKTREE` or `RunKeepReason.DIRECTOR`. `OPEN_RUN` (the staff run pointer: an open run), `UNENDED_WORKER` and `UNREADABLE_RECORD` keep every `phases/` entry. An unreadable session registry (`NO_SESSIONS`) keeps them too.
+  - Open phases stay: read the run's open phase ids with `scripts/direct/recorder_state.read_open_phase_ids(run)`. An entry whose name is an open phase id is kept with a new reason "its phase is open". An unreadable recorder state keeps every entry of that run's `phases/` with the existing `UNREADABLE` style reason.
+  - Every other entry uses the same rules as a run `tmp/` entry: the 4 h idle rule, `IN_USE`, `WORKER_USES` and the git check.
+  - Timed sweeps and hand cleanup (`--plan`, `--apply`) both use this rule. Check that `cleanup_end_reason` accepts these entries: the run's guard is the end evidence the user approved ("open runs stay").
+  - Update the module docstring once.
+- `scripts/lint/test_tmp_sweep.py`: add rows to the Phase 54 helper `assert_run_tmp_entries` or its neighbor:
+  - `SESSION_WORKTREE` and `DIRECTOR` runs: an idle closed phase folder goes; an open phase folder stays; a fresh closed phase folder stays; a closed phase folder a process uses stays.
+  - `OPEN_RUN` and `UNENDED_WORKER` runs: an idle closed phase folder stays.
+  - An unreadable recorder state keeps the idle closed phase folder.
+  - `--plan` lists an idle closed phase folder of a `SESSION_WORKTREE` run as remove.
 
 **Files:**
-- `scripts/lint/sweep.py`
-- `scripts/lint/test_sweep.py`
+- `scripts/lint/tmp_sweep.py`
+- `scripts/lint/test_tmp_sweep.py`
 
 **Workers:** `1 writer`
 - writer: all files.
@@ -1178,5 +1195,5 @@ Cause: `sweep.holder_sessions` walks a pid's ancestors to the nearest live Claud
 **State:** none.
 
 **Acceptance gate:**
-- `scripts.lint.test_sweep` passes, with the new rows.
+- `scripts.lint.test_tmp_sweep` passes, with the new rows.
 - `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
