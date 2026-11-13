@@ -3941,3 +3941,36 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The probe shows zero reads of the real roots for each changed module.
 - A fixture with no helper, run under the default, resolves to a private root.
 - basedpyright 0 errors and 0 warnings on each changed file.
+
+### Phase 253 — The shutdown CLI tests copy class-built Git repositories  · status: todo
+**Depends on:** Phase 252
+
+#### Work Order
+
+**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** sdlc go 2026-11-13 15:25, option (a) after Phase 252. After Phase 243 the module costs 37.8 natedev CPU s for 136 tests: Git 7,380 starts (8.3 s), git-upload-pack and git-receive-pack 976 starts (2.8 s), taplo 231 starts (1.1 s). Top tests: RetireUnitTests unowned_or_live_sessions 3.7 s, retirement_without_saved_work 3.3 s, remote_retirement_retries_failed_steps 3.2 s; UnitRename preserve identity 1.9 s; WorkerRename owner_rename 1.8 s.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Build each Git repository, bare remote and checkout that `ShutdownRepositoryFixture` (`test_shutdown_cli.py:214`), `UnitRenameFixture`, `FolderRenameFixture` and `WorkerRenameTests` make in `setUp` once per class, and copy it per test, as Phases 235-238 did. Absolute origin or worktree paths need a fixed per-class root or a rewrite after the copy. A copy must hold no path into the seed. Keep tested fetches, pushes, commits, retries and recovery real; copy only the state a test reads before its tested step.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/agents/test_shutdown_cli.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phases 235-238 and 251: class seed copies; register cleanup before a copy.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
