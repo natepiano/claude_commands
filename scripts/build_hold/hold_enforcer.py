@@ -528,6 +528,7 @@ def protected_reason(
     process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess],
     owner: OwningSession | NoOwningSession,
     holders: Sequence[build_hold.Holder], enforcer_ancestors: frozenset[build_hold.ProcessIdentity],
+    *, drain: bool = False,
 ) -> str:
     if process.identity in enforcer_ancestors:
         return "enforcer or its ancestor"
@@ -544,7 +545,7 @@ def protected_reason(
         # Missing, stale and unreadable records grant no permission.
         return ""
     if is_waiting_gate(process):
-        return "verify.sh or a suite runner waits at its own hold gate"
+        return "the drain stops waiting runs" if drain else "verify.sh or a suite runner waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)
@@ -570,6 +571,7 @@ def gate_job_root(
 def decide_builds(
     processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
     uid: int, enforcer_pid: int, claimed: frozenset[build_hold.ProcessIdentity],
+    *, drain: bool = False,
 ) -> tuple[BuildDecision, ...]:
     protected: frozenset[build_hold.ProcessIdentity] = frozenset()
     if enforcer_pid in processes:
@@ -586,7 +588,7 @@ def decide_builds(
                 and isinstance(owner, NoOwningSession)):
             continue
         reason = ("holds a live Mac or AWS claim" if holds_claim(process, processes, claimed)
-                  else protected_reason(process, ancestors, owner, holders, protected))
+                  else protected_reason(process, ancestors, owner, holders, protected, drain=drain))
         if reason or not holders:
             decisions.append(AllowedBuild(process, owner, reason or "no hold is in force"))
             continue
@@ -857,7 +859,7 @@ def decision_lines(decisions: Sequence[BuildDecision]) -> list[str]:
     return lines
 
 
-def report(proc_root: Path, directory: Path) -> list[str]:
+def report(proc_root: Path, directory: Path, *, drain: bool = False) -> list[str]:
     holders = build_hold.natedev_holds(directory).in_force
     lines = [f"kept by {holder.name}: pid {run.pid}, start {run.start_time}"
              for holder in holders for run in holder.keep]
@@ -866,7 +868,7 @@ def report(proc_root: Path, directory: Path) -> list[str]:
     if isinstance(claims, build_hold.ClaimsUnreadable):
         lines.append(f"claims unreadable: {claims.reason}")
     claimed: frozenset[build_hold.ProcessIdentity] = claims.identities if isinstance(claims, build_hold.LiveClaims) else frozenset()
-    return lines + decision_lines(decide_builds(processes, holders, os.getuid(), os.getpid(), claimed))
+    return lines + decision_lines(decide_builds(processes, holders, os.getuid(), os.getpid(), claimed, drain=drain))
 
 
 def scan(proc_root: Path, holder_directory: Path, uid: int, enforcer_pid: int,

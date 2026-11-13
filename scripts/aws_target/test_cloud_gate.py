@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from decimal import Decimal
 from io import StringIO
@@ -28,11 +28,12 @@ from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.buildlog import store
+from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
 from scripts.production.gate_modules import GateRefused
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 
@@ -134,6 +135,9 @@ class CloudGateTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
+        _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         repository = Path(__file__).resolve().parents[2]
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         shipped = (repository / 'config/cloud_gate.conf').read_text()
@@ -157,6 +161,66 @@ class CloudGateTests(CostFixture):
                 'security_group': 'fixture-group',
                 'subnets': [{'id': 'fixture-a', 'zone': 'a'}, {'id': 'fixture-b', 'zone': 'b'}]}]}
         self.fake.result = self.result()
+
+    def test_time_limit_returns_red_with_traceback_and_ends_the_box(self) -> None:
+        import sqlite3
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection, connection:
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 0, 0, 'full', 1)""").close()
+        self.request['modules'] = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
+        self.fake.has_result = False
+        self.fake.log = ("Runner: 2 modules, whole machine, 32 CPUs\n"
+                         "Starting module: fixture/test_ok.py\n"
+                         "--- fixture/test_ok.py exit=1 ---\n"
+                         "Traceback (most recent call last):\nAssertionError: fixture red\n"
+                         "--- end module failure ---\n"
+                         "fixture/test_ok.py exit=1 seconds=0.50\n"
+                         "Starting module: fixture/nested/test_busy.py\n")
+        numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
+        with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
+            outcome = self.execute()
+        self.assertEqual(outcome['status'], 'complete')
+        row = ledger.mapping(outcome['result'])
+        cloud_gate.validate_result(row, self.request)
+        run = gate_box.decode_run(row['gate'])
+        self.assertFalse(run.passed)
+        self.assertIn('limit 2 s; elapsed 3.000 s; running modules: fixture/nested/test_busy.py', run.time_limit_report)
+        self.assertIn('Traceback (most recent call last):\nAssertionError: fixture red', run.time_limit_report)
+        self.assertIn('fixture/test_ok.py', run.time_limit_report)
+        self.assertEqual(run.jobs[0].returncode, 1)
+        self.assertEqual(run.jobs[1].returncode, 124)
+        self.assertTrue(self.fake.terminated)
+        self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
+
+    def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
+        import sqlite3
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection, connection:
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 0, 0, 'full', 1)""").close()
+        self.fake.has_result = False
+        self.fake.log = "Runner: 1 modules, whole machine, 32 CPUs\nStarting module: fixture/test_ok.py\n"
+        numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
+
+        def result_arrives(seconds: float) -> None:
+            self.advance(1)
+            self.fake.has_result = True
+            self.advance(seconds - 1)
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=result_arrives)
+        with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
+            outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'complete')
+        result = ledger.mapping(outcome['result'])
+        cloud_gate.validate_result(result, self.request)
+        run = gate_box.decode_run(result['gate'])
+        self.assertTrue(run.passed, run.time_limit_report)
+        self.assertEqual(run.time_limit_report, '')
+        self.assertTrue(self.fake.terminated)
 
     def advance(self, seconds: float) -> None:
         self.now += seconds

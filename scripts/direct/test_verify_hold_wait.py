@@ -86,7 +86,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertAlmostEqual(self.recorded_hold_wait(), float(observed["total"]), places=5)
         commands = self.hold_commands(starts)
-        self.assertTrue(any(command[1] == "wait-local" for command in commands))
+        self.assertTrue(any(command[1] == "register-local" for command in commands))
         self.assertFalse(any(command[1] in {"mark", "check-admission", "finish-local"} for command in commands))
 
     def test_held_call_waits_before_compiling_then_runs_on_release(self) -> None:

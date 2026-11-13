@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_lines
 from scripts.build_queue.queue_lines import age, field
-from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
 from scripts.lib.build_steps import StepNames
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
@@ -194,12 +194,14 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
 
 def service_activity_text(memory: admission_records.CompilerServiceMemory | admission_records.UnownedSliceMemory, now: float) -> str:
     """Describe the recorded service state at the pass time."""
-    state = memory.job_state
+    state = admission_records.recorded_service_state(memory)
     if isinstance(state, NotServiceSlice):
         raise ValueError("a build scope has no service state")
-    if isinstance(state, RunningServiceJob):
+    if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)):
         elapsed = f"{age(state.started_at, now)} min" if state.started_at else "age unknown"
-        return f"running job, {elapsed}"
+        activity = ("running job" if isinstance(state, RunningServiceJob)
+                    else "waiting job" if isinstance(state, WaitingServiceJob) else "unmatched job")
+        return f"{activity}, {elapsed}"
     return "idle"
 
 
@@ -219,7 +221,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
     if isinstance(memory, admission_records.CompilerServiceMemory) or (
-            isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
+            isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)):
         return service_text(memory, explanation.now)
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at

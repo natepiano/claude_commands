@@ -21,6 +21,7 @@ import threading
 from typing import TYPE_CHECKING, Literal, cast, override
 
 from scripts.lib.boot_identity import boot_identity
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -29,7 +30,6 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
-_CANCELLATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 @contextmanager
@@ -44,7 +44,7 @@ def defer_signals() -> Generator[None]:
         del frame
         pending.append(number)
 
-    previous = {number: signal.signal(number, record) for number in _CANCELLATION_SIGNALS}
+    previous = {number: signal.signal(number, record) for number in CANCELLATION_SIGNALS}
     try:
         yield
     finally:
@@ -321,7 +321,7 @@ def run_build(owner: str, name: str, command: Sequence[str]) -> int:
         del frame
         raise CommandSignal(number)
 
-    watched = _CANCELLATION_SIGNALS
+    watched = CANCELLATION_SIGNALS
     previous = {number: signal.signal(number, interrupted) for number in watched}
     try:
         with temporary_build_folder(spec) as path:

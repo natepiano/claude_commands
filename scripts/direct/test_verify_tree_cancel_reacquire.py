@@ -8,6 +8,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.build_queue import placement
+
 from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import BOARD
 from scripts.direct.wait_for_test_state import wait_until
@@ -23,17 +25,26 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         _ = seed.write_text(json.dumps({"holder": "hana", "since": datetime.now(UTC).isoformat(),
                                        "for": "reacquisition test", "release_eta": "unknown"}))
         shell = self.root / "hold-at-local-step.sh"
-        _ = shell.write_text('set -T\nhold_at_local_step() {\n    if [[ "$BASH_COMMAND" == build_hold_wait_local && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_HOLD_READY" ]]; then\n        cp "$TEST_HOLD_SEED" "$BUILD_HOLD_DIR/hana"\n        printf \'%s\\n%s\\n\' "$BUILDLOG_HOLD_WAITER_FILE" "$(< "$BOARD_DIR/locks/cargo.d/holder_pid")" > "$TEST_HOLD_READY"\n    fi\n}\ntrap hold_at_local_step DEBUG\n')
+        _ = shell.write_text('set -T\nhold_at_local_step() {\n    if [[ "$BASH_COMMAND" == check_routing_hold && "${TOKEN_HELD:-0}" == 1 && ! -e "$TEST_HOLD_READY" ]]; then\n        cp "$TEST_HOLD_SEED" "$BUILD_HOLD_DIR/hana"\n        printf \'%s\\n%s\\n\' "$BUILDLOG_PLACEMENT_EPISODE" "$(< "$BOARD_DIR/locks/cargo.d/holder_pid")" > "$TEST_HOLD_READY"\n    fi\n}\ntrap hold_at_local_step DEBUG\n')
         process = self.start_verify("test", BASH_ENV=str(shell),
             TEST_HOLD_SEED=str(seed), TEST_HOLD_READY=str(ready))
         lock = self.board / "locks/cargo.d"
         hold = holds / "hana"
         wait_until(lambda: ready.exists() and len(ready.read_text().splitlines()) == 2,
                    self.root, processes=(process,))
-        waiter_path, holder_pid = ready.read_text().splitlines()
+        episode, holder_pid = ready.read_text().splitlines()
         self.assertEqual(holder_pid, str(process.pid))
-        hold_waiter = Path(waiter_path)
-        wait_until(lambda: hold_waiter.exists() and not lock.exists(), hold_waiter.parent, processes=(process,))
+
+        def blocked_episode() -> bool:
+            with self.admission.loop_turn():
+                return episode in self.admission.server.placement_requests and any(
+                    candidate.destination.provider == "local"
+                    and isinstance(candidate.eligibility, placement.TemporaryExclusion)
+                    and candidate.eligibility.reason == "blocked"
+                    for candidate in self.admission.server.placement_eligibility.get(episode, ()))
+
+        wait_until(lambda: blocked_episode() and not lock.exists(), self.root, processes=(process,))
+        self.assertEqual(self.admission.server.placement_requests[episode].episode, episode)
         holder = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
