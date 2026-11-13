@@ -175,6 +175,7 @@ State:
   - **A broadcast** (a build hold, an announcement) already
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
+    Send every production-wide unit message through `broadcast.py --production <your name> --units`; never use a remembered list.
   - **The user's words for a production below you** go to your child that
     holds it, by SendMessage, beginning `From the user (via <your name>): `.
     That child relays them to its unit or to its own child. One level at a

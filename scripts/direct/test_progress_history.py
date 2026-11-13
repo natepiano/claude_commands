@@ -4142,7 +4142,7 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(resumed, first)
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
             original_prompt = prompt.read_text()
-            for changed_command in (command, [*command, "--summary", str(self.root / "summary.txt")]):
+            for changed_command in (command, [*command, "--reply-file", str(self.root / "summary.txt")]):
                 with self.subTest(prompt="changed active content", launcher=changed_command):
                     _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
                     with self.assertRaisesRegex(RuntimeError, "different prompt content"):
@@ -8055,12 +8055,13 @@ with patch.object(fcntl, "flock", admission):
 
     def test_a_phase_started_while_another_is_open_leaves_the_older_one_open(self) -> None:
         started_at = 40_000
-        session_dir = self.start_run("overlapping-phases", started_at)
+        session_dir = self.start_run("overlapping-phases", started_at, unit_owned=True)
         self.start_numbered_phase(session_dir, "6", started_at + 10)
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
         self.team_slot = ""
         self.start_numbered_phase(session_dir, "18", started_at + 100)
 
+        self.assertNotIn("anomaly:", self.last_recorder_stderr)
         self.assertEqual(self.open_phase_ids(session_dir), ("18", ["6"]))
         self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
         self.assertEqual(self.phase_events("overlapping-phases", "phase_finished"), [])
@@ -8081,6 +8082,12 @@ with patch.object(fcntl, "flock", admission):
             [(event.get("phase_id"), event.get("phase_elapsed_seconds")) for event in finished],
             [("18", 100), ("6", 290)],
         )
+
+        self.start_numbered_phase(session_dir, "19", started_at + 400)
+        self.start_numbered_phase(session_dir, "20", started_at + 500)
+        self.assertEqual(self.open_phase_ids(session_dir), ("20", ["19"]))
+        self.assertIn("anomaly: start-phase: reservation: phase 19 set aside unclosed, started 1970-01-01 11:13 UTC",
+                      self.last_recorder_stderr)
 
     def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_workers(self) -> None:
         started_at = 41_000

@@ -653,11 +653,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
   It preserves full cells and omits columns whose cells are all `—`.
   A table without rows keeps its columns.
-  The command emits one Markdown row per phase for Claude Code's native wrapping.
+  The command emits one Markdown row per phase, plus continuation rows for cells over the line cap.
   The renderer sets column widths from the terminal width and wraps text inside each cell.
-  Print the output as Markdown without code fences, `<br>`, or continuation rows.
-  Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
-  Renderer trials at 170 columns showed that native wrapping keeps each Markdown row together.
+  Print the output as Markdown without code fences or `<br>`.
+  Claude Code 2.1.319 displays `<br>` as text.
   The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
@@ -760,9 +759,22 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    Native Markdown wrapping keeps each phase's text in one row inside its cells.
-    Workers uses the same wrapping form when the status table exceeds the terminal width.
-    Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
+    `claude_table_layout.py` models the width rule in Claude Code 2.1.319.
+    `unit_phases.py` run as a script reads its pane width once through `herdr.own_pane_columns`.
+    The read sends `pane.layout` for `HERDR_PANE_ID` to `HERDR_SOCKET_PATH`.
+    `units_table_width_read_milliseconds` limits the read; the median is under 1 ms.
+    Without a width, the tables use `units_table_floor_columns` in `config/production.conf` and print no anomaly.
+    Calls to `main` or `table` from tests pass the width or use the floor; they never read a live pane.
+    `units_table_cell_lines` sets the cell line cap, which defaults to four.
+    Cells that exceed the cap continue on rows that repeat Unit and fill one work cell.
+    Item marks take priority over word boundaries when the script splits cells.
+    When the column minimums exceed that width, a space follows a `-`, `/` or `_` inside the longest ID.
+    The mark must join two letters or digits.
+    A word without a mark breaks at the column share only from `units_table_break_columns` columns; shorter words stay whole.
+    When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks at the share.
+    Unit, Status, Machine, and Progress keep their text.
+    The script fits both tables at that width without changing the style table.
+    Each column can only grow in a wider terminal.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.

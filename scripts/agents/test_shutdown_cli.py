@@ -39,6 +39,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.agents.test_support import write_machine_config
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker
@@ -349,7 +350,10 @@ class RetireUnitTests(unittest.TestCase):
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
                             + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
-                            + "# whole: 40..\nunits_table_columns=170\n")
+                            + "# whole: 40..\nunits_table_columns=170\n"
+                            + "# whole: 40..\nunits_table_floor_columns=120\n"
+                            + "# whole: 1..4\nunits_table_cell_lines=4\n"
+                            + "# whole: 2..\nunits_table_break_columns=30\n")
         return path
 
 
@@ -551,6 +555,7 @@ class RetireUnitTests(unittest.TestCase):
         atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+        write_machine_config(self.root)
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"

@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import shlex
-import socket
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
@@ -263,6 +262,16 @@ class NoHerdrPane:
 
 
 @dataclass(frozen=True)
+class RegistryName:
+    value: str
+
+
+@dataclass(frozen=True)
+class NoRegistryName:
+    """The session registry has no name for this row."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -279,6 +288,7 @@ class RosterEntry:
     account: AccountAttribution = AccountUnread("not read")
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
     pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
+    registry_name: RegistryName | NoRegistryName = NoRegistryName()
 
 
 @dataclass(frozen=True)
@@ -336,6 +346,7 @@ class ShownName:
     unit: UnitPart | NoUnit
     job: ShownJob | JobUnassigned
     address: str
+    registry_name: RegistryName | NoRegistryName = NoRegistryName()
 
     def render(self) -> str:
         parts: list[str] = []
@@ -354,7 +365,8 @@ class ShownName:
             elif isinstance(qualifier, JobSlot) and qualifier.slot:
                 label += f" {qualifier.slot}"
             parts.append(label)
-        return " · ".join(parts) or self.address
+        return " · ".join(parts) or (self.registry_name.value
+                                    if isinstance(self.registry_name, RegistryName) else self.address)
 
 
 def shown_name(entry: RosterEntry) -> ShownName:
@@ -380,7 +392,9 @@ def shown_name(entry: RosterEntry) -> ShownName:
                            JobSlot(slot) if slot else Unqualified())
     address = _address(entry) or _session_address(entry)
     return ShownName(ProductionPart(production) if production else NoProduction(),
-                     UnitPart(unit) if unit else NoUnit(), job, address or entry.name)
+                     UnitPart(unit) if unit else NoUnit(), job, address or entry.name,
+                     entry.registry_name if entry.kind == "claude" and entry.role == "freestanding" and not entry.name
+                     else NoRegistryName())
 
 
 @dataclass(frozen=True)
@@ -407,13 +421,15 @@ def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
 
 
 TaggedSnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | NotAWorker
-                       | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
+                       | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution
+                       | RegistryName | NoRegistryName)
 SnapshotState = TaggedSnapshotState | WorkerAssignment | HeldDesignRole
 _SNAPSHOT_STATES: tuple[type[TaggedSnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
     UnitWithoutRunningDirector, NoDirector, NotAWorker, CodexThread, NoCodexThread,
     ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
+    RegistryName, NoRegistryName,
 )
 
 
@@ -433,6 +449,7 @@ class SnapshotEntry(TypedDict):
     account: NotRequired[dict[str, str]]
     daemon: NotRequired[dict[str, str]]
     pane: NotRequired[dict[str, str]]
+    registry_name: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
@@ -464,6 +481,7 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
                 if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
         pane=({"session": entry.pane.session, "pane": entry.pane.pane}
               if isinstance(entry.pane, HerdrPlace) else {}),
+        registry_name=_tagged_state(entry.registry_name),
     )
 
 
@@ -526,8 +544,9 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account", "daemon", "pane"}
-    if not required <= set(values) or set(values) - required - {"account", "daemon", "pane"}:
+    optional = {"account", "daemon", "pane", "registry_name"}
+    required = set(SnapshotEntry.__annotations__) - optional
+    if not required <= set(values) or set(values) - required - optional:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -535,6 +554,7 @@ def _decode_entry(value: object) -> RosterEntry:
     assignment = _decode_state(values.get("assignment"))
     thread = _decode_state(values.get("thread"))
     session = _decode_state(values.get("session"))
+    registry_name = _decode_state(values["registry_name"]) if "registry_name" in values else NoRegistryName()
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
@@ -556,7 +576,8 @@ def _decode_entry(value: object) -> RosterEntry:
             and isinstance(assignment, Assignment)
             and isinstance(thread, CodexThread | NoCodexThread)
             and isinstance(session, ClaudeSession | NoClaudeSession)
-            and isinstance(attributed, AccountAttribution)):
+            and isinstance(attributed, AccountAttribution)
+            and isinstance(registry_name, RegistryName | NoRegistryName)):
         raise ValueError("snapshot state is in the wrong field")
     if isinstance(attributed, AccountLabel):
         attributed = AccountLabel(note_file.canonical_label(attributed.label))
@@ -568,7 +589,7 @@ def _decode_entry(value: object) -> RosterEntry:
         role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed, daemon=daemon, pane=pane,
+        thread=thread, session=session, account=attributed, daemon=daemon, pane=pane, registry_name=registry_name,
     )
 
 
@@ -1086,6 +1107,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
+            registry_name=RegistryName(record["name"]) if record["name"] else NoRegistryName(),
             account=_process_account(record["pid"], "claude", home_state=home_state),
         )
     return entries
@@ -1374,7 +1396,7 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
 
 
 def machine_name() -> str:
-    return socket.gethostname().split(".", 1)[0]
+    return remote.this_machine()
 
 
 @herdr.observation_snapshot()

@@ -114,7 +114,7 @@ REAL_OPEN_CASE = rca.open_case
 def write_send_config(path: Path, values: str) -> int:
     """Keep timing settings when a test changes the sender authority setting."""
     defaults = Path(send.__file__).resolve().parents[2] / "config"
-    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca"):
+    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
         _ = (path.parent / f"{name}.conf").write_text((defaults / f"{name}.conf").read_text())
     timings = "\n".join(line for line in (defaults / "send.conf").read_text().splitlines()
                         if not line.startswith("MORTY_NATIVE_ID="))
@@ -2258,7 +2258,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 1)
 
     def test_pending_remote_result_releases_the_originating_claim(self) -> None:
-        options = send.parse(["--machine", "fixture", "--to", "session:recipient", "--from", "test",
+        options = send.parse(["--machine", "mac", "--to", "session:recipient", "--from", "test",
                               "--key", "pending-remote", "--repeat-minutes", "30", "--text", "Notice"])
         with mock.patch.object(send, "run", return_value=(5, "PENDING: remote delivery is active", "")):
             self.assertEqual(send.send(options).outcome, "pending")
@@ -4852,7 +4852,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
         self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -4878,7 +4878,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
         self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -4895,7 +4895,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
-                                    ("Codex workers", "They spend credits now.", "Set use_credits: off in codex2.md"),
+                                    ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
             with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):
@@ -5318,6 +5318,8 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_rows: dict[str, staff.StaffRow] = {}
         _ = self.enterContext(mock.patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot(tuple(self.staff_rows.values()))))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "config").mkdir()
+        _ = write_send_config(self.root / "config/send.conf", "")
         binaries = self.root / "bin"
         binaries.mkdir()
         (self.root / "sessions").mkdir()
@@ -5336,6 +5338,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "CONF_DIR": str(self.root / "config"),
             "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "SSH_RECORD": str(self.ssh_log),
@@ -5455,11 +5458,20 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):
             with self.subTest(address=address):
                 self.peer([self.row("peer", address)])
-                status, output, errors = self.run_main(address)
+                listed = roster.peer_roster(os.environ)
+                listing = io.StringIO()
+                with mock.patch.object(roster, "roster", return_value=listed), redirect_stdout(listing):
+                    self.assertEqual(roster.main(["--json"]), 0)
+                document = cast(dict[str, object], json.loads(listing.getvalue()))
+                printed = cast(list[roster.SerializedRosterEntry], document["entries"])[0]
+                self.assertEqual(printed["machine"], "mac")
+                status, output, errors = self.run_main(printed["address"])
                 self.assertEqual((status, errors), (0, ""), output)
                 forwarded = self.forwarded()[-1]
                 self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
                 self.assertIn("--here", forwarded)
+                self.assertTrue(all(cast(list[str], call["args"])[2] == printed["machine"]
+                                    for call in self.ssh_calls()))
         self.assertEqual(len(self.forwarded()), 3)
         self.assertEqual(self.relayed, [])
         self.assertEqual(self.daemon_calls, [])
@@ -5510,8 +5522,21 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         status, output, errors = self.run_main("bare name", "--machine", "mac")
         self.assertEqual((status, errors), (0, ""), output)
         self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertEqual(cast(list[str], self.ssh_calls()[0]["args"])[2], "mac")
         self.assertEqual(self.forwarded()[0][self.forwarded()[0].index("--to") + 1], "session:remote")
         self.assertIn("--here", self.forwarded()[0])
+        for host in ("Nates-MacBook-Pro-2023", "MAC", "nates-MACBOOK-pro-2023"):
+            with self.subTest(host=host):
+                status, output, errors = self.run_main("bare name", "--machine", host)
+                self.assertEqual((status, errors), (0, ""), output)
+                self.assertEqual(cast(list[str], self.ssh_calls()[-1]["args"])[2], "mac")
+        before = len(self.ssh_calls())
+        status, output, errors = self.run_main("bare name", "--machine", "other-host")
+        self.assertEqual(status, 2)
+        self.assertEqual(output, "")
+        for value in ("unknown machine", "other-host", "accepted names", "mac", "natedev", "Nates-MacBook-Pro-2023"):
+            self.assertIn(value, errors)
+        self.assertEqual(len(self.ssh_calls()), before)
 
     def test_clean_peer_misses_keep_each_forms_local_outcome(self) -> None:
         for target, expected in (("session:gone", 1), ("codex:gone", 3), ("worker:gone/impl", 2), ("bare missing", 2)):

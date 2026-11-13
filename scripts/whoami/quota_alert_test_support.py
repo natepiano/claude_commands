@@ -21,6 +21,7 @@ from unittest import mock
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.message import session_send
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
 from scripts.whoami.account_test_support import create_claude_account
 
 
@@ -49,8 +50,8 @@ REGISTRY = registry_text({
                               'design_roles': 'codex   # a trailing comment'}),
     'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
     'direct.claude': ExactRows({'impl': 'opus:high'}),
-    'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
-    'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
+    'cli.codex': ExactRows({'merge_branch': 'gpt-6-sol:high'}),
+    'cli.claude': ExactRows({'merge_branch': 'sonnet:high'}),
     'design_roles.codex': ExactRows({'reviewer': 'gpt-6-sol:xhigh'}),
     'design_roles.claude': ExactRows({'reviewer': 'opus:max'}),
     'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
@@ -127,10 +128,12 @@ class QuotaReminderFixture(unittest.TestCase):
         self.pushed: list[tuple[str, str, quota_alert.Ask]] = []
         self.noted: list[RenderedPush] = []
         self.broadcasts: list[list[str]] = []
+        self.credits: set[str] = set()
 
     @override
     def setUp(self) -> None:
         self.root = self.fixture_root()
+        self.credits = hold_credit_accounts(self)
         _ = self.enterContext(mock.patch("socket.gethostname", return_value=role_map.ROLE_MAP_HOST))
         self.broadcasts = self.enterContext(worker_mode_broadcasts())
         _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
@@ -388,11 +391,13 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.phone: mock.MagicMock = mock.MagicMock()
         self.relay: mock.MagicMock = mock.MagicMock()
         self.swap: mock.MagicMock = mock.MagicMock()
+        self.credits: set[str] = set()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.broadcasts = self.enterContext(worker_mode_broadcasts())
+        self.credits = hold_credit_accounts(self)
         _ = self.enterContext(mock.patch.object(accounts, "_launch_worker_moves", return_value=None))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text('{"schema":2,"rows":[]}\n')
@@ -445,8 +450,9 @@ always=director
         path = self.root / f"codex{number}.md"
         _ = path.write_text(f"---\nlogin: account{number}@example.invalid\nrole: worker\nsessions: 0\n"
             + f"weekly_remaining_usage: {left}\ncredit_balance: 6370\n"
-            + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n"
-            + (f"use_credits: {setting}\n" if setting else "") + "---\n")
+            + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n---\n")
+        if setting:
+            set_credits(self.credits, f"codex{number}", setting)
         note = read_note(path)
         assert isinstance(note, note_file.Note)
         return note

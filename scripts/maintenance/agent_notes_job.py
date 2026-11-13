@@ -154,6 +154,10 @@ def _perform(part: Part) -> int:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
             print(line)
+    elif part is Part.LOGINS:
+        from scripts.accounts import login_sittings
+        for line in login_sittings.run(datetime.now(timezone.utc)):
+            print(line)
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main
         return main()

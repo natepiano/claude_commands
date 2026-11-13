@@ -34,6 +34,7 @@ from scripts.whoami import usage_store
 from scripts.notify.push_texts import RenderedPush, catalog, render_entry
 from scripts.notify.user_action import ActionRequired
 from scripts.whoami.test_quota_alert import REGISTRY
+from scripts.whoami.credit_accounts_test_support import hold_credit_accounts, set_credits
 from scripts.whoami.quota_alert_test_support import complete_worker_moves, worker_mode_broadcasts
 
 CURRENT_READING_AGE = timedelta()
@@ -55,12 +56,14 @@ class CodexAccountAlertTests(unittest.TestCase):
     sent: list[str] = []
     pushes: list[RenderedPush] = []
     relayed: list[str] = []
+    credits: set[str] = set()
 
     @override
     def setUp(self) -> None:
         _ = self.enterContext(worker_mode_broadcasts())
         _ = self.enterContext(patch.object(accounts, "_launch_worker_moves", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.credits = hold_credit_accounts(self)
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
         self.pushes = []
@@ -157,10 +160,7 @@ always=director
                                        reset=self.now + timedelta(hours=12))
                         self.save_room(later, 90 if fallback == "codex2" else 0)
                         note = self.note(1, "active", left)
-                        _ = note.path.write_text(note.path.read_text().replace(
-                            "credit_balance:", f"use_credits: {credits}\ncredit_balance:"))
-                        note = note_file.read_note(note.path)
-                        assert isinstance(note, note_file.Note)
+                        set_credits(self.credits, "codex1", credits)
                         push = quota_alert.codex_next_move_push(note, now=self.now)
                         if not 0 < left <= 2:
                             self.assertIsInstance(push, quota_alert.QuotaStatusNote)
@@ -399,9 +399,7 @@ always=director
         self.save_room(target, 80)
         self.save_room(other, 80)
         note = self.note(1, "active", 0)
-        _ = note.path.write_text(note.path.read_text().replace("credit_balance:", "use_credits: off\ncredit_balance:"))
-        note = note_file.read_note(note.path)
-        assert isinstance(note, note_file.Note)
+        set_credits(self.credits, "codex1", "off")
         readings = self.readings(source, self.report(source, 0), self.report(target, 80), self.report(other, 80))
         _ = next_moves.add_next_move("workers", 1, "codex2")
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
@@ -613,9 +611,7 @@ always=director
             with self.subTest(target=target_label):
                 head = next_moves.add_next_move("workers", 1, target_label)
                 note = self.note(1, "active", 1)
-                _ = note.path.write_text(note.path.read_text().replace("credit_balance:", "use_credits: off\ncredit_balance:"))
-                note = note_file.read_note(note.path)
-                assert isinstance(note, note_file.Note)
+                set_credits(self.credits, "codex1", "off")
                 reminder = quota_alert.codex_next_move_push(note, now=self.now)
                 self.assertEqual(reminder, quota_alert.QuotaStatusNote("codex1", expected))
                 with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
@@ -1125,9 +1121,8 @@ always=director
             worktree=staff.PresentWorktree("natedev", self.root))
         _ = fixture_worker("alert-review", unit.id, backend=staff.CodexBackend(source.home))
         for number in (1, 2):
-            note = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
-            _ = note.path.write_text(note.path.read_text().replace("credit_balance:",
-                "use_credits: on\ncredit_balance:"))
+            _ = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
+            set_credits(self.credits, f"codex{number}", "on")
         readings = self.readings(source, self.report(source, 0, "6370"), self.report(target, 1, "6370"))
         with (patch.object(accounts, "_codex_live", return_value=self.report(target, 0, "6370")) as live,
               patch.object(stop_resume, "stop") as stop):
@@ -1249,7 +1244,7 @@ always=director
                     self.assertEqual((rendered.sender, rendered.need), (example.values["sender"], "decision"))
                     self.assertIsInstance(rendered.action, ActionRequired)
                     assert isinstance(rendered.action, ActionRequired)
-                    self.assertIn(example.values["account"] + ".md", rendered.action.text)
+                    self.assertIn(f"remove {example.values['account']} from codex_credit_accounts", rendered.action.text)
                     keys = {"sender", "account", "machine", "credits", "refill"}
                     if entry.id == "quota.paid_credits":
                         keys.add("next_reset")
