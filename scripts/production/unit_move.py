@@ -726,9 +726,9 @@ def move_processes_inside(row: staff.StaffRow, folder: Path, *,
         try:
             observed = herdr.read_conversation(str(member.current_session))
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
-            return processes
+            continue
         if isinstance(observed, herdr.UnknownConversation):
-            return processes
+            continue
         if isinstance(observed, herdr.LiveConversation):
             for pid in observed.pids:
                 try:
