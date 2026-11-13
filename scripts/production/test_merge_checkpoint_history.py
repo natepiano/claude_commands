@@ -113,8 +113,11 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(ledger.read_bytes(), first_row)
 
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
-        for newer_plan, closing_kind in ((False, "shrink"), (True, "shrink"), (True, "as-built")):
-            with self.subTest(newer_plan=newer_plan, closing_kind=closing_kind):
+        for configured_plan, closing_kind in (("docs/plans/alpha.md", "shrink"),
+                                               ("docs/plans/new-alpha.md", "shrink"),
+                                               ("docs/plans/new-alpha.md", "as-built"),
+                                               ("docs/as-built/beta.md", "as-built")):
+            with self.subTest(configured_plan=configured_plan, closing_kind=closing_kind):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
@@ -126,18 +129,18 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.write(self.unit, "docs/plans/alpha.md", "short as built\n")
                 self.write(self.unit, "docs/plans/alpha-next.md", "next items\n")
                 _ = self.git("add", "docs/plans/alpha.md", "docs/plans/alpha-next.md", cwd=self.unit)
-                subject = "shrink(alpha): phase 2 — Alpha phase" if newer_plan else "shrink"
+                subject = "shrink(alpha): phase 2 — Alpha phase" if configured_plan != "docs/plans/alpha.md" else "shrink"
                 if closing_kind == "as-built":
                     _ = self.git("rm", "-f", "docs/plans/alpha.md", cwd=self.unit)
-                    self.write(self.unit, "docs/as-built/alpha.md", "as built\n")
-                    _ = self.git("add", "docs/as-built/alpha.md", cwd=self.unit)
+                    as_built_plan = configured_plan if configured_plan.startswith("docs/as-built/") else "docs/as-built/alpha.md"
+                    self.write(self.unit, as_built_plan, "as built\n")
+                    _ = self.git("add", as_built_plan, cwd=self.unit)
                     subject = "docs(alpha): as-built"
                 _ = self.git("commit", "-m", subject, cwd=self.unit)
                 sha = self.git("rev-parse", "HEAD", cwd=self.unit)
                 _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
-                if newer_plan:
-                    config = self.unit / ".unit.toml"
-                    _ = config.write_text(config.read_text().replace("docs/plans/alpha.md", "docs/plans/new-alpha.md"))
+                config = self.unit / ".unit.toml"
+                _ = config.write_text(config.read_text().replace("docs/plans/alpha.md", configured_plan))
                 result = self.run_checkpoint(sha, "--" + closing_kind, review=False)
                 self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
                 self.assertEqual(len(self.events("review_regime.py")), 1)
