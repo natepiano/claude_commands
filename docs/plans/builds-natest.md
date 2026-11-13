@@ -3562,36 +3562,9 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Two ranked tables with file:line, reaching modules, measured CPU and a proposed fix.
 - No repository file changes.
 
-### Phase 231 — Every test module run sees no host herdr  · status: todo
+### Phase 231 — Every test module run sees no host herdr  · status: done
 **Depends on:** Phase 229
 
-#### Work Order
+#### As-built
 
-**Goal:** the gate, the paired aws trial and `module_cost.py` give each test module the same environment, so a module passes or fails the same way on each.
-
-**Decision:** director, 2026-11-13. The Phase 229 aws trial failed 18 `agents/test_shutdown_cli.py` tests on base and changed alike. Cause (impl4 diagnosis, `phases/229/impl4/diagnosis.txt`): the paired guest at `gate_box.py:138` does not set `HERDR_BIN`. The normal guest sets `HERDR_BIN=/nonexistent/herdr` at `gate_box.py:340`, and `module_cost.py:97` and `:167` set it again. Without it, `herdr.py:1028` raises `HerdrMissing` before the mocks run. The value lives in four places; it must live in one.
-
-**Spec:**
-1. Set `HERDR_BIN` to `/nonexistent/herdr` in `merge_gate.test_module_environment` (`merge_gate.py:1103`), the one builder of a module's environment. Name the value once, as a module constant.
-2. Remove the copies at `gate_box.py:340`, `module_cost.py:97` and `module_cost.py:167` where each caller already gets its environment from `test_module_environment`. Where a caller does not, make it call `test_module_environment`, or report why it cannot before you change it.
-3. Keep `test_gate_trial.py:211` true, or move its assertion to the shared builder's test. Keep every assertion.
-4. Add one row to the existing `test_module_environment` test that proves the value.
-5. Run `aws_target/test_gate_trial.py`, `aws_target/test_gate_box.py` if it exists, the merge gate test modules that cover `test_module_environment`, `test_times/test_module_cost.py` if it exists, and `agents/test_shutdown_cli.py` through `module_cost.py` with `HERDR_BIN` unset in the caller (`env -u HERDR_BIN`). Run basedpyright on each changed file.
-
-**Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/aws_target/gate_box.py`
-- `scripts/test_times/module_cost.py`
-- their existing test modules
-
-**Workers:** 1 writer; one value moves to one place.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 222: no signal handlers anywhere.
-- Phase 228: a WholeMachine run keeps no shared gate state.
-
-**Acceptance gate:**
-- One definition of the `HERDR_BIN` value for test modules; no other copy.
-- Through `module_cost.py`, all 136 shutdown CLI tests pass with `HERDR_BIN` unset in the caller's environment.
-- All named modules pass; basedpyright clean.
+- The paired aws guest (`gate_box.py` paired environment) did not set `HERDR_BIN`, so 18 `agents/test_shutdown_cli.py` tests raised `HerdrMissing` on base and changed alike. `merge_gate.TEST_HERDR_BIN` is now the one definition; `test_module_environment` sets it after the inherited environment. The normal guest, both `module_cost.py` paths and `fast_track.fast_check` drop their copies; the paired supervisor embeds the constant beside the copied builder. `module_cost.py` now gives a module the gate's full environment. All 136 shutdown CLI tests pass through `module_cost.py` with `HERDR_BIN` unset. Checkpoint `0db93aadd`.
