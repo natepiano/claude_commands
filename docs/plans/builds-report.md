@@ -1194,7 +1194,9 @@ From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~
 - `scripts/buildlog/disk.py` — `FOLDERS`.
 - `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
 
-### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: reverted
+
+**Reverted 2026-11-13.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below describes the reverted code.
 
 From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
 
@@ -1211,3 +1213,15 @@ From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C15
 - `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
 - `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
 - `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: todo
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, older admission clients refused the snapshot with "invalid snapshot variant" and stopped. Affected: a hana lint step in `hana_catalyst-research`, trunk run `20261113T011836-3473767-16a1`, and hana CI Clippy, Rendering Diagnostic and Linux Compile at 02:03 (runners pinned at claude-commands `7fdfd9a6a`). Fix at the source:
+- The service keeps the wire shape that older pinned clients parse. New information goes in a new optional field that an older client ignores.
+- The client accepts unknown variants in fields it does not use.
+- A test proves that a client at an older schema parses the new service snapshot.
+Changes to `snapshot_codec` and `admission_client` need queue's go.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: todo
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61. The waiting and unmatched CI job states go in the new optional field.

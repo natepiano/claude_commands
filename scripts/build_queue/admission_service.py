@@ -47,8 +47,7 @@ from scripts.buildlog import store
 from scripts.lib import test_phase
 
 from scripts.build_queue.scope_activity import (
-    LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
-    ScopeActivityReader, ScopeProcesses,
+    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, ScopeActivityReader, ScopeProcesses,
 )
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
@@ -1467,12 +1466,11 @@ class AdmissionServer:
             use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
                       else item.bytes for item in duplicate)
             use += sum(item.anonymous.bytes for item in scoped if isinstance(item.anonymous, records.AnonymousRunUse))
+            job = memory.job_state
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
-            job = (gate.service_job_state(workers, dict(evidence.processes), tree_pids | scoped_pids,
-                    [waiting.row for waiting in self.waiters.values()],
-                    memory.job_state.started_at if isinstance(memory.job_state,
-                        (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0)
-                   if required else memory.job_state)
+            if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
+                               dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
+                job = IdleService()
             result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
