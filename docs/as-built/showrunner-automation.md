@@ -643,11 +643,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
-  The phase tables and the style table use `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
+  The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
+  It preserves full cells and omits columns whose cells are all `—`.
+  A table without rows keeps its columns.
+  The command emits one Markdown row per unit for Claude Code's native wrapping.
+  The renderer sets column widths from the terminal width and wraps text inside each cell.
+  Print the output as Markdown without code fences, `<br>`, or continuation rows.
+  Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
+  Renderer trials at 170 columns showed that native wrapping keeps each unit in one visible row.
+  The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
   The helper omits columns whose cells are all `—`; a table without rows keeps its columns.
-  The callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
+  The style caller reads `units_table_columns` from `config/production.conf` at use; the default is 170.
   The helper measures display columns with `terminal_cells.terminal_width` and allows four columns for the terminal margin.
   Row width is `1 + sum(width + 3)`, with each width at least three columns.
   The helper cuts text until the rows fit or each cuttable column reaches its header width.
@@ -696,8 +704,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
-    The work table prints `| Unit | Notes | Workers | Non-Phase Work | Queued |`.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
+    The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears only when at least one row has unfinished plan phases.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
@@ -718,13 +726,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
-    Notes first limits text to 80 characters and ends longer text with `…`.
-    Each phase table calls `display_cells.fitted` separately with `units_table_columns`.
+    Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
+    Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    The status table has no cuttable column.
-    The work table uses `CutOrder.WIDEST_FIRST` only when that table exceeds the width.
-    It cuts the widest cuttable column by one character per step.
-    Equal widths use this cut order: Queued, Non-Phase Work, Workers, Notes.
+    Native Markdown wrapping keeps each unit's text in one row inside its cells.
+    Workers uses the same wrapping form when the status table exceeds the terminal width.
     Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
@@ -738,6 +744,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
     Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
+    Its cell keeps the existing 80-character limit.
     Run workers appear first; idle workers append a count, and closed workers add nothing.
     Remote units show no worker facts.
     The command reads panes once for the displayed units and their workers.
@@ -749,7 +756,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     It excludes each queue item whose text equals Notes in the same row.
     Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
-    Each item or title uses an 80-character limit; counts remain after the cut.
+    Each displayed item or title keeps its full text and count suffix.
     A configured plan with phases takes priority over the newest run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.

@@ -232,11 +232,11 @@ class RetireUnitTests(unittest.TestCase):
         listing = live_units.units_in("alpha", observed)
         rendered = unit_phases.table(listing, {}, snapshot=record, pane_rows={})
         self.assertEqual(rendered.splitlines(), [
-            "| Unit | Status | Progress | Phase | ETA Next |",
-            "| --- | --- | --- | --- | --- |",
+            "| Unit | Status | Progress | Phase | ETA Next | Workers |",
+            "| --- | --- | --- | --- | --- | --- |",
             "",
-            "| Unit | Notes | Workers | Non-Phase Work | Queued |",
-            "| --- | --- | --- | --- | --- |",
+            "| Unit | Notes | Non-Phase Work | Queued |",
+            "| --- | --- | --- | --- |",
         ])
 
 

@@ -8,6 +8,8 @@ Run this in the showrunner session. Run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
+Print the tables as Markdown in the reply, without code fences.
+Keep each unit on one Markdown row so Claude Code wraps its cells within the terminal width.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
 For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule.
@@ -23,15 +25,17 @@ The home machine is the `kind.<machine>=local` entry in `config/build_targets.co
 
 Each table omits a column when every row has `—` in that column.
 A table without rows keeps its columns.
-Each table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
-They allow four columns for the terminal margin and measure text before Markdown escaping.
-Long text cells end with `…`; a cut never splits a wide character.
-Column headers set the minimum text widths.
-Fixed columns and minimum text widths can exceed a smaller configured width.
+The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
+Claude Code sets their column widths from the terminal width.
+The style table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
+It allows four columns for the terminal margin and measures text before Markdown escaping.
+Long style text cells end with `…`; a cut never splits a wide character.
+Style column headers set the minimum text widths.
+Fixed style columns and minimum text widths can exceed a smaller configured width.
 
 For units outside the `Style units` table in a production without `Kind: style`, the command prints two tables.
-Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
-Table 2 shows `| Unit | Notes | Workers | Non-Phase Work | Queued |`.
+Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
+Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
 Both tables use the same unit order.
 Workers uses the configured display name.
 ETA Plan appears only when at least one row has unfinished plan phases.
@@ -77,13 +81,13 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Notes and Workers first limit each cell to 80 characters.
-Queued first limits each item or title to 80 characters and adds its count suffix.
-Each table calls `display_cells.fitted()` separately with `units_table_columns`.
-Table 1 has no cuttable column.
-Table 2 cuts its widest cuttable column by one character per step until its rows fit the width.
-Equal widths use this cut order: Queued, Non-Phase Work, Workers, Notes.
-The tables preserve Unit, Status, Machine, Progress, Phase, and both ETA cells.
+Workers first limits each cell to 80 characters.
+Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
+Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
+The helper preserves full cells for native Markdown wrapping.
+Workers uses the same wrapping form when the status table exceeds the terminal width.
+Do not insert `<br>` or continuation rows.
+Claude Code displays `<br>` as text and adds row borders around continuation rows.
 Empty cells show `—`.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
