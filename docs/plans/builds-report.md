@@ -1290,7 +1290,16 @@ From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/sc
 
 ### Phase 67 — The Queued title shares the waiting header row · status: done
 
-From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers". Put the phase 65 title on the waiting header row (`# | Done | Waiting | Unit | Pid | Machine | vCPU`), bottom-aligned with those headers, at its current font, so the empty row goes away.
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers".
+
+#### As-built
+
+- The phase 65 title sits on the waiting header row, bottom-aligned with the column headers. It keeps its `.section-head` font.
+- The empty title row and its height code are gone. The Next step room row and its hairline do not move.
+- A long title ends in an ellipsis before the header columns and shows its full text on hover. The stacked phone layout does not change.
+- `test_memory_hover.py` checks that the header row follows the room row. `memory_page_proof.mjs` checks bottom alignment and no overlap at 1400, 900 and 390 px in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `test_memory_hover.py`, `memory_page_proof.mjs`.
 
 ### Phase 66 — Retire /build:queue · status: todo
 
