@@ -957,7 +957,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 from scripts.build_targets import build_targets
 
                 directory = Path(self.environment["BUILD_HOLD_DIR"])
-                blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory)
+                owner = key.local_hold_owner
+                lineage = (build_targets.read_caller_lineage(admission.proc.path, owner.pid, owner.start_time)
+                           if isinstance(owner, placement.SubmittingOwner)
+                           else build_targets.UnavailableCallerLineage("the local caller identity is unavailable"))
+                blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
                 if not isinstance(blocking, build_targets.NoBlockingHold):
                     eligibility = placement.TemporaryExclusion("blocked")
             else:
@@ -978,7 +982,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     gate = (f"continue-sleep-{attempt}" if self.placement_policy.get("TEST_STEP_ROUTING_SLEEP") == "1"
                             else "continue-sleep")
                     directory = Path(self.environment["BUILD_HOLD_DIR"])
-                    holding = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory)
+                    request = admission.server.host_requests[key]
+                    lineage = build_targets.read_caller_lineage(admission.proc.path, request.owner.pid, request.owner.start_time)
+                    holding = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
                     allow_runner_refusal = ((self.runner_state / gate).exists()
                         and not isinstance(holding, build_targets.NoBlockingHold)
                         and self.placement_policy.get("TEST_RUNNER_BUSY_REASON") != "blocked")
@@ -1229,6 +1235,10 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
     def call_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         """Call the real result and retry functions with private tools and records."""
+        return self.finish_verify(self.start_mac_functions(body, extra=extra))
+
+    def start_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        """Start the real result and retry functions with private tools and records."""
         install_fixed_cargo(self.bin_directory / "cargo")
         direct = self.root / "direct-functions"
         direct.mkdir(exist_ok=True)
@@ -1245,6 +1255,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
             "placement_once", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
+            "route_compiling_step", "sync_token_state",
             "pinned_target_refuse", "record_token_wait", "renew_token", "start_token_renewer",
             "try_reserved_target", "mac_only_refuse",
             "route_test", "check_routing_hold")
@@ -1288,6 +1299,8 @@ MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB=""
 PINNED_TARGET="" STEP_FORCE_MAC=0
 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
+PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
+LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$TEST_REAL_DIRECT/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
@@ -1296,19 +1309,18 @@ BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_S=""
 BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
 DOC_REPO_TOP=$PACKAGE_ROOT
 BOARD_HELPER=$TEST_REAL_DIRECT/board.sh BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=direct
-TOKEN_HELD=0 TOKEN_RENEWER_PID=""
+TOKEN_USED=0 TOKEN_HELD=0 TOKEN_RENEWER_PID="" TOKEN_WAITED=0
 VERIFY_MONOTONIC_OFFSET_US=0
 trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 '''
         invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
         _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")
-        process = subprocess.Popen(["bash", str(script), body], cwd=self.root,
+        return subprocess.Popen(["bash", str(script), body], cwd=self.root,
                                    env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
                                         "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
                                         **(extra or {})},
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True, preexec_fn=restore_sigint)
-        return self.finish_verify(process)
 
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None

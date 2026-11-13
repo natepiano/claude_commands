@@ -921,7 +921,11 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
     diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NoProviderDiagnostic()
     if key.destination.provider == "local":
         directory = fixture.root / "build-hold"
-        blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory)
+        owner = key.local_hold_owner
+        lineage = (build_targets.read_caller_lineage(fixture.proc.path, owner.pid, owner.start_time)
+                   if isinstance(owner, placement.SubmittingOwner) and owner.host == fixture.server.host
+                   else build_targets.UnavailableCallerLineage("the local caller identity is unavailable"))
+        blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
         if not isinstance(blocking, build_targets.NoBlockingHold):
             eligibility = placement.TemporaryExclusion("blocked")
             try:

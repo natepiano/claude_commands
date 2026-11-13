@@ -326,8 +326,13 @@ class ClientTests(unittest.TestCase):
                 fixture.free(0)
                 request = fixture.request()
                 finish_probe = threading.Event()
+                local_evidence_ready = threading.Event()
 
                 def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    if key.destination.provider == "local":
+                        if not local_evidence_ready.is_set():
+                            return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "the local evidence is not ready")
+                        return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
                     if not finish_probe.wait(10):
                         raise AssertionError("the test did not release its private evidence reader")
                     return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
@@ -347,11 +352,7 @@ class ClientTests(unittest.TestCase):
                         self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
                         with fixture.loop_turn():
                             submitted = fixture.server.placement_requests[request.episode]
-                            destination = next(candidate.destination for candidate in submitted.constraints.candidates
-                                               if candidate.destination.provider == "local")
-                            fixture.server.publish_host_evidence(placement.FreshHostEvidence(
-                                fixture.server.host_evidence_key(submitted, destination), fixture.clock.now(), "",
-                                placement.AllowedHost()))
+                            local_evidence_ready.set()
                             if execution_target != "local":
                                 remote = next(candidate.destination for candidate in submitted.constraints.candidates
                                               if candidate.destination.provider == "mac")

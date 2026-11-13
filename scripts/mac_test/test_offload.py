@@ -886,7 +886,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         for target, settings in (("", alternate), ("", alternate.relative_to(self.root)),
                                  ("mac", alternate), ("mac", Path(alternate.name)),
                                  ("builder", alternate)):
-            with self.subTest(target=target, settings=settings), mock.patch.object(admission_client, "request_placement", side_effect=submit):
+            with self.subTest(target=target, settings=settings), mock.patch.object(
+                    admission_client, "request_placement", side_effect=submit):
                 self.clear_events()
                 options = ("--target", target) if target else ()
                 if target == "builder":

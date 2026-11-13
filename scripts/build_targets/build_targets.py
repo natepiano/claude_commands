@@ -1125,9 +1125,47 @@ class NoBlockingHold:
     """No hold in force prevents this session from starting."""
 
 
+@dataclass(frozen=True)
+class ConfirmedCallerLineage:
+    """The caller identity matches the checked process lineage."""
+
+    processes: frozenset[build_hold.ProcessIdentity]
+
+
+@dataclass(frozen=True)
+class UnavailableCallerLineage:
+    """The caller lineage cannot grant permission through a keep list."""
+
+    reason: str
+
+
+CallerLineage = ConfirmedCallerLineage | UnavailableCallerLineage
+
+
+def read_caller_lineage(proc_root: Path, pid: int, start_time: str) -> CallerLineage:
+    """Read the lineage only while the checked caller identity matches."""
+    from scripts.build_hold import build_hold
+
+    if not start_time or build_hold.process_start_time(pid, proc_root) != start_time:
+        return UnavailableCallerLineage("the caller start time is unavailable or differs")
+    processes = build_hold.caller_processes(proc_root, pid)
+    if (build_hold.ProcessIdentity(pid, start_time) not in processes
+            or build_hold.process_start_time(pid, proc_root) != start_time):
+        return UnavailableCallerLineage("the caller lineage is unavailable or its identity changed")
+    return ConfirmedCallerLineage(processes)
+
+
+def current_caller_lineage() -> CallerLineage:
+    """Read the current process lineage for a local hold decision."""
+    from scripts.build_hold import build_hold
+
+    pid = os.getpid()
+    return read_caller_lineage(build_hold.PROC_ROOT, pid, build_hold.process_start_time(pid, build_hold.PROC_ROOT))
+
+
 def hold_waited_on(holds: build_hold.NatedevHolds,
                    owner: OwningSession | NoOwningSession,
-                   directory: Path) -> build_hold.Holder | NoBlockingHold:
+                   directory: Path, caller_lineage: CallerLineage) -> build_hold.Holder | NoBlockingHold:
     """Choose the oldest hold that applies to the caller and belongs to another session."""
     from scripts.build_hold import build_hold
 
@@ -1137,10 +1175,10 @@ def hold_waited_on(holds: build_hold.NatedevHolds,
             own_key = build_hold.holder_path(directory, build_hold.holder_of(owner.session_id).key).name
         except ValueError:
             pass
-    lineage = (build_hold.caller_processes(build_hold.PROC_ROOT, os.getpid())
-               if any(holder.keep for holder in holds.in_force) else frozenset[build_hold.ProcessIdentity]())
     for holder in holds.in_force:
-        if holder.key != own_key and not lineage.intersection(holder.keep):
+        kept = (isinstance(caller_lineage, ConfirmedCallerLineage)
+                and bool(caller_lineage.processes.intersection(holder.keep)))
+        if holder.key != own_key and not kept:
             return holder
     return NoBlockingHold()
 
@@ -1149,7 +1187,8 @@ def caller_waits_on_hold(holds: build_hold.NatedevHolds, directory: Path) -> boo
     """Check whether a hold makes the calling session wait."""
     from scripts.build_hold import build_hold
 
-    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory), build_hold.Holder)
+    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory,
+                                    current_caller_lineage()), build_hold.Holder)
 
 
 def command_register_local(_call_id: str, *, pid: int,
@@ -1240,7 +1279,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             if not holds.in_force:
                 return 0
             session = claim_state.submitting_session(session)
-            blocking = hold_waited_on(holds, session, directory)
+            blocking = hold_waited_on(holds, session, directory, current_caller_lineage())
             if isinstance(blocking, NoBlockingHold):
                 return 0
             if not isinstance(state, Held):
@@ -1340,7 +1379,7 @@ def command_check_local(caller: str = "", *,
         if not holds.in_force:
             return 0
         owner = claim_state.submitting_session(session)
-        blocking = hold_waited_on(holds, owner, directory)
+        blocking = hold_waited_on(holds, owner, directory, current_caller_lineage())
         if isinstance(blocking, NoBlockingHold):
             return 0
         if not isinstance(state, Held):

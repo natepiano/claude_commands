@@ -355,6 +355,11 @@ ExecutionEvidence = ExecutionNotStarted | ObservedExecution | ExecutionEvidenceU
 
 
 @dataclass(frozen=True)
+class NoLocalHoldOwner:
+    """Remote host evidence does not depend on a local caller lineage."""
+
+
+@dataclass(frozen=True)
 class HostEvidenceKey:
     destination: PlacementDestination
     session: SubmittingSession
@@ -364,6 +369,7 @@ class HostEvidenceKey:
     package: str = ""
     step: str = ""
     settings: ProviderSettings = ConfiguredProviderSettings()
+    local_hold_owner: SubmittingOwner | NoLocalHoldOwner = NoLocalHoldOwner()
 
 
 @dataclass(frozen=True)

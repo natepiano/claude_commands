@@ -1564,7 +1564,7 @@ elif kind == "hold":
     resource = "natedev"
     directory = Path(hold_name)
     holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
-                                        build_hold.owning_session(), directory)
+                                        build_hold.owning_session(), directory, build_targets.current_caller_lineage())
     if isinstance(holder, build_hold.Holder):
         session = build_hold.holder_session(holder.key)
         try:

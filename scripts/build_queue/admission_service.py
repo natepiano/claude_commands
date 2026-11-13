@@ -959,6 +959,7 @@ class AdmissionServer:
         self.execution_evidence: dict[str, placement.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
+        self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
         self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
             host_probe if host_probe is not None else self._read_host_evidence)
         self.host_readers: dict[placement.HostEvidenceKey, HostEvidenceReader] = {}
@@ -1649,6 +1650,7 @@ class AdmissionServer:
         self.configuration = configuration
         self.pass_stale = False
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
+            self.local_hold_holders.clear()
             self.reading_hold = NoReadingHold()
             self.next_pass = self.next_config_watch_retry
             self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
@@ -2054,7 +2056,8 @@ class AdmissionServer:
                 digest.update(b"missing")
         return placement.HostEvidenceKey(destination, request.constraints.session,
             request.constraints.command, digest.hexdigest(), request.constraints.repository,
-            request.constraints.package, request.profile.step, settings)
+            request.constraints.package, request.profile.step, settings,
+            request.owner if destination.provider == "local" else placement.NoLocalHoldOwner())
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
         from scripts.build_targets import target_config
@@ -2067,6 +2070,8 @@ class AdmissionServer:
         return conf.read("mac_test").number("probe_timeout_s")
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
+        if evidence.key.destination.provider == "local":
+            return
         self.host_observations[evidence.key] = evidence
         reader = self.host_readers.get(evidence.key)
         if reader is not None:
@@ -2091,6 +2096,11 @@ class AdmissionServer:
     def _request_host_evidence(self, request: wire.PlacementRequest,
                                destination: placement.PlacementDestination) -> placement.HostEvidence:
         key = self.host_evidence_key(request, destination)
+        if destination.provider == "local":
+            try:
+                return self.host_probe(key)
+            except Exception as error:
+                return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
         self.host_requests[key] = request
         current = self.host_evidence(key)
         if isinstance(current, placement.FreshHostEvidence):
@@ -2106,20 +2116,23 @@ class AdmissionServer:
         return self.host_evidence(key)
 
     def read_provider_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
-        """Expose the background provider reader without replacing its transport hook."""
+        """Read provider evidence without replacing the transport hook."""
         return self._read_host_evidence(key)
 
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
-        """Read provider policy and exact claims outside the service loop."""
+        """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, offload, mac_test
         from scripts.build_hold import build_hold
 
-        request = self.host_requests[key]
         destination = key.destination
         if destination.provider == "local":
             holds = build_hold.natedev_holds(build_hold.holder_directory())
-            blocking = build_targets.hold_waited_on(holds, key.session, build_hold.holder_directory())
+            owner = key.local_hold_owner
+            lineage = (build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
+                       if isinstance(owner, placement.SubmittingOwner) and owner.host == self.host
+                       else build_targets.UnavailableCallerLineage("the local caller identity is unavailable"))
+            blocking = build_targets.hold_waited_on(holds, key.session, build_hold.holder_directory(), lineage)
             local_eligibility: placement.HostEligibility = (placement.AllowedHost()
                 if isinstance(blocking, build_targets.NoBlockingHold) else placement.TemporaryExclusion("blocked"))
             holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
@@ -2131,6 +2144,7 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
+        request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
         target = next((target for target in target_config.read_targets() if target.name == destination.target), None)
@@ -2279,8 +2293,10 @@ done
             and isinstance(saved.state, placement.ClosedAssignment)]
         return previous[-1].retry if previous else placement.RetryAt(0)
 
-    def _candidate_eligibility(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
+    def _candidate_eligibility(self, request: wire.PlacementRequest
+                               ) -> tuple[tuple[placement.CandidateEligibility, ...], placement.ResourceHolder]:
         result: list[placement.CandidateEligibility] = []
+        local_holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
         for candidate in request.constraints.candidates:
             destination = candidate.destination
             permitted: placement.HostEligibility = candidate.eligibility
@@ -2296,6 +2312,8 @@ done
                 permitted = placement.TemporaryExclusion("retry deadline has not passed")
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination)
+                if destination.provider == "local" and isinstance(evidence, placement.FreshHostEvidence):
+                    local_holder = evidence.holder
                 permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
                              else placement.EvidenceNeeded(evidence.reason))
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
@@ -2317,7 +2335,7 @@ done
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
             result.append(placement.CandidateEligibility(destination, permitted))
-        return tuple(result)
+        return tuple(result), local_holder
 
     def _local_placement_ready(self, request: wire.PlacementRequest) -> bool:
         return (isinstance(request.local, wire.LocalAdmissionContext)
@@ -2326,6 +2344,8 @@ done
                     for candidate in self.placement_eligibility.get(request.episode, ())))
 
     def _prepare_placements(self) -> None:
+        # Keep the current holder label without retaining local process evidence.
+        self.local_hold_holders.clear()
         for request in self.placement_requests.values():
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
             if (not self._placement_owner_live(request.owner) and saved is not None
@@ -2333,7 +2353,9 @@ done
                 self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
             if not self._placement_waiting(request):
                 continue
-            self.placement_eligibility[request.episode] = self._candidate_eligibility(request)
+            candidates, local_holder = self._candidate_eligibility(request)
+            self.placement_eligibility[request.episode] = candidates
+            self.local_hold_holders[request.episode] = local_holder
             admission = self._placement_admission(request)
             row = self._placement_row(request)
             if isinstance(admission, wire.AdmitRequest):
@@ -2353,7 +2375,7 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _placement_reply(self, request: wire.PlacementRequest
+    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
@@ -2441,9 +2463,12 @@ done
             for candidate in candidates)
         if blocked and (blocked[0].destination.provider == "local" or not local_possible):
             candidate = blocked[0]
-            evidence = self.host_evidence(self.host_evidence_key(request, candidate.destination))
-            holder = (evidence.holder if isinstance(evidence, placement.FreshHostEvidence)
-                      else placement.ResourceHolderUnknown())
+            if candidate.destination.provider == "local":
+                holder = local_holder
+            else:
+                evidence = self.host_evidence(self.host_evidence_key(request, candidate.destination))
+                holder = (evidence.holder if isinstance(evidence, placement.FreshHostEvidence)
+                          else placement.ResourceHolderUnknown())
             assert isinstance(candidate.eligibility, placement.TemporaryExclusion)
             return wire.PlacementWait(request.episode, request.since, position, candidates,
                 wire.PlacementResourceWait(candidate.destination.target, candidate.eligibility.reason, holder), diagnostics, disk_exclusions, retry_notices)
@@ -2694,7 +2719,8 @@ done
             self._watch_owner(request.owner)
             self.persist()
             _ = self.run_pass()
-            return [self._placement_reply(request)]
+            return [self._placement_reply(request,
+                self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
         assignment = request.assignment
         key = placement.attempt_key(assignment.episode, assignment.attempt)
         saved = self.assignments.get(key)
