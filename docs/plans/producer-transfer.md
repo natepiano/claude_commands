@@ -81,6 +81,7 @@ The checkpoint gate passes. basedpyright reports zero errors and zero warnings. 
 - Claude: read `<id>.jsonl[.zst]` below each `~/.claude*/projects`.
 - Print the last `--blocks N` blocks (default 150): each user message, assistant message, tool call and tool result with its time.
   A tool block is one line of 200 characters. `--chars N` (default 4000) limits one message.
+  `config/catch_up.conf` holds these three values and the first read window (admin-console review, 2026-11-13).
 - A Claude compaction summary is one block. A Codex compaction summary is encrypted, so the reader prints only its time
   and does not stop at it. (The first plan started at the last compaction; that gave 14 minutes of morty's Codex conversation.)
 - A missing transcript prints one line and exits 1.

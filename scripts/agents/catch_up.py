@@ -3,6 +3,8 @@
 
 Usage: catch_up.py NATIVE_ID [--blocks N] [--chars N]
 
+The defaults and the tool line length come from config/catch_up.conf.
+
 NATIVE_ID is `session:<id>`, `codex:<id>` or an id alone. An id alone selects the
 newest transcript of either family. A block is one user message, assistant message,
 tool call or tool result. A tool block is one shortened line. A Claude compaction
@@ -25,10 +27,8 @@ import re
 import sys
 from typing import cast
 
-from scripts.lib import transcripts
+from scripts.lib import conf, transcripts
 
-WINDOW_BYTES = 8 * 1024 * 1024
-TOOL_CHARS = 200
 CODEX_FOLDERS = ("sessions", "archived_sessions")
 
 
@@ -129,11 +129,10 @@ def record_blocks(line: bytes) -> Iterator[Block]:
         yield from _claude_blocks(at, record)
 
 
-def last_blocks(path: Path, count: int) -> list[Block]:
-    """Read from the end in doubling windows, so a large transcript is not read in full."""
+def last_blocks(path: Path, count: int, window: int) -> list[Block]:
+    """Read from the end in windows that start at `window` bytes and double, so a large transcript is not read in full."""
     with transcripts.open_transcript(path) as stream:
         size = stream.seek(0, 2)
-        window = WINDOW_BYTES
         while True:
             start = max(0, size - window)
             _ = stream.seek(start)
@@ -148,14 +147,14 @@ def last_blocks(path: Path, count: int) -> list[Block]:
             window *= 2
 
 
-def render(block: Block, chars: int, zone: tzinfo) -> str:
+def render(block: Block, chars: int, tool_chars: int, zone: tzinfo) -> str:
     try:
         shown = datetime.fromisoformat(block.at).astimezone(zone).strftime("%m-%d %H:%M:%S")
     except ValueError:
         shown = block.at or "no time"
     if block.one_line:
         text = " ".join(block.text.split())
-        return f"[{shown}] {block.label}: {text[:TOOL_CHARS]}{'…' if len(text) > TOOL_CHARS else ''}"
+        return f"[{shown}] {block.label}: {text[:tool_chars]}{'…' if len(text) > tool_chars else ''}"
     text = block.text.strip()
     if len(text) > chars:
         text = f"{text[:chars]}\n[{len(text) - chars} more characters]"
@@ -167,10 +166,15 @@ def main(arguments: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="catch_up.py", description="Print the last blocks of a saved conversation.")
     _ = parser.add_argument("native_id", metavar="NATIVE_ID")
-    _ = parser.add_argument("--blocks", type=int, default=150, help="blocks to print (default 150)")
-    _ = parser.add_argument("--chars", type=int, default=4000, help="characters kept in one message (default 4000)")
+    _ = parser.add_argument("--blocks", type=int, help="blocks to print (default: blocks in config/catch_up.conf)")
+    _ = parser.add_argument("--chars", type=int,
+                            help="characters kept in one message (default: message_chars in config/catch_up.conf)")
     options = parser.parse_args(arguments)
-    native_id, blocks, chars = cast(str, options.native_id), cast(int, options.blocks), cast(int, options.chars)
+    limits = conf.read("catch_up")
+    native_id = cast(str, options.native_id)
+    given_blocks, given_chars = cast(int | None, options.blocks), cast(int | None, options.chars)
+    blocks = limits.whole("blocks") if given_blocks is None else given_blocks
+    chars = limits.whole("message_chars") if given_chars is None else given_chars
     if blocks < 1 or chars < 1:
         parser.error("--blocks and --chars must be 1 or more")
     try:
@@ -180,11 +184,12 @@ def main(arguments: list[str] | None = None) -> int:
     except NoSavedTranscript as error:
         print(f"catch_up.py: {error}", file=sys.stderr)
         return 1
-    found = last_blocks(path, blocks)
+    found = last_blocks(path, blocks, limits.whole("window_bytes"))
+    tool_chars = limits.whole("tool_chars")
     zone = user_zone()
     print(f"{path}: last {len(found)} blocks, times in {zone.key}")
     for block in found:
-        print(render(block, chars, zone))
+        print(render(block, chars, tool_chars, zone))
     return 0
 
 

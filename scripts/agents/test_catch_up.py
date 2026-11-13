@@ -73,7 +73,13 @@ class CatchUpTests(unittest.TestCase):
         self.home = Path(directory.name)
         environment = {key: value for key, value in os.environ.items() if key not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR")}
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
-            os.environ, {**environment, "HOME": str(self.home), "USER_ZONE": "UTC"}, clear=True)))
+            os.environ, {**environment, "HOME": str(self.home), "USER_ZONE": "UTC", "CONF_DIR": str(self.home / "config")},
+            clear=True)))
+        (self.home / "config").mkdir()
+        _ = (self.home / "config/catch_up.conf").write_text(
+            "".join(f"# whole: 1..1073741824\n{key}={value}\n" for key, value in
+                    (("blocks", 150), ("message_chars", 4000), ("tool_chars", 200), ("window_bytes", 8388608))),
+            encoding="utf-8")
         self.codex = self.write(".codex/sessions/2026/11/13", f"rollout-2026-11-13T12-00-00-{CODEX_ID}.jsonl", CODEX_RECORDS)
         self.claude = self.write(".claude5/projects/-home-fixture", f"{CLAUDE_ID}.jsonl", CLAUDE_RECORDS)
 
@@ -83,8 +89,8 @@ class CatchUpTests(unittest.TestCase):
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in records) + "not json\n")
         return path
 
-    def labels(self, path: Path, count: int = 50) -> list[tuple[str, str]]:
-        return [(block.label, block.text) for block in catch_up.last_blocks(path, count)]
+    def labels(self, path: Path, count: int = 50, window: int = 8388608) -> list[tuple[str, str]]:
+        return [(block.label, block.text) for block in catch_up.last_blocks(path, count, window)]
 
     def test_codex_blocks_keep_messages_tools_and_the_compaction_time(self) -> None:
         self.assertEqual(self.labels(self.codex), [
@@ -110,10 +116,9 @@ class CatchUpTests(unittest.TestCase):
 
     def test_a_small_window_reads_the_same_last_blocks(self) -> None:
         whole = self.labels(self.codex)
-        with mock.patch.object(catch_up, "WINDOW_BYTES", 40):
-            for count in (1, 3, len(whole), len(whole) + 5):
-                with self.subTest(count=count):
-                    self.assertEqual(self.labels(self.codex, count), whole[-count:])
+        for count in (1, 3, len(whole), len(whole) + 5):
+            with self.subTest(count=count):
+                self.assertEqual(self.labels(self.codex, count, window=40), whole[-count:])
 
     def test_the_address_kind_selects_the_family_and_an_id_alone_takes_the_newest(self) -> None:
         shared = "00000000-0000-4000-8000-00000000beef"
