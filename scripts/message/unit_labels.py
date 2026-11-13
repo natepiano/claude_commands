@@ -82,12 +82,22 @@ class OwnerRole(StrEnum):
     UNIT = "unit"
 
 
+class Runner(StrEnum):
+    """Who ran the step: the showrunner, the unit director, or a worker."""
+
+    UNKNOWN = "unknown"
+    SHOWRUNNER = "showrunner"
+    UNIT_DIRECTOR = "unit director"
+    WORKER = "worker"
+
+
 @dataclass(frozen=True)
 class UnitLabels:
     session: str
     showrunner: str = "—"
     unit: str = "—"
     role: OwnerRole = OwnerRole.UNKNOWN
+    runner: Runner = Runner.UNKNOWN
 
     @property
     def owner_text(self) -> str:
@@ -123,7 +133,17 @@ def make_labels(name: str, showrunner: ShowrunnerRelationship,
         role = OwnerRole.SHOWRUNNER
     else:
         role = OwnerRole.UNKNOWN
-    return UnitLabels(session, production or "—", unit or "—", role)
+    return UnitLabels(session, production or "—", unit or "—", role, runner_of(showrunner, director))
+
+
+def runner_of(showrunner: ShowrunnerRelationship, director: DirectorRelationship) -> Runner:
+    if isinstance(showrunner, RunsProduction):
+        return Runner.SHOWRUNNER
+    if isinstance(director, DirectsUnit):
+        return Runner.UNIT_DIRECTOR
+    if isinstance(director, (UnderDirector, UnitWithoutRunningDirector)) or isinstance(showrunner, UnderShowrunner):
+        return Runner.WORKER
+    return Runner.UNKNOWN
 
 
 def production_of(showrunner: ShowrunnerRelationship) -> str:

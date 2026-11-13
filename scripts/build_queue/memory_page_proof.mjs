@@ -6,6 +6,7 @@
 // Add --owners as the fourth argument for machine owners and table spacing.
 // Add --cloud-owner as the fourth argument for cloud worker owner images.
 // Add --blocks as the fourth argument for the target block and hold images.
+// Add --identity as the fourth argument for the row hover identity block images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -33,6 +34,7 @@ try {
   const ownersComparison = process.argv[4] === '--owners';
   const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
   const blocksComparison = process.argv[4] === '--blocks';
+  const identityComparison = process.argv[4] === '--identity';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -861,8 +863,8 @@ try {
             await evaluate(`showTip('row:0',180,160)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             if(version==='after') {
-              assert.match(tooltip,/Showrunner: hana/);
-              assert.match(tooltip,/Unit: research/);
+              assert.match(tooltip,/showrunner\s*:?\s*hana/);
+              assert.match(tooltip,/unit\s*:?\s*research/);
             } else assert.match(tooltip,/owner not recorded/);
             await capture(version+'-aws-tooltip','#tip');
             comparisons.push({version,...row,tooltip});
@@ -924,14 +926,13 @@ try {
             if(version==='after') {
               const tips=await evaluate(`[...latest.walk.map((row,index)=>'row:'+index),...latest.waiters.map((row,index)=>'wait:'+index)].map(key=>tooltipHtml(key,latest))`);
               for(const tip of tips) {
-                assert.match(tip,/Showrunner/);assert.match(tip,/hana/);
-                assert.match(tip,/Unit/);assert.match(tip,/research/);
+                assert.match(tip,/<dl class="identity"><dt>showrunner<\/dt><dd>hana<\/dd><dt>unit<\/dt><dd>research<\/dd>/);
               }
               const allTips=await evaluate(`(() => {
                 const keys=[...new Set([...document.querySelectorAll('[data-tip]')].map(node=>node.dataset.tip))];
                 return keys.map(key=>({key,html:tooltipHtml(key,latest)}));
               })()`);
-              for(const tip of allTips) assert.ok(/Showrunner/.test(tip.html) && /Unit/.test(tip.html) || /CI/.test(tip.html), tip.key);
+              for(const tip of allTips) assert.ok(/showrunner/i.test(tip.html) && /unit/i.test(tip.html) || /CI/.test(tip.html), tip.key);
               const nativeTips=await evaluate(`[...document.querySelectorAll('[title],svg title')].map(node=>node.localName==='title'?node.textContent:node.getAttribute('title'))`);
               assert.ok(nativeTips.length>0);
               for(const tip of nativeTips) {assert.match(tip,/Showrunner/);assert.match(tip,/Unit/);}
@@ -1227,7 +1228,54 @@ try {
             comparisons.push({line,tooltip});
           }
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison) {
+        if (identityComparison) {
+          assert.ok(beforePage, 'The identity comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const reading=structuredClone(readings.step_owners);
+          const mac=reading.walk.findIndex(row=>row.kind==='mac-build');
+          const local=reading.walk.findIndex(row=>!row.kind);
+          assert.ok(mac>=0 && local>=0 && reading.waiters.length>0);
+          Object.assign(reading.walk[mac],{name:'hana nextest',showrunner:'hana',unit:'research',runner:'worker',worker:'impl2',
+            used:9.7,started_at:reading.read_at-13*60,read_at:reading.read_at,stage:{kind:'MacTesting'},
+            progress:{kind:'RowProgress',phase:'testing',done:891,total:894,percent:100*891/894,unit:'units'}});
+          Object.assign(reading.walk[local],{name:'builds merge gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
+          Object.assign(reading.waiters[0],{name:'report nextest',showrunner:'builds',unit:'report',runner:'unit director',worker:''});
+          const lines=text=>text.split('\n').map(line=>line.trim()).filter(Boolean);
+          const identity=key=>evaluate(`(() => {
+            showTip(${JSON.stringify(key)},700,420);
+            const tip=document.querySelector('#tip');
+            const block=tip.querySelector('.identity');
+            return {text:tip.innerText,fields:block?[...block.querySelectorAll('dt')].map(cell=>[cell.textContent,
+              cell.nextElementSibling.textContent,getComputedStyle(cell,'::after').content,
+              cell.getBoundingClientRect().right]):[],
+              first:tip.children[1]?.className||''};
+          })()`);
+          for (const version of ['before','after']) {
+            await navigate(version==='before'?'before.html':'memory_live.html');
+            await show(reading);
+            const state=await identity('row:'+mac);
+            if(version==='after') {
+              assert.equal(state.first,'identity');
+              assert.deepEqual(state.fields.map(([name,value])=>[name,value]),
+                [['showrunner','hana'],['unit','research'],['worker','impl2']]);
+              assert.ok(state.fields.every(([, , colon])=>colon==='":"'));
+              assert.ok(new Set(state.fields.map(([, , , right])=>Math.round(right))).size===1,'The colons do not align.');
+            } else assert.ok(!lines(state.text).includes('worker'),state.text);
+            await capture(`${version}-identity-mac-row`,'#tip');
+            comparisons.push({version,row:'mac worker',...state});
+          }
+          for (const [key,name,expected] of [
+            ['row:'+local,'showrunner-row',[['showrunner','builds'],['unit','this run is from the showrunner']]],
+            ['wait:0','unit-director-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
+            const state=await identity(key);
+            assert.equal(state.first,'identity');
+            assert.deepEqual(state.fields.map(([field,value])=>[field,value]),expected);
+            await capture(`after-identity-${name}`,'#tip');
+            comparisons.push({version:'after',row:name,...state});
+          }
+        }
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';

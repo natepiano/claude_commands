@@ -152,16 +152,52 @@ class MemoryHoverTests(unittest.TestCase):
                     "name": name, "unit": "fixture", "showrunner": "fixture-production",
                     "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
                     "progress": counter}]}))
-                self.assertEqual(hover[0], f"{name} · fixture-production")
-                self.assertIn("Showrunner: fixture-production", hover[1])
-                self.assertIn("Unit: fixture", hover[1])
+                self.assertEqual(hover[0], name)
+                self.assertNotIn("showrunner:", hover[1])
                 for expected in ("suites:1, 80.0% done", "0.5 GiB", "highest anonymous use in the next 20.0%",
-                                 "The queue holds this memory for the run.", "\nfixture",
+                                 "The queue holds this memory for the run.",
                                  f"testing · 8 of 10 {counter['unit']} · 80.0% done"):
                     with self.subTest(expected=expected):
                         self.assertIn(expected, hover[1])
                 self.assertEqual("Modules start slowest first, so this reads low early." in hover[1], ordering_note)
 
+
+    def test_every_running_and_queued_hover_starts_with_who_ran_it(self) -> None:
+        owner = {"showrunner": "builds", "unit": "report"}
+        for runner, extra, expected in (
+            ("showrunner", {"unit": "—"}, [("showrunner", "builds"), ("unit", "this run is from the showrunner")]),
+            ("unit director", {}, [("showrunner", "builds"), ("unit", "report"),
+                                   ("worker", "this run is from the unit director")]),
+            ("worker", {"worker": "impl2"}, [("showrunner", "builds"), ("unit", "report"), ("worker", "impl2")]),
+            ("worker", {"unit": "—", "worker": "staff1"}, [("showrunner", "builds"),
+                                                          ("unit", "this run is from the showrunner"), ("worker", "staff1")]),
+            ("unknown", {"showrunner": "owner not recorded", "unit": "owner not recorded"},
+             [("showrunner", "owner not recorded"), ("unit", "owner not recorded")]),
+        ):
+            row: dict[str, object] = {"name": "hana nextest", "queued": True, "used": 1, "reserved": 0, "counted": 1,
+                                      "progress": {"kind": "NoProgress"}, **owner, "runner": runner, **extra}
+            waiter: dict[str, object] = {"name": "hana nextest", "need": 2, "since": 100, "reason": "start spacing",
+                                         **owner, "runner": runner, **extra}
+            mac: dict[str, object] = {**row, "kind": "mac-build", "machine": "mac", "started_at": 100, "read_at": 190}
+            data = {"read_at": 200, "walk": [row, mac], "waiters": [waiter]}
+            for key in ("row:0", "row:1", "wait:0"):
+                with self.subTest(runner=runner, extra=extra, key=key):
+                    rendered = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                    root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                    self.assertEqual(root[0].tag, "b")
+                    self.assertEqual(root[1].get("class"), "identity")
+                    names = [cell.text for cell in root[1].findall("dt")]
+                    values = [cell.text for cell in root[1].findall("dd")]
+                    self.assertEqual(list(zip(names, values, strict=True)), expected)
+                    self.assertNotIn("showrunner:", "".join(root.itertext()))
+
+    def test_a_ci_hover_keeps_its_ci_line(self) -> None:
+        data = {"read_at": 200, "waiters": [], "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
+                                                          "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
+        rendered = cast(str, self.page_expression("tooltipHtml('row:0', data)", data, walk=True))
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual([(cell.text) for cell in root[1].findall("dt")], ["CI"])
+        self.assertEqual([(cell.text) for cell in root[1].findall("dd")], ["hana CI · runner-1"])
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
@@ -175,8 +211,10 @@ class MemoryHoverTests(unittest.TestCase):
                     "status": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn(expected, hover[1])
                 self.assertIn("Target: aws. No local memory reservation.", hover[1])
-                self.assertIn("Showrunner: fixture", hover[1])
-                self.assertIn("Unit: cloud-unit", hover[1])
+                owner = {"walk": [{"unit": "cloud-unit", "showrunner": "fixture"}]}
+                identity = ElementTree.fromstring(
+                    f"<root>{self.page_expression('identityHtml(data.walk[0])', owner, walk=True)}</root>")
+                self.assertEqual([cell.text for cell in identity.findall("dl/dd")], ["fixture", "cloud-unit"])
                 self.assertFalse(hover[1].startswith("."), hover[1])
 
     def test_progress_percent_rounds_down_until_the_counter_is_complete(self) -> None:
@@ -309,10 +347,10 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(sentence.text, "Mac memory does not count against natedev.")
                 labels = [cell.text for cell in tooltip.findall("dl/dt")]
                 values = [cell.text for cell in tooltip.findall("dl/dd")]
-                self.assertEqual(labels, ["Showrunner", "Unit", "Target", "Started", "Used", "Reading age"])
+                self.assertEqual(labels, ["showrunner", "unit", "Target", "Started", "Used", "Reading age"])
                 fields = dict(zip(labels, values, strict=True))
-                self.assertEqual(fields["Showrunner"], "hana")
-                self.assertEqual(fields["Unit"], "trunk")
+                self.assertEqual(fields["showrunner"], "hana")
+                self.assertEqual(fields["unit"], "trunk")
                 self.assertEqual(fields["Target"], "mac")
                 self.assertIn("3.5 GiB", result[1])
 

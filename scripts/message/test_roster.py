@@ -669,7 +669,7 @@ class RosterTests(unittest.TestCase):
              mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts:
             fast = roster.unit_labels_for(wanted, self.environment)
         self.assertEqual(fast, {session_id: full[session_id] for session_id in wanted})
-        self.assertEqual(fast["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT))
+        self.assertEqual(fast["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR))
         scan.assert_not_called()
         daemon.assert_not_called()
         accounts.assert_not_called()
@@ -730,7 +730,7 @@ class RosterTests(unittest.TestCase):
     def test_session_labels_read_the_staff_owner_once(self) -> None:
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
             labels = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"], self.environment)
-        self.assertEqual(labels["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT))
+        self.assertEqual(labels["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR))
         self.assertEqual(reads.call_count, 1)
 
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
@@ -740,7 +740,7 @@ class RosterTests(unittest.TestCase):
         _ = staff.rename(owner.id, "builds")
         full = roster.unit_labels(self._entries().values())
         fast = roster.unit_labels_for(["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], self.environment)
-        self.assertEqual(full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "builds", "unit-one", unit_labels.OwnerRole.UNIT))
+        self.assertEqual(full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"], roster.UnitLabels("unit-one", "builds", "unit-one", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR))
         self.assertEqual(fast, {"17e44ec4-3e24-5ae1-b10d-5cf30de9455b": full["17e44ec4-3e24-5ae1-b10d-5cf30de9455b"]})
 
     def test_unregistered_runtime_with_the_same_unit_labels_keeps_the_registered_units_owner(self) -> None:
@@ -759,7 +759,7 @@ class RosterTests(unittest.TestCase):
         full = roster.unit_labels(found.entries)
         self.assertFalse(any("its mark is on herdr sessions" in problem for problem in found.problems))
         expected = {
-            "17e44ec4-3e24-5ae1-b10d-5cf30de9455b": roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT),
+            "17e44ec4-3e24-5ae1-b10d-5cf30de9455b": roster.UnitLabels("unit-one", "alpha", "unit-one", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR),
             "6e203923-e688-516d-a58a-3a0712762814": roster.UnitLabels("", "—", "—"),
         }
         self.assertEqual({sid: full[sid] for sid in expected}, expected)
@@ -2867,12 +2867,12 @@ class CodexHolderLabelsTests(unittest.TestCase):
         full = roster.unit_labels(roster.roster(self.environment, roster.ThisMachine()).entries)
         fast = roster.unit_labels_for([self.thread, self.director_id, "unknown-thread", "report-test2"], self.environment)
         self.assertEqual(fast, {sid: full[sid] for sid in (self.thread, self.director_id)})
-        self.assertEqual(fast[self.thread], roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT))
-        self.assertEqual(fast[self.director_id], roster.UnitLabels("report", "builds", "report", unit_labels.OwnerRole.UNIT))
+        self.assertEqual(fast[self.thread], roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER))
+        self.assertEqual(fast[self.director_id], roster.UnitLabels("report", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR))
 
     def test_twenty_run_lookup_is_well_inside_the_cli_budget(self) -> None:
         wanted = [self.thread]
-        expected = {self.thread: roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT)}
+        expected = {self.thread: roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER)}
         for number in range(1, 20):
             run = self.runs / f"run-{number:02}"
             thread = f"01a1775e-0fcd-7842-a664-{number:012}"
@@ -2881,7 +2881,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             (run / "heartbeat.log").touch()
             _ = (run / "progress_history_state.json").write_text(json.dumps({"production": "builds", "unit": "report"}))
             wanted.append(thread)
-            expected[thread] = roster.UnitLabels(name, "builds", "report", unit_labels.OwnerRole.UNIT)
+            expected[thread] = roster.UnitLabels(name, "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER)
         started = time.perf_counter()
         labels = roster.unit_labels_for([*wanted, "unknown-thread"], self.environment)
         elapsed = time.perf_counter() - started
@@ -2940,9 +2940,9 @@ class UnitLabelsTests(unittest.TestCase):
         ]
         labels = roster.unit_labels(entries)
         self.assertEqual(labels, {
-            "director-id": roster.UnitLabels("report-director", "builds", "report", unit_labels.OwnerRole.UNIT),
-            "worker-thread": roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT),
-            "runner-id": roster.UnitLabels("builds-showrunner", "builds", "—", unit_labels.OwnerRole.SHOWRUNNER),
+            "director-id": roster.UnitLabels("report-director", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR),
+            "worker-thread": roster.UnitLabels("report-test2", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER),
+            "runner-id": roster.UnitLabels("builds-showrunner", "builds", "—", unit_labels.OwnerRole.SHOWRUNNER, unit_labels.Runner.SHOWRUNNER),
             "unmatched-id": roster.UnitLabels("scratch", "—", "—"),
             "offline-id": roster.UnitLabels("orphan", "offline", "—", unit_labels.OwnerRole.SHOWRUNNER),
         })
@@ -2967,7 +2967,7 @@ class UnitLabelsTests(unittest.TestCase):
                 entries.append(self.entry(worker.current_session, name,
                     showrunner=roster.UnderShowrunner("builds", "builds", ""), director=director, codex=codex))
                 expected[worker.current_session] = roster.UnitLabels(
-                    name, "builds", "report" if parent == unit else "—", role)
+                    name, "builds", "report" if parent == unit else "—", role, unit_labels.Runner.WORKER)
                 if not codex:
                     records.append({"pid": len(records) + 100, "sessionId": worker.current_session,
                         "name": name, "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": []})
@@ -3000,15 +3000,15 @@ class UnitLabelsTests(unittest.TestCase):
         ]
         labels = roster.unit_labels(entries)
         self.assertEqual(labels, {
-            "style-director": roster.UnitLabels("types-director", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT),
-            "style-worker": roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT),
+            "style-director": roster.UnitLabels("types-director", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR),
+            "style-worker": roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER),
         })
         self.assertEqual(labels["style-worker"].folder_name(), "cargo-liner-style-types")
 
     def test_labels_collapse_whitespace_without_changing_the_registered_name(self) -> None:
         entry = self.entry("id", "report\n test2", showrunner=roster.UnderShowrunner(" builds\t", "runner", ""),
                            director=roster.UnderDirector(" report\n", "director", ""), codex=True)
-        self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report", unit_labels.OwnerRole.UNIT)})
+        self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER)})
 
     def test_fast_lookup_uses_only_fixture_sessions_registry_and_staff_marks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -3063,9 +3063,9 @@ class UnitLabelsTests(unittest.TestCase):
             labels = roster.unit_labels_for([unit.id, unit.parent.id, "free-id", worker.id, "missing-id"],
                                             environment)
         self.assertEqual(labels, {
-            unit.id: roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT),
-            worker.id: roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT),
-            unit.parent.id: roster.UnitLabels("cargo-liner-style", "cargo-liner-style", "—", unit_labels.OwnerRole.SHOWRUNNER),
+            unit.id: roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR),
+            worker.id: roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER),
+            unit.parent.id: roster.UnitLabels("cargo-liner-style", "cargo-liner-style", "—", unit_labels.OwnerRole.SHOWRUNNER, unit_labels.Runner.SHOWRUNNER),
             "free-id": roster.UnitLabels("", "—", "—"),
         })
         runs.assert_not_called()

@@ -1400,3 +1400,18 @@ From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-
 - The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
 - The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
 - `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
+
+### Phase 74 — Every row hover names who ran it · status: todo
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until-2026-11-16T0500Z-hover-shot-a361af/user-hover-identity.png: "this hover panel is going in the right direction - i want to make sure we non-redundantly indentify the showrunner: {showrunner} unit : {unit} worker : {worker} if the showrunner is the only thing that ran it, then it should say showrunner: {showrunner} unit : this run is from the showrunner and don't show the unit similarly if it is something run from the unit it should be showrunner: {showrunner} unit : {unit} worker : this run is from the unit director This should be a standard at the beginning of each hover over every running and queued row". From builds (not the user), 2026-11-13: in the showrunner case show no worker line; use the user's label texts exactly; one shared block from one place in the code; a run with no recorded owner keeps "owner not recorded".
+
+1. `unit_labels.UnitLabels` records who ran the step: the showrunner, the unit director, a worker, or not known. `make_labels` sets it from the existing relationships.
+2. The feed's one owner function (`page_owner_labels`) sends `runner` and `worker` on every running and queued row, cloud rows included.
+3. One page function builds the identity block. Every running and queued row hover shows it first, under the heading:
+   - showrunner run: `showrunner: {showrunner}`, `unit: this run is from the showrunner`;
+   - unit director run: `showrunner`, `unit: {unit}`, `worker: this run is from the unit director`;
+   - worker run: `showrunner`, `unit`, `worker: {worker}`;
+   - worker of a showrunner: `showrunner`, `unit: this run is from the showrunner`, `worker: {worker}`. From builds (not the user), 2026-11-13: every block starts with the same showrunner and unit lines;
+   - no recorded owner: the current "not recorded" text. A CI row keeps its CI line.
+   The labels are lowercase, and the colons align.
+4. Proof: before and after shots of the user's hana nextest hover, plus one showrunner-run row and one unit-director-run row. Run every build_queue module before the checkpoint.

@@ -312,18 +312,24 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     mac_text: NotRequired[str]
+    runner: NotRequired[unit_labels.Runner]
+    worker: NotRequired[str]
 
 
 class PageOwnerLabels(TypedDict):
     showrunner: str
     unit: str
     ci_label: str
+    runner: unit_labels.Runner
+    worker: str
 
 
 def page_owner_labels(identity: unit_labels.UnitLabels, *, ci_label: str = "") -> PageOwnerLabels:
-    """Keep CI labels separate from staff ownership."""
+    """Name the showrunner, unit and runner of a row; keep CI labels separate from staff ownership."""
+    runner = unit_labels.Runner.UNKNOWN if ci_label else identity.runner
     return {"showrunner": "" if ci_label else identity.owner_text,
-            "unit": "" if ci_label else identity.unit, "ci_label": ci_label}
+            "unit": "" if ci_label else identity.unit, "ci_label": ci_label, "runner": runner,
+            "worker": identity.session if runner is unit_labels.Runner.WORKER else ""}
 
 
 def ci_step_label(runner: str, job: str) -> str:
@@ -1174,7 +1180,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             identity = queue_view.cloud_step_labels(cloud, model)
             values: CloudWorkRow = {"kind": "cloud", "name": queue_view.cloud_step_name(cloud, model),
-                "showrunner": identity.owner_text, "unit": identity.unit, "pid": cloud.owner.pid,
+                **page_owner_labels(identity), "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
