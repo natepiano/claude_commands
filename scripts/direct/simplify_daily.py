@@ -23,6 +23,9 @@ from scripts.lib.process_failure import failure_detail
 from scripts.usage import agents_log
 
 
+AGENT_EXEC = Path(__file__).resolve().parents[1] / "agents/agent_exec.sh"
+
+
 def git(cwd: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["git", "-C", str(cwd), *arguments], capture_output=True, text=True, errors="replace", check=False)
     if check and result.returncode:
@@ -93,7 +96,7 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             env["AGENT_EXEC_EXTRA_ARGS"] = (env.get("AGENT_EXEC_EXTRA_ARGS", "") + f" --session-id {session}").strip()
             write_text_atomic(status, "reviewing\n")
             launched = subprocess.run([
-                "bash", str(Path(__file__).resolve().parents[1] / "agents/agent_exec.sh"),
+                "bash", str(AGENT_EXEC),
                 "direct.simplify", "readonly", str(clone), str(prompt), str(report_path), str(log_path),
             ], env=env, check=False)
             report = report_path.read_text()
