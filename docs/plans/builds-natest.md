@@ -3882,3 +3882,35 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The same test count and assertions; the module passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 258 — The accounts tests check the same behavior with fewer tests  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `accounts/test_accounts.py` has fewer tests, and every behavior check stays.
+
+**Decision:** count phase. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. This module has the most tests (488).
+
+**Spec:**
+1. List groups of tests with the same setup and the same result under test. Fold each group into one table test with `subTest`, one row for each old check. Keep each old assertion as a row assertion.
+2. Run `python3 scripts/test_times/coverage_overlap.py scripts/accounts test_accounts.py`. Remove a candidate only when its covering test checks the same result. Name the covering test for each removal in the commit body.
+3. Do not fold tests whose setup or failure message differs in a way a row cannot express. Keep a test that checks a process boundary, a signal or a wait.
+4. Map each old test to its row or covering test in `phases/258/count_map.md`.
+5. Run the module three times and basedpyright. Report the test count and `module_cost.py` CPU before and after.
+
+**Files:**
+- `scripts/accounts/test_accounts.py`
+
+**Workers:** 1 writer; one test module. No-worker mode: the director writes it.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere. Phase 252: bind private run roots with `bind_private_run_roots`.
+- sdlc count-phase terms: every behavior check stays; name each covering test; builds decides the order.
+
+**Acceptance gate:**
+- Fewer tests; every old check maps to a row or a named covering test.
+- The module passes three times; basedpyright 0 errors and 0 warnings.
+- aws pairs show no CPU loss.
+
