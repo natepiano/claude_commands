@@ -102,6 +102,14 @@ with (state / "validation-locks").open("a") as output:
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
         from scripts.production import change_review
 
+        with self.subTest(line="malformed on a non-checkpoint commit"):
+            malformed = self.dated_checkpoint("Show waiting and starting session states\n\n"
+                                             + "Change-Review: a worker reads waiting")
+            result = self.run_checkpoint(malformed)
+            self.assertEqual(result.process.returncode, 1)
+            self.assert_stopped_before_merge(result, "held", "needs three parts")
+            self.assertIn(malformed[:change_review.SHORT], result.process.stdout)
+            self.assertNotIn("change review: ok", result.process.stdout)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 1)
@@ -132,11 +140,18 @@ with (state / "validation-locks").open("a") as output:
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
     def test_a_production_without_a_list_writes_no_rows(self) -> None:
-        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
-                      result.process.stdout)
+        for message, count in (("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script", 1),
+                               ("Show waiting and starting session states", 0),
+                               ("Show waiting and starting session states\n\n"
+                                + "Change-Review: Sessions show waiting | Read the session list | The state reads waiting", 1)):
+            with self.subTest(message=message):
+                sha = self.dated_checkpoint(message)
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
+                              result.process.stdout)
+                self.assertIn(f"change review: ok — {count} unit commit(s) carry their Change-Review lines",
+                              result.process.stdout)
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""
         self.production_doc()

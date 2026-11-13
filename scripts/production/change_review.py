@@ -3,6 +3,8 @@
 
 A visible trailer has three fields and an optional fourth field: after <step>.
 An invisible change uses Change-Review: none — <reason>.
+Every supplied review line must parse, whatever the commit subject.
+Only checkpoints that change more than Markdown require a review line.
 See commands/change_review.md for actions, list selection, urgency, verdicts, and scratch folders.
 
 An open Production cell holds its unit's fixed staff id or its showrunner's fixed staff id.
@@ -187,10 +189,8 @@ def needs_trailer(subject: str, files: tuple[str, ...]) -> bool:
 
 def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
     """Why a commit's message fails the rule, or the empty string."""
-    if not needs_trailer(subject, files):
-        return ""
     found = entries(message)
-    if not found:
+    if not found and needs_trailer(subject, files):
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
@@ -291,7 +291,7 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
 
 
 def missing(commits: list[Commit]) -> list[str]:
-    """Each checkpoint without a good line that no passing commit names in a Change-Review-Covers line.
+    """Each invalid commit that no passing commit names in a Change-Review-Covers line.
 
     A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
     """
