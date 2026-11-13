@@ -157,6 +157,33 @@ class NativeClaudeUnitTests(StaffTestCase):
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def test_plan_unit_type_controls_admission_and_repeated_launch(self) -> None:
+        _ = self.successful("alpha", "--unit-type", "style", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.opening_prompt(), "/unit:style docs/plans/given.md")
+        with patch.dict(os.environ, self.env):
+            row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+            self.assertEqual(row.unit_type, staff.UnitDetails("style"))
+        before_calls = self.herdr_calls()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertFalse(any(row[2:4] in (["agent", "start"], ["agent", "prompt"])
+                             for row in self.herdr_calls()[len(before_calls):]))
+        result = self.cli("alpha", "--unit-type", "merge", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unit_type conflicts", result.stderr)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(staff.by_id(row.id), row)
+
+    def test_standby_merge_loads_its_command_before_waiting(self) -> None:
+        _ = self.successful("merges", "--unit-type", "merge", "--permanent")
+        prompt = self.opening_prompt()
+        self.assertIn("Load /unit:merge before waiting for orders.", prompt)
+        self.assertIn("on standby", prompt)
+        self.assertNotIn("/unit:direct", prompt)
+
+    def test_brief_approval_names_the_selected_command(self) -> None:
+        _ = self.successful("alpha", "--unit-type", "style", "--brief", "Judge the style tickets.")
+        self.assertIn("approval before you run /unit:style ", self.opening_prompt())
+
     def assert_observed_identity(self, row: staff.StaffRow) -> None:
         pid = int(self.env["FAKE_CLAUDE_PID"])
         registry = sessions.read_session(Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json")
@@ -456,11 +483,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
             def interrupted(production: Production, unit: str, *,
                             worktree: staff.PresentWorktree | staff.WorktreeUnfilled,
-                            runtime_id: str = "") -> staff.StaffRow:
+                            runtime_id: str = "", unit_type: staff.UnitType | None = None) -> staff.StaffRow:
                 self.assertEqual(runtime_id, self.env["FAKE_CLAUDE_SESSION_ID"])
                 self.assertEqual(self.staff.staff_file.read_bytes(), before)
                 if after:
-                    _ = original(production, unit, worktree=worktree, runtime_id=runtime_id)
+                    _ = original(production, unit, worktree=worktree, runtime_id=runtime_id, unit_type=unit_type)
                 raise RuntimeError("stopped at staff step")
 
             with patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
@@ -481,6 +508,21 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")),
                          (document, data, head))
+
+    def test_pending_admission_keeps_the_saved_type_without_a_retry_flag(self) -> None:
+        with patch.object(add_unit, "ensure_staff_unit", side_effect=RuntimeError("interrupted admission")):
+            stopped = self.cli("alpha", "--plan", "docs/plans/given.md", "--unit-type", "merge")
+        self.assertEqual(stopped.returncode, 1, stopped.stderr)
+        self.assertEqual(staff.find(kind="unit"), [])
+        production = read_production(self.production_name)
+        fields = cast(dict[str, str], json.loads(add_unit.opening_record(production, "alpha").read_text()))
+        self.assertEqual(fields["unit_type"], "merge")
+        conflicting = self.cli("alpha", "--plan", "docs/plans/given.md", "--unit-type", "style")
+        self.assertEqual(conflicting.returncode, 2, conflicting.stderr)
+        self.assertIn("conflicts with pending admission", conflicting.stderr)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        row = staff.find(kind="unit")[0]
+        self.assertEqual(row.to_json()["unit_type"], "merge")
 
     def test_new_row_with_a_running_labeled_session_refuses_before_any_write(self) -> None:
         prior = self.root / "prior-session"

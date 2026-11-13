@@ -130,7 +130,7 @@ class PendingDispatchTests(unittest.TestCase):
                     if remote is not None:
                         _ = remote.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
-        for target, active_start in (("mac", False), ("mac", True), ("aws", False), ("aws", True)):
+        for target, active_start in (("mac", False), ("mac", True), ("linux", False), ("linux", True)):
             with self.subTest(target=target, active_start=active_start), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 environment = {**os.environ, "HOME": str(root)}
@@ -178,17 +178,18 @@ class PendingDispatchTests(unittest.TestCase):
                 self.assertEqual(late.stdout, acknowledgement)
                 self.assertEqual(list(fence_directory.iterdir()), [])
 
-        for target in ("mac", "aws"):
+        for target in ("mac", "linux"):
             for ending in ("completed", "failed", "cancelled", "released"):
                 with self.subTest(target=target, ending=ending), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     environment = {**os.environ, **config_environment(root), "HOME": str(root),
                                    "MAC_TEST_STATE_DIR": str(root / ".local/state/mac-test")}
                     _ = (root / "build_targets.conf").write_text(
-                        "targets=mac,aws\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n")
-                    settings = root / ("mac_test.conf" if target == "mac" else "aws_target.conf")
-                    _ = write_config_fixture(settings, "offload=on\nhost=private-host\n", template="mac_test")
+                        "targets=mac,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n")
+                    settings = root / ("mac_test.conf" if target == "mac" else "linux_target.conf")
+                    for name in ("mac_test.conf", "linux_target.conf"):
+                        _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
                     identity = claim_state.ClaimIdentity("cleanup-claim", "cleanup-episode", "cleanup-attempt")
                     prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, target)],
                         cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=5)
@@ -252,7 +253,7 @@ class PendingDispatchTests(unittest.TestCase):
                     self.assertEqual(list(fence_directory.iterdir()), [])
 
 
-        for target in ("mac", "aws"):
+        for target in ("mac", "linux"):
             with self.subTest(target=target, stale_scope=True), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 environment = {**os.environ, "HOME": str(root)}

@@ -476,10 +476,6 @@ def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
 def _placement_wire_defaults(record: dict[str, object]) -> dict[str, object]:
     """Decode older placement messages into semantic recovery states."""
     record = _read_wire_record(record)
-    if record.get("kind") in ("PlacementConstraints", "PlacementAssignment") and isinstance(record.get("source_key"), str):
-        key = record["source_key"]
-        return {**record, "source_key": {"kind": "SourceKeyKnown", "key": key} if key else
-                {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"}}
     if record.get("kind") == "AdoptedProviderClaim" and "holder" not in record:
         return {**record, "holder": {"kind": "ClaimHolderUnconfirmed", "reason": "older holder evidence"}}
     if record.get("kind") == "ExecutionReport" and isinstance(record.get("outcome"), str):

@@ -330,7 +330,6 @@ class PlacementTests(unittest.TestCase):
     def test_remote_refusal_gets_one_local_reservation_for_the_replacement(self) -> None:
         cases = ((offload.DeclinedMacRun("disk", 0), True, False),
                  (offload.NoTestMatchedOnMac(0), True, True), (offload.LostMacRun(0), True, True),
-                 (offload.InterruptedTargetRun("fixture-generation", 0), False, False),
                  (offload.LostMacRun(0), False, False))
         for result, consumed, authorized in cases:
             with self.subTest(result=type(result).__name__, consumed=consumed), PlacementFixture() as fixture:
@@ -812,19 +811,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                         self.assertIsInstance(reply.permission, placement.PermissionConsumed)
 
     def test_closed_unknown_and_changed_assignments_never_receive_authorization(self) -> None:
-        for case in ("closed", "unknown", "source", "owner", "claim", "generation-old-last", "generation-old-first",
-                     "generation-unversioned"):
+        for case in ("closed", "unknown", "source", "owner", "claim"):
             with self.subTest(case=case), PlacementFixture() as fixture:
                 request = placement_request(fixture)
-                if case.startswith("generation-"):
-                    target = "box" if case == "generation-unversioned" else "aws"
-                    settings = f"{target}_target.conf"
-                    _ = (fixture.root / "build_targets.conf").write_text(
-                        f"targets={target}\nkind.{target}=ssh\nplatform.{target}=linux\nsettings.{target}={settings}\n")
-                    _ = write_config_fixture(fixture.root / settings, "offload=off\n", template="mac_test")
-                    destination = replace(request.constraints.candidates[0].destination, provider="ssh", target=target)
-                    request = replace(request, constraints=replace(request.constraints,
-                        candidates=(placement.PlacementCandidate(destination),)))
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 claim = adopt_assignment(fixture, request, assignment)
@@ -843,27 +832,6 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     assignment = replace(assignment, owner=replace(assignment.owner, host="another-coordinator"))
                 elif case == "claim":
                     claim = replace(claim, claim_id="another-claim")
-                else:
-                    paths = claim_state.state_paths(assignment.destination.target)
-                    paths.claims.mkdir(parents=True)
-                    _ = (paths.directory / "controller.json").write_text('{"generation":"host-generation-a"}')
-                    current_generation = "" if case == "generation-unversioned" else "host-generation-a"
-                    for name, generation in (("a", current_generation), ("z", "obsolete-generation")):
-                        record = {"claim_id": f"claim-{name}", "episode": assignment.episode, "attempt": assignment.attempt,
-                                  "submitting_session": "submitting-session", "pid": assignment.owner.pid,
-                                  "proc_start": assignment.owner.start_time, "remote_host": assignment.destination.host,
-                                  "repo_name": "hana", "repo_key": "", "what": "hana tests",
-                                  "worktree": str(fixture.root), "since": "2026-11-01T12:00:00+00:00"}
-                        if generation:
-                            record["instance_generation"] = generation
-                        filename = {"a": "z", "z": "a"}[name] if case == "generation-old-first" else name
-                        _ = (paths.claims / f"{filename}.json").write_text(json.dumps(record))
-                    key = fixture.server.host_evidence_key(request, assignment.destination)
-                    fixture.server.host_requests[key] = request
-                    evidence = fixture.read_host_evidence(key)
-                    fixture.provider_evidence[key] = evidence
-                    fixture.server.publish_host_evidence(evidence)
-                    claim = replace(claim, claim_id="claim-z")
                 for restart in (False, True):
                     if restart:
                         fixture.restart()

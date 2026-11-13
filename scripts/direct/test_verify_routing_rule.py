@@ -47,7 +47,7 @@ class RoutingRuleTests(unittest.TestCase):
             for pin in ("", "--target", "--mac", "--local"):
                 with self.subTest(command=command, pin=pin):
                     routing = targets.LocalRequired("local files") if pin == "--local" else targets.ANY_ELIGIBLE_TARGET
-                    selection = Pinned("mac" if pin == "--mac" else "aws") if pin in ("--mac", "--target") else ROUTED
+                    selection = Pinned("mac" if pin == "--mac" else "linux") if pin in ("--mac", "--target") else ROUTED
                     answer = build_targets.step_routing_rule(command, routing, selection)
                     local = pin == "--local" or command in ("build", "final") and not pin
                     self.assertIsInstance(answer, build_targets.NatedevOnly if local else build_targets.AnyTarget)
@@ -58,7 +58,7 @@ class RoutingRuleTests(unittest.TestCase):
 VERIFY_CALL_ENVIRONMENT=()
 for CMD in check test doc lint example build final; do
     for flag in --target --mac --local; do
-        value=aws
+        value=linux
         [[ "$flag" != --mac ]] || value='macOS API'
         [[ "$flag" != --local ]] || value='local files'
         parse_routing_arguments sample "$flag" "$value"
@@ -73,7 +73,7 @@ done
         self.assertEqual(result.stdout.splitlines(), [
             f"{command} {flag} {target} {mac} {local}"
             for command in commands
-            for flag, target, mac, local in (("--target", "aws", 0, 0), ("--mac", "", 1, 0), ("--local", "", 0, 1))
+            for flag, target, mac, local in (("--target", "linux", 0, 0), ("--mac", "", 1, 0), ("--local", "", 0, 1))
         ])
 
 
@@ -97,10 +97,10 @@ class RemoteCommandTests(VerifySshTargetsFixture):
                 for line in (self.runner_state / "received-arguments").read_text().splitlines()]
 
     def test_check_uses_the_first_eligible_linux_target(self) -> None:
-        self.configure("aws,natedev")
+        self.configure("linux,natedev")
         result = self.verify("check", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
         self.assertIn("run", self.ssh_events()[0]["actions"])
         words, = self.received_arguments()
         self.assertEqual(words[words.index("--verb") + 1], "check")
@@ -108,14 +108,14 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["check"]], [])
 
     def test_example_uses_linux_when_its_private_settings_permit_examples(self) -> None:
-        self.configure("aws,natedev")
-        settings = self.root / "aws_target.conf"
+        self.configure("linux,natedev")
+        settings = self.root / "linux_target.conf"
         _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,example"))
         reader = Path(self.environment["LINT_CONFIG_READER"])
         _ = reader.write_text(reader.read_text() + '\nlint_config_enabled() { [[ "$1" == clippy ]]; }\n')
         result = self.verify("example", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
         self.assertIn("run", self.ssh_events()[0]["actions"])
         words, = self.received_arguments()
         self.assertEqual(words[words.index("--verb") + 1], "clippy")
@@ -124,11 +124,11 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["clippy"]], [])
 
     def test_pinned_final_sends_both_steps_to_the_target_without_a_saved_pass(self) -> None:
-        self.configure("aws,natedev")
+        self.configure("linux,natedev")
         git = self.bin_directory / "git"
         _ = git.write_text(git.read_text().replace("wanted=ls-files", "wanted=HEAD\n"
             + "if has \"$@\"; then printf 'fixture-commit\\n'; exit 0; fi\nwanted=ls-files"))
-        result = self.verify("final", "sample", "--target", "aws")
+        result = self.verify("final", "sample", "--target", "linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = self.received_arguments()
         self.assertEqual(len(arguments), 2)
@@ -143,8 +143,8 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual(list((state / "final_pass").glob("*.json")), [])
 
     def test_pinned_build_reports_the_remote_binary(self) -> None:
-        self.configure("aws,natedev")
-        settings = self.root / "aws_target.conf"
+        self.configure("linux,natedev")
+        settings = self.root / "linux_target.conf"
         _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,build"))
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         metadata["target_directory"] = str(self.root / "target")
@@ -152,18 +152,18 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         targets = cast(list[dict[str, object]], packages[0]["targets"])
         targets.append({"name": "sample-cli", "kind": ["bin"], "src_path": str(self.root / "src/main.rs")})
         self.environment["TEST_METADATA"] = json.dumps(metadata)
-        result = self.verify("build", "sample", "--target", "aws")
+        result = self.verify("build", "sample", "--target", "linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["aws"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
         words, = self.received_arguments()
         self.assertEqual(words[words.index("--verb") + 1], "build")
         self.assertEqual(words[words.index("--kind") + 1], "build")
-        self.assertIn("binary: aws:target/debug/sample-cli", result.stdout)
+        self.assertIn("binary: linux:target/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
     def test_pinned_build_uses_the_runner_target_directory(self) -> None:
-        self.configure("aws,natedev")
-        settings = self.root / "aws_target.conf"
+        self.configure("linux,natedev")
+        settings = self.root / "linux_target.conf"
         _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,build"))
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         metadata["target_directory"] = str(self.root / "local-target")
@@ -173,9 +173,9 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.environment["TEST_METADATA"] = json.dumps(metadata)
         _ = self.runner.write_text(self.runner.read_text().replace(
             'build_target_directory=target', 'build_target_directory=/remote/cargo output'))
-        result = self.verify("build", "sample", "--target", "aws")
+        result = self.verify("build", "sample", "--target", "linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("binary: aws:/remote/cargo output/debug/sample-cli", result.stdout)
+        self.assertIn("binary: linux:/remote/cargo output/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
 
@@ -201,8 +201,8 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         self.environment.update({"NO_COLOR": "1", "RUST_LOG": "sample=trace",
                                  **{name: "caller" for name in FIXED_ENVIRONMENT},
                                  "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\n",
-                                 template="aws_target")
+        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
+                                 template="mac_test")
         targets_file = self.root / "build_targets.conf"
         _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
             + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")

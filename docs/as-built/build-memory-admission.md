@@ -814,6 +814,25 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+`QueuePlace.popen` installs no signal handler.
+It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
+It then restores the caller's previous signal mask.
+The program wrapper unblocks these signals before exec.
+The program wrapper atomically publishes a `ProgramStart` record before execution.
+The record contains the holder identity, program identity, and memory scope.
+The wrapper checks the holder's PID and start time before and after publication.
+A dead holder prevents program execution.
+A later interruption leaves the complete record in the build log's `program-starts` directory.
+The next start stops recorded scopes or program groups with dead holders before it requests admission.
+It removes their records after their scopes or process trees become empty.
+Normal cleanup removes the record after the program and its descendants stop.
+Temporary queue-place folder names contain the holder's PID and start time.
+The next start removes this account's folders after those exact holders end.
+Folder allocation and removal use a signal mask and install no handler.
+SIGTERM uses its default action and can leave cleanup for the next start or service read.
+Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
+`defer_cleanup_signals` retains its signal mask during normal cleanup.
+It uses `pthread_sigmask` and installs no handler.
 
 ### Startup, cut-over, and rollback
 
@@ -1223,7 +1242,25 @@ While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf`
 
 - A target that goes away during a pass counts as done. The pass finishes with status 0. Its bytes do not count as removed.
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
-- **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
+- **Targets in use.** A target is busy while a build holds its Cargo locks.
+  It is also busy when a live process uses an executable, working directory, or mapped file under it.
+  `process_uses()` checks `/proc/<pid>/exe`, `cwd` and `maps`.
+  A cargo-nextest or `verify.sh` process also keeps its workspace targets busy, including time between test binaries and time in the build queue.
+  The scan recognizes `verify.sh` directly or as the first script argument after options to `bash`, `sh`, `zsh` or `dash`.
+  `workspace_targets()` resolves `--target-dir`, `CARGO_TARGET_DIR`, Cargo config, or a target beside an ancestor of the working directory.
+  The use text is `runs verify.sh in <cwd>`.
+  nextest holds no Cargo lock during tests and executes binaries from `deps/`.
+  A floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
+  `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts the target as held.
+  `sweep_workspace` prints `… skipped` and removes nothing from the busy target.
+  A running app also keeps its target busy.
+  Executable or mapped paths that end with `(deleted)` do not count as use.
+  The sweep cannot remove or damage those files.
+  A process with only deleted files under a target leaves it idle when its working directory is outside.
+  A hung cargo-berth process held 26 GiB of cargo-liner-berth output for three days before this rule changed on 2026-10-21.
+  One scan of `/proc` covers every target and runs only below the floor.
+  A measured scan took 0.21 seconds over 110 targets and about 600 readable processes.
+  Without `/proc`, as on the Mac, the scan finds no use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
 - **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, the hourly `tmp-sweep` job runs `tmp_sweep.py`.
 `modules/darwin/tmp-sweep.nix` in nixos defines this job.
@@ -1716,7 +1753,58 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
-Running rows show a `machine` column after `min` and before `pid`.
+The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+The first column shows `building` or `testing` from the recorded progress counter.
+A row without a counter shows `—`.
+Local builds, merge gates, and cloud rows use their recorded counters.
+hana CI currently has no admission counter.
+The Running table shows hana CI only when a recorded runner has a busy job.
+Idle or unreadable runners have no separate Running row.
+Their memory remains in the taken total, the cap, and the summary tooltip.
+Waiting rows use `#` in the first column for their queue place.
+Both sections use the same column widths.
+The narrow layout adds the `Step` column.
+The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
+It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
+A v3 registration must match the current boot, process start time, uid, PID, and generation.
+The reader reads at most 64 KiB from each registration and log.
+It groups descendant cargo calls and compilers under their top-level cargo run.
+Native projects and both test mirrors appear as separate runs.
+The recorded project directory identifies the run; a compiler's crate directory does not.
+The step name uses the command's package, then the repository when the command has no package.
+A step name never contains an unknown-value dash.
+The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
+The Mac row shows the repository on its second label line.
+The stage uses a test counter or a running test binary as evidence for `testing`.
+The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
+It embeds the shared Cargo folder reader in the same Mac reading.
+The Mac kernel supplies only the selected Cargo path environment fields.
+Observed compiler output folders also identify test binaries, as they do in cargo tile.
+The reader resolves symlinks before it compares directory components.
+A test binary under a custom target folder can supply `testing` without a counter.
+Build scripts and binaries outside the selected output folders do not supply `testing`.
+The stage otherwise shows `building` for an observed cargo run.
+The reader uses the same captured Cargo and nextest output that cargo tile reads.
+The page shows the recorded done percentage and a progress line.
+The command's `--test-threads`, `-j`, or `--jobs` value supplies vCPU.
+An absent positive value supplies `—`.
+The Unit comes from the submitting session in a matching Mac claim and that session's staff record.
+A remote mirror session and repository can identify that claim.
+A mirror lease can identify the claim session.
+The copy record's fallback owner does not supply a Unit.
+The page shows `—` when no claim supplies an owner.
+The Mac row uses the local used-memory style and the same GiB scale.
+Its memory is the sum of resident memory for the run's process tree.
+The Mac row has no reservation or hatching and changes no natedev memory total.
+The Mac tooltip states that its memory does not count against natedev.
+It aligns Machine, Started, Used, and Reading age in labelled rows.
+A readable counter adds a Progress row.
+A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
+The feed log retains raw errors; the page shows only the status and reading age.
+CI runner records supply the `hana CI` owner for their Running and Waiting steps.
+The aggregate running CI row also shows Unit `hana CI`.
+The feed compares the step's recorded runner unit with the runner records, not page text.
+The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.

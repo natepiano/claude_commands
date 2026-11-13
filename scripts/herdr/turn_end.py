@@ -253,7 +253,13 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             details.append(reason)
     completion = replace(completion, details=tuple(details))
     progress_history.save_hook_completion(run, instance, completion)
-    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
+    try:
+        reply = path.read_text()
+    except FileNotFoundError:
+        if outcome != TurnOutcome.ERROR:
+            raise
+        reply = "\n".join(completion.details)
+    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, reply, "\n".join(details))
 
     def send_notice() -> None:
         decision.send_notice()

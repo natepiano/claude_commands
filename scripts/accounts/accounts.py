@@ -2881,8 +2881,13 @@ class AccountWorkerActivity(Protocol):
     def row(self) -> staff.StaffRow: ...
 
 
+class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
+    @property
+    def status(self) -> str: ...
+
+
 class AccountPaneReader(Protocol):
-    OpenWorker: type[AccountWorkerActivity]
+    OpenWorker: type[AccountOpenWorkerActivity]
 
     def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
@@ -4213,14 +4218,18 @@ class RoleSessionCounts:
     idle: int
     paused: int
     exited: int
+    waiting: int = field(default=0, kw_only=True)
+    starting: int = field(default=0, kw_only=True)
 
     @property
     def total(self) -> int:
-        return self.busy + self.idle + self.paused + self.exited
+        return self.busy + self.starting + self.waiting + self.idle + self.paused + self.exited
 
 
 class RoleSessionCountsDocument(TypedDict):
     busy: int
+    starting: int
+    waiting: int
     idle: int
     paused: int
     exited: int
@@ -4255,6 +4264,18 @@ class StatusRow:
 
 
 @dataclass(frozen=True)
+class UseTableProblemLines:
+    """All supplied table notes also belong in panes."""
+
+
+@dataclass(frozen=True)
+class PaneProblemLines:
+    """Classified status lines that belong in account panes."""
+
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class StatusReading:
     rows: tuple[StatusRow, ...]
     notes: tuple[str, ...]
@@ -4264,6 +4285,10 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
+    pane_problems: PaneProblemLines | UseTableProblemLines = field(default_factory=UseTableProblemLines)
+
+    def pane_problem_lines(self) -> tuple[str, ...]:
+        return self.pane_problems.lines if isinstance(self.pane_problems, PaneProblemLines) else self.notes
 
 
 class StatusAccountDocument(TypedDict):
@@ -4396,7 +4421,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
-            role_counts=[RoleSessionCountsDocument(busy=count.busy,
+            role_counts=[RoleSessionCountsDocument(busy=count.busy, starting=count.starting, waiting=count.waiting,
                 idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
@@ -4412,7 +4437,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.pane_problem_lines()]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4421,6 +4446,11 @@ ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage"
 @dataclass(frozen=True)
 class NoSeparateCause:
     """The fault itself states all that is known about its cause."""
+
+
+@dataclass(frozen=True)
+class SharedHomeRepair:
+    """Shared home entries need repair outside account panes."""
 
 
 @dataclass(frozen=True)
@@ -4509,7 +4539,7 @@ class StatusProblem:
 
     subject: str
     wrong: str
-    cause: ProblemCause | NoSeparateCause
+    cause: ProblemCause | NoSeparateCause | SharedHomeRepair
     step: ProblemStep | NoUserStep
     footnote: bool = False
     origin: Literal["diagnostic", "account state", "role"] = "diagnostic"
@@ -4696,9 +4726,12 @@ def status_check_problem(text: str, subject: str, *, setup: str, login: str,
     if primary.endswith(" is a link"):
         return StatusProblem(subject, "private file is linked", ProblemCause("check", text, CauseFile(primary.removesuffix(" is a link"))),
             ProblemStep("use a private file in this home; " + setup))
+    shared_repair = primary.endswith(" is a real file") or (primary.startswith("repair ") and any(
+        marker in primary for marker in (": resolve clashing entries ", ": move its contents into a shared folder at ",
+                                        ": atomic no-replace moves to ", ": could not move into ")))
     if primary.startswith(subject + " "):
         primary = primary[len(subject) + 1:]
-    return StatusProblem(subject, primary, NoSeparateCause(), step)
+    return StatusProblem(subject, primary, SharedHomeRepair() if shared_repair else NoSeparateCause(), step)
 
 
 def _account_state_problems(status: AccountStatus | CodexStatus) -> list[StatusProblem]:
@@ -5029,8 +5062,11 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     problems.extend(diagnostics)
     for problem in problems:
         _observe_status_problem(problem)
-    notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
+    merged = merge_status_problems(problems)
+    notes = [render_status_problem(problem) for problem in merged]
     notes.extend(count_problems)
+    pane_problems = PaneProblemLines((*(render_status_problem(problem) for problem in merged
+                                       if not isinstance(problem.cause, SharedHomeRepair)), *count_problems))
     detail_lines: tuple[str, ...] = ()
     if detail:
         journal = moves.read_journal()
@@ -5038,7 +5074,8 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
             *_move_status_lines(moves.account_moves(journal), zone, account_config=account_config), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs)
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs,
+                         pane_problems=pane_problems)
 
 
 @dataclass
@@ -5174,6 +5211,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    pane_notes = list(reading.pane_problem_lines())
     warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
@@ -5186,9 +5224,12 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         warning_groups.setdefault(key, []).append(line)
     for (kind, cause), lines in warning_groups.items():
         warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
-        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", warning), NoUserStep())))
-    return replace(reading, notes=tuple(dict.fromkeys(notes)))
+        rendered = render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", warning), NoUserStep()))
+        notes.append(rendered)
+        pane_notes.append(rendered)
+    return replace(reading, notes=tuple(dict.fromkeys(notes)),
+                   pane_problems=PaneProblemLines(tuple(dict.fromkeys(pane_notes))))
 
 
 def _upcoming_move_lines() -> tuple[str, ...]:
@@ -5232,7 +5273,7 @@ class LocalRoleSessions:
 @dataclass(frozen=True)
 class CodexRoleProcess:
     pid: int
-    activity: Literal["busy", "idle"]
+    activity: Literal["busy", "idle", "starting"]
 
 
 def _local_codex_processes() -> dict[str, CodexRoleProcess]:
@@ -5243,8 +5284,9 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
         agents = herdr.Herdr(herdr.shared_session()).agents()
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
-    activities: dict[str, Literal["busy", "idle"]] = {
-        agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
+    activities: dict[str, Literal["busy", "idle", "starting"]] = {
+        agent["agent_session"].session_id: ("busy" if agent["agent_status"] == herdr.AgentStatus.WORKING
+            else "starting" if agent["agent_status"] == herdr.AgentStatus.STARTING else "idle")
         for agent in agents if agent.get("agent") == "codex"
         and isinstance(agent["agent_session"], herdr.ReportedAgentSession)
     }
@@ -5388,7 +5430,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if not isinstance(evidence, session_staff.RecordedWorker):
                     session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = worker_panes.worker_state(state)
+                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
+                          else worker_panes.worker_state(state))
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
@@ -5449,6 +5492,7 @@ def _session_counts_machine() -> str:
 
 
 def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+    """Publish waiting within busy and starting within idle for older peers."""
     mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
@@ -5461,14 +5505,15 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
     for (label, role), members in mapped.items():
         tool = "codex" if label.startswith("codex") else "claude"
         count = _role_session_counts(tuple(members.values()), tool)
-        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy + count.waiting, starting=count.starting, waiting=count.waiting,
+            idle=count.idle + count.starting, paused=count.paused, exited=count.exited, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     return document
 
 
 def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
+    """Separate waiting and starting from the legacy counts."""
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("invalid session counts")
@@ -5485,13 +5530,19 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
+            starting = count.get("starting", 0)
+            waiting = count.get("waiting", 0)
             busy, idle, paused, exited, total = (count.get(key) for key in ("busy", "idle", "paused", "exited", "total"))
-            if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
+            if any(type(value) is not int for value in (busy, starting, waiting, idle, paused, exited, total)):
                 raise ValueError("invalid activity counts")
+            starting = cast(int, starting)
+            waiting = cast(int, waiting)
             busy, idle, paused, exited, total = (cast(int, value) for value in (busy, idle, paused, exited, total))
-            if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
+            busy -= waiting
+            idle -= starting
+            if min(busy, starting, waiting, idle, paused, exited, total) < 0 or busy + starting + waiting + idle + paused + exited != total:
                 raise ValueError("invalid count total")
-            checked[label][role] = RoleSessionCountsDocument(busy=busy, idle=idle, paused=paused, exited=exited, total=total)
+            checked[label][role] = RoleSessionCountsDocument(busy=busy, starting=starting, waiting=waiting, idle=idle, paused=paused, exited=exited, total=total)
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
@@ -5499,8 +5550,9 @@ def _fetch_session_counts() -> int:
     """Fetch only the other machine's local counts through the shared transport."""
     try:
         machine = remote.other_machine()
-        document = _decode_session_counts(role_map.ssh_role_map(("session-counts-read",), machine=machine), machine)
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps(document))
+        text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
+        _ = _decode_session_counts(text, machine)
+        atomic_file.write_text_atomic(_session_counts_cache(), text)
     except (OSError, ValueError, subprocess.SubprocessError):
         atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
         return 1
@@ -5547,7 +5599,7 @@ def _machine_role_counts(
         peer_accounts = {}
     counted: list[StatusRow] = []
     for row in rows:
-        local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
+        local_counts = {role: RoleSessionCountsDocument(busy=count.busy, starting=count.starting, waiting=count.waiting,
             idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
             for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts)}
         machines = {local: local_counts}
@@ -5561,6 +5613,8 @@ def _machine_role_counts(
             counts = [machine[role] for machine in machines.values() if role in machine]
             combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
                 busy=sum(count["busy"] for count in counts),
+                starting=sum(count["starting"] for count in counts),
+                waiting=sum(count["waiting"] for count in counts),
                 idle=sum(count["idle"] for count in counts),
                 paused=sum(count["paused"] for count in counts),
                 exited=sum(count["exited"] for count in counts)))
@@ -5577,14 +5631,15 @@ def _role_count_text(row: StatusRow, role: str) -> str:
     count = row.role_counts[index] if index < len(row.role_counts) else NoRoleCount()
     if not isinstance(count, RoleSessionCounts):
         return role + selected
-    activity = f"busy {count.busy}, idle {count.idle}, paused {count.paused}, exited {count.exited}"
+    activity = f"busy {count.busy}, starting {count.starting}, waiting {count.waiting}, idle {count.idle}, paused {count.paused}, exited {count.exited}"
     return f"{role}{selected} {count.total} ({activity})"
 
 
 def _role_session_counts(states: tuple[str, ...], _tool: Literal["claude", "codex"]) -> RoleSessionCounts:
     """Treat unknown live activity as idle without changing role membership."""
-    busy, paused, exited = (states.count(state) for state in ("busy", "paused", "exited"))
-    return RoleSessionCounts(busy, len(states) - busy - paused - exited, paused, exited)
+    busy, starting, waiting, paused, exited = (states.count(state) for state in ("busy", "starting", "waiting", "paused", "exited"))
+    return RoleSessionCounts(busy, len(states) - busy - starting - waiting - paused - exited, paused, exited,
+                             starting=starting, waiting=waiting)
 
 
 def _workers_status_lines(now: datetime, selected: CodexWorkersAccount, continuation_lines: tuple[str, ...], *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> list[str]:

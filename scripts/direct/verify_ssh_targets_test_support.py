@@ -8,10 +8,8 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-from decimal import Decimal
 from dataclasses import dataclass
 import subprocess
-import time
 from unittest import mock
 from typing import Callable, TypedDict, cast, override
 
@@ -19,8 +17,6 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, caller_
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
-
-from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -45,7 +41,6 @@ class SshRunnerEvent(TypedDict):
     holder: str
     remote_output: str
     remote_status: int
-    interruption_generation: str
     token_held: bool
     pinned: str
 
@@ -120,9 +115,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import shlex
 import time
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
@@ -183,14 +177,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
         actions.append("reachability")
         return offload.CommandOutput(0, "", "")
     actions.append("probe")
-    if mode == "probe-interrupted":
-        return offload.CommandOutput(75, "aws_interrupted=fixture-generation\n", "")
     if mode == "probe-leftovers":
         return offload.CommandOutput(255, "", "host unavailable")
     if mode == "probe-refusal":
         (root / (request.target + ".marker")).touch()
         return offload.CommandOutput(75, "linux_startup=unresolved\n", "")
-    wire = "free_gib=1000\nhost=aws-build\nnextest=nextest fixture\n"
+    wire = "free_gib=1000\nhost=linux-build\nnextest=nextest fixture\n"
     wire += "mend=mend fixture\nscripts_commit=fixture-commit\nrc=0\n"
     if mode == "disk":
         wire = wire.replace("free_gib=1000", "free_gib=0")
@@ -221,46 +213,9 @@ def stream(arguments):
         (root / (request.target + ".marker")).touch()
     elif mode == "runtime-version-mismatch":
         wire = (request.target + " version mismatch: rustc box=rustc other natedev=rustc fixture; "
-                + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/aws-build.nix\n"
+                + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix\n"
                 + "mac_cleanup=kept\n")
         status = 75
-    elif mode in ("interrupted", "other-generation"):
-        generation = "fixture-generation" if mode == "interrupted" else "old-generation"
-        wire, status = "aws_interrupted=" + generation + "\n", 255
-    elif mode == "runner-sigterm":
-        from scripts.mac_test import linux_runner
-        from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
-
-        now = int(time.time())
-        permission_directory = seed_runner_permission(Path.home(), config.source, now, "fixture-boot")
-        values = offload.runner_values(offload.read_config(config.source), request.target)
-        import unittest
-        from scripts.mac_test.offload_test_support import mirror_use_payload
-
-        command = shlex.split(mirror_use_payload(unittest.TestCase(), arguments)[-1])
-        mirror = Path.home() / command[command.index("--mirror") + 1]
-        mirror.mkdir(parents=True, exist_ok=True)
-        exports = root / "shell-exports"
-        shell = linux_runner.ShellEnvironment("fixture-shell", exports, root)
-
-        def interrupted_child(argv, **options):
-            assert argv[:2] == ["bash", "-c"], argv
-            step, = mirror.glob(".linux-step-*")
-            (step / "started").touch()
-            interrupt_runner(permission_directory, now)
-            return subprocess.CompletedProcess(argv, 143)
-
-        output = io.StringIO()
-        with mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"), \
-             mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
-             mock.patch.object(linux_runner, "prepare_shell", return_value=shell), \
-             mock.patch.object(linux_runner, "trim_build_folder", return_value=0), \
-             mock.patch.object(linux_runner, "output_free_bytes", return_value=1000 * 1024 ** 3), \
-             mock.patch.object(subprocess, "run", side_effect=interrupted_child), \
-             redirect_stdout(output):
-            status = linux_runner.run(mirror, values, request.package, request.verb,
-                                      request.nextest_words, request.call_id, "sent-tree")
-        wire = output.getvalue()
     elif mode == "lost":
         wire, status = "connection lost\n", 255
     else:
@@ -311,7 +266,7 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
 
 configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
 if not configured_mode.endswith("-once"):
-    reason = ("unreachable" if isinstance(result, (offload.LostMacRun, offload.InterruptedTargetRun)) else
+    reason = ("unreachable" if isinstance(result, offload.LostMacRun) else
               "busy" if isinstance(result, offload.BusyMacDecline) and controller.attempt_evidence.cleanup != "confirmed" else
               result.reason if isinstance(result, offload.DeclinedMacRun) else "")
     outcome = root / ("provider-outcome-" + request.target + ".json")
@@ -333,7 +288,6 @@ event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.
              remaining_claim_ids=[claim.record["claim_id"] for claim in mac_test.read_claims(mac_test.state_paths(request.target))],
              result_type=type(result).__name__,
              remote_output=remote_output, remote_status=remote_status,
-             interruption_generation=result.generation if isinstance(result, offload.InterruptedTargetRun) else "",
              holder=type(result.holder).__name__ if isinstance(result, offload.BusyMacDecline) else "",
              clock=Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "")
 with (root / "ssh-events.jsonl").open("a") as output:
@@ -387,7 +341,7 @@ source() {
         self.write_executable(self.bin_directory / "git", GIT_STUB.replace(
             "wanted=ls-files", 'wanted=remote\nif has "$@"; then printf "https://example.com/team/hana.git\\n"; exit 0; fi\nwanted=ls-files'))
         _ = (self.root / ".git/config").write_text('[remote "origin"]\nurl=https://example.com/team/hana.git\n')
-        self.configure("mac,natedev,aws")
+        self.configure("mac,natedev,linux")
         install_fixed_cargo(self.bin_directory / "cargo")
 
     @override
@@ -418,7 +372,7 @@ source() {
         _ = self.enterContext(mock.patch.object(self.admission.server, "handle_request", side_effect=observe))
 
     @contextmanager
-    def spare_after_aws_refusal(self) -> Generator[None]:
+    def spare_after_linux_refusal(self) -> Generator[None]:
         """Make the spare available after the first provider refuses the step."""
         controls = caller_provider_controls(self, self.admission)
         controls.set_host("spare", placement.TemporaryExclusion("starting"))
@@ -430,7 +384,7 @@ source() {
             if (isinstance(request, wire.ClaimFailure)
                     or isinstance(request, wire.ExecutionReport)
                     and isinstance(request.outcome, placement.PrelaunchRefused)):
-                if request.assignment.destination.target == "aws":
+                if request.assignment.destination.target == "linux":
                     controls.set_host("spare", placement.AllowedHost())
             return replies
 
@@ -441,20 +395,18 @@ source() {
         _ = (self.root / "build_targets.conf").write_text(
             f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\n"
+            + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
             + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
-        for name in ("aws_target", "spare"):
+        for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",
-                "offload=on\nhost=fake-aws\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
+                "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
+                + "devshell=default\nshell_cache=fixture-shells\nshell_timeout_s=2\n"
+                + "build_budget_gib=32\ntarget_budget_gib=24\nversion_pin_file=nixos hosts/linux-build.nix\n"
                 + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\n"
-                + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n", template="aws_target")
-        observed_at = int(time.time())
-        for target in ("aws", "spare"):
-            book = ledger.CostLedger(Path(self.environment["HOME"]) / ".local/state/build-targets" / target)
-            book.record_inventory(ledger.ResourceInventory(observed_at, (
-                ledger.PricedResource("retained-storage", Decimal("1")),), "private priced inventory"))
-            book.observe(ledger.InstanceObservation(observed_at, "stopped", "fake DescribeInstances"))
+                + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n", template="mac_test")
+        for target in ("linux", "spare"):
+            self.target_state(target).mkdir(parents=True, exist_ok=True)
 
     def ssh_events(self) -> list[SshRunnerEvent]:
         path = self.runner_state / "ssh-events.jsonl"
@@ -530,9 +482,6 @@ source() {
     def target_state(self, target: str) -> Path:
         return self.home / ".local/state/build-targets" / target
 
-    def seed_controller(self, target: str = "aws") -> None:
-        _ = (self.target_state(target) / "controller.json").write_text(
-            json.dumps({"generation": "fixture-generation"}))
 
     def first_wait(self) -> tuple[Path, dict[str, str]]:
         path = self.root / "first-wait"

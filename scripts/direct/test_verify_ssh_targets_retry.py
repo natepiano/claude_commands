@@ -77,11 +77,11 @@ class VerifySshRetryTests(VerifySshTargetsFixture):
         self.assertEqual((attempt["outcome"], attempt["completion"]), ("no_tests", "confirmed"))
 
     def test_permanent_mac_refusal_keeps_other_ssh_retry_candidates(self) -> None:
-        self.configure("mac,natedev,aws")
+        self.configure("mac,natedev,linux")
         self.enable_mac()
         self.release_memory_after_hook()
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac", "aws"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac", "linux"])
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.routing_record()["target"], "aws")
+        self.assertEqual(self.routing_record()["target"], "linux")

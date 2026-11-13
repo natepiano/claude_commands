@@ -21,6 +21,7 @@ from scripts.accounts import new_account
 from scripts.hooks import showrunner_footer
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import session_labels, staff
+from scripts.rebuild import need
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 
@@ -76,7 +77,7 @@ def seed_rebuild_cache(home: Path) -> None:
 
 
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
-UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"))
+UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), unit_type=staff.UnitDetails("direct"))
 WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
 
 
@@ -152,7 +153,7 @@ class ColorTests(unittest.TestCase):
             lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": str(folder)}},
                                  staff_text=staff_text(
                                      staff.StaffRow(OWNER.id, "showrunner", "hana", staff.StaffRoot(), current_session=OWNER.id),
-                                     staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id)), STAFF_ID=UNIT.id)
+                                     staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))), STAFF_ID=UNIT.id)
             self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables | cables")
 
     def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
@@ -695,7 +696,7 @@ class RoleTests(unittest.TestCase):
 
     def test_jq_and_queue_reader_agree_on_identity_unique_names_and_ambiguity(self) -> None:
         other = staff.StaffRow(staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"), "showrunner", "other", staff.StaffRoot(), current_session=staff.StaffId("9ac86c12-2241-576a-ba84-431dc42bb778"))
-        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", staff.ReportsTo(other.id), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"))
+        duplicate = staff.StaffRow(staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), "unit", "trunk", staff.ReportsTo(other.id), current_session=staff.StaffId("589d5100-ff94-52e9-a854-d37bc466fdd3"), unit_type=staff.UnitDetails("direct"))
         rows = (OWNER, UNIT, WORKER)
         for members in (rows, (*rows, other, duplicate)):
             _ = self.write_staff(*members)
@@ -908,7 +909,9 @@ class CountsRowTests(unittest.TestCase):
                 for kind, enabled in (("showrunner", 0), ("unit", 0)):
                     with self.subTest(kind=kind, enabled=enabled):
                         _ = (instance / "state").write_text(f"ENABLED={enabled}\n", encoding="utf-8")
-                        row = replace(OWNER, kind=kind, doc=staff.LiveDoc(remote.local_machine(),
+                        row = replace(OWNER, kind=kind,
+                                      unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit(),
+                                      doc=staff.LiveDoc(remote.local_machine(),
                                       self.home / "docs/plans/show-production.md"))
                         _ = record.write_text(staff_text(row), encoding="utf-8")
                         # Keep the retained counts newer than the changed staff file.
@@ -1058,6 +1061,326 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(cache.read_text(encoding="utf-8").splitlines()[:2],
                                  ["For you: 1 question, 1 proposal", ""])
 
+    def test_failed_proposal_and_question_files_retry_and_remain_watched(self) -> None:
+        folder = self.home / "issues"
+        folder.mkdir()
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        question_folder = self.cache.parent.parent / OWNER.id / "questions"
+        question_folder.mkdir(parents=True)
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        proposal = f"---\nstatus: open\ntags: [proposal]\nproposed_by: {OWNER.id}\n---\n# Proposal\n"
+        fields = {"since": "2000-01-01T08:00", "text": "Choose", "question": "Which?", "asked_by": OWNER.id}
+        question = (f"---\nrecord_type: question\nstatus: open\nproduction_id: {OWNER.id}\n"
+                    + f"asked_by: {OWNER.id}\nregistration: {json.dumps(fields)}\n---\n# Choose\n")
+        read_text = Path.read_text
+        for failure in ("unreadable proposal", "invalid proposal encoding", "unreadable question",
+                        "invalid question encoding", "malformed question", "invalid registration",
+                        "late unreadable proposal", "late unreadable question", "late unreadable proposal body",
+                        "invalid proposal urgency", "invalid proposal date"):
+            with self.subTest(failure=failure):
+                for previous in (*folder.glob("*.md"), *question_folder.glob("*.md")):
+                    previous.unlink()
+                is_question = "question" in failure or failure == "invalid registration"
+                _ = doc.write_text(document if is_question else document + f"- **Proposals:** {folder}\n")
+                store = question_folder if is_question else folder
+                path = store / ("question-choice.md" if is_question else "proposal.md")
+                saved = question if is_question else proposal
+                _ = path.write_text(saved)
+                if "encoding" in failure:
+                    _ = path.write_bytes(b"\xff")
+                elif failure == "malformed question":
+                    _ = path.write_text("---\nrecord_type: question\n")
+                elif failure == "invalid registration":
+                    _ = path.write_text(saved.replace(json.dumps(fields), "{"))
+                elif failure == "invalid proposal urgency":
+                    _ = path.write_text(saved.replace("status: open", "status: open\nreview_urgency: invalid"))
+                elif failure == "invalid proposal date":
+                    _ = path.write_text(saved.replace("status: open", "status: open\ndate_created: invalid"))
+
+                reads = 0
+
+                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    nonlocal reads
+                    if path_to_read == path:
+                        reads += 1
+                        readable = 2 if failure == "late unreadable proposal body" else 1
+                        if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > readable):
+                            raise PermissionError(f"{path}: unreadable")
+                    return read_text(path_to_read, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(path), sources)
+                self.assertIn(str(doc), sources)
+                self.assertIn(str(store), sources)
+                _ = path.write_text(saved)
+                self.assertEqual(self.lines()[-1], "For you: 1 question" if is_question else "For you: 1 proposal")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+                path.unlink()
+
+    def test_failed_change_lists_retry_and_remain_watched(self) -> None:
+        listing = self.home / f"change-review - {OWNER.name}.md"
+        saved = "## To review\n\n| # | Change | Urgency |\n| --- | --- | --- |\n| C1 | First | normal |\n"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text() + f"- **Change review:** {listing}\n")
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        read_text = Path.read_text
+        for failure in ("unreadable", "invalid encoding", "malformed table", "invalid urgency", "invalid merge date"):
+            with self.subTest(failure=failure):
+                _ = listing.write_text(saved)
+                if failure == "invalid encoding":
+                    _ = listing.write_bytes(b"\xff")
+                elif failure == "malformed table":
+                    _ = listing.write_text("# Missing table\n")
+                elif failure == "invalid urgency":
+                    _ = listing.write_text(saved.replace("normal", "invalid"))
+                elif failure == "invalid merge date":
+                    _ = listing.write_text(saved.replace("Urgency |", "Urgency | Merged |")
+                                           .replace("--- | --- | --- |", "--- | --- | --- | --- |")
+                                           .replace("normal |", "normal | invalid |"))
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path == listing and failure == "unreadable":
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(listing), sources)
+                self.assertIn(str(doc), sources)
+                _ = listing.write_text(saved)
+                self.assertEqual(self.lines()[-1], "For you: 1 change")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+
+    def test_failed_change_routing_reads_retry_and_remain_watched(self) -> None:
+        from scripts.production import change_routing
+
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        links = self.home / "links"
+        links.mkdir()
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "REVIEW_LINKS_ROOT": str(links)}
+        read_text = Path.read_text
+        list_owner = change_routing.StaffRouting.list_owner
+        for failure in ("validation", "question", "legacy document", "invalid delivery JSON"):
+            with self.subTest(failure=failure):
+                legacy = failure == "legacy document"
+                listing = self.home / ("legacy.md" if legacy else f"change-review - {OWNER.name}.md")
+                _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
+                _ = doc.write_text(document + f"- **Change review:** {listing}\n")
+                delivery = change_routing.delivery_path(links, listing, "C1")
+                fields = ({"question": {"question_id": "q1", "text": "Why?"}} if failure == "question"
+                          else {"validation": {"state": "sent", "attempt": "a1"}})
+                if not legacy:
+                    _ = delivery.write_text("{" if failure == "invalid delivery JSON" else json.dumps(fields))
+                failed = doc if legacy else delivery
+                routing = False
+
+                def owner(router: change_routing.StaffRouting, path: Path) -> str:
+                    nonlocal routing
+                    routing = True
+                    try:
+                        return list_owner(router, path)
+                    finally:
+                        routing = False
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path == failed and failure != "invalid delivery JSON" and (not legacy or routing):
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(change_routing.StaffRouting, "list_owner", owner), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(failed), sources)
+                if not legacy:
+                    delivery.unlink()
+                self.assertEqual(self.lines()[-1], "For you: 1 change")
+                self.assertEqual(cache.read_text().splitlines()[1], "")
+                listing.unlink()
+
+    def test_failed_source_folders_retry_and_missing_folders_are_optional(self) -> None:
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        lists, links, proposals = (self.home / name for name in ("lists", "links", "proposals"))
+        questions = self.cache.parent.parent / OWNER.id / "questions"
+        folders = (lists, links, proposals, questions)
+        for folder in folders:
+            folder.mkdir(parents=True)
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "REVIEW_LINKS_ROOT": str(links), "CHANGE_REVIEW_DIR": str(lists)}
+        iterdir = Path.iterdir
+        for folder in folders:
+            with self.subTest(folder=folder.name):
+                # The proposals field also selects the canonical question folder.
+                _ = doc.write_text(document + (f"- **Proposals:** {proposals}\n" if folder == proposals else ""))
+
+                def paths(path: Path):
+                    if path == folder:
+                        raise PermissionError(str(path))
+                    return iterdir(path)
+
+                now = int(time.time()) - 100
+                with patch.dict(os.environ, environment), patch.object(Path, "iterdir", paths), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(folder), sources)
+                folder.rmdir()
+                with patch.dict(os.environ, environment):
+                    cache = counts_row.write(instance)
+                self.assertEqual(cache.read_text().splitlines()[:2], ["", ""])
+                folder.mkdir(parents=True)
+
+    def test_unreadable_routing_config_retries_and_keeps_the_config_source(self) -> None:
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        settings = config / "change_review.conf"
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "CHANGE_REVIEW_DIR": "", "REVIEW_LINKS_ROOT": ""}
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == settings:
+                raise PermissionError(str(path))
+            return read_text(path, encoding=encoding, errors=errors)
+
+        now = int(time.time()) - 100
+        with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                patch.object(time, "time", return_value=now):
+            cache = counts_row.write(instance)
+        line, due, *sources = cache.read_text().splitlines()
+        self.assertEqual((line, due), ("", str(now + 7)))
+        self.assertIn(str(settings), sources)
+        with patch.dict(os.environ, environment):
+            cache = counts_row.write(instance)
+        self.assertEqual(cache.read_text().splitlines()[:2], ["", ""])
+
+    def test_later_config_failure_does_not_count_a_committed_list_directory(self) -> None:
+        config = self.home / "config"
+        _ = shutil.copytree(SHIPPED_COLORS.parent, config)
+        _ = (config / "statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
+        live, committed, links = (self.home / name for name in ("live", "committed", "links"))
+        for folder in (live, committed, links):
+            folder.mkdir()
+        settings = config / "change_review.conf"
+        text = f"lists_directory={committed}\nreview_links_directory={links}\n"
+        _ = settings.write_text(text)
+        for arguments in (("init", "--quiet"), ("add", settings.name), ("commit", "--quiet", "-m", "Save fixture settings")):
+            _ = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test",
+                                "-c", "user.email=test@example.invalid", *arguments],
+                               cwd=config, capture_output=True, text=True, check=True)
+        _ = settings.write_text(text.replace(str(committed), str(live)))
+        listing = live / f"change-review - {OWNER.name}.md"
+        stale = committed / listing.name
+        table = "## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n"
+        _ = listing.write_text(table)
+        _ = stale.write_text(table.replace("C1", "C2"))
+        doc = self.home / "docs/plans/show-production.md"
+        document = doc.read_text()
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "CONF_DIR": str(config), "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent),
+                       "CHANGE_REVIEW_DIR": "", "REVIEW_LINKS_ROOT": ""}
+        read_text = Path.read_text
+        now = int(time.time()) - 100
+        for field, failed_read in ((str(listing), 4), ("", 1)):
+            with self.subTest(field=field, failed_read=failed_read):
+                _ = doc.write_text(document + f"- **Change review:** {field}\n")
+                reads = 0
+
+                def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    nonlocal reads
+                    if path == settings:
+                        reads += 1
+                        if reads == failed_read:
+                            raise PermissionError(str(path))
+                    return read_text(path, encoding=encoding, errors=errors)
+
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read), \
+                        patch.object(time, "time", return_value=now):
+                    cache = counts_row.write(instance)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertGreaterEqual(reads, failed_read)
+                self.assertEqual((line, due), ("", str(now + 7)))
+                self.assertIn(str(settings), sources)
+                self.assertIn(str(doc), sources)
+                if field:
+                    self.assertIn(str(listing), sources)
+                self.assertNotIn(str(stale), sources)
+                with patch.dict(os.environ, environment):
+                    cache = counts_row.write(instance)
+                self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 change", ""])
+
+    def test_unreadable_ledgers_retry_while_footer_readers_keep_available_counts(self) -> None:
+        from scripts.production import footer_counts
+
+        efficiency = self.home / "efficiency.md"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text() + f"- **Efficiency ledger:** {efficiency}\n")
+        _ = self.ledger.write_text("- 2026-10-19 Faster tests (idea.md) — proposed\n")
+        _ = efficiency.write_text("- 2026-10-19 Tests — proposed\n")
+        detail = self.home / "idea.md"
+        _ = detail.write_text("Written 2026-10-19 by writer.\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        read_text = Path.read_text
+        for path in (self.ledger, efficiency, detail):
+            with self.subTest(path=path.name):
+                def read(path_to_read: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    if path_to_read == path:
+                        raise PermissionError(f"{path}: unreadable")
+                    return read_text(path_to_read, encoding=encoding, errors=errors)
+
+                with patch.dict(os.environ, environment), patch.object(Path, "read_text", read):
+                    cache = counts_row.write(instance)
+                    counts = footer_counts.read_counts(doc)
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual(line, "")
+                self.assertTrue(due.isdigit())
+                self.assertIn(str(path), sources)
+                expected = (0, 1) if path == self.ledger else (1, 0) if path == efficiency else (1, 1)
+                self.assertEqual((counts.proposals, counts.efficiency), expected)
+
     def test_unusable_retry_config_writes_a_cache_and_refreshes_after_a_config_fix(self) -> None:
         self.questions({"since": "2026-10-16T19:00", "text": "A"})
         config = self.home / "config"
@@ -1168,8 +1491,13 @@ class CountsRowTests(unittest.TestCase):
 
 
 class RebuildRowTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(Path(directory) / "needs")})))
+
     def settings(self) -> rebuild_row.RebuildSettings:
-        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60)
+        return rebuild_row.RebuildSettings(Path("/test/nixos"), "main", "natedev", "MacBook-Pro", "mac", 60, 120)
 
     def answer(self, local: str, mac: str, expected: str = "/nix/store/main-system") -> str:
         def run(command: list[str]) -> str:
@@ -1208,24 +1536,26 @@ class RebuildRowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "statusline.conf"
             text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
-                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\n")
+                    + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\n")
             _ = path.write_text(text, encoding="utf-8")
             settings = rebuild_row.RebuildSettings.read(path)
-            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17))
-            _ = path.write_text(text.replace("interval=17", "interval=29"), encoding="utf-8")
+            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41))
+            _ = path.write_text(text.replace("interval=17", "interval=29").replace("eval_timeout=41", "eval_timeout=73"), encoding="utf-8")
             self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
+            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
 
     def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
-                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
             running = "/nix/store/old"
 
-            def run(command: list[str]) -> str:
+            def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
+                self.assertEqual(timeout, 120 if command[0] == "nix" else 30)
                 if command[0] == "git":
                     return "a" * 40
                 if command[0] == "nix":
@@ -1294,13 +1624,14 @@ class RebuildRowTests(unittest.TestCase):
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
-                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.cache={cache}\n", encoding="utf-8")
+                                  + f"rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=47\nrebuild.cache={cache}\n", encoding="utf-8")
             commands: list[list[str]] = []
             commit = "a" * 40
             running = "/nix/store/old"
 
-            def run(command: list[str]) -> str:
+            def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
+                self.assertEqual(timeout, 47 if command[0] == "nix" else 30)
                 if command[0] == "git":
                     self.assertEqual(command, ["git", "-C", "/test/nixos", "rev-parse", "--verify", "main^{commit}"])
                     return commit
@@ -1327,19 +1658,73 @@ class RebuildRowTests(unittest.TestCase):
                                      ["git", "nix", "realpath", "ssh"] if changed else ["git", "realpath", "ssh"])
                     self.assertEqual(rebuild_row.read(config).row(), "")
 
-    def test_failed_eval_is_cached_for_the_commit_without_a_false_item(self) -> None:
-        commands: list[list[str]] = []
+    def test_failed_eval_is_retried_for_the_commit_without_a_false_item(self) -> None:
+        for failure in ("timeout", "error", "empty natedev", "empty mac"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "statusline.conf"
+                cache = Path(directory) / "cache"
+                _ = config.write_text("rebuild.repo=/test/nixos\nrebuild.ref=main\nrebuild.natedev=natedev\n"
+                    + "rebuild.mac=MacBook-Pro\nrebuild.ssh=mac\nrebuild.interval=60\nrebuild.eval_timeout=59\n"
+                    + f"rebuild.cache={cache}\n", encoding="utf-8")
+                evaluated = 0
 
-        def run(command: list[str]) -> str:
-            commands.append(command)
-            return "a" * 40 if command[0] == "git" else ""
+                def run(command: list[str], *, timeout: int = 30) -> str:
+                    nonlocal evaluated
+                    if command[0] == "git":
+                        return "a" * 40
+                    if command[0] != "nix":
+                        return "/nix/store/old"
+                    evaluated += 1
+                    paths = {"natedev": "/nix/store/main", "mac": "/nix/store/main"}
+                    if evaluated == 1:
+                        if failure.startswith("empty"):
+                            paths[failure.removeprefix("empty ")] = ""
+                        else:
+                            effect = (subprocess.TimeoutExpired(command, timeout) if failure == "timeout"
+                                      else subprocess.CompletedProcess(command, 1, "", "eval failed"))
+                            with patch.object(subprocess, "run", side_effect=[effect]) as process:
+                                output = rebuild_row.command_output(command, timeout=timeout)
+                            self.assertEqual(process.call_args.kwargs["timeout"], 59)
+                            return output
+                    return json.dumps(paths)
 
-        expected = rebuild_row.expected_systems(self.settings(), rebuild_row.NoExpectedSystems(), run)
-        self.assertIsInstance(expected, rebuild_row.ExpectedSystems)
-        self.assertEqual(rebuild_row.row(self.settings(), expected, run), "")
-        commands.clear()
-        self.assertEqual(rebuild_row.expected_systems(self.settings(), expected, run), expected)
-        self.assertEqual([command[0] for command in commands], ["git"])
+                stale = rebuild_row.ExpectedSystems("a" * 40, ("/test/nixos", "main", "natedev", "MacBook-Pro"), "", "")
+                _ = cache.write_text("\n0\n" + str(config) + "\n" + stale.details() + "\n", encoding="utf-8")
+                rebuild_row.write(config, run)
+                self.assertEqual(evaluated, 1)
+                answer = rebuild_row.read(config)
+                self.assertIsInstance(answer.expected, rebuild_row.NoExpectedSystems)
+                self.assertEqual(answer.row(), {"empty natedev": "rebuild mac", "empty mac": "rebuild natedev"}.get(failure, ""))
+                lines = cache.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(lines[3:], [])
+                lines[1] = "0"
+                _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                rebuild_row.write(config, run)
+                self.assertEqual(evaluated, 2)
+                self.assertIsInstance(rebuild_row.read(config).expected, rebuild_row.ExpectedSystems)
+                self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev, rebuild mac")
+
+    def test_open_needs_show_without_an_evaluation_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "statusline.conf"
+            cache = Path(directory) / "cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            for machine in ("natedev", "mac"):
+                with self.subTest(machine=machine):
+                    need.add_need(machine, "a" * 40, "Apply the settings.", "fixture")
+                    self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev" if machine == "natedev"
+                                     else "rebuild natedev, rebuild mac")
+            _ = cache.write_text("rebuild mac\n9999999999\n" + str(config) + "\n", encoding="utf-8")
+            self.assertEqual(rebuild_row.read(config).row(), "rebuild natedev, rebuild mac")
+            for path in need.needs_folder().glob("*.json"):
+                path.unlink()
+            self.assertEqual(rebuild_row.read(config).row(), "rebuild mac")
+            for error in (PermissionError("fixture denied"), json.JSONDecodeError("fixture JSON", "", 0),
+                          KeyError("created_at"), TypeError("fixture record")):
+                with self.subTest(need_error=type(error).__name__), patch.object(need, "read_needs", side_effect=error):
+                    answer = rebuild_row.read(config)
+                    self.assertEqual(answer.row(), "rebuild mac")
+                    self.assertEqual(status_lines({}, rebuild=answer.row())[-1], "For you: rebuild mac")
 
     def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1348,12 +1733,17 @@ class RebuildRowTests(unittest.TestCase):
             cache.parent.mkdir(parents=True)
             _ = cache.write_text("rebuild natedev\n9999999999\n/dev/null\n", encoding="utf-8")
             built = cache.stat().st_mtime_ns
-            for shell in SHELLS:
-                result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
-                                        check=True, env={**SHELL_ENVIRONMENT, "HOME": directory, "PATH": os.environ["PATH"]}, cwd=home)
-                self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")
-                self.assertEqual(result.stderr, "")
-                self.assertEqual(cache.stat().st_mtime_ns, built)
+            for unreadable in (False, True):
+                if unreadable:
+                    (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
+                for shell in SHELLS:
+                    with self.subTest(shell=shell, unreadable=unreadable):
+                        result = subprocess.run([shell, "-c", COMMAND], input="{}", capture_output=True, text=True,
+                                                check=True, env={**SHELL_ENVIRONMENT, "HOME": directory,
+                                                                 "PATH": os.environ["PATH"]}, cwd=home)
+                        self.assertEqual(result.stdout.splitlines()[-1], "For you: rebuild natedev")
+                        self.assertEqual(result.stderr, "")
+                        self.assertEqual(cache.stat().st_mtime_ns, built)
 
 if __name__ == "__main__":
     _ = unittest.main()

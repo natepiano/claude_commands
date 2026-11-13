@@ -81,6 +81,7 @@ class FreeMessageState(TypedDict):
 
 class GhRun(TypedDict):
     databaseId: int
+    createdAt: NotRequired[str]
     headBranch: NotRequired[str]
     headSha: NotRequired[str]
 
@@ -734,25 +735,6 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         )
         return cast(str, values["variable"])
 
-    def test_aws_block_uses_mac_idle_policy_without_target_idle_keys(self) -> None:
-        _ = write_config_fixture(self.root / "build_targets.conf", "\n".join((
-            "targets=mac,natedev,aws", "kind.aws=ssh", "platform.aws=linux", "settings.aws=aws_target.conf",
-        )))
-        settings = self.root / "aws_target.conf"
-        values = conf.read(settings).values()
-        self.assertTrue(all(key not in values for key in (
-            "alert_seconds", "push_seconds", "stale_seconds", "repeat_minutes", "send_timeout_s",
-        )))
-        result = self.command("block", "--target", "aws", "--holder", "alice", "--for", "rendering")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        block = cast(dict[str, object], json.loads(
-            (self.root / ".local/state/build-targets/aws/block.json").read_text(),
-        ))
-        self.assertEqual(block["state"], "active")
-        self.assertEqual(block["holder"], "alice")
-        self.assertEqual(block["for"], "rendering")
-        self.assertEqual(block["ci"], "not_configured")
-        self.assertEqual(self.gh_calls(""), 0)
 
     def test_status_without_block_reports_all_switch_results(self) -> None:
         on = self.command("status", subprocess_cli=True)
@@ -1805,33 +1787,57 @@ for arguments in (
         self.assertEqual(self.logged_arguments("gh"), [])
 
     def test_queued_or_in_progress_run_without_mac_job_is_busy(self) -> None:
-        active_runs: tuple[tuple[str, list[GhRun], list[GhRun], int], ...] = (
-            ("queued", [{"databaseId": 40}], [], 40),
-            ("in_progress", [], [{"databaseId": 41}], 41),
+        now = datetime(2026, 11, 12, 20, tzinfo=timezone.utc)
+        active_runs: tuple[tuple[str, str, float, list[GhJob], str], ...] = (
+            ("queued", "queued", 1, [], "ci_job"),
+            ("in_progress", "in_progress", 1, [], "ci_job"),
+            ("old queued", "queued", 61, [], ""),
+            ("old in_progress", "in_progress", 61, [], "ci_job"),
+            ("at limit", "queued", 60, [], "ci_job"),
+            ("configured limit", "queued", 45, [], ""),
+            ("old with job", "queued", 61, [{"name": "Linux", "status": "completed"}], "ci_job"),
+            ("missing time", "queued", 61, [], "ci_unknown"),
+            ("invalid time", "queued", 61, [], "ci_unknown"),
+            ("no time zone", "in_progress", 61, [], "ci_unknown"),
         )
-        for status, queued, in_progress, run_id in active_runs:
-            with self.subTest(status=status):
+        for case, status, age_minutes, jobs, waiting in active_runs:
+            with self.subTest(case=case):
                 (self.state_directory / "block.json").unlink(missing_ok=True)
+                self.write_config(ci_jobless_queued_minutes="30" if case == "configured limit" else "60")
+                run: GhRun = {"databaseId": 40}
+                if case != "missing time":
+                    run["createdAt"] = (now - timedelta(minutes=age_minutes)).isoformat()
+                if case == "invalid time":
+                    run["createdAt"] = "not a timestamp"
+                elif case == "no time zone":
+                    run["createdAt"] = "2026-11-12T18:59:00"
                 self.gh["variable"] = "true"
-                self.gh["queued"] = queued
-                self.gh["in_progress"] = in_progress
-                self.gh["jobs"] = {str(run_id): []}
+                self.gh["queued"] = [run] if status == "queued" else []
+                self.gh["in_progress"] = [run] if status == "in_progress" else []
+                self.gh["jobs"] = {"40": jobs}
                 self.sync_gh()
 
-                result = self.command(
-                    "block", "--holder", "alice", "--for", "rendering"
-                )
+                with mock.patch.object(mac_test, "utc_now", return_value=now):
+                    result = self.command(
+                        "block", "--holder", "alice", "--for", "rendering"
+                    )
 
                 self.assertEqual(
                     result.returncode, 0, result.stdout + result.stderr
                 )
-                self.assertIn("a CI run may still use the Mac", result.stdout)
                 block = self.block_state()
-                self.assertEqual(block["state"], "pending")
-                self.assertEqual(block["waiting_on"], {"kind": "ci_job"})
+                if waiting:
+                    if waiting == "ci_job":
+                        self.assertIn("a CI run may still use the Mac", result.stdout)
+                    else:
+                        self.assertIn("gh returned invalid JSON", result.stdout)
+                    self.assertEqual(block["state"], "pending")
+                    self.assertEqual(block["waiting_on"], {"kind": waiting})
+                else:
+                    self.assertEqual(block["state"], "active")
 
     def test_completed_skipped_mac_job_is_idle(self) -> None:
-        self.gh["queued"] = [{"databaseId": 42}]
+        self.gh["queued"] = [{"databaseId": 42, "createdAt": datetime.now(timezone.utc).isoformat()}]
         self.gh["jobs"] = {
             "42": [
                 {"name": CI_JOB, "status": "completed", "conclusion": "skipped"}
@@ -1845,7 +1851,7 @@ for arguments in (
         self.assertEqual(self.block_state()["state"], "active")
 
     def test_busy_ci_keeps_block_pending_until_watch_sends_once(self) -> None:
-        self.gh["queued"] = [{"databaseId": 41}]
+        self.gh["queued"] = [{"databaseId": 41, "createdAt": datetime.now(timezone.utc).isoformat()}]
         self.gh["jobs"] = {
             "41": [{"name": CI_JOB, "status": "in_progress", "conclusion": ""}]
         }
@@ -2838,7 +2844,7 @@ subprocess.run = expire_gh
 
     def test_status_reports_pending_ci_job_and_unknown_ci(self) -> None:
         self.gh["variable"] = "false"
-        self.gh["queued"] = [{"databaseId": 71}]
+        self.gh["queued"] = [{"databaseId": 71, "createdAt": datetime.now(timezone.utc).isoformat()}]
         self.gh["jobs"] = {
             "71": [{"name": CI_JOB, "status": "queued", "conclusion": ""}]
         }

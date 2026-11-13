@@ -22,7 +22,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 from scripts.message import session_send
 from scripts.aws_target.config import (
-    LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, offload_enabled, read_settings,
+    LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, read_settings,
 )
 
 InstanceState = Literal["pending", "running", "stopping", "stopped", "shutting-down", "terminated", "unknown"]
@@ -1543,11 +1543,9 @@ class CostLedger:
         self._save(state)
 
     def refresh_charges(self, settings_path: Path, now: int,
-                        fetch: Callable[[int, int], Sequence[ChargeRead]], *, gate_workload: bool = False) -> ChargeRead | MeasurementUnavailable:
+                        fetch: Callable[[int, int], Sequence[ChargeRead]]) -> ChargeRead | MeasurementUnavailable:
         """Refresh recent account bills through the shared schedule and recovery lock."""
         configuration = conf.read(settings_path)
-        if not gate_workload and not offload_enabled(configuration):
-            return MeasurementUnavailable('disabled')
         settings = read_settings(configuration)
         day = charge_period_day(now)
         start, end = period_bounds(day, ZoneInfo('UTC'))

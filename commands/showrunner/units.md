@@ -8,29 +8,36 @@ Run this in the showrunner session. Run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
-Both tables show only the production's staff units, sorted by unit name without case distinctions.
-For the phase table, **Status** is `busy`, `idle`, `paused` or `exited`.
-The accounts board uses the same status rule. An exit record gives `exited`.
-A pause record gives `paused`, even with no live session.
-Exit and pause records take priority.
-A local live pane process without a Claude registry record gives `idle`.
-With no live session or process, the status is `exited`. Otherwise the live session gives `busy` or `idle`.
+Print the tables as Markdown in the reply, without code fences.
+Keep each unit on one Markdown row so Claude Code wraps its cells within the terminal width.
+Each table shows only the production's staff units, sorted by unit name without case distinctions.
+For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
+The accounts board uses the same status rule.
+An exit record gives `exited` before a pause record gives `paused`.
+A busy pane gives `busy`. A starting pane gives `starting` before a live detached run gives `waiting`.
+Without these activity states, a live session or pane process gives `idle`.
+No live session or process gives `exited`.
 The style table uses the same status words as the phase table.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
-Both tables add a **Machine** column after **Status** only when a row runs on another machine.
+The phase status table and the style table add **Machine** after **Status** only when a row runs on another machine.
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
-Both tables omit a column when every row has `—` in that column.
+Each table omits a column when every row has `—` in that column.
 A table without rows keeps its columns.
-Both tables use `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
-They allow four columns for the terminal margin and measure text before Markdown escaping.
-Long text cells end with `…`; a cut never splits a wide character.
-Column headers set the minimum text widths.
-Fixed columns and minimum text widths can exceed a smaller configured width.
+The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
+Claude Code sets their column widths from the terminal width.
+The style table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
+It allows four columns for the terminal margin and measures text before Markdown escaping.
+Long style text cells end with `…`; a cut never splits a wide character.
+Style column headers set the minimum text widths.
+Fixed style columns and minimum text widths can exceed a smaller configured width.
 
-For units outside the `Style units` table in a production without `Kind: style`, the table is:
-`| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
+For units outside the `Style units` table in a production without `Kind: style`, the command prints two tables.
+Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
+Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
+Both tables use the same unit order.
+Workers uses the configured display name.
 ETA Plan appears only when at least one row has unfinished plan phases.
 
 1. **Progress** shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
@@ -38,8 +45,9 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    An open phase takes priority over not started, then done.
    All three characters use the same display width.
    With no recorded phases, Progress gives `—`.
-   When a row shows a Progress bar, one blank line separates the table from this legend:
+   When a row shows a Progress bar, one blank line separates table 1 from this legend:
    `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+   A blank line separates table 2 from the legend or table 1.
    The style table has no Progress legend.
 2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
@@ -62,17 +70,24 @@ ETA Plan appears only when at least one row has unfinished plan phases.
    Idle workers append ` +<n> idle` to a nonempty cell.
    Closed workers and workers on another machine add nothing.
 7. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
+   It excludes the phase that Notes names in the same row.
+   With no remaining phase, it shows `—`.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
+   It excludes each queue item whose text equals Notes in the same row.
    Each part adds ` +<n> more` for later items.
+   The queue count includes only remaining items.
+   With no remaining queue item, it shows the plan part or `—`.
    Plan work includes every phase that is neither done nor open.
    It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Notes and Workers first limit each cell to 80 characters.
-Queued first limits each item or title to 80 characters and adds its count suffix.
-The table then cuts Queued, Non-Phase Work, Workers, and Notes, in that order, until its rows fit the width.
-Notes keeps its text while another cuttable column can shrink.
-The table preserves Unit, Status, Machine, Progress, Phase, and both ETA cells.
+Workers first limits each cell to 80 characters.
+Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
+Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
+The helper preserves full cells for native Markdown wrapping.
+Workers uses the same wrapping form when the status table exceeds the terminal width.
+Do not insert `<br>` or continuation rows.
+Claude Code displays `<br>` as text and adds row borders around continuation rows.
 Empty cells show `—`.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is

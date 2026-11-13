@@ -413,22 +413,6 @@ def _state(session_dir: Path) -> dict[str, object]:
     return state
 
 
-def _events(path: Path) -> list[dict[str, object]]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            lines = handle.read().splitlines()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        return []
-    events: list[dict[str, object]] = []
-    for line in lines:
-        event = _json_object(line)
-        if event is not None:
-            events.append(event)
-    return events
-
-
 def _epoch(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -975,7 +959,8 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
+    run_events = [plan_history.read_run_events(path)
+                  for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     current_run = _current_run_events(run_events, resolver.record)
     open_instance = _newest_open_instance(current_run)
@@ -1488,7 +1473,7 @@ def _production_unit_plans(production: Production, *, resolver: session_staff.Ro
 
 def show_production(production_doc: Path) -> str:
     """Return every live unit's phase record as one JSON object."""
-    resolver = session_staff.RowResolver(staff.snapshot())
+    resolver = session_staff.RowResolver(plan_history.staff_record())
     production = read_production(production_doc, resolver=resolver)
     records: dict[str, object] = {}
     for unit_plan in _production_unit_plans(production, resolver=resolver):
@@ -1552,10 +1537,7 @@ def _phase_note_name(production: str, unit: str, *, resolver: session_staff.RowR
         row = next((item for item in resolver.record.find(kind="unit", parent=owner.id)
                     if unit_names.name(item.name) == unit_names.name(unit)), None)
         if row is not None:
-            from scripts.message import sessions
-            live = next((item for item in sessions.live_sessions() if item["sessionId"] == row.current_session), None)
-            if live is not None:
-                name = live["name"]
+            name = row.name
         break
     cleaned = name.replace("/", "-").replace("\0", "-").lstrip(".")
     return cleaned or unit
@@ -1849,8 +1831,9 @@ def refresh(session_dir: Path) -> None:
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions
     try:
-        showrunner = next((item["name"] for item in sessions.live_sessions()
-                           if owner is not None and item["sessionId"] == owner.current_session), "")
+        live = sessions.live_sessions()
+        showrunner = owner.name if owner is not None and any(
+            item["sessionId"] == owner.current_session for item in live) else ""
     except OSError as error:
         raise Refusal(f"cannot look up the showrunner of {production.name}: {error}") from error
     if showrunner:
@@ -1869,12 +1852,15 @@ def refresh(session_dir: Path) -> None:
             "phase note target is not owned by "
             + f"{production.name}/{reference.unit}: {target}"
         )
+    unit = next(row for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
+                if row.name == unit_names.name(reference.unit))
+    display_name = next((item["name"] for item in live if item["sessionId"] == unit.current_session), name)
+    display_name = display_name.replace("/", "-").replace("\0", "-").lstrip(".") or reference.unit
     _write_note(
         target,
         _note_text(
-            name,
-            next(row.id for row in resolver.record.find(kind="unit", parent=owner.id if owner else None)
-                 if row.name == unit_names.name(reference.unit)),
+            display_name,
+            unit.id,
             record,
         ),
         production.name,

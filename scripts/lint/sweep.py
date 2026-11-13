@@ -137,18 +137,18 @@ combines them with the journal and legacy removals.jsonl rows; nothing writes
 the legacy file.
 
 Concurrency. cargo 1.98.1 holds flock() on .cargo-lock, .cargo-build-lock
-and .cargo-artifact-lock for the whole build (checked 2026-09-15 by probing
-each with LOCK_EX|LOCK_NB while a build script slept). This takes all of them
-without waiting, in every build tree, before scanning, and skips the sweep if
-any is held: a delete under a running build leaves cargo failing to write
-into fingerprint dirs that vanished. Holding them makes a build that starts
-mid-sweep wait until the sweep finishes. A test run holds none of those locks:
-nextest executes its binaries straight from deps/ after the build, and on
-2026-10-15 a floor sweep at test 2105 of 4072 left 1965 hana tests failing to
-exec theirs. So a target is also busy while a live process runs from it, works
-in it or maps a file under it (/proc/<pid>/exe, cwd, maps), or while a
-cargo-nextest runs whose workspace owns it, which covers the moments between two
-test binaries. A running app counts too, so its target waits for it to exit.
+and .cargo-artifact-lock for the whole build.
+Probes with LOCK_EX|LOCK_NB confirmed this on 2026-09-15 while a build script slept.
+The sweep takes these locks in every build tree without waiting before it scans.
+If any lock is held, it skips the sweep.
+These locks prevent deletion during a build and make a new build wait until the sweep finishes.
+A nextest test run holds none of these locks and executes binaries from deps/.
+On 2026-10-15, a floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
+A target is also busy when a live process uses an executable, working directory, or mapped file under it.
+The scan reads /proc/<pid>/exe, cwd and maps for this check.
+A cargo-nextest or verify.sh process keeps its workspace targets busy.
+This protection includes time between test binaries and time in the build queue.
+A running app also keeps its target busy until the app exits.
 """
 
 from __future__ import annotations
@@ -1206,17 +1206,16 @@ def mapped_files(maps: bytes) -> Iterator[str]:
 
 
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
-    """Each target a live process uses, with one such process: its exe, its working directory or a
-    file it maps lies under the target, or it is a cargo-nextest run whose workspace owns the target.
+    """Find one live process that uses each target, with one scan of /proc.
 
-    nextest's run phase holds none of cargo's locks: it executes test binaries straight from
-    deps/, and between two of them no child may be running from the target, so the nextest
-    process itself counts. Without /proc (the Mac) no use can be seen.
+    A process uses a target when its executable, working directory, or a mapped file lies under it.
+    A cargo-nextest or verify.sh process also uses the targets of its workspace.
+    This keeps targets busy between test binaries and while verify.sh waits in the build queue.
+    Without /proc, as on the Mac, the scan finds no use.
 
-    An exe or mapped file that reads "(deleted)" is not a use: its blocks come back only when the
-    process exits, and the sweep can neither take nor break it. So a stale process whose exe and
-    mappings under a target are all deleted, working outside it, does not keep the target busy: a
-    hung cargo-berth resolve held 26 GiB of cargo-liner's target that way for three days (2026-10-21).
+    Ignore executable and mapped paths that end with "(deleted)".
+    Their blocks remain until the process exits, and the sweep cannot remove or damage those files.
+    A process with only deleted files under a target does not keep it busy if its working directory is outside.
     """
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
     found: dict[str, TargetUse] = {}
@@ -1260,10 +1259,14 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
                 _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}"))
-        if NEXTEST_ARG in argv[1:2] or (argv and os.path.basename(argv[0]) == f"cargo-{NEXTEST_ARG}"):
-            for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), owners):
+        command = os.path.basename(argv[0]) if argv else ""
+        verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
+            next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
+        if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
+            runner = "verify.sh" if verify else "cargo-nextest"
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
                 if target in checked:
-                    _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
+                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
     return {target: found[target] for target in owners if target in found}
 
 
@@ -1396,22 +1399,66 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
-    """The live Claude session each pid runs under: the nearest ancestor a session record names."""
+    """Find each process's session or the director of its detached worker."""
     if not pids:
         return {}
+    from scripts.agents import worker_lifecycle
     from scripts.message import process_table
     from scripts.message.sessions import live_sessions
+    from scripts.production import staff
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
         return {}
     names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
+
+    @cache
+    def membership() -> staff.StaffSnapshot:
+        return staff.local_snapshot()
+
+    @cache
+    def detached_record(record_path: Path) -> dict[str, object]:
+        try:
+            return worker_lifecycle.read_json_object(record_path)
+        except (OSError, ValueError, UnicodeError):
+            return {}
+
+    def detached_owner(supervisor_pid: int, record_path: Path) -> str:
+        try:
+            record = detached_record(record_path)
+            identity = record.get("staff_id")
+            if (record.get("pid") != supervisor_pid or record.get("status") != "running"
+                    or not isinstance(identity, str)):
+                return ""
+            snapshot = membership()
+            worker = snapshot.by_id(staff.StaffId(identity))
+            parent = snapshot.parent_of(worker) if worker is not None else None
+            return parent.name if parent is not None else ""
+        except (OSError, ValueError, UnicodeError):
+            return ""
+
     found: dict[int, str] = {}
     for pid in pids:
         process = table.get(pid)
         name = process_table.nearest_named(process, table, names) if process is not None else None
         if name is not None:
             found[pid] = name
+            continue
+        seen: set[int] = set()
+        while process is not None and process.pid not in seen:
+            seen.add(process.pid)
+            try:
+                arguments = shlex.split(process.arguments)
+            except ValueError:
+                arguments = []
+            records = [Path(arguments[index + 2]) for index, argument in enumerate(arguments[:-2])
+                       if Path(argument).name == "detached_runs.py" and arguments[index + 1] == "supervise"]
+            if records:
+                owner = detached_owner(process.pid, records[0])
+                if owner:
+                    found[pid] = owner
+                break
+            process = table.get(process.parent)
     return found
 
 
@@ -1530,7 +1577,7 @@ def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, c
     return os.path.realpath(setting.base / value)
 
 
-def nextest_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -3134,6 +3181,31 @@ def alert_path(path: str, limit: int) -> str:
     return f"{prefix}…/{leaf}"
 
 
+def unnamed_disk_fall(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
+                      previous: NoFloorRecord | FloorRecord) -> int:
+    unaccounted = max(0, free_fall - cache_growth)
+    if (isinstance(measurement, AvailableDiskMeasurement)
+            and isinstance(measurement.comparison, EarlierDiskMeasurement)
+            and isinstance(previous, FloorRecord) and measurement.measured_at.timestamp() > previous.measured_at):
+        return unaccounted - min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
+    return unaccounted
+
+
+def finish_disk_walk_request(now: float, *, lint_settings: conf.ConfigRead) -> None:
+    request = store.read_disk_walk_request()
+    if isinstance(request, store.DiskWalkRequestState):
+        return
+    measurement = read_disk_measurement()
+    if (isinstance(measurement, AvailableDiskMeasurement)
+            and measurement.measured_at > datetime.fromisoformat(request["requested_at"])):
+        message = fit_alert_text(lambda width: "\n".join([
+            f"Folder walk for the {request['alert_at']} fall:",
+            *disk_measurement_lines(measurement, 0, 0, now, False, width, lint_settings=lint_settings),
+        ]), lint_settings=lint_settings)
+        if send_floor_alert(message, lint_settings=lint_settings).accepted:
+            (store.root() / store.DISK_WALK_REQUEST_NAME).unlink()
+
+
 def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_growth: int,
                            now: float, explain_fall: bool, path_limit: int,
                            previous: NoFloorRecord | FloorRecord = NO_FLOOR_RECORD, *,
@@ -3159,8 +3231,8 @@ def disk_measurement_lines(measurement: DiskMeasurement, free_fall: int, cache_g
         lines.append(f"Measured folders {movement(measurement.outside_cache_growth_bytes, 'grew', 'shrank')} outside build caches.")
         if explain_fall and not measured_before_fall:
             unaccounted = max(0, free_fall - cache_growth)
-            covered = min(max(measurement.outside_cache_growth_bytes, 0), unaccounted)
-            remainder = unaccounted - covered
+            remainder = unnamed_disk_fall(measurement, free_fall, cache_growth, previous)
+            covered = unaccounted - remainder
             coverage = ("cover all of it" if remainder == 0
                         else f"cover {gib(covered)}; {gib(remainder)} came after {pacific_time(measurement.measured_at)} or outside measured folders")
             lines.append(f"Of {gib(unaccounted)} of the fall beyond cache growth, measured folders {coverage}.")
@@ -4059,6 +4131,11 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         current = floor_record_or_new(previous, after)
         free = after
+        if root_scope and isinstance(policy, NatedevFloor):
+            try:
+                finish_disk_walk_request(time.time(), lint_settings=lint_settings)
+            except OSError as error:
+                print(f"lint sweep: cannot finish the disk walk request: {error}", file=sys.stderr)
         if root_scope:
             try:
                 # Measure inside the record lock. Older callers cannot reset a newer crossing.
@@ -4421,6 +4498,27 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             try:
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
+                    free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
+                    cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                    recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
+                    same_held_roots = (isinstance(previous, FloorRecord)
+                                       and isinstance(previous.held_roots, KnownHeldRoots)
+                                       and previous.held_roots.roots == frozenset(hold_targets))
+                    same_filesystem = True
+                    if isinstance(filesystem, FilesystemFloor):
+                        same_filesystem = isinstance(previous, FloorRecord) and (
+                            previous.filesystem == filesystem.key and previous.measured_roots == tuple(sorted(idle))
+                            or filesystem.root_device and filesystem.legacy_history_safe and previous.filesystem == "")
+                    if (recent and same_held_roots and same_filesystem
+                            and (not isinstance(filesystem, FilesystemFloor) or filesystem.root_device)
+                            and not (store.root() / store.DISK_WALK_REQUEST_NAME).exists()):
+                        measurement = read_disk_measurement()
+                        unnamed = unnamed_disk_fall(measurement, free_fall, cache_growth, previous)
+                        if (isinstance(measurement, AvailableDiskMeasurement)
+                                and unnamed > lint_settings.whole("sweep_walk_request_fall_bytes")
+                                and now - measurement.measured_at.timestamp() >= lint_settings.number("sweep_walk_request_interval_seconds")):
+                            store.write_disk_walk_request({"requested_at": store.utc_iso(now),
+                                                          "alert_at": store.utc_iso(now), "unnamed_bytes": unnamed})
                     history = base.alert_history
                     push_history = base.push_history
                     alert_interval = lint_settings.number("sweep_alert_interval_seconds")
@@ -4440,19 +4538,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         if delivered.accepted or told:
                             push_history = DeliveredAlert(time.time())
                     elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= alert_interval):
-                        free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
-                        cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
-                        recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
-                        same_held_roots = (isinstance(previous, FloorRecord)
-                                           and isinstance(previous.held_roots, KnownHeldRoots)
-                                           and previous.held_roots.roots == frozenset(hold_targets))
                         unexplained_fall = lint_settings.whole("sweep_unexplained_fall_bytes")
                         large_removal = lint_settings.whole("sweep_large_removal_bytes")
-                        same_filesystem = True
-                        if isinstance(filesystem, FilesystemFloor):
-                            same_filesystem = isinstance(previous, FloorRecord) and (
-                                previous.filesystem == filesystem.key and previous.measured_roots == tuple(sorted(idle))
-                                or filesystem.root_device and filesystem.legacy_history_safe and previous.filesystem == "")
                         growth_fired = recent and same_held_roots and same_filesystem and free_fall - cache_growth > unexplained_fall
                         removal_fired = removed > large_removal
                         if growth_fired or removal_fired:

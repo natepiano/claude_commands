@@ -7,9 +7,6 @@ from pathlib import Path
 from typing import Literal, TypeVar, cast
 from collections.abc import Callable
 import os
-import subprocess
-import sys
-import time
 from urllib.parse import urlsplit
 import re
 import json
@@ -114,25 +111,6 @@ def _live(settings: conf.ConfigRead, key: str, convert: Callable[[str], T]) -> T
     return result.value
 
 
-def service_loop(settings_path: Path, interval: str, action: Callable[[], object], *,
-                 pause: Callable[[float], object] = time.sleep) -> None:
-    """Repeat enabled work and retain the last usable interval after a read failure."""
-    if not offload_enabled(conf.read(settings_path)):
-        return
-    delay = conf.read(settings_path).number(interval)
-    while offload_enabled(conf.read(settings_path)):
-        try:
-            try:
-                _ = action()
-            finally:
-                delay = conf.read(settings_path).number(interval)
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            print(f'aws_service: {error}', file=sys.stderr)
-        if not offload_enabled(conf.read(settings_path)):
-            return
-        _ = pause(delay)
-
-
 def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     """Refuse recovered spending data while preserving ordinary configuration recovery."""
     settings = conf.read(path) if isinstance(path, Path) else path
@@ -190,32 +168,6 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
                             live_text('instance_type'), spot_bid)
 
 
-@dataclass(frozen=True)
-class ControlSettings:
-    enabled: bool
-    instance_type: str
-    region: str
-    instance_id: str
-    credentials_profile: str
-    start_after_wait_s: float
-    start_min_waiting: int
-    version_decline_hold_s: float
-    capacity_backoff_s: float
-    drain_max_minutes: float
-    idle_stop_minutes: float
-    tick_interval_s: float
-    aws_timeout_s: float
-    snapshot_max_age_s: float
-    permission_ttl_s: float
-    interruption_poll_s: float
-    imds_timeout_s: float
-    remote_state_directory: str
-
-
-def offload_enabled(settings: conf.ConfigRead) -> bool:
-    return target_config.aws_routing_enabled(settings)
-
-
 def deployment_record(directory: Path | None = None) -> dict[str, object]:
     """Read saved resource identities without changing deployment state."""
     if directory is None:
@@ -237,32 +189,6 @@ def deployment_outputs(directory: Path | None = None) -> dict[str, str]:
     if any(not isinstance(key, str) or not isinstance(item, str) for key, item in entries.items()):
         raise ValueError('deployment.json: expected text resource identities')
     return cast(dict[str, str], value)
-
-
-def read_control_settings(path: Path | conf.ConfigRead, directory: Path | None = None, *,
-                          remote_identity: bool = False) -> ControlSettings:
-    settings = conf.read(path) if isinstance(path, Path) else path
-    values = settings.values()
-    enabled = offload_enabled(settings)
-    if enabled and not remote_identity:
-        saved = deployment_record(directory)
-        if saved and saved.get('region') != values.get('region'):
-            raise ValueError('deployment.json: the saved region differs from configuration')
-    def required(key: str) -> str:
-        value = settings.text(key)
-        if not value.strip():
-            raise ValueError(f'{key}: expected nonempty text')
-        return value
-    return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
-                           values.get('instance_id', '') if remote_identity else deployment_outputs(directory).get('InstanceId', ''),
-                           required('credentials_profile'), settings.number('start_after_wait_s'),
-                           settings.whole('start_min_waiting'), settings.number('version_decline_hold_s'),
-                           settings.number('capacity_backoff_s'),
-                           settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
-                           settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
-                           settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),
-                           settings.number('interruption_poll_s'), settings.number('imds_timeout_s'),
-                           required('remote_state_directory'))
 
 
 @dataclass(frozen=True)
@@ -364,7 +290,6 @@ def read_deployment_settings(path: Path, directory: Path | None = None) -> Deplo
                               source_url, commit, source_hash, template)
 
 
-
 def retained_volume(path: Path, directory: Path | None = None) -> str:
     """Keep the saved volume selection until the stack owner changes."""
     saved = deployment_record(directory)
@@ -372,24 +297,3 @@ def retained_volume(path: Path, directory: Path | None = None) -> str:
     if saved.get('stack') == conf.read(path).text('stack_name'):
         return outputs.get('ExistingDataInput', '')
     return outputs.get('DataVolumeId', '')
-
-def deployment_price_path(path: Path) -> Path:
-    """Locate the deployment price state outside the public repository."""
-    key = 'deployment_price_file'
-    state_path = Path(_live(conf.read(path), key, str)).expanduser().resolve()
-    if state_path.is_relative_to(Path(__file__).resolve().parents[2]):
-        raise ValueError(f'{key}: {state_path}: the price file must stay outside the public repository')
-    return state_path
-
-
-def deployment_price(path: Path, now: int) -> tuple[int, Decimal]:
-    state_path = deployment_price_path(path)
-    try:
-        state = conf.read(state_path)
-        at = _live(state, 'deployment_price_at', positive_seconds)
-        price = _live(state, 'deployment_price_usd_per_hour', money)
-        if price <= 0 or not 0 <= now - at <= read_settings(path).price_max_age_seconds:
-            raise ValueError('deployment requires a fresh positive public price')
-    except ValueError as error:
-        raise ValueError(f'deployment_price_file: {state_path}: {error}; run deploy.py price') from None
-    return at, price

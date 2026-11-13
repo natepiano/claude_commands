@@ -83,6 +83,7 @@ MIN_OUTSIDE_DIRECTORY_BYTES = 1 << 30
 
 FOLDERS: list[tuple[str, str]] = [
     ("~/rust", "~/rust"),
+    ("~/.local/state", "~/.local/state"),
     ("/tmp", "/tmp"),
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
@@ -294,8 +295,11 @@ def snapshot() -> MeasuredDiskSnapshot:
             and "outside_build_caches" in previous_snapshot and "outside_build_cache_totals" in previous_snapshot
             and "previous_measured_at" in previous_snapshot):
         now = datetime.now(user_zone())
-        if (now.timestamp() - datetime.fromisoformat(previous_snapshot["measured_at"]).timestamp() < walk_minutes * 60
-                or now.hour != walk_hour):
+        request = store.read_disk_walk_request()
+        requested = (not isinstance(request, store.DiskWalkRequestState)
+                     and datetime.fromisoformat(request["requested_at"]) > datetime.fromisoformat(previous_snapshot["measured_at"]))
+        if not requested and (now.timestamp() - datetime.fromisoformat(previous_snapshot["measured_at"]).timestamp() < walk_minutes * 60
+                              or now.hour != walk_hour):
             usage = filesystem.filesystem_usage("/")
             capacities: list[FilesystemCapacity] = []
             for row in previous_snapshot["filesystems"]:

@@ -23,7 +23,7 @@ import sys
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
 import uuid
 
-from scripts.build_queue import admission_code, placement
+from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -476,7 +476,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         last_silence_notice = CLOCK.monotonic()
                         continue
                     try:
-                        reply = wire.parse_reply(line, request)
+                        with snapshot_codec.snapshot_read_policy(snapshot_codec.SnapshotReadPolicy.ACQUISITION_FIELDS):
+                            reply = wire.parse_reply(line, request)
                     except ValueError as error:
                         raise CheckerFailure(str(error)) from error
                     if CLOCK.monotonic() > retry.deadline:

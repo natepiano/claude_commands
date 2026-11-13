@@ -6,6 +6,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import io
@@ -253,7 +254,7 @@ class WorkerLockHold:
         self._blocking = blocking
         self.active = True
 
-    def bind(self, row: staff.StaffRow) -> None:
+    def bind(self, row: staff.StaffRow, *, deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
         """Acquire the fixed-id lock before creation serialization ends."""
         if not self.active or not row.reports_to(self.parent) or row.name != self.name.value:
             raise ValueError("worker lock does not own this worker")
@@ -261,7 +262,13 @@ class WorkerLockHold:
             path = _worker_lock_path(row.id)
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = self._operations.enter_context(path.open("a"))
-            fcntl.flock(handle, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
+            if deadline == worker_lifecycle.NO_LOCK_DEADLINE:
+                fcntl.flock(handle, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
+            else:
+                try:
+                    worker_lifecycle.acquire_flock(handle, deadline=deadline)
+                except worker_lifecycle.OperationDeadlineExpired as error:
+                    raise BlockingIOError(errno.EAGAIN, "dispatch lock is held") from error
             self._held.add(row.id)
 
     def owns(self, row: staff.StaffRow) -> bool:
@@ -820,7 +827,8 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
             completion = _completed_turn(worker.row, passed.get("instance_id"))
         else:
-            return _final_reply(worker.row)
+            return (CloseAllowed() if worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
+                    else Kept(f"agent state is {worker.status.value}"))
     else:
         return _final_reply(worker.row)
     if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
@@ -1126,7 +1134,9 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                   codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
     started = time.monotonic()
     try:
-        start_seconds = conf.read("direct").number("PANE_AGENT_START_SECONDS")
+        settings = conf.read("direct")
+        start_seconds = settings.number("PANE_AGENT_START_SECONDS")
+        publish_lock_seconds = settings.number("WORKER_PUBLISH_LOCK_SECONDS")
     except conf.Unusable as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     deadline = started + start_seconds
@@ -1169,11 +1179,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                         pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
                         row = worker_admission.publish(allowed, native,
                             launch_home=pane_launch.config_home(entry, record=record)).row
-                        lock.bind(row)
+                        lock.bind(row, deadline=time.monotonic() + publish_lock_seconds)
                         pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", entry)
                     else:
                         row = worker_admission.publish(allowed, native).row
-                        lock.bind(row)
+                        lock.bind(row, deadline=time.monotonic() + publish_lock_seconds)
                 except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")
@@ -1363,6 +1373,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return result
 
     identity = ""
+    switched = False
     try:
         if switching:
             request = hashlib.sha256(f"{row.current_session if row else ''}:{policy.settings.kind}".encode()).hexdigest()
@@ -1370,13 +1381,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 dispatch=worker_admission.DispatchOwner.TURN_SUBMISSION, cleanup=cleanup, request=request,
                 launch_home=launch_home)
             row = published.row
+            switched = True
         else:
             identity = start(worker_admission.NoFamilyHandoff())
             if row is not None and identity != row.current_session:
                 return _uncertain(row, "launch proves another native session; pane retained")
             if row is None:
                 row = worker_admission.publish(allowed, identity, launch_home=launch_home).row
-                lock.bind(row)
+                lock.bind(row, deadline=time.monotonic() + publish_lock_seconds)
         launched = launches[-1]
         if launched.pane in first_turn_launches:
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", first_turn_launches[launched.pane])
@@ -1384,6 +1396,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if not launches:
             return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
         if row is not None:
+            if (not switching or switched) and not isinstance(launch_destinations[launches[-1].pane], herdr.ExistingPane):
+                _ = cleanup(identity)
             return _uncertain(row, f"launch proof is incomplete: {error}")
         launched = launches[-1]
         admitted = staff.initial_snapshot().by_current_session(identity) if identity else None

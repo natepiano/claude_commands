@@ -17,6 +17,7 @@ The status line's `For you:` row shows how many efficiency proposals wait on the
 - `sources(doc)` includes the Efficiency ledger and Improvement queue ledger paths even before the files exist. This makes the status line cache refresh when either ledger appears or changes.
 - `counts_line` orders production counts as questions, changes, efficiency, proposals. It omits zero counts. "efficiency" has no plural. Every kind is available through `/next`.
 - The status line puts the session's adhoc count first, then questions, changes, rebuild items, efficiency and proposals. Example: `For you: 3 adhoc items, 1 question, 2 changes, 130 efficiency`.
+- Rebuild items combine system comparisons with open needs. See [Rebuild needs](rebuild-needs.md#status-line) for the cache and evaluation rules.
 - `scripts/statusline/adhoc_items.py` reads one number from `~/.local/state/adhoc_review/<session id>`. Pink text shows the count in any Claude session during `/adhoc_review`. The number is bold. Zero removes the file and the part.
 - `scripts/hooks/showrunner_footer.py` and `scripts/statusline/counts_row.py` pass `FooterCounts` through without change.
 - Tests: `scripts/production/test_footer_counts.py` covers the parser, missing and non-UTF-8 ledgers, sources and render order. `scripts/statusline/test_statusline.py` covers the count end to end in the status line.

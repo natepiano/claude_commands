@@ -233,6 +233,7 @@ class MacTestConfig:
     ci_workflow: str
     ci_job: str
     gh_timeout_s: float
+    ci_jobless_queued_minutes: float
     block_hours: float
     block_max_hours: float
     block_warn_minutes: float
@@ -363,6 +364,7 @@ def read_config(target: str = "") -> MacTestConfig:
         ci_workflow=ci_fields["ci_workflow"],
         ci_job=ci_fields["ci_job"],
         gh_timeout_s=config.number("gh_timeout_s"),
+        ci_jobless_queued_minutes=config.number("ci_jobless_queued_minutes") if ci_repo else 0.0,
         block_hours=config.number("block_hours"),
         block_max_hours=config.number("block_max_hours"),
         block_warn_minutes=config.number("block_warn_minutes"),
@@ -860,23 +862,17 @@ def jobs_for_run(config: MacTestConfig, database_id: int) -> list[object] | GhFa
     return cast(list[object], jobs)
 
 
-def run_ids(answer: GhAnswer) -> list[int] | GhFailure:
-    items = json_items(answer)
-    if isinstance(items, GhFailure):
-        return items
-    ids: list[int] = []
-    for item in items:
-        if not isinstance(item, dict):
-            return GhFailure("gh returned invalid JSON")
-        database_id = cast(dict[str, object], item).get("databaseId")
-        if type(database_id) is not int:
-            return GhFailure("gh returned invalid JSON")
-        ids.append(database_id)
-    return ids
+@dataclass(frozen=True)
+class CiRun:
+    """A CI run that can still need the Mac."""
+
+    status: Literal["queued", "in_progress"]
+    created_at: datetime
 
 
 def ci_activity(config: MacTestConfig) -> CiActivity:
-    ids: list[int] = []
+    runs: dict[int, CiRun] = {}
+    now = utc_now()
     for status in ("queued", "in_progress"):
         answer = run_gh(
             config,
@@ -889,18 +885,35 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             "--status",
             status,
             "--json",
-            "databaseId",
+            "databaseId,createdAt",
         )
         if isinstance(answer, GhFailure):
             return CiUnknown(answer.line)
-        status_ids = run_ids(answer)
-        if isinstance(status_ids, GhFailure):
-            return CiUnknown(status_ids.line)
-        ids.extend(status_ids)
-    for database_id in dict.fromkeys(ids):
+        items = json_items(answer)
+        if isinstance(items, GhFailure):
+            return CiUnknown(items.line)
+        for item in items:
+            if not isinstance(item, dict):
+                return CiUnknown("gh returned invalid JSON")
+            run = cast(dict[str, object], item)
+            database_id = run.get("databaseId")
+            created = run.get("createdAt")
+            if type(database_id) is not int or not isinstance(created, str):
+                return CiUnknown("gh returned invalid JSON")
+            try:
+                created_at = datetime.fromisoformat(created)
+            except ValueError:
+                return CiUnknown("gh returned invalid JSON")
+            if created_at.tzinfo is None:
+                return CiUnknown("gh returned invalid JSON")
+            runs[database_id] = CiRun(status, created_at)
+    for database_id, run in runs.items():
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
             return CiUnknown(jobs.line)
+        if (run.status == "queued" and not jobs
+                and now - run.created_at > timedelta(minutes=config.ci_jobless_queued_minutes)):
+            continue
         mac_job_completed = False
         for raw_job in jobs:
             if not isinstance(raw_job, dict):
@@ -1780,16 +1793,6 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     return ClaimFinished(13)
 
 
-def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
-    """Bind new AWS work without changing retained claim evidence."""
-    from scripts.mac_test import offload
-
-    if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
-        generation = offload.expected_instance_generation(paths.target)
-        if generation:
-            claim['instance_generation'] = generation
-
-
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
                assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
@@ -1884,7 +1887,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
-        bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
     if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -1959,7 +1961,6 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = {**claim.record}
     else:
         record = {**claim.record, "remote_host": args.remote}
-        bind_instance_generation(paths, record)
     record["pid"] = args.pid
     record["proc_start"] = start.start
     write_json(claim.path, record)
@@ -2599,87 +2600,6 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
     return command_status(paths, config)
-
-
-RELEASE_STATES = ("stopping", "stopped", "terminated")
-
-
-@dataclass(frozen=True)
-class StoppedInstanceEvidence:
-    target: str
-    generation: str
-    state: str
-    observed_at: float
-    claims: tuple[HeldClaim, ...]
-    remote_host: str
-
-
-def release_host(paths: StatePaths, generation: str) -> str:
-    from scripts.mac_test import offload
-
-    configured = offload.configured_ssh_target(paths.target)
-    if not target_config.is_aws_target(configured) or not generation:
-        raise StateReadError('instance evidence cannot release these claims')
-    return offload.read_connection_settings(configured.settings).host
-
-
-def claim_matches_instance(claim: HeldClaim, host: str, generation: str, state: str) -> bool:
-    claim_generation = claim.record.get('instance_generation', '')
-    return (claim.record.get('remote_host') == host
-            and bool(claim_generation)
-            and (claim_generation != generation or state in RELEASE_STATES))
-
-
-def capture_release_evidence(paths: StatePaths, generation: str, state: str,
-                             observed_at: float) -> StoppedInstanceEvidence:
-    """Capture host claims whose generation ended before the observation."""
-    with locked(paths.lock):
-        host = release_host(paths, generation)
-        claims = tuple(claim for claim in read_claims(paths)
-                       if claim_matches_instance(claim, host, generation, state)
-                       and datetime.fromisoformat(claim.record['since']).timestamp() <= observed_at)
-    return StoppedInstanceEvidence(paths.target, generation, state, observed_at, claims, host)
-
-
-def release_stopped_claims(paths: StatePaths, evidence: StoppedInstanceEvidence) -> int:
-    """Release unchanged claims after a stop or a generation change."""
-    from scripts.mac_test import offload
-
-    if evidence.target != paths.target:
-        raise StateReadError('instance evidence does not match the target')
-    released = 0
-    fenced: list[HeldClaim] = []
-    with locked(paths.lock):
-        host = release_host(paths, evidence.generation)
-        if host != evidence.remote_host:
-            raise StateReadError('instance host evidence does not match the target')
-        current = {claim.path: claim for claim in read_claims(paths)}
-        for claim in evidence.claims:
-            if claim.path not in current or current[claim.path].record != claim.record:
-                continue
-            if not claim_matches_instance(claim, host, evidence.generation, evidence.state):
-                continue
-            proof: dict[str, object] = {'target': evidence.target, 'generation': evidence.generation,
-                     'remote_host': host, 'state': evidence.state, 'observed_at': evidence.observed_at,
-                     'path': str(claim.path), 'claim': dict(claim.record)}
-            (paths.directory / 'release-evidence').mkdir(parents=True, exist_ok=True)
-            write_json(paths.directory / 'release-evidence' / claim.path.name, proof)
-            if offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
-                    claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])).exists():
-                fenced.append(claim)
-            else:
-                claim.path.unlink(missing_ok=True)
-                released += 1
-    for claim in fenced:
-        release = CliArguments()
-        release.pid, release.target = claim.record["pid"], paths.target
-        release.claim_id = claim.record["claim_id"]
-        release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
-        if command_release(release, paths) == 0:
-            with locked(paths.lock):
-                if isinstance(read_run(claim.path), NoRun):
-                    released += 1
-    return released
 
 
 if __name__ == "__main__":

@@ -13,19 +13,20 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 from urllib.parse import quote
 
 from scripts.lib import conf_reads
+from scripts.rebuild import need
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
 
 
 @dataclass(frozen=True)
 class RebuildSettings:
-    """The configured source, machines, and refresh interval."""
+    """The configured source, machines, refresh interval, and evaluation time limit."""
 
     repo: Path
     ref: str
@@ -33,13 +34,14 @@ class RebuildSettings:
     mac: str
     ssh: str
     interval: int
+    eval_timeout: int
 
     @classmethod
     def read(cls, path: Path) -> RebuildSettings:
         values = config_values(path)
         settings = cls(Path(values["rebuild.repo"]), values["rebuild.ref"],
                        values["rebuild.natedev"], values["rebuild.mac"],
-                       values["rebuild.ssh"], int(values["rebuild.interval"]))
+                       values["rebuild.ssh"], int(values["rebuild.interval"]), int(values["rebuild.eval_timeout"]))
         if not settings.repo.is_absolute() or settings.interval <= 0:
             raise ValueError("Invalid rebuild settings")
         if not all((settings.ref, settings.natedev, settings.mac, settings.ssh)):
@@ -47,10 +49,16 @@ class RebuildSettings:
         return settings
 
 
-def command_output(command: list[str]) -> str:
+class CommandRunner(Protocol):
+    """Read a command's output within its time limit."""
+
+    def __call__(self, command: list[str], *, timeout: int = 30) -> str: ...
+
+
+def command_output(command: list[str], *, timeout: int = 30) -> str:
     """Return command output, or an empty string when the command fails."""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -81,13 +89,14 @@ class ExpectedSystems:
 
 
 def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoExpectedSystems,
-                     run: Callable[[list[str]], str]) -> ExpectedSystems | NoExpectedSystems:
-    """Evaluate both paths once when the source commit changes."""
+                     run: CommandRunner) -> ExpectedSystems | NoExpectedSystems:
+    """Reuse complete evaluations and retry missing results."""
     commit = run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{settings.ref}^{{commit}}"])
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
         return NoExpectedSystems()
     source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
-    if isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source:
+    if (isinstance(previous, ExpectedSystems) and previous.commit == commit and previous.source == source
+            and system_path(previous.natedev) and system_path(previous.mac)):
         return previous
     flake = f"git+file://{quote(str(settings.repo))}?rev={commit}"
     expression = (
@@ -97,7 +106,7 @@ def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoEx
         + f"natedev = pathOrEmpty flake.nixosConfigurations.{json.dumps(settings.natedev)}.config.system.build.toplevel.outPath; "
         + f"mac = pathOrEmpty flake.darwinConfigurations.{json.dumps(settings.mac)}.system.outPath; }}"
     )
-    output = run(["nix", "eval", "--json", "--no-write-lock-file", "--expr", expression])
+    output = run(["nix", "eval", "--json", "--no-write-lock-file", "--expr", expression], timeout=settings.eval_timeout)
     try:
         paths = cast(dict[str, object], json.loads(output))
         local, mac = paths["natedev"], paths["mac"]
@@ -105,7 +114,8 @@ def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoEx
                                local if isinstance(local, str) and system_path(local) else "",
                                mac if isinstance(mac, str) and system_path(mac) else "")
     except (ValueError, KeyError, TypeError):
-        return ExpectedSystems(commit, source, "", "")
+        pass
+    return NoExpectedSystems()
 
 
 def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
@@ -153,7 +163,17 @@ def cache_path(config: Path) -> Path:
 
 
 def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
-    """Read the configured cache for the status line and external callers."""
+    """Combine the cached comparison with open rebuild needs."""
+    answer = _read_cache(config)
+    try:
+        machines = set(answer.machines) | {summary.newest["machine"] for summary in need.read_needs()}
+    except (OSError, ValueError, KeyError, TypeError):
+        return answer
+    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines))
+
+
+def _read_cache(config: Path) -> RebuildAnswer:
+    """Read the configured comparison cache without evaluating systems."""
     try:
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
@@ -174,7 +194,7 @@ def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
                 local, mac = details["natedev"], details["mac"]
                 if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
                         and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))
-                        and isinstance(local, str) and isinstance(mac, str)):
+                        and isinstance(local, str) and system_path(local) and isinstance(mac, str) and system_path(mac)):
                     expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
             except (ValueError, KeyError, TypeError):
                 pass
@@ -183,7 +203,7 @@ def read(config: Path = DEFAULT_CONFIG) -> RebuildAnswer:
         return RebuildAnswer((), True)
 
 
-def write(config: Path, run: Callable[[list[str]], str] = command_output) -> None:
+def write(config: Path, run: CommandRunner = command_output) -> None:
     """Refresh the configured cache without concurrent evaluations."""
     from scripts.statusline import counts_row
 
@@ -206,7 +226,7 @@ def write(config: Path, run: Callable[[list[str]], str] = command_output) -> Non
             settings = RebuildSettings.read(config)
             expected = expected_systems(settings, answer.expected, run)
             line = row(settings, expected, run)
-            if isinstance(expected, ExpectedSystems):
+            if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
                 details = expected.details()
             due = str(int(time.time()) + settings.interval)
         except (OSError, ValueError, KeyError):

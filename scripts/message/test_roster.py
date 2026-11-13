@@ -80,6 +80,8 @@ NO_DIRECTOR = roster.NoDirector()
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     _ = unittest.enterModuleContext(mock.patch("scripts.message.failed_lookup.send_notice"))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", root / "astra-runs"))
 
 
 class RosterTests(unittest.TestCase):
@@ -183,6 +185,8 @@ class RosterTests(unittest.TestCase):
             mock.patch.dict(os.environ, self.environment, clear=True),
         )
         _ = self.enterContext(environment_patch)
+        _ = self.enterContext(mock.patch.object(unit_runs, "run_roots", return_value=(self.runs,)))
+        _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         _ = self.enterContext(mock.patch.object(showrunners, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier))
         _ = self.enterContext(mock.patch.object(
@@ -294,9 +298,17 @@ class RosterTests(unittest.TestCase):
                     self.pane_world.add(child, pane, family="codex")
                 self.pane_world.locations[pane]["agent_status"] = "working" if entry.get("status") == "running" else "idle"
             role = entry.get("role")
+            if role in staff.WORKER_ROLES:
+                _ = staff.set_worker_role(child.id, staff.KnownWorkerRole(role))
             if role in agents_log.ROLES:
                 lens = next((value for value in agents_log.LENSES if value == entry.get("lens")), None)
                 agents_log.append(identity, role, cast(agents_log.Lens | None, lens), datetime.now(UTC))
+        write_text_atomic(path.parent / unit_runs.STATE_FILE, json.dumps({
+            unit_runs.OWNER_FIELD: parent.id,
+            "pass": {name: {"worker_id": entry.get("thread_id"), "kind": "review", "status": "active",
+                            "lens": entry["lens"], "started_at": 1}
+                     for name, entry in entries.items() if entry.get("role") == "review" and entry.get("lens")},
+        }))
 
     def _write_pane_workers(self, run: Path, entries: dict[str, dict[str, object]],
                             *, server_pid: int | None = None) -> None:
@@ -592,7 +604,7 @@ class RosterTests(unittest.TestCase):
         record = staff.snapshot()
         row = staff.StaffRow(
             staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Staff owner", staff.StaffRoot(),
-            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+            current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
         )
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
             result, _, errors = self._run_main("--json")
@@ -612,7 +624,7 @@ class RosterTests(unittest.TestCase):
             with self.subTest(parent=parent):
                 row = staff.StaffRow(
                     staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), "unit", "Codex window", staff.ReportsTo(parent),
-                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"),
+                    current_session=staff.StaffId("eaa2b2bc-f66c-5ac8-98a1-ed9d5a1eb539"), unit_type=staff.UnitDetails("direct"),
                 )
                 with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, row))):
                     result, lines, errors = self._run_main("--json")
@@ -1142,12 +1154,29 @@ class RosterTests(unittest.TestCase):
             ),
         )
 
-    def test_codex_review_lens_uses_role_and_lens_fields(self) -> None:
-        entry = self._entries()["alpha-research"]
+    def test_codex_review_uses_staff_role_and_dispatch_lens(self) -> None:
+        original = self._entries()
+        entry = original["alpha-research"]
         self.assertEqual(
             entry.assignment,
             roster.WorkerAssignment("review (adversary)", str(self.director_run), "review", "research"),
         )
+        history = self.root / "damaged-dispatch-history.jsonl"
+        _ = history.write_bytes(b"\xff\n")
+        state_path = self.director_run / unit_runs.STATE_FILE
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state["history_file"] = str(history)
+        write_text_atomic(state_path, json.dumps(state))
+        damaged = self._entries()
+        expected = dict(original)
+        expected["alpha-research"] = replace(entry, assignment=roster.WorkerAssignment(
+            "review", str(self.director_run), "review", "research"))
+        self.assertEqual(damaged, expected)
+        member = staff.local_snapshot().by_current_session("76d3172a-4806-51c4-89b6-e328af9f6367")
+        assert member is not None
+        _ = staff.set_worker_role(member.id, staff.KnownWorkerRole("fix"))
+        self.assertEqual(self._entries()["alpha-research"].assignment,
+                         roster.WorkerAssignment("fix", str(self.director_run), "fix", "research"))
 
     def test_codex_review_without_lens_uses_its_role(self) -> None:
         entry = self._entries()["alpha-review-plain"]
@@ -1162,6 +1191,19 @@ class RosterTests(unittest.TestCase):
             self._entries()["alpha-impl"].assignment,
             roster.WorkerAssignment("impl", str(self.director_run), "impl", "impl"),
         )
+        row = staff.snapshot().by_current_session("7aa082fc-e724-5e46-8846-bd68e7eb3f46")
+        assert row is not None
+        for role in ("fix", "test"):
+            with self.subTest(staff_role=role):
+                _ = staff.set_worker_role(row.id, staff.KnownWorkerRole(cast(staff.WorkerRole, role)))
+                self.assertEqual(self._entries()["alpha-impl"].assignment,
+                                 roster.WorkerAssignment(role, str(self.director_run),
+                                                         cast(roster.WorkerRole, role), "impl"))
+        for contents in (b"", b"\xff"):
+            with self.subTest(history=contents):
+                _ = (agents_log.state_dir() / "agents.jsonl").write_bytes(contents)
+                self.assertEqual(self._entries()["alpha-impl"].assignment,
+                                 roster.WorkerAssignment("test", str(self.director_run), "test", "impl"))
 
     def test_a_roster_takes_folder_and_status_from_the_registry_read_it_receives(self) -> None:
         registry = sessions.read_registry()
@@ -1210,12 +1252,12 @@ class RosterTests(unittest.TestCase):
         self.assertIn("lost-worker", {entry.name for entry in found.entries})
         self.assertTrue(found.entries, found.problems)
 
-    def test_a_roster_build_reads_the_role_log_once(self) -> None:
+    def test_a_roster_build_does_not_read_the_role_log(self) -> None:
         with mock.patch.object(agents_log, "assignments", wraps=agents_log.assignments) as read:
             entries = self._entries()
 
         self.assertGreater(sum(entry.role == "worker" for entry in entries.values()), 1)
-        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_count, 0)
 
     def test_each_roster_shares_run_scans_across_worker_parents(self) -> None:
         self.assertGreater(len(session_staff.pane_parents(staff.snapshot())), 1)

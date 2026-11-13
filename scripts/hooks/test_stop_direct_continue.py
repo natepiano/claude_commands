@@ -14,6 +14,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -90,6 +91,18 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
 
 
 class DirectorStopTests(unittest.TestCase):
+    def test_stop_names_the_recorded_unit_command(self) -> None:
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type), director_stop_fixture() as fixture:
+                document = cast(dict[str, object], json.loads(fixture.staff_file.read_text()))
+                rows = cast(list[dict[str, object]], document["rows"])
+                rows[0].update(kind="unit", unit_type=unit_type)
+                _ = fixture.staff_file.write_text(json.dumps(document))
+                result = fixture.call()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"/unit:{unit_type} run active", result.stderr)
+                self.assertIn(f"commands/unit/{unit_type}.md", result.stderr)
+
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
         self.assertIn(

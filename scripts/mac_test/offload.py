@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from importlib import import_module
@@ -29,7 +29,7 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Literal, NewType, Protocol, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NewType, Protocol, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
@@ -244,12 +244,6 @@ class LostMacRun:
 
 
 @dataclass(frozen=True)
-class InterruptedTargetRun:
-    generation: str
-    seconds: float
-
-
-@dataclass(frozen=True)
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
@@ -344,7 +338,7 @@ class AttemptEvidence:
 
 
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | InterruptedTargetRun | DeclinedMacRun | BusyMacDecline
+    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
 )
 
 
@@ -849,12 +843,7 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
-@dataclass(frozen=True)
-class InterruptedTargetStatus:
-    generation: str
-
-
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | InterruptedTargetStatus | ToolVersionMismatch | MirrorUseBusy
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -865,7 +854,7 @@ class UnavailableProbe:
     detail: str = ""
 
 
-ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup | InterruptedTargetStatus
+ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup
 UNAVAILABLE_PROBE = UnavailableProbe()
 
 
@@ -1171,13 +1160,6 @@ class ProcessController:
                     held_status_line = ""
                     cleanup = CleanupUnconfirmed()
                     continue
-                if marker.startswith('aws_interrupted='):
-                    generation = marker.removeprefix('aws_interrupted=')
-                    status = (InterruptedTargetStatus(generation) if generation
-                              else MISSING_MAC_STATUS)
-                    held_status_line = ''
-                    cleanup = CleanupUnconfirmed()
-                    continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None:
                     if held_status_line:
@@ -1221,13 +1203,13 @@ class ProcessController:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if mismatch and not isinstance(status, (ReportedMacStatus, InterruptedTargetStatus)):
+        if mismatch and not isinstance(status, (ReportedMacStatus)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if mirror_refused:
             return MirrorUseBusy()
-        if isinstance(status, (UnresolvedSlotStartup, InterruptedTargetStatus)):
+        if isinstance(status, UnresolvedSlotStartup):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
@@ -1306,8 +1288,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
-        enabled=(target_config.aws_routing_enabled(config) if settings.name == "aws_target.conf"
-                 else config.text("offload") == "on"),
+        enabled=config.text("offload") == "on",
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
@@ -1382,14 +1363,11 @@ def write_result(
             print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
-    elif isinstance(result, (LostMacRun, InterruptedTargetRun)):
+    elif isinstance(result, LostMacRun):
         mac = "lost"
-        reason = "interrupted" if isinstance(result, InterruptedTargetRun) else result.detail if target else ""
+        reason = result.detail if target else ""
         status = 75
-        if isinstance(result, InterruptedTargetRun):
-            print(f"mac_test: the {label} instance was interrupted (generation {result.generation})")
-        else:
-            print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
+        print(f"mac_test: the {label} {result.detail}; local fallback requires admission")
     else:
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
@@ -1413,8 +1391,6 @@ def write_result(
             count = str(evidence.unresolved_count) if isinstance(evidence.unresolved_count, int) else "unavailable"
             details = (f"slot={evidence.slot}\ncompletion={evidence.completion}\ncleanup={evidence.cleanup}\n"
                        + f"unresolved_count={count}\nevidence_at={evidence.evidence_at}\n")
-        if isinstance(result, InterruptedTargetRun):
-            details += f'interruption_generation={result.generation}\n'
         if isinstance(result, (PassedOnMac, PassedOnTarget)) and result.build_target_directory:
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
@@ -1885,11 +1861,6 @@ def probe_mac(
         [*ssh_prefix(config), script],
         CommandTimeLimit(timeout_s),
     )
-    if linux and isinstance(result, CommandOutput):
-        interruptions = [line.removeprefix('aws_interrupted=') for line in result.stdout.splitlines()
-                         if line.startswith('aws_interrupted=')]
-        if interruptions:
-            return InterruptedTargetStatus(interruptions[-1])
     if (linux and isinstance(result, CommandOutput)
             and result.stdout.strip() == "linux_startup=unresolved"):
         return UnresolvedSlotStartup()
@@ -2092,13 +2063,7 @@ def nextest_words_with_skip(
 
 def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
     return {**config.values, 'selected_target': target,
-            'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', ''),
-            'selected_settings': str(config.source) if isinstance(config.source, Path) else ''}
-
-
-def expected_instance_generation(target: str) -> str:
-    instance_generation = cast(Callable[[Path], str], import_module('scripts.aws_target.aws_target').instance_generation)
-    return instance_generation(state_directory(target))
+            'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', '')}
 
 
 def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
@@ -2330,7 +2295,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
             raise ValueError("Linux cleanup requires a repository and slot")
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
-                                                   require_boot_identity=target_config.is_aws_target(configured_ssh_target(target)))
+                                                   require_boot_identity=False)
     root = mac_mirror_root().relative
     mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
@@ -2571,8 +2536,6 @@ def claimed_run(
     evidence.slot = request.slot
     try:
         linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
-        generation = (expected_instance_generation(request.target)
-                      if target_config.is_aws_target(configured_ssh_target(request.target or "mac")) else "")
         if linux:
             expected = expected_linux_parity(controller, config)
             if isinstance(expected, UnavailableToolParity):
@@ -2587,14 +2550,6 @@ def claimed_run(
             copy_seconds = elapsed_seconds(copy_started)
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, InterruptedTargetStatus):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(checked, LeftoversEnded)
-                observe_cleanup(evidence, checked)
-                report_leftover_check(checked, request)
-                if generation and probe.generation == generation:
-                    return InterruptedTargetRun(generation, elapsed_seconds(started))
-                return LostMacRun(elapsed_seconds(started))
             if isinstance(probe, UnresolvedSlotStartup):
                 checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
@@ -2620,7 +2575,7 @@ def claimed_run(
                 return declined("disk", started)
         else:
             probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup, InterruptedTargetStatus)):
+            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
             disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
@@ -2692,8 +2647,6 @@ def claimed_run(
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if isinstance(remote_status, InterruptedTargetStatus) and (not generation or remote_status.generation != generation):
-            remote_status = MISSING_MAC_STATUS
         if not isinstance(remote_status, ReportedMacStatus):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
@@ -2709,8 +2662,6 @@ def claimed_run(
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
-            if isinstance(remote_status, InterruptedTargetStatus):
-                return InterruptedTargetRun(remote_status.generation, elapsed_seconds(started))
             if isinstance(remote_status, ToolVersionMismatch):
                 write_version_decline(request.target, repository.name)
                 return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
@@ -3128,7 +3079,7 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
         queued = Path(first).read_text().strip()
     outcome = ("passed" if isinstance(result, (PassedOnMac, PassedOnTarget)) else "failed"
                if isinstance(result, (FailedOnMac, FailedOnTarget)) else "lost"
-               if isinstance(result, (LostMacRun, InterruptedTargetRun)) else "no_tests"
+               if isinstance(result, LostMacRun) else "no_tests"
                if isinstance(result, NoTestMatchedOnMac) else "declined")
     attempt: MeasuredSshAttempt = {
         "call_id": request.call_id, "target": request.target,
@@ -3221,7 +3172,7 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         outcome = placement.AttemptCompleted(result.status)
     elif isinstance(result, NoTestMatchedOnMac):
         outcome = placement.AttemptDeclined("no_tests")
-    elif (isinstance(result, (LostMacRun, InterruptedTargetRun)) and evidence.cleanup == "confirmed"
+    elif (isinstance(result, LostMacRun) and evidence.cleanup == "confirmed"
           and isinstance(controller.pending, SettledDispatchOperations)):
         outcome = (placement.PrelaunchRefused("lost")
                    if not evidence.launch_authorized and isinstance(evidence.execution, placement.ExecutionNotStarted)
