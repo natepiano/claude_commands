@@ -588,6 +588,8 @@ def scheduled_prompt(minutes: int, production: Production) -> str:
     prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
     prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", str(production.zone)).replace("<showrunner name>", production.name)
     prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(production.owner.id)))
+    if not prompt.strip():
+        raise RegistrationFailure("prompt", "scheduled prompt is empty")
     return prompt
 
 
@@ -622,7 +624,7 @@ def register(production: Production) -> None:
     owner = production.owner
     updates = f"showrunner-{owner.id}"
     _ = notifier(["new", updates, "--to", f"session:{owner.id}", "--every", str(DEFAULT_MINUTES),
-                  "--prompt", "scheduled", "--from", f"showrunner-timer-{production.name}"])
+                  "--prompt", "scheduled"])
     _ = notifier(["stop", updates])
     if isinstance(instance("stall-watch"), InstanceAbsent):
         run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
@@ -1561,8 +1563,9 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    prompt = commands.add_parser("prompt")
-    _ = prompt.add_argument("--owner", required=True)
+    for action in ("prompt", "delivery"):
+        delivery = commands.add_parser(action)
+        _ = delivery.add_argument("--owner", required=True)
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action)
@@ -1590,11 +1593,12 @@ def main() -> int:
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
-        if action == "prompt":
+        if action in ("prompt", "delivery"):
             production = read_production(cast(str, args.owner))
             schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
             minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
-            print(scheduled_prompt(minutes, production))
+            prompt = scheduled_prompt(minutes, production)
+            print(f"showrunner-timer-{production.owner.name}\n{prompt}" if action == "delivery" else prompt)
             return 0
         identities = QuestionStaff.read() if action in ("ask", "questions-table") else None
         name = cast(str | None, args.production)
