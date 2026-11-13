@@ -3752,7 +3752,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Correctness fix with no aws trial. Probes inject a failure before and after root creation; each gives one setup error, and the next test passes.
 - 96 tests and 589 assertions unchanged; two blind reviews approve with no findings. Checkpoint 536f8eb74.
 
-### Phase 252 — Tests never reach the real unit run roots  · status: todo
+### Phase 252 — Tests never reach the real unit run roots  · status: done
 **Depends on:** none
 
 #### Work Order

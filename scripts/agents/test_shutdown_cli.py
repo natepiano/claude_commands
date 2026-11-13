@@ -39,6 +39,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
@@ -2828,6 +2829,7 @@ class UnitRenameTests(UnitRenameFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
 
     def test_explicit_branch_change_keeps_the_staff_row(self) -> None:
@@ -3633,6 +3635,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
 
     def test_recordless_rename_keeps_the_staff_session_without_a_launch(self) -> None:

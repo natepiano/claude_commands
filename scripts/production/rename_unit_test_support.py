@@ -27,6 +27,7 @@ from scripts.production import staff, unit_config, fake_unit_host
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.agents import shutdown
 from scripts.agents import pane_record
 from scripts.style import style_ledger
@@ -300,6 +301,7 @@ class FolderRenameFixture(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         self.home = self.root / "home"
         self.checkout = self.root / "repository"
         self.source = self.home / "rust" / f"cargo-liner-{self.old_name}"

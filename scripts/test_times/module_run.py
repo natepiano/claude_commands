@@ -567,7 +567,24 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
         raise
 
 
-def run_with_descendant_cleanup() -> None:
+@contextmanager
+def private_run_roots() -> Generator[Callable[[], None]]:
+    """Keep imported run roots and child processes under one private folder."""
+    names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
+    previous = {name: os.environ[name] for name in names if name in os.environ}
+    temporary = tempfile.TemporaryDirectory(prefix="test-run-roots-", dir="/tmp")
+    try:
+        root = Path(temporary.name)
+        os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
+        yield temporary.cleanup
+    finally:
+        for name in names:
+            _ = os.environ.pop(name, None)
+        os.environ.update(previous)
+        temporary.cleanup()
+
+
+def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
@@ -652,6 +669,7 @@ def run_with_descendant_cleanup() -> None:
     exit_code = os.waitstatus_to_exitcode(status)
     if received or exit_code < 0:
         number = received or -exit_code
+        cleanup_run_roots()
         if number not in (signal.SIGKILL, signal.SIGSTOP):
             _ = signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
@@ -661,4 +679,5 @@ def run_with_descendant_cleanup() -> None:
 
 
 if __name__ == "__main__":
-    run_with_descendant_cleanup()
+    with private_run_roots() as cleanup_run_roots:
+        run_with_descendant_cleanup(cleanup_run_roots)
