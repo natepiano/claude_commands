@@ -2301,3 +2301,51 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
 
 **Gotchas:** `bash -o pipefail verify.sh` is not matched, because the first argument without a leading `-` is `pipefail`.
+
+### Phase 109 — Every hana Linux CI job finds its devShell tools again, and a cargo version call skips the queue  · status: done
+
+#### As-built
+
+- `cargo_path(explicit, front)` returns every `os.get_exec_path()` entry in its order. It drops only the folder that holds the front and each folder whose `cargo` is an executable that resolves to the front. The devShell folders (`cc`, `cargo-deny`, `cargo-nextest`, `cargo-sweep`, `mold`) before the real cargo stay on the child PATH.
+- Without `--cargo`, the command is the first `cargo` on that PATH that does not resolve to the front. With `--cargo <path>`, the command is that path; its folder goes first and its later duplicate is dropped.
+- `building_call(arguments)` returns no build when a flag that only prints text comes after the subcommand and before `--`: `-V` or `--version` (not for `install`, where `--version <VERSION>` takes a value), and `-h` or `--help`. Such a call runs at once with no admission request. An argument after `--` does not change the result.
+- Measured before the fix: every hana Linux CI job failed from the 2026-11-11 14:30 switch with `linker cc not found` and `no such command`. On 2026-11-12, `cargo clippy --version` held the queue head for 85 minutes with a 6,740,828,160-byte estimate.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — `cargo_path()`, `building_call()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the wrapper test with a devShell folder and a recursing shim before the real cargo, with and without `--cargo`; a `building_call()` table; a `clippy --version` row in the outage pass-through test
+
+**Gotchas:** the CI runners run the front from a nix store copy. A fix reaches CI only after the nixos input bump and a switch.
+
+### Phase 110 — A cancelled CI job leaves no admission folder behind  · status: done
+
+#### As-built
+
+- The CI front names its shared admission folder `build-admission-ci-<uid>-<pid>-<start>-<random>`, with the front pid and its `/proc` start time.
+- `remove_abandoned_folders(shared_folder)` runs in `run_cargo()` before the front makes its folder, only when `--shared-folder` is given. It removes each `build-admission-ci-<uid>-*` folder that the same uid owns when the named owner is not live (`records.process_start_time(pid)` differs) or the name has no owner (the old name form). A live owner's folder stays. A folder that another front removes first is not an error.
+- A front that ends by SIGKILL still leaves its folder; the next building call on that runner removes it. No signal handler, flag or config key.
+- Measured before the fix: each hana runner held two left folders (05:30 and 16:43 on 2026-11-12).
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — `remove_abandoned_folders()`, the folder prefix in `run_cargo()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the shared-folder row of the wrapper test makes a dead-owner, an old-form and a live-owner folder; only the live-owner folder stays
+
+**Gotchas:** at the first building call after the deploy, an old-form folder of a front that still runs is removed too.
+
+### Phase 112 — A queued hana CI run with no jobs stops holding a Mac block  · status: done
+
+#### As-built
+
+- `ci_activity()` asks `gh run list` for `databaseId,createdAt` for the `queued` and `in_progress` lists, and keeps each run's status in a `CiRun`.
+- A run from the `queued` list with an empty job list and a `createdAt` more than `ci_jobless_queued_minutes` before now does not count as CI busy. Every other run counts as before: an `in_progress` run with no jobs stays busy, and a queued run with jobs is busy until its `ci_job` is completed.
+- A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
+- `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
+- No new `gh` call, flag, cancel call or state file.
+- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+
+**Files:**
+- `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`
+- `scripts/mac_test/test_mac_test.py` — rows in `test_queued_or_in_progress_run_without_mac_job_is_busy` for the age limit, a configured limit, a running run with no jobs and a malformed timestamp
+- `config/mac_test.conf` — `ci_jobless_queued_minutes`
+
+**Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.

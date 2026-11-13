@@ -4152,20 +4152,35 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         else f"In the natedev Claude session, say which {machine.value} folders to delete.")
 
     def test_crossing_session_keeps_trash_and_scratch_effects(self) -> None:
-        for folder, effect, recommendation in (
+        for folder, effect, recommendation, age in (
             ("/private/Trash", "Deleting it removes discarded files.",
-             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
             ("/private/scratch/work", "Deleting it removes temporary work; check for work you still need.",
-             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."),
+             "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
+            ("/private/daily", "Deleting it removes its contents; their use is unknown.",
+             "Review /private/daily first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 26 * 3600),
+            ("/private/missed", "Deleting it removes its contents; their use is unknown.", "", 100801),
         ):
-            with self.subTest(folder=folder), self.crossing_delivery({}) as delivery:
-                measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+            with self.subTest(folder=folder, age=age), self.crossing_delivery({}) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_snapshot_max_age_seconds=100800\n")
+                now = time.time()
+                measurement = sweep.AvailableDiskMeasurement(datetime.fromtimestamp(now - age, UTC), sweep.NoEarlierDiskMeasurement(), [
                     sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
                 ], 0)
                 with (self.measured_output_roots((folder,)),
                       mock.patch.object(sweep, "read_disk_measurement", return_value=measurement)):
                     self.finalize_crossing(140)
                 message = delivery.attempts[0].text
+                if age > 100800:
+                    self.assertNotIn(folder, message)
+                    self.assertIn("Folder sizes are unknown.", message)
+                    self.assertIn("Folder sizes are unknown.", phone_text(delivery.attempts))
+                    details = sweep.disk_measurement_lines(
+                        measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))
+                    self.assertIn("stale", "\n".join(details))
+                    continue
+                self.assertNotIn("stale", "\n".join(sweep.disk_measurement_lines(
+                    measurement, 0, 0, now, False, 100, lint_settings=conf.read("lint"))))
                 lines = [
                     "Free disk space fell below the 150.0 GiB alert line. 140.0 GiB remains.",
                     "The cleanup run freed nothing.",
@@ -7059,6 +7074,42 @@ class HolderSessionTests(unittest.TestCase):
               mock.patch.object(sessions, "live_sessions", return_value=[record])):
             self.assertEqual(sweep.holder_sessions([300, 400, 999]), {300: "hana-unit"})
         self.assertEqual(sweep.holder_sessions([]), {})
+
+        from scripts.agents import worker_lifecycle
+        from scripts.production import staff
+
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = base / "detached.json"
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "builds-director", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "impl2", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("worker-session"))
+        table.update({
+            500: process_table.Process(500, 1, "python3", f"python3 detached_runs.py supervise {path}"),
+            600: process_table.Process(600, 500, "verify.sh", "bash verify.sh test"),
+            700: process_table.Process(700, 600, "cargo", "cargo nextest run"),
+        })
+        for case in ("worker", "wrong pid", "missing worker", "missing parent", "finished", "missing", "unreadable"):
+            with self.subTest(case=case):
+                rows = (worker,) if case == "missing parent" else (director, worker)
+                _ = path.write_text(json.dumps({
+                    "pid": 501 if case == "wrong pid" else 500,
+                    "status": "finished" if case == "finished" else "running",
+                    "staff_id": "unknown" if case == "missing worker" else str(worker.id),
+                }))
+                if case == "missing":
+                    path.unlink()
+                elif case == "unreadable":
+                    _ = path.write_text("{")
+                with (mock.patch.object(process_table, "snapshot", return_value=table),
+                      mock.patch.object(sessions, "live_sessions", return_value=[record]),
+                      mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(rows)),
+                      mock.patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as read):
+                    expected = {300: "hana-unit"}
+                    if case == "worker":
+                        expected.update({600: "builds-director", 700: "builds-director"})
+                    self.assertEqual(sweep.holder_sessions([300, 600, 700, 999]), expected)
+                    read.assert_called_once_with(path)
 
 
 class BudgetTests(unittest.TestCase):

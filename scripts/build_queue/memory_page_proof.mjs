@@ -25,7 +25,10 @@ try {
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
     const shift = now - reading.read_at;
-    for (const row of reading.walk) if (row.started_at) row.started_at += shift;
+    for (const row of reading.walk) {
+      if (row.started_at) row.started_at += shift;
+      if (row.read_at) row.read_at += shift;
+    }
     for (const waiter of reading.waiters) waiter.since += shift;
     reading.read_at = now;
   }
@@ -613,6 +616,48 @@ try {
               assert.equal(ciProof.ci,0.125);
               assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
             }
+            await show(base);
+
+            await show(readings.mac_three);
+            const macProof=await evaluate(`(() => {
+              const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
+              const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
+              return rows.map(({row,index})=>{
+                const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+                const table=document.querySelector('.walk-table tr[data-tip="row:'+index+'"]');
+                return {name:row.name,stage:table.querySelector('.place').textContent,
+                  unit:table.querySelector('.unit').textContent,percent:chart.querySelector('.progress-amount').textContent,
+                  used:chart.querySelector('.seg-used').getBoundingClientRect().width,
+                  expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
+                  tip:tooltipHtml('row:'+index,latest),
+                  chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
+                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead').getBoundingClientRect().bottom};
+              });
+            })()`);
+            assert.equal(macProof.length,3);
+            assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
+            assert.deepEqual(macProof.map(row=>row.percent),['60.4% done','64.7% done','98.3% done']);
+            assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
+            const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
+              repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
+              jobs:document.querySelector('tr[data-tip="row:'+index+'"] .vcpus').textContent}))`);
+            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','cargo-liner']);
+            assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
+            for(const row of macProof) {
+              assert.equal(row.stage,'building');
+              assert.ok(Math.abs(row.used-row.expected)<1);
+              assert.equal(row.hatched,false);
+              assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
+              assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
+            }
+            await show(readings.mac_failed);
+            const failedMac=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
+              text:document.querySelector('#walk').textContent,
+              unknown:document.querySelector('.walk-table tr[data-tip="row:'+latest.walk.findIndex(row=>row.kind==='mac-unavailable')+'"] .place').textContent})`);
+            assert.ok(failedMac.text.includes('Mac reading is old'));
+            assert.ok(!failedMac.text.includes('private raw error'));
+            assert.ok(!failedMac.text.includes('Progress unavailable: Mac process'));
+            assert.equal(failedMac.unknown,'—');
             await show(base);
 
             const positions=()=>evaluate(`(() => {

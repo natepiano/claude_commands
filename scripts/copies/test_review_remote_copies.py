@@ -584,7 +584,6 @@ print('RUNNER', os.getpid(), flush=True)
 values = dict(kinds='test', devshell='default', shell_cache='cache', shell_timeout_s='1',
               build_budget_gib='20', target_budget_gib='10', free_floor_gib='1', abandoned_session_minutes='1')
 with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner.ShellEnvironment('key', exports, exports)),
-      mock.patch.object(linux_runner, 'permission_refused', return_value=False),
       mock.patch.object(linux_runner, 'output_free_bytes', return_value=100 * 1024**3),
       mock.patch.object(linux_runner, 'trim_build_folder', return_value=0)):
     linux_runner.execute_slot(root, values, 'repository', 'nextest', (), 'call', 'tree')

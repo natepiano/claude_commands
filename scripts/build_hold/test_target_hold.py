@@ -117,9 +117,9 @@ class TargetHoldTests(IsolatedTargetState):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.claim(name).returncode, 10)
         before = {name: (self.directory(name) / "block.json").read_bytes() for name in ("mac", "linux-two")}
-        result = self.invoke_hold(["release", "--target", "aws", "--holder", "alice"])
+        result = self.invoke_hold(["release", "--target", "linux", "--holder", "alice"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.AwsStatusRow)
+        self.assertIsInstance(targets.target_state(self.selected_target("linux")), targets.Free)
         for name in ("mac", "linux-two"):
             self.assertEqual((self.directory(name) / "block.json").read_bytes(), before[name])
             self.assertEqual(self.claim(name).returncode, 10)
@@ -127,12 +127,12 @@ class TargetHoldTests(IsolatedTargetState):
         self.assertFalse((self.root / "release").exists())
 
     def test_target_word_syntax_selects_the_same_hold_as_target_option(self) -> None:
-        result = self.invoke_hold(["hold", "--holder", "alice", "--for", "inspect aws", "target", "aws"])
+        result = self.invoke_hold(["hold", "--holder", "alice", "--for", "inspect linux", "target", "linux"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.Held)
-        result = self.invoke_hold(["release", "--target", "aws", "--holder", "alice"])
+        self.assertIsInstance(targets.target_state(self.selected_target("linux")), targets.Held)
+        result = self.invoke_hold(["release", "--target", "linux", "--holder", "alice"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.AwsStatusRow)
+        self.assertIsInstance(targets.target_state(self.selected_target("linux")), targets.Free)
 
     def test_begin_and_end_events_record_the_actual_target(self) -> None:
         for name in TARGET_NAMES:
@@ -145,14 +145,14 @@ class TargetHoldTests(IsolatedTargetState):
                           for name in TARGET_NAMES for event in ("began", "ended")])
 
     def test_wrong_holder_cannot_release_another_targets_hold(self) -> None:
-        result = self.invoke_hold(["hold", "--target", "aws", "--holder", "alice", "--for", "inspect"])
+        result = self.invoke_hold(["hold", "--target", "linux", "--holder", "alice", "--for", "inspect"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        result = self.invoke_hold(["release", "--target", "aws", "--holder", "bob"])
+        result = self.invoke_hold(["release", "--target", "linux", "--holder", "bob"])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("alice", result.stdout)
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([(event["target"], event["event"]) for event in self.events()], [("aws", "began")])
+        self.assertEqual([(event["target"], event["event"]) for event in self.events()], [("linux", "began")])
 
     def test_unknown_targets_refuse_without_writes_or_dispatch(self) -> None:
         before = self.snapshot()
@@ -174,7 +174,7 @@ class TargetHoldTests(IsolatedTargetState):
         for name in TARGET_NAMES:
             self.assertFalse(self.directory(name).exists())
             self.assertIsInstance(targets.target_state(self.selected_target(name)),
-                                  targets.AwsStatusRow if name == "aws" else targets.Free)
+                                  targets.Free)
 
 
 if __name__ == "__main__":

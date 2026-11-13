@@ -255,8 +255,9 @@ Each local Promote checkout must exist before the command pushes.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
      A shrink allows only the plan doc and `<plan stem>-next.md`.
-     An as-built commit allows only Markdown paths and must change or delete `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
+     An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
      The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
+     It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
@@ -427,6 +428,11 @@ The caller's working directory stays unchanged.
 
 ### Production open, promote and wrap: `production_lifecycle.py`
 
+`add_showrunner.finish_publication` completes an unknown staff home through `set_home(..., only_unknown=True)`.
+The staff transaction preserves a home that another writer records first.
+The admitted receipt keeps staff references and removes its `session_id`, `doc`, and `config_dir` copies.
+The [launch receipt contract](build-followups-fn-length-hook.md#production-launch-and-wrap-records) defines pending creation claims and retry behavior.
+
 `production_lifecycle.py load|open|promote-main|wrap --production <showrunner name> [--no-ci] …`. `--no-ci` makes the CI, smoke-launch and Mac-run steps print `<step>: ok — skipped: no CI` and is refused together with a verdict flag.
 
 - `load [--resume] [--scratch <dir>]`: checks the checkout. With `--scratch`, it prints `state-dir: ok — <dir>` after the copy above. On resume or for a running doc, it reads the current state file through `update_registration.judgment_state`. It prints the `next` items, or `no next list`, and each unit's last code merge and session. A refused state file prints one `anomaly:` line; load continues.
@@ -502,6 +508,9 @@ Registration retains a stopped timer for discovery and session ownership.
 Timer folders and targets retain the showrunner's fixed staff ID.
 Discovery uses the staff row's current session and current name.
 Registry names do not affect registration or discovery.
+Scheduled timer configurations store no sender name.
+`delivery --owner <staff id>` derives the sender and prompt from one current staff snapshot.
+The [notifier contract](session-notifier.md#delivery) defines framing and delivery failure behavior.
 The herdr session list classifies showrunner panes through native session identity and the owning staff ID.
 Quota notices retain staff IDs for named recipients.
 Current staff names resolve at notice creation; former names do not resolve.
@@ -618,6 +627,14 @@ The [staff identity contract](staff-accessors.md#staff-identity-and-backends) de
 Saved progress state uses the fixed staff reference instead of a copied session name.
 
 - **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+
+  `unit_status.sh` recognizes peers by their staff name, fixed staff id, and current session id.
+  A replaced session therefore keeps its peer-wait classification.
+  Registry display names do not select these peers.
+
+`/showrunner:promote_unit` selects an existing member through its staff row.
+It joins the row's `current_session` to native pane or process evidence.
+An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
   Each table prints one row per production staff unit.
@@ -830,7 +847,21 @@ The pass shares one absolute monotonic deadline across discovery, pane text and 
 
 - **Paused units and external waits.** `stall_watch.status_defers_bump` checks the latest assistant turn-end status in the transcript. The pane supplies a fallback when the transcript has no usable status. A pause or an explicit external-owner wait resets the stretch without a bump or report, including near compaction. The watcher reads `paused_status_pattern`, `external_wait_pattern` and `external_owner_pattern` from `config/stall_watch.conf` at use. The `owner` group identifies the dependency. Live peer names and the showrunner's staff name also match. Matching ignores case. Other `holding:` lines prevent a bump only when they name an outside party anywhere in the line. The watcher reads those party words from `holding_party_pattern` at use and also checks the same peer names. The unit's own name, pane label, Claude session name and full session address do not count as outside parties. A party occurrence inside a complete own name does not count. A separate occurrence or a longer peer name still counts. The watcher reuses the pane labels from discovery through the shared pane snapshot. It makes no extra herdr read for labels. A failed label read produces one diagnostic per session per pass. Prompt checks continue without the label. Both checks keep the status text unchanged. Hyphens join words, so `user-interface` does not name the user. A sentence period ends a name; `.v2` continues it. Such a hold gets only the per-unit log line `inspected <showrunner name>/<name>: holding`. It sends no delivery to the unit or showrunner. The hold leaves `tell_sent` false, so a later idle unit can receive its bump and tell. A hold naming only its own worker, work order, tests or build receives the normal idle bump when nothing runs. Running work resets the stretch, and the unit reads `running`. Running work is one of these: a process that `work_running` finds; a busy pane worker whose staff parent is the director (`worker_panes.worker_state(observed) == "busy"`); or a live detached run of such a worker (`detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`). The watcher checks pane workers only for a unit with no process work, and detached runs only when no pane worker is busy. `read_busy_pane_worker_parents` makes one `worker_panes.observe_parents` read for all directors of the pass, on first need, and makes none when no watched director has staff workers. The held run folder is `unit_lookup.HeldRun.folder`, which can be a verified marker target outside `unit_runs.run_roots()`. A worker that waits on its own detached run reads idle in its pane, so only the detached-run check finds that work. A failed pane read or detached-run read counts as no work. It prints one `stall-watch: pane workers:` or `stall-watch: detached runs: <unit>:` line, and the pass continues. A resumed unit gets a fresh idle stretch. An override may omit status patterns; the watcher reads those patterns from the packaged config. Prompt grace still requires a valid value in the selected file. Invalid status rules print a diagnostic and suppress the unit's bump for that pass. Other units and pending deliveries continue. Missing, unmatched or empty `owner` captures are invalid. Run records still control eligibility. Herdr's `blocked` status follows the permission-prompt path above. Shutdown adds no unit-pause flag; stopped directors fail the live-session check.
 
-- **Expired login.** The watcher reads `login_limit_pattern` from `config/stall_watch.conf` at use. It checks the pane text after the last turn end, before the idle stretch. While the limit shows, the unit gets no bump. The showrunner gets one tell: `<unit>: the Claude login reached its time limit and needs /login.` The saved stretch keeps a `login_since` mark and `tell_sent`, so later passes send nothing more. The idle clock stays reset, and the log line reads `login limit`. The login is back when the usage store holds a successful read for the session's Claude login, newer than the session's last transcript activity. `login_restored` makes that read only for a pane at the limit. The login belongs to the account, so other sessions keep the old limit text after one `/login`. With the login back, the unit follows the normal idle path and gets its bump after the stall time. A value that cannot be read keeps the limit. A newer turn end also ends the limit. An old stretch file without the mark still reads.
+- **Expired login.** The watcher reads `login_limit_pattern` from `config/stall_watch.conf` at use.
+  `login_limited` checks the session's latest assistant transcript entry before the idle stretch.
+  Only an API error that matches the pattern establishes a login limit.
+  A successful assistant reply clears the limit, including after a resume on another account.
+  A process start newer than the error also clears it.
+  Old pane scrollback and saved stretch records cannot establish a login limit.
+  A successful usage read for the current account clears an error older than that read.
+  The usage read does not need to follow later transcript activity.
+  While the limit remains, the unit gets no bump.
+  The showrunner gets one tell: `<unit>: the Claude login reached its time limit and needs /login.`
+  The saved stretch keeps `login_since`, `login_pid` and `tell_sent` across pane changes, including a missing pane match.
+  The idle clock stays reset, and the log line reads `login limit`.
+  After recovery, the normal idle clock starts again.
+  A later login limit can send a new tell.
+  Old stretch files remain readable.
 
 - **`unit_status.sh` units.** `unit_status.sh <state-dir> <user-zone> --production <showrunner name>` takes its units from `live_units.py --production <showrunner name>`. Each block is headed by the unit id, and its text is read with `session_pane.py read unit <showrunner name> <unit>`.
 

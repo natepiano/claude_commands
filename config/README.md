@@ -313,7 +313,8 @@ The installed account file supplies these settings:
 The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
 These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
 They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
-`spot_quota_request_vcpus=128` requests capacity for four gates with 32 vCPUs each through `deploy.py quota-request`.
+`spot_quota_request_vcpus=136` requests capacity through `deploy.py quota-request`.
+This covers four 32-vCPU gates and one 8-vCPU Hana box.
 The gate records its own bid and allowance in each reservation.
 `attempt_allowance_usd` reserves non-compute costs before launch.
 Admission includes every open reservation's allowance when bills exist.

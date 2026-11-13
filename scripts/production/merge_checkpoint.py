@@ -97,7 +97,7 @@ class ShrinkCommit(NamedTuple):
 
 
 class AsBuiltCommit(NamedTuple):
-    """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
+    """A unit's closing documentation commit after its last phase merged."""
 
 
 class ReviewTrial(NamedTuple):
@@ -586,9 +586,16 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         plan = checkpoint_plan(request).as_posix()
         unexpected = [path for path in paths if not path.endswith(".md")]
         if unexpected or plan not in paths:
-            raise checkpoint_gate.Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
-                       + f"got {', '.join(paths)}",
-                       "commit only the as-built docs and the plan's deletion, then resend the as-built")
+            plan_exists = bool(good(git(request.production.checkout, "ls-tree", "--name-only",
+                                        request.production.merge_branch, "--", plan), "scope"))
+            if plan_exists or unexpected or any(PurePosixPath(path).parent != PurePosixPath("docs/as-built")
+                                                for path in paths):
+                rule = (f"an as-built commit carries only docs and must change or delete {plan}; " if plan_exists
+                        else f"an as-built commit without {plan} on the merge branch allows only docs/as-built/*.md; ")
+                raise checkpoint_gate.Stop("scope", "held", rule
+                           + f"got {', '.join(paths)}",
+                           "commit only the as-built docs" + (" and the plan's deletion" if plan_exists else "")
+                           + ", then resend the as-built")
     checkpoint_gate.report("scope", "ok", f"{len(paths)} changed paths"
            + (f"; {imported} came from origin merge branches" if imported else ""))
 
