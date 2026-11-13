@@ -1179,3 +1179,32 @@ From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved del
 **Files:**
 - `scripts/lint/tmp_sweep.py` — `judge_entries`, `run_folder_guards`, `ClosedPhaseEntry`, `CleanupEndReason.CLOSED_PHASE`, `remove_entry`.
 - `scripts/lint/test_tmp_sweep.py` — rows in `assert_run_tmp_entries`, `OwnerTests`, `RunFolderTests` and `PaneRunTests`: both eligible guards, open and older open phases, `ad hoc`, fresh and used folders, unreadable state, an unended worker with a live worktree, a replaced parent, and `--plan`/`--apply`.
+
+### Phase 59 — The disk walk measures ~/.local/state · status: done
+
+From builds (not the user), 2026-11-12: "a gap for buildlog-disk and disk_floor. The aws GPU size trial wrote 49 GiB under ~/.local/state/gpu-size-trial in 90 min, and neither saw it, because ~/.local/state is outside the measured folders. Measure the large writers under ~/.local/state too, so the floor alert names them."
+
+Cause: `scripts/buildlog/disk.py` `FOLDERS` lists only `~/rust`, `/tmp` and the two CI runners. The floor alert and the build report read their folder rows from that walk. Measured 2026-11-12 20:25 EST: `~/.local/state` holds 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+
+#### Work Order
+
+**Goal:** The disk walk measures `~/.local/state`, so a large writer there appears in the walk rows, the growth totals and the floor alert.
+
+**Spec:**
+- `scripts/buildlog/disk.py`: add `("~/.local/state", "~/.local/state")` to `FOLDERS`. The existing depth rule (levels 0 to 3) and the cargo target exclusion apply unchanged.
+- No change to `sweep.py`: `read_disk_measurement` and the alert already read every walk row and total.
+- `scripts/buildlog/test_disk.py`: add one row that proves a large folder under a `~/.local/state` root appears in `outside_build_caches` with its growth, and in `outside_build_cache_totals`.
+- Do not run the real walk.
+
+**Files:**
+- `scripts/buildlog/disk.py`
+- `scripts/buildlog/test_disk.py`
+
+**Workers:** `1 writer`
+- writer: all files.
+
+**State:** none.
+
+**Acceptance gate:**
+- `scripts.buildlog.test_disk` passes, with the new row.
+- `basedpyright` reports 0 errors and 0 warnings on the changed Python files.
