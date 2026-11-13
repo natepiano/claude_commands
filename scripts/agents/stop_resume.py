@@ -1175,10 +1175,20 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = original.entry if original is not None else None
         if original is not None:
             source_client = client if original.path == pane_record.record_path(client.session) else herdr.Herdr(original.path.stem)
-            source_matches = pane_launch.reference_panes(pane_launch.launch_reference(original.entry, names.tab_record),
-                names.tab_record, source_client, {original.entry["pane_id"]: original.entry})
+            locations = [dict(pane) for pane in source_client.panes()]
+            evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(names.tab_record, locations))
+            reference = pane_launch.launch_reference(original.entry, names.tab_record)
+            source_matches = pane_launch.reference_panes(reference, names.tab_record, source_client,
+                {original.entry["pane_id"]: original.entry}, evidence=evidence)
             if len(source_matches) == 1:
                 source_pane = pane_launch.ResumeSourcePane(str(source_matches[0]["pane_id"]))
+            elif not any(pane["pane_id"] == original.entry["pane_id"] for pane in locations):
+                source_pane = pane_launch.ResumeSourcePane(original.entry["pane_id"])
+            elif any(pane["pane_id"] == original.entry["pane_id"]
+                     for owner_id, panes in evidence.scan.found.items()
+                     if not isinstance(reference, pane_launch.StaffLaunchReference) or owner_id != reference.id
+                     for pane in panes):
+                source_pane = pane_launch.ResumeSourceAbsent.OTHER_OWNER
         if entry is None and row is None:
             recovered = _unrecorded_codex_launch(identity)
             if isinstance(recovered, SessionNotFound):
