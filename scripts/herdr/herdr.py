@@ -41,7 +41,7 @@ from contextvars import ContextVar
 from threading import RLock
 from functools import cache, cached_property
 from importlib import import_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
@@ -329,6 +329,14 @@ class OpeningPrompt:
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
+    def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
+        """Keep a supplied cursor or position a new cursor before the agent starts."""
+        if isinstance(self.cursor, TranscriptCursor) or not isinstance(self.transcript, SessionTranscript):
+            return self
+        cursor = TranscriptCursor(self.transcript, since)
+        cursor.skip_existing_turns()
+        return replace(self, cursor=cursor)
+
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
@@ -370,6 +378,17 @@ class TranscriptCursor:
     current_paths: tuple[Path, ...] = field(default=(), init=False)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def bind_transcript(self, transcript: SessionTranscript) -> None:
+        """Read a changed native transcript from zero and retain the launch time filter."""
+        if transcript == self.transcript:
+            return
+        self.transcript = transcript
+        self.offsets.clear()
+        self.sizes.clear()
+        self.turns.clear()
+        self.current_paths = ()
+        self.readability = TranscriptReadable()
 
     def skip_existing_turns(self) -> None:
         """Skip complete rows before launch without parsing historical JSON."""
@@ -2344,6 +2363,8 @@ class Herdr:
         launched_at = datetime.now(timezone.utc)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
+        if isinstance(opening, OpeningPrompt):
+            opening = opening.prepare_for_launch(launched_at)
         try:
             while True:
                 result = self.start_command(
@@ -2398,12 +2419,14 @@ class Herdr:
                     print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
                     return PromptNotSubmitted("native session is unavailable; pane retained")
                 transcript = SessionTranscript(transcript.config_dir, identity)
+                if isinstance(opening.cursor, TranscriptCursor):
+                    opening.cursor.bind_transcript(transcript)
                 try:
                     _ = opening.before_prompt(transcript)
                 except Exception as error:
                     print(f"herdr {transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
                     return PromptNotSubmitted(f"staff publication failed: {error}")
-                opening = OpeningPrompt(opening.text, transcript)
+                opening = replace(opening, transcript=transcript)
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()

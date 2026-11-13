@@ -23,7 +23,7 @@ from threading import Event, RLock, Thread
 from pathlib import Path
 from typing import Literal, cast, override
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import NAMESPACE_URL, uuid5
 from unittest.mock import call, patch
@@ -2399,6 +2399,59 @@ class RestartTests(RestartTestCase):
         wait.assert_called_once_with(staff.StaffSnapshot(()))
         self.assertTrue(output.getvalue().startswith("saved 0 rows for restart at "))
         self.assertEqual(errors.getvalue(), "restart: save anomaly: staff unavailable\n")
+
+    def test_restart_shares_the_prelaunch_cursor_without_losing_resume_proof(self) -> None:
+        row = self.rows[0]
+        self.running.clear()
+        home = self.root / ".claude2"
+        requested = herdr.SessionTranscript(home, str(row.current_session))
+        original = home / "projects/fixture" / f"{row.current_session}.jsonl"
+        history = json.dumps({"timestamp": "2020-01-01T00:00:00+00:00", "type": "assistant",
+                              "message": {"role": "assistant", "content": "prelaunch-only-history"}}) + "\n"
+        for native_identity_changes in (False, True):
+            with self.subTest(native_identity_changes=native_identity_changes):
+                native = herdr.SessionTranscript(home, str(row.current_session) + ("-native" if native_identity_changes else ""))
+                source = original.with_name(native.session_id + ".jsonl")
+                write_text_atomic(original, history)
+                write_text_atomic(source, history)
+                shutdown_record.save([str(row.id)])
+                cursors: list[herdr.TranscriptCursor] = []
+
+                def launched(*arguments: object, **_options: object) -> herdr.AgentLaunched:
+                    opening = arguments[5]
+                    assert isinstance(opening, herdr.OpeningPrompt)
+                    cursor = opening.cursor
+                    assert isinstance(cursor, herdr.TranscriptCursor)
+                    cursors.append(cursor)
+                    self.assertEqual(cursor.transcript, requested)
+                    self.assertEqual(cursor.offsets, {original: len(history.encode())})
+                    user_at = cursor.since + timedelta(seconds=1)
+                    user = {"timestamp": user_at.isoformat(), "type": "user",
+                            "message": {"role": "user", "content": opening.text}}
+                    write_text_atomic(source, source.read_text() + json.dumps(user) + "\n")
+                    assistant = {"timestamp": (user_at + timedelta(seconds=1)).isoformat(), "type": "assistant",
+                                 "message": {"role": "assistant", "content": "Resumed work"}}
+                    write_text_atomic(source, source.read_text() + json.dumps(assistant) + "\n")
+                    _ = opening.before_prompt(native)
+                    self.assertEqual(cursor.transcript, native)
+                    self.assertEqual(cursor.offsets, {} if native_identity_changes else {source: len(history.encode())})
+                    proof = cursor.submitted_prompt(opening.text)
+                    self.assertIsInstance(proof, herdr.PromptSubmitted)
+                    return herdr.AgentLaunched("w1:p0", herdr.PromptSubmitted(user_at))
+
+                with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                      patch.object(herdr, "launch_prepared_agent", side_effect=launched),
+                      patch.object(json, "loads", wraps=json.loads) as parsed,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(), 0)
+                self.assertEqual(len(cursors), 1)
+                self.assertEqual([line for line in output.getvalue().splitlines() if "restart check:" in line],
+                                 ["restart check: 1 of 1 directors resumed"])
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(shutdown_record.read(), [])
+                self.assertEqual(any("prelaunch-only-history" in str(value)
+                                    for parsed_call in parsed.call_args_list
+                                    for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
 
     def test_restart_fixed_reference_uses_current_native_id_name_and_folder(self) -> None:
         class ContinuationDelivery(Enum):
