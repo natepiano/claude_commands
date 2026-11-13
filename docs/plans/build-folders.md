@@ -378,6 +378,15 @@ Run the existing complete gate after the final migration.
 
 ## Phase 9 — Test run folders
 
+**Implementation:** Direct unittest and timed runs allocate through the shared Python bootstrap.
+`targeted_test.py` uses the same maker context.
+Each run holds its lock and sets TMPDIR for itself and its children.
+Normal exit removes the complete allocation.
+The next run sweeps free residue in the same test-runs parent before allocation.
+The sweep retains held allocations and removes unfinished temporary lease files under the allocation lock.
+`run_build` keeps its command in the caller's process group and installs no signal handler.
+Stopped commands leave recorded residue for the sweep after their locks become free.
+
 **Goal:** Give each test run outside the merge gate its own TMPDIR, so a killed run leaves no folder behind.
 **Owner unit:** devtools.
 **Estimate:** 4 worker hours.

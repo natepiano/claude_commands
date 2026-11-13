@@ -48,6 +48,7 @@ def select_checkout(arguments: list[str]) -> str:
         state.__path__ = []
     selected = next(iter(state.__path__), "")
     if selected and state.__dict__.get("completed_selection") == (selected, _selection_inputs(sys.path)):
+        _start_test_run(selected, arguments, state)
         return selected
     if not selected:
         script = arguments[0] if arguments else ""
@@ -71,7 +72,27 @@ def select_checkout(arguments: list[str]) -> str:
         paths.insert(position, selected)
     sys.path[:] = paths
     state.__dict__["completed_selection"] = (selected, _selection_inputs(sys.path))
+    _start_test_run(selected, arguments, state)
     return selected
+
+
+def _start_test_run(selected: str, arguments: list[str], state: ModuleType) -> None:
+    """Allocate for direct test runners after checkout selection."""
+    if state.__dict__.get("test_run_started") or os.environ.get("MERGE_GATE_PARENT_PID"):
+        return
+    original = sys.orig_argv
+    unittest_module = ("-munittest" in original
+                       or any(original[index:index + 2] == ["-m", "unittest"] for index in range(len(original))))
+    target = arguments[0] if arguments else ""
+    if not (unittest_module or target == "unittest" or os.path.basename(target) == "module_run.py"):
+        return
+    # Partial fixture checkouts can contain only the startup files.
+    if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):
+        return
+    state.__dict__["test_run_started"] = True
+    from scripts.lib.testing_folders import start_test_run
+
+    start_test_run()
 
 
 def after_startup(callback: Callable[[], None]) -> None:
