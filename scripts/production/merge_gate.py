@@ -876,6 +876,29 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
 
 
 @contextmanager
+def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
+    """Keep a whole-machine run's recovery files in its own temporary directory."""
+    current = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+        yield current
+        return
+    identity = process_start(os.getpid())
+    if not isinstance(identity, Started):
+        raise GateRefused("the gate has no readable process start")
+    with tempfile.TemporaryDirectory(prefix="merge-gate-recovery-", dir=parent) as folder:
+        directory = Path(folder)
+        with (directory / "operation.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+            recovery.save()
+            token = ACTIVE_GATE_RECOVERY.set(recovery)
+            try:
+                yield recovery
+            finally:
+                ACTIVE_GATE_RECOVERY.reset(token)
+
+
+@contextmanager
 def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
     with ExitStack() as cleanup:
         with defer_cleanup_signals():
@@ -1382,8 +1405,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
-    recover_gate_runs(repo)
     shared = isinstance(machine, SharedMachine)
+    if shared:
+        recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
     try:
         memory_stop_reruns = conf.read("merge_gate").whole("memory_stop_reruns") if shared else 0
@@ -1521,7 +1545,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    with (gate_recovery(repo) as recovery, record_on_abort(),
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
           ExitStack() as module_folders,
