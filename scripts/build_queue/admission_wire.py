@@ -297,12 +297,49 @@ class BuildHistoryReply:
 
 
 @dataclass(frozen=True)
+class LocalAdmissionContext:
+    argv: tuple[str, ...]
+    cwd: str
+    sidecar: str
+    call: records.Call
+    test_width: records.TestWidth
+    fresh_test: bool
+    token_back_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class LocalAdmissionUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PlacementRequest(CallerCode):
     episode: str
     owner: placement.SubmittingOwner
     since: float
     profile: records.StepProfile | records.ProgramProfile
     constraints: placement.PlacementConstraints
+    identity: Identity = Identity("", "", "", "")
+    run: RunIdentity | NoRun = NO_RUN
+    local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
+    prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())
+    purpose: placement.PlacementPurpose = field(default_factory=lambda: placement.NormalStep())
+
+
+@dataclass(frozen=True)
+class PrerequisiteReport(CallerCode):
+    request_id: str
+    episode: str
+    owner: placement.SubmittingOwner
+    prerequisite: placement.LocalExecutionPrerequisite
+
+
+@dataclass(frozen=True)
+class CancelPlacement(CallerCode):
+    request_id: str
+    episode: str
+    owner: placement.SubmittingOwner
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -310,6 +347,8 @@ class ClaimFailure(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
     reason: str
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim = field(
+        default_factory=lambda: placement.NoProviderClaim())
 
 
 @dataclass(frozen=True)
@@ -317,15 +356,30 @@ class ConsumePermission(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
+    holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
+        default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
 
 
 @dataclass(frozen=True)
 class ExecutionReport(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
-    claim: placement.ProviderClaimReference
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim
     evidence: placement.ExecutionEvidence
-    outcome: str = ""
+    outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
+    path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
+
+
+@dataclass(frozen=True)
+class PlacementEvidenceWait:
+    pass
+
+
+@dataclass(frozen=True)
+class PlacementResourceWait:
+    resource: str
+    reason: str
+    holder: placement.ResourceHolder = field(default_factory=lambda: placement.ResourceHolderUnknown())
 
 
 @dataclass(frozen=True)
@@ -334,11 +388,25 @@ class PlacementWait:
     since: float
     position: int
     eligibility: tuple[placement.CandidateEligibility, ...]
+    wait: Wait | PlacementEvidenceWait | PlacementResourceWait = field(default_factory=PlacementEvidenceWait)
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
+    retry_notices: tuple[placement.ProviderRetryNotice, ...] = ()
 
 
 @dataclass(frozen=True)
 class Assignment:
     assignment: placement.PlacementAssignment
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LocalPlacementGranted:
+    assignment: placement.PlacementAssignment
+    grant: Admitted
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -353,14 +421,15 @@ class DispatchStatus:
     state: placement.AssignmentState
     permission: placement.LaunchPermission | placement.NoLaunchPermission
     reason: str = ""
+    retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
 Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
-           | PlacementRequest | ClaimFailure | ConsumePermission | ExecutionReport)
+           | PlacementRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
 Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
-         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
+         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus)
 
 _REQUESTS: dict[str, type] = {
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
@@ -369,15 +438,17 @@ _REQUESTS: dict[str, type] = {
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
 }
 REPLY_TYPES: dict[str, type] = {
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
+    "local_placement_granted": LocalPlacementGranted,
 }
-_PLACEMENT_TYPES = (PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport,
-                    PlacementWait, Assignment, FirstAuthorization, DispatchStatus)
+_PLACEMENT_TYPES = (PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+                    PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
 
@@ -399,6 +470,16 @@ def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
     priority = record.get("priority")
     if isinstance(priority, dict):
         record["priority"] = records.upgrade_queue_priority(cast(dict[str, object], priority))
+    return record
+
+
+def _placement_wire_defaults(record: dict[str, object]) -> dict[str, object]:
+    """Decode older placement messages into semantic recovery states."""
+    record = _read_wire_record(record)
+    if record.get("kind") == "AdoptedProviderClaim" and "holder" not in record:
+        return {**record, "holder": {"kind": "ClaimHolderUnconfirmed", "reason": "older holder evidence"}}
+    if record.get("kind") == "ExecutionReport" and isinstance(record.get("outcome"), str):
+        return {**record, "outcome": {"kind": "AttemptOutcomeUnavailable", "reason": record["outcome"] or "older outcome"}}
     return record
 
 
@@ -438,7 +519,7 @@ def encode_envelope(value: object, variants: dict[str, type], version: int = VER
 
 def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, object]:
     try:
-        value = cast(object, json.loads(line, object_hook=_read_wire_record))
+        value = cast(object, json.loads(line, object_hook=_placement_wire_defaults))
         if not isinstance(value, dict):
             raise ValueError("invalid admission envelope")
         envelope = cast(dict[str, object], value)

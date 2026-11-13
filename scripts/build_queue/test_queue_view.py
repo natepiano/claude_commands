@@ -22,6 +22,7 @@ from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, L
 from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
@@ -113,6 +114,27 @@ class RecordedOwnerQueueTests(unittest.TestCase):
 def queue_json_text(data: QueueLines) -> str:
     """Read the text cells from the queue pane's JSON lines."""
     return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
+
+
+def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
+    """Keep a local charge beside host-scoped executions with equal process values."""
+    local = reading.view.running[0]
+    local = replace(local, execution=placement.ObservedExecution(
+        placement.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
+    remote = tuple(replace(local, session_id=f"remote-{host}", session_name=f"remote-{host}",
+        promise=0, measured=admission_records.RemoteMemoryUnavailable("remote memory is unavailable"), pid=900,
+        execution=placement.ObservedExecution(placement.ProcessExecution(host, "remote-generation", 900, "equal-start")),
+        assignment_host=host) for host in ("fixture-mac", "fixture-ssh"))
+    uncertain = replace(remote[0], session_id="remote-uncertain", session_name="remote-uncertain",
+        pid=admission_records.PidNotRecorded(), execution=placement.ExecutionEvidenceUnavailable("transport unavailable", NOW),
+        assignment_host="uncertain-mac")
+    explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+        0, 0, 0, owner=f"remote-{index}") for index, step in enumerate((*remote, uncertain)))
+    running = (local, *reading.view.running[1:], *remote, uncertain)
+    existing = tuple(replace(row, step=local) if row.step == reading.view.running[0] else row
+                     for row in reading.explanation.running)
+    return replace(reading, view=replace(reading.view, running=running),
+                   explanation=replace(reading.explanation, running=(*existing, *explained)))
 
 
 class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
@@ -596,6 +618,22 @@ class QueueViewFixtureTests(QueueFixtureTests):
 
 
 class QueueViewTests(QueueViewFixtureTests):
+
+    def test_converted_hosts_keep_equal_process_values_separate_and_preserve_the_local_charge(self) -> None:
+        self.fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+        baseline = self.fixture.model()
+        model = replace(baseline, reading=with_converted_executions(baseline.reading))
+        rows = queue_view.running_builds(model)
+        self.assertEqual(len(rows), len(queue_view.running_builds(baseline)) + 3)
+        self.assertEqual(sum(row.used for row in rows), sum(row.used for row in queue_view.running_builds(baseline)))
+        text = plain(queue_view.render_view(model, 160))
+        for host in ("local-host", "fixture-mac", "fixture-ssh", "uncertain-mac"):
+            self.assertIn(host, text)
+        self.assertEqual(model.reading.explanation.room, baseline.reading.explanation.room)
+        unknown = next(row for row in rows if row.step.session_id == "remote-uncertain")
+        self.assertIsInstance(unknown.step.pid, admission_records.PidNotRecorded)
+        self.assertFalse(unknown.measured)
+        self.assertEqual(unknown.used, 0)
 
     def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()

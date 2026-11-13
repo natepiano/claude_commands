@@ -34,6 +34,9 @@ class SavedPlacementAssignment:
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
     provider: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+    holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
+    retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
+    terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -452,7 +455,13 @@ def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -
 class GoneMemory:
     pass
 
-StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory
+
+@dataclass(frozen=True)
+class RemoteMemoryUnavailable:
+    reason: str
+
+
+StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory | RemoteMemoryUnavailable
 
 
 @dataclass(frozen=True)
@@ -853,6 +862,28 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
+    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    assignment_host: str = ""
+
+
+def execution_host(step: RunningStep, local_host: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+    return step.assignment_host or local_host
+
+
+def execution_group(step: RunningStep, fallback: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        if isinstance(identity, placement.ProcessExecution):
+            return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        return repr((identity.target, identity.generation, identity.instance, identity.attempt))
+    if step.assignment_host:
+        return repr((step.assignment_host, fallback))
+    return run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else fallback
 
 
 @dataclass(frozen=True)

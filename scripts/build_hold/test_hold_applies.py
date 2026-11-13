@@ -126,7 +126,7 @@ class HoldAppliesTest(TemporaryHoldTest):
         self.assertEqual(hold_applies.hold_applies(), REFUSAL)
         self.assert_cli(0, REFUSAL)
         proc = self.root / "proc"
-        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+        for pid, parent in ((10, 1), (20, 10), (30, 1), (40, 1)):
             directory = proc / str(pid)
             directory.mkdir(parents=True)
             fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
@@ -135,9 +135,9 @@ class HoldAppliesTest(TemporaryHoldTest):
         _ = holder.write_text(json.dumps({
             "holder": "builder", "since": "2026-10-28T12:00:00+00:00",
             "for": "app test", "release_eta": "unknown",
-            "keep": [{"pid": 10, "start_time": "1000"}],
+            "keep": [{"pid": 10, "start_time": "1000"}, {"pid": 40, "start_time": "3999"}],
         }))
-        for pid, refusal in ((10, ""), (20, ""), (30, REFUSAL)):
+        for pid, refusal in ((10, ""), (20, ""), (30, REFUSAL), (40, REFUSAL), (50, REFUSAL)):
             with self.subTest(caller_pid=pid), mock.patch.object(build_hold, "PROC_ROOT", proc), \
                  mock.patch.object(os, "getpid", return_value=pid):
                 self.assertEqual(hold_applies.hold_applies(), refusal)

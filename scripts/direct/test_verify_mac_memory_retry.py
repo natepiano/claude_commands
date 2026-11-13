@@ -49,7 +49,8 @@ class VerifyMacMemoryRetryTests(VerifyMacMemoryRetryFixture):
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"), **self.leave_once()})
         self.addCleanup(self.stop_verify, process)
         # The Mac claim declined again; the local run waits with the hook still set.
-        self.wait_for_path(self.runner_state / "free-now-after-leave", (process,))
+        self.wait_until(lambda: len(self.runner_events()) == 2, "two remote refusals", (process,))
+        self.wait_for_memory_wait(process)
         self.assertEqual(len(self.runner_events()), 2)
         self.assertEqual(self.local_runs(), [])
         self.release_memory(meminfo)
@@ -57,7 +58,7 @@ class VerifyMacMemoryRetryTests(VerifyMacMemoryRetryFixture):
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.local_runs()), 1)
         self.assertEqual(len(self.runner_events()), 2)
-        self.assertEqual(output.count("verify.sh: running on natedev"), 2)
+        self.assertEqual(output.count("verify.sh: running on natedev"), 1)
         self.assertEqual(self.routing_record()["target"], "natedev")
         record = self.last_call()
         self.assertEqual((record["mac"], record["mac_reason"]), ("declined", "busy"))
