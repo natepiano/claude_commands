@@ -1333,10 +1333,14 @@ From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-
 
 ### Phase 70 — Cloud step names carry their unit · status: done
 
-From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: "you see how the unit shows for hana's trunk nextest? it should also show for the sdlc panes targeted test - so it should say "panes targeted test" but to save space probably it should just say "panes targeted". and the merge gate for builds when it is a showrunner doing a merge gate we should just say "showrunner merge" rather than merge gate - when it is a merge gate done by a showrunner - if it's a merge gate run by a unit director then it should say {unit} merge - so for merge gates it is either "showrunner merge" or "{unit} merge"".
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: a targeted test should read "<unit> targeted", and a merge gate "showrunner merge" or "<unit> merge".
 
-1. On the build page, a targeted test step reads "<unit> targeted".
-2. A merge gate step reads "showrunner merge" when a showrunner runs it, and "<unit> merge" when a unit director runs it.
-3. The name templates are new keys in `config/build_steps.conf`. The current `names.*` and `prose.*` values do not change.
-4. A step whose owner is not known keeps its current name.
-5. Director decision, 2026-11-13: a worker runs a step for its owner. A worker under a unit director (running or not) owns the step for that unit. A showrunner's own staff worker, with no unit, owns it for the showrunner.
+#### As-built
+
+- `make_labels` sets `OwnerRole` on `UnitLabels`. `SHOWRUNNER`: a session that runs a production, or a showrunner's own staff worker with no unit. `UNIT`: a unit director or a worker under one, running or not. `UNKNOWN`: every other path.
+- `StepNames.for_owner(step, unit, role)` reads new `owned.*` keys in `config/build_steps.conf`: `{unit} targeted`, `{unit} merge` and `showrunner merge`. `UNKNOWN` keeps the current name. The `names.*` and `prose.*` values do not change.
+- One cloud naming helper in `queue_view.py` names both the Running and the Queued rows.
+- A worker's step belongs to its owner (director decision, 2026-11-13). sdlc's merge worker, staff kind unit, reads "sdlc-merge-gate merge".
+- Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
+
+**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
