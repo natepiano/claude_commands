@@ -146,8 +146,65 @@ def read_snapshot(directory: Path) -> dict[str, object]:
         return {'prices': [], 'regions': []}
 
 
+@dataclass(frozen=True)
+class SnapshotFailure:
+    region: str
+    at: int
+    read: str
+    error: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SnapshotFailureStreak:
+    since: int
+    notice_claimed: bool
+
+
+@dataclass(frozen=True)
+class SnapshotHealthy:
+    """Every regional read succeeded."""
+
+
+def snapshot_failures(document: dict[str, object]) -> tuple[SnapshotFailure, ...]:
+    """Read the latest failed attempt for each region."""
+    return tuple(SnapshotFailure(ledger.text(row, 'region'), ledger.instant(row, 'at'),
+        ledger.text(row, 'read'), ledger.text(row, 'error'), str(row.get('reason', '')))
+        for row in ledger.rows(document, 'failures')) if 'failures' in document else ()
+
+
+def snapshot_failure_notice(key: str, text: str, timeout: float) -> bool:
+    """Send a keyed user notice through the existing message interface."""
+    command = Path(__file__).resolve().parents[1] / 'message/send.py'
+    try:
+        result = subprocess.run([sys.executable, str(command), '--to', 'user',
+            '--text-id', 'nate.adhoc', '--value', 'sender=buildlog',
+            '--value', 'title=AWS Spot snapshot failed', '--value', 'description=' + text,
+            '--key', key], capture_output=True, text=True, check=False, timeout=timeout)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def snapshot_failure_text(failures: Sequence[SnapshotFailure]) -> str:
+    """Name each regional error and its repair."""
+    lines = ['AWS Spot snapshot failed.']
+    for failure in failures:
+        stamp = datetime.fromtimestamp(failure.at, UTC).isoformat()
+        lines.append(f'{failure.region} at {stamp}: {failure.read}: {failure.error}: {failure.reason}')
+    denied = any(any(word in row.reason.lower() for word in (
+        'accessdenied', 'unauthorizedoperation', 'not authorized', 'permission')) for row in failures)
+    if denied:
+        lines.append('Run deploy.py up --workload merge-gates --approve-resources.')
+    else:
+        lines.append('Check the saved AWS error and restore the scaler credentials or network access.')
+    lines.append('The next hourly read retries.')
+    return '\n'.join(lines)
+
+
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
-             clock: Callable[[], float] = time.time) -> int:
+             clock: Callable[[], float] = time.time,
+             notify: Callable[[str, str, float], bool] = snapshot_failure_notice) -> int:
     """Replace successful regional reads and preserve failed regional reads."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
@@ -188,6 +245,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         prices = list(ledger.rows(document, 'prices'))
         readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
+        failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
         for region in regions:
             read_name = 'price'
@@ -203,6 +261,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
                 readings = [row for row in readings if row.get('region') != region]
                 readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
+                _ = failures.pop(region, None)
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
                 raw_lines: list[str] = []
                 for raw_line in str(error).splitlines():
@@ -215,9 +274,30 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     for pattern in SNAPSHOT_ERROR_PATTERNS)), lines[0] if lines else '')
                 reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
                 print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
+                failures[region] = SnapshotFailure(region, now, read_name, type(error).__name__, reason)
                 status = 1
-        write_text_atomic(directory / 'spot-prices.json', json.dumps(
-            {'prices': prices, 'regions': readings}, sort_keys=True) + '\n')
+        current_failures = tuple(failures[region] for region in regions if region in failures)
+        output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
+            dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
+            for row in current_failures]}
+        # Success drops an unsent notice because no user action remains.
+        streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
+        if current_failures:
+            previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
+            since = ledger.instant(previous, 'since') if previous else now
+            notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
+            streak = SnapshotFailureStreak(since, notice_claimed)
+            output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
+        write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+        if isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
+            # Save the claim before delivery because note keys alone do not suppress repeats.
+            output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
+            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_text(current_failures),
+                          configuration.number('snapshot_notification_timeout_s')):
+                output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
+                write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+                print('aws_target: snapshot user notice remains pending', file=sys.stderr)
         _ = lock.seek(0)
         _ = lock.truncate()
         _ = lock.write(str(now))
@@ -313,10 +393,13 @@ class AccountRefresh:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('tick', 'snapshot'))
+    _ = parser.add_argument('command', choices=('tick', 'snapshot', 'open-gates'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     args = parser.parse_args(namespace=RefreshArguments())
+    if args.command == 'open-gates':
+        from scripts.aws_target.open_gates import report
+        return report(args.directory, int(time.time()))
     if args.command == 'snapshot':
         return snapshot(args.settings, args.directory)
     AccountRefresh(args.settings, args.directory).tick()

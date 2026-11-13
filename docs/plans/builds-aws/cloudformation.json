@@ -1751,7 +1751,7 @@
             {
               "Effect": "Allow",
               "Action": [
-                "service-quotas:GetServiceQuota"
+                "servicequotas:GetServiceQuota"
               ],
               "Resource": "*"
             },

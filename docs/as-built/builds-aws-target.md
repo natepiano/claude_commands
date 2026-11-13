@@ -320,14 +320,36 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota`.
-`GateGpuTrialScalerPolicy` already permits both actions on all resources without regional conditions.
-This change requires no IAM deployment.
+The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
+See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
+The snapshot test derives IAM actions from every request in the real snapshot path.
+It checks the scaler policy for each action, all resources, and no regional condition.
+A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
+The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
 The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
 The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
 A regional failure preserves that region's previous prices, quotas, and read time.
 Other regions still refresh, and the command returns a failure status.
+The `failures` array saves the latest failed attempt for each region.
+Each record contains `region`, `at`, `read`, `error`, and the bounded, redacted `reason`.
+A successful regional read removes that region's failure record.
+Old snapshots without failure records remain readable.
+The `failure_streak` record stores `since` and `notice_claimed` while any candidate region fails.
+The reader also accepts the previous `notified` field.
+The snapshot saves each failure before it attempts a user notice.
+It uses `message/send.py --to user --text-id nate.adhoc` with a key from the streak's start time.
+The notice names the failed regions, UTC times, AWS errors, and the repair.
+Permission errors request `deploy.py up --workload merge-gates --approve-resources`.
+Other errors request a check of scaler credentials and network access.
+The snapshot saves the notice claim before it calls the message process.
+The claim prevents another send for that streak after a crash.
+A crash before delivery can suppress that streak's notice.
+A normal delivery failure clears the claim for the next snapshot attempt with the same key.
+Success in every candidate region ends the streak and drops any unsent notice because no user action remains.
+A later failure starts a new streak and permits a new notice.
+`snapshot_notification_timeout_s=120` bounds message review and delivery in seconds.
 Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
 The read name is `price`, `Standard quota`, or `G and VT quota`.
 The shared `admin_secrets.redact` helper removes AWS account ids, ARNs, access key ids, and instance, subnet, AMI, volume, and snapshot ids.
@@ -348,14 +370,32 @@ The snapshot does not change `controller.json`.
 
 `python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
 It prints machine types as rows and candidate regions as columns.
-Each cell shows the lowest zone price in USD/h, or `-` when the snapshot has no offer.
+Each cell shows the lowest zone price in USD/h.
+An empty cell says `no snapshot`, `read failed`, or `no offer`.
+Cached prices and quotas remain visible after a read failure.
+Their cells include `read failed`, and the regional detail gives the last good age.
+Old values include `old <age>s` in their cells.
+Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
+Each region without evidence says `no snapshot was ever taken`.
+The table never uses a bare `-` for an unavailable value.
 It splits wide tables into groups of region columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
 The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
 Standard types use the Standard quota; GPU types use the G and VT quota.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
-An absent snapshot shows unknown quotas and box counts without creating files.
+An absent snapshot explains missing quotas and box counts without creating files.
+
+`python3 scripts/aws_target/aws_target.py open-gates` reads only the local cost ledger.
+It prints the ledger path, file write time, age, counts by state, and pending compute request count.
+It lists each open attempt, state, reservation time, expiry, instance type, region, and mode.
+It never prints an instance id.
+`ledger.gate_is_open` defines open entries as `GateLaunchPending` or `GateRunning`.
+The spending report uses the same function for open reservations.
+Expired reservations remain open until AWS confirms their closure.
+The command calls `CostLedger.read_snapshot()` and `pending_compute_requests()` without locks, writes, or AWS calls.
+It returns 1 when a gate reservation is open and 0 when none is open.
+Missing or unreadable evidence returns 2.
 
 A new gate ranks only variants from its deployment.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.

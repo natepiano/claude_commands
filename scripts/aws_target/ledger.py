@@ -143,6 +143,11 @@ class GateReservation:
     root_gib: int = 0
 
 
+def gate_is_open(reservation: GateReservation) -> bool:
+    """Keep pending and running reservations open until AWS confirms closure."""
+    return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
 @dataclass(frozen=True)
 class GateReserved:
     reservation: GateReservation
@@ -1107,7 +1112,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     month_start, _ = period_bounds(local.date().replace(day=1), settings.accounting_zone)
     first = min(today.replace(day=1), datetime.fromtimestamp(month_start, zone).date())
     last_at = max((r.expires for r in state.gate_reservations
-                   if not isinstance(r.state, (GateAbsent, GateTerminated))), default=now) if reserve else now
+                   if gate_is_open(r)), default=now) if reserve else now
     last = datetime.fromtimestamp(max(now, last_at - 1), zone).date()
     bills = {r.day: r for r in readings if is_billed_day(r) and r.period_end <= now}
     if bills:
@@ -1178,7 +1183,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
             if ((bill is None and latest is None) or
-                    (reserve and isinstance(reservation.state, (GateLaunchPending, GateRunning)))):
+                    (reserve and gate_is_open(reservation))):
                 allowance = gate_allowance(reservation)
                 groups['other'] += allowance.usd
                 include(ChargedInterval(reservation.at, reservation.at, allowance.usd,
