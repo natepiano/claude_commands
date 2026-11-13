@@ -1386,13 +1386,17 @@ From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner 
 
 **Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
 
-### Phase 73 — The Builds page shows each block and hold · status: todo
+### Phase 73 — The Builds page shows each block and hold · status: done
 
-From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". From builds (not the user), 2026-11-13: the item list below.
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". No AWS hold exists, so the page has no AWS row (director decision).
 
-1. The Builds page shows each active block or hold: a Mac block and a natedev hold. Each names its owner (showrunner and unit), why, since and until. No AWS hold exists: the permanent AWS builder was removed, and cloud gates have no hold of their own (director decision; an AWS hold kind, if added later, gets its row then).
-2. A blocked Mac reads "blocked", not "idle". The idle time may stay as detail.
-3. An item that is eligible for the Mac but runs or waits on natedev gets a Mac line in its tooltip. The line says why it does not go to the Mac, for example "Mac: blocked by research-unit (hana) until 15:59", "Mac: busy with <run>", "Mac: excluded, linux_only" or "Mac: kind not offloaded".
-4. The answer comes from the `build_targets.py` eligible and status readers. There is no second reader.
-5. An astra design review reads the design (a mockup or a written design with the shot) before the build. Its findings are fixed and go to builds with the checkpoint.
-6. Proof: before and after shots of the same live Mac block state.
+#### As-built
+
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
+- `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
+- The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
+- The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
+- `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
