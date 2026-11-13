@@ -125,6 +125,7 @@ class PaneWorld(herdr.Herdr):
         config.mkdir()
         write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                           + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
+                          + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
                           + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
                           + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
                           + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"

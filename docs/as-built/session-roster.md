@@ -23,14 +23,16 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 ### Record sources
 
-The roster joins staff, run records, process evidence, and assignment logs.
-Staff supplies each worker's current session and parent.
-The assignment log supplies its task role and lens.
+The roster joins staff, run records, and process evidence.
+Staff supplies each worker's current session, parent, and task role.
+`progress_history.last_dispatch` supplies an addressed reviewer's lens.
+An unavailable lens keeps the worker with a plain `review` label.
+The roster reads no current role from the agents log.
 The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines stored run fields.
 
 | Source | Where | Gives |
 |---|---|---|
-| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
+| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | Owner staff id; staff supplies the current session, name, and document; native records supply the socket |
 | Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
 | Open runs | The director's staff row | `run` stores the run folder; `current_session` selects the director |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
@@ -66,7 +68,10 @@ Codex rows:
 - **Worker.** Staff membership and pane evidence supply state and process evidence.
   The fixed staff id resolves the current thread and parent through one staff snapshot.
   A worker whose backend is Claude appears only as a Claude row.
-  The assignment log supplies the task role and review lens.
+  The staff row supplies the task role through `KnownWorkerRole`.
+  Dispatch evidence supplies the review lens.
+  A failed lens lookup keeps this worker and later workers in the roster.
+  An unknown staff role produces an unrecorded assignment without a history fallback.
   Open workers show the native status and pane.
   Other workers show stopped, closed, unknown or incomplete evidence.
   `session_staff.worker_directory` supplies the working directory.

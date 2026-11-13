@@ -17,7 +17,6 @@ import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, fields, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -34,7 +33,6 @@ from scripts.message import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, session_staff, worker_admission
 from scripts.production.production_doc import Refusal as ProductionDocumentRefused
-from scripts.usage import agents_log
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -66,8 +64,8 @@ from scripts.message.sessions import RegistryRead, SessionRecord, messaging_sock
 
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]
-WorkerRole = Literal["impl", "test", "fix", "review"]
-KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
+WorkerRole = staff.WorkerRole
+KNOWN_SLOT_ROLES = frozenset(staff.WORKER_ROLES)
 MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
 
 
@@ -805,20 +803,23 @@ def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: l
     return fallback
 
 
-def _role_log() -> agents_log.RoleLog:
-    return agents_log.assignments(agents_log.state_dir() / "agents.jsonl")
-
-
 def _worker_assignment(run: Path | str, slot: str, record: Mapping[str, object],
-                       membership: staff.StaffSnapshot, role_log: agents_log.RoleLog) -> WorkerAssignment:
-    assignment = agents_log.role_at(role_log, session_staff.worker_session(record, membership),
-                                    datetime.now(timezone.utc))
-    if isinstance(assignment, agents_log.Unassigned):
+                       membership: staff.StaffSnapshot) -> WorkerAssignment:
+    member = session_staff.worker_row(record, membership)
+    if member is None or not isinstance(member.role, staff.KnownWorkerRole):
         return WorkerAssignment("no role", str(run), AssignmentUnrecorded(), slot)
-    role = worker_role({"role": assignment.role})
-    label = (f"review ({assignment.lens})" if assignment.role == "review" and assignment.lens
-             else assignment.role)
-    return WorkerAssignment(label, str(run), role, slot)
+    label = member.role.value
+    if member.role.value == "review":
+        from scripts.direct import progress_history
+
+        try:
+            with progress_history.dispatch_reads(membership, (Path(run),)):
+                dispatch = progress_history.last_dispatch(member.id)
+        except (OSError, ValueError):
+            dispatch = progress_history.NoDispatchRecorded()
+        if isinstance(dispatch, progress_history.RecordedDispatch) and isinstance(dispatch.lens, str):
+            label = f"review ({dispatch.lens})"
+    return WorkerAssignment(label, str(run), member.role.value, slot)
 
 
 def _held_location(parent: staff.StaffRow, membership: staff.StaffSnapshot,
@@ -894,7 +895,7 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
     place = places.get(unit_runs.director(run, record=membership))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
-    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership, _role_log())
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record, membership)
     entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
                         reach=Messageable(name), cwd="", showrunner=showrunner,
                         director=director, assignment=assignment)
@@ -905,20 +906,13 @@ def worker_shown_name(session_dir: str, name: str, record: Mapping[str, object])
 
 
 def claude_assignment(run: Path, member: staff.StaffRow, problems: list[str]) -> WorkerAssignment:
-    """The launch names the slot; the board records its current assignment."""
+    """Read the slot from launch evidence and the current role from staff."""
     slot = _slot_role(member.name)
     legacy_label = slot if slot in KNOWN_SLOT_ROLES else "role unknown"
     slot = _worker_slot(run, member.name, {"staff_id": member.id}, problems)
-    try:
-        result = subprocess.run(["bash", str(SCRIPTS / "direct/board.sh"), "roles", str(run)],
-                                capture_output=True, text=True, timeout=5, check=True,
-                                stdin=subprocess.DEVNULL)
-        roles = dict(line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line)
-    except (OSError, subprocess.SubprocessError) as error:
-        _problem(problems, f"worker assignments {run}", error)
-        return WorkerAssignment(legacy_label, str(run), AssignmentUnreadable(str(error)), slot)
-    assignment = worker_role({"role": roles[slot]} if slot in roles else {})
-    return WorkerAssignment(legacy_label, str(run), assignment, slot)
+    if isinstance(member.role, staff.KnownWorkerRole):
+        return WorkerAssignment(member.role.value, str(run), member.role.value, slot)
+    return WorkerAssignment(legacy_label, str(run), AssignmentUnrecorded(), slot)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1213,7 +1207,6 @@ def _unit_workers(
             _problem(problems, "process table", error)
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
-    role_log = _role_log()
     try:
         parents = session_staff.pane_parents(membership)
         selected_workers = membership.find(kind="worker")
@@ -1257,7 +1250,7 @@ def _unit_workers(
                         cwd=str(session_staff.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
                         assignment=_worker_assignment(run, _worker_slot(run, row.name, {"staff_id": row.id}, problems),
-                                                      {"staff_id": row.id}, membership, role_log),
+                                                      {"staff_id": row.id}, membership),
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
