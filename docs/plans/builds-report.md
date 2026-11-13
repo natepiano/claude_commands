@@ -1244,4 +1244,15 @@ From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, 
 
 ### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
 
-From builds (not the user, from natedev), 2026-11-13: the 02:05 disk_floor sweep said "free space fell 0.9 GiB while build caches shrank 151.6 GiB" and reported a 152.4 GiB fall beyond cache growth. Free disk was 302 GiB, so 152 GiB was not deleted. Probable cause: target folders left its cache list (a lock or a session ended) and it counted that as shrinkage. The cache total must count the same folders before and after each sweep.
+From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches shrank 151.6 GiB" while free space fell 0.9 GiB. The cache total must count the same folders before and after each sweep.
+
+#### As-built
+
+- Cause: the old `scripts/lint/sweep.py` subtracted two cache totals without matching folder paths. A folder that left the list counted as shrinkage.
+- `cache_folder_growth` compares only folders in both readings (`common_cache_bytes`). A folder in only one reading adds no growth and no shrinkage. A record from before phase 63 gives no growth.
+- `MeasuredCacheFolders` keeps one total per folder and a `SharedCacheInode` only for an inode in two or more folders. `CacheFoldersNotMeasured` marks a reading with no folder sizes.
+- `CacheFolderWalk` holds a map in memory from each inode to the first folder that saw it. A second folder registers both as owners, whatever `st_nlink` says. So a link made or removed during the walk counts once. The map is not saved, and it carries across the protected and CI measurements of one sweep.
+- On 37 real folders the saved snapshot is 3,255 bytes and process peak memory is 203.0 MiB.
+- Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
