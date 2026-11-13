@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -12,8 +13,16 @@ from scripts.lib.terminal_cells import terminal_width
 NONE = "—"
 
 
+class CutOrder(Enum):
+    """Select which text column loses width first."""
+
+    LISTED = "listed"
+    WIDEST_FIRST = "widest_first"
+
+
 def fitted(headers: Sequence[str], rows: Sequence[Sequence[str]], *,
-           cuttable: tuple[int, ...], columns: int) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
+           cuttable: tuple[int, ...], columns: int,
+           cut_order: CutOrder = CutOrder.LISTED) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
     """Remove columns with only NONE cells, then cut text to fit the terminal width.
 
     The cuttable indexes refer to headers before column removal.
@@ -29,9 +38,10 @@ def fitted(headers: Sequence[str], rows: Sequence[Sequence[str]], *,
                   for index, minimum in enumerate(minimums)]
         if 1 + sum(width + 3 for width in widths) <= columns - 4:
             break
-        column = next((index for index in cut_columns if widths[index] > minimums[index]), None)
-        if column is None:
+        candidates = [index for index in cut_columns if widths[index] > minimums[index]]
+        if not candidates:
             break
+        column = max(candidates, key=lambda index: widths[index]) if cut_order is CutOrder.WIDEST_FIRST else candidates[0]
         width = widths[column] - 1
         for index, row in enumerate(table_rows):
             cell = row[column]

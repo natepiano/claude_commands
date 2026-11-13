@@ -467,7 +467,7 @@ def delete_landed_branch(request: MergeRequest, branch: str, tip: str) -> None:
 
 
 def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
-    """Check required review lines and count checkpoints and commits without a descendant checkpoint."""
+    """Check review lines and count selected commits with valid lines."""
     previous = request.production.merge_branch
     try:
         commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
@@ -476,7 +476,9 @@ def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
         raise checkpoint_gate.Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
     if refused := change_review.missing(commits):
         raise checkpoint_gate.Stop("change review", "held", "; ".join(refused), change_review.HELD_NEXT_STEP)
-    selected = change_review.review_commits(commits)
+    selected = [commit for commit in change_review.review_commits(commits)
+                if (lines := change_review.entries(commit.message))
+                and not any(isinstance(line, change_review.Malformed) for line in lines)]
     checkpoint_gate.report("change review", "ok", f"{len(selected)} unit commit(s) carry their {change_review.TRAILER} lines")
     return commits
 

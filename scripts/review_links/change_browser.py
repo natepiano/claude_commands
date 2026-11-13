@@ -237,33 +237,53 @@ def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot)
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
-    feedback_rows = conf.read("review_links").whole("feedback_rows")
+    settings = conf.read("review_links")
+    feedback_rows = settings.whole("feedback_rows")
+    refresh_seconds = settings.number("page_refresh_seconds")
     prepared = prepare(browser, status)
     rebuilds = need.read_needs()
-    tabs = ''.join(f'<button type="button" role="tab" data-type="changes" data-showrunner="{html.escape(tab)}">'
-                   + f'{html.escape("Owner unavailable" if tab == "unrouted" else tab)} (<span data-count>{sum(item.tab == tab and item.waiting for item in prepared.changes)}</span>)</button>'
-                   for tab in prepared.queues)
-    question_tabs = ''.join(f'<button type="button" role="tab" data-type="questions" data-showrunner="{html.escape(tab)}">'
-        + f'{html.escape("Owner unavailable" if tab == "unrouted" else tab)} (<span data-count>{sum(item.tab == tab for item in prepared.questions)}</span>)</button>'
-        for tab in prepared.question_tabs)
-    type_tabs = ('<nav role="tablist" aria-label="Review type">'
-        + f'<button type="button" role="tab" data-review-type="questions">Questions (<span data-type-count="questions">{len(prepared.questions)}</span>)</button>'
-        + f'<button type="button" role="tab" data-review-type="changes">Changes (<span data-type-count="changes">{sum(item.waiting for item in prepared.changes)}</span>)</button>'
-        + f'<button type="button" role="tab" data-review-type="rebuilds">Rebuilds (<span data-type-count="rebuilds">{len(rebuilds)}</span>)</button></nav>')
-    content = ('''<style>[hidden]{display:none!important}nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
-nav button{margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
+    menus: list[str] = []
+    for kind, names in (("changes", prepared.queues), ("questions", prepared.question_tabs)):
+        for name in names:
+            count = (sum(item.tab == name and item.waiting for item in prepared.changes) if kind == "changes"
+                     else sum(item.tab == name for item in prepared.questions))
+            label = "Owner unavailable" if name == "unrouted" else name
+            menus.append(f'<option data-type="{kind}" data-showrunner="{html.escape(name)}" '
+                         + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
+    type_tabs = '<nav class="review-types" role="tablist" aria-label="Review type">'
+    for kind, label, count in (("questions", "Questions", len(prepared.questions)),
+                               ("changes", "Changes", sum(item.waiting for item in prepared.changes)),
+                               ("rebuilds", "Rebuilds", len(rebuilds))):
+        type_tabs += (f'<button type="button" id="type-{kind}" role="tab" aria-controls="review-panel" '
+                      + f'aria-selected="{str(kind == "changes").lower()}" data-review-type="{kind}">'
+                      + f'{label} (<span data-type-count="{kind}">{count}</span>)</button>')
+    type_tabs += '</nav>'
+    content = ('''<style>[hidden]{display:none!important}
+.review-types{display:flex;flex-wrap:nowrap;margin:0;gap:0}
+.review-types button{flex:1;min-width:0;margin:0;padding:10px 6px;white-space:nowrap;font-size:clamp(13px,3.6vw,17px);background:transparent;color:light-dark(#595959,#b0b0b0);border:1px solid transparent;border-bottom:1px solid light-dark(#707070,#a0a0a0);border-top:3px solid transparent}
+.review-types button[aria-selected=true]{color:CanvasText;background:Canvas;border-color:light-dark(#707070,#a0a0a0);border-bottom-color:Canvas;border-top-color:Highlight}
+.review-types button:focus-visible{outline-offset:-5px}
+.review-panel{border:1px solid light-dark(#707070,#a0a0a0);border-top:0;padding:16px;min-width:0;background:Canvas}
+[data-showrunner-filter]{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;margin-bottom:16px}
+[data-showrunner-filter] label{white-space:nowrap}
+[data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
+.feedback-actions{display:flex;flex-wrap:nowrap;gap:8px}.feedback-actions button{margin-right:0;font-size:16px;white-space:nowrap}
 section+section{border:0;margin:0;padding:0}
 [data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:16px;padding-top:16px}
 [data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}
 [data-rebuilds] details p{margin:0}[data-rebuilds] details p+p{margin-top:8px}
-.navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
-</style><h1 data-review-heading>Changes to review</h1>''' + type_tabs + '<div data-showrunner-tabs><p>Showrunner</p><nav role="tablist" aria-label="Showrunner">' + tabs + question_tabs + '</nav></div>'
+.navigation{padding:12px 0;background:Canvas}button{min-height:44px}
+</style>''' + f'<div data-review-content data-refresh-seconds="{refresh_seconds}"><h1 data-review-heading>Changes to review</h1>'
+               + type_tabs + '<div class="review-panel" id="review-panel" role="tabpanel" aria-labelledby="type-changes">'
+               + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
+               + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
+               + '<template data-runner-options>' + ''.join(menus) + '</template>'
                + '<p hidden role="status" data-save-notice></p>'
                + ''.join(section(item, feedback_rows) for item in prepared.changes)
                + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
                + rebuild_list(rebuilds, prepared.record)
                + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
-               + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript>'
+               + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div></div>'
                + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
     return change_page.document(content)
 
@@ -359,54 +379,75 @@ def submit_question(question: WaitingQuestion, answer: str, status: change_page.
 
 
 SCRIPT = r'''
-const rows=[...document.querySelectorAll('section[data-key]')];
-const allTabs=[...document.querySelectorAll('[data-showrunner]')];
-const types=[...document.querySelectorAll('[data-review-type]')];
-const rebuilds=document.querySelector('[data-rebuilds]'), rebuildCount=Number(rebuilds.dataset.count);
-const showrunners=document.querySelector('[data-showrunner-tabs]');
-const next=document.querySelector('[data-next]'), empty=document.querySelector('[data-empty]');
-const heading=document.querySelector('[data-review-heading]');
-const saveNotice=document.querySelector('[data-save-notice]');
+let content=document.querySelector('[data-review-content]');
+let rows,runnerOptions,types,rebuilds,rebuildCount,showrunners,runnerMenu,next,empty,heading,saveNotice;
+let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
 const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
-function waiting(){return rows.filter(r=>r.dataset.type===kind && r.dataset.tab===tab && r.dataset.pending==='true');}
+function bindPage(){
+ rows=[...content.querySelectorAll('section[data-key]')];
+ runnerOptions=[...content.querySelector('[data-runner-options]').content.children];
+ types=[...content.querySelectorAll('[data-review-type]')];
+ rebuilds=content.querySelector('[data-rebuilds]');rebuildCount=Number(rebuilds.dataset.count);
+ showrunners=content.querySelector('[data-showrunner-filter]');runnerMenu=showrunners.querySelector('select');
+ next=content.querySelector('[data-next]');empty=content.querySelector('[data-empty]');
+ heading=content.querySelector('[data-review-heading]');saveNotice=content.querySelector('[data-save-notice]');
+ runnerMenu.addEventListener('change',()=>{tab=runnerMenu.value;go(remembered.get(kind+'/'+tab));});
+ types.forEach(t=>t.addEventListener('click',()=>{navigation++;clearNotice();kind=t.dataset.reviewType;
+  location.hash=places.get(kind) || new URLSearchParams({type:kind});show();}));
+ content.querySelector('[role=tablist]').addEventListener('keydown',event=>{
+  let index=types.indexOf(document.activeElement);
+  if(event.key==='ArrowRight') index=(index+1)%types.length;
+  else if(event.key==='ArrowLeft') index=(index+types.length-1)%types.length;
+  else if(event.key==='Home') index=0;
+  else if(event.key==='End') index=types.length-1;
+  else return;
+  event.preventDefault();types[index].click();types[index].focus();
+ });
+ next.addEventListener('click',()=>advance(current));
+ rows.forEach(row=>{
+  const form=row.querySelector('form');
+  if(form) form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
+ });
+}
+function waiting(){return rows.filter(r=>r.dataset.type===kind && (tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
 function show(){
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
  kind=place.get('type') || rows.find(r=>r.dataset.key===requested)?.dataset.type || (rows.some(r=>r.dataset.type==='questions') ? 'questions' : 'changes');
- const tabs=allTabs.filter(t=>t.dataset.type===kind);
+ const options=runnerOptions.filter(option=>option.dataset.type===kind);
  const rebuildMode=kind==='rebuilds';
  heading.textContent={questions:'Questions to answer',changes:'Changes to review',rebuilds:'Rebuilds needed'}[kind];
  rebuilds.hidden=!rebuildMode;showrunners.hidden=rebuildMode;
  document.querySelector('.navigation').hidden=rebuildMode;
- types.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.reviewType===kind));
+ types.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.reviewType===kind));t.tabIndex=t.dataset.reviewType===kind ? 0 : -1;
   t.querySelector('[data-type-count]').textContent=t.dataset.reviewType==='rebuilds' ? rebuildCount : rows.filter(r=>r.dataset.type===t.dataset.reviewType && r.dataset.pending==='true').length;});
- allTabs.forEach(t=>t.hidden=t.dataset.type!==kind);
- tab=place.get('showrunner') || rows.find(r=>r.dataset.key===requested)?.dataset.tab || tabs[0]?.dataset.showrunner;
- if(!tabs.some(t=>t.dataset.showrunner===tab)) tab=tabs[0]?.dataset.showrunner;
- current=rows.find(r=>r.dataset.key===requested && r.dataset.tab===tab && r.dataset.type===kind) || waiting()[0] || null;
+ content.querySelector('[role=tabpanel]').setAttribute('aria-labelledby','type-'+kind);
+ tab=place.get('showrunner') || '';
+ if(tab!=='' && !options.some(option=>option.value===tab)) tab='';
+ runnerMenu.replaceChildren(new Option('All ('+rows.filter(row=>row.dataset.type===kind && row.dataset.pending==='true').length+')',''),...options.map(option=>{
+  const item=option.cloneNode(true);
+  item.textContent=(item.value==='unrouted' ? 'Owner unavailable' : item.value)+' ('+rows.filter(row=>row.dataset.type===kind && row.dataset.tab===item.value && row.dataset.pending==='true').length+')';
+  return item;
+ }));runnerMenu.value=tab;
+ current=rows.find(r=>r.dataset.key===requested && (tab==='' || r.dataset.tab===tab) && r.dataset.type===kind) || waiting()[0] || null;
  empty.hidden=rebuildMode || current!==null;
  const typeWaiting=rows.some(r=>r.dataset.type===kind && r.dataset.pending==='true');
  empty.textContent=kind==='questions' ? (typeWaiting ? 'No questions for this showrunner.' : 'No questions to answer.') :
   (typeWaiting ? 'No changes for this showrunner.' : 'No changes to review.');
  rows.forEach(r=>r.hidden=r!==current);
- tabs.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.showrunner===tab && t.dataset.type===kind));
-  t.querySelector('[data-count]').textContent=rows.filter(r=>r.dataset.type===t.dataset.type && r.dataset.tab===t.dataset.showrunner && r.dataset.pending==='true').length;});
  next.hidden=rebuildMode || !waiting().some(r=>r!==current);
  if(current) remembered.set(kind+'/'+tab,current.dataset.key);
  const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
  places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
 function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
-allTabs.forEach(t=>t.addEventListener('click',()=>{tab=t.dataset.showrunner;go(remembered.get(kind+'/'+tab));}));
-types.forEach(t=>t.addEventListener('click',()=>{navigation++;clearNotice();kind=t.dataset.reviewType;
- location.hash=places.get(kind) || new URLSearchParams({type:kind});show();}));
 function advance(row){
  const at=rows.indexOf(row), candidates=waiting();
  const following=candidates.find(r=>rows.indexOf(r)>at) || candidates[0];
  go(following?.dataset.key || ''); }
-next.addEventListener('click',()=>advance(current));
 async function save(row,form,outcome){
  if(form.dataset.saving==='true') return;
+ activeSaves++;let saved=false;
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);
@@ -416,21 +457,71 @@ async function save(row,form,outcome){
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : 'The showrunner will validate this';
+  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : outcome==='feedback' ? 'The showrunner will act on this' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
+  saved=true;
   row.dataset.pending='false';form.hidden=true;
-  if(current===row && tab===row.dataset.tab && navigation===position){
+  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){
    advance(row);saveNotice.textContent=row.dataset.type==='questions' ? 'Answer saved.' : 'Review saved.';saveNotice.hidden=false;
   }
   else show();
  }catch(error){
   row.dataset.saveState='failed'; state.textContent='Not saved: '+(error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message);
- }finally{form.dataset.saving='false';}
+ }finally{
+  form.dataset.saving='false';activeSaves--;
+  // Read after the save, so an older response cannot restore the saved item.
+  if(saved){heldPage=null;newestRequest++;refreshPage(true);}
+  else applyHeldPage();
+ }
 }
-rows.forEach(row=>{
- const form=row.querySelector('form');
- if(!form) return;
- form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
- });
-window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});show();
+function detailKey(detail){
+ const owner=detail.closest('[data-key],[data-machine]');
+ return (owner?.dataset.key || 'rebuild/'+owner?.dataset.machine)+'/'+[...owner.querySelectorAll('details')].indexOf(detail);
+}
+function applyHeldPage(){
+ if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
+ const fresh=heldPage;heldPage=null;
+ if(fresh.outerHTML===shownPage) return;
+ const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
+ const left=scrollX,top=scrollY,focused=document.activeElement;
+ const controlId=focused===runnerMenu || types.includes(focused) ? focused.id : '';
+ const fieldRow=focused?.closest('[data-key]')?.dataset.key;
+ const fieldName=focused?.matches('textarea,input[type=text]') ? focused.name : '';
+ const selection=[focused?.selectionStart,focused?.selectionEnd,focused?.selectionDirection];
+ const previous=rows.indexOf(current),following=rows.slice(previous+1).map(row=>row.dataset.key);
+ const candidates=[...fresh.querySelectorAll('section[data-key]')].filter(row=>row.dataset.type===kind && (tab==='' || row.dataset.tab===tab) && row.dataset.pending==='true');
+ const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
+ const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
+ const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
+ content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
+ history.replaceState(null,'','#'+new URLSearchParams(kind==='rebuilds' ? {type:kind} : {type:kind,showrunner:tab || '',row:chosen?.dataset.key || ''}));
+ show();
+ if(notice){saveNotice.textContent=notice;saveNotice.hidden=false;}
+ if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
+ const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
+ if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
+ window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
+}
+async function refreshPage(supersede=false){
+ if(document.visibilityState!=='visible' || (activeLoads && !supersede)) return;
+ const request=++newestRequest;
+ activeLoads++;
+ try{
+  const response=await fetch(location.href,{cache:'no-store'});
+  if(!response.ok) return;
+  const fresh=new DOMParser().parseFromString(await response.text(),'text/html').querySelector('[data-review-content]');
+  if(request!==newestRequest || !fresh) return;
+  heldPage=fresh;applyHeldPage();
+ }catch(error){}
+ finally{activeLoads--;}
+}
+function scheduleRefresh(){
+ clearInterval(refreshTimer);
+ if(document.visibilityState==='visible') refreshTimer=setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000);
+}
+document.addEventListener('input',()=>applyHeldPage());
+document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
+window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
+bindPage();show();scheduleRefresh();
 '''
