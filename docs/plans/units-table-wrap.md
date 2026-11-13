@@ -38,39 +38,26 @@ The showrunner's ruling:
 
 ### Phase 1 — Workers move to the status table and work text wraps  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** In the Claude Code terminal at 170 columns, `/showrunner:units` shows Workers as the last column of the status table, and shows every word of Notes, Non-Phase Work and Queued, wrapped inside their cells, with no `…` cut.
-
-**Spec:**
-
-1. **Status table.** Headers become `Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | <Workers heading>`. The Workers heading and cell text stay the same (`worker_heading()`, `workers_cell()`). The all-`—` column removal still applies.
-2. **Work table.** Headers become `Unit | Notes | Non-Phase Work | Queued`. No cell is cut with `…`.
-3. **Find how the renderer shows a wide table.** In a Claude Code 2.1.319 session in an X11 terminal 170 columns wide, render sample Markdown tables: (a) one row wider than the terminal, (b) a cell with `<br>`, (c) continuation rows with empty cells. Record which form keeps each text cell inside its column and keeps each unit's text visibly in one row. Report the result with one screenshot per form.
-4. **Wrap.** Choose the simplest form from step 3 that shows each unit's text as one visible row inside the column width. Make the command emit that form. When the command itself wraps text, it breaks at spaces to the column widths that fit `units_table_columns` (the `1 + sum(width + 3) <= columns - 4` rule), measures with `terminal_cells.terminal_width`, never splits a wide character, and splits a word only when the word alone is wider than its column. Put the shared wrap rule in `display_cells.py`, beside `fitted`. Workers in the status table use the same rule when the status table does not fit.
-5. **Docs.** Update `commands/showrunner/units.md` (the table layout and how to print the output) and the "Unit phases" entry in `docs/as-built/showrunner-automation.md`. These docs go in the same commit as the code.
-6. **Proof.** Screenshot `/showrunner:units` for the sdlc production in a Claude Code terminal 170 columns wide, before the change (the phase baseline) and after. Each screenshot shows both tables in full. Save the PNG files under the session folder, never in the repository.
+- The status table headers are `Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | <Workers heading>`. Workers is the last column. The all-`—` column removal still applies.
+- The work table headers are `Unit | Notes | Non-Phase Work | Queued`. Each cell holds the full text, with no `…` cut.
+- The command does not wrap text. Claude Code 2.1.319 wraps each cell at the terminal width and keeps one visible row per unit.
+- `display_cells.wrapped(headers, rows)` keeps the full cells and removes columns whose cells are all `—`. Both tables go through it.
+- `unit_phases.single_spaced(text)` is the one whitespace rule for cells. `shortened()` (`TASK_WIDTH` 80) applies only to the Workers and ETA cells.
+- `units_table_columns` sets only the width of the style table.
 
 **Files:**
-- `scripts/production/unit_phases.py` — the two table layouts.
-- `scripts/production/display_cells.py` — the shared wrap rule.
-- `scripts/production/test_unit_phases.py` — table rows.
-- `commands/showrunner/units.md` — the command text.
-- `docs/as-built/showrunner-automation.md` — the as-built entry.
+- `scripts/production/unit_phases.py` — the two table layouts and the cell text.
+- `scripts/production/display_cells.py` — `wrapped()` beside `fitted()`.
+- `scripts/production/test_display_cells.py`, `scripts/production/test_unit_phases.py`, `scripts/agents/test_shutdown_cli.py` — the table rows.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `config/production.conf` — the layout and the width key.
 
-Add `scripts/production/test_display_cells.py` rows when the wrap rule lives in `display_cells.py`. `scripts/agents/test_shutdown_cli.py` rows change when they hold the table layout.
+**Binds later work:** each open phase row builds on `display_cells.wrapped()` and the full cell text; Workers stays the last status-table column; `single_spaced()` normalizes cell text.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — runs step 3, then writes steps 1, 2, 4 and 5.
-- `test` — writes the test rows for the new layouts and the wrap rule, keeps the test lane green, and makes the step 6 screenshots when `impl` posts `done`.
+**Gotchas:** `<br>` renders as literal text, and continuation rows get borders between lines. Neither form keeps one visible row per unit.
 
-**State:** none.
-
-**Acceptance gate:**
-1. Build: 0 errors, 0 warnings, 0 notes for every changed Python file.
-2. The Test command passes for the test lane and for the tests of each changed module.
-3. Live: `scripts/lib/py scripts/production/unit_phases.py --production sdlc` prints the status table with Workers last and a work table with no `…`.
-4. The after screenshot shows every word of Notes, Non-Phase Work and Queued inside the 170-column terminal, and the before screenshot shows the old layout.
+**Ruled out:** command-side wrapping to `units_table_columns` — the renderer sets the column widths, so the command cannot hold them.
 
 ### Phase 2 — Each open phase shows its work, its wait and its latest ETA  · status: todo
 
@@ -96,6 +83,12 @@ The user, relayed by the cargo-liner showrunner at 22:20 EST on 2026-11-12: "i c
 6. **Tests.** Add rows to the existing tests in `scripts/production/test_unit_phases.py`, and in `scripts/direct/test_phase_table.py` or `scripts/direct/test_worker_runs.py` when a cause lives there. Build each fixture from the shape of the evidence records, in a temporary folder. Use no live unit.
 7. **Docs.** Update `commands/showrunner/units.md` and the "Unit phases" entry in `docs/as-built/showrunner-automation.md` in the same commit as the code.
 8. **Proof.** Screenshot `/showrunner:units` for the cargo-liner production in a Claude Code terminal 170 columns wide, before the change and after. Save the PNG files under the session folder, never in the repository.
+
+**Constraints from prior phases:**
+- Phase 1 put Workers last in the status table (`table()` in `scripts/production/unit_phases.py`) and left the work table as `Unit | Notes | Non-Phase Work | Queued`.
+- Both phase tables pass through `display_cells.wrapped(headers, rows)`: full cell text, all-`—` columns removed. Claude Code wraps each cell at the terminal width; never cut text with `…`, insert `<br>` or add continuation rows. `units_table_columns` sets only the style table.
+- `single_spaced(text)` in `unit_phases.py` is the one whitespace rule for cell text. `shortened()` (80 characters) now applies only to the Workers cell and ETA Next.
+- The test lane includes `scripts.production.test_display_cells`.
 
 **Files:**
 - `scripts/production/unit_phases.py` — row layout, Notes, ETA Next, Workers.
