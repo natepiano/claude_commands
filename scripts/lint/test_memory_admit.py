@@ -426,6 +426,67 @@ class MemoryRoomRulesTests(unittest.TestCase):
         reading = gate.memory_room(missing, [], admission_policy_fixture())
         self.assertEqual(reading, missing)
 
+    def test_swap_outside_the_build_and_ci_slices_is_demand(self) -> None:
+        policy = admission_policy_fixture()
+        for case, swap_used, build_and_ci, share, demand in (
+            ("agents swapped", 15, 0, 100, 15),
+            ("build and CI swap excluded", 15, 4, 100, 11),
+            ("only build and CI swapped", 4, 4, 100, 0),
+            ("share 0", 15, 0, 0, 0),
+            ("share 50", 15, 0, 50, 7.5),
+        ):
+            with self.subTest(case=case):
+                host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, int((32 - swap_used) * GIB),
+                                                    build_and_ci_swap=build_and_ci * GIB)
+                reading = gate.memory_room(host, [], replace(policy, agent_swap_share_percent=share))
+                assert isinstance(reading, admission_records.MemoryRoom)
+                self.assertEqual(reading.agent_swap_demand, int(demand * GIB))
+                self.assertEqual(reading.signed_room, 17 * GIB - int(demand * GIB))
+
+    def test_unavailable_slice_swap_cannot_publish_room(self) -> None:
+        missing = admission_records.ReadingUnavailable("builds.slice: memory.swap.current is missing")
+        host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, 17 * GIB, build_and_ci_swap=missing)
+        self.assertEqual(gate.memory_room(host, [], admission_policy_fixture()), missing)
+
+    def test_swapped_agents_leave_one_build_to_start_alone(self) -> None:
+        policy = admission_policy_fixture()
+        host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, 17 * GIB)
+        run = admission_records.RunningStep("run", "run", "check", "/run", 2 * GIB,
+            admission_records.MeasuredMemory(2 * GIB, anonymous=admission_records.AnonymousRunUse(2 * GIB)), pid=100)
+        waiter: admission_records.Waiter = {"pid": 200, "start_time": "200", "need": 8 * GIB, "since": NOW_EPOCH}
+        for case, running, reservations, state in (
+            ("no build runs", (), (), "admit"),
+            ("one build runs", (run,), (fixture_reservation(100, 2 * GIB),), "hold"),
+        ):
+            with self.subTest(case=case):
+                inputs = admission_records.QueueInputs([(Path("200.waiting"), waiter)], running, reservations, host,
+                    admission_records.NoPressureHold(), admission_records.ReadyToStart(),
+                    admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+                decision = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
+                self.assertEqual(decision.state, state)
+
+    def test_slice_swap_reads_only_live_slices_and_only_when_the_host_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builds, ci = root / "builds.slice", root / "ci.slice"
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text("MemAvailable: 1048576 kB\nSwapTotal: 8388608 kB\nSwapFree: 4194304 kB\n")
+            environment = {"BUILDLOG_BUILDS_CGROUP": str(builds), "BUILDLOG_CI_CGROUP": str(ci)}
+            with patch.dict(os.environ, environment):
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 0)
+                for group, amount in ((builds, GIB), (ci, 2 * GIB)):
+                    group.mkdir()
+                    _ = (group / "memory.swap.current").write_text(f"{amount}\n")
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 3 * GIB)
+                (ci / "memory.swap.current").unlink()
+                self.assertIsInstance(gate.read_meminfo(meminfo).build_and_ci_swap, admission_records.ReadingUnavailable)
+                _ = meminfo.write_text("MemAvailable: 1048576 kB\nSwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 0)
+            with patch.dict(os.environ, {"BUILDLOG_CI_CGROUP": ""}), patch.object(
+                    subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "\n", "")):
+                self.assertIsInstance(gate.systemd_slice_group("hana-ci.slice"), gate.InactiveSlice)
+                self.assertIsInstance(gate.ci_slice_cgroup("hana-ci.slice"), admission_records.ReadingUnavailable)
+
     def test_overlapping_grants_count_each_anonymous_scope_once(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
         run = LiveBuildRun(900, "900", NOW_EPOCH - 60)

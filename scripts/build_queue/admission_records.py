@@ -74,6 +74,7 @@ class AdmissionPolicy:
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
     progress_lookahead_percent: float = field(kw_only=True)
+    agent_swap_share_percent: int = field(default=100, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -489,6 +490,7 @@ class HostMemory:
     total: int | UnknownHostTotal
     swap_total: int = 0
     swap_free: int = 0
+    build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 
@@ -683,6 +685,7 @@ class MemoryRoom:
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
+    agent_swap_demand: int = field(default=0, kw_only=True)
 
     @property
     def cap_use(self) -> int:
@@ -1224,7 +1227,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       progress_lookahead_percent=number("progress_lookahead_percent")),
+                                       progress_lookahead_percent=number("progress_lookahead_percent"),
+                                       agent_swap_share_percent=whole("agent_swap_share_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),

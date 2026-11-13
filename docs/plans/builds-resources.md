@@ -2444,3 +2444,203 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/memory_feed.py`, `memory_live.html` — the page limits and the swap gauge
 - `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf` — `swap_used_limit` deleted
 - tests: `test_memory_admit.py`, `test_snapshot_codec.py`, `test_admission_protocol.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py`, `test_memory_hover.py`, `test_merge_gate_suites_admission.py`
+
+### Phase 118 — A nextest run takes jobserver tokens for its test threads  · status: todo
+
+**Depends on:** queue's phase 44 re-land on origin/builds (builds sends the word), and Phase 114 checkpointed first.
+
+**Source (2026-11-13, builds showrunner):** "a nextest run takes jobserver tokens for its test threads, so compiles and tests share one CPU pool and the jobserver queues them fairly. Cores and widths come from config, not code." Design approved; item 6: "remove the width share and its marker files in this phase. One way to do a thing." At the 12:26 natedev freeze, four hana nextest runs had 42 test threads beside 32 compile tokens, and load reached 437.
+
+#### Work Order
+
+**Goal:** on natedev, compiles and test threads share the one `/dev/steve` pool. A test run holds one token for each test thread, and holds no token while it compiles.
+
+**Measured:**
+1. `run_once` (`scripts/lint/invoke.sh`) claims the test width (`nextest_share_claim`, about line 381) after the memory gate and before `cargo nextest run`, which can still compile.
+2. `run_nextest_shared` and `nextest_share_claim` divide the mode's width by the runs in flight through flock marker files under `admission/nextest` (`scripts/lint/nextest_budget.py` `claim`, `shared_width`, `is_locked`).
+3. `CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"` joins the machine pool (`invoke.sh` about line 61). steve takes back the tokens of a process that exits (`/etc/nixos/modules/linux/jobserver.nix`).
+4. hana CI's `cargo nextest run` reaches `run_once` through the queue's cargo wrapper.
+
+**Spec:**
+1. A `cargo nextest run` step on a host with `/dev/steve` first runs `cargo nextest run --no-run` with the same arguments.
+2. Then a token holder (a new script beside `nextest_budget.py`) opens `/dev/steve`. It takes `test_token_floor` tokens, waiting if needed. Then it takes more without a wait, up to the run's width.
+3. The holder runs the test command as its child with `--test-threads` equal to the tokens it holds. It writes every token back when the child ends, on any exit, signal or cancel.
+4. The width per mode still comes from the cores, as now. `test_token_floor` is a new key in `config/build_admission.conf`, proposed value 4.
+5. The holder writes the tokens it holds to the step's memory reservation (`memory_admit width`), as the share claim does now.
+6. Remove the width share: `run_nextest_shared`, `nextest_share_claim`, `nextest_share_end`, the marker files, and `claim`/`shared_width`/`is_locked` in `nextest_budget.py`. Keep `nextest_thread_report` and the trial mode. Name any config key that becomes unused.
+7. A host with no `/dev/steve` (the Mac) keeps today's width with no token take.
+8. Change no admission wire record. The client at `7fdfd9a6a` must still parse every reply.
+
+**Tests:**
+1. A fake pool of 4 tokens: a compile holds 3, a test run asks for floor 2 and width 8. The run waits until the compile gives a token back, then runs at the tokens it got.
+2. A killed child and a cancelled run give every token back.
+3. The width written to the reservation equals the tokens held.
+4. No `/dev/steve`: the run keeps today's width and takes no token.
+5. Remove the share tests in `test_nextest_budget.py` and `test_nextest_width.py` that test removed code only.
+
+**Files:**
+- `scripts/lint/invoke.sh`
+- `scripts/lint/nextest_budget.py`
+- `scripts/lint/nextest_tokens.py`
+- `scripts/lint/test_nextest_tokens.py`
+- `scripts/lint/test_nextest_budget.py`
+- `scripts/lint/test_nextest_width.py`
+- `config/build_admission.conf`
+- `scripts/lint/fixtures/build_admission.conf`
+
+**Workers:** one implement worker.
+
+**State:** the `admission/nextest` marker files are no longer written.
+
+**Verification:**
+1. Test: `scripts.lint.test_nextest_tokens`, `scripts.lint.test_nextest_budget`, `scripts.lint.test_nextest_width`, `scripts.lint.test_invoke_scope`, `scripts.build_queue.test_snapshot_codec`.
+2. Lint: `basedpyright` on the changed Python files; `bash -n scripts/lint/invoke.sh`.
+
+**Speed:** one extra `--no-run` cargo call per test step, which finds the build fresh; one token read per test thread.
+
+### Phase 119 — An agent or ssh cargo run on the Mac needs a live queue placement  · status: todo
+
+**Depends on:** queue's read-only `placement-status --episode E --attempt A` admission request (queue 44al). Tests use a fake of it. The `offload.py` change waits for queue's 44 re-land on origin/builds, which gives offload its placement. The Mac PATH change is a Mac nixos change with the user's go; it lands after this phase is promoted to the Mac.
+
+**Source:** 2026-11-13 14:08, the user via builds: "nothing from natedev should get to the mac for running without going through the build queue - it needs to be made impossible". At 15:00 the user chose the simple form (via dwight, natedev and builds): "i am for the simple plan so that's good". builds: "Mac guard is the simple form: 1) a cargo gate on the Mac, in its own folder ahead of ~/.cargo/bin, that refuses an agent or natedev run with no live placement; 2) a detector in memory_feed.py that alerts builds about an unplaced cargo or rustc run on the Mac. Drop macbuild, the broker daemon, the sshd path, the sandbox and the allowlists. The user's own Mac terminal passes the gate." The simple form stops every shortcut and shows every way around it; it does not stop a determined agent.
+
+#### Work Order
+
+**Goal:** a cargo, rustc or cargo-nextest call on the Mac from an agent or an ssh session runs only under a live queue placement, and builds sees each run that went around the gate.
+
+**Measured:**
+1. natedev reaches the Mac as natemccoy through Tailscale SSH as a zsh login shell, which reports exit 0 for every command. Callers print `mac_exit=N` as the last line and parse it (`offload.py` `stream_mac_run`, `mac_run.sh` `on_mac`).
+2. The Mac login PATH starts `/opt/homebrew/bin:/opt/homebrew/sbin:~/.cargo/bin:~/.local/bin:…`. `~/.cargo/bin` comes from `environment.extraInit` (nixos `modules/common/shell.nix`); Homebrew comes first from `brew shellenv` in `~/.zprofile` (`modules/darwin/shell.nix` `profileExtra`). Homebrew has no cargo, rustc or rustup.
+3. Claude Code sets `CLAUDECODE=1` in each command it runs; a Codex process carries `CODEX_HOME`. An ssh session carries `SSH_CONNECTION`.
+4. hana-ci runs as its own macOS user `hana-ci` from a launchd daemon, with its own PATH, `CARGO_HOME` and rustup (nixos `modules/darwin/hana-macos-runner.nix`). It reads no shell profile.
+5. `queue_view.py` `mac_build_script` reads the Mac process table (pid, ppid, uid, start time, command) in one ssh call. `memory_feed.py` shows the Mac builds from that reading. `scripts/buildlog/mac_idle.py` `notify_outage` sends builds one message for a Mac alert.
+6. `mac_run.sh` runs `cargo build -q -p hana` over ssh in a scratch clone, then starts hana with `open -a Terminal <launch.command>` so hana gets the camera grant. The hana shot builds and the cargo-liner installs run cargo over ssh by hand, with no placement.
+
+**Spec:**
+1. The gate is one zsh script, `scripts/mac_test/cargo_gate/gate.zsh`, with links `cargo`, `rustc` and `cargo-nextest` to it in `scripts/mac_test/cargo_gate/bin/`. The Mac nixos change puts `~/.claude/scripts/mac_test/cargo_gate/bin` first on the login PATH.
+2. The gate finds the real program by its own name on PATH with its own folder removed, and runs it with `exec` and the same arguments.
+3. A call with none of `CLAUDECODE`, `CODEX_HOME`, `SSH_CONNECTION` and `SSH_CLIENT` in its environment is the user's own terminal: it passes with no check.
+4. Any other call passes only with `MAC_PLACEMENT=<episode>/<attempt>` for a live placement whose target is the Mac. The gate asks queue's `placement-status` on natedev over ssh, with a time limit. The command and the limit come from `config/mac_gate.conf`. It never accepts a bare `mac_test.py claim`.
+5. A live answer is kept in a per-user file under the gate's state folder (mode 0600) for `placement_recheck_seconds`. A call with the same placement inside that time passes with no ssh call, so the many rustc calls of one build add no network wait.
+6. A refusal is one line on stderr: `mac cargo gate refused: <reason>; run it through mac_queue_run.py`, then exit with `refusal_exit_code` from config. Reasons: no placement; placement <e>/<a> closed; target is <t>; no answer in <n>s; unreadable answer. No answer refuses: the gate fails closed.
+7. Each passed call that is not under an earlier gate pass writes one record: pid, process start time, and the label (`user` or `placement <e>/<a>`). It sets `MAC_GATE_RECORD=<pid>` for its children; a child call that finds its recorded ancestor writes no record.
+8. The detector: `mac_build_script` also reads the gate records. Each cargo, rustc or cargo-nextest process gets one label: `hana-ci` (uid of `hana-ci`), the label of the nearest recorded ancestor with a matching start time, or `unplaced`.
+9. `memory_feed.py` shows each `unplaced` run on the page and sends builds one message for it, in the way `mac_idle.py` `notify_outage` sends. One run gives one message. `hana-ci` runs give no alert.
+10. `scripts/mac_test/mac_queue_run.py --what "<purpose>" --kind <shot|install|probe|run> --package <name> [--worktree DIR] [--cwd MACDIR] -- argv...` runs on natedev. It takes a queue placement for target mac with `admission_client.py place-step --once --wait-events --target mac --assignment-file <file>`. It runs `ssh <mac host>` with `MAC_PLACEMENT=<episode>/<attempt>` set before the argv, streams the output, and exits with the Mac status from `mac_exit=`. It gives the placement back with `finish-step --assignment-file <file> --status <exit>` after a run, or `cancel-placement --episode E --pid P` before one, on every exit, signal or cancel.
+11. `offload.py` sets `MAC_PLACEMENT` from `request.placement.assignment` (episode and attempt) in its Mac test script. It reads both from the assignment, not from the environment.
+12. `mac_run.sh` runs its hana build and its hana launch under one `mac_queue_run.py` placement. The launch stays `open -a Terminal`.
+13. `commands/build/mac.md` names `mac_queue_run.py` as the way to build, test, install or run built code on the Mac from natedev or from an agent, with one example each for a hana shot build, a cargo install and a probe.
+14. No second path: no caller in this repo runs cargo, rustc, nextest, `lint` or a built binary over plain ssh. A test scans the callers for it.
+15. Delete the broker: `mac_broker.py`, `broker_client.py`, `test_mac_broker.py` and `config/mac_broker.conf`. Their callers move to `MAC_PLACEMENT` and `config/mac_gate.conf`.
+16. Change no admission wire record. Copy no placement logic: the check is queue's call, named in config.
+
+**Tests:**
+1. The gate, with a fake real cargo and a fake placement check: the user's environment passes with no check; each agent or ssh marker with no placement refuses with the named line; a live placement passes and runs the real program with the same arguments and exit status; closed, another target, a slow check past the limit and unreadable output each refuse and start nothing.
+2. A second call with the same live placement inside `placement_recheck_seconds` makes no check call; after that time it checks again.
+3. The gate removes only its own folder from PATH, and a missing real program gives a clear error, not a loop.
+4. Records: a root pass writes one record with the right label; a child under it writes none.
+5. The detector, with a fake process table and records: a placed tree, a user tree and a hana-ci process get no alert; a cargo with no recorded ancestor is `unplaced`; a record whose start time does not match does not count; one run gives one message.
+6. `mac_queue_run.py` gives the placement back after success, a child failure, a refusal and SIGTERM, and sends `MAC_PLACEMENT` with the episode and attempt of the assignment.
+7. `offload.py` and `mac_run.sh` build their Mac commands with the placement's episode and attempt.
+8. The no-second-path scan fails on a fixture caller that runs `ssh mac cargo build`.
+
+**Files:**
+- `scripts/mac_test/cargo_gate/gate.zsh`, `scripts/mac_test/cargo_gate/bin/` (links)
+- `scripts/mac_test/test_cargo_gate.py`
+- `scripts/mac_test/mac_queue_run.py`, `scripts/mac_test/test_mac_queue_run.py`
+- `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload.py`
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py`
+- `scripts/production/mac_run.sh`, `scripts/production/test_mac_run.py`
+- `config/mac_gate.conf`
+- `commands/build/mac.md`
+- deleted: `scripts/mac_test/mac_broker.py`, `scripts/mac_test/broker_client.py`, `scripts/mac_test/test_mac_broker.py`, `config/mac_broker.conf`
+
+**Workers:** one implement worker.
+
+**State:** a per-user gate state folder on the Mac (placement checks and pass records), removed automatically: each file is deleted once its process or its recheck time is gone. No new state on natedev.
+
+**Verification:**
+1. Test: `scripts.mac_test.test_cargo_gate`, `scripts.mac_test.test_mac_queue_run`, `scripts.mac_test.test_offload`, `scripts.mac_test.test_offload_lifecycle`, `scripts.build_queue.test_queue_view`, `scripts.build_queue.test_memory_feed`, `scripts.production.test_mac_run`, `scripts.copies.test_copy_guard_sources`.
+2. Lint: `basedpyright` on the changed Python files; `zsh -n` on `gate.zsh` and `scripts/production/mac_run.sh`.
+
+**Speed:** a user terminal call adds one zsh start and no check. An agent call adds one ssh check per placement each `placement_recheck_seconds`; the other calls of that build read one local file.
+
+### Phase 120 — Admission counts swapped agent memory as demand  · status: done
+
+**Source:** 2026-11-13 15:5x, builds (URGENT, ahead of 119): the user reports chronic mouse and keyboard freezes on natedev ("it's chronic"). Admission lets builds take memory that the agents then lose to swap. Plan approved by builds; land order 44 re-land, 117, 120.
+
+#### Work Order
+
+**Goal:** admission does not start a build into memory that swapped agents will take back. Swapped memory outside the build and CI slices counts as demand in the room calculation.
+
+**Measured:** 2026-11-13 15:50 EST on natedev:
+- MemAvailable 13.2 GiB. app.slice (agents) 23.1 GiB resident and 12.4 GiB in swap. builds.slice 16.6 GiB resident and 4.0 GiB in swap.
+- Host swap used 19.2 GiB; 15.1 GiB of it is outside builds.slice. zram holds that swap in 6.5 GiB of RAM.
+- `memory_room` in `scripts/lint/memory_admit.py` computes room as MemAvailable minus `safety_gib` minus the holds of running builds. It reads no swap, so swapped agent memory counts as free room. With the new term, room at 15:50 is below zero.
+
+**Spec:**
+1. `memory_room` subtracts a swapped-demand term: host swap used (SwapTotal minus SwapFree) minus the `memory.swap.current` of builds.slice and of the CI slice (`ci_memory_slice`), times `agent_swap_share_percent` / 100. The term is never below zero.
+2. Add the key `agent_swap_share_percent=100` (whole, 0..100) to `config/build_admission.conf`. Its comment carries the measurement: 15:50, 15.1 GiB swap outside builds.slice, room under 0. Change no other key.
+3. Floor: with no build running, the head starts on the rule without the new term. Builds never stop; at most one build runs while agents are swapped.
+4. When a swap reading is unavailable, the term is unavailable and admission treats it as today's unavailable readings do. It never reads as zero.
+5. `MemoryRoom` carries the term as its own field. The head explanation (`scripts/build_queue/queue_evidence.py` `room_text`) shows it as its own term, for example `15.1 GiB swapped outside builds`.
+6. builds.slice keeps MemoryMax 44G as a static backstop; admission does not change it at runtime. The user (via natedev and builds): "but builds needs to be dynamic". The room term is the dynamic control: builds start only into memory that the agents and the desktop do not need now, RAM plus swap.
+
+**Tests:**
+1. Table rows in the existing `memory_room` tests: swap outside builds reduces room; builds.slice and CI swap do not; share 0 and 100; the no-running-build floor; an unavailable swap reading.
+2. A row in the existing `room_text` test for the new term.
+
+**Files:**
+- `scripts/lint/memory_admit.py`
+- `scripts/build_queue/admission_records.py`
+- `scripts/build_queue/queue_evidence.py`
+- `config/build_admission.conf`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/build_queue/test_queue_evidence.py`
+
+**Workers:** one implement worker.
+
+**State:** none.
+
+**Verification:**
+1. Test: `scripts.lint.test_memory_admit`, `scripts.build_queue.test_queue_evidence`, `scripts.build_queue.test_admission_service`, `scripts.build_queue.test_queue_view`.
+2. Lint: `basedpyright` on the changed Python files.
+
+**Speed:** two more `memory.swap.current` reads on each admission pass; `/proc/meminfo` is already read.
+
+### Phase 120b — The Builds page memory bar shows the desktop guarantee and the agents  · status: todo
+
+**Source:** 2026-11-13 ~15:55, the user (via natedev and builds): "we need to reflect these larger tranches in other - show the desktop guarantee and the agents (which is more dynamic) - when i say other i mean the main memory bar at the top of the builds page". builds: split today's "other" into its own segments; read them from the same source as the Phase 120 admission room. Lands right after Phase 120.
+
+#### Work Order
+
+**Goal:** the main memory bar at the top of the Builds page shows the room that admission sees: the desktop guarantee, the agents' RAM and the agents' swapped demand each have their own segment, and "other" holds only the rest.
+
+**Measured:** 2026-11-13 15:55 EST: session.slice `memory.min` reads 2147483648 (2 GiB, nixos dd9e7f6). `memory_feed.py` sets `other` = total − MemAvailable − build use; `memory_live.html` draws it as one grey segment ("Other programs and the system"). The feed reads its room from `explanation.room` (`MemoryRoom`), which carries the Phase 120 swapped-demand term.
+
+**Spec:**
+1. The feed payload adds `desktop_guarantee` (session.slice `memory.min`, read live, never a constant), `agents_ram` (app.slice `memory.current`) and `agents_swap` (the Phase 120 swapped-demand term from `MemoryRoom`). `other` becomes the rest and is never below zero.
+2. Read the session.slice and app.slice values through the cgroup readers in `scripts/lint/memory_admit.py`, so that the bar and admission read one source.
+3. The bar draws three new segments: the desktop guarantee, the agents' RAM, and the agents' swapped demand. The swapped demand is drawn inside the free part of the bar with its own pattern, because admission takes it from the room. Each segment has a tooltip and a legend entry in the page's style, in light and dark themes.
+4. An unavailable reading shows its segment as unavailable, never as zero.
+5. Keep apart from report phase 73's blocks banner edits in `memory_live.html`: change only the bar, its legend and its tooltips.
+
+**Tests:** table rows in the existing feed payload test for the three new values and for an unavailable reading.
+
+**Files:**
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/memory_live.html`
+- `scripts/lint/memory_admit.py`
+- `scripts/build_queue/test_memory_feed.py`
+
+**Workers:** one implement worker (the Phase 119 `impl` worker, which owns `memory_feed.py`).
+
+**State:** none.
+
+**Verification:**
+1. Test: every `scripts.build_queue` test module, and `scripts.lint.test_memory_admit`.
+2. Lint: `basedpyright` on the changed Python files.
+3. Live proof: before and after shots of the bar on natedev.
+
+**Speed:** two more cgroup file reads for each page refresh.
