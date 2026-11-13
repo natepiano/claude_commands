@@ -3887,7 +3887,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 251 — The crate run setup removes a partial seed copy  · status: todo
+### Phase 251 — The crate run setup removes a partial seed copy  · status: done
 **Depends on:** none
 
 #### Work Order

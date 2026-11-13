@@ -197,8 +197,8 @@ class CrateRunTests(CargoProjectTests):
             seed = self.frozen_seed
         else:
             seed = self.fixture_seed
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         _ = shutil.copytree(seed, self.root, symlinks=True)
-        self.addCleanup(shutil.rmtree, self.root)
         self.repo: Path = self.root / "project"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
