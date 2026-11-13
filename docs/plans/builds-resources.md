@@ -2331,3 +2331,43 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/test_ci_cargo_front.py` — the shared-folder row of the wrapper test makes a dead-owner, an old-form and a live-owner folder; only the live-owner folder stays
 
 **Gotchas:** at the first building call after the deploy, an old-form folder of a front that still runs is removed too.
+
+### Phase 112 — A queued hana CI run with no jobs stops holding a Mac block  · status: done
+
+**Depends on:** none.
+
+**Source (2026-11-12, builds showrunner, top priority):** "mac_test.py ci_activity() reads hana CI run 43096016385 (init/catalyst, queued since 11-11 20:25 UTC, zero jobs) as CI_BUSY. hana trunk's Mac block has waited since 20:04 EST. gh cannot cancel it ('completed') while it lists as queued: a ghost run. Fix: a queued run with no jobs past a time limit does not count as CI busy (new conf key for the limit; no go needed). Add a test row."
+
+#### Work Order
+
+**Goal:** a queued CI run that GitHub lists with no jobs for longer than a set time no longer makes a Mac block wait.
+
+**Measured:**
+1. `gh run list --status queued` lists run 43096016385 (natepiano/hana, `ci.yml`), created 2026-11-11 20:25 UTC. `gh run view --json jobs` gives an empty job list.
+2. `ci_activity()` (`scripts/mac_test/mac_test.py`) returns `CI_BUSY` for each queued or running run that has no completed `ci_job`, an empty job list included. So hana trunk's Mac block stays `pending` from 20:04 EST.
+3. `gh run cancel` refuses the run with "completed". Nothing on the GitHub side clears it.
+
+**Spec:**
+1. Add the key `ci_jobless_queued_minutes` to `config/mac_test.conf`, value `60`, with a comment and a range line in the same form as `gh_timeout_s`. Read it into `MacTestConfig`.
+2. `ci_activity()` asks `gh run list` for `databaseId,createdAt`. It keeps the status (queued or in_progress) of each run.
+3. A run counts as busy as now, except one case: the run is from the `queued` list, its job list is empty, and its `createdAt` is more than `ci_jobless_queued_minutes` before now. Such a run does not count as busy.
+4. An in_progress run with no jobs stays busy. A queued run with any job stays busy as now. A missing or malformed `createdAt` is `CiUnknown`, as other malformed `gh` JSON is.
+5. Add no flag, no cancel call and no new state file.
+
+**Tests** (`scripts/mac_test/test_mac_test.py`):
+1. In `test_queued_or_in_progress_run_without_mac_job_is_busy`, give each fake run a `createdAt`. Add rows: a queued run with no jobs created more than the limit ago does not hold the block (the block becomes `active`); an in_progress run with no jobs created as long ago stays busy.
+
+**Files:**
+- `scripts/mac_test/mac_test.py`
+- `scripts/mac_test/test_mac_test.py`
+- `config/mac_test.conf`
+
+**Workers:** one implement worker.
+
+**State:** hana trunk's pending Mac block becomes active at its next watch check after the deploy.
+
+**Verification:**
+1. Test: `scripts.mac_test.test_mac_test`.
+2. Lint: `basedpyright` on the changed Python files, once after the edits.
+
+**Speed:** no new `gh` call; `createdAt` comes in the same `gh run list` call.
