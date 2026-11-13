@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import io
 import json
 import os
@@ -78,7 +80,7 @@ class SilenceTests(unittest.TestCase):
         _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
         posted = root / "posted.jsonl"
         channel = root / "channel.py"
-        _ = channel.write_text('''import json
+        _ = channel.write_text(python_tool_source('''import json
 import os
 from pathlib import Path
 import sys
@@ -95,11 +97,10 @@ push_texts.approval_date = lambda text_id: "2026-11-06"
 if sys.argv[1:] == ["release"]:
     raise SystemExit(silence.off(lambda command: 0, lambda push: pushover.post_kept(push, keys, post)))
 raise SystemExit(pushover.send(sys.argv[1:], keys, post))
-''')
+'''))
         environment = {
             "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": "/nonexistent/herdr",
-            "PYTHONPATH": os.pathsep.join([str(checkout), *(str(path) for path in (checkout / "scripts").iterdir()
-                                                         if path.is_dir())]),
+            "PYTHONPATH": str(checkout / "scripts/lib/python_startup"),
             "CONF_DIR": str(root / "config"), "NOTIFY_STATE_DIR": str(root / "notify"),
             "XDG_STATE_HOME": str(root / "state"), "USER_ZONE": "America/New_York",
             "FIXTURE_KEYS": str(keys), "FIXTURE_POSTED": str(posted),

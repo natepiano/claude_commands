@@ -25,7 +25,7 @@ class RecordedMarksTests(unittest.TestCase):
         self.registry = self.root / "sessions"
         self.registry.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.registry),
-            "HERDR_PANE_RECORD_DIR": str(self.root / "panes")})))
+            "HERDR_PANE_RECORD_DIR": str(self.root / "panes"), "STAFF_FILE": str(self.root / "staff.json")})))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
 
 

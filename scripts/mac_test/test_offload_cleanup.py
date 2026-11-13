@@ -157,7 +157,7 @@ exit "$CLEANUP_TEST_STATUS"
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
             env={**os.environ, **self.configuration_environment,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                  "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),

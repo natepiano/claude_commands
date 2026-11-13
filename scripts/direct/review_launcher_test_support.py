@@ -183,15 +183,15 @@ class ReviewLauncherFixture(LauncherFixture):
         # Test the wrapper after admission in this private fixture.
         _ = (direct_dir / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
         lint = self.root / "scripts/lint"
-        lint.mkdir()
+        lint.mkdir(exist_ok=True)
         for name in ("style_review.py", "lint_config.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lint" / name, lint / name)
         message = self.root / "scripts/message"
-        message.mkdir()
+        message.mkdir(exist_ok=True)
         for name in ("sessions.py", "process_identity.py", "relay_identity.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
         review_config = self.root / "config/review"
-        review_config.mkdir(parents=True)
+        review_config.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
@@ -204,7 +204,7 @@ class ReviewLauncherFixture(LauncherFixture):
         environment["STAFF_FILE"] = str(self.root / "staff.json")
         environment["CODEX_HOME"] = str(self.root / "codex-home")
         environment["CODEX_THREAD_ID"] = self.staff_parent
-        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parents[1])
+        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parent / "lib/python_startup")
         _ = environment.pop("STAFF_ID", None)
         environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"

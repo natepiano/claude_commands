@@ -431,8 +431,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
         from scripts.notify import review
 
         push = render("codex.reset_ready", machine=machine)
-        command = user_send_argv(push)
-        command[1] = str(broadcast.SEND)
+        command = user_send_argv(push, send_script=broadcast.SEND)
         with quiet_notice_state() as state:
             if observation.generation != state.generation:
                 return

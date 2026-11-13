@@ -230,6 +230,8 @@ class PaneRestoreTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "STAFF_FILE": str(self.root / "staff.json")})))
         self.config = self.root / ".claude3"
         self.row = replace(type(self).row, home=staff.SessionHome(self.config))
         _ = self.enterContext(mock.patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))

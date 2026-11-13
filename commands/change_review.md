@@ -35,7 +35,7 @@ On exit 1 report its one line.
 
 ## Find the list
 
-Every action finds the list from its production, written `<production>` below:
+Every action finds the list from its production, written `[--production <name>]` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
@@ -70,7 +70,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -122,7 +122,7 @@ To rewrite a row still to review, such as one that lacks where to try it or
 what the person sees:
 
 ```sh
-… edit <production> --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 ```
 
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
@@ -178,6 +178,10 @@ The Mac block states that updates can take five minutes while the Mac is reachab
 The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
+The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
+It combines these needs with cached system comparisons without duplicate machines.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds.
+`rebuild.eval_retry_seconds` sets a 600-second wait after failed or partial evaluations; a new commit bypasses this wait.
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
@@ -240,11 +244,11 @@ A nonblocking lock prevents two renders from sending one alert at once.
 The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
-The diagnostic command `show <production>` still prints the current row and count.
+The diagnostic command `show [--production <name>]` still prints the current row and count.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
-run `mark-important <production> --row <id>`, with the ID as `/next` shows it,
+run `mark-important [--production <name>] --row <id>`, with the ID as `/next` shows it,
 such as `C434` or `sdlc/C9`.
 
 ## A folder for the user to try
@@ -269,10 +273,13 @@ A verdict beginning `works` or `fine`, after optional `okay`/`ok` and a row id
 (`c17`), lands the row. Case and later words do not affect the result; any
 other start returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
 feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
-there leaves the row open. Then:
+there leaves the row open.
+Different review rows can land feature-log notes on one merge link without `--separate-result`.
+The review page sends one failure alert per list, row, and error text.
+Then:
 
 ```sh
-… verdict <production> --row <id> --verdict "<the user's words>"
+… verdict [--production <name>] --row <id> --verdict "<the user's words>"
 ```
 
 Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.

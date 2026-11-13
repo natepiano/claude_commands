@@ -90,7 +90,9 @@ Countdown spans redraw once per second until expiry, without another script run.
 ## Account drawing
 
 `AccountsView(elements, columns, status, zone, now)` fits the pane width.
-Its columns include the access mark, account, left, role, busy, starting, waiting, idle, paused, exited, total, resets, credits, and enabled.
+Its columns start with the access mark, account, left, and role.
+The activity columns follow: busy, starting, waiting, idle, paused, exited, and total.
+The final columns show resets, credits, and enabled.
 Account labels are bold, and numbers align right.
 Each role has its own row and counts.
 Only the first row repeats the account values.
@@ -99,6 +101,7 @@ The peer transport includes waiting within busy and starting within idle for old
 The decoder separates those subsets before the board combines machine counts.
 A role without reported members has zero counts; `spare` has no count.
 The totals row sums known activity counts.
+The pane uses zero for starting and waiting when older status producers omit those fields.
 
 Without live detached work, units and showrunners without live sessions count as exited on their selected role account.
 Claude producers count under `showrunners` through the same hold and activity rules.
@@ -115,6 +118,7 @@ Narrow panes split columns or show labeled facts.
 Wrapping preserves complete facts and stays inside the pane.
 Problems appear as wrapped warning lines.
 `accountDisplay` converts the wire contract to `AccountReading<T>` and `CreditBalance`.
+It converts `StoredRoleSessionCounts` to `RoleSessionCounts` with all activity counts present.
 The [account design](accounts.md#status-counts-and-notes) defines count attribution and stored reads.
 
 `resolveUserZone` follows `scripts/lib/user_zone.py`.

@@ -1,5 +1,9 @@
 """Prepare local GPU trials and run their scaler service."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import base64
@@ -85,6 +89,17 @@ def settings() -> TrialLimits:
     return TrialLimits(conf.decimal(source.text('gpu_size_trial_limit_usd')),
                        source.whole('gpu_size_trial_lifetime_minutes'),
                        conf.decimal(source.text('gpu_size_trial_box_extra_usd')), maximums)
+
+
+def required_vcpus(limits: TrialLimits) -> int:
+    """Derive the trial quota from every configured launch type."""
+    needed = 0
+    for size in limits.spot_max_usd_per_hour:
+        vcpus = largest_gate_vcpus((size,))
+        if not vcpus:
+            raise ValueError('No vCPU count is available for configured GPU type: ' + size)
+        needed = max(needed, vcpus)
+    return needed
 
 
 def digest(path: Path) -> str:
@@ -872,12 +887,7 @@ class GpuTrialWorker:
 
     def select_region(self, deployment: dict[str, object], limits: TrialLimits) -> dict[str, object]:
         values = conf.read_or_repository('cloud_gate')
-        needed = 0
-        for size in limits.spot_max_usd_per_hour:
-            vcpus = largest_gate_vcpus((size,))
-            if not vcpus:
-                raise ValueError('No vCPU count is available for configured GPU type: ' + size)
-            needed = max(needed, vcpus)
+        needed = required_vcpus(limits)
         regions = {str(row['region']): row for row in ledger.rows(deployment, 'regions')}
         applied: list[str] = []
         for region in values.words('spot_candidate_regions'):

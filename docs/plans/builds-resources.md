@@ -2349,3 +2349,16 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `config/mac_test.conf` — `ci_jobless_queued_minutes`
 
 **Gotchas:** a real queued run that waits more than the limit with no jobs (for example, behind a concurrency group) no longer holds the Mac. The run it waits behind still counts as busy while it runs.
+
+### Phase 113 — A cargo version or help call runs during a build hold  · status: done
+
+#### As-built
+
+- After the subcommand is found, `scripts/build_hold/cargo` scans the later arguments up to `--`. A `-h` or `--help`, or a `-V` or `--version` with a subcommand other than `install`, runs the real cargo at once, with no Python and no scope.
+- During a hold, `cargo nextest --version` in `have_nextest()` (`scripts/lint/invoke.sh`) now succeeds, so `require_nextest()` no longer prints `cargo nextest is required`.
+- `install --version <v>` and a `--help` after `--` still go through the hold check, as in `ci_cargo_front.building_call()`.
+- No change to `invoke.sh` or to the rest of the wrapper.
+
+**Files:**
+- `scripts/build_hold/cargo` — the help and version scan after the subcommand
+- `scripts/build_hold/test_cargo_wrapper.py` — rows in `test_non_building_commands_skip_scope_and_python` for `nextest --version`, `clippy -V`, `build --help` and `test -h`; rows in the building test for `install --version 1.0 x` and `nextest run -- --help`

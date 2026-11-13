@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -48,7 +49,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, he
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -71,7 +72,9 @@ def feed_code_paths() -> tuple[str, ...]:
         _ = importlib.import_module(name)
     source_root = Path(__file__).resolve().parents[2]
     paths = {"scripts/" + relative for relative in admission_code.ADMISSION_CODE_PATHS}
-    paths.update(("scripts/lib/package_root.py", "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
+    from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
+    paths.update((*STARTUP_FILES, "scripts/build_queue/memory_live.html", "config/memory_feed.conf"))
     for module in tuple(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if isinstance(source, str) and source.endswith(".py"):
@@ -130,6 +133,22 @@ SWAP_OWNER_SLICES = {"app-agents.slice": "agents", "session.slice": "desktop",
                      "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 
 
+class MachineColors(TypedDict):
+    natedev: str
+    mac: str
+    aws: str
+
+
+class ThemeColors(TypedDict):
+    remote_memory: str
+    machines: MachineColors
+
+
+class PageColors(TypedDict):
+    light: ThemeColors
+    dark: ThemeColors
+
+
 @dataclass(frozen=True)
 class FeedConfiguration:
     output_folder: Path
@@ -137,6 +156,7 @@ class FeedConfiguration:
     history_days: int
     swap_rows: int
     report_refresh_seconds: int
+    colors: PageColors
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -148,9 +168,22 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
         settings = conf.read("memory_feed")
+
+    def color(key: str) -> str:
+        value = settings.text(key)
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+            raise ValueError(f"{key}: expected six hexadecimal digits")
+        return "#" + value
+
+    def theme(name: str) -> ThemeColors:
+        return {"remote_memory": color(f"remote_memory_{name}"), "machines": {
+            "natedev": color(f"machine_natedev_{name}"), "mac": color(f"machine_mac_{name}"),
+            "aws": color(f"machine_aws_{name}")}}
+
     return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
-                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"))
+                             settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
+                             {"light": theme("light"), "dark": theme("dark")})
 
 
 class PageArguments(CodeRootArguments):
@@ -267,6 +300,7 @@ class RowQueueNotes(TypedDict):
 
 
 class RunRow(RowQueueNotes):
+    admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     age: NotRequired[str]
@@ -418,6 +452,7 @@ class ReportNotRead(Enum):
 
 
 class MemoryPage(TypedDict):
+    colors: PageColors
     ok: bool
     read_at: float
     total: float
@@ -447,6 +482,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     head_text: str
     priority_text: str
+    queued_priority_units: list[str]
     unmatched_priority_text: str
     mac_idle_alert: str
     cloud_slots_used: int
@@ -561,7 +597,7 @@ def ci_amount(value: float) -> str:
 
 
 def build_ci_row(used: float, now: float,
-                 cgroup: Path = CI_CGROUP, proc: Path = PROC) -> RunRow:
+                 cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False) -> RunRow:
     runners: list[CIRunner]
     try:
         units = sorted(child for child in cgroup.iterdir()
@@ -591,7 +627,8 @@ def build_ci_row(used: float, now: float,
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
             "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
+            "ci_runners": runners, "admitted": admitted,
+            "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
 def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
@@ -905,9 +942,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
         memory = entry.step.measured
-        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(memory.job_state, NotServiceSlice):
+        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
             ci_rows[memory.cgroup] = build_ci_row(gib(memory.bytes), explanation.now,
-                Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
+                Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
     ci_runners = frozenset(runner["name"] for row in ci_rows.values() for runner in row.get("ci_runners", []))
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
@@ -960,7 +998,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         unit, state = detail, ""
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
             service = (isinstance(memory, admission_records.CompilerServiceMemory)
-                       or not isinstance(memory.job_state, NotServiceSlice) or bool(memory.diagnostic))
+                       or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
             if service:
                 name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
                 activity = service_activity_text(memory, explanation.now)
@@ -981,7 +1019,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
-                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP)
+                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
+                                   admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
                 if memory.diagnostic:
                     row["keep_text"] += "\n" + memory.diagnostic
                 name, detail = row["name"], row["detail"]
@@ -1070,9 +1109,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
     unmatched_priority_text = ""
+    queued_priority_units: list[str] = []
     if isinstance(explanation.priority, admission_records.QueuePriority):
         priorities = {entry["unit"]: f"queue priority: {entry['unit']} ({entry['why']})"
                       for entry in explanation.priority.entries}
+        queued_priority_units = list(dict.fromkeys(row["unit"] for row in waiting_rows if row["unit"] in priorities))
         matched_units: set[str] = set()
         for work_row in (*work_rows, *waiting_rows):
             if work_row["unit"] in priorities:
@@ -1100,6 +1141,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
     return {
+        "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
@@ -1114,6 +1156,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
+        "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,
         "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone()) or "",
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,

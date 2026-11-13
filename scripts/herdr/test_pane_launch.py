@@ -13,7 +13,7 @@ from typing import Literal, override, cast
 from unittest.mock import patch
 
 
-from scripts.herdr import pane_launch
+from scripts.herdr import pane_launch, herdr_types
 from scripts.production import session_labels, staff
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib import atomic_file, legacy_identity
@@ -28,6 +28,26 @@ class LaunchEnvironmentTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = self.enterContext(tempfile.TemporaryDirectory())
         _ = self.enterContext(isolated_staff_file(Path(directory) / "staff.json", {}))
+
+    def test_retained_pane_with_unreadable_current_identity_is_not_a_shell_candidate(self) -> None:
+        owner = staff.StaffRow(staff.StaffId("owner"), "unit", "other-unit", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("owner-native"))
+        record = staff.StaffSnapshot((owner,))
+        client = herdr.Herdr("fixture")
+        pane: dict[str, object] = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}
+        entry = pane_launch.launch("w1:p1", owner.current_session, "/repo", {}, ["claude"])
+        evidence = pane_launch.NativePaneEvidence((pane,), herdr.RowPaneScan({}, []))
+        info = {"process_info": {"shell_pid": 41, "foreground_process_group_id": 42,
+                                "foreground_processes": [{"pid": 42, "argv": ["claude"]}]}}
+        for error in (herdr.NativeRegistryUnavailable("pid 42: native registry identity is unavailable"),
+                      ValueError("fixture identity is unreadable"), OSError("fixture process is unreadable"),
+                      herdr_types.HerdrFailure("fixture pane is unreadable")):
+            with (self.subTest(error=type(error).__name__),
+                  patch.object(client, "result", return_value=info),
+                  patch.object(herdr, "pane_native_process", side_effect=error) as decoded):
+                self.assertEqual(pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                    record, client, {"w1:p1": entry}, evidence=evidence), [])
+                decoded.assert_called_once()
 
     def test_launch_does_not_retain_staff_environment(self) -> None:
         policy = ["--sandbox", "read-only", "-c", 'model_reasoning_effort="high"',

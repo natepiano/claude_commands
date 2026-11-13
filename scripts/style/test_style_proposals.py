@@ -3628,8 +3628,23 @@ class StyleProposalsTests(unittest.TestCase):
             issue = self.approved_decision(ledger, renamed, left)
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed"), "alpha/src/b.rs": "pub fn other() {}\n"})
             before = self.written(ledger)
-            dry = self.follow("--dry-run")
-            self.assertEqual(self.written(ledger), before)
+            read = style_ledger.Ledger.declaration_reading
+            observed_reads = 0
+
+            def read_and_check(active: style_ledger.Ledger, ids: Iterable[str],
+                               approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
+                nonlocal observed_reads
+                result = read(active, ids, approved)
+                observed_reads += 1
+                for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_tips"):
+                    self.assertFalse(getattr(active, cache))
+                return result
+
+            with mock.patch.object(style_ledger.Ledger, "declaration_reading", read_and_check):
+                dry = self.follow("--dry-run")
+                self.assertEqual(self.written(ledger), before)
+                self.assertEqual(self.follow("--dry-run"), dry)
+            self.assertEqual(observed_reads, 2)
             self.assertEqual(dry[0], 1)
             lines = dry[1].splitlines()
             self.assertIn(f"built {renamed.finding_id} {self.rename} alpha/src/a.rs:1: struct Parent renamed to Renamed in alpha/src/a.rs:1", lines)

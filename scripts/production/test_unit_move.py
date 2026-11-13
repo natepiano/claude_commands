@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -85,6 +86,8 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
                   mock.patch.object(herdr, "Herdr", return_value=client)):
                 resumed = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", owner.current_session,
                                    "--cwd", str(old), "--model", "opus")
+            shutil.rmtree(Path(self.env["HERDR_PROC"]) / str(shell_pid))
+            shutil.rmtree(Path(self.env["HERDR_PROC"]) / "102")
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             destination = self.root / "moved-alpha"
             arguments = ["move-folder", "--unit", owner.id, "--to", str(destination)]
@@ -144,6 +147,38 @@ class UnitFolderMoveTests(FolderRenameFixture):
                 mock.patch.object(pane_record, "pane_shell_pid", return_value=shell),
             ):
                 self.assertEqual(unit_move.move_processes_inside(self.owner, self.source), [above_pane, *extra])
+
+        worker = fixture_worker("unknown-worker", self.owner.id)
+
+        def conversation(identity: str) -> herdr.LiveConversation | herdr.UnknownConversation:
+            if identity == worker.current_session:
+                return herdr.UnknownConversation("fixture worker evidence is unavailable")
+            return herdr.LiveConversation("claude", (director,))
+
+        for extra in ((), (other_shell,)):
+            with (
+                self.subTest(worker="unknown", unrelated_shell=bool(extra)),
+                mock.patch.object(unit_move, "processes_inside", return_value=[shell, wrapper, director, child, *extra]),
+                mock.patch.object(pane_record, "process_parent", side_effect=parent),
+                mock.patch.object(herdr, "read_conversation", side_effect=conversation),
+                mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                    herdr.EnvironmentThread(self.owner.current_session), "fixture-start", {})),
+                mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+                mock.patch.object(pane_record, "pane_shell_pid", return_value=shell),
+            ):
+                self.assertEqual(unit_move.move_processes_inside(self.owner, self.source, preserved_workers=[worker]), list(extra))
+
+    def test_processes_inside_reads_the_selected_process_root(self) -> None:
+        process_root = self.root / "selected-proc"
+        process_root.mkdir()
+        for pid, cwd in ((41, str(self.source)), (23, str(self.source / "child")),
+                         (17, str(self.source) + "-other"), (31, str(self.source) + " (deleted)")):
+            process = process_root / str(pid)
+            process.mkdir()
+            (process / "cwd").symlink_to(cwd)
+        with (mock.patch.dict(os.environ, {"HERDR_PROC": str(process_root)}),
+              mock.patch.object(sys, "platform", "linux")):
+            self.assertEqual(unit_move.processes_inside(self.source), [23, 31, 41])
 
     def test_running_unit_stops_moves_and_resumes_current_session(self) -> None:
         from scripts.agents import detached_run_process

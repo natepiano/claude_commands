@@ -461,7 +461,6 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             modules.update(p.relative_to(repo) for p in (repo / path.parent).glob(pattern))
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
-    environment["HERDR_BIN"] = "/nonexistent/herdr"
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)

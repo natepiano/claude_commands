@@ -746,6 +746,114 @@ class FailureReported:
 
 
 @dataclass(frozen=True)
+class CacheFoldersNotMeasured:
+    """The earlier record has no inode measurements for a growth comparison."""
+
+
+@dataclass(frozen=True)
+class SharedCacheInode:
+    bytes: int
+    folders: frozenset[str]
+
+
+@dataclass(frozen=True)
+class MeasuredCacheFolders:
+    bytes_by_path: dict[str, int]
+    shared_inodes: dict[InodeKey, SharedCacheInode]
+
+
+@dataclass(frozen=True)
+class DirectoryMeasurement:
+    unique_bytes: int
+    folder_bytes: int
+
+
+@dataclass
+class CacheFolderWalk:
+    first_folder: dict[InodeKey, str] = field(default_factory=dict)
+    shared_inodes: dict[InodeKey, SharedCacheInode] = field(default_factory=dict)
+    folders: dict[str, DirectoryMeasurement] = field(default_factory=dict)
+
+    def observe(self, key: InodeKey, folder: str, size: int) -> bool:
+        """Return true only for the first observation in this folder."""
+        if key not in self.first_folder:
+            self.first_folder[key] = folder
+            return True
+        first = self.first_folder[key]
+        if first == folder:
+            return False
+        if key not in self.shared_inodes:
+            self.shared_inodes[key] = SharedCacheInode(size, frozenset((first, folder)))
+            return True
+        shared = self.shared_inodes[key]
+        if folder in shared.folders:
+            return False
+        self.shared_inodes[key] = SharedCacheInode(size, shared.folders | {folder})
+        return True
+
+    @classmethod
+    def from_scan(cls, scan: Scan, paths: Collection[str]) -> CacheFolderWalk:
+        """Use the idle scan's existing folder membership records."""
+        walk = cls()
+        for path in paths:
+            unique = 0
+            for key in scan.target_links.get(path, {}):
+                first = key not in walk.first_folder
+                if walk.observe(key, path, scan.blocks[key]) and first:
+                    unique += scan.blocks[key]
+            walk.folders[path] = DirectoryMeasurement(
+                unique, sum(scan.blocks[key] for key in scan.target_links.get(path, {})))
+        return walk
+
+    def forget(self, paths: set[str], keys: Iterable[InodeKey]) -> None:
+        """Remove changed folders before their next measurement."""
+        for key in keys:
+            owners: frozenset[str] = frozenset()
+            if key in self.shared_inodes:
+                shared = self.shared_inodes[key]
+                owners = shared.folders - paths
+                if len(owners) > 1:
+                    self.shared_inodes[key] = SharedCacheInode(shared.bytes, owners)
+                else:
+                    del self.shared_inodes[key]
+            if self.first_folder.get(key) in paths:
+                if owners:
+                    self.first_folder[key] = min(owners)
+                else:
+                    del self.first_folder[key]
+        for path in paths:
+            if path in self.folders:
+                del self.folders[path]
+
+    def snapshot(self) -> MeasuredCacheFolders:
+        """Save folder totals and shared identities without the transient owner map."""
+        return MeasuredCacheFolders({path: measurement.folder_bytes for path, measurement in self.folders.items()},
+                                    dict(self.shared_inodes))
+
+    def sizes(self, paths: Sequence[str]) -> tuple[tuple[str, int], ...]:
+        """Count shared bytes once within this measurement group."""
+        earlier: set[str] = set()
+        sizes: list[tuple[str, int]] = []
+        for path in paths:
+            size = self.folders[path].folder_bytes
+            size -= sum(shared.bytes for shared in self.shared_inodes.values()
+                        if path in shared.folders and shared.folders & earlier)
+            sizes.append((path, size))
+            earlier.add(path)
+        return tuple(sizes)
+
+
+@dataclass(frozen=True)
+class ProtectedFolderMeasurement:
+    sizes: tuple[tuple[str, int], ...]
+    walk: CacheFolderWalk
+
+    @property
+    def cache_folders(self) -> MeasuredCacheFolders:
+        return self.walk.snapshot()
+
+
+@dataclass(frozen=True)
 class FloorRecord:
     measured_at: float
     free_bytes: int
@@ -758,6 +866,7 @@ class FloorRecord:
     measured_roots: tuple[str, ...] = ()
     phone_crossing: PhoneCrossing = AbovePhoneFloor()
     failure: NoFailure | FailurePending | FailureReported = NoFailure()
+    cache_folders: CacheFoldersNotMeasured | MeasuredCacheFolders = CacheFoldersNotMeasured()
 
 
 @dataclass(frozen=True)
@@ -1399,22 +1508,66 @@ def alert_floor_lock(path: str, free: int, floor: int, *,
 
 
 def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
-    """The live Claude session each pid runs under: the nearest ancestor a session record names."""
+    """Find each process's session or the director of its detached worker."""
     if not pids:
         return {}
+    from scripts.agents import worker_lifecycle
     from scripts.message import process_table
     from scripts.message.sessions import live_sessions
+    from scripts.production import staff
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.CalledProcessError):
         return {}
     names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
+
+    @cache
+    def membership() -> staff.StaffSnapshot:
+        return staff.local_snapshot()
+
+    @cache
+    def detached_record(record_path: Path) -> dict[str, object]:
+        try:
+            return worker_lifecycle.read_json_object(record_path)
+        except (OSError, ValueError, UnicodeError):
+            return {}
+
+    def detached_owner(supervisor_pid: int, record_path: Path) -> str:
+        try:
+            record = detached_record(record_path)
+            identity = record.get("staff_id")
+            if (record.get("pid") != supervisor_pid or record.get("status") != "running"
+                    or not isinstance(identity, str)):
+                return ""
+            snapshot = membership()
+            worker = snapshot.by_id(staff.StaffId(identity))
+            parent = snapshot.parent_of(worker) if worker is not None else None
+            return parent.name if parent is not None else ""
+        except (OSError, ValueError, UnicodeError):
+            return ""
+
     found: dict[int, str] = {}
     for pid in pids:
         process = table.get(pid)
         name = process_table.nearest_named(process, table, names) if process is not None else None
         if name is not None:
             found[pid] = name
+            continue
+        seen: set[int] = set()
+        while process is not None and process.pid not in seen:
+            seen.add(process.pid)
+            try:
+                arguments = shlex.split(process.arguments)
+            except ValueError:
+                arguments = []
+            records = [Path(arguments[index + 2]) for index, argument in enumerate(arguments[:-2])
+                       if Path(argument).name == "detached_runs.py" and arguments[index + 1] == "supervise"]
+            if records:
+                owner = detached_owner(process.pid, records[0])
+                if owner:
+                    found[pid] = owner
+                break
+            process = table.get(process.parent)
     return found
 
 
@@ -2286,10 +2439,23 @@ def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
 
 def directory_blocks(directory: str, seen: set[InodeKey] | None = None,
                      excluded: Collection[str] = ()) -> int:
-    """Disk blocks under a directory, counting inodes already in seen once."""
-    if seen is None:
-        seen = set()
+    """Return disk blocks without counting an inode twice."""
+    walk = CacheFolderWalk()
+    counted: Collection[InodeKey] = () if seen is None else seen
+    measurement = measure_directory(directory, walk, excluded, counted_inodes=counted)
+    if seen is not None:
+        seen.update(walk.first_folder)
+    return measurement.unique_bytes
+
+
+def measure_directory(directory: str, walk: CacheFolderWalk,
+                      excluded: Collection[str] = (), *,
+                      counted_inodes: Collection[InodeKey] = ()) -> DirectoryMeasurement:
+    """Measure each inode once per folder and retain its first folder."""
+    if directory in walk.folders:
+        return DirectoryMeasurement(0, walk.folders[directory].folder_bytes)
     total = 0
+    folder_total = 0
     frontier = [directory]
     while frontier:
         try:
@@ -2307,11 +2473,14 @@ def directory_blocks(directory: str, seen: set[InodeKey] | None = None,
                     frontier.append(entry.path)
                 continue
             key = (stat.st_dev, stat.st_ino)
-            if key in seen:
+            size = stat.st_blocks * 512
+            first = key not in walk.first_folder
+            if not walk.observe(key, directory, size):
                 continue
-            seen.add(key)
-            total += stat.st_blocks * 512
-    return total
+            folder_total += size
+            if first and key not in counted_inodes:
+                total += size
+    return DirectoryMeasurement(total, folder_total)
 
 
 def try_lock(path: str) -> int | None:
@@ -2987,10 +3156,39 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
         status, detail = pending.get("status"), pending.get("detail")
         if isinstance(status, int) and not isinstance(status, bool) and isinstance(detail, str):
             failure = FailurePending(FloorFailureEvent(status, detail))
+    cache_folders: CacheFoldersNotMeasured | MeasuredCacheFolders = CacheFoldersNotMeasured()
+    saved_folders = data.get("cache_folders")
+    saved_shared = data.get("shared_cache_inodes")
+    if isinstance(saved_folders, dict) and isinstance(saved_shared, list):
+        folders = cast(dict[str, object], saved_folders)
+        valid = all(isinstance(size, int) and not isinstance(size, bool) and size >= 0 for size in folders.values())
+        shared: dict[InodeKey, SharedCacheInode] = {}
+        for item in cast(list[object], saved_shared):
+            if not isinstance(item, list):
+                valid = False
+                break
+            values = cast(list[object], item)
+            if len(values) != 4 or not all(isinstance(value, int) and not isinstance(value, bool)
+                                           and value >= 0 for value in values[:3]):
+                valid = False
+                break
+            names = values[3]
+            if not isinstance(names, list) or not all(isinstance(name, str) and name in folders
+                                                     for name in cast(list[object], names)):
+                valid = False
+                break
+            owners = frozenset(cast(list[str], names))
+            if len(owners) < 2:
+                valid = False
+                break
+            device, inode, size = cast(list[int], values[:3])
+            shared[(device, inode)] = SharedCacheInode(size, owners)
+        if valid:
+            cache_folders = MeasuredCacheFolders(cast(dict[str, int], folders), shared)
     return FloorRecord(float(measured), int(free), int(caches), history, push_history, held_roots, lock_alert,
                        filesystem if isinstance(filesystem, str) else "",
                        tuple(cast(list[str], measured_roots)) if isinstance(measured_roots, list)
-                       and all(isinstance(root, str) for root in cast(list[object], measured_roots)) else (), crossing, failure)
+                       and all(isinstance(root, str) for root in cast(list[object], measured_roots)) else (), crossing, failure, cache_folders)
 
 
 @contextmanager
@@ -3014,6 +3212,11 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         "last_alert_at": alert_at,
         "last_push_at": push_at,
     }
+    if isinstance(record.cache_folders, MeasuredCacheFolders):
+        data["cache_folders"] = record.cache_folders.bytes_by_path
+        data["shared_cache_inodes"] = [
+            [device, inode, shared.bytes, sorted(shared.folders)]
+            for (device, inode), shared in record.cache_folders.shared_inodes.items()]
     crossing = record.phone_crossing
     if isinstance(crossing, AbovePhoneFloor):
         data["phone_crossing"] = "above"
@@ -3046,6 +3249,24 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         data["held_roots"] = sorted(record.held_roots.roots)
     _ = partial.write_text(json.dumps(data) + "\n")
     _ = partial.replace(path)
+
+
+def common_cache_bytes(measurement: MeasuredCacheFolders, common: set[str]) -> int:
+    """Count shared inodes once among the common folders."""
+    total = sum(measurement.bytes_by_path[path] for path in common)
+    for shared in measurement.shared_inodes.values():
+        count = len(shared.folders & common)
+        total -= max(0, count - 1) * shared.bytes
+    return total
+
+
+def cache_folder_growth(previous: NoFloorRecord | FloorRecord, current: MeasuredCacheFolders) -> int:
+    """Compare only folders measured in both readings."""
+    if not isinstance(previous, FloorRecord) or not isinstance(previous.cache_folders, MeasuredCacheFolders):
+        return 0
+    earlier = previous.cache_folders
+    common = earlier.bytes_by_path.keys() & current.bytes_by_path.keys()
+    return common_cache_bytes(current, common) - common_cache_bytes(earlier, common)
 
 
 def read_disk_measurement() -> DiskMeasurement:
@@ -3303,11 +3524,16 @@ def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCache
             if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
 
 
-def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str]) -> tuple[tuple[str, int], ...]:
-    """Measure protected folders once, excluding nested targets and shared inodes."""
-    seen: set[InodeKey] = set()
-    return tuple((path, directory_blocks(path, seen, excluded)) for path in sorted(roots)
-                 if os.path.isdir(path) and on_floor_filesystem(path))
+def measure_protected_folders(roots: frozenset[str], excluded: frozenset[str], *,
+                              walk: CacheFolderWalk) -> ProtectedFolderMeasurement:
+    """Measure protected folders with the sweep's shared owner map."""
+    measured: list[str] = []
+    for path in sorted(roots):
+        if not os.path.isdir(path) or not on_floor_filesystem(path):
+            continue
+        walk.folders[path] = measure_directory(path, walk, excluded)
+        measured.append(path)
+    return ProtectedFolderMeasurement(walk.sizes(measured), walk)
 
 
 def protected_folder_lines(protected: Sequence[tuple[str, int]], path_limit: int, *,
@@ -3536,7 +3762,6 @@ def send_phone_push(phone: RenderedPush, *,
         from scripts.notify.push_texts import user_send_argv
         from scripts.notify import review
     command = user_send_argv(phone)
-    command[1] = str(session_send.SEND_SCRIPT)
     command.extend(crossing_send_argv(repeat))
     return run_send(command, "phone alert", input=None,
                     timeout=send_budget.user_seconds(review.user_send_seconds()))
@@ -4381,22 +4606,32 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         busy_bytes: dict[str, int] = {}
         ci_bytes = 0
         before_caches = total
+        cache_walk = CacheFolderWalk.from_scan(scan, [path for path in scan.target_bytes if on_floor_filesystem(path)])
         if not dry_run:
             # Build holds and Mac claims prevent size walks of their output.
             busy_bytes = {path: 0 for path in busy if on_floor_filesystem(path)}
             measured = measure_protected_folders(frozenset(
                 path for path, use in busy.items()
                 if not isinstance(policy, MacFloor) and not isinstance(use, BuildHoldTarget)),
-                excluded_targets)
-            busy_bytes.update(measured)
-            protected = tuple((path, size) for path, size in measured if isinstance(busy[path], NoRecordedEvidence))
+                excluded_targets, walk=cache_walk)
+            busy_bytes.update(measured.sizes)
+            protected = tuple((path, size) for path, size in measured.sizes if isinstance(busy[path], NoRecordedEvidence))
             held_bytes = sum(busy_bytes.values())
-            ci_seen: set[InodeKey] = set()
-            ci_bytes = sum(directory_blocks(os.path.expanduser(path), ci_seen)
-                           for path in lint_settings.words("sweep_ci_targets")
-                           if on_floor_filesystem(os.path.expanduser(path)))
+            ci_paths: list[str] = []
+            for path in lint_settings.words("sweep_ci_targets"):
+                path = os.path.expanduser(path)
+                if not on_floor_filesystem(path):
+                    continue
+                cache_walk.folders[path] = measure_directory(path, cache_walk)
+                if os.path.isdir(path):
+                    if path not in ci_paths:
+                        ci_paths.append(path)
+                else:
+                    del cache_walk.folders[path]
+            ci_bytes = sum(item[1] for item in cache_walk.sizes(ci_paths))
             unchanged_caches = held_bytes + ci_bytes
             before_caches = total + unchanged_caches
+        before_folders = cache_walk.snapshot()
         # The growth check compares this pair with the previous record. The scan takes minutes, so
         # free is read again after it: a target another process deletes during the scan is then out
         # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
@@ -4442,9 +4677,13 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             now = time.time()
             unchanged = {key for path in idle if path not in scan.changed_targets and on_floor_filesystem(path)
                          for key in scan.target_links.get(path, {})}
-            after_caches = sum(scan.blocks[key] for key in unchanged) + unchanged_caches
-            after_caches += sum(directory_blocks(path, unchanged, excluded_targets)
-                                for path in idle if path in scan.changed_targets and on_floor_filesystem(path))
+            changed = {path for path in idle if path in scan.changed_targets and on_floor_filesystem(path)}
+            cache_walk.forget(changed, (key for path in changed for key in scan.target_links.get(path, {})))
+            for path in idle:
+                if path in changed:
+                    cache_walk.folders[path] = measure_directory(path, cache_walk, excluded_targets)
+            after_folders = cache_walk.snapshot()
+            after_caches = common_cache_bytes(after_folders, {path for path in idle if on_floor_filesystem(path)}) + unchanged_caches
             # This pass did not remove these blocks.
             externally_removed_keys = {key for root in idle if root not in taken and not os.path.lexists(root)
                                       for key in scan.target_links.get(root, {})
@@ -4455,7 +4694,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 with locked_floor_record(record_path) as previous:
                     base = floor_record_or_new(previous, after_free)
                     free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
-                    cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
+                    cache_growth = cache_folder_growth(previous, before_folders)
                     recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= lint_settings.number("sweep_growth_window_seconds")
                     same_held_roots = (isinstance(previous, FloorRecord)
                                        and isinstance(previous.held_roots, KnownHeldRoots)
@@ -4515,7 +4754,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         alert_history=history, push_history=push_history,
                         held_roots=KnownHeldRoots(frozenset(hold_targets)),
                         filesystem=filesystem.key if isinstance(filesystem, FilesystemFloor) else "",
-                        measured_roots=tuple(sorted(idle))))
+                        measured_roots=tuple(sorted(idle)), cache_folders=after_folders))
             except OSError as error:
                 print(f"lint sweep: cannot save floor accounting: {error}", file=sys.stderr)
         outcome = FloorOutcome(tmp_sweep.CompletedSweepAssessment(0 if isinstance(policy, MacFloor) else (1 if failures else 0)),

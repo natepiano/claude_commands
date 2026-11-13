@@ -50,6 +50,10 @@ class MergeGateHoldTests(TemporaryHoldTest):
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
         _ = (Path(self.gate.environment["CONF_DIR"]) / "build_targets.conf").write_bytes(
             (self.root / "build_targets.conf").read_bytes())
+        # The fake process root also identifies the real process that owns this gate.
+        process = Path(os.environ["VERIFY_PROC_ROOT"]) / str(os.getpid())
+        process.mkdir(parents=True, exist_ok=True)
+        _ = (process / "stat").write_bytes(Path(f"/proc/{os.getpid()}/stat").read_bytes())
         self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
 

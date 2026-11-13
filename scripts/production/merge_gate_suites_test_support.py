@@ -19,11 +19,11 @@ CONCURRENCY_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_
                 if time.monotonic() >= deadline:
                     self.fail("runner never released the module")
                 time.sleep(0.01)'''
-CONCURRENCY_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
-                exec(package_root.read(), {"__file__": package_root.name})
-            from scripts.direct.wait_for_test_state import wait_until
-            wait_until((state / (str(os.getpgrp()) + ".released")).exists,
-                       state, timeout=TEST_HANG_GUARD_SECS)'''
+CONCURRENCY_EVENT = '''            import subprocess
+            helper = Path(os.environ["MERGE_GATE_TEST_WAIT"])
+            subprocess.run([str(helper.parents[1] / "scripts/lib/py"), str(helper),
+                            "file", str(state / (str(os.getpgrp()) + ".released"))],
+                           check=True, timeout=TEST_HANG_GUARD_SECS)'''
 OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             while True:
                 with (state / "modules.jsonl").open() as source:
@@ -33,14 +33,26 @@ OVERLAP_POLL = '''            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
                 if time.monotonic() >= deadline:
                     self.fail("module processes never overlapped")
                 time.sleep(0.01)'''
-OVERLAP_EVENT = '''            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
-                exec(package_root.read(), {"__file__": package_root.name})
-            from scripts.direct.wait_for_test_state import wait_until
-            def both_started():
-                with (state / "modules.jsonl").open() as source:
-                    starts = [json.loads(line) for line in source if line.strip()]
-                return len([row for row in starts if row["suite"] == "lib" and row["event"] == "start"]) == 2
-            wait_until(both_started, state, timeout=TEST_HANG_GUARD_SECS)'''
+OVERLAP_EVENT = '''            import subprocess
+            helper = Path(os.environ["MERGE_GATE_TEST_WAIT"])
+            subprocess.run([str(helper.parents[1] / "scripts/lib/py"), str(helper), "overlap", str(state)],
+                           check=True, timeout=TEST_HANG_GUARD_SECS)'''
+
+WAIT_FOR_STATE = '''import json
+import sys
+from pathlib import Path
+from scripts.direct.wait_for_test_state import wait_until
+
+path = Path(sys.argv[2])
+if sys.argv[1] == "file":
+    wait_until(path.exists, path.parent)
+else:
+    def both_started():
+        with (path / "modules.jsonl").open() as source:
+            starts = [json.loads(line) for line in source if line.strip()]
+        return len([row for row in starts if row["suite"] == "lib" and row["event"] == "start"]) == 2
+    wait_until(both_started, path)
+'''
 
 
 class GateSuitesFixture(MergeGateFixture):
@@ -49,6 +61,12 @@ class GateSuitesFixture(MergeGateFixture):
         super().bind_fixture(root)
         self.environment["LINT_CONFIG_FILE"] = str(root / "lint.conf")
         self.environment["MERGE_GATE_PYTHON"] = sys.executable
+        self.environment["MERGE_GATE_TEST_WAIT"] = str(self.bin / "wait-for-state.py")
+
+    @override
+    def build_fixture(self, root: Path) -> None:
+        super().build_fixture(root)
+        self.write(self.bin / "wait-for-state.py", WAIT_FOR_STATE)
 
     @override
     def write(self, path: Path, content: str) -> None:

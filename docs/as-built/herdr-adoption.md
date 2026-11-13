@@ -189,6 +189,11 @@ Exit 6 means busy before submission.
 A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
 Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
+For an active pass, that prompt includes the saved DONE instruction without changing the pass or saved delivery.
+Use `answer` to resubmit work when compaction consumed the assignment prompt.
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+The pass stays active, and the pane stays open, including a managed worker with `end_worker` set.
+The matching DONE reply then uses the normal completion hook.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
 For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
