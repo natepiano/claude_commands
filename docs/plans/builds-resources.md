@@ -2301,3 +2301,59 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `docs/as-built/build-memory-admission.md` — the "Targets in use" bullet
 
 **Gotchas:** `bash -o pipefail verify.sh` is not matched, because the first argument without a leading `-` is `pipefail`.
+
+### Phase 109 — Every hana Linux CI job finds its devShell tools again, and a cargo version call skips the queue  · status: done
+
+#### As-built
+
+- `cargo_path(explicit, front)` returns every `os.get_exec_path()` entry in its order. It drops only the folder that holds the front and each folder whose `cargo` is an executable that resolves to the front. The devShell folders (`cc`, `cargo-deny`, `cargo-nextest`, `cargo-sweep`, `mold`) before the real cargo stay on the child PATH.
+- Without `--cargo`, the command is the first `cargo` on that PATH that does not resolve to the front. With `--cargo <path>`, the command is that path; its folder goes first and its later duplicate is dropped.
+- `building_call(arguments)` returns no build when a flag that only prints text comes after the subcommand and before `--`: `-V` or `--version` (not for `install`, where `--version <VERSION>` takes a value), and `-h` or `--help`. Such a call runs at once with no admission request. An argument after `--` does not change the result.
+- Measured before the fix: every hana Linux CI job failed from the 2026-11-11 14:30 switch with `linker cc not found` and `no such command`. On 2026-11-12, `cargo clippy --version` held the queue head for 85 minutes with a 6,740,828,160-byte estimate.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py` — `cargo_path()`, `building_call()`
+- `scripts/build_queue/test_ci_cargo_front.py` — the wrapper test with a devShell folder and a recursing shim before the real cargo, with and without `--cargo`; a `building_call()` table; a `clippy --version` row in the outage pass-through test
+
+**Gotchas:** the CI runners run the front from a nix store copy. A fix reaches CI only after the nixos input bump and a switch.
+
+### Phase 110 — A cancelled CI job leaves no admission folder behind  · status: done
+
+**Depends on:** Phase 109 (same file).
+
+**Source (2026-11-12, builds showrunner):** "Add-on (left admission folders): current. Start it as the next phase now. The next front start on a runner removes each build-admission-ci-* folder whose front is gone; add one test row to the existing tests. No signal handler. The two folders there now go at that first start."
+
+#### Work Order
+
+**Goal:** a building call of the CI admission front removes each folder that an earlier front left in the shared admission folder after that front ended.
+
+**Measured:**
+1. On 2026-11-12, `/run/hana-ci-admission/hana-linux-1/` held `build-admission-ci-992-jh4xaa3k` (05:30) and `build-admission-ci-992-aajrqily` (16:44) with no live front; `hana-linux-2/` held two such folders (05:30, 16:43).
+2. `run_cargo()` (`scripts/build_queue/ci_cargo_front.py`) makes its folder with `tempfile.TemporaryDirectory(prefix=f"build-admission-ci-{os.getuid()}-", dir=shared_folder)`. A SIGKILL (job cancel, runner stop) skips the `with` exit, so the folder stays.
+3. The folder name holds no owner, so a later front cannot tell a live folder from a left one.
+
+**Spec:**
+1. Put the owner in the folder name: prefix `build-admission-ci-<uid>-<pid>-<start>-`, where `<pid>` is the front pid and `<start>` is `records.process_start_time(pid)` (both already read at the top of `run_cargo()`).
+2. In `run_cargo()`, when the shared folder is a `Path`, before the front makes its own folder, remove each `build-admission-ci-<uid>-*` folder of the same uid in that shared folder when:
+   - its name parses to `<pid>-<start>` and `records.process_start_time(pid)` is not `<start>` (the front is gone, or the pid is reused); or
+   - its name does not parse to an owner (a folder made by the code before this phase).
+3. Keep each folder whose owner is live. Remove only folders that `os.getuid()` owns. A folder that another front removes at the same time is not an error.
+4. With no shared folder (`JobTemporaryFolder`), change nothing: the job temporary folder is the runner's.
+5. Add no signal handler, no flag and no config key.
+
+**Tests** (`scripts/build_queue/test_ci_cargo_front.py`):
+1. In `test_packaged_wrapper_selects_the_next_cargo_and_admits_once`, the `use_shared` row first makes three folders in `shared`: one with a dead owner (a pid from a finished child process), one with the old name form, and one owned by the test process (live pid and start time). After the run, `shared` holds only the live-owner folder. Change the `list(shared.iterdir()) == []` assertion to that one-folder list for the `use_shared` row only.
+
+**Files:**
+- `scripts/build_queue/ci_cargo_front.py`
+- `scripts/build_queue/test_ci_cargo_front.py`
+
+**Workers:** one implement worker.
+
+**State:** the shared admission folder on each runner: the first building call after the deploy removes the left folders, the old name form included.
+
+**Verification:**
+1. Test: `scripts.build_queue.test_ci_cargo_front`.
+2. Lint: `basedpyright` on both files, once after the edits.
+
+**Speed:** one `scandir` of the shared folder and one `/proc/<pid>/stat` read per left folder, once per building call.

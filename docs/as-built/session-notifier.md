@@ -55,7 +55,9 @@ The root is `$NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`. Each insta
   `COMMAND` holds fixed message text; `PROMPT=scheduled` selects a prompt built at delivery.
   `RUN` holds a command for an instance that sends no message.
   `EVERY` specifies minutes; `TIMEOUT` specifies seconds and defaults to 120.
-  `FROM` defaults to the instance name; `CHECK` can be empty.
+  Fixed-message instances store `FROM`, which defaults to the instance name.
+  Scheduled showrunner instances store no `FROM`; delivery derives the sender from staff.
+  `CHECK` can be empty.
   `HOLD` and `ALIGN` use 0 or 1.
 - `state`: `ENABLED`, `NEXT_DUE`, `LAST_SENT`, `LAST_RESTART`, `LAST_TARGET` (the socket of the last send).
 - `lock`: the instance's flock. Every read-modify-write of `conf` or `state` holds it, and each file is rewritten whole (temp file, then `mv`).
@@ -80,9 +82,9 @@ job (15 s) → notifier.sh tick
     sessions.py member-socket TARGET → none: skip "session not running"; records unreadable
                                       (exit 3): skip "session lookup exit 3"
     hold (HOLD=1 only)              → skip, or release and go on
-    PROMPT=scheduled               → build prompt from the current owner row; failure skips this tick
+    PROMPT=scheduled               → build sender and prompt from the current owner row; failure skips this tick
     record LAST_SENT, LAST_TARGET
-    send.py --to uds:<socket> --from FROM --key notifier-<instance>
+    send.py --to uds:<socket> --from <derived sender or FROM> --key notifier-<instance>
             --summary 'scheduled update' --timeout TIMEOUT --text <fixed command or built prompt>
     append the outcome to fire.log
   wait for every subshell, release .tick.lock
@@ -100,14 +102,18 @@ A restarted session can therefore receive messages at its current socket.
 
 `COMMAND` supplies fixed message text.
 `codex_winddown.start_count` passes its `TICK` text through `--command` and creates no prompt file.
-For `PROMPT=scheduled`, the notifier runs `update_registration.py prompt --owner <staff-id>` before delivery.
+For `PROMPT=scheduled`, the notifier runs `update_registration.py delivery --owner <staff-id>` once before delivery.
 It removes the `session:` prefix from `TARGET` for that command.
-The command resolves the owner's current name and document through staff.
+The command resolves the owner's current name and document through one staff read.
 It reads the update interval from that document.
 `scheduled_prompt(minutes, production)` fills the template's interval, zone, name, and state directory.
-The output contains the template text without an added document-path line.
-A failed build skips the tick and prints one stderr line.
+The first output line is `showrunner-timer-<current staff name>`.
+The remaining output is the prompt, without an added document-path line.
+`prompt --owner <staff-id>` prints only the prompt for callers that need no sender.
+A failed command, missing separator, or empty prompt skips the tick and prints one stderr line.
 It does not record `LAST_SENT` or send a message.
+Scheduled delivery ignores a stored legacy `FROM` value.
+The next configuration rewrite removes that value.
 
 The notifier sends the prompt with `send.py --text`.
 The key `notifier-<instance>` limits each instance to one queued tick.
@@ -162,12 +168,13 @@ With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that
 ### The showrunner instance
 
 `update_registration.py register` creates or retargets `showrunner-<staff id>` and stops it.
-The timer retains its target session for discovery.
+The timer retains its owner's fixed staff id for discovery.
 Its configuration stores `PROMPT=scheduled` and targets `session:<staff id>`.
+It stores no sender name.
 Registration creates no prompt file.
 The staff id preserves the instance across production renames and session changes.
-`notifier.sh` builds each prompt through `update_registration.py prompt --owner <staff id>` before it records `LAST_SENT`.
-The builder reads the current owner name and document through staff.
+`notifier.sh` builds each sender and prompt through `update_registration.py delivery --owner <staff id>` before it records `LAST_SENT`.
+The builder reads the current owner name and document through one staff snapshot.
 It reads the interval from the document and the template from `commands/showrunner/produce.md`.
 The template uses `/showrunner:units`.
 A failed build prints one stderr line and skips delivery.
