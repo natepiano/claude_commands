@@ -159,7 +159,7 @@ Staff name conflicts also produce lines. Worker run checks share one process sna
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
 A process without an identity reports an unreadable thread when its pane holds staff.
 One staff candidate retains its pane placement with unknown status.
-Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
+Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
