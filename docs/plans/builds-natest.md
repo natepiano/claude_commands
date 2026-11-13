@@ -3574,3 +3574,105 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `UnitConfigFixture.setUpClass` (`unit_config_test_support.py`) builds one seed repository under a private home: `git init` on `main` and one empty commit. `setUp` copies it into each test's new root. Each test keeps its own home, environment, staff file and staff rows.
 - The three fixture classes inherit the seed. `test_unit_config.py` (45 tests) and `lib/test_git_exclude.py` (5 tests) did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: `test_unit_config.py` CPU 3.099 to 2.947 s; `test_git_exclude.py` 0.295 to 0.285 s; peak unchanged. natedev module_cost 3.915 to 1.744 s for both. Taplo (158 starts, 1.16 natedev CPU s) is now the top command in `test_unit_config.py`. Checkpoint `63acaa3e0`.
+
+### Phase 235 — The copies tests copy one source seed  · status: todo
+**Depends on:** Phase 234
+
+#### Work Order
+
+**Goal:** `copies/test_copies.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** architect 29 trial queue row 1; sdlc owner go 2026-11-13 13:38. Cached gate median 30.18 CPU s. `StandingTests.setUp` (`test_copies.py:64`) builds the source repositories in each of 120 tests: `ImmutableGitSeed.create` at `:108` (two inits, config, add, commit, push), then a remote add on the origin, `rev-parse`, an unpushed commit and a second `rev-parse` (about 12 Git commands per test).
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD copies/test_copies.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. If the per-test source setup is a top cost: build the published and unpushed source state once in `setUpClass`, and keep `published` and `head` as class values. In `setUp`, copy it with `ImmutableGitSeed.copy_to` (`production/cli_fixture.py:161`), which rewrites the origin path in the checkout config. Check every other absolute path the seed holds (the origin's added remote, the fixture Git config from `write_fixture_git_config`). Keep the per-test base, environment, staff rows, gate caches and patches.
+3. Keep the two other `ImmutableGitSeed.create` calls at `:1634` and `:1721` unless the profile shows a clear gain.
+4. If the profile names a larger cost, report it to the director before you change the plan.
+5. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+6. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+7. The director runs the aws pairs.
+
+**Files:**
+- `scripts/copies/test_copies.py`
+- `scripts/production/cli_fixture.py` (only if `ImmutableGitSeed` needs a small shared addition; keep its other callers unchanged)
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phases 233–234: a class seed copy replaces per-test Git setup; a copy to a new path must hold no absolute path into the seed.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: todo
+**Depends on:** Phase 234
+
+#### Work Order
+
+**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** architect 29 trial queue row 2; sdlc owner go 2026-11-13 13:38. Cached gate median 38.41 CPU s. `RetireUnitTests.setUp` (`test_shutdown_cli.py:544`) runs about 13 Git commands in each of its tests: bare init, clone, three config, add, commit, push, worktree add, add, commit, push, merge. `ResumeUnitTests.setUp` (`:1394`) runs about 8: bare init, clone, three config, add, commit, push.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. If the setup Git work is a top cost: build a retired-state snapshot and a resume-state snapshot once per class, and copy it in `setUp`. The production doc holds the absolute checkout path, and the worktree links are absolute. So either keep one fixed root path per class and restore into it (as Phase 233 did), or rewrite every absolute path after the copy. Keep the per-test staff rows, configs, run folder, holds, pane world, unit config and patches.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/agents/test_shutdown_cli.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 229: the move process scan reads the selected process root; keep that.
+- Phase 232: no signal handlers anywhere.
+- Phase 233: a class snapshot restored to the same path keeps Git worktree links valid.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 237 — The build record tests copy one seed repository  · status: todo
+**Depends on:** Phase 234
+
+#### Work Order
+
+**Goal:** `buildlog/test_record.py` uses less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** architect 29 trial queue row 4; sdlc owner go 2026-11-13 13:38. `setUp` (`test_record.py:126-129`) runs `git init` and an empty commit in each of 84 tests.
+
+**Spec:**
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD buildlog/test_record.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. If the per-test `git init` and commit are a top cost: build one seed repository in `setUpClass` and copy it into each test's `self.repo`, as Phase 234 did in `unit_config_test_support.py`. Keep admission state, build records, environment and patches private per test. The copy must hold no absolute path into the seed.
+3. If the profile names a larger cost, report it to the director before you change the plan.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+6. The director runs the aws pairs.
+
+**Files:**
+- `scripts/buildlog/test_record.py`
+
+**Workers:** 1 writer; one test module.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 234: the seed pattern in `unit_config_test_support.py` (class seed under a private home; `shutil.copytree` per test).
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
