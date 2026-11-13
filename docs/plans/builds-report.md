@@ -1371,7 +1371,7 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 
 **Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_memory_hover.py`.
 
-### Phase 72 — AWS rows name their owner · status: todo
+### Phase 72 — AWS rows name their owner · status: done
 
 From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png, pid 3184935). Cause, from aws: `cloud_gate.service_command` (scripts/aws_target/cloud_gate.py, about line 1061) starts each gate worker, and `gate_trial.py:476` each paired-trial worker, as a `systemd-run` unit without the caller's session id or unit. The worker's step record has no owner, so `queue_evidence.step_labels` falls back.
 

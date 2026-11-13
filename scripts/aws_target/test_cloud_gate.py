@@ -36,6 +36,40 @@ from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
+from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
+from scripts.build_hold import build_hold
+from scripts.build_hold.owning_session import OwningSession
+from scripts.build_queue import admission_records, queue_evidence
+from scripts.lib.build_steps import read_step_names
+from scripts.message.unit_labels import OwnerRole, UnitLabels
+
+
+def service_environment(command: Sequence[str]) -> dict[str, str]:
+    """Read the environment assignments from a service command."""
+    return dict(argument.removeprefix('--setenv=').split('=', 1)
+                for argument in command if argument.startswith('--setenv='))
+
+
+class CloudWorkerHoldTests(IsolatedBuildHoldTest):
+    def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
+        from scripts.lib import conf
+
+        configuration = conf.read_or_repository('cloud_gate')
+        for paired in (False, True):
+            with (self.subTest(paired=paired), mock.patch.dict(os.environ,
+                  {'CLAUDE_CODE_SESSION_ID': 'fixture-caller', 'CODEX_THREAD_ID': ''}),
+                  mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
+                command = cloud_gate.service_command('scripts.aws_target.gate_trial',
+                    ['--paired-worker', str(self.scratch / 'trial')], 'fixture', paired=paired)
+                environment = {**os.environ, **service_environment(command)}
+                self.assertEqual(build_hold.owning_session(environment), OwningSession('fixture-caller'))
+                holders = Path(environment['BUILD_HOLD_DIR'])
+                holders.mkdir(exist_ok=True)
+                path = write_holder(holders, 'fixture-other', '2026-11-13T12:00:00+00:00', 'fixture work')
+                result = invoke_hold(['wait'], environment)
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+                self.assertIn('fixture-other', result.stdout)
+                path.unlink()
 
 
 class FakeGateAws:
@@ -2265,6 +2299,48 @@ class CloudRouteTests(CostFixture):
                 _ = os.environ.pop('CONF_DIR', None)
                 command = cloud_gate.service_command('scripts.aws_target.gate_trial', ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                 self.assertFalse(any(argument.startswith('--setenv=CONF_DIR=') for argument in command))
+
+    def test_service_commands_forward_only_set_owner_variables(self) -> None:
+        owner = {'CODEX_THREAD_ID': 'fixture-codex', 'CLAUDE_CODE_SESSION_ID': 'fixture-claude',
+                 'CLAUDE_SESSION_NAME': 'fixture caller', 'BUILDLOG_UNIT': 'fixture-unit'}
+        for paired in (False, True):
+            for values in ({}, owner, {'CLAUDE_CODE_SESSION_ID': 'fixture-claude'}, {'BUILDLOG_UNIT': ''}):
+                with self.subTest(paired=paired, values=values), mock.patch.dict(os.environ):
+                    for key in owner:
+                        _ = os.environ.pop(key, None)
+                    os.environ.update(values)
+                    command = cloud_gate.service_command('scripts.aws_target.gate_trial',
+                        ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
+                    forwarded = service_environment(command)
+                    self.assertEqual({key: value for key, value in forwarded.items() if key in owner}, values)
+                    self.assertEqual(set(forwarded) - set(owner), {'AWS_SHARED_CREDENTIALS_FILE', 'CONF_DIR'})
+                    self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
+
+    def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
+        owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
+        for paired in (False, True):
+            for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
+                with self.subTest(paired=paired, session_key=session_key), mock.patch.dict(os.environ):
+                    _ = os.environ.pop('CODEX_THREAD_ID', None)
+                    _ = os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+                    os.environ.update({session_key: 'fixture-owner', 'CLAUDE_SESSION_NAME': owner.session,
+                                       'BUILDLOG_UNIT': owner.unit})
+                    command = cloud_gate.service_command('scripts.aws_target.gate_trial',
+                        ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
+                    forwarded = service_environment(command)
+                    for key in (session_key, 'CLAUDE_SESSION_NAME', 'BUILDLOG_UNIT'):
+                        del os.environ[key]
+                    os.environ.update(forwarded)
+                    with cloud_gate.cloud_reservation(self.repo, self.root / 'worker.sidecar', gate.SuiteMode.MERGE_GATE):
+                        record, = self.admission.caller_reservations().values()
+                        identity = record.queue_waiter
+                        self.assertEqual((identity.get('session_id'), identity.get('session_name'), identity.get('unit')),
+                                         ('fixture-owner', owner.session, owner.unit))
+                        step = admission_records.WaitingStep(record.owner.pid, identity.get('session_id', ''),
+                            identity.get('session_name', ''), record.step, record.worktree, identity['since'],
+                            record.need, admission_records.ReadyForAdmission(), unit=identity.get('unit', ''))
+                        self.assertEqual(queue_evidence.step_labels(step, {'fixture-owner': owner}), owner)
+                        self.assertEqual(read_step_names().for_owner(step.step, owner.unit, owner.role), 'fixture-unit merge')
 
     def test_service_command_preserves_credential_override(self) -> None:
         credential = self.root / 'override-credentials'
