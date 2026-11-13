@@ -390,7 +390,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
                 wire.AdmitHeadRequest("head", "urgent", "actor"),
-                wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
+                wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor", records.SelectedPriorityStep(42, "start", 123)),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
                 for call in (test_phase.CallRecord("a-call"), test_phase.NoCallRecord()):

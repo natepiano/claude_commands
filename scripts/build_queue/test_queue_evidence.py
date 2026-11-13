@@ -426,7 +426,7 @@ class QueueEvidenceTests(unittest.TestCase):
     def test_order_rule_shows_the_queue_priority_from_its_snapshot(self) -> None:
         from dataclasses import replace
         reading = gate.queue_read()
-        priority: records.QueuePriority = records.QueuePriority(({'unit': "resources", 'why': "work", 'set_at': NOW, 'set_by': "showrunner"},), records.SettledPriority())
+        priority: records.QueuePriority = records.QueuePriority(({"step": records.SelectedPriorityStep(1, "1", 0), 'unit': "resources", 'why': "work", 'set_at': NOW, 'set_by': "showrunner"},), records.SettledPriority())
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         facts = head_facts.read_head_facts(reading)
         model = queue_view.QueueModel(reading, {}, facts, head_facts.PaceUnavailable(), user_zone(), queue_view.HostLoadUnavailable(),

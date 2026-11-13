@@ -581,8 +581,27 @@ def admit_head(why: str, actor: str) -> wire.Ok | wire.Refused:
     return _mutation(wire.AdmitHeadRequest(uuid.uuid4().hex, why, actor))
 
 
-def priority_set(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
-    return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor))
+def priority_set(unit: str, why: str, actor: str, step: records.SelectedPriorityStep,
+                 *, selector: str = "") -> wire.Ok | wire.Refused:
+    return _mutation(wire.PrioritySetRequest(uuid.uuid4().hex, unit, why, actor, step, selector))
+
+
+def priority_set_unit(unit: str, why: str, actor: str) -> wire.Ok | wire.Refused:
+    from scripts.build_queue import admission_records as records
+
+    reading = view()
+    rows: list[records.Waiter] = [row for _, row in reading.ordered]
+    rows.extend(row["queue_waiter"] for row in reading.explanation.reservations if "queue_waiter" in row)
+    missing = [row.get("session_id", "") for row in rows if not row.get("unit")]
+    labels = {}
+    if missing:
+        from scripts.message import unit_labels
+        labels = unit_labels.unit_labels_for(missing, os.environ)
+    from scripts.lint.memory_admit import queue_unit
+    selected = next((row for row in rows if queue_unit(row.get("unit", ""), row.get("session_id", ""), labels) == unit), None)
+    if selected is None:
+        return wire.Refused(f"no live step matches {unit}; the queue priority did not change")
+    return priority_set(unit, why, actor, records.priority_step(selected), selector=unit)
 
 
 def priority_clear(actor: str, unit: str = "") -> wire.Ok | wire.Refused:
@@ -881,13 +900,13 @@ def main(argv: list[str] | None = None) -> int:
     _ = head_parser.add_argument("why")
     priority_parser = subcommands.add_parser("priority-set")
     _ = priority_parser.add_argument("unit")
-    _ = priority_parser.add_argument("--why", default="the user's bump")
+    _ = priority_parser.add_argument("--why", default=None)
     class Arguments(argparse.Namespace):
         command: str = ""
         session_id: str = ""
         reservation: str = ""
         value: int = 0
-        why: str = ""
+        why: str | None = None
         unit: str = ""
         pid: int = 0
         since: float = 0.0
@@ -949,18 +968,20 @@ def main(argv: list[str] | None = None) -> int:
             if not args.wait_events:
                 print(wire.encode_reply(grant), end="")
             return 0
+        from scripts.build_queue import admission_records as records
+
         def command_actor() -> str:
-            from scripts.build_queue import admission_records as records
             return records.queue_command_actor()
 
         result = (view() if args.command == "view" else explain() if args.command == "explain" else
                   mine(args.session_id) if args.command == "mine" else release(args.reservation, args.value, _saved_cleanup_timing())
                   if args.command == "release" else width(args.reservation, args.value)
                   if args.command == "width" else token_wait(args.reservation, _saved_cleanup_timing()) if args.command == "token-wait" else
-                  priority_set(args.unit, args.why, command_actor()) if args.command == "priority-set" else
+                  priority_set_unit(args.unit, args.why if args.why is not None else records.queue_priority_reason(command_actor()), command_actor()) if args.command == "priority-set" else
                   priority_clear(command_actor()) if args.command == "priority-clear" else
-                  admit_head(args.why, command_actor()))
+                  admit_head(args.why or "", command_actor()))
         if isinstance(result, wire.Refused):
+            print(f"build queue: {result.reason}", file=sys.stderr)
             return 2
         print(wire.encode_record(result))
     except _QueueLeft:

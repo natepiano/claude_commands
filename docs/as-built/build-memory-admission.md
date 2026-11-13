@@ -293,13 +293,22 @@ A failed first query shows `Build queue could not be read.`
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Set one step’s priority or clear selected priorities |
 | `admit_head` | Waive existing keep-asides for the head when free memory permits |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
-It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
-The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+`/build:queue bump <position|session|folder> [--why <reason>]` selects one live waiting or running step.
+`SelectedPriorityStep` binds the bump to its PID, process start time, and queue arrival time.
+The service validates that identity and its unit before it stores the bump.
+An unmatched selector exits 3 without a priority change.
+The priority remains through admission and ends with completion, cancellation, or owner death.
+A later step from the same unit has normal priority.
+Both command paths resolve the caller's staff name for the default reason.
+They preserve an explicit `--why` exactly and retain the caller identifier in `set_by`.
+An unavailable staff record uses the caller identifier; a shell without a session uses `user`.
+The mutation's `Ok` proves success even when the second view is unavailable.
+That case returns 0 and states that the new place is not known now.
+The view timeout remains 0.5 seconds.
 The queue commands `bump`, `clear`, and `admit-head` work from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
 The pane passes its session id to mutating commands. Read-only commands keep their existing environment.
@@ -852,7 +861,15 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
-Queue-priority commands accept only unit labels in the local roster. Only sessions with a real unit supply membership; the no-unit display placeholder supplies none. Unknown units, including that placeholder, leave the old priority unchanged and return `build queue: unknown unit <unit>; the queue priority did not change` on stdout with exit 3. The pane shows this through its existing refusal protocol. Callers pass a unit as `--unit=<unit>`, including names that start with `-`. The pane passes its own session id to the command. Each card shows the stored priority reason once and counts priority steps as `N of <unit> (queue priority)`; old per-step bump records are not card reasons. Clearing an unreadable priority file removes it and names the removed file.
+Queue-priority commands require a real unit and a live selected step.
+The no-unit display placeholder supplies no membership.
+An invalid or ended selector leaves the priority unchanged.
+The bump command returns `build queue: no live step matches <selector>` on stdout with exit 3.
+The pane shows the command result through its existing refusal protocol.
+The pane passes its session id to the command.
+Each card shows the stored reason once and counts priority steps as `N of <unit> (queue priority)`.
+Old per-step bump records are not card reasons.
+Clearing an unreadable priority file removes it and names the removed file.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -1581,9 +1598,11 @@ Token waiters keep their clocks and places but cannot protect room as the head.
 `TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
 The renderers use the eligible head's position and token history.
 
-Priority accepts real roster units, including units without a waiting step.
+Priority requires a live selected step with a real unit.
 The no-unit display placeholder is not a unit.
-Unassigned sessions retain `NormalOrder`, including with an old placeholder priority record.
+Unassigned sessions retain `NormalOrder`.
+The service reads only priorities with a typed selected-step identity.
+Deployment converts unit-only entries outside the repository before the new service starts.
 The pane passes its session id explicitly.
 Unknown units return exit 3 with a stdout line starting `build queue: `.
 Cards show `N of <unit> (queue priority)` once and use the saved reason.

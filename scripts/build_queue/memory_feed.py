@@ -264,6 +264,7 @@ class RowProgress(TypedDict):
 class RowQueueNotes(TypedDict):
     head: NotRequired[bool]
     priority: NotRequired[admission_records.PriorityEntry]
+    priority_text: NotRequired[str]
 
 
 class RunRow(RowQueueNotes):
@@ -864,6 +865,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     names = read_step_names()
     parsed = admission_client.view()
     explanation = parsed.explanation
+    priority_entries = ({entry["step"]: entry for entry in explanation.priority.entries}
+                        if isinstance(explanation.priority, admission_records.QueuePriority) else {})
+    matched_priority_steps: set[admission_records.SelectedPriorityStep] = set()
+
+    def priority_notes(steps: Sequence[admission_records.SelectedPriorityStep], unit: str) -> RowQueueNotes:
+        entries = [priority_entries[step] for step in steps
+                   if step in priority_entries and priority_entries[step]["unit"] == unit]
+        matched_priority_steps.update(entry["step"] for entry in entries)
+        return ({"priority": entries[0], "priority_text": "\n".join(f"queue priority: {entry['unit']} ({entry['why']})" for entry in entries)}
+                if entries else {})
+
     captured = explanation.room
     host = explanation.decided_from.host
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
@@ -895,6 +907,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     by_owner: dict[str, admission_records.RunningStep] = {}
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
     estimates: dict[str, admission_records.RecordedNeed | admission_records.NeedSourceNotRecorded] = {}
+    priority_steps_by_owner: dict[str, list[admission_records.SelectedPriorityStep]] = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
     for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
         owner = gate.reservation_owner(reservation, entry.step)
@@ -902,6 +915,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         estimates[owner] = (estimate_source(reservation["queue_waiter"]) if "queue_waiter" in reservation
                             else admission_records.NeedSourceNotRecorded())
         steps_by_owner.setdefault(owner, []).append(entry.step)
+        if "queue_waiter" in reservation:
+            priority_steps_by_owner.setdefault(owner, []).append(admission_records.priority_step(reservation["queue_waiter"]))
     run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
@@ -923,7 +938,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "estimated_need": gib(hold.memory.need), "held": gib(hold.memory.held),
                      "estimate": estimates.get(hold.memory.owner, admission_records.NeedSourceNotRecorded()),
-                     "group": "", "ci": False, "parts": []})
+                     "group": "", "ci": False, "parts": [],
+                     **priority_notes(priority_steps_by_owner.get(hold.memory.owner, ()), unit)})
     groups: dict[str, list[RunRow]] = {}
     for entry in explanation.running:
         step = entry.step
@@ -974,6 +990,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for row in walk:
         row["machine"] = machine
         row["vcpus"] = vcpus if vcpus is not None else queue_view.UnknownCpuCount()
+    waiter_identities = {(row["pid"], row["since"]): admission_records.priority_step(row) for _, row in parsed.ordered}
     waiters: list[WaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -986,11 +1003,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         reason = reason_phrase(waiter.reason, parsed.view.waiting)
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason = "head protection · " + reason
+        key = (waiter.pid, waiter.since)
+        steps = (waiter_identities[key],) if key in waiter_identities else ()
         waiters.append({"name": step_text(waiter, names, labels=labels), "showrunner": identity.owner_text, "unit": identity.unit, "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": identity.unit,
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room,
-                        "estimate": waiter_sources.get(waiter.pid, admission_records.NeedSourceNotRecorded())})
+                        "estimate": waiter_sources.get(waiter.pid, admission_records.NeedSourceNotRecorded()),
+                        **priority_notes(steps, identity.unit)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_reading = queue_view.read_mac_builds()
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
@@ -1029,7 +1049,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
                     if isinstance(information.update, queue_view.CloudUpdateLate)
-                    and not isinstance(cloud.wait, wire.CloudSlotWait) else ""}
+                    and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
+                **priority_notes((admission_records.SelectedPriorityStep(cloud.owner.pid, cloud.owner.start_time, cloud.since),), identity.unit)}
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text}
             else:
@@ -1037,15 +1058,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         work_rows.sort(key=lambda row: row["started_at"])
         waiting_rows = [cloud_waiters[entry.owner] if isinstance(entry, wire.CloudRow) else waiters[entry.position - 1]
                         for entry in queue_view.waiting_builds(model)]
-    unmatched_priorities: list[admission_records.PriorityEntry] = []
-    if isinstance(explanation.priority, admission_records.QueuePriority):
-        priorities = {entry["unit"]: entry for entry in explanation.priority.entries}
-        matched_units: set[str] = set()
-        for work_row in (*work_rows, *waiting_rows):
-            if work_row["unit"] in priorities:
-                work_row["priority"] = priorities[work_row["unit"]]
-                matched_units.add(work_row["unit"])
-        unmatched_priorities = [entry for unit, entry in priorities.items() if unit not in matched_units]
+    unmatched_priorities = (list({(entry["unit"], entry["why"]): entry
+                                 for entry in explanation.priority.entries
+                                 if entry["step"] not in matched_priority_steps}.values())
+                            if isinstance(explanation.priority, admission_records.QueuePriority) else [])
     if waiting_rows:
         waiting_rows[0]["head"] = True
     if isinstance(explanation.head, admission_records.HeadExplanation):

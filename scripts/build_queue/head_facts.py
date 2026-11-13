@@ -410,8 +410,10 @@ def bump_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_label
 
 
 def priority_text(priority: admission_records.QueuePriority | admission_records.NoQueuePriority) -> str:
-    return ("" if isinstance(priority, admission_records.NoQueuePriority) else
-            "queue priority: " + ", ".join(f"{entry['unit']} ({entry['why']})" for entry in priority.entries))
+    if isinstance(priority, admission_records.NoQueuePriority):
+        return ""
+    return "queue priority: " + ", ".join(
+        f"{summary.unit} ({'; '.join(summary.reasons)})" for summary in priority.unit_summaries())
 
 
 def order_rule(facts: HeadFacts) -> str:

@@ -570,7 +570,19 @@ class PendingPriorityTransition:
     set_by: str = ""
 
 
+@dataclass(frozen=True)
+class SelectedPriorityStep:
+    pid: int
+    start_time: str
+    since: float
+
+
+def priority_step(row: Waiter) -> SelectedPriorityStep:
+    return SelectedPriorityStep(row["pid"], row["start_time"], row["since"])
+
+
 class PriorityEntry(TypedDict):
+    step: SelectedPriorityStep
     unit: str
     why: str
     set_at: float
@@ -578,24 +590,21 @@ class PriorityEntry(TypedDict):
 
 
 @dataclass(frozen=True)
+class PriorityUnitSummary:
+    unit: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class QueuePriority:
     entries: tuple[PriorityEntry, ...]
     transition: SettledPriority | PendingPriorityTransition = SettledPriority()
 
-
-def upgrade_queue_priority(value: dict[str, object]) -> dict[str, object]:
-    """Read an older priority without changing its stored record."""
-    if "entries" in value or not all(key in value for key in ("unit", "why", "set_at", "set_by")):
-        return value
-    entry = {key: value[key] for key in ("unit", "why", "set_at", "set_by")}
-    transition = value.get("transition", {"kind": "SettledPriority"})
-    clearing = False
-    if isinstance(transition, dict):
-        old = cast(dict[str, object], transition)
-        clearing = old.get("action") == "clear"
-        if old.get("kind") == "PendingPriorityTransition":
-            transition = {**old, "unit": entry["unit"], "why": entry["why"], "set_by": entry["set_by"]}
-    return {"kind": "QueuePriority", "entries": [] if clearing else [entry], "transition": transition}
+    def unit_summaries(self) -> tuple[PriorityUnitSummary, ...]:
+        reasons: dict[str, dict[str, None]] = {}
+        for entry in self.entries:
+            reasons.setdefault(entry["unit"], {})[entry["why"]] = None
+        return tuple(PriorityUnitSummary(unit, tuple(values)) for unit, values in reasons.items())
 
 
 @dataclass(frozen=True)
@@ -626,6 +635,21 @@ class NoHeadAdmissionOverride:
 def queue_command_actor() -> str:
     """Identify the user command without a session-role check."""
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "user"
+
+
+def queue_priority_reason(actor: str) -> str:
+    """Name the caller without changing its recorded actor identity."""
+    from scripts.production import staff
+
+    name = actor
+    if actor != "user":
+        try:
+            member = staff.snapshot().by_member_reference(actor)
+            if member is not None:
+                name = member.name
+        except (OSError, ValueError, staff.StaffUnreadable):
+            pass
+    return f"{name}'s bump"
 
 
 @dataclass(frozen=True)

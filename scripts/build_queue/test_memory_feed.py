@@ -48,7 +48,12 @@ def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ())
 
 def with_queue_priority(reading: admission_records.QueueRead) -> admission_records.QueueRead:
     """Add a private user priority to the reading."""
-    priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "research", 'why': "the user's bump", 'set_at': reading.explanation.now, 'set_by': "fixture-user"},), admission_records.SettledPriority())
+    rows: list[admission_records.Waiter] = [row for _, row in reading.ordered]
+    rows.extend(reservation["queue_waiter"] for reservation in reading.explanation.reservations if "queue_waiter" in reservation)
+    steps = [admission_records.priority_step(row) for row in rows] or [admission_records.SelectedPriorityStep(1, "1", 0)]
+    priority = admission_records.QueuePriority(tuple(
+        {"step": step, "unit": "research", "why": "the user's bump", "set_at": reading.explanation.now, "set_by": "fixture-user"}
+        for step in steps))
     return replace(reading, explanation=replace(reading.explanation, priority=priority))
 
 
@@ -70,6 +75,9 @@ def report_fixture(*, empty: bool = False) -> charts.PageData:
 
 def reservation_reading(*, project: str = "fixture-project") -> admission_records.QueueRead:
     reservation = memory_tests.ProgressKeepAsideTests.reservation("nextest")
+    reservation["queue_waiter"] = {"pid": reservation["pid"], "start_time": reservation["start_time"],
+        "since": 0, "need": reservation["need"], "session_id": "session", "session_name": "fixture",
+        "step": "nextest", "folder": reservation["worktree"]}
     memory = admission_records.MeasuredMemory(2 * admission_records.GIB, anonymous=admission_records.AnonymousRunUse(admission_records.GIB))
     inputs = memory_tests.ProgressKeepAsideTests.inputs((reservation,), (memory,))
     inputs = replace(inputs, running=(replace(inputs.running[0], project=project),))
@@ -79,7 +87,11 @@ def reservation_reading(*, project: str = "fixture-project") -> admission_record
 def with_wait_reason(reading: admission_records.QueueRead, reason: admission_records.WaitReason) -> admission_records.QueueRead:
     waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
                               admission_records.GIB, reason, project="fixture-project")
-    return replace(reading, view=replace(reading.view, waiting=(waiter,)))
+    row: admission_records.Waiter = {"pid": waiter.pid, "start_time": str(waiter.pid), "since": waiter.since,
+        "need": waiter.need, "session_id": waiter.session_id, "session_name": waiter.session_name,
+        "step": waiter.step, "folder": waiter.folder}
+    return replace(reading, view=replace(reading.view, waiting=(waiter,)),
+                   ordered=[(Path("/fixture/waiter"), gate.rank_waiter(row, admission_records.NormalOrder()))])
 
 
 def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> admission_records.RunningStep:
@@ -154,7 +166,10 @@ class MemoryFeedTests(unittest.TestCase):
                       mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
                     page = memory_feed.reading()
                 row, = [row for row in page["walk"] if row.get("ci")]
-                self.assertEqual(cast(memory_feed.RunRow, row).get("ci_runners", [])[0]["state"], "busy" if busy else "idle")
+                row = cast(memory_feed.RunRow, row)
+                if "ci_runners" not in row:
+                    self.fail("the CI row has no runner evidence")
+                self.assertEqual(row["ci_runners"][0]["state"], "busy" if busy else "idle")
                 self.assertEqual(page["ci_ram"], 0.125)
                 self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
                 self.assertEqual(page["taken"], 0.125)
@@ -920,7 +935,7 @@ class MemoryFeedTests(unittest.TestCase):
         priority = first.explanation.priority
         assert isinstance(priority, admission_records.QueuePriority)
         two = replace(first, explanation=replace(first.explanation, priority=admission_records.QueuePriority(
-            (*priority.entries, {"unit": "cables", "why": "urgent", "set_at": first.explanation.now,
+            (*priority.entries, {"step": admission_records.SelectedPriorityStep(1, "1", 0), "unit": "cables", "why": "urgent", "set_at": first.explanation.now,
                                  "set_by": "actor"}))))
         cases = ((first, "queue priority: research (the user's bump)"),
                  (two, "queue priority: research (the user's bump), cables (urgent)"), (base, ""))
@@ -930,6 +945,59 @@ class MemoryFeedTests(unittest.TestCase):
                     payload = memory_feed.reading()
                 self.assertEqual([entry["unit"] for entry in payload["unmatched_priorities"]],
                                  ["research", "cables"] if reading is two else ["research"] if reading is first else [])
+
+    def selected_step_reading(self, *, running: bool) -> admission_records.QueueRead:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            if not running:
+                fixture.free(0)
+                fixture.hold_starts()
+            for index in range(3):
+                request = fixture.request(since=fixture.clock.now() - 30 + index)
+                request = replace(request, identity=replace(request.identity, unit="research"),
+                                  sidecar=str(fixture.scope(request.owner)))
+                if running:
+                    fixture.allow_next_start()
+                    _ = only_admitted(fixture.server.handle_request(request))
+                else:
+                    _ = fixture.server.handle_request(request)
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            reading = reply.reading
+            rows = ([row["queue_waiter"] for row in reading.explanation.reservations if "queue_waiter" in row]
+                    if running else [row for _, row in reading.ordered])
+            priority = admission_records.QueuePriority(tuple(
+                {"step": admission_records.priority_step(row), "unit": "research", "why": reason,
+                 "set_at": fixture.clock.now(), "set_by": "fixture"}
+                for row, reason in zip(rows[:2], ("first reason", "second reason"), strict=True)))
+            return replace(reading, explanation=replace(reading.explanation, priority=priority))
+
+    def test_priority_reasons_follow_two_selected_steps_of_the_same_unit(self) -> None:
+        for running in (False, True):
+            with self.subTest(running=running):
+                reading = self.selected_step_reading(running=running)
+                priority = reading.explanation.priority
+                assert isinstance(priority, admission_records.QueuePriority)
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                rows = page["walk"] if running else page["waiters"]
+                for entry in priority.entries:
+                    row, = [row for row in rows if row["pid"] == entry["step"].pid]
+                    self.assertEqual(row.get("priority_text", ""),
+                                     f"queue priority: research ({entry['why']})")
+
+    def test_unselected_step_of_a_priority_unit_has_no_priority_note(self) -> None:
+        for running in (False, True):
+            with self.subTest(running=running):
+                reading = self.selected_step_reading(running=running)
+                priority = reading.explanation.priority
+                assert isinstance(priority, admission_records.QueuePriority)
+                selected = {entry["step"].pid for entry in priority.entries}
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                rows = page["walk"] if running else page["waiters"]
+                unselected, = [row for row in rows if row["unit"] == "research" and row["pid"] not in selected]
+                self.assertEqual(unselected.get("priority_text", ""), "")
 
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(

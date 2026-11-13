@@ -274,9 +274,25 @@ class HeadFactsTests(AdmissionLogTests):
         facts = self.facts(head_reading())
         self.assertEqual(head_facts.cargo_token_text(facts), "no cargo token wait")
 
+    def test_three_selected_steps_show_the_same_unit_and_reason_once(self) -> None:
+        priority = admission_records.QueuePriority(tuple(
+            admission_records.PriorityEntry(step=admission_records.SelectedPriorityStep(pid, str(pid), NOW),
+                unit="resources", why="user work", set_at=NOW, set_by="showrunner") for pid in (1, 2, 3)))
+        self.assertEqual(head_facts.priority_text(priority), "queue priority: resources (user work)")
+
+    def test_selected_steps_keep_each_reason_in_one_unit_summary(self) -> None:
+        priority = admission_records.QueuePriority(tuple(
+            admission_records.PriorityEntry(step=admission_records.SelectedPriorityStep(pid, str(pid), NOW),
+                unit="resources", why=why, set_at=NOW, set_by="showrunner")
+            for pid, why in ((1, "first"), (2, "second"), (3, "first"))))
+        self.assertEqual(priority.unit_summaries(),
+                         (admission_records.PriorityUnitSummary("resources", ("first", "second")),))
+        self.assertEqual(len(priority.entries), 3)
+        self.assertEqual(head_facts.priority_text(priority), "queue priority: resources (first; second)")
+
     def test_live_queue_priority_is_shown_with_legacy_bump_history(self) -> None:
         reading = head_reading()
-        priority: admission_records.QueuePriority = admission_records.QueuePriority(({'unit': "resources", 'why': "user work", 'set_at': NOW, 'set_by': "showrunner"},), admission_records.SettledPriority())
+        priority: admission_records.QueuePriority = admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), 'unit': "resources", 'why': "user work", 'set_at': NOW, 'set_by': "showrunner"},), admission_records.SettledPriority())
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         write_bumps(NOW, [bump_line(NOW - 5)])
         facts = self.facts(reading)

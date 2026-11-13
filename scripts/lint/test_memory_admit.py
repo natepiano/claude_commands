@@ -59,6 +59,14 @@ from scripts.message.roster import UnitLabels
 READY_FOR_ADMISSION = admission_records.ReadyForAdmission()
 
 
+
+def priority_target(fixture: AdmissionFixture, unit: str) -> admission_records.SelectedPriorityStep:
+    rows = [waiting.row for waiting in fixture.server.waiters.values()]
+    rows.extend(reservation.queue_waiter for reservation in fixture.server.reservations.values())
+    labels = gate.priority_labels([row.get("session_id", "") for row in rows])
+    selected = next((row for row in rows if gate.queue_unit(row.get("unit", ""), row.get("session_id", ""), labels) == unit), None)
+    return admission_records.priority_step(selected) if selected is not None else admission_records.SelectedPriorityStep(0, "", 0)
+
 class SnapshotCompatibilityTests(unittest.TestCase):
     def test_older_record_uses_field_default(self) -> None:
         self.assertEqual(codec.parse_snapshot_value(
@@ -2471,7 +2479,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             before = {key: wire.encode_record(admission_records.stored_waiter(value.row))
                 for key, value in admission.server.waiters.items()}
             for unit, expected in (("first", [300, 400]), ("second", [300, 400])):
-                replies = admission.completed_queue_change(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id"))
+                replies = admission.completed_queue_change(wire.PrioritySetRequest(unit, unit, "user's work", "showrunner-id", step=priority_target(admission, unit)))
                 self.assertEqual(replies, [wire.Ok()])
                 reading, = admission.server.handle_request(wire.ViewRequest())
                 assert isinstance(reading, wire.ViewReply)
@@ -2588,16 +2596,20 @@ class ServicePriorityRepairTests(unittest.TestCase):
 
     def test_unknown_priority_unit_preserves_the_priority_and_log(self) -> None:
         with AdmissionFixture() as fixture:
+            fixture.free(0)
+            selected = fixture.request()
+            selected = replace(selected, identity=replace(selected.identity, unit="chosen"))
+            _ = fixture.server.handle_request(selected)
             self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
-                "initial", "chosen", "saved reason", "director")), [wire.Ok()])
+                "initial", "chosen", "saved reason", "director", step=priority_target(fixture, "chosen"))), [wire.Ok()])
             priority = fixture.server.priority
             assert not isinstance(priority, admission_records.NoQueuePriority)
             before = priority
             logged = buildlog_rows(fixture.state_dir.parent)
             for unit in ("not-a-roster-unit", UnitLabels("").unit):
                 self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
-                    "bad-" + unit, unit, "new reason", "director")), [wire.Refused(
-                        f"unknown unit {unit}; the queue priority did not change")])
+                    "bad-" + unit, unit, "new reason", "director", step=priority_target(fixture, unit))), [wire.Refused(
+                        f"no live step matches {unit}; the queue priority did not change")])
                 self.assertEqual(fixture.server.priority, before)
                 self.assertEqual(buildlog_rows(fixture.state_dir.parent), logged)
 
@@ -2607,7 +2619,7 @@ class ServicePriorityRepairTests(unittest.TestCase):
             request = fixture.request()
             self.labels[request.identity.session_id] = UnitLabels("unassigned")
             _ = fixture.server.handle_request(request)
-            fixture.server.priority = admission_records.QueuePriority(({'unit': UnitLabels("").unit, 'why': "old wire value", 'set_at': fixture.clock.now(), 'set_by': "director"},), admission_records.SettledPriority())
+            fixture.server.priority = admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), 'unit': UnitLabels("").unit, 'why': "old wire value", 'set_at': fixture.clock.now(), 'set_by': "director"},), admission_records.SettledPriority())
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             self.assertEqual(admission_records.waiter_priority(view.reading.ordered[0][1]), admission_records.NormalOrder())
@@ -2615,11 +2627,15 @@ class ServicePriorityRepairTests(unittest.TestCase):
 
     def test_priority_cleanup_uses_the_saved_log_end_and_records_a_stopped_set_once(self) -> None:
         with AdmissionFixture() as fixture:
+            fixture.free(0)
+            selected = fixture.request()
+            selected = replace(selected, identity=replace(selected.identity, unit="chosen"))
+            _ = fixture.server.handle_request(selected)
             path = store.host_file(store.host_name(), fixture.clock.now())
             path.parent.mkdir(parents=True, exist_ok=True)
             prefix = b"this old prefix is not JSON\n"
             _ = path.write_bytes(prefix)
-            request = wire.PrioritySetRequest("stopped-set", "chosen", "saved reason", "director")
+            request = wire.PrioritySetRequest("stopped-set", "chosen", "saved reason", "director", step=priority_target(fixture, "chosen"))
             with patch.object(buildlog_record, "queue_priority", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     _ = fixture.completed_queue_change(request)
@@ -5488,7 +5504,7 @@ class QueueExplanationTests(MemoryQueueFixture):
                                                 "since": NOW_EPOCH - 30})]),
             "recorded priority": replace(inputs, ordered=[(head_path, {**head, "priority_rank": 0}),
                                                              inputs.ordered[1]],
-                priority=admission_records.QueuePriority(({"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
+                priority=admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), "unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
                           "set_by": "showrunner"},))),
             "override": replace(inputs, override=override, host=admission_records.HostMemory(60 * GIB, 60 * GIB)),
             "unavailable": replace(inputs, host=admission_records.ReadingUnavailable()),
@@ -5658,9 +5674,9 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.waiting(400, GIB, 0)
         priorities: tuple[admission_records.QueuePriority | admission_records.NoQueuePriority, ...] = (
             admission_records.NO_QUEUE_PRIORITY,
-            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.SettledPriority()),
-            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)),
-            admission_records.QueuePriority(({'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)))
+            admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), 'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.SettledPriority()),
+            admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), 'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "set", NOW_EPOCH)),
+            admission_records.QueuePriority(({"step": admission_records.SelectedPriorityStep(1, "1", 0), 'unit': "head", 'why': "the user's bump", 'set_at': NOW_EPOCH, 'set_by': "showrunner"},), admission_records.PendingPriorityTransition("transition", "clear", NOW_EPOCH)))
         for priority in priorities:
             for owners in (frozenset[str](), frozenset(('400-warmup', '300-head'))):
                 with self.subTest(owners=owners):
