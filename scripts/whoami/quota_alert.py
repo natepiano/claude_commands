@@ -1919,14 +1919,6 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
     stamp = now.isoformat(timespec="seconds")
     pushes: list[tuple[QuotaNote, Literal["phone", "forecast_phone"], str]] = []
     log: list[str] = []
-    warnings: set[str] = set()
-    for home in readings.checked_homes:
-        account = agent_accounts.codex_account(home.home)
-        if isinstance(account, agent_accounts.KnownCodexAccount):
-            setting = agent_accounts.codex_credits_setting(account.label)
-            if isinstance(setting, agent_accounts.CreditsOn) and setting.warning:
-                warnings.add(setting.warning)
-    log.extend(sorted(warnings))
     workers_queued = workers_entry_pending()
     with state_file() as state:
         fallback = state["fallback"]

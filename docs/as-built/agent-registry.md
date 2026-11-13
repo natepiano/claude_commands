@@ -51,7 +51,7 @@ A direct change to an unsupported family refuses without writing.
 | Function | Sub-tasks |
 | --- | --- |
 | `direct` | `impl`, `test`, `fix`, `review`, plus the Claude `simplify` task |
-| `cli` | `commit_prep`, `merge_branch`, `interactive` |
+| `cli` | `merge_branch`, `interactive` |
 | `production` | `director` |
 | `design_roles` | `designer`, `reviewer` |
 
