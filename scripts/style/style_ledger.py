@@ -56,8 +56,10 @@ from scripts.style import approved_renames
 from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
                               NoAppliedCheck, NoOuterBindingBlock, OuterBindingBlocked as OuterBindingBlocked, OuterBindingUnproved as OuterBindingUnproved, RenameNotApplied, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, file_rename)
-from scripts.style.refill_inputs import RefillInputs, regex_tool_identity
+from scripts.style.refill_inputs import RefillInputs, UnstoredFact, input_identity, regex_tool_identity
 from scripts.style.refill_facts import RefillFacts
+from scripts.style.refill_cells import (CellState as CellState, CellDependencies, JudgmentCells,
+                                       JUDGMENT_READER_VERSION, cell_identity)
 from scripts.style.declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
@@ -78,7 +80,6 @@ class BuiltEntryEvidence:
         return self.applied
 
 
-CellState = Literal["current", "stale", "open", "awaiting merge"]
 # `removed` closes a ticket cell whose file the ticket's own commits deleted; it is not a verdict on code.
 Verdict = Literal["clean", "fixed", "exception", "held", "waived", "removed"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
@@ -1899,6 +1900,7 @@ class RepositoryTip:
     crate_dirs: tuple[str, ...]
     rust_files: tuple[str, ...]
     entries: dict[str, TreeEntry]
+    read_objects: tuple[str, ...]
 
     def crate(self, path: str) -> str:
         """The innermost crate directory that holds path, as a decision's crate is."""
@@ -1979,6 +1981,15 @@ def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
     return parse_tree_listing(_git(repo, "ls-tree", "-rz", "--full-tree", revision))
 
 
+TIP_CONFIG_PATHS = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
+
+
+def _tip_input_blobs(blobs: dict[str, str]) -> dict[str, str]:
+    """Select every blob read to construct a repository tip."""
+    return {path: blob for path, blob in blobs.items()
+            if PurePosixPath(path).name == "Cargo.toml" or path in TIP_CONFIG_PATHS}
+
+
 def _tip(repo: Path, commit: str) -> RepositoryTip:
     command = ("git", "-C", str(repo), "rev-parse", "--end-of-options",
                f"{commit}^{{commit}}", f"{commit}^{{tree}}")
@@ -1987,19 +1998,20 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
             or any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None for object_id in reply[1:])):
         raise GitReadFailed(command, 0, f"{commit}: invalid Git response")
     commit, tree = reply[1:]
-    entries = tree_entries(repo, commit)
+    inventory = parse_tree_listing(_git(repo, "ls-tree", "-rzt", "--full-tree", commit))
+    entries = {path: entry for path, entry in inventory.items() if entry.kind != "tree"}
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
-    configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
-    inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
+    inputs = _tip_input_blobs(blobs)
     contents = {path: content.decode(errors="replace") for path, content in blob_contents(repo, inputs)}
     manifests = {path: text for path, text in contents.items() if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
-    for config in configs:
+    for config in TIP_CONFIG_PATHS:
         if config in blobs:
             ignored.extend(_ignored_paths(_table(tomllib.loads(contents[config]))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
-    return RepositoryTip(commit, tree, blobs, directories, files, entries)
+    read_objects = (commit, tree, *(entry.object for entry in inventory.values() if entry.kind == "tree"), *inputs.values())
+    return RepositoryTip(commit, tree, blobs, directories, files, entries, read_objects)
 
 
 def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
@@ -2145,6 +2157,43 @@ def legacy_built_at_sql(finding: str = "held_findings") -> str:
     """The build time of a built finding before schema 25, using its SQL table name or alias."""
     return (f"COALESCE((SELECT updated_at FROM tickets WHERE id={finding}.build_ticket "
             + f"AND state='merged'), {finding}.updated_at)")
+
+
+def _judgment_version_triggers() -> str:
+    """Version each source mutation and mark its existing cell subscribers."""
+    sources = (
+        ("judgments", "id", "judgments"),
+        ("rule_generations", "rule", "rule_generations"),
+        ("invalidated_held_judgments", "judgment_id", "judgments"),
+        ("held_cell_corrections", "judgment_id", "judgments"),
+        ("lint_runs", "id", "lint_runs"),
+        ("sync", "id", "sync"),
+    )
+    statements: list[str] = []
+    for table, primary_key, dependency in sources:
+        statements.append(f"INSERT OR IGNORE INTO refill_tables VALUES ('{table}',0,0);")
+        for event, references in (("INSERT", ("NEW",)), ("UPDATE", ("OLD", "NEW")), ("DELETE", ("OLD",))):
+            body = [f"UPDATE refill_tables SET version=version+1 WHERE source_table='{table}';"]
+            for reference in references:
+                key = f"cast({reference}.{primary_key} AS TEXT)"
+                present = int(reference == "NEW")
+                body.append(
+                    "INSERT INTO refill_rows "
+                    + f"SELECT '{table}',{key},version,{present} FROM refill_tables WHERE source_table='{table}' "
+                    + "ON CONFLICT(source_table,source_key) DO UPDATE SET version=excluded.version,present=excluded.present;")
+                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "judgments":
+                    match += (f" OR (source_kind='judgment_cell' AND "
+                              + f"source_key=json_array({reference}.rule,{reference}.path))")
+                elif table == "lint_runs":
+                    match += f" OR (source_kind='lint_tool' AND source_key={reference}.tool)"
+                body.append(
+                    "UPDATE refill_cells SET dirty_version=dirty_version+1 WHERE consumer_key IN "
+                    + f"(SELECT consumer_key FROM refill_dependencies WHERE consumer_table='refill_cells' AND ({match}));")
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS refill_{table}_{event.lower()} AFTER {event} ON {table} BEGIN "
+                + " ".join(body) + " END;")
+    return "\n".join(statements)
 
 
 MIGRATIONS = {
@@ -2435,6 +2484,34 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS refill_object_declarations
             ON refill_objects(object_store, reader_version, fact_kind, declaration_name);
     """,
+    42: """
+        CREATE TABLE IF NOT EXISTS refill_tables (
+            source_table TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_version INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS refill_rows (
+            source_table TEXT NOT NULL, source_key TEXT NOT NULL, version INTEGER NOT NULL, present INTEGER NOT NULL,
+            PRIMARY KEY(source_table,source_key)
+        );
+        CREATE INDEX IF NOT EXISTS refill_changed_rows ON refill_rows(source_table,version);
+        CREATE TABLE IF NOT EXISTS refill_inputs (
+            object_store TEXT NOT NULL, input_kind TEXT NOT NULL, input_identity TEXT NOT NULL,
+            comparator_version INTEGER NOT NULL, result TEXT NOT NULL,
+            PRIMARY KEY(object_store,input_kind,input_identity,comparator_version)
+        );
+        CREATE TABLE IF NOT EXISTS refill_cells (
+            consumer_key TEXT PRIMARY KEY, catalog TEXT NOT NULL, rule TEXT NOT NULL, path TEXT NOT NULL,
+            view TEXT NOT NULL, input_identity TEXT NOT NULL, state TEXT NOT NULL, verdict TEXT NOT NULL,
+            dirty_version INTEGER NOT NULL, objects TEXT NOT NULL,
+            crate TEXT NOT NULL DEFAULT '', family TEXT, tier TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS refill_cell_domain ON refill_cells(catalog,view,rule,crate);
+        CREATE VIEW IF NOT EXISTS refill_cell_counts AS
+            SELECT catalog,view,rule,crate,family,state,count(*) AS cells,
+                sum(state='current' AND verdict='held') AS held
+            FROM refill_cells GROUP BY catalog,view,rule,crate,family,state;
+        DELETE FROM refill_cells;
+        DELETE FROM refill_dependencies WHERE consumer_table='refill_cells';
+    """ + _judgment_version_triggers(),
 }
 
 
@@ -2574,6 +2651,11 @@ class Ledger:
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
                  resolver: session_staff.RowResolver | None = None) -> None:
         self.repo: Path = repo
+        self._maintain_judgments: bool = access == LedgerAccess.READ_WRITE
+        self._maintaining_cell: bool = False
+        self._judgment_objects: dict[str, bool] = {}
+        self._judgment_reads: set[str] = set()
+        self._judgment_read_failures: int = 0
         self._finding_reads: list[HeldFindingReads] = []
         self._refill_changes: int = 0
         self._refill_object_store: str = ""
@@ -2666,9 +2748,13 @@ class Ledger:
                 raise CheckCouldNotRun(f"unsupported ledger schema version {version}")
             for number, migration in sorted(MIGRATIONS.items()):
                 if number > version:
-                    for statement in migration.split(";"):
-                        if statement.strip():
-                            _ = self._connection.execute(statement)
+                    statement = ""
+                    for fragment in migration.split(";"):
+                        statement += fragment + ";"
+                        if sqlite3.complete_statement(statement):
+                            if statement.strip("; \n"):
+                                _ = self._connection.execute(statement)
+                            statement = ""
                     _ = self._connection.execute("DELETE FROM schema_version")
                     _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
             self._connection.commit()
@@ -2748,10 +2834,14 @@ class Ledger:
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if isinstance(self.git_cache, GitReadCache):
-            return self.git_cache.tip(commit)
-        if commit not in self._tips:
-            self._tips[commit] = _tip(self.repo, commit)
-        return self._tips[commit]
+            tip = self.git_cache.tip(commit)
+        else:
+            if commit not in self._tips:
+                self._tips[commit] = _tip(self.repo, commit)
+            tip = self._tips[commit]
+        if self._maintaining_cell:
+            self._judgment_reads.update(tip.read_objects)
+        return tip
 
     def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
         key = _input_key(tip, scope, path)
@@ -2766,15 +2856,60 @@ class Ledger:
             self._inputs[key] = _inputs(tip, scope, path)
         return self._inputs[key]
 
+    def _judgment_facts(self) -> RefillFacts:
+        if not self._refill_object_store:
+            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        objects = Path(self._refill_object_store) / "objects"
+        status = objects.stat()
+        store = input_identity((self._refill_object_store, status.st_dev, status.st_ino))
+        return RefillFacts(self._connection, store, "", on_derived_write=self._note_refill_changes)
+
+    def _note_refill_changes(self, changes: int) -> None:
+        self._refill_changes += changes
+
+    def _judgment_objects_available(self, objects: tuple[str, ...]) -> bool:
+        unread = tuple(dict.fromkeys(name for name in objects if name not in self._judgment_objects))
+        groups: dict[Path, list[tuple[str, str]]] = {}
+        for name in unread:
+            if name.startswith("rule:"):
+                repository, object_id = cast(tuple[str, str], json.loads(name.removeprefix("rule:")))
+                groups.setdefault(Path(repository), []).append((name, object_id))
+            else:
+                groups.setdefault(self.repo, []).append((name, name))
+        for repository, names in groups.items():
+            result = _git_bytes(repository, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                                input="".join(object_id + "\n" for _, object_id in names).encode())
+            replies = result.stdout.decode(errors="replace").splitlines()
+            for (name, object_id), reply in zip(names, replies, strict=True):
+                self._judgment_objects[name] = reply.startswith(object_id + " ") and not reply.endswith(" missing")
+        return all(self._judgment_objects[name] for name in objects)
+
+    def _judgment_rule_matches(self, blob: str, rule: Rule) -> bool:
+        repository = next((parent for parent in rule.path.parents if (parent / ".git").exists()), None)
+        if repository is not None and blob != rule.blob:
+            self._judgment_reads.add("rule:" + json.dumps((str(repository), blob), separators=(",", ":")))
+        return rule_catalog.judged_text_unchanged(blob, rule)
+
     def _rust_code(self, blob: str) -> RustCode | NotTokenized:
         """What _rust_code reads in a blob, read once."""
+        self._judgment_reads.add(blob)
+        facts = self._judgment_facts() if self._maintaining_cell else None
+        if facts is not None and self._judgment_objects_available((blob,)):
+            stored = facts.input_fact("rust_code", blob, JUDGMENT_READER_VERSION)
+            if not isinstance(stored, UnstoredFact):
+                return RustCode(bytes.fromhex(stored)) if stored else NOT_TOKENIZED
         if blob not in self._rust_codes:
             if isinstance(self.git_cache, GitReadCache):
                 self.git_cache.read_blobs((blob,))
                 self._rust_codes[blob] = _rust_code(self.git_cache.contents[blob])
-                return self._rust_codes[blob]
-            result = _git_bytes(self.repo, "cat-file", "blob", blob)
-            self._rust_codes[blob] = _rust_code(result.stdout)
+            else:
+                result = _git_bytes(self.repo, "cat-file", "blob", blob)
+                self._rust_codes[blob] = _rust_code(result.stdout)
+        if facts is not None:
+            code = self._rust_codes[blob]
+            with facts.publication():
+                facts.store_input("rust_code", blob, JUDGMENT_READER_VERSION,
+                                  code.digest.hex() if isinstance(code, RustCode) else "")
         return self._rust_codes[blob]
 
     def _judged_commit_missing(self, commit: str) -> bool:
@@ -2783,6 +2918,35 @@ class Ledger:
         return result.returncode == 1
 
     def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
+        """Reuse only comparisons with the same immutable inputs and policy."""
+        if not self._maintaining_cell:
+            return self._compare_judgment_inputs(row, tip, scope, path, family)
+        effective = _comparison_scope(row.declared_scope, scope)
+        member = (path if isinstance(row.reads, ReadFiles) else _input_key(tip, effective, path)[2])
+        key = (row.commit, row.input_fingerprint, row.input_scope, row.declared_scope,
+               asdict(row.reads), tip.commit, effective, member, family)
+        facts = self._judgment_facts()
+        stored = facts.input_fact("scope_comparison", key, JUDGMENT_READER_VERSION)
+        if not isinstance(stored, UnstoredFact):
+            matched, required = cast(tuple[bool, list[str]], json.loads(stored))
+            self._judgment_reads.update(required)
+            if self._judgment_objects_available(tuple(required)):
+                return matched
+        previous = self._judgment_reads
+        self._judgment_reads = {row.commit, tip.commit}
+        failures = self._judgment_read_failures
+        try:
+            matched = self._compare_judgment_inputs(row, tip, scope, path, family)
+            required = sorted(self._judgment_reads)
+            if failures == self._judgment_read_failures and self._judgment_objects_available(tuple(required)):
+                with facts.publication():
+                    facts.store_input("scope_comparison", key, JUDGMENT_READER_VERSION, json.dumps((matched, required)))
+            return matched
+        finally:
+            previous.update(self._judgment_reads)
+            self._judgment_reads = previous
+
+    def _compare_judgment_inputs(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
         """Whether the judged inputs are unchanged at tip.
 
         Names rules judge comment text, so their inputs must be byte equal. A modules judgment also matches when only
@@ -2807,17 +2971,28 @@ class Ledger:
             return _only_comments_changed(self._scope_inputs(self._tip(row.commit), scope, path),
                                           self._scope_inputs(tip, scope, path), self._rust_code)
         except GitReadFailed:
+            self._judgment_read_failures += 1
             if self._judged_commit_missing(row.commit):
                 return False
             raise
         except LedgerError:
+            self._judgment_read_failures += 1
             return False
 
     def _is_ancestor(self, commit: str, tip: str) -> bool:
+        self._judgment_reads.update((commit, tip))
         key = (commit, tip)
+        facts = self._judgment_facts() if self._maintaining_cell else None
+        if facts is not None:
+            stored = facts.input_fact("ancestor", key, JUDGMENT_READER_VERSION)
+            if not isinstance(stored, UnstoredFact) and self._judgment_objects_available(key):
+                return stored == "true"
         if key not in self._ancestors:
             result = _git_bytes(self.repo, "merge-base", "--is-ancestor", commit, tip, answers=GitExitAnswers(frozenset({0, 1})))
             self._ancestors[key] = result.returncode == 0
+        if facts is not None and self._judgment_objects_available(key):
+            with facts.publication():
+                facts.store_input("ancestor", key, JUDGMENT_READER_VERSION, "true" if self._ancestors[key] else "false")
         return self._ancestors[key]
 
     def set_tip(self, tip: str, style_branch: str | None = None) -> None:
@@ -6287,7 +6462,7 @@ class Ledger:
 
     def _refresh_site_rows(self) -> None:
         version = (cast(tuple[int], self._connection.execute("PRAGMA data_version").fetchone())[0],
-                   self._connection.total_changes)
+                   self._connection.total_changes - self._refill_changes)
         if version == self._site_rows_version:
             return
         self._site_rows_version = version
@@ -7958,7 +8133,7 @@ class Ledger:
                     pass
                 continue
             judged = True
-            if row.declared_scope != declared or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
+            if row.declared_scope != declared or not self._judgment_rule_matches(row.rule_blob, rule):
                 continue
             try:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
@@ -7986,6 +8161,37 @@ class Ledger:
         if pending:
             return "awaiting merge", pending
         return ("stale" if judged else "open"), ""
+
+    def _cell_dependencies(self, rule: Rule, path: str, tip: RepositoryTip) -> CellDependencies:
+        rows = cast(list[tuple[int]], self._connection.execute(
+            "SELECT id FROM judgments WHERE rule=? AND path=?", (rule.rule_id, path)).fetchall())
+        scope = _cell_scope(rule, path, tip)
+        return CellDependencies((
+            ("judgment_cell", json.dumps((rule.rule_id, path), separators=(",", ":"), ensure_ascii=False), ""),
+            ("rule_generations", base_rule(rule.rule_id), ""),
+            ("scope_membership", json.dumps(_input_key(tip, scope, path)[1:]), tip.tree),
+            ("history", tip.commit, tip.commit),
+            ("removal_barriers", json.dumps((rule.rule_id, path)), tip.commit),
+            *(("judgments", str(id), "") for (id,) in rows),
+            *(("git_object", object_id, object_id) for object_id in sorted(self._judgment_reads)),
+        ))
+
+    def _maintained_judgment(self, cells: JudgmentCells, rule: Rule, path: str,
+                             tip: RepositoryTip, crate: str, branch: str) -> tuple[CellState, str]:
+        self._judgment_reads = {tip.commit}
+        identity = cell_identity((tip.commit, branch, cells.facts.object_store, rule.rule_id,
+                                  rule.blob, rule.judgment_identity, rule.tier, rule.family, rule.input_scope, path))
+        def calculate() -> tuple[CellState, str]:
+            previous = self._maintaining_cell
+            self._maintaining_cell = True
+            try:
+                return self._judgment_state(rule, path, tip)
+            finally:
+                self._maintaining_cell = previous
+        return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
+                            calculate,
+                            lambda: self._cell_dependencies(rule, path, tip),
+                            crate=crate, family=rule.family, tier=rule.tier)
 
     def _style_branch(self) -> StyleBranch:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -8057,22 +8263,53 @@ class Ledger:
         return StyleMergeChanges(style_branch.name, changed) if changed else NoStyleMergeChange()
 
     def _lint_coverage(self, tool: LintTool, tip: RepositoryTip) -> LintCoverage:
-        rows = cast(list[tuple[str, str, int, str, str]], self._connection.execute(
-            "SELECT tree,config_hash,passed,diagnostics_json,rule_blobs_json FROM lint_runs WHERE tool=? AND scope='workspace' ORDER BY id DESC", (tool,),
-        ).fetchall())
         config_hash = _config_hash(self.repo, tip, tool)
+        rows = cast(list[tuple[str, str, int, str, str]], self._connection.execute(
+            "SELECT tree,config_hash,passed,diagnostics_json,rule_blobs_json FROM lint_runs "
+            + "WHERE tool=? AND scope='workspace' AND tree=? AND config_hash=? ORDER BY id DESC",
+            (tool, tip.tree, config_hash),
+        ).fetchall())
         for tree, config, passed, serialized, rule_blobs_json in rows:
             if tree == tip.tree and config == config_hash:
                 diagnostics = cast(dict[str, int], json.loads(serialized))
                 rule_blobs = cast(dict[str, str], json.loads(rule_blobs_json))
                 return LintCoverage(True, bool(passed), diagnostics, rule_blobs)
-        return LintCoverage(bool(rows), False, {}, {})
+        has_runs = self._connection.execute(
+            "SELECT 1 FROM lint_runs WHERE tool=? AND scope='workspace' LIMIT 1", (tool,)).fetchone() is not None
+        return LintCoverage(has_runs, False, {}, {})
 
     def _coverage(self, rule_id: str | None = None, crate: str | None = None) -> Iterator[tuple[Cell, str]]:
         self._catalog = self._load_rules()
         self._branch_tips.clear()
         tip = self._synced_tip()
         self._refresh_sites(tip)
+        self._judgment_objects.clear()
+        roots = tuple(sorted({str(rule.path.parent) for rule in self._catalog}))
+        rule_stores: list[tuple[str, int, int]] = []
+        for root in roots:
+            repository = next((parent for parent in Path(root).parents if (parent / ".git").exists()), None)
+            if repository is not None:
+                identity = rule_catalog.RuleRepositoryIdentity.at(repository)
+                rule_stores.append((str(identity.common_dir), *identity.object_store_identity))
+        facts = self._judgment_facts()
+        facts.catalog = input_identity((str(self.repo), tuple(map(str, self._rule_checkouts)), roots, rule_stores))
+        maintained = JudgmentCells(facts, "synced")
+        if self._maintain_judgments:
+            facts.observe_sources()
+            objects = cast(list[tuple[str]], self._connection.execute(
+                "SELECT DISTINCT d.source_key FROM refill_dependencies d JOIN refill_cells c "
+                + "ON c.consumer_key=d.consumer_key WHERE d.consumer_table='refill_cells' "
+                + "AND d.source_kind='git_object' AND c.catalog=? AND c.view='synced'",
+                (facts.catalog,)).fetchall())
+            _ = self._judgment_objects_available(tuple(name for (name,) in objects))
+        style_branch = self._style_branch()
+        branch = ""
+        if isinstance(style_branch, StoredStyleBranch):
+            try:
+                branch = self._branch_commit(style_branch.name)
+            except (LedgerError, GitReadFailed) as error:
+                branch = str(error)
+        observed_rules: list[str] = []
         lint_tools: dict[LintTool, LintCoverage] = {}
         if rule_id is not None:
             if rule_id.endswith("#uncovered"):
@@ -8098,14 +8335,17 @@ class Ledger:
             if definition.tier == "B" and definition.candidates is not None and definition.candidates.surface == "partial":
                 components.append((replace(definition, rule_id=definition.rule_id + "#uncovered", tier="C"), files))
             lint_coverage = LintCoverage(False, False, {}, {})
+            lint_key = ""
             if definition.tier == "A":
                 tool = cast(LintTool, style_rules.parse_frontmatter(definition.path)["mechanism"][0])
+                lint_key = tool
                 if tool not in lint_tools:
                     lint_tools[tool] = self._lint_coverage(tool, tip)
                 lint_coverage = lint_tools[tool]
             for component, component_paths in components:
                 if rule_id is not None and rule_id.endswith("#uncovered") and component.rule_id != rule_id:
                     continue
+                observed_rules.append(component.rule_id)
                 for path in component_paths:
                     cell_crate = path if component.tier == "D" and component.input_scope == "manifest" else tip.crate(path)
                     if crate is not None and cell_crate != crate:
@@ -8116,9 +8356,22 @@ class Ledger:
                             state = "current" if (lint_coverage.passed and lint_coverage.diagnostics.get(path, 0) == 0
                                                   and rule_catalog.judged_text_unchanged(lint_coverage.rule_blobs.get(component.rule_id, ""), component)) else "stale"
                         verdict = ""
+                        if self._maintain_judgments:
+                            self._judgment_reads = {tip.commit}
+                            identity = cell_identity((tip.commit, component.blob, component.judgment_identity,
+                                                      asdict(lint_coverage), facts.object_store))
+                            state, verdict = maintained.result(
+                                component.rule_id, path, identity, self._judgment_objects_available,
+                                lambda: (state, verdict),
+                                lambda: CellDependencies((("lint_tool", lint_key, ""), ("git_object", tip.commit, tip.commit))),
+                                crate=cell_crate, family=component.family, tier=component.tier)
                     else:
-                        state, verdict = self._judgment_state(_judgment_rule(component, path), path, tip)
+                        judged_rule = _judgment_rule(component, path)
+                        state, verdict = (self._maintained_judgment(maintained, judged_rule, path, tip, cell_crate, branch)
+                                          if self._maintain_judgments else self._judgment_state(judged_rule, path, tip))
                     yield Cell(component.rule_id, path, cell_crate, cast(Tier, component.tier), component.family, state), verdict
+        if self._maintain_judgments:
+            maintained.finish(observed_rules, crate, all_rules=rule_id is None)
 
     def cells(self, rule: str | None = None, crate: str | None = None) -> Iterator[Cell]:
         for cell, _ in self._coverage(rule, crate):
