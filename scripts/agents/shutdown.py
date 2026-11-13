@@ -579,7 +579,11 @@ def _lifecycle(options: CommandLine) -> int:
                 started = False
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
-                    delivery = _message(row, "Continue where you stopped. Resume your existing workers. Do not open new workers.")
+                    from scripts.whoami import quota_alert
+
+                    workers = (quota_alert.no_worker_notice() if quota_alert.no_worker_mode()
+                               else "Resume your existing workers. Do not open new workers.")
+                    delivery = _message(row, f"Continue where you stopped. {workers}")
                     if restart_support.message_was_delivered(delivery):
                         started = True
                         shutdown_record.remove_started([str(row.id)])

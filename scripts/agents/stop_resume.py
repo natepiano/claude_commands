@@ -47,7 +47,7 @@ from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
 from scripts.lib.resume_message import (
-    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, launcher_prompt,
+    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -1226,6 +1226,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
+        mode = worker_mode() if row is not None else NO_WORKERS
+        if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
+            return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
         if entry is None:
             if row is None:
                 return SessionNotFound(session)
@@ -1299,7 +1302,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     _ = client.retitle(tab.pane_id, entry["name"])
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
-        workers = NO_WORKERS
+        workers: ResumeWorkers | WorkersHeld = NO_WORKERS
         own = NO_OWN_PASS
         detached = ""
         from scripts.production import worker
@@ -1311,6 +1314,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 run = worker_panes.worker_run(row, record=names.tab_record)
                 own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
+            elif isinstance(mode, WorkersHeld):
+                workers = mode
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:

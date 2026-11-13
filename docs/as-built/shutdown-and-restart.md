@@ -382,6 +382,16 @@ The message names idle children separately.
 It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
+
+`quota_alert.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+A missing or unreadable state reads as off.
+In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
+`agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
+A skipped worker leaves the restart record. The next assignment resumes it.
+`stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.
+`resume_message.worker_mode()` gives `WorkersHeld` in no-worker mode.
+The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
+A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker receives a continuation prompt when its transcript contains the open dispatch.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
