@@ -3704,35 +3704,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 249 — The bulk run tests do less repeated work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_bulk_run.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** Gate median CPU 47.2 s. sdlc owner go 2026-11-13 15:35, profile first.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD style/test_bulk_run.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. Remove repeated setup or process starts that no test checks. Build shared state once per class and copy it per test where setup is a top cost. Keep each real start that a test checks for exit status, signals, waits, routing or recovery. Never start anything on the Mac.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/style/test_bulk_run.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 235–243: class seed copies; register cleanup before a copy; bind import-time roots to the fixture root (Phase 243).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `style/test_bulk_run.py`: `BulkRunFixture` builds the Cargo project, tools and style staff once per class and copies the seed to the same absolute root for each test; an existing root falls back to the full setup.
+- aws pairs: 49.820 -> 36.245 CPU s (paired median saving 13.592 s); peak 272.6 -> 265.5 MiB. Base round 1 timed out; the changed variant passed all rounds.
+- 108 tests and 617 assertions unchanged; director review (no-worker mode) approves with no findings. Checkpoint 0a13c9aa4.
 
 ### Phase 250 — The verify Mac-only tests do less repeated work  · status: todo
 **Depends on:** none
