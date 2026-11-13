@@ -85,8 +85,13 @@ def read_work_events(path: Path) -> list[dict[str, object]]:
     return events
 
 
+def single_spaced(text: str) -> str:
+    """Join the words of text with one space each."""
+    return " ".join(text.split())
+
+
 def shortened(text: str) -> str:
-    text = " ".join(text.split())
+    text = single_spaced(text)
     return text if len(text) <= TASK_WIDTH else text[: TASK_WIDTH - 1].rstrip() + "…"
 
 
@@ -267,7 +272,7 @@ def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) 
         current = record.current
         if current.fix_rounds:
             parts.append(f"fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else ""))
-    return shortened(" · ".join(parts))
+    return single_spaced(" · ".join(parts))
 
 
 def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
@@ -283,7 +288,7 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     if isinstance(step, display_cells.NoOpenStep):
         return display_cells.NONE
     task = f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text or display_cells.NONE
-    return shortened(task)
+    return single_spaced(task)
 
 
 class OpenRunPhase(NamedTuple):
@@ -389,7 +394,7 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_re
         if identifier and identifier not in phase_ids:
             text = (f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text
                     ) if isinstance(step, display_cells.OpenStep) else display_cells.NONE
-            work.append(shortened(f"{identifier}: {text}"))
+            work.append(single_spaced(f"{identifier}: {text}"))
     return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
 
 
@@ -402,11 +407,12 @@ def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = 
         queue = "queue unreadable"
     else:
         items = [item for item in items if item != notes]
-        queue = (shortened(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
+        queue = (single_spaced(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
     rows = [row for row in plan_phase_rows(record_fields(record)) if row.get("status") not in ("done", "running", "open")]
     plan = ""
     if rows:
-        plan = (f"plan: phase {rows[0].get('phase')}: {shortened(rows[0].get('title', ''))}"
+        title = single_spaced(rows[0].get("title", ""))
+        plan = (f"plan: phase {rows[0].get('phase')}: {title}"
                 + (f" +{len(rows) - 1} more" if len(rows) > 1 else ""))
     return " · ".join(part for part in (queue, plan) if part) or display_cells.NONE
 
@@ -526,25 +532,23 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         status_rows.append((unit.unit, unit.status, *((machines[index],) if machines else ()),
                             progress_cell(progress_record), phase_cell(progress_record),
                             eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
-                            eta_plan_cell(progress_record, now=now, zone=zone)))
-        work_rows.append((unit.unit, notes, workers, non_phase_cell(record, opened, notes_record=notes_record), queued))
-    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan")
-    work_headers = ("Unit", "Notes", worker_heading(), "Non-Phase Work", "Queued")
+                            eta_plan_cell(progress_record, now=now, zone=zone), workers))
+        work_rows.append((unit.unit, notes, non_phase_cell(record, opened, notes_record=notes_record), queued))
+    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan",
+                      worker_heading())
+    work_headers = ("Unit", "Notes", "Non-Phase Work", "Queued")
     if not show_plan_eta:
-        status_headers = status_headers[:-1]
-        status_rows = [cells[:-1] for cells in status_rows]
+        status_headers = (*status_headers[:-2], status_headers[-1])
+        status_rows = [(*cells[:-2], cells[-1]) for cells in status_rows]
     progress_column = 3 if machines else 2
     show_progress = any(cells[progress_column] != display_cells.NONE for cells in status_rows)
-    columns = conf.read_or_repository("production").whole("units_table_columns")
     lines: list[str] = []
-    for headers, table_rows, cuttable, cut_order in (
-            (status_headers, status_rows, (), display_cells.CutOrder.LISTED),
-            (work_headers, work_rows, (4, 3, 2, 1), display_cells.CutOrder.WIDEST_FIRST)):
+    for headers, table_rows in ((status_headers, status_rows), (work_headers, work_rows)):
         if lines:
             if show_progress:
                 lines.extend(("", progress_legend()))
             lines.append("")
-        headers, table_rows = display_cells.fitted(headers, table_rows, cuttable=cuttable, columns=columns, cut_order=cut_order)
+        headers, table_rows = display_cells.wrapped(headers, table_rows)
         lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
                       "| " + " | ".join(("---",) * len(headers)) + " |"))
         lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)

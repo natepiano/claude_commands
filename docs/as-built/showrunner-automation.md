@@ -643,11 +643,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
-  The phase tables and the style table use `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
+  The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
+  It preserves full cells and omits columns whose cells are all `—`.
+  A table without rows keeps its columns.
+  The command emits one Markdown row per unit for Claude Code's native wrapping.
+  The renderer sets column widths from the terminal width and wraps text inside each cell.
+  Print the output as Markdown without code fences, `<br>`, or continuation rows.
+  Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
+  Renderer trials at 170 columns showed that native wrapping keeps each unit in one visible row.
+  The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
   The helper omits columns whose cells are all `—`; a table without rows keeps its columns.
-  The callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
+  The style caller reads `units_table_columns` from `config/production.conf` at use; the default is 170.
   The helper measures display columns with `terminal_cells.terminal_width` and allows four columns for the terminal margin.
   Row width is `1 + sum(width + 3)`, with each width at least three columns.
   The helper cuts text until the rows fit or each cuttable column reaches its header width.
@@ -696,8 +704,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
-    The work table prints `| Unit | Notes | Workers | Non-Phase Work | Queued |`.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
+    The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears only when at least one row has unfinished plan phases.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
@@ -718,13 +726,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Notes shows `phase <id> — <step>: <task>`, with the phase title when no step is open.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
-    Notes first limits text to 80 characters and ends longer text with `…`.
-    Each phase table calls `display_cells.fitted` separately with `units_table_columns`.
+    Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
+    Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    The status table has no cuttable column.
-    The work table uses `CutOrder.WIDEST_FIRST` only when that table exceeds the width.
-    It cuts the widest cuttable column by one character per step.
-    Equal widths use this cut order: Queued, Non-Phase Work, Workers, Notes.
+    Native Markdown wrapping keeps each unit's text in one row inside its cells.
+    Workers uses the same wrapping form when the status table exceeds the terminal width.
     Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
@@ -738,6 +744,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
     Workers uses `worker_runs` to show waiting runs, queued results, missing runs, and working workers.
+    Its cell keeps the existing 80-character limit.
     Run workers appear first; idle workers append a count, and closed workers add nothing.
     Remote units show no worker facts.
     The command reads panes once for the displayed units and their workers.
@@ -749,7 +756,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     It excludes each queue item whose text equals Notes in the same row.
     Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
-    Each item or title uses an 80-character limit; counts remain after the cut.
+    Each displayed item or title keeps its full text and count suffix.
     A configured plan with phases takes priority over the newest run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.
@@ -847,7 +854,21 @@ The pass shares one absolute monotonic deadline across discovery, pane text and 
 
 - **Paused units and external waits.** `stall_watch.status_defers_bump` checks the latest assistant turn-end status in the transcript. The pane supplies a fallback when the transcript has no usable status. A pause or an explicit external-owner wait resets the stretch without a bump or report, including near compaction. The watcher reads `paused_status_pattern`, `external_wait_pattern` and `external_owner_pattern` from `config/stall_watch.conf` at use. The `owner` group identifies the dependency. Live peer names and the showrunner's staff name also match. Matching ignores case. Other `holding:` lines prevent a bump only when they name an outside party anywhere in the line. The watcher reads those party words from `holding_party_pattern` at use and also checks the same peer names. The unit's own name, pane label, Claude session name and full session address do not count as outside parties. A party occurrence inside a complete own name does not count. A separate occurrence or a longer peer name still counts. The watcher reuses the pane labels from discovery through the shared pane snapshot. It makes no extra herdr read for labels. A failed label read produces one diagnostic per session per pass. Prompt checks continue without the label. Both checks keep the status text unchanged. Hyphens join words, so `user-interface` does not name the user. A sentence period ends a name; `.v2` continues it. Such a hold gets only the per-unit log line `inspected <showrunner name>/<name>: holding`. It sends no delivery to the unit or showrunner. The hold leaves `tell_sent` false, so a later idle unit can receive its bump and tell. A hold naming only its own worker, work order, tests or build receives the normal idle bump when nothing runs. Running work resets the stretch, and the unit reads `running`. Running work is one of these: a process that `work_running` finds; a busy pane worker whose staff parent is the director (`worker_panes.worker_state(observed) == "busy"`); or a live detached run of such a worker (`detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`). The watcher checks pane workers only for a unit with no process work, and detached runs only when no pane worker is busy. `read_busy_pane_worker_parents` makes one `worker_panes.observe_parents` read for all directors of the pass, on first need, and makes none when no watched director has staff workers. The held run folder is `unit_lookup.HeldRun.folder`, which can be a verified marker target outside `unit_runs.run_roots()`. A worker that waits on its own detached run reads idle in its pane, so only the detached-run check finds that work. A failed pane read or detached-run read counts as no work. It prints one `stall-watch: pane workers:` or `stall-watch: detached runs: <unit>:` line, and the pass continues. A resumed unit gets a fresh idle stretch. An override may omit status patterns; the watcher reads those patterns from the packaged config. Prompt grace still requires a valid value in the selected file. Invalid status rules print a diagnostic and suppress the unit's bump for that pass. Other units and pending deliveries continue. Missing, unmatched or empty `owner` captures are invalid. Run records still control eligibility. Herdr's `blocked` status follows the permission-prompt path above. Shutdown adds no unit-pause flag; stopped directors fail the live-session check.
 
-- **Expired login.** The watcher reads `login_limit_pattern` from `config/stall_watch.conf` at use. It checks the pane text after the last turn end, before the idle stretch. While the limit shows, the unit gets no bump. The showrunner gets one tell: `<unit>: the Claude login reached its time limit and needs /login.` The saved stretch keeps a `login_since` mark and `tell_sent`, so later passes send nothing more. The idle clock stays reset, and the log line reads `login limit`. The login is back when the usage store holds a successful read for the session's Claude login, newer than the session's last transcript activity. `login_restored` makes that read only for a pane at the limit. The login belongs to the account, so other sessions keep the old limit text after one `/login`. With the login back, the unit follows the normal idle path and gets its bump after the stall time. A value that cannot be read keeps the limit. A newer turn end also ends the limit. An old stretch file without the mark still reads.
+- **Expired login.** The watcher reads `login_limit_pattern` from `config/stall_watch.conf` at use.
+  `login_limited` checks the session's latest assistant transcript entry before the idle stretch.
+  Only an API error that matches the pattern establishes a login limit.
+  A successful assistant reply clears the limit, including after a resume on another account.
+  A process start newer than the error also clears it.
+  Old pane scrollback and saved stretch records cannot establish a login limit.
+  A successful usage read for the current account clears an error older than that read.
+  The usage read does not need to follow later transcript activity.
+  While the limit remains, the unit gets no bump.
+  The showrunner gets one tell: `<unit>: the Claude login reached its time limit and needs /login.`
+  The saved stretch keeps `login_since`, `login_pid` and `tell_sent` across pane changes, including a missing pane match.
+  The idle clock stays reset, and the log line reads `login limit`.
+  After recovery, the normal idle clock starts again.
+  A later login limit can send a new tell.
+  Old stretch files remain readable.
 
 - **`unit_status.sh` units.** `unit_status.sh <state-dir> <user-zone> --production <showrunner name>` takes its units from `live_units.py --production <showrunner name>`. Each block is headed by the unit id, and its text is read with `session_pane.py read unit <showrunner name> <unit>`.
 

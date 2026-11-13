@@ -20,6 +20,16 @@ class CutOrder(Enum):
     WIDEST_FIRST = "widest_first"
 
 
+def wrapped(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
+    """Keep full cells for native Markdown wrapping and omit columns with only NONE cells.
+
+    The renderer wraps each cell inside one table row at the terminal width.
+    A table without rows keeps every column.
+    """
+    kept = [index for index in range(len(headers)) if not rows or any(row[index] != NONE for row in rows)]
+    return tuple(headers[index] for index in kept), [tuple(row[index] for index in kept) for row in rows]
+
+
 def fitted(headers: Sequence[str], rows: Sequence[Sequence[str]], *,
            cuttable: tuple[int, ...], columns: int,
            cut_order: CutOrder = CutOrder.LISTED) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:

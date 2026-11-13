@@ -223,7 +223,6 @@
     "exclude_from_merge": "user-invocable-only",
     "focused_eval": "user-invocable-only",
     "idle_timeout": "user-invocable-only",
-    "implement_issue": "user-invocable-only",
     "improve_decisions": "user-invocable-only",
     "local_style": "user-invocable-only",
     "monitor": "user-invocable-only",
