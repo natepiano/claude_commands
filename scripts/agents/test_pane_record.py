@@ -772,6 +772,12 @@ MAC_RECORD = (
 
 @final
 class MacRecordTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "STAFF_FILE": str(Path(directory) / "staff.json")})))
+
     def test_on_the_mac_a_launch_reads_its_flags_and_never_keeps_the_token(self) -> None:
         parents = {"200": "100\n", "100": "1\n"}
 

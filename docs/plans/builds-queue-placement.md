@@ -371,7 +371,7 @@ No placement adapter restores sender timestamps for changed content.
 | `build_targets.py::command_kind_eligible`, `command_pinned_eligible`, `command_eligible` | Return queue eligibility for converted execution callers; retain diagnostic use. |
 | `build_targets.py::command_reserve` | Claim only the assignment's scope; remove destination and slot fallback. |
 | `build_targets.py::owns_wait_claim`, `command_release_wait` | Match exact claims and the explicit submitting session. |
-| `build_targets.py::caller_waits_on_hold`, `command_check_local`, `command_wait_local` | Accept caller identity at the policy boundary; remove host selection from converted hold waits. |
+| `build_targets.py::caller_holds_only_own`, `command_check_local`, `command_wait_local` | Accept caller identity at the policy boundary; remove host selection from converted hold waits. |
 | `mac_test.blocking_claim_block`, `claim_once`, `adopt_wait_claim`, `command_claim_wait`, `command_claim` | Use explicit session identity and exact scope; persist exact attempt identity before dispatch. |
 | `mac_test.command_release` and its argument boundary | Release only the matching claim under the existing target lock. |
 | `cloud_gate.cloud_reservation`, `run`, `route` | Request placement and return route outcomes instead of selecting local fallback. |

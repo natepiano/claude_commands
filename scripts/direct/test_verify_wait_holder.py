@@ -1,7 +1,7 @@
 """Record resource holders through private event pipes and real verify calls."""
 from __future__ import annotations
 
-from scripts.build_queue import admission_client, admission_records, admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import admission_records
 
 import json
 import os
@@ -12,13 +12,12 @@ import sys
 from datetime import datetime, timezone
 from typing import ClassVar, cast, override
 import unittest
-from unittest import mock
 
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture
 from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -122,16 +121,12 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
-                              "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
-                              "buildlog_memory_event")
-            + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
+                              "phase_wait_finish_all", "buildlog_memory_event") + '''
 PY=$TEST_EVENT_ROOT/recorder-python
 PHASE_WAIT_RECORDER=$2
 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
 HOLD_WAIT_DIR=$TEST_EVENT_ROOT/waits
 BOARD_DIR=$UNIT_RUN_DIR
-ROUTING_WAIT_STARTED="" PHASE_RESOURCE_WAIT="" PLACEMENT_WAIT_MEMORY=0
-BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/hold-seconds
 BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_EVENT_ROOT/event-client.py
 BUILDLOG_MEM_WAIT_SINCE=100
 BUILDLOG_MEM_WAIT_FIRST_FILE=$HOLD_WAIT_DIR/first-queued-at
@@ -515,9 +510,18 @@ run_once cargo check
         self.assertTrue(any(event["args"][:1] == ["check"] for event in self.fixture.cargo_events()))
 
 
+CAPACITY_TOOL = '''import os, runpy, sys
+from pathlib import Path
+root = Path(os.environ["PACKAGE_ROOT"])
+if sys.argv[1] == "eligible" and (root / "target-starting").exists():
+    print("any_target")
+    print("mac\\texcluded\\tstarting\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
+    raise SystemExit(0)
+runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
+'''
+
 POLL_SLEEP = '''#!/bin/sh
 if [ "$1" != "${BUILD_TARGETS_POLL_S}" ]; then exec "$TEST_REAL_SLEEP" "$@"; fi
-if ! find "$TMPDIR" -name 'phase-wait.*.resource' -print -quit | read -r marker; then exit 0; fi
 count=0
 [ ! -f "$PACKAGE_ROOT/target-passes" ] || read -r count < "$PACKAGE_ROOT/target-passes"
 count=$((count + 1))
@@ -594,6 +598,8 @@ class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("The fixture needs sleep.")
+        tool = root / "capacity-tool.py"
+        _ = tool.write_text(CAPACITY_TOOL)
         self.fixture.write_executable(self.fixture.bin_directory / "sleep", POLL_SLEEP)
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(ROUTING_WAIT_STUB)
@@ -601,9 +607,6 @@ class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
             "TEST_REAL_TARGETS": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
             "TEST_REAL_SLEEP": real_sleep, "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(local_wait),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        admission = caller_admission(self.fixture, root, self.fixture.environment)
-        controls = caller_provider_controls(self.fixture, admission)
-        controls.starting["mac"] = root / "target-starting"
         git = self.fixture.bin_directory / "git"
         source = git.read_text().replace("wanted=rev-parse\n", '''if [[ "$*" == "rev-parse HEAD" ]]; then
     printf '%040d\\n' 1
@@ -613,13 +616,11 @@ wanted=rev-parse
 ''')
         self.fixture.write_executable(git, source)
         runner = self.fixture.runner
-        source = runner.read_text().replace('if "--assignment-file" in arguments:', '''import atexit
-def hold_after_cleanup():
-    if os.environ.get("TEST_REHOLD_FINAL") == "1" and globals().get("attempt") == 1:
-        Path(os.environ["TEST_CLAIM_FILE"]).write_text(os.environ["TEST_NEXT_CLAIM"])
-atexit.register(hold_after_cleanup)
-if "--assignment-file" in arguments:''', 1)
-        source = source.replace('raise SystemExit(runner_status)', RUN_HISTORY + 'raise SystemExit(runner_status)')
+        source = runner.read_text().replace('raise SystemExit(runner_status)', RUN_HISTORY + '''
+if os.environ.get("TEST_REHOLD_FINAL") == "1" and attempt == 1:
+    Path(os.environ["TEST_CLAIM_FILE"]).write_text(os.environ["TEST_NEXT_CLAIM"])
+raise SystemExit(runner_status)
+''')
         self.fixture.write_executable(runner, source)
         return claims / f"{root.name}.json"
 
@@ -640,8 +641,52 @@ if "--assignment-file" in arguments:''', 1)
         (self.fixture.root / f"target-resume-{number}").touch()
 
     def start_pinned_route(self) -> subprocess.Popen[str]:
-        """Check target waits through the real placement command."""
-        return self.start("check", "sample", "--target", "mac", "--no-cache")
+        """Call real target admission, wait recording, and remote execution."""
+        script = self.fixture.root / "pinned-route.sh"
+        _ = script.write_text('set -euo pipefail\nsource "$1"\n' + shell_functions(
+            VERIFY, "verify_helper", "step_state", "publish_step_state", "remove_step_record",
+            "phase_wait_holder_flags", "phase_wait_target_busy", "phase_wait_start", "phase_wait_finish",
+            "phase_wait_finish_all", "collect_routing_wait", "collect_hold_wait", "check_routing_hold",
+            "initialize_step_record", "step_can_retry", "target_platform", "target_for_settings",
+            "register_mac_wait", "remote_step_kind", "ssh_reserve_hook", "mac_retry_hook",
+            "remember_mac_retry", "try_reserved_target", "try_mac_test", "release_wait_claim",
+            "check_mac_only_result", "mac_only_refuse", "route_test")
+            + next(line for line in VERIFY.read_text().splitlines()
+                   if line.startswith("SSH_RETRYABLE_REASON=")) + '\n' + '''
+PY=$TEST_REAL_PYTHON
+VERIFY_START_DIR=$2
+STEP_RECORD_SCRIPT=$VERIFY_START_DIR/step_record.py
+PHASE_WAIT_RECORDER=$VERIFY_START_DIR/progress_history.py
+PHASE_WAIT_SESSION=$UNIT_RUN_DIR
+HOLD_WAIT_DIR=$PACKAGE_ROOT/route-functions
+mkdir -p "$HOLD_WAIT_DIR"
+export BUILDLOG_CALL_ID="direct-route-$$" BUILDLOG_CALLER=verify
+BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/seconds
+BUILDLOG_HOLD_WAIT_S=0 ROUTING_WAIT_STARTED=""
+CMD=check PKG=sample ARGS=(sample) COMMAND_ARGS=()
+PINNED_TARGET=mac LOCAL_ONLY=0 MAC_ONLY=0 LOCAL_REASON="" STEP_FORCE_MAC=0
+STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=natedev_only STEP_DEFER_LOCAL=0
+STEP_TARGET_TABLE="" DOC_REPO_TOP=$PACKAGE_ROOT
+MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
+MAC_IDLE_SCRIPT=$VERIFY_START_DIR/../buildlog/mac_idle.py
+MAC_IDLE_MARKER="" BUILDLOG_MAC_IDLE_HOOK=""
+MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0 MAC_RETRY_NOTICE_SHOWN=0
+SSH_RETIRED_SETTINGS=() SSH_RETRY_SETTINGS=() SSH_RETRY_DEADLINES=()
+SSH_RETRY_AFTER_SETTINGS="" SSH_RESERVE_RECOVERY=""
+MAC_VERB=check MAC_VERB_ARGS=(-p sample) MAC_SOURCE_ROOT="" MAC_FINISH_CALL=0
+MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0 FILTER_RUN=0
+MAC_PASSED=0 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID=""
+TREE_WATCH_PID="" CACHE_DIR=""
+trap 'phase_wait_finish_all; remove_step_record' EXIT
+initialize_step_record
+route_test
+''')
+        process = subprocess.Popen(["bash", str(script), str(SCRIPTS / "lint/memory_gate.sh"),
+                                    str(SCRIPTS / "direct")], cwd=self.fixture.root,
+                                   env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        self.addCleanup(self.stop_process, process)
+        return process
 
     def assert_closed_before_remote_steps(self) -> list[dict[str, object]]:
         snapshots = [cast(dict[str, object], json.loads(line)) for line in
@@ -707,7 +752,7 @@ if "--assignment-file" in arguments:''', 1)
             process = self.start("check", "sample", "--target", "linux-box", "--no-cache")
             rows = self.pause(process, 1)
             self.assertEqual(recorded_holders(rows), [named_holder("slot", "linux-box", NEXT_SESSION)])
-            self.assertEqual((root / "reservation-results").read_text().splitlines(), ["11"])
+            self.assertEqual((root / "reservation-results").read_text().splitlines(), ["1"])
             self.assertEqual(self.fixture.runner_events(), [])
             claim = Path((root / "reservation-raced").read_text())
             claim.unlink()
@@ -764,6 +809,7 @@ if "--assignment-file" in arguments:''', 1)
 
     def test_pinned_starting_target_records_an_unnamed_holder(self) -> None:
         _ = self.prepare_target_wait()
+        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.fixture.root / "capacity-tool.py")
         starting = self.fixture.root / "target-starting"
         starting.touch()
         process = self.start_pinned_route()
@@ -816,31 +862,36 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
+MEMORY_CLIENT_OBSERVER = '''import json, os, sys
+from pathlib import Path
+arguments = sys.argv[1:]
+if arguments and arguments[0].endswith("admission_client.py") and arguments[1] == "admit":
+    with (Path(os.environ["PACKAGE_ROOT"]) / "memory-joins.jsonl").open("a") as output:
+        output.write(json.dumps({"since": arguments[arguments.index("--since") + 1],
+            "first": Path(os.environ["BUILDLOG_MEM_WAIT_FIRST_FILE"]).read_text()}) + "\\n")
+os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *arguments])
+'''
+
+
 class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
     def prepare_memory_route(self) -> Path:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()
-        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
-        controls = caller_provider_controls(self.fixture, admission)
-        controls.set_host("mac", placement.TemporaryExclusion("busy"))
-        handle_request = admission.server.handle_request
-
-        def observe(request: wire.Request,
-                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                for path in Path(self.fixture.environment["TMPDIR"]).glob(
-                        f"verify-hold.{request.owner.pid}.*/placement-*.json.wait"):
-                    notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
-                    if isinstance(notice.last_reply, wire.Wait):
-                        _ = controls.hosts.pop("mac", None)
-                first, = Path(self.fixture.environment["TMPDIR"]).glob(
-                    f"verify-hold.{request.owner.pid}.*/first-queued-at")
-                with (self.fixture.root / "memory-joins.jsonl").open("a") as output:
-                    _ = output.write(json.dumps({"since": str(request.since).removesuffix(".0"),
-                        "first": first.read_text()}) + "\n")
-            return handle_request(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=observe))
+        observer = self.fixture.root / "observe-memory-python"
+        recorder = self.fixture.root / "observe-memory-client.py"
+        self.fixture.write_executable(recorder, MEMORY_CLIENT_OBSERVER)
+        self.fixture.write_executable(observer, '''#!/bin/sh
+case "$1" in
+    */admission_client.py)
+        if [ "$2" = admit ]; then
+            exec "$TEST_REAL_PYTHON" "$TEST_MEMORY_OBSERVER" "$@"
+        fi
+        ;;
+esac
+exec "$TEST_REAL_PYTHON" "$@"
+''')
+        self.fixture.environment["TEST_MEMORY_OBSERVER"] = str(recorder)
+        self.fixture.environment["CLAUDE_PYTHON"] = str(observer)
         _ = self.fixture.hold_memory()
         return Path(self.fixture.environment["UNIT_RUN_DIR"])
 
@@ -873,10 +924,7 @@ class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
         self.fixture.environment.update({"TEST_RUNNER_BUSY_UNTIL": str(self.fixture.runner_state / "mac-free"),
                                          **self.fixture.leave_once()})
         process = self.start("test", "sample", "--no-cache")
-        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
-        controls = caller_provider_controls(self.fixture, admission)
-        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 2 and bool(controls.memory_waits()),
-                                "the refused remote attempt and its memory wait", (process,))
+        self.fixture.wait_for_path(self.fixture.runner_state / "free-now-after-leave", (process,))
         self.fixture.wait_until(lambda: sum(row["event_type"] == "wait_started" for row in wait_rows(session)) == 2,
                                 "the second memory interval", (process,), directory=session)
         self.assertEqual(len(self.fixture.runner_events()), 2)

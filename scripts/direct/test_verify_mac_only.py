@@ -79,15 +79,55 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         }
 
     def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
-        """Run the same result rows through queue placement."""
-        words = ["test", "sample", "--mac", "why", "--no-cache"]
-        if fetch:
-            words.extend(("--fetch", fetch))
-        return self.verify(*words, extra=extra)
+        """Pass a runner result through the real result reader and call recorder."""
+        functions = shell_functions(
+            VERIFY, "verify_helper", "target_for_settings", "target_platform", "step_state", "release_wait_claim",
+            "phase_wait_finish", "collect_routing_wait", "collect_hold_wait", "note_event",
+            "try_mac_test", "check_mac_only_result", "mac_only_refuse", "try_reserved_target",
+        )
+        # These calls start after routing. Other tests keep the watcher and admission boundaries.
+        script = functions + r'''
+set -euo pipefail
+CMD=test PKG=sample ARGS=(sample) MAC_ONLY=1 LOCAL_ONLY=0
+MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() NEXTEST_ARGS=()
+MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_IDLE_MARKER=""
+MAC_FINISH_CALL=1 FILTER_RUN=0 CALL_NOTED=0 CACHE_DIR=""
+STEP_RECORD_ACTIVE=0 STEP_RUNS_ON=mac_allowed
+TREE_WATCH_PID=caller-owned ROUTING_WAIT_STARTED=""
+BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
+BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S=""
+BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
+BUILDLOG_LOCAL_REASON=""
+export BUILDLOG_CALL_ID="result-$$" BUILDLOG_LOCAL_REASON
+STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_SETTINGS")
+MAC_LEAVE_SETTINGS=$MAC_SETTINGS MAC_LEAVE_REASON=""
+try_reserved_target
+'''
+        return subprocess.run(
+            ["bash", "-c", script], cwd=self.root,
+            env={**self.environment, "PY": sys.executable, "MAC_RUNNER": str(self.runner),
+                 "MAC_SETTINGS": self.environment["MAC_TEST_CONFIG"],
+                 "DOC_REPO_TOP": str(self.root), "HOLD_WAIT_DIR": str(self.root / "tmp"),
+                 "BUILDLOG_RECORD": str(self.home / ".claude/scripts/buildlog/record.py"),
+                 "MAC_FETCH": fetch, "MAC_FETCH_GIVEN": "1" if fetch else "0", **extra},
+            text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+        )
 
     def routing_result(self) -> subprocess.CompletedProcess[str]:
-        """Check caller routing through the real placement command."""
-        return self.verify("test", "sample", "--mac", "needs macOS", "--no-cache")
+        """Use the real eligibility and routing functions with private records."""
+        functions = shell_functions(
+            VERIFY, "initialize_step_record", "remove_step_record", "phase_wait_start",
+            "phase_wait_holder_flags", "phase_wait_target_busy",
+        )
+        return self.call_mac_functions(functions + r'''
+MAC_ONLY=1 MAC_REASON="needs macOS"
+STEP_RECORD_SCRIPT=$TEST_REAL_DIRECT/step_record.py
+STEP_RECORD_PATH="" STEP_STATE_PATH=""
+SSH_RETRYABLE_REASON='^(busy|blocked|disk|backoff|unreachable|state|copy|mac_busy)$'
+trap 'remove_step_record; finish_tree_watch; finish_hold_wait; release_token' EXIT
+initialize_step_record
+route_test
+''')
 
     def test_fixed_cargo_replies_match_python_events(self) -> None:
         reference = self.bin_directory / "cargo-reference"
@@ -96,7 +136,6 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         install_fixed_cargo(cargo)
         token = Path(self.environment["TEST_TOKEN_RECORD"])
         token.parent.mkdir(parents=True, exist_ok=True)
-        self.environment["BUILDLOG_HOLD_PID"] = "owned"
         for token_held in (False, True):
             if token_held:
                 _ = token.write_text("owned\n")
@@ -180,45 +219,14 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assert_nothing_outlives()
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
-        from unittest import mock
-        from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
-        from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
-
-        admission = caller_admission(self, self.root, self.environment)
-        controls = caller_provider_controls(self, admission)
-        previous = admission.server.handle_request
-        busy_published = False
-
-        def publish_busy(request: wire.Request,
-                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            nonlocal busy_published
-            if (isinstance(request, wire.ExecutionReport) and not busy_published
-                    and request.outcome == placement.PrelaunchRefused("busy")):
-                controls.set_host("mac", placement.TemporaryExclusion("busy"))
-                busy_published = True
-            return previous(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=publish_busy))
+        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "never-free"),
-            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1"})
+            "TEST_STEP_ROUTING_SLEEP": "1"})
         self.addCleanup(self.stop_verify, process)
-
-        def busy_wait_delivered() -> bool:
-            if not busy_published:
-                return False
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
-                try:
-                    queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
-                except (OSError, ValueError):
-                    continue
-                if queued.episode == self.runner_episode():
-                    return True
-            return False
-
-        self.wait_until(busy_wait_delivered, "the client queue wait after the busy refusal", (process,))
+        self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         _ = (self.runner_state / "busy-reason").write_text("blocked\n")
-        controls.set_host("mac", placement.AllowedHost())
+        _ = (self.runner_state / "continue-sleep-1").write_text("continue\n")
         output, errors = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 2, output + errors)
         self.assertIn("verify.sh: test --mac refused: the Mac is blocked (/build:status names the holder and when it lifts); nothing ran on natedev.\n", errors)
@@ -264,8 +272,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
-        self.assertGreaterEqual(sum(key.destination.provider == "mac" for key in self.provider_observations), 2)
-        self.assertEqual(len(self.runner_events()), 1)
+        self.assertGreaterEqual(len(self.runner_events()), 2)
         self.assertIn("Mac only (needs macOS)", errors)
         self.assertEqual(self.last_call()["mac"], "passed_full")
         self.assertEqual(self.routing_record()["target"], "mac")

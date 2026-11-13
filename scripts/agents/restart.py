@@ -19,6 +19,7 @@ from contextvars import copy_context
 from threading import Event
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
@@ -83,8 +84,23 @@ class WorkerRestartScope(Enum):
 
 
 class RestartDisposition(Enum):
-    RESTORED = "the row started or already runs"
+    STARTED = "this attempt launched the row"
+    RESTORED = "the row needs no new launch"
     HELD = "the row keeps its pause or exit record"
+
+
+class RestartSuccessReport(Enum):
+    START_ROW = "start_row prints the success line"
+    CALLER = "the caller prints the success line"
+
+
+@dataclass(frozen=True)
+class FailedHolderStart:
+    """A failed start retains its arguments for one stopped-director retry."""
+
+    holder: staff.StaffRow
+    focus: bool
+    error: Exception
 
 
 class ResumeCheckState(Enum):
@@ -263,9 +279,13 @@ def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> Regist
         time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
-def _anomaly(row: staff.StaffRow, error: object) -> None:
+def _error_reason(error: object) -> str:
     reason = str(error).splitlines()
-    print(f"{row.name}: restart anomaly: {reason[0] if reason else type(error).__name__}", file=sys.stderr)
+    return reason[0] if reason else type(error).__name__
+
+
+def _anomaly(row: staff.StaffRow, error: object) -> None:
+    print(f"{row.name}: restart anomaly: {_error_reason(error)}", file=sys.stderr)
 
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
@@ -429,7 +449,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               worker_scope: WorkerRestartScope = WorkerRestartScope.FOLLOW_OWNER,
               observed: RestartObservations | None = None,
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
-              resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT) -> str:
+              resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
+              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
                 herdr.read_conversation(str(row.current_session), codex=observed.codex))
@@ -594,7 +615,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                  _restore_workers(row, record, observed=observed))
         if isinstance(resume_checks, DirectorResumeChecks) and isinstance(check, DirectorResumeCheck):
             resume_checks.checks.append(check)
-        print(f"{row.name}: restarted")
+        if success_report is RestartSuccessReport.START_ROW:
+            print(f"{row.name}: restarted")
         return result.pane
 
 
@@ -983,7 +1005,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     resume_checks = DirectorResumeChecks()
 
-    def start_holder(holder: staff.StaffRow, focus: bool) -> RestartDisposition:
+    def start_holder(holder: staff.StaffRow, focus: bool,
+                     success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition:
         with staff.row_operation(str(holder.id)):
             current_record = staff.initial_snapshot()
             current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
@@ -1006,35 +1029,69 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             facts = session_staff.RowResolver(current_record)
             opening = (herdr.OpeningPrompt(resume_message.resume_message(why))
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
+            launch_row = (start_row if success_report is RestartSuccessReport.START_ROW else
+                          partial(start_row, success_report=success_report))
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
-                _ = start_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
-                              opening=opening, resume_checks=resume_checks)
+                pane = launch_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
+                                  opening=opening, resume_checks=resume_checks)
             else:
-                _ = start_row(current, current_record, client, present=focus, resolver=facts,
-                              target_account="" if isinstance(account, AllRestartAccounts) else account,
-                              worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
-            return RestartDisposition.RESTORED
+                pane = launch_row(current, current_record, client, present=focus, resolver=facts,
+                                  target_account="" if isinstance(account, AllRestartAccounts) else account,
+                                  worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
+            return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
+    def record_start(holder: staff.StaffRow, disposition: RestartDisposition) -> None:
+        members = members_by_holder[holder.id]
+        if disposition is RestartDisposition.HELD:
+            pending.extend(members)
+            return
+        started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
+        pending.extend(member for member in members if staff.StaffId(member) in blocked_workers)
+
+    failed_starts: list[FailedHolderStart] = []
     if holders:
         with ThreadPoolExecutor(max_workers=min(16, len(holders))) as pool:
-            futures = [(holder, pool.submit(copy_context().run, start_holder, holder, present and index == 0))
+            futures = [(holder, present and index == 0,
+                        pool.submit(copy_context().run, start_holder, holder, present and index == 0))
                        for index, holder in enumerate(holders.values())]
-            for holder, future in futures:
+            for holder, focus, future in futures:
                 members = members_by_holder[holder.id]
                 try:
-                    if future.result() is RestartDisposition.HELD:
-                        pending.extend(members)
-                        continue
-                    started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
-                    pending.extend(member for member in members if staff.StaffId(member) in blocked_workers)
+                    record_start(holder, future.result())
                 except ClaudeTrustWriteFailed:
                     pending.extend(members)
                     exit_code = 1
                 except staff.StaffRefused as error:
                     _anomaly(holder, error)
                 except errors as error:
-                    pending.extend(members)
-                    _anomaly(holder, error)
+                    failed_starts.append(FailedHolderStart(holder, focus, error))
+    for failed in failed_starts:
+        holder = failed.holder
+        fresh: herdr.LiveConversation | herdr.StoppedConversation | herdr.UnknownConversation
+        fresh = herdr.UnknownConversation(str(failed.error))
+        if holder.kind in ("unit", "showrunner"):
+            try:
+                fresh = herdr.read_conversation(str(holder.current_session))
+            except errors:
+                pass
+        if not isinstance(fresh, herdr.StoppedConversation):
+            pending.extend(members_by_holder[holder.id])
+            _anomaly(holder, failed.error)
+            continue
+        try:
+            disposition = start_holder(holder, failed.focus, RestartSuccessReport.CALLER)
+            record_start(holder, disposition)
+            if disposition is RestartDisposition.STARTED:
+                print(f"{holder.name}: down; started")
+        except ClaudeTrustWriteFailed:
+            pending.extend(members_by_holder[holder.id])
+            exit_code = 1
+        except staff.StaffRefused as error:
+            pending.extend(members_by_holder[holder.id])
+            _anomaly(holder, error)
+        except errors as error:
+            pending.extend(members_by_holder[holder.id])
+            print(f"{holder.name}: down: {_error_reason(error)}")
     if started or pending:
         shutdown_record.update(started=started, pending=pending)
     if started:

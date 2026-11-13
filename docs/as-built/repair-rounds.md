@@ -169,6 +169,12 @@ A rejected resumed handoff keeps its existing unpublished merge.
 The bump path pushes first and starts its background gate afterward.
 
 A main conflict aborts the merge and reports the conflicting paths.
+Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
+Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
+The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
+Clean items can land in the same run.
+If every item is clean, the combined merge conflict keeps the batch held.
+Each notice then says the checkpoint is clean against main and can land alone.
 A malformed incoming manifest also triggers preparation rollback.
 Rollback preserves unpublished work that existed before the run.
 Shrink and as-built ancestry uses Git, without requiring a checkpoint event from a particular worktree.

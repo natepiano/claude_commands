@@ -93,15 +93,6 @@ if [[ $command != ssh ]]; then
     exit 99
 fi
 remote=${!#}
-if [[ $remote == *dispatch_start_settled=* && $remote == *"printf 'leftovers=0"* &&
-      $remote != *'select_leftovers()'* ]]; then
-    /bin/bash -c "$remote"
-    exit $?
-fi
-if [[ $remote == *sweep.sweep_workspace* && $remote != *'~/.claude/scripts/lint/lint '* ]]; then
-    printf 'mac_exit=0\n%s\n' "$run_cleanup_line"
-    exit 0
-fi
 if [[ $remote == *'sweep.py --floor-only --host mac' ]]; then
     printf 'called\n' >> "$root/sweeps"
     if [[ -p $root/continue-sweep ]]; then await_release continue-sweep; fi
@@ -147,13 +138,8 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
 fi
 if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'lint clippy'* ||
       $remote == *'lint mend-check'* || $remote == *'lint doc'* ]]; then
-    if (( hold_run )); then
-        printf 'mac_exit=0\nfixture acknowledgement\n'
-        printf 'started\n' > "$root/run-started"
-        await_release finish-run
-    else
-        printf 'started\n' > "$root/run-started"
-    fi
+    printf 'started\n' > "$root/run-started"
+    if (( hold_run )); then await_release finish-run; fi
     for index in "${!run_lines[@]}"; do
         if [[ ${run_streams[index]} == stdout ]]; then
             printf '%s\n' "${run_lines[index]}"
@@ -168,18 +154,6 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
     if (( run_status_reported )); then
         printf '%s\n' "$run_status_line"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
-        python3 - "$claim_file" <<'SETTLE_FENCE'
-import json
-from pathlib import Path
-import subprocess
-import sys
-from scripts.mac_test import claim_state, offload
-path = Path(sys.argv[1])
-claim = json.loads(path.read_text())
-identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-command = offload.start_fence_command(identity, "mac", settle=True, scope_key=path.stem)
-raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
-SETTLE_FENCE
     fi
     exit "$run_ssh_status"
 fi

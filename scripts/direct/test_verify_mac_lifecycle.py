@@ -7,8 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import final
 from scripts.build_hold import build_hold
-from scripts.build_queue import admission_client, admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -26,10 +24,9 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         mac_free = self.runner_state / "mac-free"
         process = self.start_verify("test", "sample", "--no-cache", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
-            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1", "TEST_PROVIDER_ROUTE_POLL_GATES": "1",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_memory_wait(process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
         self.assertEqual(len(self.runner_events()), 1)
         _ = mac_free.write_text("free\n")
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -55,10 +52,9 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         mac_free = self.runner_state / "mac-free"
         process = self.start_verify("test", "sample", "--no-cache", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
-            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1", "TEST_PROVIDER_ROUTE_POLL_GATES": "1",
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_memory_wait(process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
         # The memory waiter keeps the token until it leaves for the Mac.
         lock = self.board / "locks" / "cargo.d"
         self.assertEqual((lock / "holder_pid").read_text(), str(process.pid))
@@ -90,10 +86,9 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         mac_free = self.runner_state / "mac-free"
         process = self.start_verify("test", "sample", "--no-cache", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
-            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1", "TEST_PROVIDER_ROUTE_POLL_GATES": "1",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_memory_wait(process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
         with self.hold_environment():
             _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
                                       "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
@@ -101,32 +96,13 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
             assert cycle is not None
         cycle_path = self.root / "release" / cycle["id"] / "cycle.json"
 
-        admission = caller_admission(self, self.root, self.environment)
-        episode = self.runner_episode()
-
         def waiting_on_the_hold() -> bool:
-            with admission.loop_turn():
-                return any(candidate.destination.provider == "local"
-                    and isinstance(candidate.eligibility, placement.TemporaryExclusion)
-                    and candidate.eligibility.reason == "blocked"
-                    for candidate in admission.server.placement_eligibility.get(episode, ()))
+            return any(Path(self.environment["TMPDIR"]).glob("verify-hold.*/waiter"))
 
         # Memory frees while natedev is held: the step moves to the hold wait,
         # where the Mac is still busy.
         self.release_memory(meminfo)
         self.wait_until(waiting_on_the_hold, "the hold wait", (process,))
-        def delivered_hold_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
-                try:
-                    notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
-                except (OSError, ValueError):
-                    continue
-                held = notice.last_reply
-                if isinstance(held, wire.PlacementResourceWait) and (held.resource, held.reason) == ("natedev", "blocked"):
-                    return True
-            return False
-
-        self.wait_until(delivered_hold_wait, "the delivered hold wait", (process,))
         self.assertEqual(len(self.runner_events()), 1)
         _ = mac_free.write_text("free\n")
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)

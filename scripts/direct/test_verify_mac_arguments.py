@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import final
 
 from scripts.build_hold import build_hold
-from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP, BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -65,7 +65,7 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
                         self.assertNotIn("package(sample)", " ".join(nextest_arguments))
                 self.assertNotIn("--no-cache", runner_arguments)
                 self.assertFalse(runners[0]["token_held"])
-                self.assertTrue(local[0]["token_held"], json.dumps(local[0]) + result.stdout + result.stderr)
+                self.assertTrue(local[0]["token_held"])
                 record = self.last_call()
                 self.assertEqual(record["mac"], "declined")
                 self.assertEqual(record["mac_reason"], "busy")
@@ -99,14 +99,6 @@ from pathlib import Path
 
 from scripts.mac_test import offload
 
-arguments = sys.argv[1:]
-root = Path(os.environ["TEST_RUNNER_STATE"])
-result = Path(arguments[arguments.index("--result") + 1])
-''' + ASSIGNED_RUNNER_SETUP + '''
-if "--assignment-file" in arguments:
-    fixture_outcome = placement.AttemptDeclined("no_tests")
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
-    fixture_cleanup_confirmed = True
 with (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").open("a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "token_held": False, "at": time.time()}) + "\\n")
 result = offload.NoTestMatchedOnMac(4.5)

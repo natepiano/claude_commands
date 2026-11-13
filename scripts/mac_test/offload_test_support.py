@@ -15,7 +15,6 @@ import subprocess
 import tempfile
 import time
 import unittest
-import uuid
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, override
 
@@ -29,15 +28,10 @@ from scripts.lint.memory_test_support import write_config_fixture, config_enviro
 from scripts.mac_test import offload, mac_test
 from scripts.lib import conf
 from scripts.buildlog import treekey
-from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
-from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
-from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_hold import build_hold
-from scripts.mac_test import claim_state
 
 SCRIPT = Path(__file__).with_name("offload.py")
 
@@ -46,21 +40,6 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
-
-
-def assigned_adapter_main() -> int:
-    """Run the adapter after placement, with the current provider state."""
-    arguments = offload.parser().parse_args(namespace=offload.CliArguments())
-    request = offload.request_from_arguments(arguments)
-    config = offload.read_config(Path(arguments.settings)) if arguments.settings else offload.read_config()
-    controller = offload.ProcessController()
-    started = time.monotonic()
-    with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
-        result = offload.run_offload(controller, config, request, started)
-    status = offload.write_result(result, request.result, request.last_decline, request.verb,
-                                 request.target, controller.attempt_evidence, request.fetch)
-    offload.persist_attempt(request, result, controller.attempt_evidence, started)
-    return status
 
 
 class RemoteLine(TypedDict):
@@ -102,16 +81,9 @@ class CommandEvent(TypedDict):
 
 
 def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str]:
-    remote = argv[-1]
-    if "\ndispatch_status=$?\nexec 8<&-\n" in remote:
-        case.assertIn("\n(\n", remote)
-        remote = remote.split("\n(\n", 1)[1].rsplit("\n)\ndispatch_status=$?\n", 1)[0]
-    elif "\n)\nprobe_status=$?\n" in remote:
-        case.assertTrue(remote.startswith("(\n"))
-        remote = remote.removeprefix("(\n").split("\n)\nprobe_status=$?\n", 1)[0]
-    words = shlex.split(remote)
+    words = shlex.split(argv[-1])
     if "mirror-use" not in words:
-        return [*argv[:-1], remote]
+        return list(argv)
     boundary = words.index("--")
     case.assertEqual(words[boundary + 1:boundary + 3], ["sh", "-c"])
     case.assertEqual(len(words[boundary + 3:]), 1)
@@ -358,76 +330,15 @@ class OffloadCommandFixture(unittest.TestCase):
             "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
-        self.start_admission()
-
-    def start_admission(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.25)
-
-        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            directory = (self.state_directory if key.destination.provider == "mac" else
-                         Path(self.environment["HOME"]) / ".local/state/build-targets" / key.destination.target)
-            paths = claim_state.StatePaths(directory, key.destination.target,
-                platform="macos" if key.destination.provider == "mac" else "linux")
-            return private_provider_evidence(admission, key, paths)
-
-        admission.server.host_probe = provider
-
-    def assignment_options(self, repository: Path, verb: offload.MacVerb,
-                           settings: Path | offload.DefaultMacSettings,
-                           runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None) -> list[str]:
-        """Give command fixtures one real queue assignment before the adapter starts."""
-        if "--assignment-file" in runner_options:
-            return []
-        admission = caller_admission(self, self.root, self.environment)
-        owner_start = process_identity.process_start(os.getpid())
-        if not isinstance(owner_start, process_identity.Started):
-            self.fail("The command fixture has no checked coordinator identity")
-        owner = wire.Owner(os.getpid(), owner_start.start)
-        admission.proc.register(owner)
-        target = runner_options[runner_options.index("--target") + 1] if "--target" in runner_options else "mac"
-        settings_path = settings if isinstance(settings, Path) else self.config_path
-        values = dict(line.split("=", 1) for line in settings_path.read_text().splitlines()
-                      if "=" in line and not line.lstrip().startswith("#")) if settings_path.is_file() else self.config
-        host = values.get("host", self.config["host"])
-        scope: claim_state.ClaimScope = (claim_state.RepositoryScope(repository.name)
-            if repository == self.repository else claim_state.WholeMacScope())
-        provider: Literal["mac", "ssh"] = "mac" if target == "mac" else "ssh"
-        if provider == "ssh":
-            scope = claim_state.RepositoryScope(repository.name, "", 1)
-        destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
-        local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
-        source_key = treekey.tree_key(str(repository))
-        source = (placement.SourceKeyKnown(source_key) if source_key is not None
-                  else placement.SourceKeyUnavailable("the fixture has no tree key"))
-        constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
-            build_hold.owning_session(self.environment if environment is None else environment),
-            (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
-        request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
-            local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
-        deadline = time.monotonic() + 10
-        while True:
-            with admission.loop_turn():
-                reply, = admission.server.handle_request(request)
-            if not isinstance(reply, wire.PlacementWait) or time.monotonic() >= deadline:
-                break
-            time.sleep(0.01)
-        if not isinstance(reply, wire.Assignment):
-            self.fail(f"The command fixture could not obtain its assigned destination: {reply!r}")
-        assignment_file = self.root / f"assignment-{local.episode}.json"
-        _ = assignment_file.write_text(wire.encode_reply(reply))
-        return ["--assignment-file", str(assignment_file)]
 
     def write_executable(self, path: Path, source: str) -> None:
         write_python_tool(path, source)
 
     def sync_config(self) -> None:
-        ready = self.config_path.with_suffix(".ready")
-        _ = write_config_fixture(ready, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
-        lines = ready.read_text().splitlines()
-        _ = ready.write_text("\n".join(line for line in lines
+        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
+        lines = self.config_path.read_text().splitlines()
+        _ = self.config_path.write_text("\n".join(line for line in lines
             if not line.startswith("linux_only.") or line.partition("=")[0] in self.config) + "\n")
-        _ = ready.replace(self.config_path)
 
     def sync_fixture(self) -> None:
         assignments = [f"TEST_HANG_GUARD_SECS={test_hang_guard.TEST_HANG_GUARD_SECS}"]
@@ -460,8 +371,6 @@ class OffloadCommandFixture(unittest.TestCase):
         source: offload.MacSource = WORKING_TREE_SOURCE,
         runner_options: tuple[str, ...] = (),
         call_id: str = "call-17",
-        direct_placement: bool = False,
-        assigned_adapter: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -486,37 +395,21 @@ class OffloadCommandFixture(unittest.TestCase):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
-        assignment_options = (() if direct_placement or assigned_adapter else self.assignment_options(
-            self.repository if repository is None else repository, verb, settings, runner_options))
-        arguments.extend(["--result", str(self.result_path), *runner_options, *assignment_options, "--"])
+        arguments.extend(["--result", str(self.result_path), *runner_options, "--"])
         arguments.extend(nextest_arguments)
-        if assigned_adapter:
-            if not subprocess_cli:
-                return invoke_cli(offload, assigned_adapter_main, arguments[2:], self.environment, self.root,
-                                  combined_output=not separate_stderr,
-                                  environment_lock=caller_admission(self, self.root, self.environment).loop_access)
-            entry = self.root / "assigned-adapter.py"
-            _ = entry.write_text(
-                f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
-                + "from scripts.mac_test.offload_test_support import assigned_adapter_main\n"
-                + "raise SystemExit(assigned_adapter_main())\n")
-            arguments[1] = str(entry)
         if subprocess_cli:
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                                   text=True, check=False, timeout=timeout)
         return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
-                          combined_output=not separate_stderr,
-                          environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+                          combined_output=not separate_stderr)
 
     def process_command(self, *arguments: str, separate_stderr: bool = False,
-                        last_decline: str = "", assigned_adapter: bool = False,
-                        runner_options: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+                        last_decline: str = "") -> subprocess.CompletedProcess[str]:
         # These cases inspect a claim owned by an exited launcher. Its lifetime
         # is part of the assertion, so use a real child rather than this process.
         return self.command(*arguments, separate_stderr=separate_stderr,
-                            last_decline=last_decline, subprocess_cli=True, assigned_adapter=assigned_adapter,
-                            runner_options=runner_options)
+                            last_decline=last_decline, subprocess_cli=True)
 
     def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
         # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
@@ -594,8 +487,6 @@ raise SystemExit(offload.main())
             "--result",
             str(self.result_path),
             *runner_options,
-            *self.assignment_options(self.repository, "nextest", offload.DEFAULT_MAC_SETTINGS, runner_options,
-                                     environment={**self.environment, **(extra or {})}),
             "--",
             *nextest_arguments,
         ]
@@ -797,19 +688,10 @@ raise SystemExit(offload.main())
         signal_group: bool = False, signal_number: int = signal.SIGTERM,
         reply_host: str = "reply-mac",
     ) -> str:
-        runner = self.claim_stub_runner()
-        if after_takeover:
-            first = self.start_command(script=runner, extra={"MAC_TEST_TAKEOVER_FIRST": "1"})
-            try:
-                _ = first.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            finally:
-                if first.poll() is None:
-                    first.kill()
-                    _ = first.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         process = self.start_command(
-            script=runner,
+            script=self.claim_stub_runner(),
             extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
-                   "MAC_TEST_TAKEOVER_FIRST": "0",
+                   "MAC_TEST_TAKEOVER_FIRST": "1" if after_takeover else "0",
                    "MAC_TEST_TAKEOVER_REPLY": reply_host},
             start_new_session=signal_group,
         )
@@ -894,7 +776,7 @@ raise SystemExit(offload.main())
         assert isinstance(key, str)
         return key
 
-    def run_with_copy_change(self, change: Callable[[], None], *, source_changed: bool = False) -> None:
+    def run_with_copy_change(self, change: Callable[[], None]) -> None:
         self.fixture["hold_copy"] = True
         self.sync_fixture()
         process = self.start_command()
@@ -903,10 +785,8 @@ raise SystemExit(offload.main())
             change()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
             output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(process.returncode, 75 if source_changed else 0, output)
-            self.assert_wire("declined" if source_changed else "passed", "source_changed" if source_changed else "")
-            if source_changed:
-                self.assertFalse(any("mirror-use" in event["args"][-1] for event in self.events_for("ssh")))
+            self.assertEqual(process.returncode, 0, output)
+            self.assert_wire("passed", "")
         finally:
             if process.poll() is None:
                 process.kill()

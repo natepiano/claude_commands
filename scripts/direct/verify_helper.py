@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import ctypes
-from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
 import importlib.util
@@ -13,9 +12,9 @@ import os
 from pathlib import Path
 import select
 import signal
-import stat
 import sys
 import tempfile
+import time
 import traceback
 from types import ModuleType
 from typing import BinaryIO, Callable, cast
@@ -98,21 +97,14 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
     arguments, directory, search = sys.argv, os.getcwd(), sys.path[:]
     streams = sys.stdin, sys.stdout, sys.stderr
     temporary_parent = tempfile.tempdir
+    started, cpu = time.time(), time.process_time()
     status = "fallback"
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdin, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stderr, \
-            tempfile.TemporaryFile() as forwarded, ExitStack() as live_streams:
+            tempfile.TemporaryFile() as forwarded:
         descriptors = [os.dup(number) for number in range(3)]
-        stderr_output = stderr
         try:
-            if live_path := call.environment.get("VERIFY_HELPER_STDERR_PATH", ""):
-                live = live_streams.enter_context(os.fdopen(os.open(live_path, os.O_WRONLY | os.O_APPEND),
-                    "w", buffering=1, encoding="utf-8", errors="surrogateescape"))
-                mode = os.fstat(live.fileno()).st_mode
-                if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
-                    raise OSError("the helper cannot share this stderr stream")
-                stderr_output = live
             os.environ.clear()
             os.environ.update(call.environment)
             os.chdir(call.directory)
@@ -121,9 +113,9 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             sys.path.insert(0, str(Path(call.program).parent))
             _ = stdin.write(call.stdin)
             _ = stdin.seek(0)
-            for number, stream in enumerate((stdin, stdout, stderr_output)):
+            for number, stream in enumerate((stdin, stdout, stderr)):
                 _ = os.dup2(stream.fileno(), number)
-            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr_output
+            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
             if "VERIFY_RESULT_ENVIRONMENT_FD" in os.environ:
                 _ = forwarded.write(b"".join(os.fsencode(value) + b"\0" for value in call.forwarded_environment))
                 _ = forwarded.seek(0)
@@ -148,7 +140,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             status = "fallback"
         finally:
             stdout.flush()
-            stderr_output.flush()
+            stderr.flush()
             for number, descriptor in enumerate(descriptors):
                 _ = os.dup2(descriptor, number)
                 os.close(descriptor)
@@ -163,6 +155,8 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
         output, errors = stdout.read(), stderr.read()
     if status != "fallback" and (trace := call.environment.get("VERIFY_PY_TRACE")):
         try:
+            with open(trace, "a") as target:
+                _ = target.write(f"{Path(call.program).name}\t{round((time.time() - started) * 1000)}\t{round((time.process_time() - cpu) * 1000)}\n")
             with open(trace + ".calls", "a") as target:
                 argument = call.arguments[0] if call.arguments else ""
                 _ = target.write(f"{Path(call.program).name}\t{argument}\n")
@@ -183,9 +177,6 @@ def stop_when_parent_exits(parent: int) -> None:
 
 
 def main() -> int:
-    if trace := os.environ.get("VERIFY_PY_TRACE"):
-        with open(trace, "a") as target:
-            _ = target.write("verify_helper.py\t0\t0\n")
     parent = os.getppid()
     stop_when_parent_exits(parent)
     programs: dict[str, LoadedProgram | SeparateProcess] = {}

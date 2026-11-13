@@ -18,7 +18,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
-from scripts.build_queue.admission_test_support import caller_admission, private_caller_provider
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
@@ -209,8 +209,6 @@ class VerifyRoutingTests(unittest.TestCase):
         })
         self.fixture.environment["BUILD_TARGETS_POLL_S"] = "0.01"
         self.fixture.environment["BUILD_TARGETS_NOW"] = ""
-        admission = caller_admission(self.fixture, root, self.fixture.environment)
-        admission.server.host_probe = lambda key: private_caller_provider(admission, self.fixture.environment, key)
         _ = self.enterContext(mock.patch.object(build_hold, "start_recorder", side_effect=self.record_hold_event))
 
     def record_hold_event(self, command: list[str]) -> None:

@@ -275,9 +275,13 @@ def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set
 
 def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
                            owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
-    """Keep the retained pane unless another staffed owner runs there."""
+    """Keep readable retained panes unless another staffed owner runs there."""
+    try:
+        identities = native_sessions(client, pane)
+    except (herdr_types.HerdrFailure, OSError, ValueError):
+        return False
     return all(current is None or current.id == owner.id
-               for identity in native_sessions(client, pane)
+               for identity in identities
                for current in (record.by_member_reference(identity),))
 
 

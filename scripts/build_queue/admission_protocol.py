@@ -10,32 +10,6 @@ from scripts.build_queue.admission_code import (
 )
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import cloud_progress, progress_profile
-from scripts.build_queue.placement import (
-    SourceKeyKnown as SourceKeyKnown,
-    SourceKeyUnavailable as SourceKeyUnavailable,
-    SourceIdentity as SourceIdentity,
-    ClaimHolderIdentity as ClaimHolderIdentity,
-    ClaimHolderUnconfirmed as ClaimHolderUnconfirmed,
-    TokenRequired as TokenRequired,
-    TokenHeld as TokenHeld,
-    TokenNotRequired as TokenNotRequired,
-    LocalExecutionPrerequisite as LocalExecutionPrerequisite,
-    NormalStep as NormalStep,
-    SpeculativeCopy as SpeculativeCopy,
-    PlacementPurpose as PlacementPurpose,
-    AttemptRunning as AttemptRunning,
-    AttemptCompleted as AttemptCompleted,
-    PrelaunchRefused as PrelaunchRefused,
-    AttemptDeclined as AttemptDeclined,
-    AttemptCancelled as AttemptCancelled,
-    AttemptOutcomeUnavailable as AttemptOutcomeUnavailable,
-    AttemptOutcome as AttemptOutcome,
-    RetryAt as RetryAt,
-    DoNotRetry as DoNotRetry,
-    RetryDecision as RetryDecision,
-    DispatchPathSettled as DispatchPathSettled,
-    DispatchPathPending as DispatchPathPending,
-)
 from scripts.build_queue.admission_wire import (
     AdmissionUnavailable as AdmissionUnavailable,
     UnsupportedVersion as UnsupportedVersion,
@@ -72,18 +46,11 @@ from scripts.build_queue.admission_wire import (
     Ok as Ok,
     BuildHistoryReply as BuildHistoryReply,
     PlacementRequest as PlacementRequest,
-    LocalAdmissionContext as LocalAdmissionContext,
-    LocalAdmissionUnavailable as LocalAdmissionUnavailable,
-    PrerequisiteReport as PrerequisiteReport,
-    CancelPlacement as CancelPlacement,
     ClaimFailure as ClaimFailure,
     ConsumePermission as ConsumePermission,
     ExecutionReport as ExecutionReport,
     PlacementWait as PlacementWait,
-    PlacementResourceWait as PlacementResourceWait,
-    PlacementEvidenceWait as PlacementEvidenceWait,
     Assignment as Assignment,
-    LocalPlacementGranted as LocalPlacementGranted,
     FirstAuthorization as FirstAuthorization,
     DispatchStatus as DispatchStatus,
     VERSION as VERSION,
@@ -151,7 +118,7 @@ class MineReply:
 
 
 Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
-         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus)
+         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
 
 _REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 

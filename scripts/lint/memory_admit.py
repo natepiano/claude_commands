@@ -2061,7 +2061,7 @@ def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[i
 
 def running_has_reservation(step: RunningStep) -> bool:
     """Identify running rows that consume one reservation in the same order."""
-    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory, records.RemoteMemoryUnavailable))
+    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory))
 
 
 def inputs_after_steps_end(inputs: QueueInputs, ended: frozenset[int], policy: AdmissionPolicy) -> QueueInputs:

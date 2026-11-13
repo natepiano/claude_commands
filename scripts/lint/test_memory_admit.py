@@ -4857,14 +4857,11 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         admission = caller_admission(self, self.root, self.environment)
         grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
-        observed_grants: set[str] = set()
 
         def capture(reply: wire.Reply) -> wire.Reply:
-            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
-            if isinstance(grant, wire.Admitted) and grant.reservation not in observed_grants:
+            if isinstance(reply, wire.Admitted):
                 record, = (record for record in admission.server.reservations.values()
-                    if record.reservation_id == grant.reservation)
-                observed_grants.add(grant.reservation)
+                    if record.reservation_id == reply.reservation)
                 grants.append((record.step, record.run))
             return reply
 
@@ -4872,7 +4869,6 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
         for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
             with self.subTest(command=command):
                 grants.clear()
-                observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
                     env=self.environment, start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
