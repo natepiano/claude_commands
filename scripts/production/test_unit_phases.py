@@ -295,26 +295,23 @@ class UnitPhasesTests(unittest.TestCase):
             event("phase_started"),
         ), "—")
 
-    def test_a_long_task_is_cut_so_the_table_stays_narrow(self) -> None:
+    def test_long_notes_preserve_the_complete_task_title_and_fix_rounds(self) -> None:
+        activity = "verify.sh test hana " + "--filter one_long_test_name " * 10
         task = self.task(
             event("phase_started"),
             event("activity_started", activity_instance_id="a1", activity_label="Verification",
-                  activity_text="verify.sh test hana " + "--filter one_long_test_name " * 10),
+                  activity_text=activity),
         )
-        self.assertEqual(len(task), unit_phases.TASK_WIDTH)
-        self.assertTrue(task.startswith("Verification: verify.sh test hana --filter"))
-        self.assertTrue(task.endswith("…"))
+        self.assertEqual(task, "Verification: " + activity.strip())
         with patch.object(plan_history, "plan_runs", return_value=[self.root / "run.jsonl"]):
             cell = unit_phases.notes_cell(open_record(self.root / "plan.md"))
-        self.assertEqual(len(cell), unit_phases.TASK_WIDTH)
-        self.assertTrue(cell.startswith("phase 3 — Verification: verify.sh test hana"))
-        self.assertTrue(cell.endswith("…"))
+        self.assertEqual(cell, "phase 3 — Verification: " + activity.strip())
         record = open_record(self.root / "plan.md")
         current = record.current
         assert isinstance(current, phase_table.OpenPhase)
         for title, fix_done, expected in (
-                ("x" * 100, 0, "phase 3 — " + "x" * 69 + "…"),
-                ("x" * 56, 2, "phase 3 — " + "x" * 56 + " · fix rounds…")):
+                ("x" * 100, 0, "phase 3 — " + "x" * 100),
+                ("x" * 56, 2, "phase 3 — " + "x" * 56 + " · fix rounds 2")):
             with self.subTest(title=title, fix_done=fix_done), patch.object(plan_history, "plan_runs", return_value=[]):
                 sample = record._replace(current=replace(current, title=title, fix_done=fix_done))
                 self.assertEqual(unit_phases.notes_cell(sample), expected)
@@ -424,29 +421,23 @@ class UnitPhasesTests(unittest.TestCase):
                   activity_label="Verification", activity_text="check " + "x" * 150))
         work = unit_phases.table([selected], records).split("\n\n")[-1]
         cells = [cell.strip() for cell in work.splitlines()[2].split("|")[1:-1]]
-        self.assertTrue(cells[2].startswith("outside-c: Verification: check"))
-        self.assertEqual(len(cells[2].removesuffix(" +3 more")), 80)
-        self.assertTrue(cells[2].endswith("… +3 more"))
+        self.assertEqual(cells[2], "outside-c: Verification: check " + "x" * 150 + " +3 more")
         queue = cells[3].split(" · ", 1)[0]
-        self.assertTrue(queue.startswith("Review delivery"))
-        self.assertEqual(len(queue.removesuffix(" +1 more")), 80)
-        self.assertTrue(queue.endswith("… +1 more"))
+        self.assertEqual(queue, long_text + " +1 more")
         _ = config.write_text(configured)
         wide_records: dict[str, object] = {"messaging": typed_record(self.root / "plan.md", *(["todo"] * 20))}
         fitted = unit_phases.table([selected], wide_records)
         for section in (fitted.split("\n\n")[0], fitted.split("\n\n")[-1]):
             headings = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
             values = [cell.strip() for cell in section.splitlines()[2].split("|")[1:-1]]
-            widths = [max(3, terminal_width(heading), terminal_width(value))
-                      for heading, value in zip(headings, values, strict=True)]
-            self.assertLessEqual(1 + sum(width + 3 for width in widths), 166)
             if "Progress" in headings:
                 self.assertEqual(values[headings.index("Progress")], "⬜" * 20)
             else:
                 self.assertEqual(values[headings.index("Notes")], "not started")
-                self.assertEqual(values[headings.index("Queued")], "Review delivery " + "x" * 49 + "…")
+                self.assertEqual(values[headings.index("Queued")],
+                                 long_text + " +1 more · plan: phase 1: Delivery 1 +19 more")
                 self.assertEqual(values[headings.index("Non-Phase Work")],
-                                 "outside-c: Verification: check " + "x" * 35 + "…")
+                                 "outside-c: Verification: check " + "x" * 150 + " +2 more")
         _ = config.write_text(configured.replace("units_table_columns=170", "units_table_columns=1000"))
         path = unit_queue.state_path(member.id)
         _ = path.write_text("not json")
@@ -462,10 +453,8 @@ class UnitPhasesTests(unittest.TestCase):
         _ = run("fitting", member, "unused", 7, event("run_finished"))
         records["messaging"] = {"current": {"phase": "1", "of": 1, "title": "N" * 50},
                                 "phases": phase_rows("running")}
-        for columns, queued, notes, expected_queue in (
-                (89, "Q" * 60, "phase 1 — " + "N" * 22 + "…", "Q" * 32 + "…"),
-                (90, "Q" * 60, "phase 1 — " + "N" * 23 + "…", "Q" * 32 + "…"),
-                (89, "Review next", "phase 1 — " + "N" * 44 + "…", "Review next")):
+        for columns, queued in ((89, "Q" * 60), (90, "Q" * 60), (89, "Review next"),
+                                (170, "Review 界面 before delivery " + "é" * 180)):
             with self.subTest(columns=columns, queued=queued):
                 _ = config.write_text(configured.replace("units_table_columns=170", f"units_table_columns={columns}"))
                 _ = path.write_text(json.dumps([queued]))
@@ -473,7 +462,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(work.splitlines(), [
                     "| Unit | Notes | Queued |",
                     "| --- | --- | --- |",
-                    f"| messaging | {notes} | {expected_queue} |",
+                    f"| messaging | phase 1 — {'N' * 50} | {queued} |",
                 ])
 
     def test_a_unit_with_no_open_phase_shows_no_task(self) -> None:
@@ -704,12 +693,12 @@ class UnitPhasesTests(unittest.TestCase):
                     snapshot=staff.snapshot(), pane_rows=panes,
                     runs_reader=worker_runs.WorkerRuns(1060, process_reader=lambda: {120}))
             self.assertEqual(rendered.splitlines()[2],
-                "| workers | exited |")
-            self.assertEqual(rendered.splitlines()[0], "| Unit | Status |")
+                "| workers | exited | reader waiting on run: Tests 1m |")
+            self.assertEqual(rendered.splitlines()[0], f"| Unit | Status | {heading.capitalize()} |")
             self.assertEqual(rendered.split("\n\n")[-1].splitlines(), [
-                f"| Unit | {heading.capitalize()} |",
-                "| --- | --- |",
-                "| workers | reader waiting on run: Tests 1m |",
+                "| Unit |",
+                "| --- |",
+                "| workers |",
             ])
             self.assertNotIn("Progress:", rendered)
         self.assertEqual(requested, [member.id])
@@ -740,9 +729,8 @@ class UnitPhasesTests(unittest.TestCase):
                     headers = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
                     cells = [cell.strip() for cell in section.splitlines()[2].split("|")[1:-1]]
                     values.update(zip(headers, cells, strict=True))
-                    widths = [max(3, terminal_width(header), terminal_width(cell))
-                              for header, cell in zip(headers, cells, strict=True)]
-                    self.assertLessEqual(1 + sum(width + 3 for width in widths), 166)
+                    if "Status" in headers:
+                        self.assertEqual(headers[-2:], ["ETA Plan", unit_phases.worker_heading()])
                 self.assertEqual(values["Progress"], "🟨" + "⬜" * 19)
                 self.assertEqual(values["ETA Next"], "no ETA")
                 self.assertEqual(values["ETA Plan"], "19:00")
@@ -751,7 +739,7 @@ class UnitPhasesTests(unittest.TestCase):
                 expected_worker = ("reader waiting on run: Check " + "x" * 50 + "…" if label_size == 60
                                    else "reader waiting on run: Check " + "x" * 20 + " 1m")
                 self.assertEqual(values[unit_phases.worker_heading()], expected_worker)
-                self.assertEqual(headers, ["Unit", "Notes", unit_phases.worker_heading(),
+                self.assertEqual(headers, ["Unit", "Notes",
                     *(("Non-Phase Work",) if other else ()), "Queued"])
                 if other:
                     self.assertEqual(values["Non-Phase Work"], "outside: impl: other work")
@@ -766,7 +754,7 @@ class UnitPhasesTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         for queued, sample, expected in (
                 ([], record, "plan: phase 3: Delivery 3 +1 more"),
-                ([], long_title, "plan: phase 3: " + "x" * 79 + "… +1 more"),
+                ([], long_title, "plan: phase 3: " + "x" * 120 + " +1 more"),
                 (["Review delivery", "Clean old records"], None, "Review delivery +1 more"),
                 (["Review delivery"], record, "Review delivery · plan: phase 3: Delivery 3 +1 more"),
                 ([], typed_record(self.root / "plan.md", "done", "running"), "—"),
