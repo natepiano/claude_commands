@@ -29,7 +29,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
 from scripts.production import change_routing
-from scripts.review_links import branch_page, change_page, change_browser
+from scripts.review_links import branch_page, change_page, change_browser, console
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -194,6 +194,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(stat.st_size))
             self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
             self.send_header("X-Content-Type-Options", "nosniff")
+            if file.name == console.PAGE_NAME:
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
+                                 + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
         except BaseException:
             stream.close()

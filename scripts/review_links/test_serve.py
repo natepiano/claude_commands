@@ -25,7 +25,7 @@ from unittest.mock import patch
 from typing import cast, override
 
 
-from scripts.review_links import change_page, serve
+from scripts.review_links import change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -96,6 +96,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(reply.content_type.startswith("text/"), reply.content_type)
         self.assertIn("charset=utf-8", reply.content_type)
         self.assertEqual(reply.body.decode("utf-8"), text)
+
+    def test_console_route_serves_same_origin_navigation_under_the_existing_access_rules(self) -> None:
+        folder = self.root / "abc123"
+        folder.mkdir()
+        pages = (console.ConsolePage("changes", "Changes", "list-checks", "Changes",
+                                     console.AvailablePage("/abc123/changes.html")),)
+        _ = (folder / "console.html").write_bytes(console.render(pages))
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("GET", "/abc123/console.html?page=changes")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "text/html; charset=utf-8")
+            self.assertIn("frame-src 'self'", response.getheader("Content-Security-Policy") or "")
+            self.assertNotEqual(response.getheader("X-Frame-Options"), "DENY")
+            self.assertIn(b"<h1>Hana console</h1>", response.read())
+        finally:
+            connection.close()
+        for path in ("/../abc123/console.html", "/%2e%2e/abc123/console.html", "/.review-link-console.html"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path).status, 404)
 
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"
