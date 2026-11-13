@@ -3509,3 +3509,33 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 **Acceptance gate:**
 - `grep -n "signal.signal\|defer_signals" scripts/production/merge_gate.py` finds only the child `SIG_DFL` reset in `SUITE_BOOTSTRAP`.
 - The SIGTERM and SIGINT cases pass, and the next start cleans up; all merge-gate modules pass; basedpyright clean.
+
+### Phase 223 — Simplify lens tests call the daily command in process  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the content cases in `scripts/direct/test_simplify_lens.py` call `simplify_daily.main()` in process, and aws pairs show a CPU gain.
+
+**Decision:** architect review after Phase 219 (order row 1). Owner go: asked of sdlc, 2026-11-12; no code before the go. Send sdlc the diff before land. Land only on a measured aws gain; report paired peak memory.
+
+**Spec:**
+1. Refresh the profile first: `module_cost.py --tests 10 --commands 15` on the module.
+2. `launch():125` runs the whole assignment command, and `assign.py:813` forwards to `simplify_daily.main():121`. Call `simplify_daily.main` through `invoke_cli` (`scripts/production/cli_fixture.py:84`) for the content cases.
+3. Keep one full dispatch entry, real Git operations, reviewer children and the failure injection at `:286`.
+4. Keep every test and assertion. Change no shared support file; if the adapter cannot serve a case, report the case and stop.
+5. Run the module, its importers and basedpyright on each changed file.
+
+**Files:**
+- `scripts/direct/test_simplify_lens.py`
+
+**Workers:** 1 writer; one test file.
+- impl: the test file.
+
+**Constraints from prior phases:**
+- Phase 214: in-process launch reads carry the tier-only guard (`MODELS_CONFIG_TIER_ONLY=1`), so no catalog sync starts.
+
+**Acceptance gate:**
+- Python starts fall; all tests and assertions remain; importers pass; basedpyright clean.
+- aws pairs show a gain; sdlc sees the diff before land.
+
