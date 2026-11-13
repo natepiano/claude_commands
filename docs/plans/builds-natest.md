@@ -3554,37 +3554,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - Two of the five chain415 failures came from this branch. `buildlog/test_gate_index.py` now expects the nullable `vcpus` column from Phase 219.
 - Phase 222 masked cancellation signals only in the calling thread. A process-directed SIGINT taken by another thread broke `reap_gate_job`: it lost status and CPU, then raised `ChildProcessError`. `scripts/lib/cancellation.py` now owns `CANCELLATION_SIGNALS`, `defer_cleanup_signals` and `start_masked_thread`, which starts an existing thread under the mask so it inherits it. The gate_box guest memory monitor, the queue_place sampler, the `copies.available_tree` waiter and the admission test fixture loop start through it. QueuePlace records its child before the sampler starts. No signal handlers.
 - Base failures with owners, sent to builds: `direct/test_verify_admission_signals.py` (builds-queue `730e73dc1`, build-followups-test-speed `f085ddb08a`), `herdr/test_worker_panes.py` (staff-copies `7676e0473`, quota-refusal `b711e365a`), `review_links/test_change_page.py` (sdlc-fix-rounds `8786bfbef3`).
-- `build_folders.defer_signals` still installs signal handlers; it is a next item. Checkpoint `4f09f6f20`.
+- `build_folders.defer_signals` still installs signal handlers. sdlc devtools owns it and has ordered its deletion. Checkpoint `4f09f6f20`.
 
-### Phase 233 — The lifecycle tests reuse one running-state repository  · status: todo
+### Phase 233 — The lifecycle tests reuse one running-state repository  · status: done
 **Depends on:** Phase 232
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_production_lifecycle.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** next-items order row 1 (sdlc go 2026-11-12; builds go 2026-11-13 03:20). Cached gate median 26.487 CPU s. `LifecycleFixture.running()` (`production_lifecycle_test_support.py:229`) runs eight Git commands (switch, add, commit, two pushes, two worktree adds) in 28 tests. The class already restores a snapshot of the planned state (`setUpClass` `:98`, `setUp` `:112`); the fixture root path is the same in every test, so worktree links stay valid in a copy.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_production_lifecycle.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G`. Name the top costs by test, fixture and command.
-2. If the running-state Git work is a top cost: in `setUpClass`, build a second snapshot after the Git part of `running()`. `running()` then restores that snapshot and runs only its per-test parts (staff rows, panes, transcripts, unit config, exclude and log writes). Keep the planned snapshot for tests that do not call `running()`.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test, assertion and real CLI entry (`run_lifecycle_process`). Map each changed fixture step to the assertions that read its result.
-5. Run the module and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/production_lifecycle_test_support.py`
-- `scripts/production/test_production_lifecycle.py` (only if a test reads a fixture step that moves)
-
-**Workers:** 1 writer; one fixture file and its one importer.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere; threads start through `scripts/lib/cancellation.start_masked_thread`.
-- Land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `LifecycleFixture.setUpClass` (`production_lifecycle_test_support.py`) saves a second snapshot, `running_snapshot`, after `build_running_repository()`. That method holds the Git part of the old `running()`: branch switch, running document add and commit, two pushes, two worktree adds.
+- `running()` replaces `origin.git`, `checkout`, `alpha` and `beta` with copies from that snapshot. The fixed paths keep the Git worktree links valid. Then it writes the per-test staff rows, panes, transcripts, unit config, exclude entry and log.
+- The test module did not change: 70 tests, all assertions and `run_lifecycle_process` stay. `running()` Git commands went from 448 to 56 in each module run.
+- aws paired trial, 3 rounds on c7a.8xlarge: CPU median 32.730 s to 30.856 s (saving 1.876 s); peak 155.2 to 159.2 MiB. natedev module_cost CPU 34.848 to 26.544 s. Checkpoint `1b63e07bf`.
