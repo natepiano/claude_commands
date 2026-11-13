@@ -333,6 +333,7 @@ class SyncTests(unittest.TestCase):
         with (
             mock.patch.object(ci, "ci", return_value=0) as poll,
             mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
+            mock.patch.object(cli, "aws_snapshot", return_value=0) as snapshot,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
@@ -341,12 +342,14 @@ class SyncTests(unittest.TestCase):
         poll.assert_called_once_with()
         screenshots.assert_called_once_with()
         release.assert_called_once_with()
+        snapshot.assert_called_once_with()
         self.assertEqual(self.commands, [])
 
     def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
         jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
-                (rust_release, "check_release", "rust release"), (index, "update", "index"))
+                (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
+                (index, "update", "index"))
         expected = [name for _, _, name in jobs]
         for failed in expected:
             for raises in (False, True):
@@ -370,6 +373,18 @@ class SyncTests(unittest.TestCase):
                     self.assertEqual(calls, expected)
                     # index.update returns a row count, unlike the job exit statuses.
                     self.assertEqual(result, 0 if failed == "index" and not raises else 1)
+
+    def test_aws_snapshot_uses_the_installed_settings_and_state_directory(self) -> None:
+        from scripts.aws_target import aws_target
+        from scripts.build_targets import target_config
+        from scripts.lib import conf
+
+        folder = self.root / "aws"
+        with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
+              mock.patch.object(aws_target, "snapshot", return_value=1) as read):
+            self.assertEqual(cli.aws_snapshot(), 1)
+        state.assert_called_once_with("aws")
+        read.assert_called_once_with(conf.path("aws_target"), folder)
 
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []
