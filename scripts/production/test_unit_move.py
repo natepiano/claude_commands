@@ -145,6 +145,26 @@ class UnitFolderMoveTests(FolderRenameFixture):
             ):
                 self.assertEqual(unit_move.move_processes_inside(self.owner, self.source), [above_pane, *extra])
 
+        worker = fixture_worker("unknown-worker", self.owner.id)
+
+        def conversation(identity: str) -> herdr.LiveConversation | herdr.UnknownConversation:
+            if identity == worker.current_session:
+                return herdr.UnknownConversation("fixture worker evidence is unavailable")
+            return herdr.LiveConversation("claude", (director,))
+
+        for extra in ((), (other_shell,)):
+            with (
+                self.subTest(worker="unknown", unrelated_shell=bool(extra)),
+                mock.patch.object(unit_move, "processes_inside", return_value=[shell, wrapper, director, child, *extra]),
+                mock.patch.object(pane_record, "process_parent", side_effect=parent),
+                mock.patch.object(herdr, "read_conversation", side_effect=conversation),
+                mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                    herdr.EnvironmentThread(self.owner.current_session), "fixture-start", {})),
+                mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+                mock.patch.object(pane_record, "pane_shell_pid", return_value=shell),
+            ):
+                self.assertEqual(unit_move.move_processes_inside(self.owner, self.source, preserved_workers=[worker]), list(extra))
+
     def test_running_unit_stops_moves_and_resumes_current_session(self) -> None:
         from scripts.agents import detached_run_process
         from scripts.lib import unit_runs
