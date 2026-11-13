@@ -1,5 +1,5 @@
 ---
-description: Print the build memory page link.
+description: Print the Builds page link.
 ---
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/memory_feed.py link`.

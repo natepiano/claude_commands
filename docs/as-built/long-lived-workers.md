@@ -78,6 +78,13 @@ That notice names its own pass and says it is a late result. The pane stays for 
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
 If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
+A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
+The pass records the digest before submission.
+Changed content at the same prompt path starts a new pass after completion.
+With an active pass, changed content returns busy and names that pass without printing `submitted`.
+This refusal applies when the launcher arguments change.
+The recorder repeats the content check under its lock before it changes the pass.
+The intentional second review stage keeps its existing pass across its separate prompt path.
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
@@ -577,6 +584,10 @@ Detached command results use `detached_runs.deliver` and `send.deliver_worker_te
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
+The command shares the supervisor's process group, including through a systemd scope prefix.
+The supervisor installs no signal handler.
+After a group stop, the existing orphan reaper finishes the record and delivers the result.
+The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.

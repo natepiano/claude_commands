@@ -1,6 +1,8 @@
 // Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
 // The optional third argument names the previous page for comparison images.
 // Add --queued as the fourth argument for the queued-section comparison.
+// Add --console as the fourth argument for the Builds title comparison.
+// Add --step-names as the fourth argument for owner-based step names.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -23,6 +25,8 @@ try {
   const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const queuedComparison = process.argv[4] === '--queued';
+  const consoleComparison = process.argv[4] === '--console';
+  const stepNamesComparison = process.argv[4] === '--step-names';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -821,6 +825,54 @@ try {
           await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
         };
         const comparisons = [];
+        if (stepNamesComparison) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          for (const version of ['before','after']) {
+            await show(readings['owner_names_'+version]);
+            const names = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.walk-table tbody tr')];
+              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
+                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
+            })()`);
+            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            assert.deepEqual(names.running,expected);
+            assert.deepEqual(names.waiting,expected);
+            await capture(version+'-running-step-names','#walk');
+            comparisons.push({version,...names});
+          }
+        }
+        if (consoleComparison) {
+          assert.ok(beforePage,'The console comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            await navigate(version==='before'?'before.html':'memory_live.html');
+            await show(base);
+            const state=await evaluate(`(() => ({
+              title:document.title,heading:document.querySelector('h1').textContent,
+              navigation:document.querySelectorAll('nav').length,
+              outbound:[...document.querySelectorAll('a[href]')].filter(a=>!a.getAttribute('href').startsWith('#'))
+                .map(a=>({href:a.getAttribute('href'),target:a.target}))
+            }))()`);
+            if(version==='after') {
+              assert.equal(state.title,'Builds');
+              assert.equal(state.heading,'Builds');
+              assert.equal(state.navigation,0);
+              for(const link of state.outbound) assert.equal(link.target,'_top');
+            } else {
+              assert.equal(state.heading,'Build memory on natedev');
+            }
+            const clip=await evaluate(`(() => {
+              const status=document.querySelector('.status').getBoundingClientRect();
+              return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
+            })()`);
+            const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+            await writeFile(join(folder,`${version}-dark-title.png`),Buffer.from(shot.data,'base64'));
+            comparisons.push({version,...state});
+          }
+        }
         if (queuedComparison) {
           assert.ok(beforePage, 'The queued comparison needs the previous page.');
           const cases = [
@@ -921,7 +973,7 @@ try {
             }
           }
         }
-        if (beforePage && !queuedComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';

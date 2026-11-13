@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 from scripts.agents.detached_runs import RunRecord
@@ -36,6 +36,24 @@ class WorkerRun(TypedDict):
 class WorkerRunState(TypedDict):
     state: str
     run: NotRequired[WorkerRun]
+
+
+class NamedWaitHolder(NamedTuple):
+    """The holder named in a wait record."""
+
+    label: str
+
+
+class UnnamedWaitHolder(NamedTuple):
+    """The wait record names no holder."""
+
+
+class PhaseWait(NamedTuple):
+    """An open worker or director wait in one phase instance."""
+
+    reason: str
+    started: float
+    holder: NamedWaitHolder | UnnamedWaitHolder
 
 
 def parse_process_table(ps_output: str) -> ProcessTable:
@@ -163,6 +181,79 @@ def observe_pane_rows(session: Path, pane_rows: Sequence[Mapping[str, object]], 
             _ = row.pop("run", None)
             row.update(observed[identity])
     return rows
+
+
+def _phase_passes(events: Sequence[Mapping[str, object]], instance_id: str) -> list[Mapping[str, object]]:
+    """Read open passes for one phase instance."""
+    passes: dict[str, Mapping[str, object]] = {}
+    for event in events:
+        kind = event.get("event_type")
+        pass_id = str(event.get("pass_instance_id", ""))
+        if kind == "run_finished" or kind == "phase_finished" and event.get("phase_instance_id") == instance_id:
+            passes.clear()
+        elif kind == "pass_started" and event.get("phase_instance_id") == instance_id:
+            passes[pass_id] = event
+        elif kind == "pass_finished":
+            _ = passes.pop(pass_id, None)
+    return list(passes.values())
+
+
+def phase_workers(session: Path, events: Sequence[Mapping[str, object]], instance_id: str,
+                  runs: WorkerRuns) -> list[dict[str, object]]:
+    """Show workers from open phase passes with their detached run states."""
+    workers: dict[str, str] = {}
+    pass_starts: dict[str, float] = {}
+    for event in _phase_passes(events, instance_id):
+        slot = str(event.get("team_slot") or event.get("worker_name") or event.get("team_role") or "")
+        if not slot:
+            continue
+        identity = str(event.get("worker_id") or slot)
+        workers[identity] = slot
+        started = event.get("pass_started_at", event.get("timestamp_epoch", 0))
+        if isinstance(started, int | float):
+            pass_starts[identity] = float(started)
+    observed = observe_session(session, dict.fromkeys(workers, "idle"), pass_starts, runs)
+    return [{"slot": slot, **observed[identity],
+             "state": "working" if observed[identity]["state"] == "idle" else observed[identity]["state"]}
+            for identity, slot in workers.items()]
+
+
+def _wait_holder(value: object) -> NamedWaitHolder | UnnamedWaitHolder:
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        holder = fields.get("holder")
+        if fields.get("state") == "NamedHolder" and isinstance(holder, dict):
+            holder = cast(dict[str, object], holder)
+            label = holder.get("unit") or holder.get("session_id")
+            if isinstance(label, str) and label:
+                return NamedWaitHolder(label)
+    return UnnamedWaitHolder()
+
+
+def phase_waits(events: Sequence[Mapping[str, object]], instance_id: str) -> list[PhaseWait]:
+    """Read waits that remain open in one phase instance."""
+    waits: dict[str, Mapping[str, object]] = {}
+    for event in events:
+        kind = event.get("event_type")
+        wait_id = str(event.get("wait_id", ""))
+        if kind == "run_finished" or kind == "phase_finished" and event.get("phase_instance_id") == instance_id:
+            waits.clear()
+        elif kind == "wait_started" and event.get("phase_instance_id") == instance_id:
+            waits[wait_id] = event
+        elif kind in ("wait_finished", "wait_unclosed"):
+            _ = waits.pop(wait_id, None)
+        elif kind == "wait_holder_seen" and wait_id in waits:
+            waits[wait_id] = {**waits[wait_id], "holder": event.get("holder")}
+        elif kind == "pass_finished":
+            waits = {key: wait for key, wait in waits.items()
+                     if wait.get("pass_instance_id") != event.get("pass_instance_id")}
+    result: list[PhaseWait] = []
+    for wait in waits.values():
+        started = wait.get("wait_started_epoch", wait.get("timestamp_epoch"))
+        if isinstance(started, int | float):
+            result.append(PhaseWait(str(wait.get("wait_reason") or wait.get("wait_kind") or "wait"),
+                                    float(started), _wait_holder(wait.get("holder"))))
+    return result
 
 
 def pane_worker_rows(record: staff.StaffSnapshot) -> dict[staff.StaffId, list[dict[str, object]]]:

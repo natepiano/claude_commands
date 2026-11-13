@@ -2788,6 +2788,45 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches),
                           self.fixture.world.locations.copy()), before)
         self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+        original_prompt = self.prompt.read_text()
+        instance = str(worker_panes.worker_pass(self.agent.row(submitted_pane), self.run_dir)["instance_id"])
+        for status in ("working", "idle"):
+            with self.subTest(prompt="changed content", status=status):
+                self.fixture.world.locations[submitted_pane]["agent_status"] = status
+                atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
+                code, output, errors = self.command(*args)
+                self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+                self.assertIn(f"active pass {instance}", errors)
+                self.assertIn("no prompt sent", errors)
+                self.assertEqual(len(self.agent.submitted), 1)
+                self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+                atomic_file.write_text_atomic(self.prompt, original_prompt)
+        for changed_at in ("before lookup", "after lookup"):
+            with self.subTest(prompt="changed active content and launcher", changed_at=changed_at):
+                self.fixture.world.locations[submitted_pane]["agent_status"] = "idle"
+                changed_args = (*args[:-1], json.dumps(["assign.sh", "--prompt", str(self.prompt), "--summary", str(self.reply)]))
+                read_dispatch = progress_history.dispatch_worker
+
+                def change_after_lookup(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
+                                        prompt: Path, launcher_command: list[str],
+                                        ) -> progress_history.MatchedDispatch | progress_history.NoMatchedDispatch | progress_history.ActiveDispatchPromptConflict:
+                    result = read_dispatch(session_dir, slot=slot, phase=phase, role=role,
+                                           prompt=prompt, launcher_command=launcher_command)
+                    atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
+                    return result
+
+                if changed_at == "before lookup":
+                    atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
+                    code, output, errors = self.command(*changed_args)
+                else:
+                    with patch.object(progress_history, "dispatch_worker", side_effect=change_after_lookup):
+                        code, output, errors = self.command(*args, "--name", self.agent.row(submitted_pane).name)
+                self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+                self.assertIn(f"active pass {instance}", errors)
+                self.assertIn("no prompt sent", errors)
+                self.assertEqual(len(self.agent.submitted), 1)
+                self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+                atomic_file.write_text_atomic(self.prompt, original_prompt)
         self.agent.complete(submitted_pane)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertEqual(self.fixture.world.locations, expected_panes)
@@ -2810,6 +2849,15 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(self.agent.waited, [])
         self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), state)
+        with self.subTest(prompt="changed content"):
+            previous = worker_panes.worker_pass(self.agent.row(self.agent.submitted[0][0]), self.run_dir)
+            atomic_file.write_text_atomic(self.prompt, "Read the changed work order and implement it.\n")
+            self.assertEqual(self.command(*args), (0, "submitted\n", ""))
+            self.assertEqual(len(self.agent.submitted), 2)
+            current = worker_panes.worker_pass(self.agent.row(self.agent.submitted[-1][0]), self.run_dir)
+            self.assertNotEqual(current["instance_id"], previous["instance_id"])
+            self.assertIn(f"DONE {current['instance_id']}", self.agent.submitted[-1][1])
+            self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
 
     def test_role_changes_read_completion_before_recording_the_new_pass(self) -> None:
         _ = write_registry(self.fixture.root / "conf/models.conf", {

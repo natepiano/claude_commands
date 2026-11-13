@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,26 @@ GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
+        page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        self.assertIn("<title>Builds</title>", page)
+        self.assertIn("<h1>Builds</h1>", page)
+        elements: list[tuple[str, dict[str, str]]] = []
+
+        def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            elements.append((tag, {key: value or "" for key, value in attrs}))
+
+        parser = HTMLParser()
+        parser.handle_starttag = collect
+        parser.feed(page)
+        self.assertNotIn("nav", [element[0] for element in elements])
+        for tag, attributes in elements:
+            if tag == "a" and not attributes.get("href", "").startswith("#"):
+                self.assertEqual(attributes.get("target"), "_top")
+            if tag == "meta":
+                self.assertNotEqual(attributes.get("http-equiv", "").lower(), "x-frame-options")
+                self.assertNotIn("frame-ancestors 'none'", attributes.get("content", "").lower())
+
     def test_time_cells_use_short_times_without_a_wait_prefix(self) -> None:
         for elapsed, expected in ((0, "<1 min"), (29, "<1 min"), (30, "1 min"),
                                   (60, "1 min"), (2580, "43 min"), (3600, "1 h 0 min")):
