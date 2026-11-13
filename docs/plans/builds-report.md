@@ -1288,6 +1288,81 @@ From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/sc
 
 **Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
 
+### Phase 67 — The Queued title shares the waiting header row · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers".
+
+#### As-built
+
+- The phase 65 title sits on the waiting header row, bottom-aligned with the column headers. It keeps its `.section-head` font.
+- The empty title row and its height code are gone. The Next step room row and its hairline do not move.
+- A long title ends in an ellipsis before the header columns and shows its full text on hover. The stacked phone layout does not change.
+- `test_memory_hover.py` checks that the header row follows the room row. `memory_page_proof.mjs` checks bottom alignment and no overlap at 1400, 900 and 390 px in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
 ### Phase 66 — Retire /build:queue · status: todo
 
 From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
+
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
+
+### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
+
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
+
+#### As-built
+
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+
+### Phase 70 — Cloud step names carry their unit · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: a targeted test should read "<unit> targeted", and a merge gate "showrunner merge" or "<unit> merge".
+
+#### As-built
+
+- `make_labels` sets `OwnerRole` on `UnitLabels`. `SHOWRUNNER`: a session that runs a production, or a showrunner's own staff worker with no unit. `UNIT`: a unit director or a worker under one, running or not. `UNKNOWN`: every other path.
+- `StepNames.for_owner(step, unit, role)` reads new `owned.*` keys in `config/build_steps.conf`: `{unit} targeted`, `{unit} merge` and `showrunner merge`. `UNKNOWN` keeps the current name. The `names.*` and `prose.*` values do not change.
+- One cloud naming helper in `queue_view.py` names both the Running and the Queued rows.
+- A worker's step belongs to its owner (director decision, 2026-11-13). sdlc's merge worker, staff kind unit, reads "sdlc-merge-gate merge".
+- Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
+- Repair (merge test red, from builds): live Claude workers take their labels through `staff_relationships` and `make_labels`, so the live, recorded and roster readers give the same role. `priority_labels` order does not change.
+
+**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/build_queue/test_admission_service.py`; `scripts/message/test_roster.py`; `scripts/production/test_unit_lookup.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
+
+### Phase 69f — The Mac reading survives an unreadable folder · status: done
+
+From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading at 13:20. `project_record` called `Path.exists()` on `/Users/hana-ci/actions-runner/_work/hana/hana/.git`, which natepiano cannot read, so a `PermissionError` failed the whole read.
+
+1. `project_record` returns the empty record on `OSError`, so an unreadable folder reads as unknown.
+2. `read_builds` keeps a row when one field fails, and the other rows stay.
+3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
+4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
+
+### Phase 71 — Every row names its unit and showrunner · status: todo
+
+From the user (via builds), 2026-11-13: "it's working but i can't tell who is the showrunner for hana nextest running on the mac - it needs to show the showrunner in small text underneath and it should show the {unit} {step} above - if it is a showrunner run thing then it should say showrunner nextest and still show the name of the showrunner before it. the showrunner and the unit should be on every hoverable tooltip so i don't have to guess". Screenshot: /tmp/claude/scratch/user-shot-mac-showrunner-names.png. <!-- allow-banned: user quote --> From builds (not the user), 2026-11-13: items 1-5.
+
+1. Every row on every machine (natedev, Mac, AWS), Running and Queued, has the top line "{unit} {step}". A showrunner run reads "showrunner {step}".
+2. The small text under it is the showrunner name, for example "hana".
+3. A CI row has no unit or showrunner: the top line is "CI {step}", and the small text is the current ci_label (hana CI · runner · job).
+4. Every hover tooltip on the page names the showrunner and the unit, or CI.
+5. Proof: before and after shots of the Mac CI row (pid 90082 in the shot) and one tooltip.
+6. From the user (via builds), 2026-11-13: "space between columns Done and Duration should be consistent - there is too much space between these two column headers that could be used". Screenshot: /tmp/claude/scratch/user-shot-done-duration-gap.png. From builds (not the user): every column gap in the Running and Queued tables has the same width, the Waiting header included. The freed space goes to the Unit column, so "owner not recorded" shows in full. Proof: before and after shots of both tables.
+7. From the user (via builds), 2026-11-13: "rename Machine column header to Target - rename Duration to Dur - this should give a couple of chars back in many circumstances". From builds (not the user): rename both headers in the Running and Queued tables and anywhere else the page uses them. The freed space goes to Unit.

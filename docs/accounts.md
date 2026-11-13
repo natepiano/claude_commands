@@ -69,6 +69,7 @@ In a terminal:
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
+| Login ends | The Claude login's server time limit in the user's zone. A dash means unknown or Codex. |
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses the launch. It does not select `~/.codex` as a fallback. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
@@ -81,7 +82,12 @@ The text board keeps these lines, including with `--detail`.
 All other problem lines remain in JSON.
 `upcoming_moves` contains the rendered upcoming move lines, including the heading.
 
-Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`.
+Each account has `label`, `tool`, `roles`, `selected_roles`, `role_counts`, `sessions`, `weekly_left_percent`, `resets_at`, `login_ends_at`, `credits`, `use_credits` and `read_at`.
+`login_ends_at` is an ISO 8601 UTC string, or null for an unknown date or a Codex row.
+`Login ends` uses the same date format as `Weekly resets`.
+The usage reader takes this date from `claudeAiOauth.refreshTokenExpiresAt` in the metadata it already loads.
+Claude Code reports the same value as `loginExpiresAt`.
+A token refresh does not extend this server time limit.
 `tool` is `claude` or `codex`.
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.

@@ -75,14 +75,18 @@ class WaitingOnLocalRun:
 
 
 class WaitingOnCiJob:
-    """A block waiting for CI's Mac job."""
+    """A block waiting for CI's Mac job to start."""
+
+
+class WaitingOnCiMacJob:
+    """A block waiting for CI's running Mac job to finish."""
 
 
 class WaitingOnUnknownCi:
     """A block waiting until CI can be checked."""
 
 
-WaitingOn = WaitingOnLocalRun | WaitingOnCiJob | WaitingOnUnknownCi
+WaitingOn = WaitingOnLocalRun | WaitingOnCiJob | WaitingOnCiMacJob | WaitingOnUnknownCi
 
 
 class FreeMessageNotNeeded:

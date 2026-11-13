@@ -114,6 +114,9 @@ A replacement process in that terminal stays open.
 `scripts/agents/detached_runs.py` starts and supervises long commands.
 Records and logs live under `<run>/detached_runs/`.
 `detached_run_process.py` proves supervisor identity before a caller signals its process group.
+The command shares that group through the systemd scope prefix.
+The supervisor installs no signal handler.
+The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
 
 ### Channels and user decisions
@@ -140,8 +143,11 @@ The [messaging contract](session-roster.md) defines peer lookup and delivery out
 `change_review.change_queue(path, scope, below=False) -> ChangeQueue` supplies both `/next change` and `change_review.py show`.
 `ChangeQueue` carries the pin name and ordered entries.
 Scoped lookup includes earlier production lists and routes their rows through current staff ownership.
-Current-list rows retain plain ids. Other lists qualify their ids, such as `sdlc/C9`.
-Their prerequisites receive the same qualification.
+Displayed IDs use the responsible showrunner, such as `sdlc/C9`, through the page's shared staff resolver.
+The queue retains plain keys for current-list rows and list-qualified keys for other rows.
+Prerequisites retain that list qualification.
+Row commands accept both displayed IDs and existing list-based IDs.
+An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.

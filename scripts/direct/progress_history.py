@@ -1832,10 +1832,29 @@ class NoMatchedDispatch:
     pass
 
 
+@dataclass(frozen=True)
+class ActiveDispatchPromptConflict:
+    """The same assignment names an active pass with different prompt content."""
+
+    worker_name: str
+    instance_id: str
+
+
+class DispatchPromptRefused(RuntimeError):
+    """The locked recorder refuses a changed prompt for an active pass."""
+
+    def __init__(self, conflict: ActiveDispatchPromptConflict) -> None:
+        self.conflict: ActiveDispatchPromptConflict = conflict
+        super().__init__(f"Active pass {conflict.instance_id} has different prompt content")
+
+
 def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool, allow_stage_two: bool = False) -> MatchedDispatch | NoMatchedDispatch:
+                    dispatch_owned: bool, allow_stage_two: bool = False,
+                    ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or _pass_phase_instance(active) != _string(phase.get("instance_id")):
+        return NoMatchedDispatch()
+    if active.get("kind", "") != fields.get("kind", ""):
         return NoMatchedDispatch()
     saved_command = active.get("launcher_command")
     current_command: object = (_worker_launcher(cast(list[str], saved_command), _string(active.get("worker_name")))
@@ -1843,10 +1862,21 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                        else cast(object, saved_command))
     same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
         active.get("status") in ("active", "refused") and launcher_command == current_command))
+    stage_two = (allow_stage_two and same_launcher
+                 and fields.get("prompt_file") != active.get("prompt_file"))
+    if dispatch_owned and not stage_two:
+        try:
+            digest = hashlib.sha256(Path(_string(fields.get("prompt_file"))).read_bytes()).hexdigest()
+        except OSError:
+            return NoMatchedDispatch()
+        if active.get("prompt_digest") != digest:
+            if active.get("status") == "active":
+                return ActiveDispatchPromptConflict(_string(active.get("worker_name")), _string(active.get("instance_id")))
+            return NoMatchedDispatch()
     if launcher_command and saved_command and not same_launcher:
         return NoMatchedDispatch()
     if not all(active.get(key, "") == value for key, value in fields.items()
-               if key != "prompt_file" or not (allow_stage_two and same_launcher)):
+               if key != "prompt_file" or not stage_two):
         return NoMatchedDispatch()
     if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
@@ -1871,7 +1901,8 @@ def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_comma
 
 
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
-                    prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
+                    prompt: Path, launcher_command: list[str],
+                    ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
@@ -1936,6 +1967,8 @@ def _start_pass(args: argparse.Namespace) -> None:
     match = _dispatch_match(active, phase, dispatch_fields, launcher_command,
                             dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
                             allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
+    if isinstance(match, ActiveDispatchPromptConflict):
+        raise DispatchPromptRefused(match)
     if active is not None and isinstance(match, MatchedDispatch):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid
@@ -1968,6 +2001,8 @@ def _start_pass(args: argparse.Namespace) -> None:
         "phase": _phase_stamp(phase),
         "status": "active",
     }
+    if getattr(args, "dispatch_owned", False):
+        current_pass["prompt_digest"] = hashlib.sha256(Path(_optional_arg(args, "prompt_file")).read_bytes()).hexdigest()
     slots = _pass_slots(state)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
