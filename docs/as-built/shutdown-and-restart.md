@@ -253,6 +253,16 @@ Publication replaces earlier bindings through the recoverable `.producer-publica
 Resume compares source and destination pane locations before it lists panes.
 An own-pane resume therefore needs no pane list call.
 
+### Catch-up reader
+
+`scripts/agents/catch_up.py NATIVE_ID [--blocks N] [--chars N]` prints the last blocks of a saved conversation.
+A session that takes a producer role reads the earlier conversation of that role with it.
+`NATIVE_ID` is `session:<id>`, `codex:<id>` or an ID alone. An ID alone selects the newest transcript of either family.
+A block is one user message, assistant message, tool call or tool result. A tool block is one shortened line.
+A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
+The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
+`config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
