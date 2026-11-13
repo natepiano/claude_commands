@@ -1264,6 +1264,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 destination = client.producer_row_tab(str(row.id), row.name, space, record=names.tab_record)
                 tab = (herdr.TabSession(destination.pane, row.name, "", identity)
                        if isinstance(destination, herdr.ExistingPane) else SessionNotFound(identity))
+        elif row is not None and isinstance(tab, SessionNotFound):
+            own_pane = client.saved_row_tab(str(row.id), row.name, herdr.row_workspace(row, names.tab_record, row.name),
+                                             record=names.tab_record)
+            if isinstance(own_pane, herdr.ExistingPane):
+                tab = herdr.TabSession(own_pane.pane, row.name, "", identity)
         if isinstance(tab, SessionNotFound):
             space = herdr.row_workspace(row or STAFF_ROOT, names.tab_record, entry["name"])
             with herdr.restore_staff(names.tab_record, labels=names.labels):

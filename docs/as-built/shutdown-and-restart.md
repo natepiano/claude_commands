@@ -113,7 +113,14 @@ The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-Resume from its own empty pane executes the saved launch in that pane.
+Resume, restart and account moves start a session in its own pane.
+The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
+`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+When the wait ends first, the start is refused with one line.
+The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
+A new tab opens only for a session with no own pane.
+A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A restart never splits a pane beside a worker.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
 Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
 Other rows use their parent showrunner's workspace, the entry name, or the shared session.
