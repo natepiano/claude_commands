@@ -739,6 +739,8 @@ class WorkerCommandTests(unittest.TestCase):
                 "role": "user", "content": f"End your final reply with DONE {dispatch}."}}) + "\n")
             agents_log.append(child.current_session, "impl", None, datetime.now(timezone.utc))
             agents_log.append(native.current_session, "impl", None, datetime.now(timezone.utc))
+            _ = staff.set_worker_role(child.id, staff.KnownWorkerRole("impl"))
+            _ = staff.set_worker_role(native.id, staff.KnownWorkerRole("impl"))
             result = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
         saved = next(item for item in result.results if isinstance(item, Resumable))
         self.assertEqual(saved.seat["staff_id"], child.id)
@@ -747,7 +749,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(result.cwd, str(self.fixture.root))
         missing = next(item for item in result.results if isinstance(item, Unavailable))
         self.assertEqual(missing.staff_id, unavailable.id)
-        self.assertIn("last assignment is unavailable", missing.reason)
+        self.assertIn("staff worker role is unavailable", missing.reason)
         child_ids = {staff.StaffId(item.staff_id if isinstance(item, Unavailable) else item.seat["staff_id"])
                      for item in result.results}
         self.assertEqual(child_ids, {child.id, unavailable.id})
