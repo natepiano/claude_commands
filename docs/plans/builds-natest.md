@@ -3630,35 +3630,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 238 — The models publication tests copy one publication fixture  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `agents/test_models_conf_publish.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 3; sdlc owner go 2026-11-13 13:38. Cached gate median 33.79 CPU s. `RegistryPublishingTests.setUp` (`test_models_conf_publish.py:284-295`) runs nine Git commands in each of 43 tests: bare init, init, add, commit, remote add, push, clone of a competitor, rev-parse, then a staged add after the dirty and staged edits.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_models_conf_publish.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the setup Git work is a top cost: build the checkout, remote and competitor once per class, with the dirty, staged and unstaged states, and copy them per test. The checkout's origin URL and the competitor's origin URL are absolute: use a fixed per-class root or rewrite them after the copy. Keep `initial` as a class value. Keep real writers, locks, rejected pushes and publication checks.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/agents/test_models_conf_publish.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phases 233–234: a class seed copy replaces per-test Git setup; a copy to a new path must hold no absolute path into the seed.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `RegistryPublishingTests.setUpClass` (`agents/test_models_conf_publish.py`) builds the checkout, bare remote, competitor clone, registry and the dirty, staged and unstaged states once. Each test copies the whole seed back to the same fixed class root, so both absolute origin URLs stay valid, and refreshes both copied indexes. Each test gets its own environment dictionary; `initial` is a class value.
+- Real writers, locks, rejected pushes and publication checks did not change. All 51 test bodies and 214 assertions did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 32.828 to 31.491 s; peak 104.2 to 104.4 MiB. Git (17.3 natedev CPU s) and `models_registry.py` (6.8 s) stay the top commands. Checkpoint `0a5f1f853`.
 
 ### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: todo
 **Depends on:** Phase 234
