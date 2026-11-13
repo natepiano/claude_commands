@@ -138,6 +138,50 @@ It identifies the source event in the history file, including a finding's title 
 
 `reattribute` re-resolves every stored turn of the machine on every pass, so a late role-log line corrects earlier turns without adding rows. An `unreadable` role log leaves stored attribution as it was.
 
+### Command use
+
+`/command_use` runs `scripts/usage/command_use.py` on natedev.
+The report lists commands from the running checkout's `commands/**/*.md` tree.
+It lists commands without evidence first, then other commands by oldest last use.
+Rows contain the last use, user count, agent count, and first observed transcript use.
+The heading gives the oldest and newest dated evidence.
+
+The reader scans every local `.claude` and numbered `.claudeN` projects tree, including subagents and `.jsonl.zst` files.
+User entries with automation metadata count as agent uses; unmarked user entries count as user uses.
+Automation metadata includes `isMeta`, `isSidechain`, non-human `origin` or `source`, forwarded intent, and non-interactive entrypoints.
+Assistant `Skill` tool calls also count as agent uses.
+The prompt hook records launcher input in `~/.local/state/notify/auto-silence-events.jsonl` after it consumes the script prompt marker.
+The journal records the session, input hash, time, and source.
+The reader matches each journal entry to the nearest command within the time window, with the same session and input hash.
+If two entries have the same time difference, the reader selects the later entry.
+If metadata already marks the selected entry as an agent use, the journal entry changes no other entry.
+The window accepts transcript times before or after the recorded time because the hook can write its evidence later.
+`command_use_launcher_window_seconds` in `config/context_economy.conf` limits the match window to 30 seconds.
+Matching uses time order rather than transcript read order.
+Each journal entry applies to one submission.
+The report derives launcher attribution without changing the actor recorded in the transcript event.
+Herdr launch records and staff rows do not retain the input text.
+`add_unit` removes its pending opening record after submission.
+Restart and resume prose uses the script envelope; the transcript keeps this marker.
+The hook records prompt sources only for showrunners and unit directors.
+Other sessions, hook failures, and deleted hook records can leave launcher input without evidence.
+Unmarked input without retained evidence counts as user use.
+Only the `skillUsage` key enters the report from each account's `.claude.json`.
+The default home uses `~/.claude.json`; numbered homes use `~/.claudeN/.claude.json`.
+`lastUsedAt` extends the last-use date without inventing user counts, agent counts, or a first-use date.
+
+`command_use_events.sqlite3` keeps durable command events under `~/.cache/context_economy/`.
+`command_use.sqlite3` keeps the parse checkpoints in that folder.
+The checkpoint eviction budget excludes the durable events database.
+Each event uses its transcript entry UUID and command position as its identity.
+Entries without a UUID use the logical transcript path and a hash of the complete entry.
+Reparsing inserts only new identities, so trimming and checkpoint eviction preserve the counts and dates.
+The report reads the event store; the shared cache resumes appended files at the last complete line.
+The same database retains prompt source evidence after its journal disappears.
+The context-economy database remains separate.
+The first event-store read reparses available sources whose checkpoints contain only old aggregates.
+The reader moves event tables from the earlier combined database into the durable database once.
+
 ### The Mac half
 
 The Mac is read on the Mac. `collect_mac` runs `python3 -c REMOTE_BOOTSTRAP` over `ssh -o BatchMode=yes natemccoy@mac` (`MAC_HOST`). It appends `; printf "\nrc=%s\n" "$?"`. `reader_payload` sends the sources of `scripts/usage/activity.py`, `agents_log.py`, `rollouts.py` and `collect.py`, in that order, and the stored Mac cursors on stdin; the bootstrap loads them under their module names and calls `read_mac(offsets)`. The Mac needs `python3` and no checkout, and nothing is written to its disk.
