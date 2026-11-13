@@ -62,7 +62,7 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
    | done | `production/test_change_review.py` (Phase 225, `2cc7b7d02`): aws CPU 16.32 to 14.38 s; peak 156.3 to 147.2 MiB. | — | — |
    | done | `direct/test_assign_claude_*` (Phase 226, `ff5068f46`): aws CPU 81.69 to 62.84 s over four modules; peak up 26–36 MiB each. | — | — |
    | 1 | `production/test_production_lifecycle.py` (26.487 cached CPU s): profile the archive commands and the repeated running-state preparation at support `:229` (commands already use `invoke_cli` at `:260`; Phase 177 measured 28 archive commands at 3.273 local CPU s) | One writer owns `production_lifecycle_test_support.py` and its importer. | 2–4 h |
-   | 2 | `production/test_unit_move.py` (6.342): trial a private seed for the repeated repository preparation at `rename_unit_test_support.py:315` | One writer; include `agents/test_shutdown_cli.py`, which shares the fixture. | 2–4 h |
+   | 0 (Phase 229) | `production/test_unit_move.py` (72.9–91.2 CPU s in recent gates; the 6.342 cache was stale) and `agents/test_shutdown_cli.py` (61.9–75.4): most CPU is in-process Python; profile first, then trial a private seed for the repeated repository preparation at `rename_unit_test_support.py:315` | One writer; include `agents/test_shutdown_cli.py`, which shares the fixture. | 2–4 h |
    | 3 | `production/test_unit_config.py` (2.625): trial a seed for initialization and the empty commit at `unit_config_test_support.py:39` | One writer; include `lib/test_git_exclude.py`, which shares the fixture. | 1–3 h |
    | beside | The Rule 2 candidates in item 11 (separate from speed comparisons) | One writer per file; no shared support changes; two removal reviews; apart from speed comparisons. | — |
 
