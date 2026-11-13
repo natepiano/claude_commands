@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 import json
 import os
+import shlex
+import struct
 import subprocess
 import time
 import unittest
@@ -160,6 +162,27 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
+    def test_mac_names_use_the_package_then_the_repository(self) -> None:
+        for command, repository, expected in (
+            ("cargo build --release -p hana", "", "hana build"),
+            ("cargo build -phana", "other", "hana build"),
+            ("cargo build --package=hana", "other", "hana build"),
+            ("cargo check --package hana", "other", "hana check"),
+            ("cargo nextest run", "cargo-liner", "cargo-liner nextest"),
+            ("cargo build", "", "build"),
+            ("", "", "cargo"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(queue_view.mac_step_name(queue_view.MacBuild(1, "/project", 0,
+                    command, repository)), expected)
+
+    def test_mac_command_jobs_reads_all_supported_positive_values(self) -> None:
+        for argument in ("--test-threads 12", "--test-threads=12", "-j12", "-j 12", "--jobs 12", "--jobs=12"):
+            with self.subTest(argument=argument):
+                self.assertEqual(queue_view.mac_command_jobs("cargo nextest run " + argument), 12)
+        for command in ("cargo build", "cargo build -j0", "cargo nextest run --test-threads 0"):
+            self.assertIsInstance(queue_view.mac_command_jobs(command), queue_view.MacJobsUnavailable)
+
     def test_periodic_reader_preserves_folders_and_elapsed_days(self) -> None:
         with QueueFixture(captured=False) as fixture:
             _ = (fixture.root / "mac_test.conf").write_text(
@@ -169,7 +192,9 @@ class MacQueueViewTests(unittest.TestCase):
             for elapsed, seconds in (("03:04", 184), ("02:03:04", 7384), ("1-02:03:04", 93784)):
                 with self.subTest(elapsed=elapsed):
                     result = subprocess.CompletedProcess(["ssh"], 0,
-                        stdout=f"710001\t{elapsed}\t/Users/nate/mac clone\nrc=0\n", stderr="")
+                        stdout=json.dumps([{"pid": 710001, "folder": "/Users/nate/mac clone", "started_at": now - seconds,
+                            "resident_bytes": 1048576, "test_pid": 710002, "command": "cargo nextest run --jobs=4",
+                            "repository": "hana", "progress_tail": "", "recorded_unit": "", "session": ""}]) + "\nrc=0\n", stderr="")
                     with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
                           mock.patch.object(subprocess, "run", return_value=result),
                           mock.patch.object(time, "time", return_value=now)):
@@ -181,9 +206,168 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(build.pid, 710001)
                     self.assertEqual(build.folder, "/Users/nate/mac clone")
                     self.assertEqual(build.started_at, now - seconds)
+                    self.assertEqual(build.stage, queue_view.MacTesting(710002))
+                    self.assertEqual(build.resident_bytes, 1048576)
+                    self.assertEqual(build.jobs, 4)
+                    self.assertEqual(queue_view.mac_step_name(build), "hana nextest")
 
 
 
+
+    def test_mac_reader_finds_all_three_tile_runs_and_their_counters(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            binary = fixture.root / "bin"
+            binary.mkdir()
+            born = int(time.mktime(time.strptime("Thu Nov 12 18:00:00 2026", "%a %b %d %H:%M:%S %Y")))
+            stamp = "Thu Nov 12 18:00:00 2026"
+            records = fixture.root / "captures" / "501"
+            (records / "state/pids").mkdir(parents=True)
+            folders = [fixture.root / "native" / "trunk-p172", fixture.root / "mirror" / "hana",
+                       fixture.root / "mirror" / "cargo-liner"]
+            for index, (pid, folder, done, total) in enumerate(zip((100, 200, 300), folders, (604, 647, 983), (1000,) * 3, strict=True)):
+                folder.mkdir(parents=True)
+                _ = (folder / ".copy-record.json").write_text(json.dumps({
+                    "owner": "trunk" if index == 0 else "mirror-unit",
+                    "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
+                if index == 0:
+                    _ = (folder / "Cargo.toml").write_text(
+                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                generation = f"fixture-{pid}"
+                log = f"run-{generation}-{pid}.log"
+                arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]
+                fields = ["cargo-tile-v3", generation, "fixture-boot", str(born), log, str(folder),
+                          str(fixture.root), str(len(arguments)), *arguments]
+                _ = (records / "state/pids" / f"{pid}.{generation}").write_bytes("\0".join([*fields, ""]).encode())
+                _ = (records / log).write_text(f"\rBuilding [==> ] {done}/{total}: fixture\r")
+            # The nested cargo and the compiler stay in their parent's row.
+            process_rows = [f"{pid} 1 501 100 01:00 {stamp} /bin/cargo" for pid in (100, 200, 300)]
+            process_rows += [f"201 200 501 200 00:59 {stamp} /bin/cargo",
+                             f"202 201 501 300 00:58 {stamp} /bin/rustc"]
+            scripts = {
+                "sysctl": "printf 'fixture-boot\\n'",
+                "git": "exit 1",
+                "lsof": "exit 1",
+                "ps": "case \"$*\" in *comm=*) cat <<'ROWS'\n" + "\n".join(process_rows) + "\nROWS\n;;\n*) cat <<'ROWS'\n" +
+                      "\n".join(f"{pid} /bin/cargo nextest run" for pid in (100, 200, 201, 300)) + "\n202 /bin/rustc\nROWS\n;;\nesac",
+            }
+            for name, body in scripts.items():
+                path = binary / name
+                _ = path.write_text("#!/bin/sh\n" + body + "\n")
+                path.chmod(0o755)
+            script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
+                f"CAPTURE_ROOT = Path({str(records.parent)!r})")
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            self.assertEqual([row["pid"] for row in rows], [100, 200, 300])
+            self.assertEqual([row["resident_bytes"] for row in rows], [100 * 1024, 600 * 1024, 100 * 1024])
+            self.assertEqual([row["recorded_unit"] for row in rows], ["trunk", "mirror-unit", "mirror-unit"])
+            self.assertEqual([row["repository"] for row in rows], ["hana", "hana", "cargo-liner"])
+            self.assertEqual(queue_view.mac_command_jobs(str(rows[1]["command"])), 12)
+            percentages: list[float] = []
+            for row in rows:
+                counter = progress_profile.parse_progress(str(row["progress_tail"]))
+                assert isinstance(counter, progress_profile.ProgressCounter)
+                percentages.append(counter.percent)
+            self.assertEqual(percentages, [60.4, 64.7, 98.3])
+            # A reused PID cannot supply the old capture's folder or counter.
+            stale = records / "state/pids/100.fixture-100"
+            _ = stale.write_bytes(stale.read_bytes().replace(str(born).encode(), str(born - 1).encode()))
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            self.assertEqual([row["pid"] for row in rows], [200, 300])
+
+    def test_mac_reader_finds_tests_in_the_selected_target_directory(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            binary = fixture.root / "bin"
+            binary.mkdir()
+            folder = fixture.root / "project"
+            (folder / ".cargo").mkdir(parents=True)
+            _ = (folder / "Cargo.toml").write_text('[workspace]\n')
+            config = folder / ".cargo/config.toml"
+            (folder / "linked-output").symlink_to(folder / "out space", target_is_directory=True)
+            cases: list[tuple[str, list[str], dict[str, str], str, str, bool, bool]] = [
+                ("default", [], {}, "", "target/debug/deps/test_binary", False, True),
+                ("argument", ["--target-dir", "out space"], {"CARGO_TARGET_DIR": "wrong"}, "", "out space/debug/deps/test_binary", False, True),
+                ("equals", ["--target-dir=out space"], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("symlink", ["--target-dir", "linked-output"], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("environment", [], {"CARGO_TARGET_DIR": "out space"}, "", "out space/debug/deps/test_binary", False, True),
+                ("build environment", [], {"CARGO_BUILD_TARGET_DIR": "out space"}, "", "out space/debug/deps/test_binary", False, True),
+                ("configuration", [], {}, "out space", "out space/debug/deps/test_binary", False, True),
+                ("CLI configuration", ["--config", 'build.target-dir="out space"'], {}, "", "out space/debug/deps/test_binary", False, True),
+                ("compiler observation", [], {}, "", "out space/debug/deps/test_binary", True, True),
+                ("unrelated directory", ["--target-dir", "out space"], {}, "", "other/debug/deps/test_binary", False, False),
+                ("directory prefix", ["--target-dir", "out space"], {}, "", "out space-other/debug/deps/test_binary", False, False),
+                ("build script", ["--target-dir", "out space"], {}, "", "out space/debug/deps/build-script-build", False, False),
+            ]
+            for name, arguments, environment, configured, executable, compiler, testing in cases:
+                with self.subTest(source=name):
+                    config.unlink(missing_ok=True)
+                    if configured:
+                        _ = config.write_text('[build]\ntarget-dir = ' + json.dumps(configured) + '\n')
+                    stamp = "Thu Nov 12 18:00:00 2026"
+                    process_rows = [f"100 1 501 100 01:00 {stamp} /bin/cargo",
+                                    f"101 100 501 100 01:00 {stamp} {folder / executable}"]
+                    commands = ["100 " + shlex.join(["cargo", "test", *arguments]), f"101 {folder / executable}"]
+                    if compiler:
+                        process_rows.append(f"102 100 501 100 01:00 {stamp} /bin/rustc")
+                        commands.append("102 " + shlex.join(["rustc", "--crate-name", "hana_tests", "--out-dir",
+                                                            str(folder / executable).rsplit("/", 1)[0]]))
+                    scripts = {
+                        "sysctl": "exit 1",
+                        "git": "exit 1",
+                        "lsof": "cat <<'ROWS'\np100\nn" + str(folder) + "\nROWS",
+                        "ps": "case \"$*\" in *comm=*) cat <<'ROWS'\n" + "\n".join(process_rows) + "\nROWS\n;;\n*) cat <<'ROWS'\n" + "\n".join(commands) + "\nROWS\n;;\nesac",
+                    }
+                    for program, body in scripts.items():
+                        path = binary / program
+                        _ = path.write_text("#!/bin/sh\n" + body + "\n")
+                        path.chmod(0o755)
+                    environment = {"HOME": str(fixture.root), **environment}
+                    # The kernel buffer contains argv, then environment fields.
+                    data = struct.pack("i", 3) + b"/bin/cargo\0\0cargo\0test\0CARGO_TARGET_DIR=not-an-environment-field\0"
+                    data += b"\0".join(os.fsencode(key + "=" + value) for key, value in environment.items())
+                    data += b"\0TOKEN=not-public\0\0"
+                    script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
+                        f"CAPTURE_ROOT = Path({str(fixture.root / 'captures')!r})")
+                    script = script.replace("print(json.dumps(read_builds()))",
+                        f"assert cargo_environment({data!r}) == {environment!r}\n"
+                        + f"process_environment = lambda pid: cargo_environment({data!r})\nprint(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
+                        env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertNotIn("not-public", result.stdout)
+                    rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    row, = rows
+                    self.assertEqual(row["test_pid"], 101 if testing else 0)
+                    row["counter"] = {}
+                    build = queue_view.mac_build_from_record(row)
+                    self.assertIsInstance(build.stage, queue_view.MacTesting if testing else queue_view.MacBuilding)
+
+    def test_mac_command_jobs_requires_a_recorded_positive_value(self) -> None:
+        for command in ("cargo nextest run -j8", "cargo build -j 8", "cargo test --jobs=8", "cargo check --jobs 8"):
+            self.assertEqual(queue_view.mac_command_jobs(command), 8)
+        for command in ("cargo test", "cargo build --jobs=0", "cargo test --jobs=-1"):
+            self.assertIsInstance(queue_view.mac_command_jobs(command), queue_view.MacJobsUnavailable)
+
+    def test_mac_reader_logs_raw_errors_without_publishing_them(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            _ = (fixture.root / "mac_test.conf").write_text("host=fixture\n# range: 5e-324..\nconnect_timeout_s=2\nmirror_root=~/.local/state/mac-test/mirror\n")
+            path = fixture.root / "mac-builds.json"
+            _ = path.write_text('{"read_at":0,"builds":[],"error":""}')
+            result = subprocess.CompletedProcess(["ssh"], 0, stdout="rc=0\n", stderr="awk: private raw error")
+            with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
+                  mock.patch.object(subprocess, "run", return_value=result) as run,
+                  self.assertLogs(queue_view.__name__, level="WARNING") as logs):
+                queue_view.refresh_mac_builds()
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("private raw error", str(logs.output))
+            self.assertNotIn("private raw error", path.read_text())
 
     def test_native_mac_rows_show_the_folder_without_local_memory(self) -> None:
         with QueueFixture(captured=False) as fixture:

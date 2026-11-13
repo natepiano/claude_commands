@@ -511,7 +511,13 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               "header", slot, role], env, check=False)
     previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(recorded))
     with log.open("a") as output:
+        offset = output.tell()
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
+    with log.open() as output:
+        _ = output.seek(offset)
+        for line in output:
+            if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
+                print(line, end="")
     selected = progress_history.launch_slot(run, slot, launcher)
     passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
     if selected != slot:

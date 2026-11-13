@@ -730,7 +730,7 @@ route_test
         root = self.fixture.root
         settings = root / "linux-box.conf"
         _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n",
-                                 template="aws_target")
+                                 template="mac_test")
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
             + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n")
