@@ -255,7 +255,8 @@ Each local Promote checkout must exist before the command pushes.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
      A shrink allows only the plan doc and `<plan stem>-next.md`.
-     An as-built commit allows only Markdown paths and must change or delete the plan.
+     An as-built commit allows only Markdown paths and must change or delete `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
+     The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
