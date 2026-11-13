@@ -140,8 +140,11 @@ The [messaging contract](session-roster.md) defines peer lookup and delivery out
 `change_review.change_queue(path, scope, below=False) -> ChangeQueue` supplies both `/next change` and `change_review.py show`.
 `ChangeQueue` carries the pin name and ordered entries.
 Scoped lookup includes earlier production lists and routes their rows through current staff ownership.
-Current-list rows retain plain ids. Other lists qualify their ids, such as `sdlc/C9`.
-Their prerequisites receive the same qualification.
+Displayed IDs use the responsible showrunner, such as `sdlc/C9`, through the page's shared staff resolver.
+The queue retains plain keys for current-list rows and list-qualified keys for other rows.
+Prerequisites retain that list qualification.
+Row commands accept both displayed IDs and existing list-based IDs.
+An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.
