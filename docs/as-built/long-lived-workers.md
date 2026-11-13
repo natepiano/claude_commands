@@ -23,7 +23,8 @@ A later assignment resumes the same conversation when the worker remains availab
 Codex code review uses read-only review workers.
 The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
-A failed compaction prints one error line, and the dispatch continues without compaction.
+A compaction must write its transcript record within `WORKER_COMPACT_SECONDS`.
+A failed compaction prints one error line, and the dispatch sends no prompt.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.
 

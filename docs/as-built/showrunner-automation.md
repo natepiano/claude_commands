@@ -255,7 +255,8 @@ Each local Promote checkout must exist before the command pushes.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
      A shrink allows only the plan doc and `<plan stem>-next.md`.
-     An as-built commit allows only Markdown paths and must change or delete the plan.
+     An as-built commit allows only Markdown paths and must change or delete `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
+     The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
@@ -307,6 +308,8 @@ Each local Promote checkout must exist before the command pushes.
   A merge message can carry only invisible lines.
   The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
+  A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
+  Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
   The merge gates retain their staff reads before publication.
 
@@ -321,7 +324,8 @@ Each local Promote checkout must exist before the command pushes.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
-  The count and row writer use this same selection.
+  The count includes only selected commits with review lines that parse.
+  The row writer uses the same selection and reads its visible lines.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
@@ -616,23 +620,32 @@ Saved progress state uses the fixed staff reference instead of a copied session 
 - **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
-  The command prints one row per production staff unit.
+  Each table prints one row per production staff unit.
   Without `--production`, `showrunners.own_name()` selects the production name.
   `read_production(name)` reads the document from that showrunner's staff row.
   A missing owner or document exits 1.
   Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
   All cells escape pipes.
-  Both tables use `display_cells.fitted(headers, rows, *, cuttable, columns)` before escaping cells.
-  `cuttable` contains original column indexes in cut order, so equal header text does not change the selected columns.
+  The phase tables and the style table use `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
+  `cuttable` contains original column indexes, so equal header text does not change the selected columns.
+  `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
   The helper omits columns whose cells are all `—`; a table without rows keeps its columns.
-  Both callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
+  The callers read `units_table_columns` from `config/production.conf` at use; the default is 170.
   The helper measures display columns with `terminal_cells.terminal_width` and allows four columns for the terminal margin.
   Row width is `1 + sum(width + 3)`, with each width at least three columns.
-  The helper cuts text in the specified order until the rows fit or each cuttable column reaches its header width.
+  The helper cuts text until the rows fit or each cuttable column reaches its header width.
+  `LISTED` cuts columns in the listed order.
+  `WIDEST_FIRST` cuts the widest cuttable column by one character per step and uses the listed order for equal widths.
   A cut adds `…` and never splits a wide character.
   Fixed columns and minimum text widths can exceed a smaller configured width.
   The command reads terminal metadata, never pane contents.
-  - **Status and anomalies:** Both tables derive Status through the shared session classifier and the staff hold fields.
+  - **One read per command:** `unit_phases.main` takes one `staff.snapshot()` and opens `plan_history.history_snapshot(snapshot)` inside `herdr.observation_snapshot()`.
+    Inside that scope, `plan_history.staff_record()`, `run_starts()` and `read_run_events(path)` return the shared staff record, run headers and run events.
+    Each run file is read once per command.
+    The live-unit reader thread runs `live_units.read_units(name, record=snapshot, ...)` through `copy_context().run`, so it uses the same snapshot.
+    A thread started without `copy_context()` does not see the snapshot and reads everything again.
+    On natedev, `--production sdlc` prints in about 2 seconds.
+  - **Status and anomalies:** The phase status table and the style table derive Status through the shared classifier and staff hold fields.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
@@ -665,19 +678,23 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** `| Unit | Status | Progress | Phase | Notes | ETA Next | ETA Plan | Workers | Non-Phase Work | Queued |`.
+  - **Phase productions:** The command prints two tables in the same unit order.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
+    The work table prints `| Unit | Notes | Workers | Non-Phase Work | Queued |`.
+    Workers uses the configured display name.
     ETA Plan appears only when at least one row has unfinished plan phases.
     Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
     A live Claude or Codex pane supplies live evidence.
-    Both tables add a **Machine** column after **Status** only when a row runs on another machine.
+    The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
     `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
     `worker.py list --json` keeps its existing fields.
-    Both tables sort unit names without case distinctions before they select their rows.
+    The phase tables and the style table sort unit names without case distinctions before they select their rows.
     Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
     Plans above 20 phases use 20 equal groups, with open before not started before done.
     The bar has no text cut, and all three characters use the same display width.
-    When the table keeps Progress, it adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+    When the status table keeps Progress, it adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`.
+    A blank line separates the work table from the legend or the status table.
     `progress_cell` and `progress_legend` use the same `ProgressState` constants for the squares and labels.
     A table with no Progress bar in any row has no legend; the style table also has no legend.
     Phase shows `<done>/<total>` from the same phase rows, or `—` with no phases.
@@ -685,12 +702,16 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
     Notes first limits text to 80 characters and ends longer text with `…`.
-    The table then cuts Queued, Non-Phase Work, Workers, and Notes, in that order, to fit the width.
-    Notes keeps its text while another cuttable column can shrink.
+    Each phase table calls `display_cells.fitted` separately with `units_table_columns`.
+    Each table removes columns whose cells are all `—`.
+    The status table has no cuttable column.
+    The work table uses `CutOrder.WIDEST_FIRST` only when that table exceeds the width.
+    It cuts the widest cuttable column by one character per step.
+    Equal widths use this cut order: Queued, Non-Phase Work, Workers, Notes.
     Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
-    The fallback does not change Non-Phase Work or Queued.
+    The fallback does not change Queued.
     A finished newest run supplies no fallback.
     ETA Next uses the open plan phase's latest promise from `eta_trail`, never `schedule_end`.
     Otherwise, it uses the newest open phase outside the plan, then the next not-started plan phase with a promise.
@@ -705,7 +726,12 @@ Saved progress state uses the fixed staff reference instead of a copied session 
     The command reads panes once for the displayed units and their workers.
     It shares one lazy process snapshot and reads no CPU totals or log tails.
     Non-Phase Work uses the unit's newest unfinished run and shows open phases absent from the configured plan.
+    It excludes each open phase whose id matches the phase that Notes names in the same row.
+    It shows `—` when no phase remains.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    It excludes each queue item whose text equals Notes in the same row.
+    Its queue count includes only remaining items.
+    With no remaining queue item, it shows the plan part or `—`.
     Each item or title uses an 80-character limit; counts remain after the cut.
     A configured plan with phases takes priority over the newest run's plan.
     The fallback plan path resolves against the staff worktree.
