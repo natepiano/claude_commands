@@ -63,6 +63,7 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
 .lbl.hide { opacity: 0; }
+.lbl.tight { padding: 1px 2px; font-size: 0.75rem; }
 .legend-box { margin-top: 12px; }
 .legend-box > summary .chev { display: block; width: 14px; height: 14px; font-size: 0; position: relative; top: 1px; }
 .legend-box > summary .chev::before { content: ""; position: absolute; left: 4px; top: 3px; border-left: 6px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
@@ -1117,7 +1118,9 @@ function fitLabels() {
   $("marklabel").style.left = `${at}px`;
   for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram", "agents_swap", "agents", "desktop"]) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
-    lbl.classList.toggle("hide", lbl.offsetWidth + 6 > seg.clientWidth);
+    lbl.classList.remove("tight");
+    if (lbl.offsetWidth + 6 > seg.clientWidth) lbl.classList.add("tight");
+    lbl.classList.toggle("hide", lbl.offsetWidth + 2 > seg.clientWidth);
   }
 }
 window.addEventListener("resize", fitLabels);
