@@ -267,11 +267,23 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
             usage = rollouts.token_usage(record)
             if usage is not None:
                 tokens = usage.uncached_input + usage.cached_input + usage.output
+        offset = stream.tell()
     if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS"):
         _agent_command(client, current, "compact")
         ended = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
         if isinstance(ended, herdr.WaitTimedOut):
             raise herdr_types.HerdrFailure("compaction did not finish before the settle bound", "timeout")
+        source = worker_admission.transcript_source(current.row, backend)
+        with open_transcript(source) as stream:
+            _ = stream.seek(offset)
+            for line in stream:
+                if not line.endswith(b"\n"):
+                    break
+                record = rollouts.decode_rollout(line.decode("utf-8"))
+                if record is not None and (rollouts.is_compaction(record)
+                        or rollouts.payload_of(record).get("type") == "task_started"):
+                    return
+        raise herdr_types.HerdrFailure("compaction has no transcript proof", "not_submitted")
 
 
 def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCode:
@@ -516,9 +528,16 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         return ExitCode.BUSY
     try:
         _compact_before_dispatch(client, current)
-    except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         reason = " ".join(str(error).splitlines())
-        print(f"{current.row.name}: compaction failed: {reason}; prompt is sent without compaction", file=sys.stderr)
+        try:
+            composer = client.composer(current.pane)
+            if isinstance(composer, herdr.ComposerInput) and composer.text.strip() == "/compact":
+                client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
+            reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
+        print(f"{current.row.name}: compaction failed: {reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
