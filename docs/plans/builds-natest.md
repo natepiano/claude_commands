@@ -3883,14 +3883,15 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 258 — The accounts tests check the same behavior with fewer tests  · status: todo
-**Depends on:** none
+### Phase 258 — The accounts tests use less CPU through fewer tests  · status: todo
+**Depends on:** Phase 257
+**Blocked by:** accounts change 5827e6dc7 on main — builds gave the go 2026-11-13 and says when it lands; then start from main.
 
 #### Work Order
 
-**Goal:** `accounts/test_accounts.py` has fewer tests, and every behavior check stays.
+**Goal:** `accounts/test_accounts.py` uses less CPU in aws pairs, through folded and removed tests; every behavior check stays.
 
-**Decision:** count phase. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. This module has the most tests (488).
+**Decision:** count phase. The prize is aws CPU (user 2026-11-13): fold or remove a test only where it cuts setup or run CPU. User 2026-11-13 objects to 18,000 tests (gate count 18,229 -> 18,925 in one day). sdlc 2026-11-13 approved count phases for modules that sdlc units own: fold and remove; the term is "every behavior check stays". sdlc refused a land gate count line. This module has the most tests (488).
 
 **Spec:**
 1. List groups of tests with the same setup and the same result under test. Fold each group into one table test with `subTest`, one row for each old check. Keep each old assertion as a row assertion.
@@ -3910,7 +3911,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - sdlc count-phase terms: every behavior check stays; name each covering test; builds decides the order.
 
 **Acceptance gate:**
-- Fewer tests; every old check maps to a row or a named covering test.
+- aws pairs (3 rounds) show a CPU gain; peak memory reported.
+- Every old check maps to a row or a named covering test.
 - The module passes three times; basedpyright 0 errors and 0 warnings.
-- aws pairs show no CPU loss.
 
