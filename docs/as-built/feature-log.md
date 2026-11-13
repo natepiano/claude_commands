@@ -222,7 +222,14 @@ Release refusals, each checked before any write:
 | `add`/`supersede --review ROW` | lands with the saved arguments, the saved `completed` included; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
 
-A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
+A feature-log review ID uses `A<n>` or `C<n>` on hana's list.
+Other lists use `<list>/C<n>`, where `<list>` comes from `change-review - <list>.md`, such as `natedev/C3`.
+Each list numbers its rows from 1.
+The qualifier separates equal row numbers in different lists.
+The proposal path is `proposals/<list>/<ROW>.json`.
+`propose` refuses a bare row for projects other than hana.
+`add`, `supersede`, and `drop` use the ID that `propose` saved.
+These stored IDs remain valid when the review page or `/next` displays the responsible showrunner, such as `sdlc/C3`.
 
 A verb that differs from the proposal's fails and names the right verb. `propose` also requires every `--old` note to exist and be live.
 
