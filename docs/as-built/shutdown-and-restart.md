@@ -447,7 +447,17 @@ If a stop includes the caller, restart continues in a detached process before th
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
 A stop checks the current conversation before it sends a signal.
-A failed row prints one anomaly line. Other rows continue.
+A failed row does not stop other rows.
+After the start pool finishes, restart reads each failed unit director or showrunner conversation again.
+If the read proves that the conversation stopped, restart retries that start once with the same arguments.
+A successful retry prints only `<name>: down; started`.
+If the row becomes live before the retry launches it, the retry prints only `<name>: unchanged`.
+A second failure prints `<name>: down: <reason>` on stdout and keeps the row pending.
+An error without text uses its type name as the reason.
+A live or unknown conversation keeps the existing anomaly line and gets no retry.
+Trust-write failures and row-lock refusals keep their existing behavior without a retry.
+An unreadable native identity in a retained pane excludes that pane from placement candidates.
+It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.

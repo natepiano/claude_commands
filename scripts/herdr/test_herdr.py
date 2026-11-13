@@ -6850,6 +6850,34 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_launch_ignores_an_unreadable_identity_in_another_rows_retained_pane(self) -> None:
+        owner = unit_membership("natedev", "report")
+        _ = unit_membership("natedev", "accounts")
+        client = LayoutHerdr()
+        pane = client.open_tab("natedev", owner.name, str(self.root), {})
+        tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+        _ = tab.pop("session_id")
+        entry = pane_launch.launch(pane, owner.current_session, str(self.root), {}, ["claude"])
+        pane_launch.save(pane_launch.record_directory() / "fixture.json", {pane: entry})
+        record = staff.initial_snapshot()
+        with herdr.pane_evidence_run():
+            panes = client.listed("pane")
+            cached = client.scan_row_panes(record, panes)
+            self.assertEqual(cached, herdr.RowPaneScan({}, []))
+            tab["session_id"] = owner.current_session
+            with (patch.object(herdr, "pane_native_process",
+                               side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
+                  patch.object(client, "run_in_pane"),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
+                result = herdr.launch_prepared_agent("fixture", herdr.NewTab("natedev", "accounts"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(),
+                    5000, agent="accounts", client=client)
+                self.assertGreater(decoded.call_count, 0)
+                started.assert_called_once()
+        self.assertNotEqual(result.pane, pane)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        self.assertIn(tab, client.tabs)
+
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()
         cases: tuple[tuple[staff.Kind, str, str], ...] = (
