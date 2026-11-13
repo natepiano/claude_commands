@@ -74,6 +74,10 @@ It uses no current-role fallback from the role history.
 Resume messages use these settings to construct `assign.sh` commands.
 `write_review_turn` owns review-turn records.
 
+Supplier lookup resolves a staff member reference or an explicit native id.
+It joins the selected row's `current_session` to a live native registry record.
+Registry names and former names do not select suppliers.
+
 Schema version 1 records these event types:
 
 - `run_started` / `run_finished`
