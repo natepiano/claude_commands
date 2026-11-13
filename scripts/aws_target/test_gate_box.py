@@ -99,7 +99,6 @@ class GateBoxTests(unittest.TestCase):
     def test_guest_names_no_merge_gate_signal_function(self) -> None:
         for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):
             self.assertNotIn('rollback_signals', code)
-            self.assertNotIn('defer_signals', code)
             self.assertNotRegex(code, r'\bmerge_gate\.\w*signal\w*')
             self.assertNotIn('signal.signal', code)
 

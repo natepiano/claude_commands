@@ -3,7 +3,8 @@
 
 Start writes a run record and returns after it starts the supervisor.
 The supervisor runs the command and delivers its result to the current worker.
-Reap delivers results for records whose supervisor disappeared.
+Reap finishes records whose supervisor disappeared and delivers their results.
+Stop a run through its supervisor's process group, including scoped commands.
 Exit 3 means that no registered worker owns the caller.
 """
 
@@ -31,13 +32,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
@@ -61,7 +62,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR as DETACHED_RUNS_DIR, DETACHED_RUN_START_GRACE_SECS
-FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in builds-detached.slice, a child of builds.slice.
 # The parent slice's memory limit and CPU weight also apply to the detached command.
 # The scope writes the marker before the command starts.
@@ -643,22 +643,16 @@ def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
-    """Run the command with its output appended to the log, forward signals to it, and return its status."""
+    """Run the command in the supervisor's process group and return its status."""
     try:
         with log.open("ab") as output:
-            child = subprocess.Popen(command, env=environment,
+            child = subprocess.Popen(command, env=environment, process_group=os.getpgrp(),
                                      stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
             _ = output.write(f"detached_runs: command did not start: {exc}\n")
         return 127
 
-    def forward(signum: int, _frame: FrameType | None) -> None:
-        with contextlib.suppress(OSError):
-            child.send_signal(signum)
-
-    for forwarded in FORWARDED_SIGNALS:
-        _ = signal.signal(forwarded, forward)
     return _exit_status(child.wait())
 
 
@@ -742,4 +736,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["supervise"]:
+        for number in CANCELLATION_SIGNALS:
+            _ = signal.signal(number, signal.SIG_DFL)
     sys.exit(main())

@@ -4074,7 +4074,7 @@ verify_cleanup() {
 trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; final_pass_finish "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
 verify_interrupted() {
     trap - EXIT
-    # The supervisor can forward a signal that this group already received.
+    # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))

@@ -577,6 +577,10 @@ Detached command results use `detached_runs.deliver` and `send.deliver_worker_te
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
+The command shares the supervisor's process group, including through a systemd scope prefix.
+The supervisor installs no signal handler.
+After a group stop, the existing orphan reaper finishes the record and delivers the result.
+The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
