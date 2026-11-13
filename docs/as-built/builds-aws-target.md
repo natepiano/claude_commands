@@ -165,7 +165,19 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by size and expected cost before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after every regional variant refuses.
+A normal gate uses natedev after all capacity choices refuse.
+A confirmed Spot interruption before a final result starts another cloud attempt.
+`spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
+The retry uses the next choice in the saved launch order.
+The route keeps its cloud slot across retries.
+The route saves the interruption count and the next choice in `current.json` before each retry.
+Resume restores both values, so a crash cannot reset the retry budget.
+Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+The worker confirms cleanup of the interrupted box and reservation before the retry.
+The final natedev fallback row includes the interruption count when retries or capacity choices end.
+A complete gate failure keeps its failed result and gets no retry.
+An unconfirmed termination or another controller error retains the existing fallback behavior.
+The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
 The home stack owns the artifact bucket and the global gate role and instance profile.
