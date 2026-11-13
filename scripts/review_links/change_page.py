@@ -1006,6 +1006,11 @@ def publish_browser(initial: str = "") -> str:
     return url
 
 
+def page_url() -> str:
+    """Publish the Changes page and return its path under the review root."""
+    return urlsplit(publish_browser()).path
+
+
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "answer-question":
         parser = argparse.ArgumentParser(description="Answer an open question about a change.")
@@ -1035,7 +1040,9 @@ def main(arguments: list[str]) -> int:
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
-            print(publish_browser())
+            from scripts.review_links import console
+
+            print(console.publish())
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")
