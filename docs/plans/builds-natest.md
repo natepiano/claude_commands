@@ -3834,3 +3834,23 @@ Checkpoint 215299cb2. Changed `production_lifecycle_test_support.py` and added `
 - `showrunners.py` keeps a Python stub, because only an interpreter runs it; a wrong call still records its name.
 - `session_records_test_support.socket_path` answers the in-process `socket_for` and serves as the `SHOWRUNNERS_SESSIONS` script for process runs.
 - AWS pair (c7a.8xlarge, 3 rounds): median 29.54 → 24.55 CPU s. The rest is production `git` and `phase_table.py` starts.
+
+### Phase 260 — The repeat guard notice fixture starts lighter supervisors  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### Work Order
+
+**Goal:** `message/test_repeat_guard.py` uses less CPU in aws pairs; every behavior check stays.
+
+**Spec:**
+- Profile: 16.0 local CPU s. The notice fixture starts a supervisor, a drain and an attempt process for each run; each imported send and staff (0.38 CPU s).
+- The supervisor role runs only `repeat_guard.notice_job`, so it imports only `repeat_guard` (0.05 CPU s) and exits.
+- The drain and attempt roles keep their imports and patches.
+- Test file only.
+
+**Files:** `scripts/message/test_repeat_guard.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:** the module passes; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
