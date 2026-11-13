@@ -879,6 +879,23 @@ class TurnEndTests(unittest.TestCase):
         self.assertIn("ledger write failed", self.case.agent.notices[-1])
         self.assertEqual(len(self.case.agent.notices), 1)
 
+        with self.subTest(completion="error reply is missing"):
+            current = self.case.opened("missing-error-reply")
+            instance = progress_history.begin_dispatch(self.case.run_dir, slot=current.row.name, phase="8", role="impl",
+                worker_name=current.row.name, worker_id=current.row.id, launcher_command=["assign.sh"],
+                prompt=self.case.prompt, kind="impl", lens="")
+            missing = self.case.run_dir / "missing-error-reply.md"
+            progress_history.save_dispatch_delivery(self.case.run_dir, instance,
+                progress_history.DispatchDelivery("saved prompt", instance, str(missing)))
+            progress_history.complete_dispatch(self.case.run_dir, current.row.name, instance, status="error")
+            progress_history.save_hook_completion(self.case.run_dir, instance,
+                progress_history.HookCompletion("error", str(missing), ("error reply write failed",)))
+            turn_end.run_finished(str(current.row.current_session))
+            self.assertEqual(worker_panes.worker_pass(current.row, self.case.run_dir)["status"], "error")
+            self.assertEqual(len(self.case.agent.notices), 2)
+            self.assertIn("error reply write failed", self.case.agent.notices[-1])
+            self.assertFalse(missing.exists())
+
     def test_submission_keeps_the_held_role_until_the_hook_completes(self) -> None:
         self.case.agent.finish_after = 1
         row = self.case.opened("astra-reviewer", "astra-reviewer").row
