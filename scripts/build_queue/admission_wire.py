@@ -327,6 +327,30 @@ class PlacementRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class PlacementStatusRequest(CallerCode):
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class KnownPlacementStatus:
+    assignment: placement.PlacementAssignment
+    state: placement.AssignmentState
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim
+
+
+@dataclass(frozen=True)
+class UnknownPlacementStatus:
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class PlacementStatusReply:
+    status: KnownPlacementStatus | UnknownPlacementStatus
+
+
+@dataclass(frozen=True)
 class PrerequisiteReport(CallerCode):
     request_id: str
     episode: str
@@ -426,17 +450,17 @@ class DispatchStatus:
 
 Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
-           | PlacementRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
 Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
-         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus)
+         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _REQUESTS: dict[str, type] = {
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
-    "placement": PlacementRequest, "claim_failure": ClaimFailure,
+    "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
 }
@@ -445,9 +469,9 @@ REPLY_TYPES: dict[str, type] = {
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
-    "local_placement_granted": LocalPlacementGranted,
+    "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
                     PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 

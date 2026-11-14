@@ -10,7 +10,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -48,7 +48,8 @@ from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import admission_code, queue_snapshot, queue_view, queue_card, queue_evidence, head_facts
+from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue import admission_code, queue_snapshot, queue_view, queue_card, queue_evidence, head_facts, placement
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from scripts.build_queue.queue_lines import plain
 from zoneinfo import ZoneInfo
@@ -58,6 +59,388 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, In
 
 def setUpModule() -> None:
     forbid_real_sender()
+
+
+class PlacementStatusTests(unittest.TestCase):
+    def read_only_status(self, fixture: AdmissionFixture, assignment: placement.PlacementAssignment
+                         ) -> status_wire.KnownPlacementStatus | status_wire.UnknownPlacementStatus:
+        fields = tuple(service.ServiceState.__dataclass_fields__)
+        before = wire.encode_record({name: getattr(fixture.server, name) for name in fields})
+        files = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in fixture.state_dir.rglob("*") if path.is_file()}
+        next_pass = fixture.server.next_pass
+        with mock.patch.object(fixture.server, "persist") as persist, \
+                mock.patch.object(fixture.server, "_record_caller_version") as record_version, \
+                mock.patch.object(fixture.server, "_request_host_evidence",
+                    side_effect=AssertionError("status must not request evidence")):
+            reply, = fixture.server.handle_request(status_wire.PlacementStatusRequest(
+                assignment.episode, assignment.attempt, code_version="status-reader"))
+            self.assertEqual(fixture.server.handle_request(status_wire.PlacementStatusRequest(
+                assignment.episode, assignment.attempt)), [reply])
+            persist.assert_not_called()
+            record_version.assert_not_called()
+        self.assertEqual(wire.encode_record({name: getattr(fixture.server, name) for name in fields}), before)
+        self.assertEqual({str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in fixture.state_dir.rglob("*") if path.is_file()}, files)
+        self.assertEqual(fixture.server.next_pass, next_pass)
+        self.assertIsInstance(reply, status_wire.PlacementStatusReply)
+        assert isinstance(reply, status_wire.PlacementStatusReply)
+        return reply.status
+
+    def test_released_failed_cancelled_and_ended_local_placements_answer_closed(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
+
+        for ending in ("released", "failed", "cancelled", "run-ended"):
+            with self.subTest(ending=ending), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                request = replace(request, run=fixture.run_owner(), constraints=replace(request.constraints,
+                    candidates=(local_candidate(fixture),)))
+                granted, = fixture.connect(request).replies()
+                assert isinstance(granted, wire.LocalPlacementGranted)
+                status = self.read_only_status(fixture, granted.assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                if ending in ("released", "failed"):
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                        "local-release", granted.grant.reservation, 1 if ending == "failed" else 0)), [wire.Ok()])
+                elif ending == "cancelled":
+                    self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                        "local-cancel", request.episode, request.owner, "caller cancelled")), [wire.Ok()])
+                else:
+                    assert isinstance(request.run, wire.RunIdentity)
+                    fixture.end_run(request.run)
+                status = self.read_only_status(fixture, granted.assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertIsInstance(status.state, placement.ClosedAssignment)
+                assert isinstance(status.state, placement.ClosedAssignment)
+                self.assertTrue(status.state.reason)
+                if ending == "cancelled":
+                    self.assertEqual(status.state.reason, "cancelled")
+                replay, = fixture.server.handle_request(request)
+                assert isinstance(replay, wire.DispatchStatus)
+                self.assertEqual(replay.state, status.state)
+                with mock.patch.object(client, "placement_status", return_value=status_wire.PlacementStatusReply(status)), \
+                        redirect_stderr(io.StringIO()), io.StringIO() as output:
+                    with redirect_stdout(output):
+                        self.assertEqual(client.main(["placement-status", "--episode", request.episode,
+                            "--attempt", granted.assignment.attempt]), 1)
+                    self.assertEqual(output.getvalue().split("\t")[0], "closed")
+
+    def test_released_mac_claim_answers_closed_from_cached_evidence(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("consume-mac", assignment, claim)),
+                [wire.FirstAuthorization(assignment, claim)])
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request, claims=())
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.ClosedAssignment("provider claim released"))
+            self.assertEqual(status.claim, claim)
+            replay, = fixture.server.handle_request(consume_permission("repeat-consume-mac", assignment, claim))
+            assert isinstance(replay, wire.DispatchStatus)
+            self.assertEqual(replay.state, status.state)
+
+    def test_empty_provider_reading_keeps_a_live_holder_or_pending_start_current(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        for blocker in ("live holder", "pending start"):
+            with self.subTest(blocker=blocker), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-current", assignment, claim)),
+                    [wire.FirstAuthorization(assignment, claim)])
+                if blocker == "pending start":
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+                    identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
+                    pending = offload.pending_start_path(assignment.destination.target, identity)
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    _ = pending.write_text("pending startup\n")
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=())
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                replay, = fixture.server.handle_request(consume_permission("repeat-current", assignment, claim))
+                assert isinstance(replay, wire.DispatchStatus)
+                self.assertEqual(replay.state, placement.CurrentAssignment())
+                if blocker == "live holder":
+                    waiting, = fixture.server.handle_request(request)
+                    self.assertIsInstance(waiting, wire.PlacementWait)
+
+    def test_status_and_replay_keep_pending_terminal_reports_current(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        for outcome in (placement.AttemptCompleted(0), placement.AttemptCancelled("cancelled"),
+                placement.PrelaunchRefused("busy"), placement.AttemptDeclined("lost")):
+            with self.subTest(outcome=outcome), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-pending", assignment, claim)),
+                    [wire.FirstAuthorization(assignment, claim)])
+                holder = fixture.proc.spawn(used=0)
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                report = placement.TerminalAttemptReport(outcome,
+                    placement.DispatchPathPending("adapter cleanup remains unresolved"), fixture.clock.now())
+                fixture.server.assignments[key] = replace(saved, terminal_report=report,
+                    holder=placement.ClaimHolderIdentity(fixture.server.host, holder.pid, holder.start_time))
+                fixture.proc.kill(holder)
+                identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
+                self.assertFalse(offload.pending_start_path(assignment.destination.target, identity).exists())
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, request, claims=())
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                replay, = fixture.server.handle_request(request)
+                self.assertIsInstance(replay, wire.PlacementWait)
+                self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                self.assertEqual(fixture.server.assignments[key].terminal_report, report)
+
+    def test_a_settled_decline_waits_for_evidence_at_or_after_its_report(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("consume-declined", assignment, claim)),
+                [wire.FirstAuthorization(assignment, claim)])
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request, claims=())
+            fixture.clock.advance(1)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
+                placement.DispatchPathSettled(), fixture.clock.now())
+            fixture.server.assignments[key] = replace(fixture.server.assignments[key], terminal_report=report)
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            replay, = fixture.server.handle_request(request)
+            self.assertIsInstance(replay, wire.PlacementWait)
+            _ = publish_candidate(fixture, request, claims=())
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.ClosedAssignment("provider claim released"))
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+
+    def test_expired_empty_evidence_keeps_status_current_and_replay_waiting(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+
+        with PlacementFixture() as fixture:
+            entered, release = threading.Event(), threading.Event()
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private blocked probe")
+
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("consume-expiry", assignment, claim)),
+                [wire.FirstAuthorization(assignment, claim)])
+            holder = fixture.proc.spawn(used=0)
+            attempt = placement.attempt_key(assignment.episode, assignment.attempt)
+            fixture.server.assignments[attempt] = replace(fixture.server.assignments[attempt],
+                holder=placement.ClaimHolderIdentity(fixture.server.host, holder.pid, holder.start_time))
+            fixture.clock.advance(1)
+            evidence = publish_candidate(fixture, request, claims=())
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, records.MemoryConfig)
+            fixture.clock.advance(config.waiting_pass_seconds + conf.read("mac_test").number("probe_timeout_s") + 1)
+            self.assertIsInstance(fixture.server.host_evidence(evidence.key), placement.StaleHostEvidence)
+            fixture.proc.kill(holder)
+            fixture.server.host_probe = probe
+            try:
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                replay, = fixture.server.handle_request(request)
+                self.assertIsInstance(replay, wire.PlacementWait)
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                self.assertFalse(release.is_set())
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            finally:
+                release.set()
+
+    def test_configuration_change_keeps_status_current_and_replay_waiting(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
+
+        with PlacementFixture() as fixture:
+            entered, release = threading.Event(), threading.Event()
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the changed configuration probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private blocked probe")
+
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("consume-configuration", assignment, claim)),
+                [wire.FirstAuthorization(assignment, claim)])
+            holder = fixture.proc.spawn(used=0)
+            attempt = placement.attempt_key(assignment.episode, assignment.attempt)
+            fixture.server.assignments[attempt] = replace(fixture.server.assignments[attempt],
+                holder=placement.ClaimHolderIdentity(fixture.server.host, holder.pid, holder.start_time))
+            fixture.clock.advance(1)
+            old_evidence = publish_candidate(fixture, request, claims=())
+            settings = conf.path("mac_test")
+            _ = settings.write_text(settings.read_text() + "\n# private configuration generation\n")
+            current_key = fixture.server.host_evidence_key(request, assignment.destination)
+            self.assertNotEqual(current_key, old_evidence.key)
+            self.assertIsInstance(fixture.server.host_evidence(old_evidence.key), placement.FreshHostEvidence)
+            self.assertIsInstance(fixture.server.host_evidence(current_key), placement.HostEvidenceUnavailable)
+            fixture.proc.kill(holder)
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            self.assertEqual(fixture.server.placement_host_keys[(request.episode, assignment.destination)], old_evidence.key)
+            with mock.patch.object(fixture.server, "_request_host_evidence", return_value=old_evidence):
+                replay, = fixture.server.handle_request(request)
+                self.assertIsInstance(replay, wire.PlacementWait)
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            fixture.server.host_probe = probe
+            try:
+                replay, = fixture.server.handle_request(request)
+                self.assertIsInstance(replay, wire.PlacementWait)
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                status = self.read_only_status(fixture, assignment)
+                assert isinstance(status, status_wire.KnownPlacementStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                self.assertFalse(release.is_set())
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+            finally:
+                release.set()
+
+    def test_released_local_placement_requests_no_evidence_and_keeps_no_subscription(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
+
+        with PlacementFixture() as fixture:
+            entered, release = threading.Event(), threading.Event()
+            fixture.server.background_local_evidence = True
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the local probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private blocked local probe")
+
+            fixture.server.host_probe = probe
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            try:
+                waiting, = fixture.server.handle_request(request)
+                self.assertIsInstance(waiting, wire.PlacementWait)
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                key, = fixture.server.host_readers
+                worker = fixture.server.host_readers[key].worker
+                with worker.lock:
+                    self.assertIn(key, worker.subscriptions)
+                fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                    key, fixture.clock.now(), "", placement.AllowedHost()))
+                granted, = fixture.server.handle_request(request)
+                assert isinstance(granted, wire.LocalPlacementGranted)
+                with mock.patch.object(fixture.server, "_request_host_evidence",
+                        side_effect=AssertionError("a released local placement must not request evidence")) as request_evidence:
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                        "release-local-subscription", granted.grant.reservation, 0)), [wire.Ok()])
+                    _ = fixture.run_pass()
+                    request_evidence.assert_not_called()
+                self.assertNotIn(key, fixture.server.host_readers)
+                self.assertNotIn(key, fixture.server.host_requests)
+                self.assertNotIn(key, fixture.server.host_observations)
+                self.assertNotIn(key, fixture.server.placement_host_keys.values())
+                with worker.lock:
+                    self.assertNotIn(key, worker.subscriptions)
+                    self.assertNotIn(key, worker.due)
+            finally:
+                release.set()
+
+    def test_saved_attempt_status_is_read_only_for_current_closed_and_unknown(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            for state in (placement.CurrentAssignment(), placement.ClosedAssignment("source changed")):
+                for provider in (placement.NoProviderClaim(), claim):
+                    with self.subTest(state=state, provider=provider):
+                        saved = records.SavedPlacementAssignment(assignment, state,
+                            placement.PermissionConsumed(fixture.clock.now()), provider)
+                        fixture.server.assignments[key] = saved
+                        fixture.server.current_assignments[assignment.episode] = key
+                        fixture.server.persist()
+                        fields = tuple(service.ServiceState.__dataclass_fields__)
+                        before = wire.encode_record({name: getattr(fixture.server, name) for name in fields})
+                        files = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                            for path in fixture.state_dir.rglob("*") if path.is_file()}
+                        peer, other = socket.socketpair()
+                        with peer, other, mock.patch.object(fixture.server, "persist") as persist, \
+                                mock.patch.object(fixture.server, "_record_caller_version") as record_version:
+                            connection = service.Connection(peer)
+                            for episode, attempt in ((assignment.episode, assignment.attempt),
+                                    (assignment.episode, "unknown-attempt"), ("unknown-episode", assignment.attempt)):
+                                reply, = fixture.server.handle_request(status_wire.PlacementStatusRequest(
+                                    episode, attempt, code_version="new-caller"), connection)
+                                expected = (status_wire.KnownPlacementStatus(assignment, state, provider)
+                                    if (episode, attempt) == (assignment.episode, assignment.attempt) else
+                                    status_wire.UnknownPlacementStatus(episode, attempt))
+                                self.assertEqual(reply, status_wire.PlacementStatusReply(expected))
+                            persist.assert_not_called()
+                            record_version.assert_not_called()
+                        self.assertEqual(wire.encode_record({name: getattr(fixture.server, name) for name in fields}), before)
+                        self.assertEqual({str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                            for path in fixture.state_dir.rglob("*") if path.is_file()}, files)
 
 
 class ImportTests(unittest.TestCase):

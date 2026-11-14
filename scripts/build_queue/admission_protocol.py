@@ -95,6 +95,7 @@ from scripts.build_queue.admission_wire import (
     CLEANUP_STATUS_MAX as CLEANUP_STATUS_MAX,
     CLEANUP_REQUEST_MAX_BYTES as CLEANUP_REQUEST_MAX_BYTES,
     Request as Request,
+    Reply as WireReply,
     admission_socket_path as admission_socket_path,
     encode_record as encode_record,
     parse_record as parse_record,
@@ -150,8 +151,7 @@ class MineReply:
 
 
 
-Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
-         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus)
+Reply = WireReply | ViewReply | ExplainReply | MineReply
 
 _REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 

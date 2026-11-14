@@ -28,6 +28,32 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Placement status
+
+`PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.
+`PlacementStatusReply` contains a `KnownPlacementStatus` or an `UnknownPlacementStatus`.
+A known status includes the assignment, its current or closed state, and its provider claim reference or `NoProviderClaim`.
+The assignment identifies the destination target, owner, and session.
+A closed state includes its reason.
+An unknown status means the service has no saved assignment for that episode and attempt.
+
+Run `admission_client.py placement-status --episode E --attempt A` for one tab-separated line.
+The fields are state, target, owner, session, claim ID, and reason.
+The owner uses `host:pid:start_time`.
+Absent fields use `-`.
+The command returns 0 for current, 1 for closed or unknown, and 2 for an unreachable service.
+The check grants no permission and records no caller version.
+The status and replay paths share the same placement lifetime check.
+An ended local reservation or run returns closed even when its saved assignment still says current.
+Without a terminal report, claim release requires a later provider reading, an ended holder, and no pending start.
+A pending dispatch report keeps the placement current even after an empty provider reading.
+A settled decline requires provider evidence at or after the report time.
+The status check uses cached provider evidence and starts no probe.
+Status and settlement apply the same evidence expiry check.
+Both paths compute the evidence key from the submitted request and current configuration.
+Settlement schedules the probe before it reads the shared evidence result.
+Local placements release their reader subscriptions when their reservations end.
+
 ### Cloud gates
 
 `AdmitRequest.place` defaults to `LocalPlace()`.

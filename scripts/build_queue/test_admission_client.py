@@ -49,6 +49,45 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_placement_status_cli_reads_current_closed_and_unknown_over_the_socket(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            cases = ((placement.CurrentAssignment(), claim, "current", 0, "claim-a", "-"),
+                (placement.CurrentAssignment(), placement.NoProviderClaim(), "current", 0, "-", "-"),
+                (placement.ClosedAssignment("source changed"), claim, "closed", 1, "claim-a", "source changed"))
+            for state, provider, word, code, claim_id, reason in cases:
+                with self.subTest(state=state), fixture.loop_turn():
+                    fixture.server.assignments[key] = records.SavedPlacementAssignment(assignment, state, provider=provider)
+                with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(["placement-status", "--episode", assignment.episode,
+                        "--attempt", assignment.attempt]), code)
+                owner = assignment.owner
+                self.assertEqual(output.getvalue(), f"{word}\tmac\t{owner.host}:{owner.pid}:{owner.start_time}"
+                    + f"\tsubmitting-session\t{claim_id}\t{reason}\n")
+            with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(client.main(["placement-status", "--episode", assignment.episode,
+                    "--attempt", "unseen"]), 1)
+                self.assertEqual(client.placement_status("unseen", "unseen"),
+                    status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("unseen", "unseen")))
+            self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+
+    def test_placement_status_cli_returns_two_when_the_service_is_unreachable(self) -> None:
+        with AdmissionFixture() as fixture, mock.patch.dict(os.environ,
+                {"ADMISSION_SOCKET": str(fixture.socket_dir / "missing.sock")}), \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(client.main(["placement-status", "--episode", "episode-a", "--attempt", "attempt-a"]), 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("admission service unavailable: no socket", errors.getvalue())
+
     def test_cancel_placement_cli_removes_the_queued_episode(self) -> None:
         from scripts.build_hold.owning_session import NoOwningSession
         from scripts.build_queue import placement

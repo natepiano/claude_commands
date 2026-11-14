@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
 import uuid
 
 from scripts.build_queue import admission_code, placement, snapshot_codec
+from scripts.build_queue import admission_wire as status_wire
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
 if TYPE_CHECKING:
@@ -113,7 +114,7 @@ def _is_placement_control(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _is_placement_control(request):
         reply = _call(request, lambda _wait: None)
@@ -142,6 +143,33 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         raise wire.AdmissionUnavailable(f"no answer in {timeout:g} s") from error
     except (OSError, ValueError) as error:
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
+
+
+def placement_status(episode: str, attempt: str) -> status_wire.PlacementStatusReply:
+    """Read a saved attempt without requesting authorization."""
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt))
+    if isinstance(reply, status_wire.PlacementStatusReply):
+        return reply
+    raise wire.AdmissionUnavailable("invalid placement status answer")
+
+
+def _print_placement_status(episode: str, attempt: str) -> int:
+    status = placement_status(episode, attempt).status
+    if isinstance(status, status_wire.UnknownPlacementStatus):
+        print("unknown\t-\t-\t-\t-\t-")
+        return 1
+    from scripts.build_hold.owning_session import OwningSession
+
+    assignment = status.assignment
+    current = isinstance(status.state, placement.CurrentAssignment)
+    owner = assignment.owner
+    fields = ("current" if current else "closed", assignment.destination.target,
+        f"{owner.host}:{owner.pid}:{owner.start_time}",
+        assignment.session.session_id if isinstance(assignment.session, OwningSession) else "-",
+        status.claim.claim_id if isinstance(status.claim, placement.ProviderClaimReference) else "-",
+        status.state.reason if isinstance(status.state, placement.ClosedAssignment) else "-")
+    print("\t".join(value.replace("\t", " ").replace("\n", " ").replace("\r", " ") for value in fields))
+    return 0 if current else 1
 
 
 def request_placement(request: wire.PlacementRequest
@@ -1071,6 +1099,7 @@ class ClientArguments(argparse.Namespace):
     wait_events: bool = False
     argv: list[str] = []
     episode: str = ""
+    attempt: str = ""
     repo_root: str = ""
     package: str = ""
     kind: str = ""
@@ -1251,6 +1280,9 @@ def main(argv: list[str] | None = None) -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("view", "explain", "down-alert", "priority-clear", "code-version"):
         _ = subcommands.add_parser(name)
+    status_parser = subcommands.add_parser("placement-status")
+    _ = status_parser.add_argument("--episode", required=True)
+    _ = status_parser.add_argument("--attempt", required=True)
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
@@ -1313,6 +1345,8 @@ def main(argv: list[str] | None = None) -> int:
         launch_without_wait=args.command == "launch" and launch_limit == 0))
     outcome = "Refused"
     try:
+        if args.command == "placement-status":
+            return _print_placement_status(args.episode, args.attempt)
         if args.command == "down-alert":
             return down_alert()
         if args.command == "finish-step":

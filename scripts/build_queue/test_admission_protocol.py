@@ -33,6 +33,32 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_placement_status_round_trips_without_launch_permission(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt)
+            self.assertEqual(wire.parse_request(wire.encode_request(status_request)), status_request)
+            statuses = (status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("cancelled"), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), placement.NoProviderClaim()),
+                status_wire.UnknownPlacementStatus("unseen-episode", "unseen-attempt"))
+            for status in statuses:
+                with self.subTest(status=status):
+                    reply = status_wire.PlacementStatusReply(status)
+                    encoded = wire.encode_reply(reply)
+                    self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+                    self.assertNotIn("permission", encoded)
+                    with self.assertRaisesRegex(ValueError, "placement requires version 3"):
+                        _ = wire.encode_reply(reply, version=2)
+
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
