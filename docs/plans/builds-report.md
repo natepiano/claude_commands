@@ -1413,10 +1413,13 @@ From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until
 - Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
 - `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.
 
-### Phase 75 — The hover colons line up exactly · status: todo
+### Phase 75 — The hover colons line up exactly · status: done
 
-From builds (not the user), 2026-11-13 23:46: "the colon after 'showrunner' sits about 3 px left of the colons after 'unit' and 'worker'. The page font is proportional, so space padding cannot align them. Put the label, the colon and the value in three grid columns, so all three colons line up exactly. Send it as a small phase with before and after shots."
+From builds (not the user), 2026-11-13 23:46: align the colons in the who-ran-it hover block exactly.
 
-1. `identityHtml` gives each line three cells: the label (`dt`), the colon (`dd.colon`, hidden from screen readers) and the value (`dd`). The `.identity` grid has three columns, so every colon starts at the same x.
-2. Proof: before and after shots of a Mac row hover and a queued row hover; the proof measures the colon cells and requires one left edge.
-3. Run every build_queue module before the checkpoint.
+#### As-built
+
+- `identityHtml` gives each line three cells: `<dt>` label, `<dd class="colon" aria-hidden="true">:</dd>` and `<dd>` value. The `.identity` grid columns are `max-content max-content minmax(0, 1fr)`, so all colons share one left edge. The Mac fields list keeps two cells per line.
+- `test_memory_hover.field_values` reads value cells without the colon cells; the who-ran-it test checks one aria-hidden colon per label.
+- `memory_page_proof.mjs --identity` measures each colon's left edge. It captures `before-` and `after-colons-mac-row` and `-queued-row` shots, and requires one edge on the after page and on the showrunner row.
+- Checkpoint 1bd7b8067.
